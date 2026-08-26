@@ -1126,7 +1126,7 @@ static bool bindCallArgsSlow(ObjClosure *closure, int argc, Value *slotBase) {
     if (variadic) {
         int extra = argc > arity ? argc - arity : 0;
         rest = jaiListNew(extra);
-        for (int i = 0; i < extra; i++) rest->items[i] = slotBase[1 + arity + i];
+        for (int i = 0; i < extra; i++) jaiListPut(rest, i, slotBase[1 + arity + i]);
         rest->count = extra;
         if (argc > arity) argc = arity;
     }
@@ -1951,7 +1951,7 @@ static bool repeatList(ObjList *list, int64_t times, Value *out) {
     ObjList *result = jaiListNew((int)(times * list->count));
     for (int64_t i = 0; i < times; i++) {
         for (int j = 0; j < list->count; j++) {
-            result->items[result->count++] = list->items[j];
+            jaiListPut(result, result->count++, jaiListGet(list, j));
         }
     }
     jaiGCPopRoot();
@@ -2232,7 +2232,7 @@ static bool containsOp(Value container, Value element, bool *out) {
     if (IS_LIST(container)) {
         ObjList *list = AS_LIST(container);
         for (int i = 0; i < list->count; i++) {
-            if (jaiValuesEqual(list->items[i], element)) { *out = true; return true; }
+            if (jaiValuesEqual(jaiListGet(list, i), element)) { *out = true; return true; }
             if (vm.hasException) return false;
         }
         *out = false;
@@ -2338,7 +2338,7 @@ JAI_INLINE bool indexGetFast(Value container, Value index, Value *out) {
         ObjList *list = (ObjList *)o;
         int at;
         if (JAI_UNLIKELY(!jaiNormalizeIndex(raw, list->count, &at))) return false;
-        *out = list->items[at];
+        *out = jaiListGet(list, at);
         return true;
     }
 
@@ -2381,7 +2381,7 @@ static bool indexGet(Value container, Value index, Value *out) {
                             "list index %" PRId64 " out of range for length %d",
                             AS_INT(index), list->count);
         }
-        *out = list->items[at];
+        *out = jaiListGet(list, at);
         return true;
     }
     if (IS_TUPLE(container)) {
@@ -2479,7 +2479,7 @@ static bool indexSet(Value container, Value index, Value value) {
                             AS_INT(index), list->count);
         }
         if (!jaiCheckKind(list->elemKind, value, "an element")) return false;
-        list->items[at] = value;
+        jaiListPut(list, at, value);
         jaiListTouch(list);      /* the count is unchanged; only the version tells */
         return true;
     }
@@ -2576,13 +2576,13 @@ bool jaiSliceGet(Value container, Value startValue, Value stopValue,
         ObjList *temp = jaiListNew((int)tuple->count);
         jaiGCPushRoot(OBJ_VAL(temp));
         for (uint32_t i = 0; i < tuple->count; i++) {
-            temp->items[temp->count++] = tuple->items[i];
+            jaiListBox(temp)[temp->count++] = tuple->items[i];
         }
         ObjList *sliced = jaiListSlice(temp, start, stop, step);
         jaiGCPopRoot();
         if (sliced == NULL) return false;
         jaiGCPushRoot(OBJ_VAL(sliced));
-        ObjTuple *outT = jaiTupleNew(sliced->items, sliced->count);
+        ObjTuple *outT = jaiTupleNew(jaiListBox(sliced), sliced->count);
         jaiGCPopRoot();
         *out = OBJ_VAL(outT);
         return true;
@@ -3543,7 +3543,7 @@ JAI_INLINE IterStep iterStepFast(ObjIter *it, Value *out) {
                 return ITER_STEP_SLOW;
             if (index >= it->limit) return ITER_STEP_DONE;
 
-            *out = list->items[index];
+            *out = jaiListGet(list, index);
             it->index = index + 1;
             return ITER_STEP_VALUE;
         }
@@ -3590,8 +3590,8 @@ JAI_INLINE bool pairSplit(Value item, Value *a, Value *b) {
     if (IS_LIST(item)) {
         ObjList *const list = AS_LIST(item);
         if (list->count != 2) return false;
-        *a = list->items[0];
-        *b = list->items[1];
+        *a = jaiListGet(list, 0);
+        *b = jaiListGet(list, 1);
         return true;
     }
     return false;
@@ -4408,6 +4408,10 @@ static JaiRunResult runLoop(int baseFrameCount) {
         Value target = PEEK(0);
         if (IS_LIST(target)) {
             AS_LIST(target)->elemKind = (uint8_t)(packed & 0xFu);
+            /* The literal is still empty here -- the stamp is emitted the
+             * instant it is built -- which is the only moment the backing
+             * array can change width for free. */
+            jaiListSpecialise(AS_LIST(target), (uint8_t)(packed & 0xFu));
         } else if (IS_DICT(target)) {
             AS_DICT(target)->keyKind = (uint8_t)((packed >> 4) & 0xFu);
             AS_DICT(target)->valKind = (uint8_t)(packed & 0xFu);
@@ -5090,7 +5094,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         DROP(1);
         SAVE_STATE();
         if (!ensureStack(list->count + 1)) goto vmThrow;
-        for (int i = 0; i < list->count; i++) PUSH(list->items[i]);
+        for (int i = 0; i < list->count; i++) PUSH(jaiListGet(list, i));
         int total = argc - 1 + list->count;
         SAVE_STATE();
         if (callValueOnStack(total) == CALL_ERROR) goto vmThrow;
@@ -5604,7 +5608,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         SAVE_STATE();
         ObjList *list = jaiListNew(count);
         LOAD_STATE();
-        for (int i = 0; i < count; i++) list->items[i] = stackTop[-count + i];
+        for (int i = 0; i < count; i++) jaiListPut(list, i, stackTop[-count + i]);
         list->count = count;
         DROP(count);
         PUSH(OBJ_VAL(list));
@@ -5793,7 +5797,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         const Value *source = NULL;
         int sourceCount = 0;
         if (IS_LIST(assigned)) {
-            source = AS_LIST(assigned)->items;
+            source = jaiListBox(AS_LIST(assigned));
             sourceCount = AS_LIST(assigned)->count;
         } else if (IS_TUPLE(assigned)) {
             source = AS_TUPLE(assigned)->items;
@@ -5819,7 +5823,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         int64_t written = 0;
         for (int64_t i = start; (step > 0) ? (i < stop) : (i > stop); i += step) {
             if (i < 0 || i >= list->count) break;
-            list->items[i] = source[written++];
+            jaiListPut(list, i, source[written++]);
         }
         if (written > 0) jaiListTouch(list);
         LOAD_STATE();
@@ -5836,7 +5840,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         const Value *items = NULL;
         int available = 0;
         if (IS_LIST(source)) {
-            items = AS_LIST(source)->items;
+            items = jaiListBox(AS_LIST(source));
             available = AS_LIST(source)->count;
         } else if (IS_TUPLE(source)) {
             items = AS_TUPLE(source)->items;
@@ -5863,12 +5867,12 @@ static JaiRunResult runLoop(int baseFrameCount) {
         for (int i = 0; i < count; i++) {
             if (hasRest && i == restIndex) {
                 ObjList *rest = jaiListNew(restCount);
-                for (int j = 0; j < restCount; j++) rest->items[j] = items[read + j];
+                for (int j = 0; j < restCount; j++) jaiListPut(rest, j, items[read + j]);
                 rest->count = restCount;
                 read += restCount;
                 unpacked[i] = OBJ_VAL(rest);
                 /* jaiListNew can collect; re-read the (still rooted) source. */
-                items = IS_LIST(source) ? AS_LIST(source)->items
+                items = IS_LIST(source) ? jaiListBox(AS_LIST(source))
                                         : AS_TUPLE(source)->items;
             } else {
                 unpacked[i] = items[read++];

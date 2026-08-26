@@ -212,7 +212,7 @@ static int jitInvokeNative(JitCallDesc *d) {
 static int jitBuildList(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjList *list = jaiListNew((int)d->argc);
-    for (int64_t i = 0; i < d->argc; i++) list->items[i] = d->args[i];
+    for (int64_t i = 0; i < d->argc; i++) jaiListPut(list, (int)i, d->args[i]);
     list->count = (int)d->argc;
     d->result = OBJ_VAL(list);
     jaiGCPopRootRange();
@@ -573,6 +573,22 @@ typedef struct {
      * loop variable is an instance of no particular class. Set by the driver,
      * which is the only place the whole list is in hand. */
     bool      elemMixed;
+    /* The ListStore each list local is backed by, pinned at compile time and
+     * re-checked by the entry guard -- the element loads are emitted at one
+     * width, so this is as much a commitment as an instance slot's class. The
+     * function tier samples nothing and leaves every entry BOXED, which is the
+     * storage a list built by compiled code always has. */
+    uint8_t   localStg[JIT_MAX_SLOTS + 1];
+    /* Storage of the list an iterKind 2 head walks, from the same sample. */
+    uint8_t   elemStg;
+    /* Which of those pins the emission is allowed to BELIEVE. Decided once,
+     * between the measuring pass and the real one, because the measuring pass
+     * is what says where a slot is written and where the body calls out --
+     * planHoists settles its own question in the same place for the same
+     * reason. False everywhere in the probe, which therefore emits the boxed
+     * form; the two passes already differ over hoisting. */
+    bool      localStgPin[JIT_MAX_SLOTS + 1];
+    bool      elemStgPin;
     /* Per-slot register assignment. Historically one flag gated the whole loop on a budget check that
      * almost nothing passed, so most loops ran fully in memory. Three things fixed it: only NAMED slots take a register; a float slot takes v8..v15 instead of an X register; overflow slots stay in the frame (busiest slots win, weighted by loop nesting) rather than all-or-nothing. */
     uint8_t   slotXReg[JIT_MAX_SLOTS + 1];   /* x19..x28, or 0 for none */
@@ -2380,6 +2396,190 @@ static uint32_t loopBodyEnd(const Chunk *c, uint32_t top) {
     return last;
 }
 
+/* Proves the list in `rList` is still the boxed Value[] every element access
+ * below is emitted against. An unboxed `list[int]` packs its elements eight
+ * bytes apart with no tag, so a body compiled for the boxed layout would read
+ * two of them as one tagged pair -- and the storage is a property of the LIST,
+ * not of the slot, so nothing the walk knows can rule it out.
+ *
+ * Two instructions, on the boxed path as well. The loop tier pins the storage
+ * per slot instead and jaiJitEnterOsr proves it once at entry (JaiOsrForm::
+ * kinds), so the sites that can name their slot skip this entirely; this is
+ * for the ones that cannot -- a nested iterator's source, a list reached
+ * through a field, anything the function tier subscripts. */
+static void emitListBoxedGuard(Emit *e, unsigned rList, unsigned scratch) {
+    emit(e, jaiA64LdrByte(scratch, rList, (unsigned)offsetof(ObjList, stg)));
+    emit(e, jaiA64SubsXImm(31, scratch, LIST_STORE_BOXED));
+    branchOnDeopt(e, JAI_A64_NE);
+}
+
+static bool subWhy(Emit *e, const char *fmt, ...);
+
+/* The ListStore a site may emit its element accesses against, and whatever
+ * guard makes that true.
+ *
+ * A slot the loop tier pinned needs no runtime check at all -- jaiJitEnterOsr
+ * proved it at entry, the same way it proves an instance slot's class, so the
+ * stride below is right before the body starts. Anything the walk cannot name
+ * a slot for -- a list reached through a field, a temporary, anything the
+ * function tier subscripts -- is proved here instead, and BOXED is the only
+ * answer those two instructions accept. */
+/* How an element access should be emitted.
+ *
+ * `stg` is the storage the first arm is emitted at. When `dynamic` is set a
+ * second arm at `alt` follows it, with a runtime test on ObjList::stg picking
+ * between the two -- see listDispatchBegin. */
+typedef struct {
+    uint8_t stg;
+    uint8_t alt;
+    bool    dynamic;
+} ListAccess;
+
+/* The one unboxed storage a list holding a `vk` could have. BOXED means there
+ * is no other possibility: a list of instances, strings or lists is boxed and
+ * nothing else, so those sites need no second arm. */
+static uint8_t listAltFor(SlotKind vk) {
+    switch (vk) {
+    case SLOT_INT:   return (uint8_t)LIST_STORE_I64;
+    case SLOT_FLOAT: return (uint8_t)LIST_STORE_F64;
+    case SLOT_BOOL:  return (uint8_t)LIST_STORE_U8;
+    default:         return (uint8_t)LIST_STORE_BOXED;
+    }
+}
+
+/* Decides between the three ways a site can know its storage, and emits
+ * whatever guard the chosen one owes.
+ *
+ * PINNED. The loop tier sampled the storage from the live frame and
+ * jaiJitEnterOsr proves it at entry, the way it proves an instance slot's
+ * class. One arm, no test, no tag check: this is the whole point of the
+ * unboxing, and it is where the 1.3-1.5x lives.
+ *
+ * PROVED. Nothing pinned it, and no unboxed storage could hold a `vk` anyway
+ * (a list of instances). Two instructions say BOXED or deoptimise, and BOXED
+ * is a fact that stays true -- `stg` only ever moves towards boxed.
+ *
+ * DISPATCHED. Nothing pinned it and two storages are possible. Emitting the
+ * boxed arm behind a deopt guard is what the first version did, and it is
+ * ruinous rather than merely slower: the guard fails on EVERY access, and each
+ * failure leaves the compiled loop and re-enters it. `var f: list[bool] = []`
+ * at the top of a loop body is enough to arrange it -- the slot is written, so
+ * nothing pins it -- and building a 300k sieve thirty times went from 80ms to
+ * 300ms. Two arms and one compare cost four instructions and never leave. */
+static ListAccess listAccessFor(Emit *e, unsigned rList, int slot,
+                                SlotKind vk, unsigned scratch) {
+    ListAccess a;
+    if (e->osr && slot >= 0 && slot <= (int)JIT_MAX_SLOTS &&
+        e->localStgPin[slot]) {
+        a.stg = e->localStg[slot];
+        a.alt = a.stg;
+        a.dynamic = false;
+        return a;
+    }
+    a.alt = listAltFor(vk);
+    a.stg = (uint8_t)LIST_STORE_BOXED;
+    a.dynamic = a.alt != LIST_STORE_BOXED;
+    if (!a.dynamic) emitListBoxedGuard(e, rList, scratch);
+    return a;
+}
+
+/* Opens the runtime test. Returns the index of the placeholder branch, or -1
+ * when the access is static and no second arm follows.
+ *
+ * Tests for `alt` EXACTLY, not merely for "not boxed". `alt` is the storage a
+ * list holding a `vk` would have -- it is a prediction, not a reading, and the
+ * list is free to have a third one. `xs[i] = 3` on a `list[bool]` predicts I64
+ * from the value's kind while the array is one byte per element, and an
+ * eight-byte store at `i << 3` then runs off the end of it. So the third case
+ * deoptimises: the interpreter's jaiListPut de-specialises or raises, which is
+ * an answer this cannot emit inline. */
+static int listDispatchBegin(Emit *e, const ListAccess *a, unsigned rList,
+                             unsigned scratch) {
+    if (!a->dynamic) return -1;
+    emit(e, jaiA64LdrByte(scratch, rList, (unsigned)offsetof(ObjList, stg)));
+    emit(e, jaiA64SubsXImm(31, scratch, a->alt));
+    int skip = (int)e->count;
+    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    emit(e, jaiA64SubsXImm(31, scratch, LIST_STORE_BOXED));
+    branchOnDeopt(e, JAI_A64_NE);
+    return skip;
+}
+
+/* Closes the first arm and opens the second. Returns the join placeholder. */
+static int listDispatchElse(Emit *e, int skip) {
+    int join = (int)e->count;
+    emit(e, jaiA64B(0));
+    e->code[skip] = jaiA64BCond(JAI_A64_EQ, (int32_t)((int)e->count - skip));
+    return join;
+}
+
+static void listDispatchEnd(Emit *e, int join) {
+    e->code[join] = jaiA64B((int32_t)((int)e->count - join));
+}
+
+
+/* log2 of the element stride: a boxed Value is sixteen bytes, an int or a
+ * double eight, a bool one. */
+static unsigned listStgShift(uint8_t stg) {
+    switch ((ListStore)stg) {
+    case LIST_STORE_I64:
+    case LIST_STORE_F64: return 3;
+    case LIST_STORE_U8:  return 0;
+    case LIST_STORE_BOXED: break;
+    }
+    return 4;
+}
+
+/* The SlotKind every element of an unboxed store has. The storage IS the type,
+ * which is most of what the unboxing buys: the boxed path spends a load, a
+ * compare and a branch per element proving what this knows statically. */
+static SlotKind listStgKind(uint8_t stg) {
+    switch ((ListStore)stg) {
+    case LIST_STORE_I64: return SLOT_INT;
+    case LIST_STORE_F64: return SLOT_FLOAT;
+    case LIST_STORE_U8:  return SLOT_BOOL;
+    case LIST_STORE_BOXED: break;
+    }
+    return SLOT_OPAQUE;
+}
+
+/* The same store with the base and index named, for the subscript arm, whose
+ * items pointer may be a hoisted register rather than JIT_SCRATCH_C. */
+static void emitElemStoreAt(Emit *e, uint8_t stg, unsigned rItems,
+                            unsigned rIdx, unsigned vtag, unsigned rVal) {
+    emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, rItems, rIdx, listStgShift(stg)));
+    if (stg == LIST_STORE_BOXED) {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, vtag, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+        emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
+    } else if (stg == LIST_STORE_U8) {
+        emit(e, jaiA64StrByte(rVal, JIT_SCRATCH_C, 0));
+    } else {
+        emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 0));
+    }
+}
+
+/* One element store, at whatever width `stg` says, from JIT_SCRATCH_C (items)
+ * and JIT_SCRATCH_A (index). Leaves JIT_SCRATCH_C pointing at the element. */
+static void emitListElemStore(Emit *e, uint8_t stg, unsigned vtag,
+                              unsigned rVal) {
+    emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_A,
+                          listStgShift(stg)));
+    if (stg == LIST_STORE_BOXED) {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_D, vtag, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SCRATCH_C, 0));
+        emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
+    } else if (stg == LIST_STORE_U8) {
+        emit(e, jaiA64StrByte(rVal, JIT_SCRATCH_C, 0));
+    } else {
+        /* A double's bits and an int's are both the whole register: the tier
+         * keeps a SLOT_FLOAT payload in an X register exactly as the boxed
+         * store did. */
+        emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 0));
+    }
+}
+
+
 /* items+count via one ldp: rCount comes back as `count | capacity << 32` (the two int32s share the
  * pair's second doubleword), so every reader must use the uxtw forms. Layout is asserted below, not assumed -- a field reordered in object.h would load a pointer as a count and index off the end of the array. */
 static void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
@@ -2551,6 +2751,11 @@ static void emitHoistsAt(Emit *e, uint32_t off) {
     if (e->inlining) return;
     for (unsigned i = 0; i < e->hoistCount; i++) {
         if (e->hoist[i].top != off) continue;
+        /* Outside the loop, so the function tier pays its two instructions
+         * once per entry rather than per element. */
+        if (!e->osr) {
+            emitListBoxedGuard(e, e->slotXReg[e->hoist[i].slot], JIT_SCRATCH_A);
+        }
         emitListHeader(e, e->slotXReg[e->hoist[i].slot],
                        e->hoist[i].itemsReg, e->hoist[i].countReg);
     }
@@ -2818,7 +3023,8 @@ static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
  * costs far more than the work itself (list_ops spent all its time on the
  * call). A full list goes out to the `grow` stubs' realloc helper and comes
  * straight back; see there for why this used to be a deopt and what it cost. */
-static bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal) {
+static bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
+                          int slot) {
     unsigned vtag = vk == SLOT_INT   ? VAL_INT
                   : vk == SLOT_FLOAT ? VAL_FLOAT
                   : vk == SLOT_BOOL  ? VAL_BOOL
@@ -2828,6 +3034,18 @@ static bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal) {
     if (vtag == 0xffffffffu) {
         e->whyNot = "pushing a kind the tier cannot store";
         return false;
+    }
+
+    /* jitListGrow only reserves, and jaiListReserve is width-aware, so the
+     * growth half of this needs nothing; it is the store below that has to
+     * know how wide an element is. */
+    /* jitListGrow only reserves, and jaiListReserve is width-aware, so the
+     * growth half of this needs nothing; it is the store below that has to
+     * know how wide an element is. */
+    ListAccess pAcc = listAccessFor(e, rList, slot, vk, JIT_SCRATCH_A);
+    if (!pAcc.dynamic && pAcc.stg != LIST_STORE_BOXED &&
+        vk != listStgKind(pAcc.stg)) {
+        return subWhy(e, "pushing kind %d onto storage %u", (int)vk, pAcc.stg);
     }
 
     emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
@@ -2861,10 +3079,16 @@ static bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal) {
 
     emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
                        (unsigned)offsetof(ObjList, items)));
-    emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_A, 4));
-    emit(e, jaiA64MovzX(JIT_SCRATCH_D, vtag, 0));
-    emit(e, jaiA64StrW(JIT_SCRATCH_D, JIT_SCRATCH_C, 0));
-    emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
+    /* JIT_SCRATCH_C is the items pointer and JIT_SCRATCH_A the index; every
+     * arm below starts from those two, so the test costs a load, a compare and
+     * two branches and touches nothing else. */
+    int pSkip = listDispatchBegin(e, &pAcc, rList, JIT_SCRATCH_D);
+    emitListElemStore(e, pAcc.stg, vtag, rVal);
+    if (pSkip >= 0) {
+        int pJoin = listDispatchElse(e, pSkip);
+        emitListElemStore(e, pAcc.alt, vtag, rVal);
+        listDispatchEnd(e, pJoin);
+    }
     emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
     emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
                        (unsigned)offsetof(ObjList, count)));
@@ -5318,6 +5542,41 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             emitConst64(e, JIT_SCRATCH_A, (int64_t)(packed & 0xFu));
             emit(e, jaiA64StrByte(JIT_SCRATCH_A, r,
                                   (unsigned)offsetof(ObjList, elemKind)));
+            /* And the storage, on the same terms jaiListSpecialise takes: an
+             * empty list with nothing reserved, which is what a `[]` literal
+             * is. Six instructions rather than a call, and no allocation --
+             * that is the whole reason the interpreter's half refuses a
+             * non-empty list too. Without this the two tiers build the same
+             * literal at different widths and a pinned loop form is denied
+             * entry for half the lists it meets; see jaiListSpecialise. */
+            uint8_t kStg = listAltFor(
+                (packed & 0xFu) == FIELD_KIND_INT   ? SLOT_INT
+              : (packed & 0xFu) == FIELD_KIND_FLOAT ? SLOT_FLOAT
+              : (packed & 0xFu) == FIELD_KIND_BOOL  ? SLOT_BOOL
+                                                    : SLOT_OPAQUE);
+            if (kStg != LIST_STORE_BOXED && jaiListUnboxOn()) {
+                /* JIT_SCRATCH_A only: this arm has always used one scratch,
+                 * and e->scratchRoom is what says how many the body actually
+                 * reserved -- reaching for a second clobbered a live value
+                 * register and miscompiled the self-hosted emitter. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
+                                   (unsigned)offsetof(ObjList, count)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                int kA = (int)e->count;
+                emit(e, jaiA64BCond(JAI_A64_NE, 0));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, r,
+                                   (unsigned)offsetof(ObjList, items)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                int kB = (int)e->count;
+                emit(e, jaiA64BCond(JAI_A64_NE, 0));
+                emitConst64(e, JIT_SCRATCH_A, (int64_t)kStg);
+                emit(e, jaiA64StrByte(JIT_SCRATCH_A, r,
+                                      (unsigned)offsetof(ObjList, stg)));
+                e->code[kA] = jaiA64BCond(JAI_A64_NE,
+                                          (int32_t)((int)e->count - kA));
+                e->code[kB] = jaiA64BCond(JAI_A64_NE,
+                                          (int32_t)((int)e->count - kB));
+            }
             e->wroteHeap = true;
             off += 2;
             break;
@@ -7371,7 +7630,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             if (!emitListStore(e, e->stack[e->depth - 1],
                                valueXReg(e, valueIndexOf(e, lidx)),
-                               pushReg(e) - 1)) {
+                               pushReg(e) - 1, e->stackLocal[lidx])) {
                 return false;
             }
             /* The value is consumed; the target stays where it was. */
@@ -7435,7 +7694,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * more than the work itself (list_ops spent all its time on the call). A full list goes out to the `grow` stubs' realloc helper and comes straight back; see there for why this used to be a deopt and what that cost. */
                 if (!emitListStore(e, e->stack[e->depth - 1],
                                    valueXReg(e, e->valueDepth - 2),
-                                   pushReg(e) - 1)) {
+                                   pushReg(e) - 1, e->stackLocal[ridx])) {
                     return false;
                 }
                 /* push returns the list, which is the receiver entry already
@@ -7839,7 +8098,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 Value srcv = e->stackSeen[e->depth - 1];
                 Value sample = NULL_VAL;
                 if (IS_LIST(srcv) && AS_LIST(srcv)->count > 0) {
-                    sample = AS_LIST(srcv)->items[0];
+                    sample = jaiListGet(AS_LIST(srcv), 0);
                 }
                 if (IS_NULL(sample)) {
                     e->whyNot = "iterating a list with nothing to look at";
@@ -8134,6 +8393,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
                     emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
                                        (unsigned)offsetof(ObjIter, source) + 8));
+                    /* Nothing names this list -- it is whatever the iterator
+                     * was built over -- so the storage is proved rather than
+                     * pinned. */
+                    emitListBoxedGuard(e, JIT_SCRATCH_C, JIT_SCRATCH_A);
 
                     /* Mutation first, as jaiIterNext tests it: a list that grew
                      * or shrank under the loop must raise, and the version is
@@ -8344,6 +8607,29 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * must raise, and the version is the only thing that says so.
                  * Nothing has happened yet, so this resumes at this very
                  * instruction and the interpreter raises it properly. */
+                /* Storage is pinned per form, not checked here: jaiJitEnterOsr
+                 * matches JaiOsrForm::iterStg against the list this head is
+                 * about to walk, so by the time the body runs the stride below
+                 * is already the right one. */
+                /* Unpinned is unproved, and the form records LIST_STG_ANY
+                 * for the head -- but a deopt guard here is not the answer.
+                 * `e->elemStgPin` is false for any body that calls out, and a
+                 * `push` is a call, so `for x in xs { out.push(f(x)) }` over a
+                 * `list[int]` would fail that guard on its FIRST element and
+                 * on every entry after: 11x slower than boxed, and the head's
+                 * give-up counter never fires because a bail is not a decline.
+                 * So the head dispatches like every other site. */
+                ListAccess iAcc;
+                iAcc.stg = e->elemStgPin ? e->elemStg
+                                         : (uint8_t)LIST_STORE_BOXED;
+                iAcc.alt = e->elemStgPin ? iAcc.stg : listAltFor(ek);
+                iAcc.dynamic = !e->elemStgPin && iAcc.alt != LIST_STORE_BOXED;
+                uint8_t iStg = iAcc.stg;
+                if (iStg != LIST_STORE_BOXED && ek != listStgKind(iStg)) {
+                    return subWhy(e, "element kind %d is not storage %u's",
+                                  (int)ek, iStg);
+                }
+
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_START_REG,
                                    (unsigned)offsetof(ObjList, version)));
                 emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_ITER_REG,
@@ -8357,11 +8643,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 /* Reload items each time rather than hoisting: a reallocation
                  * bumps the version so the guard above covers it, and one ldr
                  * removes the question entirely. */
+                int iSkip = listDispatchBegin(e, &iAcc, JIT_START_REG,
+                                              JIT_SCRATCH_A);
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_START_REG,
                                    (unsigned)offsetof(ObjList, items)));
                 emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                      JIT_IDX_REG, 4));
+                                      JIT_IDX_REG, listStgShift(iStg)));
 
+                /* Nothing to check on an unboxed element: no tag, and no
+                 * object behind it whose type could surprise the arms below. */
+                if (iStg == LIST_STORE_BOXED) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, etag));
                 branchOnDeopt(e, JAI_A64_NE);
@@ -8397,14 +8688,31 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
                     branchOnDeopt(e, JAI_A64_NE);
                 }
+                }
+
+                /* Both arms leave JIT_SCRATCH_C on the payload, as
+                 * OP_GET_INDEX's do, so the load below serves either. */
+                if (iStg == LIST_STORE_BOXED) {
+                    emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 8));
+                }
+                if (iSkip >= 0) {
+                    int iJoin = listDispatchElse(e, iSkip);
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_START_REG,
+                                       (unsigned)offsetof(ObjList, items)));
+                    emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                          JIT_IDX_REG,
+                                          listStgShift(iAcc.alt)));
+                    listDispatchEnd(e, iJoin);
+                }
 
                 /* One byte for a bool: see the note in OP_GET_INDEX. `strb` is
                  * what BOOL_VAL compiles to, so the rest of the payload word is
                  * stale, and a SLOT_BOOL register must hold 0 or 1. */
+                unsigned eAt = 0;
                 if (ek == SLOT_BOOL) {
-                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, eAt));
                 } else {
-                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, eAt));
                 }
                 localOut(e, slot, JIT_SCRATCH_A);
                 emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
@@ -8675,6 +8983,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* items is reloaded rather than hoisted: a reallocation bumps the
              * version, which the guard above covers, and one ldr removes the
              * question. */
+            emitListBoxedGuard(e, JIT_SCRATCH_B, JIT_SCRATCH_A);
             emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_B,
                                (unsigned)offsetof(ObjList, items)));
             emit(e, jaiA64AddXLsl(JIT_SCRATCH_B, JIT_SCRATCH_B,
@@ -8858,7 +9167,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (sl->count <= 0) {
                 return subWhy(e, "the live list is empty, so there is no exemplar");
             }
-            Value elem = sl->items[0];
+            Value elem = jaiListGet(sl, 0);
             SlotKind kind;
             unsigned tag;
             ObjClass *elemClass = NULL;
@@ -8895,6 +9204,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* One `ldp` for both header fields: `items` at +16, `count`/`capacity` the adjacent int32s at +24, so
              * the pair's second half is `count | capacity << 32` and the bounds test reads it with uxtw -- one instruction per element read (life does nine per cell). */
             noteSlotIndexed(e, e->stackLocal[e->depth - 2]);
+            ListAccess gAcc = listAccessFor(e, rList,
+                                            e->stackLocal[e->depth - 2],
+                                            kind, JIT_SCRATCH_D);
+            /* The sampled element and a PINNED storage cannot disagree -- an
+             * I64 store holds ints and nothing else -- but the kind is what
+             * the loads below are emitted for, so it is checked rather than
+             * assumed. A dispatched access picks its second arm from the kind,
+             * so it cannot disagree by construction. */
+            if (!gAcc.dynamic && gAcc.stg != LIST_STORE_BOXED &&
+                kind != listStgKind(gAcc.stg)) {
+                return subWhy(e, "element kind %d is not storage %u's",
+                              (int)kind, gAcc.stg);
+            }
             unsigned gItems = JIT_SCRATCH_C, gCount = JIT_SCRATCH_A;
             int gh = hoistFor(e, e->stackLocal[e->depth - 2]);
             if (gh >= 0) {
@@ -8905,11 +9227,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             emitBoundsNormalise(e, rIdx, gCount, JIT_SCRATCH_B, true);
 
+            /* Both arms below leave JIT_SCRATCH_C on the PAYLOAD rather than
+             * on the element, which is what lets one load serve them: a boxed
+             * element's payload is eight bytes into it, an unboxed element IS
+             * its payload. */
+            int gSkip = listDispatchBegin(e, &gAcc, rList, JIT_SCRATCH_D);
+
             emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems,
-                                  JIT_SCRATCH_B, 4));
+                                  JIT_SCRATCH_B, listStgShift(gAcc.stg)));
+            /* An unboxed element has no tag to check, and no object behind it
+             * to confirm the type of: the storage already said what it is. */
+            if (gAcc.stg == LIST_STORE_BOXED) {
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchOnDeopt(e, JAI_A64_NE);
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 8));
             if (kind == SLOT_INST) {
                 /* The tag says "an object", not "an object of this class" --
                  * and not even "an instance" yet: VAL_OBJ is every heap
@@ -8920,7 +9252,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * but a later element is (say) a string reads that string's
                  * header bytes as an ObjInstance's `klass` pointer and
                  * segfaults dereferencing it -- not merely a wrong answer. */
-                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 0));
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
                                    (unsigned)offsetof(Obj, type)));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
@@ -8938,11 +9270,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * same contract, same check, as OP_GET_FIELD_LOCAL's SLOT_LIST arm. Without this a
                  * heterogeneous list (`[[1, 2], "not a list"]`) passes the generic VAL_OBJ tag check on
                  * either element and reads the second one's bytes through ObjList's field offsets. */
-                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 0));
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
                                    (unsigned)offsetof(Obj, type)));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
                 branchOnDeopt(e, JAI_A64_NE);
+            }
+            }
+            if (gSkip >= 0) {
+                int gJoin = listDispatchElse(e, gSkip);
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems, JIT_SCRATCH_B,
+                                      listStgShift(gAcc.alt)));
+                listDispatchEnd(e, gJoin);
             }
 
             unsigned d1, d2;
@@ -8952,7 +9291,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* Bool payload is one byte (`BOOL_VAL` compiles to `strb`), so the other seven bytes are stale --
              * an 8-byte load would hand a SLOT_BOOL register (required to hold exactly 0 or 1, since every consumer does `cbnz` on the whole word) garbage. */
             if (kind == SLOT_BOOL) {
-                emit(e, jaiA64LdrByte(pushReg(e) - 1, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrByte(pushReg(e) - 1, JIT_SCRATCH_C, 0));
             } else if (kind == SLOT_FLOAT &&
                        fpWorthLoading(e, code, off + 1, stop)) {
                 /* Straight into the FP bank, for the same reason a float local
@@ -8960,10 +9299,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * cross-register-file move between the load and the multiply
                  * that wants it, and `ai[k] * b[k][j]` had two of them. */
                 unsigned idx = e->valueDepth - 1;
-                emit(e, jaiA64LdrD(fpRegAt(e, idx), JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrD(fpRegAt(e, idx), JIT_SCRATCH_C, 0));
                 fpClaim(e, idx);
             } else {
-                emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_C, 8));
+                emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_C, 0));
             }
             off += 1;
             break;
@@ -9012,6 +9351,18 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned rList = valueXReg(e, e->valueDepth - 3);
 
             noteSlotIndexed(e, e->stackLocal[e->depth - 3]);
+            ListAccess sAcc = listAccessFor(e, rList, e->stackLocal[e->depth - 3],
+                                            vk, JIT_SCRATCH_D);
+            /* Exactly what jaiListStoreAccepts allows, and for its reason: an
+             * int written into a `list[float]` de-specialises the list in the
+             * interpreter, which is not something this can do inline. The
+             * dispatched form cannot hit it -- its second arm is the storage
+             * that holds a `vk` and no other. */
+            if (!sAcc.dynamic && sAcc.stg != LIST_STORE_BOXED &&
+                vk != listStgKind(sAcc.stg)) {
+                return subWhy(e, "storing kind %d into storage %u",
+                              (int)vk, sAcc.stg);
+            }
             unsigned sItems = JIT_SCRATCH_C, sCount = JIT_SCRATCH_A;
             int sh = hoistFor(e, e->stackLocal[e->depth - 3]);
             if (sh >= 0) {
@@ -9022,11 +9373,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             emitBoundsNormalise(e, rIdx, sCount, JIT_SCRATCH_B, true);
 
-            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, sItems,
-                                  JIT_SCRATCH_B, 4));
-            emit(e, jaiA64MovzX(JIT_SCRATCH_A, vtag, 0));
-            emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
-            emit(e, jaiA64StrX(rVal, JIT_SCRATCH_C, 8));
+            int sSkip = listDispatchBegin(e, &sAcc, rList, JIT_SCRATCH_A);
+            emitElemStoreAt(e, sAcc.stg, sItems, JIT_SCRATCH_B, vtag, rVal);
+            if (sSkip >= 0) {
+                int sJoin = listDispatchElse(e, sSkip);
+                emitElemStoreAt(e, sAcc.alt, sItems, JIT_SCRATCH_B, vtag, rVal);
+                listDispatchEnd(e, sJoin);
+            }
             /* jaiListTouch: the count has not changed, so only the version
              * tells an iterator that the list moved under it. */
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
@@ -11021,6 +11374,7 @@ static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count) {
 
 static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            uint8_t iterKind, Value elemSample, bool elemMixed,
+                           uint8_t elemStg,
                            bool wholeBody, bool noInline,
                            const bool *nullable, bool *needNullable);
 
@@ -11050,6 +11404,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
  * loops it does unblock, on the same reasoning the enum fold was. */
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                        uint8_t iterKind, Value elemSample, bool elemMixed,
+                       uint8_t elemStg,
                        bool wholeBody, bool noInline) {
     bool nullable[JIT_MAX_SLOTS + 1];
     bool needNullable[JIT_MAX_SLOTS + 1];
@@ -11057,7 +11412,8 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     for (int attempt = 0; attempt < 2; attempt++) {
         memset(needNullable, 0, sizeof needNullable);
         if (compileOsrOnce(closure, top, slots, iterKind, elemSample, elemMixed,
-                           wholeBody, noInline, nullable, needNullable)) {
+                           elemStg, wholeBody, noInline, nullable,
+                           needNullable)) {
             return true;
         }
         bool grew = false;
@@ -11071,6 +11427,7 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 
 static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            uint8_t iterKind, Value elemSample, bool elemMixed,
+                           uint8_t elemStg,
                            bool wholeBody, bool noInline,
                            const bool *nullable, bool *needNullable) {
     bool hasIter = iterKind != 0;
@@ -11099,6 +11456,13 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     e.iterKind = iterKind;
     e.elemSample = elemSample;
     e.elemMixed  = elemMixed;
+    e.elemStg    = elemStg;
+    /* From the live frame, which is the whole reason the loop tier can pin a
+     * storage at all: the function tier compiles with no values in hand. */
+    for (unsigned i = 0; i < (unsigned)fn->maxSlots && i <= JIT_MAX_SLOTS; i++) {
+        e.localStg[i] = IS_LIST(slots[i]) ? AS_LIST(slots[i])->stg
+                                          : (uint8_t)LIST_STORE_BOXED;
+    }
     e.osrTop = top;
     e.osrEnd = end;
     e.base = 0;
@@ -11161,6 +11525,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
         probe.iterKind = iterKind; probe.elemSample = elemSample;
         probe.elemMixed = elemMixed;
+        probe.elemStg = elemStg;
+        memcpy(probe.localStg, e.localStg, sizeof probe.localStg);
         probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
         probe.noInline = noInline;
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
@@ -11302,6 +11668,31 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             for (unsigned i = 0; i < probe.clobberCount; i++) {
                 e.clobberOff[i] = probe.clobberOff[i];
             }
+
+            /* Which sampled storages the real pass may emit against.
+             *
+             * A slot ASSIGNED inside the region cannot be pinned: the tier's
+             * OP_ELEM_KIND arm writes elemKind without specialising, so a
+             * `var f: list[bool] = []` at the top of a loop body makes a BOXED
+             * list every round while the pin, taken from the frame before
+             * entry, still says U8. A sieve written that way read every
+             * element one byte wide out of a sixteen-byte array and printed a
+             * different prime count on each run.
+             *
+             * A region that CALLS OUT cannot pin either: jaiListBox is
+             * reachable from ordinary builtins -- a sort, a concat of two
+             * storages, a put of a kind the store cannot hold -- and it
+             * de-specialises the list with nothing the compiled body could
+             * watch. The same test planHoists makes of a hoisted header, for
+             * the same reason: the entry guard proves a fact, and this is
+             * whether the body can invalidate it. */
+            bool bodyCallsOut = regionCalls(&e, top, end);
+            for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+                e.localStgPin[i] =
+                    !bodyCallsOut &&
+                    !(e.slotWriteHi[i] >= top && e.slotWriteLo[i] < end);
+            }
+            e.elemStgPin = !bodyCallsOut;
             /* x13..x17 are nobody's in any body -- a call destroys them, which
              * is why only a call-free REGION may hold anything there, and
              * planHoists is what tests that. Offering them unconditionally is
@@ -11707,7 +12098,20 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     form->top   = top;
     form->slots = (uint8_t)e.locals;
     form->iterKind = iterKind;
-    for (unsigned i = 0; i < e.locals; i++) form->kinds[i] = (uint8_t)e.localKind[i];
+    /* Kind in the low nibble, ListStore in the high one. See JaiOsrForm::kinds:
+     * a list slot's storage was pinned when its element loads were emitted, so
+     * the entry guard has to prove it the same way it proves a class. */
+    for (unsigned i = 0; i < e.locals; i++) {
+        /* Only a slot the emission actually believed needs proving. An
+         * unpinned one was compiled at the boxed stride behind a guard of its
+         * own, and demanding a storage of it here would refuse entry to a loop
+         * the body would have run correctly. */
+        uint8_t stg = e.localKind[i] == SLOT_LIST && e.localStgPin[i]
+                          ? e.localStg[i]
+                          : (uint8_t)LIST_STG_ANY;
+        form->kinds[i] = (uint8_t)((unsigned)e.localKind[i] | ((unsigned)stg << 4));
+    }
+    form->iterStg = e.elemStgPin ? e.elemStg : (uint8_t)LIST_STG_ANY;
 
     /* Pin the class of every instance slot the compile specialised on. Without
      * this the entry guard checks only IS_INSTANCE, and a loop compiled for one
@@ -11767,10 +12171,35 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     return true;
 }
 
+/* Whether this form's PINNED STORAGES describe the lists in hand.
+ *
+ * Storage takes part in choosing a form, not merely in admitting one. A form
+ * pinned to F64 is not WRONG for a boxed list -- it simply does not apply --
+ * and rejecting it after it has already been selected leaves the head with
+ * nothing, for ever: the search below breaks on the first (top, iterKind)
+ * match, so a second form for the other storage is never compiled. One
+ * jaiListBox -- a sort, a slice assignment, an int put into a `list[float]` --
+ * then cost that loop its compiled form for the rest of the program. Skipping
+ * the form here instead lets the head compile another one. */
+static bool osrFormStorageFits(const JaiOsrForm *form, const Value *slots,
+                               uint8_t iterKind, uint8_t elemStg) {
+    if (iterKind == 2 && form->iterStg != LIST_STG_ANY &&
+        form->iterStg != elemStg) {
+        return false;
+    }
+    for (unsigned i = 0; i < form->slots; i++) {
+        uint8_t want = (uint8_t)(form->kinds[i] >> 4);
+        if (want == LIST_STG_ANY) continue;
+        if ((SlotKind)(form->kinds[i] & 0x0Fu) != SLOT_LIST) continue;
+        if (!IS_LIST(slots[i])) return false;
+        if (AS_LIST(slots[i])->stg != want) return false;
+    }
+    return true;
+}
+
 int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     ObjFunction *fn = closure->fn;
     CallFrame *frame = &vm.frames[vm.frameCount - 1];
-
     /* A for-loop head keeps its iterator on the stack. Only a range from zero
      * in unit steps is taken, because that is what makes the yielded value the
      * index and lets the body run against a plain counter. */
@@ -11783,6 +12212,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     uint8_t iterKind = 0;
     Value elemSample = NULL_VAL;
     bool  elemMixed = false;
+    uint8_t elemStg = (uint8_t)LIST_STORE_BOXED;
     if (hasIter) {
         if (vm.stackTop <= frame->slots) return 0;
         Value it = vm.stackTop[-1];
@@ -11820,7 +12250,8 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
              * instead gives whatever the previous iteration left there (nothing on the first entry), aiming the kind guard at the wrong type -- what crashed the first attempt at this. */
             int at = (int)iter->index;
             if (at < 0 || at >= src->count) return 0;
-            elemSample = src->items[at];
+            elemSample = jaiListGet(src, at);
+            elemStg = src->stg;
             iterKind = 2;
             /* Whether the list holds one class or several. One sample cannot
              * say, and getting it wrong is not merely a slower loop: a form
@@ -11835,7 +12266,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                 int scan = src->count < 1024 ? src->count : 1024;
                 int nulls = 0;
                 for (int i = 0; i < scan; i++) {
-                    Value v = src->items[i];
+                    Value v = jaiListGet(src, i);
                     if (IS_NULL(v)) { nulls++; continue; }
                     if (!IS_INSTANCE(v)) continue;
                     if (AS_INSTANCE(v)->klass != first) { elemMixed = true; }
@@ -11882,7 +12313,9 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         /* Kind as well as offset: a form compiled for a range head, entered with a list iterator, would read
           * ObjRange::start out of an ObjList -- `for x in cond ? xs : 0..n` is enough to arrange it. */
         if (fn->osrForms[i].top == top &&
-            fn->osrForms[i].iterKind == iterKind) {
+            fn->osrForms[i].iterKind == iterKind &&
+            osrFormStorageFits(&fn->osrForms[i], frame->slots, iterKind,
+                               elemStg)) {
             form = &fn->osrForms[i];
             break;
         }
@@ -11911,13 +12344,13 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
          * exactly that shape. So the prefix stays as the fallback: some of the
          * loop compiled beats none of it. */
         if (!compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, true, false) &&
+                        elemMixed, elemStg, true, false) &&
             !compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, true, true) &&
+                        elemMixed, elemStg, true, true) &&
             !compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, false, false) &&
+                        elemMixed, elemStg, false, false) &&
             !compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, false, true)) {
+                        elemMixed, elemStg, false, true)) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
             if (miss == fn->osrMissCount && miss < JAI_OSR_MAX) {
@@ -11950,14 +12383,19 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     /* Every slot must still hold what it held when this was compiled. */
     for (unsigned i = 0; i < form->slots; i++) {
         Value v = frame->slots[i];
-        if ((SlotKind)form->kinds[i] == SLOT_MAYBE_INST) {
+        SlotKind want = (SlotKind)(form->kinds[i] & 0x0Fu);
+        if (want == SLOT_MAYBE_INST) {
             if (!IS_NULL(v) && !IS_INSTANCE(v)) return 0;
             continue;
         }
-        switch ((SlotKind)form->kinds[i]) {
+        switch (want) {
         case SLOT_INT:   if (!IS_INT(v))   return 0; break;
         case SLOT_FLOAT: if (!IS_FLOAT(v)) return 0; break;
         case SLOT_BOOL:  if (!IS_BOOL(v))  return 0; break;
+        /* Storage is settled by osrFormStorageFits, which ran as part of
+         * choosing this form: a body compiled against a boxed list reads a
+         * Value every sixteen bytes, and the same body entered holding a
+         * `list[int]` would read two elements as one tagged pair. */
         case SLOT_LIST:  if (!IS_LIST(v))  return 0; break;
         case SLOT_INST:  if (!IS_INSTANCE(v)) return 0; break;
         /* jitArgIn (function tier) has always checked this; the loop tier let it through via `default`, so a
@@ -12247,6 +12685,126 @@ bool jaiCallFn1(Value callee, Value arg, Value *out) {
     return callFn1Rerun(base, out);
 }
 
+/* See vm.h. The same tests jaiCallFn1 makes, in the same order, up to the
+ * point where the answer stops depending on the callee alone. */
+void jaiPrepareFn1(Value callee, JaiPreparedFn1 *prepared) {
+    prepared->callee = callee;
+    prepared->flat   = false;
+    if (!IS_CLOSURE(callee)) return;
+    ObjClosure *closure = AS_CLOSURE(callee);
+    ObjFunction *fn = closure->fn;
+    if (fn->jitFunc == NULL || fn->arity != 1) return;
+
+    unsigned nargs = fn->jitArgCount;
+    if (nargs == 0 || nargs > 2) return;
+    if (nargs == 2 && (SlotKind)fn->jitParamKind[1] != SLOT_CLOSURE) return;
+    if (fn->module == NULL) return;
+    if (fn->module->version != fn->jitFuncModuleVersion) return;
+    if (vm.stack == NULL) return;
+    /* jitResultOut has to be able to answer for whatever comes back; a kind it
+     * would decline is not worth preparing, since every element would fall
+     * through to jaiCallFn1 anyway. */
+    switch ((SlotKind)fn->jitReturnKind) {
+    case SLOT_INT: case SLOT_FLOAT: case SLOT_INST: case SLOT_LIST:
+    case SLOT_OBJ: case SLOT_BOOL: case SLOT_NULL: case SLOT_MAYBE_INST:
+        break;
+    default:
+        return;
+    }
+
+    prepared->closure       = closure;
+    prepared->fn            = fn;
+    prepared->entry         = fn->jitFunc;
+    /* Fixed for the life of the VM: the stack is one allocation made at start
+     * up and freed at teardown, so the room test is a compare against a
+     * constant rather than two loads and an add. */
+    prepared->limit         = vm.stack + JAI_STACK_MAX - 3;
+    prepared->moduleVersion = fn->module->version;
+    prepared->nargs         = (uint8_t)nargs;
+    prepared->returnKind    = fn->jitReturnKind;
+    prepared->intArg        = (SlotKind)fn->jitParamKind[0] == SLOT_INT &&
+                              fn->jitArgBase == 1;
+    prepared->flat          = true;
+}
+
+/* This element the long way, and then another attempt to prepare. Two
+ * different states arrive here and both want the same treatment: the callee
+ * has not compiled YET (the ordinary state for the first sixty-four elements,
+ * since that is when the tier first looks at it), or the form prepared against
+ * has been retired under the loop. Out of line so the flat path's prologue
+ * stays as small as the body it is calling. */
+static JAI_NOINLINE bool preparedFn1Slow(JaiPreparedFn1 *p, Value arg,
+                                         Value *out) {
+    Value callee = p->callee;
+    bool ok = jaiCallFn1(callee, arg, out);
+    jaiPrepareFn1(callee, p);
+    return ok;
+}
+
+bool jaiCallPreparedFn1(JaiPreparedFn1 *p, Value arg, Value *out) {
+    ObjFunction *fn = p->fn;
+    /* The whole of the staleness check. `entry` is never NULL in a prepared
+     * struct, so a body that bailed -- jitResultOut sets jitFunc to NULL -- is
+     * caught by the same compare as a body recompiled under it. */
+    if (JAI_UNLIKELY(!p->flat || fn->jitFunc != p->entry ||
+                     fn->module->version != p->moduleVersion)) {
+        return preparedFn1Slow(p, arg, out);
+    }
+    Value *base = vm.stackTop;
+    if (JAI_UNLIKELY(base > p->limit)) {
+        return jaiCallFn1(p->callee, arg, out);
+    }
+
+    /* The two cells that keep the closure and the argument reachable while the
+     * compiled body runs; see jaiCallFn1, whose window this is. */
+    base[0] = p->callee;
+    base[1] = arg;
+    vm.stackTop = base + 2;
+
+    int64_t a0;
+    if (JAI_LIKELY(p->intArg)) {
+        if (JAI_UNLIKELY(!IS_INT(arg))) {
+            vm.stackTop = base;
+            return jaiCallFn1(p->callee, arg, out);
+        }
+        a0 = AS_INT(arg);
+    } else if (JAI_UNLIKELY(!jitArgIn(p->closure, base, 0, &a0))) {
+        vm.stackTop = base;
+        return jaiCallFn1(p->callee, arg, out);
+    }
+
+    int frameBase = vm.frameCount;
+    JitResult r =
+        p->nargs == 1
+            ? ((Fn1)(uintptr_t)p->entry)(a0)
+            : ((Fn2)(uintptr_t)p->entry)(a0, (int64_t)(uintptr_t)p->closure);
+
+    /* An int result needs no store into the window and no read back out of it:
+     * nothing between here and the caller's use of it can collect, and an int
+     * is not a root in any case. Every other kind goes the long way, which is
+     * where the tag and the bail verdicts are decided. */
+    if (JAI_LIKELY(r.bailed == 0 && p->returnKind == (uint8_t)SLOT_INT)) {
+        *out = INT_VAL(r.value);
+        vm.stackTop = base;
+        return true;
+    }
+
+    JaiJitOutcome outcome = jitResultOut(fn, r, base);
+    if (JAI_LIKELY(outcome == JAI_JIT_DONE)) {
+        *out = base[0];
+        vm.stackTop = base;
+        return true;
+    }
+    if (outcome == JAI_JIT_ERROR) {
+        vm.stackTop = base;
+        return false;
+    }
+    if (outcome == JAI_JIT_DEOPT) {
+        return jaiFinishJitDeopt1(p->closure, base, frameBase, out);
+    }
+    return callFn1Rerun(base, out);
+}
+
 #else
 
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
@@ -12257,6 +12815,13 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
 }
 bool jaiCallFn1(Value callee, Value arg, Value *out) {
     return jaiCallValue1(callee, arg, out);
+}
+void jaiPrepareFn1(Value callee, JaiPreparedFn1 *prepared) {
+    prepared->callee = callee;
+    prepared->flat   = false;
+}
+bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out) {
+    return jaiCallValue1(prepared->callee, arg, out);
 }
 
 #endif

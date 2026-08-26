@@ -114,7 +114,7 @@ static bool canvasCheckRectValues(const ObjList *pixels, int64_t bufferWidth,
     for (int64_t row = 0; row < height; row++) {
         int64_t base = (y + row) * bufferWidth + x;
         for (int64_t column = 0; column < width; column++) {
-            Value pixel = pixels->items[base + column];
+            Value pixel = jaiListGet(pixels, base + column);
             if (!IS_INT(pixel)) {
                 return jaiThrow(vm.cTypeError,
                                 "%s(): %s pixel %lld is %s, expected a packed "
@@ -128,7 +128,7 @@ static bool canvasCheckRectValues(const ObjList *pixels, int64_t bufferWidth,
 }
 
 static uint32_t canvasPixelAt(const ObjList *pixels, int64_t index) {
-    return (uint32_t)(uint64_t)AS_INT(pixels->items[index]);
+    return (uint32_t)(uint64_t)AS_INT(jaiListGet(pixels, index));
 }
 
 /* ------------------------------------------------------------------ */
@@ -147,7 +147,7 @@ static bool nCanvasFillSpan(int argc, Value *args, Value *out) {
     if (!canvasCheckSpan(pixels, offset, count, "canvas_fill_span")) return false;
 
     Value packed = INT_VAL((int64_t)color);
-    for (int64_t i = 0; i < count; i++) pixels->items[offset + i] = packed;
+    for (int64_t i = 0; i < count; i++) jaiListPut(pixels, offset + i, packed);
     if (count > 0) jaiListTouch(pixels);
 
     *out = NULL_VAL;
@@ -165,13 +165,13 @@ static bool nCanvasWriteSpan(int argc, Value *args, Value *out) {
         return false;
 
     for (int i = 0; i < source->count; i++) {
-        Value pixel = source->items[i];
+        Value pixel = jaiListGet(source, i);
         if (!IS_INT(pixel)) {
             return jaiThrow(vm.cTypeError,
                             "canvas_write_span(): source %d is %s, expected an int",
                             i, jaiTypeNameStatic(pixel));
         }
-        pixels->items[offset + i] = pixel;
+        jaiListPut(pixels, offset + i, pixel);
     }
     if (source->count > 0) jaiListTouch(pixels);
 
@@ -210,7 +210,7 @@ static bool nCanvasScanlines(int argc, Value *args, Value *out) {
     for (int64_t row = 0; row < height; row++) {
         uint8_t *line = raw + (size_t)row * stride;
         *line++ = 0;
-        const Value *source = pixels->items + (size_t)row * (size_t)width;
+        const Value *source = jaiListBox(pixels) + (size_t)row * (size_t)width;
         for (int64_t column = 0; column < width; column++) {
             Value pixel = source[column];
             if (!IS_INT(pixel)) {
@@ -276,8 +276,8 @@ static bool nCanvasFillConvex(int argc, Value *args, Value *out) {
     }
     double *ys = xs + corners;
     for (int i = 0; i < corners; i++) {
-        Value vx = points->items[i * 2];
-        Value vy = points->items[i * 2 + 1];
+        Value vx = jaiListGet(points, i * 2);
+        Value vy = jaiListGet(points, i * 2 + 1);
         if (!IS_FLOAT(vx) && !IS_INT(vx)) { goto bad_coordinate; }
         if (!IS_FLOAT(vy) && !IS_INT(vy)) { goto bad_coordinate; }
         xs[i] = IS_FLOAT(vx) ? AS_FLOAT(vx) : (double)AS_INT(vx);
@@ -351,7 +351,7 @@ static bool nCanvasFillConvex(int argc, Value *args, Value *out) {
         if (to > lastColumn) to = lastColumn;
         if (from > to) continue;
 
-        Value *line = pixels->items + (size_t)row * (size_t)width;
+        Value *line = jaiListBox(pixels) + (size_t)row * (size_t)width;
         for (int64_t column = from; column <= to; column++) {
             double coverage = 0.0;
             for (int i = 0; i < found; i++) {
@@ -404,7 +404,7 @@ static bool nCanvasBlendSpan(int argc, Value *args, Value *out) {
         return false;
 
     for (int i = 0; i < coverage->count; i++) {
-        Value weight = coverage->items[i];
+        Value weight = jaiListGet(coverage, i);
         if (!IS_INT(weight)) {
             return jaiThrow(vm.cTypeError,
                             "canvas_blend_span(): coverage %d is %s, expected an "
@@ -417,7 +417,7 @@ static bool nCanvasBlendSpan(int argc, Value *args, Value *out) {
                             "value between 0 and 255",
                             i, (long long)AS_INT(weight));
         }
-        Value pixel = pixels->items[offset + i];
+        Value pixel = jaiListGet(pixels, offset + i);
         if (!IS_INT(pixel)) {
             return jaiThrow(vm.cTypeError,
                             "canvas_blend_span(): pixel %lld is %s, expected a "
@@ -433,15 +433,15 @@ static bool nCanvasBlendSpan(int argc, Value *args, Value *out) {
     }
 
     for (int i = 0; i < coverage->count; i++) {
-        uint32_t weight = (uint32_t)AS_INT(coverage->items[i]);
+        uint32_t weight = (uint32_t)AS_INT(jaiListGet(coverage, i));
         if (weight == 0u) continue;
         /* Rounded, like every channel op here; exact at weight 255. */
         uint32_t scaled = (alpha * weight + 127u) / 255u;
         if (scaled == 0u) continue;
         uint32_t source = (color & 0x00FFFFFFu) | (scaled << 24);
         int64_t at = offset + i;
-        pixels->items[at] = INT_VAL((int64_t)canvasBlend(canvasPixelAt(pixels, at),
-                                                         source));
+        jaiListPut(pixels, at, INT_VAL((int64_t)canvasBlend(canvasPixelAt(pixels, at),
+                                                         source)));
     }
     jaiListTouch(pixels);
 
@@ -510,8 +510,8 @@ static bool nCanvasBlitScaled(int argc, Value *args, Value *out) {
             uint32_t source = canvasPixelAt(src, sourceBase + (column * sw) / dw);
             if ((source >> 24) == 0u) continue;
             int64_t at = targetBase + column;
-            dst->items[at] = INT_VAL((int64_t)canvasBlend(canvasPixelAt(dst, at),
-                                                          source));
+            jaiListPut(dst, at, INT_VAL((int64_t)canvasBlend(canvasPixelAt(dst, at),
+                                                          source)));
         }
     }
     jaiListTouch(dst);
@@ -579,7 +579,7 @@ static bool nCanvasDownsampleBox(int argc, Value *args, Value *out) {
                          (((greenSum + half) / alphaSum) << 8) |
                          ((blueSum + half) / alphaSum);
             }
-            dst->items[row * outWidth + column] = INT_VAL((int64_t)packed);
+            jaiListPut(dst, row * outWidth + column, INT_VAL((int64_t)packed));
         }
     }
     jaiListTouch(dst);

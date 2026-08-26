@@ -150,7 +150,7 @@ static bool errorTracebackString(int argc, Value *args, Value *out) {
         ObjList *frames = AS_LIST(tb);
         for (int i = 0; ok && i < frames->count; i++) {
             if (i > 0) jaiBufPush(&buf, '\n');
-            ok = appendText(&buf, frames->items[i]);
+            ok = appendText(&buf, jaiListGet(frames, i));
         }
     } else if (!IS_NULL(tb)) {
         ok = appendText(&buf, tb);

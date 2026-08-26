@@ -138,7 +138,8 @@ void jaiFreeObject(Obj *obj) {
     switch (obj->type) {
     case OBJ_LIST: {
         ObjList *l = (ObjList *)obj;
-        JAI_FREE_ARRAY(Value, l->items, l->capacity);
+        JAI_FREE_ARRAY(char, l->items,
+                       (size_t)l->capacity * jaiListStoreWidth(l->stg));
         JAI_FREE(ObjList, obj);
         return;
     }

@@ -201,7 +201,7 @@ static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
     ObjList *result = jaiListNew(n);
     jaiGCPushRoot(OBJ_VAL(result));
     if (n <= 1) {
-        for (int i = 0; i < n; i++) jaiListPush(result, items->items[i]);
+        for (int i = 0; i < n; i++) jaiListPush(result, jaiListGet(items, i));
         jaiGCPopRoot();
         return result;
     }
@@ -212,7 +212,7 @@ static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
 
     bool ok = jaiSeqSortIndices(keys, idx, scratch, n, reverse, fnName);
     if (ok) {
-        for (int i = 0; i < n; i++) jaiListPush(result, items->items[idx[i]]);
+        for (int i = 0; i < n; i++) jaiListPush(result, jaiListGet(items, idx[i]));
     }
 
     JAI_FREE_ARRAY(int, idx, n);
@@ -503,7 +503,7 @@ static bool extremum(int argc, Value *args, Value *out, bool wantMax) {
             return jaiThrow(vm.cValueError, "%s() argument is an empty sequence",
                             fnName);
         jaiGCPushRoot(OBJ_VAL(items));
-        best = items->items[0];
+        best = jaiListGet(items, 0);
         start = 1;
     } else {
         best = args[0];
@@ -513,7 +513,7 @@ static bool extremum(int argc, Value *args, Value *out, bool wantMax) {
     int count = items != NULL ? items->count : argc;
     bool ok = true;
     for (int i = start; i < count; i++) {
-        Value candidate = items != NULL ? items->items[i] : args[i];
+        Value candidate = items != NULL ? jaiListGet(items, i) : args[i];
         int order;
         if (!compareOrThrow(candidate, best, fnName, &order)) { ok = false; break; }
         if (wantMax ? order > 0 : order < 0) best = candidate;
@@ -538,7 +538,7 @@ static bool nSum(int argc, Value *args, Value *out) {
 
     bool ok = true;
     for (int i = 0; i < items->count; i++) {
-        Value item = items->items[i];
+        Value item = jaiListGet(items, i);
         if (!IS_NUMBER(item)) {
             ok = jaiBuiltinArgTypeError(1, "sum", "an iterable of int or float", item);
             break;
@@ -579,7 +579,7 @@ static bool nSorted(int argc, Value *args, Value *out) {
         jaiGCPushRoot(OBJ_VAL(keys));
         for (int i = 0; i < items->count; i++) {
             Value key;
-            Value arg = items->items[i];
+            Value arg = jaiListGet(items, i);
             if (!jaiCallFn1(keyFn, arg, &key)) { ok = false; break; }
             jaiGCPushRoot(key);
             jaiListPush(keys, key);
@@ -603,9 +603,9 @@ static bool nReversed(int argc, Value *args, Value *out) {
     ObjList *items = collectIterable(args[0]);
     if (items == NULL) return false;
     for (int i = 0, j = items->count - 1; i < j; i++, j--) {
-        Value tmp = items->items[i];
-        items->items[i] = items->items[j];
-        items->items[j] = tmp;
+        Value tmp = jaiListGet(items, i);
+        jaiListPut(items, i, jaiListGet(items, j));
+        jaiListPut(items, j, tmp);
     }
     *out = OBJ_VAL(items);
     return true;
@@ -625,7 +625,7 @@ static bool nEnumerate(int argc, Value *args, Value *out) {
     for (int i = 0; i < items->count; i++) {
         int64_t index;
         if (!jaiBuiltinAddI64(start, (int64_t)i, &index)) { ok = jaiBuiltinOverflowError("enumerate()"); break; }
-        Value pair[2] = {INT_VAL(index), items->items[i]};
+        Value pair[2] = {INT_VAL(index), jaiListGet(items, i)};
         Value tuple = OBJ_VAL(jaiTupleNew(pair, 2));
         jaiGCPushRoot(tuple);
         jaiListPush(result, tuple);
@@ -669,7 +669,7 @@ static bool nZip(int argc, Value *args, Value *out) {
     Value *slot = width > 0 ? JAI_ALLOC(Value, width) : NULL;
     for (int i = 0; i < shortest; i++) {
         for (int c = 0; c < width; c++)
-            slot[c] = AS_LIST(holder->items[c])->items[i];
+            slot[c] = jaiListGet(AS_LIST(jaiListGet(holder, c)), i);
         Value tuple = OBJ_VAL(jaiTupleNew(slot, width));
         jaiGCPushRoot(tuple);
         jaiListPush(result, tuple);
@@ -700,7 +700,7 @@ static bool nMap(int argc, Value *args, Value *out) {
     bool ok = true;
     for (int i = 0; i < shortest; i++) {
         for (int c = 0; c < width; c++)
-            callArgs[c] = AS_LIST(holder->items[c])->items[i];
+            callArgs[c] = jaiListGet(AS_LIST(jaiListGet(holder, c)), i);
         Value mapped;
         if (!jaiCallValue(fn, width, callArgs, &mapped)) { ok = false; break; }
         jaiGCPushRoot(mapped);
@@ -730,7 +730,7 @@ static bool nFilter(int argc, Value *args, Value *out) {
 
     bool ok = true;
     for (int i = 0; i < items->count; i++) {
-        Value item = items->items[i];
+        Value item = jaiListGet(items, i);
         Value verdict;
         if (!jaiCallFn1(fn, item, &verdict)) { ok = false; break; }
         if (!IS_BOOL(verdict)) {
@@ -835,7 +835,8 @@ bool jaiBuiltinMatchesType(Value v, Value t, bool *matched) {
     }
     if (IS_LIST(t) || IS_TUPLE(t)) {
         int count = IS_LIST(t) ? AS_LIST(t)->count : (int)AS_TUPLE(t)->count;
-        const Value *entries = IS_LIST(t) ? AS_LIST(t)->items : AS_TUPLE(t)->items;
+        const Value *entries = IS_LIST(t) ? jaiListBox(AS_LIST(t))
+                                          : AS_TUPLE(t)->items;
         for (int i = 0; i < count; i++) {
             if (!jaiBuiltinMatchesType(v, entries[i], matched)) return false;
             if (*matched) return true;
@@ -942,10 +943,10 @@ static bool nDir(int argc, Value *args, Value *out) {
     ObjList *unique = jaiListNew(sorted->count);
     jaiGCPushRoot(OBJ_VAL(unique));
     for (int i = 0; i < sorted->count; i++) {
-        if (i > 0 && IS_STRING(sorted->items[i]) && IS_STRING(sorted->items[i - 1]) &&
-            jaiStringEquals(AS_STRING(sorted->items[i]), AS_STRING(sorted->items[i - 1])))
+        if (i > 0 && IS_STRING(jaiListGet(sorted, i)) && IS_STRING(jaiListGet(sorted, i - 1)) &&
+            jaiStringEquals(AS_STRING(jaiListGet(sorted, i)), AS_STRING(jaiListGet(sorted, i - 1))))
             continue;
-        jaiListPush(unique, sorted->items[i]);
+        jaiListPush(unique, jaiListGet(sorted, i));
     }
     jaiGCPopRoots(2);
 
@@ -1024,7 +1025,7 @@ static bool nTupleConv(int argc, Value *args, Value *out) {
     ObjList *items = collectIterable(args[0]);
     if (items == NULL) return false;
     jaiGCPushRoot(OBJ_VAL(items));
-    ObjTuple *tuple = jaiTupleNew(items->items, items->count);
+    ObjTuple *tuple = jaiTupleNew(jaiListBox(items), items->count);
     jaiGCPopRoot();
     *out = OBJ_VAL(tuple);
     return true;
@@ -1043,8 +1044,8 @@ static bool nSetConv(int argc, Value *args, Value *out) {
 
     bool ok = true;
     for (int i = 0; i < items->count; i++) {
-        if (!requireHashable(items->items[i], "set")) { ok = false; break; }
-        (void)jaiSetAdd(set, items->items[i]);
+        if (!requireHashable(jaiListGet(items, i), "set")) { ok = false; break; }
+        (void)jaiSetAdd(set, jaiListGet(items, i));
     }
     jaiGCPopRoots(2);
     if (!ok) return false;
@@ -1054,14 +1055,14 @@ static bool nSetConv(int argc, Value *args, Value *out) {
 
 static bool dictFromPairs(ObjDict *dict, ObjList *pairs) {
     for (int i = 0; i < pairs->count; i++) {
-        Value entry = pairs->items[i];
+        Value entry = jaiListGet(pairs, i);
         Value key, value;
         if (IS_TUPLE(entry) && AS_TUPLE(entry)->count == 2) {
             key = AS_TUPLE(entry)->items[0];
             value = AS_TUPLE(entry)->items[1];
         } else if (IS_LIST(entry) && AS_LIST(entry)->count == 2) {
-            key = AS_LIST(entry)->items[0];
-            value = AS_LIST(entry)->items[1];
+            key = jaiListGet(AS_LIST(entry), 0);
+            value = jaiListGet(AS_LIST(entry), 1);
         } else {
             return jaiThrow(vm.cValueError,
                             "dict() expects (key, value) pairs, got %s at index %d",
@@ -1131,7 +1132,7 @@ static bool nBytesConv(int argc, Value *args, Value *out) {
 
     bool ok = true;
     for (int i = 0; i < items->count; i++) {
-        Value item = items->items[i];
+        Value item = jaiListGet(items, i);
         if (!IS_INT(item)) {
             ok = jaiThrow(vm.cTypeError, "bytes(): expected int elements, got %s",
                           jaiTypeNameStatic(item));

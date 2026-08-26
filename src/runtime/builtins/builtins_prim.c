@@ -451,11 +451,11 @@ static bool nPrimTraceRecordOp(int argc, Value *args, Value *out) {
         shape_len = (int)list->count;
         if (shape_len > 4) shape_len = 4;
         for (int i = 0; i < shape_len; i++) {
-            if (!IS_INT(list->items[i])) {
+            if (!IS_INT(jaiListGet(list, i))) {
                 return jaiThrow(vm.cTypeError,
                                 "trace_record_op(): shape entries must be int");
             }
-            shape[i] = (int)AS_INT(list->items[i]);
+            shape[i] = (int)AS_INT(jaiListGet(list, i));
         }
     }
     *out = BOOL_VAL(jaiTraceRecordOp(name->chars, shape, shape_len));

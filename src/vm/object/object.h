@@ -159,12 +159,52 @@ struct ObjBytes {
 ObjBytes *jaiBytesNew(const uint8_t *data, size_t length);
 
 /* ------------------------------------------------------------------ */
-/* List — growable Value array                                          */
+/* List — growable element array, boxed or not                          */
 /* ------------------------------------------------------------------ */
+
+/* How the backing array is laid out. A Value is sixteen bytes of {tag,
+ * payload}, so a boxed `list[float]` spends half its cache lines on a tag that
+ * `list[float]` already proved, loads and compares that tag once per element,
+ * re-stamps it on every store, and addresses the array with `lsl #4`. The
+ * declared element kind is a promise the mutation guards already enforce on
+ * every entry point (jaiListPush, indexSet, jaiListInsert), so for the three
+ * scalar kinds the tag carries no information at all and the payload can be
+ * stored bare: eight bytes for an int or a float, one for a bool.
+ *
+ * BOXED is zero so that a list nobody typed -- and any list that has been
+ * handed out as a `Value *` -- is the representation it always was. */
+typedef enum {
+    LIST_STORE_BOXED = 0,   /* Value[]   */
+    LIST_STORE_I64   = 1,   /* int64_t[] */
+    LIST_STORE_F64   = 2,   /* double[]  */
+    LIST_STORE_U8    = 3,   /* uint8_t[], one byte per bool -- see jaiListStoreWidth */
+} ListStore;
+
+/* Not a storage: what JaiOsrForm records for a list slot whose storage the
+ * compile did not pin, so the entry guard has nothing to prove about it. */
+#define LIST_STG_ANY 0x0Fu
+
+/* Bytes per element. A byte per bool rather than a bit: a bit needs a shift, a
+ * mask and a read-modify-write per store, and the sieve was measured at 7.2 ms
+ * over a byte array against 36 ms over std::vector<bool>. */
+JAI_INLINE size_t jaiListStoreWidth(uint8_t stg) {
+    switch ((ListStore)stg) {
+    case LIST_STORE_I64: return sizeof(int64_t);
+    case LIST_STORE_F64: return sizeof(double);
+    case LIST_STORE_U8:  return 1;
+    case LIST_STORE_BOXED: break;
+    }
+    return sizeof(Value);
+}
 
 struct ObjList {
     Obj      obj;
-    Value   *items;
+    /* Value[], int64_t[], double[] or uint8_t[] as `stg` says. Untyped, so
+     * that every one of the two hundred sites that used to walk it as a
+     * `Value *` had to be looked at rather than silently reading a double as a
+     * tag -- jaiListBox is the escape hatch for the ones that still want the
+     * boxed array, and it de-specialises the list to give them one. */
+    void    *items;
     int      count;
     int      capacity;
     uint32_t version;   /* bumped on every mutation; iterators snapshot it */
@@ -177,7 +217,91 @@ struct ObjList {
      * Lands in the struct's existing tail padding, so a list costs no more
      * than it did. */
     uint8_t  elemKind;
+    /* A ListStore. Set once, from elemKind, while the list is still empty, and
+     * only ever changed in the one direction -- back to BOXED, by jaiListBox.
+     * The tier reads it and deoptimises on anything but the storage its guards
+     * were emitted for, so a de-specialisation cannot be missed. */
+    uint8_t  stg;
 };
+
+/* Boxes element `i`. No bounds check: every caller has already normalised. */
+JAI_INLINE Value jaiListGet(const ObjList *l, int i) {
+    switch ((ListStore)l->stg) {
+    case LIST_STORE_I64: return INT_VAL(((const int64_t *)l->items)[i]);
+    case LIST_STORE_F64: return FLOAT_VAL(((const double *)l->items)[i]);
+    case LIST_STORE_U8:  return BOOL_VAL(((const uint8_t *)l->items)[i] != 0);
+    case LIST_STORE_BOXED: break;
+    }
+    return ((const Value *)l->items)[i];
+}
+
+/* Whether `v` can be stored as it is, without the store changing what the
+ * program reads back.
+ *
+ * jaiCheckKind is not this question. FIELD_KIND_FLOAT accepts an int, so
+ * `let fs: list[float] = []` followed by `fs.push(3)` passes it -- but an F64
+ * store would widen that 3 to a 3.0 and `print(fs)` would say `[3.0]` where
+ * every other tier says `[3]`. tests/golden/container_elem_kind pins exactly
+ * that line, and a storage choice is not allowed to move it: the list
+ * de-specialises instead, which costs the unboxing for a float list that is
+ * handed an int and costs nothing at all for one that is not. */
+JAI_INLINE bool jaiListStoreAccepts(const ObjList *l, Value v) {
+    switch ((ListStore)l->stg) {
+    case LIST_STORE_I64: return IS_INT(v);
+    case LIST_STORE_F64: return IS_FLOAT(v);
+    case LIST_STORE_U8:  return IS_BOOL(v);
+    case LIST_STORE_BOXED: break;
+    }
+    return true;
+}
+
+/* Unboxes `v` into element `i`. The caller must already have run the value past
+ * jaiListStoreAccepts, which is what proves it fits the store. */
+JAI_INLINE void jaiListSetRaw(ObjList *l, int i, Value v) {
+    switch ((ListStore)l->stg) {
+    case LIST_STORE_I64: ((int64_t *)l->items)[i] = AS_INT(v);      return;
+    case LIST_STORE_F64: ((double  *)l->items)[i] = jaiAsDouble(v); return;
+    case LIST_STORE_U8:  ((uint8_t *)l->items)[i] = AS_BOOL(v);     return;
+    case LIST_STORE_BOXED: break;
+    }
+    ((Value *)l->items)[i] = v;
+}
+
+/* The boxed array, de-specialising the list if it is not already boxed.
+ *
+ * Every consumer that wants to memcpy the elements, hand them to qsort, or
+ * walk them as Values comes through here. The de-specialisation is permanent
+ * and deliberate: the pointer outlives the call, and a list that went back to
+ * boxed cannot surprise anything holding one. Returns NULL only when the list
+ * is empty and has never been reserved. */
+Value   *jaiListBox(ObjList *list);
+/* Chooses the storage a `list[T]` annotation asks for, on a list that is still
+ * empty. Anything else -- an unannotated list, a list of strings, a list that
+ * already holds something -- stays boxed. */
+void     jaiListSpecialise(ObjList *list, uint8_t elemKind);
+/* Whether jaiListSpecialise will do anything. The tier asks before emitting
+ * the storage store an empty list literal gets. */
+bool     jaiListUnboxOn(void);
+
+/* An in-place store from runtime code that has NOT run the value past
+ * jaiCheckKind -- a reverse, a sort, a fill. It cannot throw, so a value the
+ * store cannot hold de-specialises the list rather than refusing it: a
+ * `list[int]` reached through `any` and written a string is a diagnostic the
+ * interpreter's own path raises, and this one must not lose the value on the
+ * way. The caller still owes jaiListTouch. */
+JAI_INLINE void jaiListPut(ObjList *l, int i, Value v) {
+    switch ((ListStore)l->stg) {
+    case LIST_STORE_I64: if (!IS_INT(v))    break; goto raw;
+    case LIST_STORE_F64: if (!IS_FLOAT(v))  break; goto raw;
+    case LIST_STORE_U8:  if (!IS_BOOL(v))   break; goto raw;
+    case LIST_STORE_BOXED: ((Value *)l->items)[i] = v; return;
+    }
+    jaiListBox(l);
+    ((Value *)l->items)[i] = v;
+    return;
+raw:
+    jaiListSetRaw(l, i, v);
+}
 
 ObjList *jaiListNew(int initialCapacity);
 void     jaiListPush(ObjList *list, Value v);
@@ -307,7 +431,16 @@ typedef struct {
      * must never be entered with the other: the prologue reads a different
      * object out of ObjIter.source for each. */
     uint8_t   iterKind;
-    uint8_t   kinds[40];   /* what each slot must hold on entry */
+    /* What each slot must hold on entry: a SlotKind in the low four bits, and
+     * for a list slot the ListStore it must be backed by in the two above. A
+     * list's storage is as much a compile-time commitment as an instance's
+     * class -- the element loads are emitted at one width -- and checking it
+     * here rather than at every subscript is what keeps the boxed case as
+     * cheap as it was. */
+    uint8_t   kinds[40];
+    /* For iterKind 2: the ListStore of the list the head iterator walks,
+     * checked the same way and for the same reason. */
+    uint8_t   iterStg;
 
     /* Which CLASS an instance slot held, not merely that it held an instance.
      *

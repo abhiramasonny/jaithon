@@ -63,7 +63,7 @@ static inline uint64_t sortableBits(double d, bool reverse) {
 static bool numericBits(ObjList *keys, const int *idx, int n, bool reverse,
                         SortPair *into) {
     for (int i = 0; i < n; i++) {
-        Value key = keys->items[idx[i]];
+        Value key = jaiListGet(keys, idx[i]);
         double d;
         if (IS_FLOAT(key)) {
             d = AS_FLOAT(key);
@@ -137,7 +137,7 @@ static bool mergeGeneral(ObjList *keys, int **src, int **dst, int n,
             int a = lo, b = mid, k = lo;
             while (a < mid && b < hi) {
                 int order;
-                if (!sortCompare(keys->items[from[b]], keys->items[from[a]],
+                if (!sortCompare(jaiListGet(keys, from[b]), jaiListGet(keys, from[a]),
                                  fnName, &order))
                     return false;
                 if (reverse) order = -order;
@@ -162,7 +162,7 @@ bool jaiSeqSortIndices(ObjList *keys, int *idx, int *scratch, int n,
      * chance, which spares a list of strings an allocation it cannot use. */
     bool ok = true;
     bool sorted = false;
-    if (n >= SORT_RADIX_FLOOR && (IS_INT(keys->items[0]) || IS_FLOAT(keys->items[0]))) {
+    if (n >= SORT_RADIX_FLOOR && (IS_INT(jaiListGet(keys, 0)) || IS_FLOAT(jaiListGet(keys, 0)))) {
         SortPair *pairs = JAI_ALLOC(SortPair, 2 * n);
         if (numericBits(keys, idx, n, reverse, pairs)) {
             const SortPair *ranked = radixPairs(pairs, pairs + n, n);

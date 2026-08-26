@@ -109,7 +109,7 @@ static bool readSurface(Value *args, int first, const char *fnName, JaiSurface *
     s->cols = cols;
     s->rows = rows;
     for (int c = 0; c < s->cn; c++) {
-        Value v = colour->items[c];
+        Value v = jaiListGet(colour, c);
         if (!IS_FLOAT(v) && !IS_INT(v)) {
             return jaiThrow(vm.cTypeError, "%s(): the colour holds a non-number", fnName);
         }
@@ -119,7 +119,7 @@ static bool readSurface(Value *args, int first, const char *fnName, JaiSurface *
 
     if (IS_LIST(args[first])) {
         ObjList *values = AS_LIST(args[first]);
-        s->boxed = values->items;
+        s->boxed = jaiListBox(values);
         s->capacity = values->count;
         values->version++;
         return true;
@@ -336,7 +336,7 @@ static bool primDrawLines(int argc, Value *args, Value *out) {
     for (int i = 0; i < segments; i++) {
         int64_t at[4];
         for (int k = 0; k < 4; k++) {
-            Value v = ends->items[i * 4 + k];
+            Value v = jaiListGet(ends, i * 4 + k);
             if (!IS_INT(v)) {
                 return jaiThrow(vm.cTypeError,
                                 "draw_lines(): segment %d holds a non-integer", i);
@@ -470,8 +470,8 @@ static bool primFillConvex(int argc, Value *args, Value *out) {
     int64_t xs[JAI_MAX_CORNERS];
     int64_t ys[JAI_MAX_CORNERS];
     for (int i = 0; i < count; i++) {
-        Value vx = flat->items[i * 2];
-        Value vy = flat->items[i * 2 + 1];
+        Value vx = jaiListGet(flat, i * 2);
+        Value vy = jaiListGet(flat, i * 2 + 1);
         if (!IS_INT(vx) || !IS_INT(vy)) {
             return jaiThrow(vm.cTypeError,
                             "fill_convex(): a corner is not a pair of integers");

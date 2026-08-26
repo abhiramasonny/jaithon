@@ -50,7 +50,7 @@ static ObjList *setElements(ObjSet *s) {
     int slot = 0;
     Value k, v;
     while (jaiTableNext(&s->table, &slot, &k, &v) && out->count < out->capacity) {
-        out->items[out->count++] = k;
+        jaiListPut(out, out->count++, k);
     }
     jaiGCPopRoots(2);
     return out;
@@ -71,11 +71,11 @@ static bool operandSet(Value v, const char *fnName, ObjSet **out) {
 
     bool ok = true;
     for (int i = 0; i < items->count; i++) {
-        if (!jaiSeqHashableKey(items->items[i], fnName, "set element")) {
+        if (!jaiSeqHashableKey(jaiListGet(items, i), fnName, "set element")) {
             ok = false;
             break;
         }
-        (void)jaiSetAdd(s, items->items[i]);
+        (void)jaiSetAdd(s, jaiListGet(items, i));
         if (vm.hasException) {
             ok = false;
             break;
@@ -285,7 +285,7 @@ static bool dictMapValues(int argc, Value *args, Value *out) {
 
     bool ok = true;
     for (int i = 0; i < entries->count; i++) {
-        ObjTuple *pair = AS_TUPLE(entries->items[i]);
+        ObjTuple *pair = AS_TUPLE(jaiListGet(entries, i));
         Value arg = pair->items[1], mapped;
         if (!jaiCallFn1(args[1], arg, &mapped)) {
             ok = false;
@@ -319,7 +319,7 @@ static bool dictFilter(int argc, Value *args, Value *out) {
 
     bool ok = true;
     for (int i = 0; i < entries->count; i++) {
-        ObjTuple *pair = AS_TUPLE(entries->items[i]);
+        ObjTuple *pair = AS_TUPLE(jaiListGet(entries, i));
         Value callArgs[2] = {pair->items[0], pair->items[1]};
         Value verdict;
         if (!jaiCallValue(args[1], 2, callArgs, &verdict)) {
@@ -433,11 +433,11 @@ static bool setCombine(int argc, Value *args, Value *out, SetOp op,
         ObjList *mine = setElements(self);
         jaiGCPushRoot(OBJ_VAL(mine));
         for (int i = 0; i < mine->count; i++) {
-            bool inOther = jaiSetHas(other, mine->items[i]);
+            bool inOther = jaiSetHas(other, jaiListGet(mine, i));
             if (vm.hasException) { ok = false; break; }
             bool keep = (op == SET_INTERSECTION) ? inOther : !inOther;
             if (!keep) continue;
-            (void)jaiSetAdd(result, mine->items[i]);
+            (void)jaiSetAdd(result, jaiListGet(mine, i));
             if (vm.hasException) { ok = false; break; }
         }
         jaiGCPopRoot();
@@ -446,10 +446,10 @@ static bool setCombine(int argc, Value *args, Value *out, SetOp op,
             ObjList *theirs = setElements(other);
             jaiGCPushRoot(OBJ_VAL(theirs));
             for (int i = 0; i < theirs->count; i++) {
-                bool inMine = jaiSetHas(self, theirs->items[i]);
+                bool inMine = jaiSetHas(self, jaiListGet(theirs, i));
                 if (vm.hasException) { ok = false; break; }
                 if (inMine) continue;
-                (void)jaiSetAdd(result, theirs->items[i]);
+                (void)jaiSetAdd(result, jaiListGet(theirs, i));
                 if (vm.hasException) { ok = false; break; }
             }
             jaiGCPopRoot();
@@ -495,7 +495,7 @@ static bool setContainment(int argc, Value *args, Value *out, bool wantSuper,
     bool result = true;
     bool ok = true;
     for (int i = 0; i < items->count; i++) {
-        bool present = jaiSetHas(tested, items->items[i]);
+        bool present = jaiSetHas(tested, jaiListGet(items, i));
         if (vm.hasException) { ok = false; break; }
         if (!present) { result = false; break; }
     }

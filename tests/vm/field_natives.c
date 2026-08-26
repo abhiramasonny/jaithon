@@ -131,7 +131,7 @@ static bool buildReceiver(ObjType type, int n, Value *out,
     case OBJ_LIST: {
         /* Capacity deliberately past the count. */
         ObjList *l = jaiListNew(n + 3);
-        for (int i = 0; i < n; i++) l->items[i] = INT_VAL(1000 + i);
+        for (int i = 0; i < n; i++) jaiListSetRaw(l, i, INT_VAL(1000 + i));
         l->count = n;
         *out = OBJ_VAL(l);
         *headerBytes = sizeof(ObjList);

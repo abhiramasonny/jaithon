@@ -65,9 +65,15 @@ static bool compareOrThrow(Value a, Value b, const char *fnName, int *out) {
                     jaiTypeNameStatic(a), jaiTypeNameStatic(b));
 }
 
-static bool callPredicate(Value pred, Value item, const char *fnName, bool *out) {
+/* Every higher-order method here drives ONE callee over a whole list, so what
+ * jaiCallFn1 asks about that callee is asked once, before the loop, and the
+ * loop calls jaiCallPreparedFn1 -- see JaiPreparedFn1 in vm.h for what that
+ * lifts out. A callee with nothing to hoist (a native, or a lambda the tier
+ * has not looked at yet) leaves the loop exactly as it was. */
+static bool callPredicate(JaiPreparedFn1 *pred, Value item, const char *fnName,
+                          bool *out) {
     Value arg = item, verdict;
-    if (!jaiCallFn1(pred, arg, &verdict)) return false;
+    if (!jaiCallPreparedFn1(pred, arg, &verdict)) return false;
     if (!IS_BOOL(verdict)) {
         return jaiThrow(vm.cTypeError,
                         "%s(): the predicate must return bool, not %s", fnName,
@@ -86,7 +92,7 @@ static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
     ObjList *items = jaiListNew(source->count);
     jaiGCPushRoot(OBJ_VAL(items));
     for (int i = 0; i < source->count && items->count < items->capacity; i++) {
-        items->items[items->count++] = source->items[i];
+        jaiListPut(items, items->count++, jaiListGet(source, i));
     }
 
     if (IS_NULL(keyFn)) {
@@ -98,9 +104,11 @@ static bool snapshotAndKeys(ObjList *source, Value keyFn, ObjList **outItems,
 
     ObjList *keys = jaiListNew(items->count);
     jaiGCPushRoot(OBJ_VAL(keys));
+    JaiPreparedFn1 key1;
+    jaiPrepareFn1(keyFn, &key1);
     for (int i = 0; i < items->count; i++) {
-        Value arg = items->items[i], key;
-        if (!jaiCallFn1(keyFn, arg, &key)) {
+        Value arg = jaiListGet(items, i), key;
+        if (!jaiCallPreparedFn1(&key1, arg, &key)) {
             jaiGCPopRoots(2);
             return false;
         }
@@ -119,7 +127,8 @@ static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
     ObjList *result = jaiListNew(n);
     jaiGCPushRoot(OBJ_VAL(result));
     if (n <= 1) {
-        for (int i = 0; i < n; i++) result->items[result->count++] = items->items[i];
+        for (int i = 0; i < n; i++)
+            jaiListPut(result, result->count++, jaiListGet(items, i));
         jaiGCPopRoot();
         return result;
     }
@@ -130,7 +139,8 @@ static ObjList *sortedCopy(ObjList *items, ObjList *keys, bool reverse,
 
     bool ok = jaiSeqSortIndices(keys, idx, scratch, n, reverse, fnName);
     if (ok) {
-        for (int i = 0; i < n; i++) result->items[result->count++] = items->items[idx[i]];
+        for (int i = 0; i < n; i++)
+            jaiListPut(result, result->count++, jaiListGet(items, idx[i]));
     }
 
     JAI_FREE_ARRAY(int, idx, n);
@@ -281,7 +291,7 @@ static bool listRemove(int argc, Value *args, Value *out) {
 
     for (int i = 0; i < self->count; i++) {
         bool same;
-        if (!jaiSeqEqualsChecked(self->items[i], args[1], &same)) return false;
+        if (!jaiSeqEqualsChecked(jaiListGet(self, i), args[1], &same)) return false;
         if (!same) continue;
         (void)jaiListRemove(self, i);
         if (vm.hasException) return false;
@@ -321,7 +331,7 @@ static bool listExtend(int argc, Value *args, Value *out) {
     jaiGCPushRoot(OBJ_VAL(items));
     int64_t needed = (int64_t)self->count + items->count;
     if (needed <= INT32_MAX) jaiListReserve(self, (int)needed);
-    for (int i = 0; i < items->count; i++) jaiListPush(self, items->items[i]);
+    for (int i = 0; i < items->count; i++) jaiListPush(self, jaiListGet(items, i));
     jaiGCPopRoot();
     if (vm.hasException) return false;
     *out = args[0];
@@ -340,7 +350,7 @@ static bool listIndex(int argc, Value *args, Value *out) {
 
     for (int64_t i = from; i < (int64_t)self->count; i++) {
         bool same;
-        if (!jaiSeqEqualsChecked(self->items[i], args[1], &same)) return false;
+        if (!jaiSeqEqualsChecked(jaiListGet(self, i), args[1], &same)) return false;
         if (same) {
             *out = INT_VAL(i);
             return true;
@@ -357,7 +367,7 @@ static bool listCount(int argc, Value *args, Value *out) {
     int64_t total = 0;
     for (int i = 0; i < self->count; i++) {
         bool same;
-        if (!jaiSeqEqualsChecked(self->items[i], args[1], &same)) return false;
+        if (!jaiSeqEqualsChecked(jaiListGet(self, i), args[1], &same)) return false;
         if (same) total++;
     }
     *out = INT_VAL(total);
@@ -371,7 +381,7 @@ static bool listContains(int argc, Value *args, Value *out) {
 
     for (int i = 0; i < self->count; i++) {
         bool same;
-        if (!jaiSeqEqualsChecked(self->items[i], args[1], &same)) return false;
+        if (!jaiSeqEqualsChecked(jaiListGet(self, i), args[1], &same)) return false;
         if (same) {
             *out = BOOL_VAL(true);
             return true;
@@ -386,9 +396,9 @@ static bool listReverse(int argc, Value *args, Value *out) {
     ObjList *self;
     if (!selfList(args, "list.reverse", &self)) return false;
     for (int i = 0, j = self->count - 1; i < j; i++, j--) {
-        Value tmp = self->items[i];
-        self->items[i] = self->items[j];
-        self->items[j] = tmp;
+        Value tmp = jaiListGet(self, i);
+        jaiListPut(self, i, jaiListGet(self, j));
+        jaiListPut(self, j, tmp);
     }
     if (self->count > 1) jaiListTouch(self);
     *out = args[0];
@@ -401,7 +411,8 @@ static bool listReversed(int argc, Value *args, Value *out) {
     if (!selfList(args, "list.reversed", &self)) return false;
 
     ObjList *result = jaiListNew(self->count);
-    for (int i = self->count - 1; i >= 0; i--) result->items[result->count++] = self->items[i];
+    for (int i = self->count - 1; i >= 0; i--)
+        jaiListPut(result, result->count++, jaiListGet(self, i));
     *out = OBJ_VAL(result);
     return true;
 }
@@ -421,7 +432,7 @@ static bool listSort(int argc, Value *args, Value *out) {
         return jaiThrow(vm.cRuntimeError, "list.sort(): list changed size during the sort");
     }
     if (n > 0) {
-        memcpy(self->items, sorted->items, sizeof(Value) * (size_t)n);
+        for (int i = 0; i < n; i++) jaiListPut(self, i, jaiListGet(sorted, i));
         jaiListTouch(self);
     }
     *out = args[0];
@@ -469,7 +480,7 @@ static bool listCopy(int argc, Value *args, Value *out) {
 
     ObjList *result = jaiListNew(self->count);
     for (int i = 0; i < self->count && result->count < result->capacity; i++) {
-        result->items[result->count++] = self->items[i];
+        jaiListPut(result, result->count++, jaiListGet(self, i));
     }
     *out = OBJ_VAL(result);
     return true;
@@ -483,15 +494,17 @@ static bool listMap(int argc, Value *args, Value *out) {
 
     ObjList *result = jaiListNew(self->count);
     jaiGCPushRoot(OBJ_VAL(result));
+    JaiPreparedFn1 mapper;
+    jaiPrepareFn1(args[1], &mapper);
     bool ok = true;
     for (int i = 0; i < self->count; i++) {
-        Value arg = self->items[i], mapped;
-        if (!jaiCallFn1(args[1], arg, &mapped)) {
+        Value arg = jaiListGet(self, i), mapped;
+        if (!jaiCallPreparedFn1(&mapper, arg, &mapped)) {
             ok = false;
             break;
         }
         if (JAI_LIKELY(result->count < result->capacity)) {
-            result->items[result->count++] = mapped;
+            jaiListPut(result, result->count++, mapped);
             result->version++;
         } else {
             jaiGCPushRoot(mapped);
@@ -517,11 +530,13 @@ static bool listFilter(int argc, Value *args, Value *out) {
 
     ObjList *result = jaiListNew(0);
     jaiGCPushRoot(OBJ_VAL(result));
+    JaiPreparedFn1 keeper;
+    jaiPrepareFn1(args[1], &keeper);
     bool ok = true;
     for (int i = 0; i < self->count; i++) {
-        Value item = self->items[i];
+        Value item = jaiListGet(self, i);
         bool keep;
-        if (!callPredicate(args[1], item, "list.filter", &keep)) {
+        if (!callPredicate(&keeper, item, "list.filter", &keep)) {
             ok = false;
             break;
         }
@@ -555,14 +570,14 @@ static bool listReduce(int argc, Value *args, Value *out) {
             return jaiThrow(vm.cValueError,
                             "list.reduce(): empty list and no initial value");
         }
-        acc = self->items[0];
+        acc = jaiListGet(self, 0);
         start = 1;
     }
 
     jaiGCPushRoot(acc);
     bool ok = true;
     for (int i = start; i < self->count; i++) {
-        Value callArgs[2] = {acc, self->items[i]};
+        Value callArgs[2] = {acc, jaiListGet(self, i)};
         Value next;
         if (!jaiCallValue(combine, 2, callArgs, &next)) {
             ok = false;
@@ -584,9 +599,11 @@ static bool listForEach(int argc, Value *args, Value *out) {
     if (!selfList(args, "list.for_each", &self)) return false;
     if (!jaiArgCallable(args[1], 1, "list.for_each")) return false;
 
+    JaiPreparedFn1 each;
+    jaiPrepareFn1(args[1], &each);
     for (int i = 0; i < self->count; i++) {
-        Value arg = self->items[i], ignored;
-        if (!jaiCallFn1(args[1], arg, &ignored)) return false;
+        Value arg = jaiListGet(self, i), ignored;
+        if (!jaiCallPreparedFn1(&each, arg, &ignored)) return false;
     }
     *out = NULL_VAL;
     return true;
@@ -599,8 +616,10 @@ static bool listQuantify(int argc, Value *args, Value *out, bool wantAny) {
     Value pred;
     if (!optCallableArg(argc, args, 1, fnName, &pred)) return false;
 
+    JaiPreparedFn1 test;
+    jaiPrepareFn1(pred, &test);
     for (int i = 0; i < self->count; i++) {
-        Value item = self->items[i];
+        Value item = jaiListGet(self, i);
         bool verdict;
         if (IS_NULL(pred)) {
             if (!IS_BOOL(item)) {
@@ -609,7 +628,7 @@ static bool listQuantify(int argc, Value *args, Value *out, bool wantAny) {
                                 "bool, not %s", fnName, jaiTypeNameStatic(item));
             }
             verdict = AS_BOOL(item);
-        } else if (!callPredicate(pred, item, fnName, &verdict)) {
+        } else if (!callPredicate(&test, item, fnName, &verdict)) {
             return false;
         }
         if (verdict == wantAny) {
@@ -642,7 +661,7 @@ static bool listSum(int argc, Value *args, Value *out) {
     }
 
     for (int i = 0; i < self->count; i++) {
-        Value item = self->items[i];
+        Value item = jaiListGet(self, i);
         if (!IS_NUMBER(item)) {
             return jaiThrow(vm.cTypeError,
                             "list.sum(): element %d is %s, not a number", i,
@@ -683,14 +702,14 @@ static bool listExtremum(int argc, Value *args, Value *out, bool wantMax) {
     bool ok = true;
     for (int i = 1; i < items->count; i++) {
         int order;
-        if (!compareOrThrow(keys->items[i], keys->items[best], fnName, &order)) {
+        if (!compareOrThrow(jaiListGet(keys, i), jaiListGet(keys, best), fnName, &order)) {
             ok = false;
             break;
         }
         if (wantMax ? order > 0 : order < 0) best = i;
     }
 
-    Value result = ok ? items->items[best] : NULL_VAL;
+    Value result = ok ? jaiListGet(items, best) : NULL_VAL;
     jaiGCPopRoots(3);
     if (!ok) return false;
     *out = result;
@@ -710,7 +729,7 @@ static bool listEnd(int argc, Value *args, Value *out, bool wantLast) {
     ObjList *self;
     if (!selfList(args, fnName, &self)) return false;
     if (self->count > 0) {
-        *out = self->items[wantLast ? self->count - 1 : 0];
+        *out = jaiListGet(self, wantLast ? self->count - 1 : 0);
         return true;
     }
     if (argc >= 2) {
@@ -740,7 +759,7 @@ static bool listJoin(int argc, Value *args, Value *out) {
     jaiBufInit(&buf);
     for (int i = 0; i < self->count; i++) {
         if (i > 0 && sep != NULL) jaiBufAppend(&buf, sep->chars, sep->length);
-        Value item = self->items[i];
+        Value item = jaiListGet(self, i);
         if (IS_STRING(item)) {
             jaiBufAppend(&buf, AS_STRING(item)->chars, AS_STRING(item)->length);
             continue;
@@ -765,7 +784,7 @@ static bool listFlatten(int argc, Value *args, Value *out) {
     bool ok = true;
     for (int i = 0; i < self->count; i++) {
         Value iterVal;
-        if (!jaiGetIter(self->items[i], &iterVal) || !IS_ITER(iterVal)) {
+        if (!jaiGetIter(jaiListGet(self, i), &iterVal) || !IS_ITER(iterVal)) {
             ok = false;
             break;
         }
@@ -802,9 +821,9 @@ static bool listZip(int argc, Value *args, Value *out) {
     ObjList *result = jaiListNew(n);
     jaiGCPushRoot(OBJ_VAL(result));
     for (int i = 0; i < n; i++) {
-        Value pair[2] = {self->items[i], other->items[i]};
+        Value pair[2] = {jaiListGet(self, i), jaiListGet(other, i)};
         ObjTuple *tuple = jaiTupleNew(pair, 2);
-        result->items[result->count++] = OBJ_VAL(tuple);
+        jaiListPut(result, result->count++, OBJ_VAL(tuple));
     }
     jaiGCPopRoots(2);
     *out = OBJ_VAL(result);
@@ -827,9 +846,9 @@ static bool listEnumerate(int argc, Value *args, Value *out) {
             ok = jaiThrow(vm.cOverflowError, "integer overflow in list.enumerate()");
             break;
         }
-        Value pair[2] = {INT_VAL(index), self->items[i]};
+        Value pair[2] = {INT_VAL(index), jaiListGet(self, i)};
         ObjTuple *tuple = jaiTupleNew(pair, 2);
-        result->items[result->count++] = OBJ_VAL(tuple);
+        jaiListPut(result, result->count++, OBJ_VAL(tuple));
     }
     jaiGCPopRoot();
     if (!ok) return false;
@@ -855,7 +874,8 @@ static bool listChunk(int argc, Value *args, Value *out) {
     for (int i = 0; i < n; i += step) {
         int width = (n - i < step) ? n - i : step;
         ObjList *chunk = jaiListNew(width);
-        for (int k = 0; k < width; k++) chunk->items[chunk->count++] = self->items[i + k];
+        for (int k = 0; k < width; k++)
+            jaiListPut(chunk, chunk->count++, jaiListGet(self, i + k));
         jaiGCPushRoot(OBJ_VAL(chunk));
         jaiListPush(result, OBJ_VAL(chunk));
         jaiGCPopRoot();
@@ -886,7 +906,8 @@ static bool listWindow(int argc, Value *args, Value *out) {
     jaiGCPushRoot(OBJ_VAL(result));
     for (int i = 0; i < count; i++) {
         ObjList *window = jaiListNew(width);
-        for (int k = 0; k < width; k++) window->items[window->count++] = self->items[i + k];
+        for (int k = 0; k < width; k++)
+            jaiListPut(window, window->count++, jaiListGet(self, i + k));
         jaiGCPushRoot(OBJ_VAL(window));
         jaiListPush(result, OBJ_VAL(window));
         jaiGCPopRoot();
@@ -911,7 +932,7 @@ static bool listUnique(int argc, Value *args, Value *out) {
     bool sawNull = false;
     bool ok = true;
     for (int i = 0; i < self->count; i++) {
-        Value item = self->items[i];
+        Value item = jaiListGet(self, i);
         bool fresh;
         if (IS_NULL(item)) {
             fresh = !sawNull;
@@ -949,9 +970,9 @@ static bool listShuffle(int argc, Value *args, Value *out) {
 
     for (int i = self->count - 1; i > 0; i--) {
         int j = (int)shuffleBelow((uint64_t)i + 1);
-        Value tmp = self->items[i];
-        self->items[i] = self->items[j];
-        self->items[j] = tmp;
+        Value tmp = jaiListGet(self, i);
+        jaiListPut(self, i, jaiListGet(self, j));
+        jaiListPut(self, j, tmp);
     }
     if (self->count > 1) jaiListTouch(self);
     *out = args[0];
@@ -1039,7 +1060,7 @@ static bool primListGet(int argc, Value *args, Value *out) {
     if (!jaiArgList(args[0], 1, "list_get", &list)) return false;
     int at;
     if (!jaiSeqIndexArg(args[1], 2, "list_get", list->count, &at)) return false;
-    *out = list->items[at];
+    *out = jaiListGet(list, at);
     return true;
 }
 
@@ -1049,7 +1070,7 @@ static bool primListSet(int argc, Value *args, Value *out) {
     if (!jaiArgList(args[0], 1, "list_set", &list)) return false;
     int at;
     if (!jaiSeqIndexArg(args[1], 2, "list_set", list->count, &at)) return false;
-    list->items[at] = args[2];
+    jaiListPut(list, at, args[2]);
     jaiListTouch(list);
     *out = NULL_VAL;
     return true;

@@ -56,13 +56,13 @@ static bool argvFromList(ObjList *list, CStrVec *out) {
     out->items = JAI_ALLOC(const char *, (size_t)list->count + 1);
     out->count = list->count;
     for (int i = 0; i < list->count; i++) {
-        if (!IS_STRING(list->items[i])) {
+        if (!IS_STRING(jaiListGet(list, i))) {
             cstrVecFree(out);
             return jaiThrow(vm.cTypeError,
                             "os_spawn(): argument %d is '%s', not 'str'",
-                            i, jaiTypeNameStatic(list->items[i]));
+                            i, jaiTypeNameStatic(jaiListGet(list, i)));
         }
-        ObjString *s = AS_STRING(list->items[i]);
+        ObjString *s = AS_STRING(jaiListGet(list, i));
         if (!checkExecText(s, "an argument")) { cstrVecFree(out); return false; }
         out->items[i] = s->chars;
     }
@@ -101,7 +101,7 @@ static bool envFromDict(ObjDict *dict, EnvVec *out) {
 
     bool ok = true;
     for (int i = 0; i < items->count && ok; i++) {
-        ObjTuple *pair = IS_TUPLE(items->items[i]) ? AS_TUPLE(items->items[i]) : NULL;
+        ObjTuple *pair = IS_TUPLE(jaiListGet(items, i)) ? AS_TUPLE(jaiListGet(items, i)) : NULL;
         if (pair == NULL || pair->count != 2 ||
             !IS_STRING(pair->items[0]) || !IS_STRING(pair->items[1])) {
             ok = jaiThrow(vm.cTypeError,

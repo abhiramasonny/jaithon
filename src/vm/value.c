@@ -141,7 +141,7 @@ static bool dispatchEq(Value a, Value b, bool *result, bool *missing) {
 static bool listsEqual(ObjList *a, ObjList *b) {
     if (a->count != b->count) return false;
     for (int i = 0; i < a->count; i++) {
-        if (!jaiValuesEqual(a->items[i], b->items[i])) return false;
+        if (!jaiValuesEqual(jaiListGet(a, i), jaiListGet(b, i))) return false;
     }
     return true;
 }
@@ -951,7 +951,7 @@ static bool renderList(ValSink *s, ObjList *l, bool allowUser) {
 
     for (int i = 0; i < l->count; i++) {
         if (i > 0) sinkWrite(s, ", ", 2);
-        Value item = l->items[i];
+        Value item = jaiListGet(l, i);
         bool rooted = tempRoot(item);
         ok = renderValue(s, item, true, allowUser);
         tempUnroot(rooted);

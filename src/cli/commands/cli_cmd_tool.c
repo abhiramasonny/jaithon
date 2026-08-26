@@ -13,7 +13,7 @@ static inline void toolPush(ObjList *args, const char *text) {
     JAI_ASSERT(args->count < args->capacity,
                "tool argument list exceeded its reserved capacity");
 
-    args->items[args->count++] = OBJ_VAL(s);
+    jaiListPut(args, args->count++, OBJ_VAL(s));
     args->version++;
 }
 

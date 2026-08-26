@@ -271,7 +271,11 @@ static void blackenObject(Obj *obj) {
 
     case OBJ_LIST: {
         ObjList *list = (ObjList *)obj;
-        markValues(list->items, list->count);
+        /* An unboxed list holds ints, floats or bools and nothing the
+         * collector can reach through -- and its elements are not Values, so
+         * scanning them as Values would read a double's bits as a tag. */
+        if (list->stg == LIST_STORE_BOXED)
+            markValues((Value *)list->items, list->count);
         break;
     }
     case OBJ_DICT:

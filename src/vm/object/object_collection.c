@@ -31,6 +31,8 @@
 #include "vm/table.h"
 #include "vm/vm.h"
 
+#include <stdlib.h>
+
 /* ------------------------------------------------------------------ */
 /* Bytes                                                                */
 /* ------------------------------------------------------------------ */
@@ -75,9 +77,100 @@ ObjList *jaiListNew(int initialCapacity) {
 
 void jaiListReserve(ObjList *list, int capacity) {
     if (capacity <= list->capacity) return;
-    int oldCap = list->capacity;
-    list->items = JAI_GROW_ARRAY(Value, list->items, oldCap, capacity);
+    size_t w = jaiListStoreWidth(list->stg);
+    list->items = jaiRealloc(list->items, w * (size_t)list->capacity,
+                             w * (size_t)capacity);
     list->capacity = capacity;
+}
+
+/* Picks the storage `list[T]` asks for. Called from OP_ELEM_KIND, on the
+ * literal, the instant it is built -- so the usual case is an empty list and
+ * the whole job is dropping a reservation made in the wrong width. A literal
+ * with elements in it (`var xs: list[int] = [1, 2, 3]`) is converted instead,
+ * and refuses if any element does not fit: FIELD_KIND_FLOAT accepts an int as
+ * well as a float, so `[1, 2.5]` is a legal `list[float]` whose first element
+ * would widen -- which is fine -- but nothing else may be reinterpreted.
+ *
+ * An unmodelled kind (str, list, instance, or `any` re-stamped over a list
+ * that was already specialised) goes back to boxed rather than being ignored,
+ * so `stg` never disagrees with `elemKind` about what the list may hold. */
+/* An A/B switch, and the honest way to measure this: the machine runs several
+ * agents at once and a load average of four moves a benchmark by more than the
+ * change does, so before and after have to be the same binary minutes apart.
+ * JAITHON_LIST_UNBOX=0 leaves every list boxed -- the tier then emits its
+ * storage guards against BOXED and everything else is as it was. */
+static bool unboxEnabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_LIST_UNBOX");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+bool jaiListUnboxOn(void) { return unboxEnabled(); }
+
+void jaiListSpecialise(ObjList *list, uint8_t elemKind) {
+    uint8_t stg;
+    if (!unboxEnabled()) return;
+    switch ((FieldKind)elemKind) {
+    case FIELD_KIND_INT:   stg = LIST_STORE_I64; break;
+    case FIELD_KIND_FLOAT: stg = LIST_STORE_F64; break;
+    case FIELD_KIND_BOOL:  stg = LIST_STORE_U8;  break;
+    default:               stg = LIST_STORE_BOXED; break;
+    }
+    if (stg == list->stg) return;
+    if (stg == LIST_STORE_BOXED) { (void)jaiListBox(list); return; }
+
+    /* EMPTY LISTS ONLY, and the reason is agreement rather than difficulty.
+     *
+     * The compiled tier has its own OP_ELEM_KIND arm, and it cannot convert a
+     * list that already holds elements: the conversion reallocates, and a
+     * compiled frame's other live values are not rooted at that point. If the
+     * interpreter converted where the tier did not, the same literal would
+     * come out unboxed or boxed depending on which tier happened to be running
+     * -- and a loop form that pinned one storage is then DENIED ENTRY for
+     * every list built by the other. tests/bench's heat_2d plate is built by
+     * both, half its rows each way, and the stencil loop over it fell back to
+     * the interpreter: 2.5 BILLION interpreted instructions against 2.9
+     * million, a 765ms run turning into 8.5s.
+     *
+     * So neither tier converts, and `var xs: list[int] = [1, 2, 3]` stays
+     * boxed while `var xs: list[int] = []` does not. The empty case is the one
+     * that matters anyway: it is how this codebase builds every list it then
+     * pushes onto. */
+    if (list->count != 0) return;
+
+    /* Whatever was reserved was reserved at the old width. Nothing has been
+     * written into it, so dropping it costs an allocation the first push would
+     * have made anyway. */
+    if (list->capacity != 0) {
+        JAI_FREE_ARRAY(char, list->items,
+                       (size_t)list->capacity * jaiListStoreWidth(list->stg));
+        list->items = NULL;
+        list->capacity = 0;
+    }
+    list->stg = stg;
+}
+
+Value *jaiListBox(ObjList *list) {
+    if (list->stg == LIST_STORE_BOXED) return (Value *)list->items;
+
+    uint8_t was = list->stg;
+    int n = list->count, cap = list->capacity;
+    /* Read out of the old array before the new one is allocated: allocating
+     * can collect, and a half-converted list is not a shape the marker can
+     * read. The list itself is rooted for the same reason. */
+    jaiGCPushRoot(OBJ_VAL(list));
+    Value *boxed = cap > 0 ? JAI_GROW_ARRAY(Value, NULL, 0, cap) : NULL;
+    jaiGCPopRoot();
+
+    for (int i = 0; i < n; i++) boxed[i] = jaiListGet(list, i);
+
+    JAI_FREE_ARRAY(char, list->items, (size_t)cap * jaiListStoreWidth(was));
+    list->items = boxed;
+    list->stg = LIST_STORE_BOXED;
+    return boxed;
 }
 
 bool jaiListReserveExact(ObjList *list, int count) {
@@ -129,7 +222,8 @@ void jaiListPush(ObjList *list, Value v) {
         !listGrowFor(list, v))
         return;
 
-    list->items[list->count++] = v;
+    if (JAI_UNLIKELY(!jaiListStoreAccepts(list, v))) (void)jaiListBox(list);
+    jaiListSetRaw(list, list->count++, v);
     list->version++;
 }
 
@@ -139,7 +233,7 @@ Value jaiListPop(ObjList *list) {
         return NULL_VAL;
     }
     list->version++;
-    return list->items[--list->count];
+    return jaiListGet(list, --list->count);
 }
 
 void jaiListInsert(ObjList *list, int idx, Value v) {
@@ -157,11 +251,14 @@ void jaiListInsert(ObjList *list, int idx, Value v) {
         !listGrowFor(list, v))
         return;
 
+    if (JAI_UNLIKELY(!jaiListStoreAccepts(list, v))) (void)jaiListBox(list);
+    size_t w = jaiListStoreWidth(list->stg);
     if (idx < list->count) {
-        memmove(&list->items[idx + 1], &list->items[idx],
-                sizeof(Value) * (size_t)(list->count - idx));
+        char *base = (char *)list->items;
+        memmove(base + w * (size_t)(idx + 1), base + w * (size_t)idx,
+                w * (size_t)(list->count - idx));
     }
-    list->items[idx] = v;
+    jaiListSetRaw(list, idx, v);
     list->count++;
     list->version++;
 }
@@ -173,10 +270,12 @@ Value jaiListRemove(ObjList *list, int idx) {
                  list->count);
         return NULL_VAL;
     }
-    Value removed = list->items[at];
+    Value removed = jaiListGet(list, at);
     if (at + 1 < list->count) {
-        memmove(&list->items[at], &list->items[at + 1],
-                sizeof(Value) * (size_t)(list->count - at - 1));
+        size_t w = jaiListStoreWidth(list->stg);
+        char *base = (char *)list->items;
+        memmove(base + w * (size_t)at, base + w * (size_t)(at + 1),
+                w * (size_t)(list->count - at - 1));
     }
     list->count--;
     list->version++;
@@ -194,19 +293,34 @@ ObjList *jaiListSlice(ObjList *list, int64_t start,
         sliceCount((int64_t)list->count, &start, &stop, &step);
 
     jaiGCPushRoot(OBJ_VAL(list));
-    ObjList *out = jaiListNew((int)count);
+    ObjList *out = jaiListNew(0);
+    /* The slice of a typed list is a list of the same type, so it keeps the
+     * storage rather than boxing on the way out -- `xs[a:b]` inside a loop
+     * would otherwise be a de-specialisation the program never asked for.
+     * Set before reserving: the width has to be right first.
+     *
+     * From the SOURCE'S STORAGE, not from its elemKind. The two disagree
+     * whenever a list has been de-specialised -- jaiListBox leaves elemKind
+     * saying `int` on a list whose array is now Values -- and the copy below
+     * is a memcpy at the source's width into an array sized at the
+     * destination's. Deriving it from elemKind wrote sixteen bytes per element
+     * into an eight-byte-per-element block. */
+    out->elemKind = list->elemKind;
+    out->stg = list->stg;
+    jaiGCPushRoot(OBJ_VAL(out));
+    jaiListReserve(out, (int)count);
+    jaiGCPopRoot();
 
     if (count > 0) {
+        size_t w = jaiListStoreWidth(list->stg);
         if (step == 1) {
-            memcpy(out->items, list->items + start,
-                   sizeof(Value) * (size_t)count);
-            out->count = (int)count;
+            memcpy(out->items, (const char *)list->items + w * (size_t)start,
+                   w * (size_t)count);
         } else {
-            Value *dst = out->items;
             for (int64_t i = 0, idx = start; i < count; ++i, idx += step)
-                dst[i] = list->items[idx];
-            out->count = (int)count;
+                jaiListSetRaw(out, (int)i, jaiListGet(list, (int)idx));
         }
+        out->count = (int)count;
     }
 
     jaiGCPopRoot();
@@ -226,14 +340,33 @@ ObjList *jaiListConcat(ObjList *a, ObjList *b) {
 
     jaiGCPushRoot(OBJ_VAL(a));
     jaiGCPushRoot(OBJ_VAL(b));
-    ObjList *out = jaiListNew((int)total);
+    /* Two lists of the same storage concatenate into a third of that storage
+     * and copy as bytes; mixed or boxed operands go through the boxed array,
+     * which is what `jaiListBox` is for. */
+    uint8_t stg = a->stg == b->stg ? a->stg : LIST_STORE_BOXED;
+    if (stg == LIST_STORE_BOXED) {
+        /* Before `out` exists: boxing allocates, and a fresh list nothing has
+         * rooted yet would not survive the collection that allocation can
+         * trigger. */
+        (void)jaiListBox(a);
+        (void)jaiListBox(b);
+    }
+    ObjList *out = jaiListNew(0);
+    if (stg != LIST_STORE_BOXED) {
+        out->elemKind = a->elemKind;
+        out->stg = stg;
+    }
+    jaiGCPushRoot(OBJ_VAL(out));
+    jaiListReserve(out, (int)total);
+    jaiGCPopRoot();
 
+    size_t w = jaiListStoreWidth(stg);
     if (aCount != 0)
-        memcpy(out->items, a->items, sizeof(Value) * (size_t)aCount);
+        memcpy(out->items, a->items, w * (size_t)aCount);
 
     if (bCount != 0)
-        memcpy(out->items + aCount, b->items,
-               sizeof(Value) * (size_t)bCount);
+        memcpy((char *)out->items + w * (size_t)aCount, b->items,
+               w * (size_t)bCount);
 
     out->count = (int)total;
     jaiGCPopRoots(2);
@@ -339,7 +472,7 @@ static ObjList *dictColumn(ObjDict *d, bool wantValues) {
     Value key, value;
 
     while (jaiTableNext(&d->table, &slot, &key, &value))
-        out->items[count++] = wantValues ? value : key;
+        jaiListBox(out)[count++] = wantValues ? value : key;
 
     out->count = count;
     jaiGCPopRoots(2);
@@ -361,7 +494,7 @@ ObjList *jaiDictItems(ObjDict *d) {
     while (jaiTableNext(&d->table, &slot, &key, &value)) {
         Value pair[2] = {key, value};
         ObjTuple *tuple = jaiTupleNew(pair, 2);
-        out->items[count++] = OBJ_VAL(tuple);
+        jaiListBox(out)[count++] = OBJ_VAL(tuple);
         out->count = count;  /* tuple is reachable before the next allocation */
     }
 

@@ -131,7 +131,7 @@ static bool nOsArgv(int argc, Value *args, Value *out) {
                      IS_LIST(stored);
     if (published) {
         ObjList *source = AS_LIST(stored);
-        for (int i = 0; i < source->count; i++) jaiListPush(result, source->items[i]);
+        for (int i = 0; i < source->count; i++) jaiListPush(result, jaiListGet(source, i));
     } else {
         const char *exe = jaiExecutablePath();
         if (exe != NULL && exe[0] != '\0') {

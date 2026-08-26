@@ -140,9 +140,9 @@ static bool splitWhitespace(ObjString *s, int64_t maxsplit, bool fromRight,
         }
 
         for (int i = 0, j = list->count - 1; i < j; ++i, --j) {
-            const Value tmp = list->items[i];
-            list->items[i] = list->items[j];
-            list->items[j] = tmp;
+            const Value tmp = jaiListGet(list, i);
+            jaiListPut(list, i, jaiListGet(list, j));
+            jaiListPut(list, j, tmp);
         }
     }
 
@@ -186,9 +186,9 @@ static bool splitSeparator(ObjString *s, ObjString *sep, int64_t maxsplit,
         }
         if (ok) ok = pushSlice(list, base, limit);
         for (int i = 0, j = list->count - 1; i < j; i++, j--) {
-            Value tmp = list->items[i];
-            list->items[i] = list->items[j];
-            list->items[j] = tmp;
+            Value tmp = jaiListGet(list, i);
+            jaiListPut(list, i, jaiListGet(list, j));
+            jaiListPut(list, j, tmp);
         }
     }
 
@@ -364,7 +364,7 @@ bool strJoin(int argc, Value *args, Value *out) {
 
     if (IS_LIST(seq) || IS_TUPLE(seq)) {
         int count = IS_LIST(seq) ? AS_LIST(seq)->count : (int)AS_TUPLE(seq)->count;
-        const Value *items = IS_LIST(seq) ? AS_LIST(seq)->items
+        const Value *items = IS_LIST(seq) ? jaiListBox(AS_LIST(seq))
                                           : AS_TUPLE(seq)->items;
         return joinSized(sep, items, count, out);
     }

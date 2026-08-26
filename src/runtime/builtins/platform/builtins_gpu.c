@@ -60,14 +60,14 @@ static double *numbersOf(ObjList *list, const char *fnName, int index) {
     if (list->count == 0) return NULL;
     double *values = JAI_ALLOC(double, list->count);
     for (int i = 0; i < list->count; i++) {
-        if (!IS_NUMBER(list->items[i])) {
+        if (!IS_NUMBER(jaiListGet(list, i))) {
             JAI_FREE_ARRAY(double, values, list->count);
             (void)jaiThrow(vm.cTypeError,
                            "%s() argument %d: element %d is %s, expected a number",
-                           fnName, index, i, jaiTypeNameStatic(list->items[i]));
+                           fnName, index, i, jaiTypeNameStatic(jaiListGet(list, i)));
             return NULL;
         }
-        values[i] = jaiAsDouble(list->items[i]);
+        values[i] = jaiAsDouble(jaiListGet(list, i));
     }
     return values;
 }
@@ -75,7 +75,7 @@ static double *numbersOf(ObjList *list, const char *fnName, int index) {
 static ObjList *listOfDoubles(const double *values, int64_t count) {
     ObjList *list = jaiListNew((int)count);
     if (list == NULL || !jaiListReserveExact(list, (int)count)) return list;
-    for (int64_t i = 0; i < count; i++) list->items[i] = FLOAT_VAL(values[i]);
+    for (int64_t i = 0; i < count; i++) jaiListPut(list, i, FLOAT_VAL(values[i]));
     list->count = (int)count;
     list->version++;
     return list;
@@ -210,13 +210,13 @@ static bool nGpuBufferUpload(int argc, Value *args, Value *out) {
 
     float *narrowed = JAI_ALLOC(float, values->count);
     for (int i = 0; i < values->count; i++) {
-        if (!IS_NUMBER(values->items[i])) {
+        if (!IS_NUMBER(jaiListGet(values, i))) {
             JAI_FREE_ARRAY(float, narrowed, values->count);
             return jaiThrow(vm.cTypeError,
                             "gpu_buffer_upload(): value %d is %s, expected a "
-                            "number", i, jaiTypeNameStatic(values->items[i]));
+                            "number", i, jaiTypeNameStatic(jaiListGet(values, i)));
         }
-        narrowed[i] = (float)jaiAsDouble(values->items[i]);
+        narrowed[i] = (float)jaiAsDouble(jaiListGet(values, i));
     }
     jaiGpuUpload(b->buffer, narrowed, (size_t)values->count * sizeof(float),
                  (size_t)(b->origin + offset) * sizeof(float));
@@ -434,7 +434,8 @@ typedef struct {
  * each a sixteen-byte store, and nothing shared between the indices. */
 static void widenRange(void *context, size_t start, size_t end) {
     const DownloadWork *work = (const DownloadWork *)context;
-    for (size_t i = start; i < end; i++) work->items[i] = FLOAT_VAL(work->raw[i]);
+    for (size_t i = start; i < end; i++)
+        work->items[i] = FLOAT_VAL(work->raw[i]);
 }
 
 static bool nGpuBufferDownload(int argc, Value *args, Value *out) {
@@ -550,7 +551,7 @@ static bool dispatchKernel(Value *args, Value *out, bool async) {
     }
     for (int i = 0; i < handles->count; i++) {
         void *ptr;
-        if (!jaiHandleGet(handles->items[i], 2, HANDLE_GPU_BUFFER, name, &ptr)) {
+        if (!jaiHandleGet(jaiListGet(handles, i), 2, HANDLE_GPU_BUFFER, name, &ptr)) {
             if (buffers != NULL)
                 JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, handles->count);
             if (offsets != NULL)
@@ -566,7 +567,7 @@ static bool dispatchKernel(Value *args, Value *out, bool async) {
     if (scalarList->count > 0) scalars = JAI_ALLOC(uint32_t, scalarList->count);
     for (int i = 0; i < scalarList->count; i++) {
         int64_t scalar;
-        if (!jaiArgInt(scalarList->items[i], 3, name, &scalar) ||
+        if (!jaiArgInt(jaiListGet(scalarList, i), 3, name, &scalar) ||
             scalar < 0 || scalar > UINT32_MAX) {
             if (buffers != NULL)
                 JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, handles->count);

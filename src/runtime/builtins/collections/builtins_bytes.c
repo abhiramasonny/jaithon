@@ -82,7 +82,7 @@ static bool bytesToList(int argc, Value *args, Value *out) {
     if (!bytesReceiver(argc, args, "to_list", &b)) return false;
     ObjList *list = jaiListNew(jaiStrCapacityFor(b->length));
     if (list == NULL || !jaiListReserveExact(list, (int)b->length)) return false;
-    for (uint32_t i = 0; i < b->length; i++) list->items[i] = INT_VAL(b->data[i]);
+    for (uint32_t i = 0; i < b->length; i++) jaiListPut(list, i, INT_VAL(b->data[i]));
     list->count = (int)b->length;
     list->version++;
     *out = OBJ_VAL(list);
@@ -291,8 +291,8 @@ static bool primBytesNew(int argc, Value *args, Value *out) {
     if (!jaiArgList(args[0], 0, "bytes_new", &list)) return false;
 
     for (int i = 0; i < list->count; i++) {
-        if (!IS_INT(list->items[i]) || AS_INT(list->items[i]) < 0 ||
-            AS_INT(list->items[i]) > 255) {
+        if (!IS_INT(jaiListGet(list, i)) || AS_INT(jaiListGet(list, i)) < 0 ||
+            AS_INT(jaiListGet(list, i)) > 255) {
             return jaiThrow(vm.cValueError,
                             "bytes_new(): item %d is not a byte value (0 to 255)",
                             i);
@@ -300,7 +300,7 @@ static bool primBytesNew(int argc, Value *args, Value *out) {
     }
     ObjBytes *b = jaiBytesNew(NULL, (size_t)list->count);
     if (b == NULL) return false;
-    for (int i = 0; i < list->count; i++) b->data[i] = (uint8_t)AS_INT(list->items[i]);
+    for (int i = 0; i < list->count; i++) b->data[i] = (uint8_t)AS_INT(jaiListGet(list, i));
     *out = OBJ_VAL(b);
     return true;
 }
@@ -445,35 +445,56 @@ static void quantiseRange(void *context, size_t start, size_t end) {
  * of ints long enough to hold the padded layout, which the caller allocates
  * once and reuses.
  */
+/* Both sides are read through the list's own storage rather than as a `Value`
+ * array, because either may be unboxed: a `list[int]` destination is an
+ * `int64_t[]`, which is the layout this primitive wants anyway -- half the
+ * stores and half the cache lines of the boxed form. The source is whichever
+ * of the four a `list[float]`, a `list[int]` or an untyped list ended up as.
+ *
+ * The kinds are read ONCE, into this struct, rather than switched per element:
+ * a list cannot change its storage while this runs (nothing here allocates or
+ * calls back into the VM), so the branch belongs outside the loop. */
 typedef struct {
-    const Value   *src;
+    const void    *src;
+    uint8_t        srcStore;
     const uint8_t *srcBytes;
-    Value         *dst;
+    void          *dst;
+    uint8_t        dstStore;
     size_t         cols;
     size_t         stride;
     size_t         origin;
 } GridNonzeroWork;
 
+/* Whether source element `i` is non-zero, whatever the source is made of. */
+JAI_INLINE bool gridSourceSet(const GridNonzeroWork *work, size_t i) {
+    if (work->srcBytes != NULL) return work->srcBytes[i] != 0;
+    switch ((ListStore)work->srcStore) {
+    case LIST_STORE_I64: return ((const int64_t *)work->src)[i] != 0;
+    /* A NaN is not zero, and comparing it against zero says so correctly --
+     * but only because the test is `!= 0`, not `> 0`. */
+    case LIST_STORE_F64: return ((const double *)work->src)[i] != 0.0;
+    case LIST_STORE_U8:  return ((const uint8_t *)work->src)[i] != 0;
+    case LIST_STORE_BOXED: break;
+    }
+    const Value item = ((const Value *)work->src)[i];
+    return IS_FLOAT(item) ? (AS_FLOAT(item) != 0.0) : (AS_INT(item) != 0);
+}
+
 static void gridNonzeroRows(void *context, size_t start, size_t end) {
     const GridNonzeroWork *work = (const GridNonzeroWork *)context;
     for (size_t y = start; y < end; y++) {
         const size_t from = y * work->cols;
-        Value *row = work->dst + work->origin + y * work->stride;
-        if (work->srcBytes != NULL) {
-            const uint8_t *src = work->srcBytes + from;
+        const size_t at = work->origin + y * work->stride;
+        if ((ListStore)work->dstStore == LIST_STORE_I64) {
+            int64_t *row = (int64_t *)work->dst + at;
             for (size_t x = 0; x < work->cols; x++) {
-                row[x] = INT_VAL(src[x] != 0 ? 1 : 0);
+                row[x] = gridSourceSet(work, from + x) ? 1 : 0;
             }
             continue;
         }
-        const Value *src = work->src + from;
+        Value *row = (Value *)work->dst + at;
         for (size_t x = 0; x < work->cols; x++) {
-            const Value item = src[x];
-            /* A NaN is not zero, and comparing it against zero says so
-             * correctly -- but only because the test is `!= 0`, not `> 0`. */
-            bool set = IS_FLOAT(item) ? (AS_FLOAT(item) != 0.0)
-                                      : (AS_INT(item) != 0);
-            row[x] = INT_VAL(set ? 1 : 0);
+            row[x] = INT_VAL(gridSourceSet(work, from + x) ? 1 : 0);
         }
     }
 }
@@ -485,18 +506,26 @@ static bool primGridNonzero(int argc, Value *args, Value *out) {
                         "grid_nonzero(): the destination must be a list, got %s",
                         jaiTypeNameStatic(args[0]));
     }
-    const Value *src = NULL;
+    const void *src = NULL;
+    uint8_t srcStore = LIST_STORE_BOXED;
     const uint8_t *srcBytes = NULL;
     size_t srcCount = 0;
     if (IS_LIST(args[1])) {
         ObjList *items = AS_LIST(args[1]);
         src = items->items;
+        srcStore = items->stg;
         srcCount = (size_t)items->count;
-        for (size_t i = 0; i < srcCount; i++) {
-            if (!IS_FLOAT(items->items[i]) && !IS_INT(items->items[i])) {
-                return jaiThrow(vm.cTypeError,
-                                "grid_nonzero(): source element %zu is %s, not a number",
-                                i, jaiTypeNameStatic(items->items[i]));
+        /* Only a boxed source can hold something that is not a number; an
+         * unboxed one is numbers by construction, so the pass is skipped
+         * rather than boxing every element to ask. */
+        if ((ListStore)srcStore == LIST_STORE_BOXED) {
+            const Value *boxed = (const Value *)src;
+            for (size_t i = 0; i < srcCount; i++) {
+                if (!IS_FLOAT(boxed[i]) && !IS_INT(boxed[i])) {
+                    return jaiThrow(vm.cTypeError,
+                                    "grid_nonzero(): source element %zu is %s, not a number",
+                                    i, jaiTypeNameStatic(boxed[i]));
+                }
             }
         }
     } else if (IS_BYTES(args[1])) {
@@ -539,8 +568,25 @@ static bool primGridNonzero(int argc, Value *args, Value *out) {
                         dst->count, (long long)reach);
     }
 
+    /* Anything but a boxed or int-backed destination is boxed first: a float
+     * or bool store cannot hold the ones and zeros this writes, and the
+     * alternative -- a third arm -- would be code nothing calls. */
+    if ((ListStore)dst->stg != LIST_STORE_BOXED &&
+        (ListStore)dst->stg != LIST_STORE_I64) {
+        jaiListBox(dst);
+        /* jaiListBox frees the old array, and `src` was read before it ran.
+         * grid_nonzero(xs, xs, ...) is one list, so that pointer is the one
+         * just handed back to the allocator -- re-read it rather than hand a
+         * freed block to the worker threads. */
+        if (IS_LIST(args[1])) {
+            ObjList *items = AS_LIST(args[1]);
+            src = items->items;
+            srcStore = items->stg;
+        }
+    }
     GridNonzeroWork work = {
-        src, srcBytes, dst->items, (size_t)cols, (size_t)stride, (size_t)origin,
+        src, srcStore, srcBytes, dst->items, dst->stg,
+        (size_t)cols, (size_t)stride, (size_t)origin,
     };
     /* Chunked by ROW, not by cell: a chunk boundary inside a row would have to
      * carry the row's base offsets, and a 1080p frame is a thousand rows --
@@ -578,14 +624,14 @@ static bool primBytesQuantise(int argc, Value *args, Value *out) {
      * thread. Checking first is one cheap read of memory that is about to be
      * read again anyway. */
     for (size_t i = 0; i < n; i++) {
-        if (!IS_FLOAT(items->items[i]) && !IS_INT(items->items[i])) {
+        if (!IS_FLOAT(jaiListGet(items, i)) && !IS_INT(jaiListGet(items, i))) {
             return jaiThrow(vm.cTypeError,
                             "bytes_quantise(): element %zu is %s, not a number",
-                            i, jaiTypeNameStatic(items->items[i]));
+                            i, jaiTypeNameStatic(jaiListGet(items, i)));
         }
     }
 
-    QuantiseWork work = {items->items, dst, (float)scale};
+    QuantiseWork work = {jaiListBox(items), dst, (float)scale};
     jaiParallelChunks(n, JAI_QUANTISE_CHUNK, quantiseRange, &work);
     *out = OBJ_VAL(result);
     return true;
@@ -626,7 +672,7 @@ static bool primListFilled(int argc, Value *args, Value *out) {
     jaiGCPopRoot();
     if (count > 0 && list->capacity < (int)count) return false;
 
-    for (int64_t i = 0; i < count; i++) list->items[i] = fill;
+    for (int64_t i = 0; i < count; i++) jaiListPut(list, i, fill);
     list->count = (int)count;
     list->version++;
     *out = OBJ_VAL(list);
@@ -744,7 +790,7 @@ static bool primListPackArgb(int argc, Value *args, Value *out) {
     if (count > 0 && list->capacity < (int)count) return false;
 
     PackWork work = {raw != NULL ? raw->data : NULL,
-                     values != NULL ? values->items : NULL,
+                     values != NULL ? jaiListBox(values) : NULL,
                      list->items, (int)channels};
     jaiParallelChunks((size_t)count, JAI_PACK_CHUNK, packRange, &work);
     list->count = (int)count;

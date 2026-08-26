@@ -165,6 +165,50 @@ bool jaiCallValue1(Value callee, Value arg, Value *out);
  * that flattening them costs no duplicated knowledge of SlotKind. */
 bool jaiCallFn1(Value callee, Value arg, Value *out);
 
+/* Everything jaiCallFn1 asks about the CALLEE, answered once instead of once
+ * per element. A higher-order builtin calls one closure over a whole list, so
+ * every one of those questions -- is it a closure, has it compiled, is its
+ * arity one, does it want its own closure as a trailing argument, was it
+ * compiled against this module's globals as they are now -- has the same
+ * answer on element nine million as on element one, and asking them again is
+ * eight loads and eight branches around a body that is nineteen instructions.
+ *
+ * The hoisted answers are allowed to go stale, never to be wrong. Both things
+ * that can retire a compiled form under a running loop are visible in a field
+ * this keeps a copy of: jitResultOut nulls fn->jitFunc when a body bails, and
+ * a global rebound anywhere in the module moves module->version. One compare
+ * against each is what remains per element, and either mismatch drops the
+ * element back onto jaiCallFn1 and prepares again from scratch. */
+typedef struct {
+    ObjClosure  *closure;
+    ObjFunction *fn;
+    void        *entry;        /* fn->jitFunc when this was prepared */
+    Value        callee;
+    Value       *limit;        /* highest base a two-cell window may start at */
+    uint32_t     moduleVersion;
+    uint8_t      nargs;        /* 1, or 2 for a callee that reads an upvalue */
+    uint8_t      returnKind;   /* SlotKind, as ObjFunction stores it */
+    /* The argument is an int and it is slot 1, so the conversion is a tag test
+     * and an untag rather than jitArgIn's switch and its read back out of the
+     * window. Every lambda in the benchmark suite's map/filter/sort is this. */
+    bool         intArg;
+    /* Whether there was anything to hoist. False is the ordinary state at the
+     * TOP of a loop, not an error: the tier looks at a function only after
+     * sixty-four calls, so a lambda written at the call site has not compiled
+     * when the loop starts and only becomes preparable sixty-four elements in.
+     * jaiCallPreparedFn1 keeps trying until it does. */
+    bool         flat;
+} JaiPreparedFn1;
+
+/* Ready `callee` for a loop that will call it once per element. Cannot fail:
+ * a callee with nothing to hoist leaves `flat` false and every element goes
+ * the long way, exactly as it did before. */
+void jaiPrepareFn1(Value callee, JaiPreparedFn1 *prepared);
+
+/* One element. Identical in effect to jaiCallFn1(prepared->callee, arg, out),
+ * including every fallback it makes. */
+bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out);
+
 /* Finish, in the interpreter, a one-argument compiled call that deoptimised
  * part-way: the body already ran and may have written, so it must not be
  * re-entered from the top. `base` is the two-cell window [closure, argument]

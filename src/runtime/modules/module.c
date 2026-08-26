@@ -765,7 +765,7 @@ static ObjBytes *bytesFromByteList(ObjList *list, const char *path) {
     uint8_t *raw = JAI_ALLOC(uint8_t, count > 0 ? count : 1);
 
     for (size_t i = 0; i < count; i++) {
-        Value item = list->items[i];
+        Value item = jaiListGet(list, i);
         if (!IS_INT(item)) {
             JAI_FREE_ARRAY(uint8_t, raw, count > 0 ? count : 1);
             (void)jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,

@@ -192,7 +192,7 @@ bool jaiIterNext(ObjIter *it, Value *out) {
             const int64_t index = it->index;
             if (index >= it->limit) return false;
 
-            *out = list->items[index];
+            *out = jaiListGet(list, index);
             it->index = index + 1;
             return true;
         }

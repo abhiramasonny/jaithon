@@ -98,7 +98,7 @@ static bool nCoreMLShape(int argc, Value *args, Value *out) {
     if (list == NULL) return false;
     if (rank > 0) {
         if (!jaiListReserveExact(list, rank)) return false;
-        for (int i = 0; i < rank; i++) list->items[i] = INT_VAL(dims[i]);
+        for (int i = 0; i < rank; i++) jaiListPut(list, i, INT_VAL(dims[i]));
         list->count = rank;
         list->version++;
     }
@@ -141,10 +141,10 @@ static bool readSide(Value handles, Value shapes, int index, const char *fnName,
     side->count = held->count;
     side->dims = 0;
     for (int i = 0; i < sizes->count; i++) {
-        if (!IS_LIST(sizes->items[i]))
+        if (!IS_LIST(jaiListGet(sizes, i)))
             return jaiThrow(vm.cTypeError, "%s(): shape %d is %s, expected a list",
-                            fnName, i, jaiTypeNameStatic(sizes->items[i]));
-        side->dims += AS_LIST(sizes->items[i])->count;
+                            fnName, i, jaiTypeNameStatic(jaiListGet(sizes, i)));
+        side->dims += AS_LIST(jaiListGet(sizes, i))->count;
     }
     if (side->count == 0) return true;
 
@@ -157,20 +157,20 @@ static bool readSide(Value handles, Value shapes, int index, const char *fnName,
     for (int i = 0; i < side->count; i++) {
         JaiGpuBuffer *native = NULL;
         int64_t origin = 0;
-        if (!jaiGpuBufferOf(held->items[i], index, fnName, &native, &origin)) {
+        if (!jaiGpuBufferOf(jaiListGet(held, i), index, fnName, &native, &origin)) {
             releaseSide(side);
             return false;
         }
         side->buffers[i] = native;
         side->offsets[i] = (size_t)origin;
-        ObjList *shape = AS_LIST(sizes->items[i]);
+        ObjList *shape = AS_LIST(jaiListGet(sizes, i));
         side->ranks[i] = shape->count;
         for (int d = 0; d < shape->count; d++) {
-            if (!IS_INT(shape->items[d])) {
+            if (!IS_INT(jaiListGet(shape, d))) {
                 releaseSide(side);
                 return jaiThrow(vm.cTypeError, "%s(): shape %d holds a non-integer", fnName, i);
             }
-            side->shapes[at++] = AS_INT(shape->items[d]);
+            side->shapes[at++] = AS_INT(jaiListGet(shape, d));
         }
     }
     return true;

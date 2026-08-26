@@ -137,7 +137,7 @@ static ObjBytes *imageBytes(Value compiled) {
     int count = list->count;
     uint8_t *raw = JAI_ALLOC(uint8_t, count);
     for (int i = 0; i < count; i++) {
-        Value item = list->items[i];
+        Value item = jaiListGet(list, i);
         if (!IS_INT(item)) {
             JAI_FREE_ARRAY(uint8_t, raw, count);
             return NULL;
@@ -293,8 +293,8 @@ static void transferOne(Value diagnostic) {
     if (jaiFrontEndField(diagnostic, "labels", &labels) && IS_LIST(labels)) {
         ObjList *list = AS_LIST(labels);
         for (int i = 0; i < list->count; i++) {
-            if (!IS_TUPLE(list->items[i])) continue;
-            ObjTuple *pair = AS_TUPLE(list->items[i]);
+            if (!IS_TUPLE(jaiListGet(list, i))) continue;
+            ObjTuple *pair = AS_TUPLE(jaiListGet(list, i));
             if (pair->count < 2) continue;
             const char *text = stringOrNull(pair->items[1]);
             jaiDiagAddLabel(d, spanFrom(pair->items[0]), "%s",
@@ -323,7 +323,7 @@ bool jaiFrontEndTransferDiagnostics(Value compiled) {
 
     ObjList *list = AS_LIST(items);
     jaiPushRoot(items);
-    for (int i = 0; i < list->count; i++) transferOne(list->items[i]);
+    for (int i = 0; i < list->count; i++) transferOne(jaiListGet(list, i));
     jaiPopRoot();
     return list->count > 0;
 }

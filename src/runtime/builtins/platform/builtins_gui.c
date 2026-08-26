@@ -81,7 +81,7 @@ static bool nGuiWindowOpen(int argc, Value *args, Value *out) {
         return jaiThrow(vm.cRuntimeError,
                         "gui_window_open(): no room for a %lld-pixel back buffer",
                         (long long)count);
-    for (int64_t i = 0; i < count; i++) pixels->items[i] = INT_VAL(0);
+    for (int64_t i = 0; i < count; i++) jaiListPut(pixels, i, INT_VAL(0));
     pixels->count = (int)count;
     pixels->version++;
     jaiGCPushRoot(OBJ_VAL(pixels));
@@ -90,13 +90,13 @@ static bool nGuiWindowOpen(int argc, Value *args, Value *out) {
      * not grow the keepalive list without bound. */
     int slot = -1;
     for (int i = 0; i < gKeepAlive->count; i++) {
-        if (IS_NULL(gKeepAlive->items[i])) { slot = i; break; }
+        if (IS_NULL(jaiListGet(gKeepAlive, i))) { slot = i; break; }
     }
     if (slot < 0) {
         slot = gKeepAlive->count;
         jaiListPush(gKeepAlive, OBJ_VAL(pixels));
     } else {
-        gKeepAlive->items[slot] = OBJ_VAL(pixels);
+        jaiListPut(gKeepAlive, slot, OBJ_VAL(pixels));
     }
     jaiGCPopRoot();
 
@@ -120,7 +120,7 @@ static bool nGuiWindowClose(int argc, Value *args, Value *out) {
      * a double free, which is what makes `close` in a `defer` safe. */
     jaiHandleRelease(AS_INT(args[0]));
     if (w->slot >= 0 && w->slot < gKeepAlive->count)
-        gKeepAlive->items[w->slot] = NULL_VAL;
+        jaiListPut(gKeepAlive, w->slot, NULL_VAL);
     jaiWindowClose(w->window);
     JAI_FREE(GuiWindow, w);
 
@@ -158,7 +158,7 @@ static bool nGuiPresent(int argc, Value *args, Value *out) {
                         w->pixels->count, bufferWidth, bufferHeight,
                         (long long)needed);
 
-    const Value *items = w->pixels->items;
+    const Value *items = jaiListBox(w->pixels);
     for (int64_t i = 0; i < needed; i++) {
         if (!IS_INT(items[i]))
             return jaiThrow(vm.cTypeError,

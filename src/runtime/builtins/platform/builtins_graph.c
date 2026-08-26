@@ -44,13 +44,13 @@ static bool intsOf(Value v, int index, const char *fnName, int64_t **out, int *c
     }
     int64_t *values = JAI_ALLOC(int64_t, (size_t)list->count);
     for (int i = 0; i < list->count; i++) {
-        if (!IS_INT(list->items[i])) {
+        if (!IS_INT(jaiListGet(list, i))) {
             JAI_FREE_ARRAY(int64_t, values, (size_t)list->count);
             return jaiThrow(vm.cTypeError,
                             "%s(): element %d of argument %d is %s, expected an integer",
-                            fnName, i, index, jaiTypeNameStatic(list->items[i]));
+                            fnName, i, index, jaiTypeNameStatic(jaiListGet(list, i)));
         }
-        values[i] = AS_INT(list->items[i]);
+        values[i] = AS_INT(jaiListGet(list, i));
     }
     *out = values;
     return true;
@@ -104,7 +104,7 @@ static bool nGraphConstant(int argc, Value *args, Value *out) {
 
     float *floats = values->count > 0 ? JAI_ALLOC(float, (size_t)values->count) : NULL;
     for (int i = 0; i < values->count; i++) {
-        Value item = values->items[i];
+        Value item = jaiListGet(values, i);
         if (IS_FLOAT(item)) floats[i] = (float)AS_FLOAT(item);
         else if (IS_INT(item)) floats[i] = (float)AS_INT(item);
         else {
@@ -531,8 +531,8 @@ static bool nGraphLstm(int argc, Value *args, Value *out) {
     if (list == NULL) return false;
     if (ok) {
         if (!jaiListReserveExact(list, 2)) return false;
-        list->items[0] = INT_VAL(made[0]);
-        list->items[1] = INT_VAL(made[1]);
+        jaiListPut(list, 0, INT_VAL(made[0]));
+        jaiListPut(list, 1, INT_VAL(made[1]));
         list->count = 2;
         list->version++;
     }
@@ -616,7 +616,7 @@ static bool nGraphGradients(int argc, Value *args, Value *out) {
         JAI_FREE_ARRAY(int, found, (size_t)count);
         return false;
     }
-    for (int i = 0; i < count; i++) list->items[i] = INT_VAL(found[i]);
+    for (int i = 0; i < count; i++) jaiListPut(list, i, INT_VAL(found[i]));
     list->count = count;
     list->version++;
     JAI_FREE_ARRAY(int, found, (size_t)count);
@@ -670,7 +670,7 @@ static bool nGraphPlanOutputShape(int argc, Value *args, Value *out) {
             jaiListReserve(list, rank);
             jaiGCPopRoot();
             if (list->capacity >= rank) {
-                for (int i = 0; i < rank; i++) list->items[i] = INT_VAL(dims[i]);
+                for (int i = 0; i < rank; i++) jaiListPut(list, i, INT_VAL(dims[i]));
                 list->count = rank;
                 list->version++;
             } else {
@@ -703,7 +703,7 @@ static bool buffersOf(Value v, int index, const char *fnName,
     for (int i = 0; i < list->count; i++) {
         JaiGpuBuffer *native = NULL;
         int64_t origin = 0;
-        if (!jaiGpuBufferOf(list->items[i], index, fnName, &native, &origin)) {
+        if (!jaiGpuBufferOf(jaiListGet(list, i), index, fnName, &native, &origin)) {
             JAI_FREE_ARRAY(JaiGpuBuffer *, buffers, (size_t)list->count);
             JAI_FREE_ARRAY(size_t, starts, (size_t)list->count);
             return false;
