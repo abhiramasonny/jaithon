@@ -742,6 +742,20 @@ typedef struct {
      * saying which one left the reader to guess -- a poor trade for ninety
      * bytes that live exactly as long as the emitter does. */
     char        whyBuf[96];
+    /* WHICH of an arm's unnamed refusals fired, and on what value.
+     *
+     * `whyNot` is a decision: an arm that names one has told the reader
+     * something durable. Several arms instead return false from a dozen places
+     * without naming any of them, and `JAI_JIT_WHY` then prints the bare
+     * opcode -- so one census row like "OP_GET_FIELD_LOCAL 129" is a merge of
+     * eleven unrelated causes wearing one label, and the fixes they want are
+     * nothing alike. This is that missing half: printed only when `whyNot` is
+     * NULL, never read by control flow, and cleared at the top of every
+     * instruction so a note cannot outlive the arm that wrote it.
+     *
+     * Inert by construction and checked as such: with it set at every site
+     * below, the decline TOTAL is unchanged run for run. */
+    char        whySub[80];
     uint8_t     lastOp;
     unsigned  descOffset;
     int       exceptionExit;
@@ -2992,6 +3006,26 @@ static bool isClassCallee(const Emit *e, unsigned argc) {
  * slot number is what the disassembly labels its locals with, so the two can
  * be put side by side.
  */
+/* Record which unnamed refusal an arm took, and return false so the call sites
+ * read as `return subWhy(e, "...")`. See Emit::whySub. */
+static bool subWhy(Emit *e, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(e->whySub, sizeof e->whySub, fmt, ap);
+    va_end(ap);
+    return false;
+}
+
+/* What `JAI_JIT_WHY` prints: the named reason when there is one, otherwise the
+ * opcode with whatever the arm noted about it. */
+static const char *declineReason(Emit *e) {
+    if (e->whyNot != NULL) return e->whyNot;
+    const char *name = jaiOpName((OpCode)e->lastOp);
+    if (e->whySub[0] == '\0') return name;
+    snprintf(e->whyBuf, sizeof e->whyBuf, "%s: %s", name, e->whySub);
+    return e->whyBuf;
+}
+
 static const char *kindClash(Emit *e, unsigned slot) {
     snprintf(e->whyBuf, sizeof e->whyBuf,
              "a local was given two different kinds (slot %u)", slot);
@@ -4957,6 +4991,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         e->offsetToInst[off]  = (int)e->count;
         e->offsetToDepth[off] = (int)stackSignature(e);
         e->lastOp = op;
+        e->whySub[0] = '\0';
         /* A borrow ends here unless the instruction is one of the few it is
          * allowed to live across. The top of an instruction is the one place
          * the release is guaranteed to be on the executed path. */
@@ -6415,30 +6450,52 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * it (`if node == null { return 0 }`) but the tier doesn't track that, so the guard stands and costs one compare against zero; a null arriving for real just deopts. */
             if (e->localKind[slot] != SLOT_INST &&
                 e->localKind[slot] != SLOT_MAYBE_INST) {
-                return false;
+                return subWhy(e, "receiver local %u is kind %d, not an instance",
+                              slot, (int)e->localKind[slot]);
             }
-            if (e->localClass[slot] == NULL) return false;
+            if (e->localClass[slot] == NULL) {
+                return subWhy(e, "receiver local %u has no pinned class", slot);
+            }
             if (e->localKind[slot] == SLOT_MAYBE_INST) {
                 unsigned rcv = localIn(e, slot, JIT_SCRATCH_A);
                 emit(e, jaiA64SubsXImm(31, rcv, 0));
                 branchOnDeopt(e, JAI_A64_EQ);
             }
             if (slot == 0) e->usesSlot0 = true;
-            if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
+            if (nameIdx >= (uint32_t)fn->chunk.constants.count) {
+                return subWhy(e, "the field name is not in the pool");
+            }
             Value nameVal = fn->chunk.constants.data[nameIdx];
-            if (!IS_STRING(nameVal)) return false;
+            if (!IS_STRING(nameVal)) return subWhy(e, "the field name is not a string");
 
             const FieldInfo *info =
                 jaiClassFieldInfo(e->localClass[slot], AS_STRING(nameVal));
-            if (info == NULL || info->isStatic) return false;
+            /* The commonest of the four by a wide margin, and the one that
+             * reads as a puzzle without being named: `self.method` is a METHOD,
+             * and jaiClassFieldInfo only knows fields, so every
+             * `return self.m(x)` written as a value lands here. */
+            if (info == NULL) {
+                return subWhy(e, "`%s` is not a field of %s",
+                              AS_STRING(nameVal)->chars,
+                              e->localClass[slot]->name
+                                  ? e->localClass[slot]->name->chars : "?");
+            }
+            if (info->isStatic) {
+                return subWhy(e, "`%s` is a static", AS_STRING(nameVal)->chars);
+            }
 
             /* Field type is read off the LIVE receiver, so the tier specialises to what the program actually
              * stores rather than a declaration -- only possible for a parameter (hence the arity cap above): a local assigned further in has no value yet to look at. */
             Value seen = localObserved(e, slot) ? e->observed[slot]
                                                 : e->localSeen[slot];
-            if (!IS_INSTANCE(seen)) return false;
+            if (!IS_INSTANCE(seen)) {
+                return subWhy(e, "no live receiver to read local %u's field off", slot);
+            }
             ObjInstance *inst = AS_INSTANCE(seen);
-            if (info->slot >= inst->fieldCount) return false;
+            if (info->slot >= inst->fieldCount) {
+                return subWhy(e, "field slot %u is past the live receiver's %d",
+                              (unsigned)info->slot, inst->fieldCount);
+            }
             Value fieldVal = inst->fields[info->slot];
 
             SlotKind kind;
@@ -7327,9 +7384,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_INVOKE: {
             uint32_t nameIdx = jaiReadU24(code + off + 1);
             unsigned argc    = code[off + 4];
-            if (argc > JIT_MAX_ARGS_OUT - 1) return false;
-            if (!e->callsOut) return false;
-            if (e->depth < argc + 1) return false;
+            /* The argc cap is a fixed limit rather than a property of this
+             * call, and it was indistinguishable in the census from every
+             * other reason an invoke declines -- which is how it went a long
+             * time without anyone knowing how many sites it costs. */
+            if (argc > JIT_MAX_ARGS_OUT - 1) {
+                return subWhy(e, "%u arguments, past the cap of %d",
+                              argc, JIT_MAX_ARGS_OUT - 1);
+            }
+            if (!e->callsOut) return subWhy(e, "this region may not call out");
+            if (e->depth < argc + 1) {
+                return subWhy(e, "the model is %u deep for %u arguments",
+                              e->depth, argc);
+            }
 
             unsigned ridx = e->depth - argc - 1;
             SlotKind rk = e->stack[ridx];
@@ -8771,16 +8838,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             /* Index normalised as jaiNormalizeIndex does it, one unsigned compare covering both ends. Out of
              * range, or an element not the kind seen at compile time, goes back to the interpreter -- reading an element has no effect, so resuming at this instruction is always sound. */
-            if (e->depth < 2) return false;
-            if (e->stack[e->depth - 2] != SLOT_LIST) return false;
-            if (e->stack[e->depth - 1] != SLOT_INT) return false;
+            if (e->depth < 2) return subWhy(e, "the model is only %u deep", e->depth);
+            if (e->stack[e->depth - 2] != SLOT_LIST) {
+                return subWhy(e, "the container is kind %d, not a list",
+                              (int)e->stack[e->depth - 2]);
+            }
+            if (e->stack[e->depth - 1] != SLOT_INT) {
+                return subWhy(e, "the subscript is kind %d, not an int",
+                              (int)e->stack[e->depth - 1]);
+            }
             unsigned rIdx = pushReg(e) - 1;
             unsigned rList = valueXReg(e, e->valueDepth - 2);
 
             Value seenList = e->stackSeen[e->depth - 2];
-            if (!IS_LIST(seenList)) return false;
+            if (!IS_LIST(seenList)) {
+                return subWhy(e, "no live list to read an element kind off");
+            }
             ObjList *sl = AS_LIST(seenList);
-            if (sl->count <= 0) return false;
+            if (sl->count <= 0) {
+                return subWhy(e, "the live list is empty, so there is no exemplar");
+            }
             Value elem = sl->items[0];
             SlotKind kind;
             unsigned tag;
@@ -10210,7 +10287,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped (measuring): %s\n",
                     fn->name ? fn->name->chars : "<anon>",
-                    body.whyNot ? body.whyNot : jaiOpName((OpCode)body.lastOp));
+                    declineReason(&body));
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
@@ -11369,7 +11446,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         }
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
-                    e.whyNot ? e.whyNot : jaiOpName((OpCode)e.lastOp));
+                    declineReason(&e));
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
