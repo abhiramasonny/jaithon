@@ -6,7 +6,30 @@ stopped : OP_CALL
 stopped : OP_DIV
 stopped : OP_GET_FIELD
 stopped : OP_GET_FIELD_LOCAL
-stopped : OP_GET_INDEX
+stopped : OP_GET_FIELD_LOCAL: `_replace` is not a field of DataFrame
+stopped : OP_GET_FIELD_LOCAL: `astype` is not a field of NDArray
+stopped : OP_GET_FIELD_LOCAL: `copy_lanes` is not a field of Column
+stopped : OP_GET_FIELD_LOCAL: `inputs` is not a field of Tensor
+stopped : OP_GET_FIELD_LOCAL: `object` is not a field of Parser
+stopped : OP_GET_FIELD_LOCAL: `view` is not a field of NDArray
+stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 1's field off
+stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 4's field off
+stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 5's field off
+stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 7's field off
+stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 8's field off
+stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 9's field off
+stopped : OP_GET_FIELD_LOCAL: receiver local 10 is kind 0, not an instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 4 is kind 0, not an instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 4 is kind 5, not an instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 5 is kind 0, not an instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 7 is kind 0, not an instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 8 is kind 0, not an instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 9 is kind 0, not an instance
+stopped : OP_GET_INDEX: no live list to read an element kind off
+stopped : OP_GET_INDEX: the container is kind 0, not a list
+stopped : OP_GET_INDEX: the container is kind 13, not a list
+stopped : OP_GET_INDEX: the container is kind 3, not a list
+stopped : OP_GET_INDEX: the live list is empty, so there is no exemplar
 stopped : OP_INVOKE
 stopped : OP_ITER_RANGE
 stopped : OP_JUMP_IF_CMP_FALSE
@@ -31,9 +54,11 @@ stopped : pushing a kind the tier cannot store
 stopped : the operand model disagrees with the bytecode
 stopped : too many roots
 stopped: OP_CALL
-stopped: OP_GET_FIELD_LOCAL
-stopped: OP_GET_INDEX
+stopped: OP_GET_FIELD_LOCAL: no live receiver to read local 17's field off
+stopped: OP_GET_INDEX: the container is kind 13, not a list
+stopped: OP_GET_INDEX: the container is kind 2, not a list
 stopped: OP_INVOKE
+stopped: OP_INVOKE: 4 arguments, past the cap of 3
 stopped: OP_JUMP_IF_CMP_FALSE
 stopped: OP_POP
 stopped: a builtin whose result kind has not been observed
@@ -42,7 +67,6 @@ stopped: a call that can raise inside a try
 stopped: a local was given two different kinds
 stopped: a return inside an OSR loop
 stopped: a type guard the kinds cannot settle
-stopped: an `is` against something other than null
 stopped: an append reaching past the model
 stopped: an indirect callee compiled against an older module
 stopped: an unpinned receiver's result kind
