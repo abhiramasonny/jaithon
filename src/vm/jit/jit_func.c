@@ -740,6 +740,13 @@ typedef struct {
     struct {
         uint32_t top, end;
         uint8_t  slot, itemsReg, countReg;
+        /* The counted-range head of the loop this hoist covers, when it has
+         * one. Per hoist rather than per form because the loop that matters is
+         * often INNER: a stencil's outer `for i` assigns the row locals, so
+         * nothing hoists there, while the inner `for j` hoists all four and is
+         * where every subscript actually happens. */
+        bool     rangeOk;
+        uint16_t rVar, rCur, rEnd;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
@@ -873,6 +880,41 @@ typedef struct {
     int64_t   kKnownVal[32];
     uint32_t  xBorrow;
     uint8_t   xBorrowReg[32];
+    /* Which entries are known to be a LOCAL plus a constant, and which local
+     * and what constant. Not a value like kKnown -- a shape. It exists so a
+     * subscript can say "this index is the loop counter, minus one" and have
+     * its bounds check hoisted to the loop head, where one compare covers
+     * every iteration instead of two instructions per element.
+     *
+     * Only int-kinded entries carry it, and only while the arithmetic stays
+     * exact: an add or subtract that could overflow drops the shape rather
+     * than describing a value the loop head's guard would not cover. Cleared
+     * with every other per-entry mask on push and pop. */
+    uint32_t  idxKnown;
+    uint8_t   idxBase[32];
+    int32_t   idxOff[32];
+    /* The span of offsets each list slot is subscripted at, over the sites
+     * whose index turned out to be the loop counter plus a constant. The
+     * measuring pass fills it; the real pass turns it into ONE compare at the
+     * loop head and lets those sites skip their own. A slot with no shaped
+     * site keeps `spanLo > spanHi`, which is how "nothing to hoist" reads. */
+    int32_t   spanLo[JIT_MAX_SLOTS + 1];
+    int32_t   spanHi[JIT_MAX_SLOTS + 1];
+    bool      spanOk[JIT_MAX_SLOTS + 1];
+    /* Which loop variable the span is measured against. Two loops subscripting
+     * the same list off different variables cannot share one span, so the
+     * second one seen turns the slot off rather than widening it. */
+    uint8_t   spanBase[JIT_MAX_SLOTS + 1];
+    bool      spanSeen[JIT_MAX_SLOTS + 1];
+    /* The OSR loop is a counted range whose head is OP_FOR_RANGE_BIND, and
+     * these are its three slots: the variable the body reads, the counter, and
+     * the end. The last two are fresh temporaries the emitter hands out per
+     * loop and nothing else writes -- see the arm for OP_FOR_RANGE_BIND --
+     * which is what makes the end a loop invariant a single compare can use.
+     * Decoded once at setup because the guard is emitted ABOVE the head, before
+     * the walk reaches the instruction that would otherwise name them. */
+    bool      rangeHead;
+    uint16_t  rangeVar, rangeCur, rangeEnd;
     /* Offsets this walk carried a deferred entry into (same reason as fpCarry): a BACKWARD branch there
      * would arrive with the value in-register while the instruction reads the borrow. Forward branches are caught during the walk; this catches the rest. */
     uint32_t  deferCarry[64];
@@ -1196,6 +1238,27 @@ static void noteSlotWrite(Emit *e, unsigned slot) {
  * used as the base of a subscript, and how hot those sites are. Weighted by
  * loop nesting for the same reason slotUse is -- a header read once per row
  * must not outrank one read every iteration. */
+/* Records that `slot` was subscripted at the loop counter plus `off`, or --
+ * when `shaped` is false -- that one of its subscripts is not a shape the loop
+ * head can guard. One unshaped site does not spoil the others: they still skip
+ * their checks and it still emits its own. What it DOES spoil is nothing, so
+ * `spanOk` exists only to record that a slot was seen at all. */
+static void noteIndexSpan(Emit *e, int slot, bool shaped, int32_t off,
+                          uint8_t base) {
+    if (!e->measuring || e->inlining) return;
+    if (slot < 0 || slot > (int)JIT_MAX_SLOTS) return;
+    if (!shaped) return;
+    if (!e->spanSeen[slot]) {
+        e->spanSeen[slot] = true;
+        e->spanBase[slot] = base;
+    } else if (e->spanBase[slot] != base) {
+        e->spanOk[slot] = false;
+        return;
+    }
+    if (off < e->spanLo[slot]) e->spanLo[slot] = off;
+    if (off > e->spanHi[slot]) e->spanHi[slot] = off;
+}
+
 static void noteSlotIndexed(Emit *e, int slot) {
     if (!e->measuring || e->inlining || slot < 0 || slot > (int)JIT_MAX_SLOTS) {
         return;
@@ -1371,9 +1434,13 @@ static bool localInRange(Emit *e, unsigned slot) {
 /* The ListStore the frame's slot is backed by, or BOXED for anything else.
  *
  * Read one slot at a time, and only once the walk has decided the slot holds a
- * LIST -- the same hazard as the kind sweep above, and the storage sweep this
- * replaces had it too: it dereferenced every slot carrying a VAL_OBJ tag,
- * including the untouched ones. */
+ * LIST. Sweeping them all up front is what the first version did, and it
+ * segfaulted the COMPILER: an OSR frame's slots run to fn->maxSlots, and the
+ * ones the program has not reached yet hold whatever the last frame at that
+ * depth left behind -- including a VAL_OBJ tag over a null pointer. IS_LIST
+ * dereferences without checking, so the sweep read `Obj::type` off address
+ * zero. Once in eight runs of tests/bench/jaiframe/frameops, and never in
+ * 3041 tests, because it needs a slot that is both stale and untouched. */
 static uint8_t localStgOf(const Emit *e, unsigned slot) {
     if (slot > JIT_MAX_SLOTS || e->observed == NULL) return LIST_STORE_BOXED;
     if (e->localKind[slot] != SLOT_LIST) return LIST_STORE_BOXED;
@@ -1758,6 +1825,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
+    e->idxKnown &= ~(1u << e->valueDepth);
     e->valueDepth++;
     /* An inlined body's entries are not in the caller's bank, so they do not
      * widen its save set -- which is the whole reason they fit. */
@@ -1850,6 +1918,7 @@ static bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
+    e->idxKnown &= ~(1u << e->valueDepth);
     if (kind != NULL) *kind = e->stack[e->depth];
     *reg = valueXReg(e, e->valueDepth);
     return true;
@@ -2754,13 +2823,70 @@ static void planHoists(Emit *e, ObjFunction *fn) {
         e->hoist[e->hoistCount].slot     = cand[pick].slot;
         e->hoist[e->hoistCount].itemsReg = (uint8_t)rI;
         e->hoist[e->hoistCount].countReg = (uint8_t)rC;
+        e->hoist[e->hoistCount].rangeOk  = false;
+        uint32_t ht = cand[pick].top;
+        if (ht + 9u <= (uint32_t)c->count && c->code[ht] == OP_FOR_RANGE_BIND) {
+            e->hoist[e->hoistCount].rangeOk = true;
+            e->hoist[e->hoistCount].rVar = jaiReadU16(c->code + ht + 3);
+            e->hoist[e->hoistCount].rCur = jaiReadU16(c->code + ht + 5);
+            e->hoist[e->hoistCount].rEnd = jaiReadU16(c->code + ht + 7);
+        }
         e->hoistCount++;
     }
+}
+
+/* Whether the loop head's guard already covers this subscript, so the compare
+ * and branch here can go.
+ *
+ * planHoists proves two of the three things that need to be true: it hoists a
+ * slot's header only over a region with no write to the slot and no call that
+ * could resize the list, which is exactly what makes `count` a loop invariant
+ * worth checking once. The third is that the index IS the loop counter plus a
+ * constant (Emit::idxKnown), and that the counter is written nowhere but the
+ * loop's own head -- `for j in ...` that assigns to `j` inside the body would
+ * otherwise index with a value the head's guard never saw.
+ *
+ * Restricted to a hoist over the OSR loop ITSELF, because the guard reads
+ * JIT_IDX_REG and JIT_LIM_REG: an inner loop nested inside the compiled one
+ * has its own counter and those registers describe the outer. */
+static bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
+                                int32_t *offOut, uint8_t *baseOut) {
+    if (!e->osr) return false;
+    if (slot < 0 || slot > (int)JIT_MAX_SLOTS) return false;
+    if ((e->idxKnown & (1u << vidx)) == 0) return false;
+    unsigned base = e->idxBase[vidx];
+    if (base > JIT_MAX_SLOTS) return false;
+    /* The index has to be a loop VARIABLE, written by its head's bind and by
+     * nothing else: a body that assigns to `j` indexes with a value no head
+     * ever bounded. One write site, and it is a range head. */
+    if (e->slotWriteLo[base] != e->slotWriteHi[base]) return false;
+    uint32_t bindAt = e->slotWriteLo[base];
+    if (bindAt >= (uint32_t)e->chunkDepthCount) return false;
+    *offOut  = e->idxOff[vidx];
+    *baseOut = (uint8_t)base;
+    /* The measuring pass answers "is this index a shape", not "is it covered".
+     * Two reasons it cannot answer the second: the span it is being asked
+     * about is the one it is still building, and hoists do not exist yet --
+     * planHoists runs BETWEEN the passes. Both made an earlier version record
+     * nothing at all and measure exactly 1.000x. */
+    if (e->measuring) return true;
+    if (!e->spanOk[slot] || e->spanLo[slot] > e->spanHi[slot]) return false;
+    int h = hoistFor(e, slot);
+    if (h < 0 || !e->hoist[h].rangeOk) return false;
+    /* The guard is emitted at THIS hoist's loop head, so it is that loop's
+     * variable the index has to be measured against. */
+    if (e->hoist[h].rVar != base) return false;
+    if (*offOut < e->spanLo[slot] || *offOut > e->spanHi[slot]) return false;
+    return true;
 }
 
 /* The loads themselves, emitted just above the head of the loop they were
  * planned out of -- which is where the walk is when it reaches that offset. */
 static void emitHoistsAt(Emit *e, uint32_t off) {
+    /* `off` is also the resume point for the bounds guard below: the hoists are
+     * emitted ABOVE the offset map, so e->curOffset still names the PREVIOUS
+     * instruction and a guard taken against it resumes somewhere whose operand
+     * model has already been consumed. */
     if (e->inlining) return;
     for (unsigned i = 0; i < e->hoistCount; i++) {
         if (e->hoist[i].top != off) continue;
@@ -2771,6 +2897,54 @@ static void emitHoistsAt(Emit *e, uint32_t off) {
         }
         emitListHeader(e, e->slotXReg[e->hoist[i].slot],
                        e->hoist[i].itemsReg, e->hoist[i].countReg);
+
+        /* And, once, the bounds every subscript of this slot inside the loop
+         * would otherwise check for itself. The counter runs [IDX, LIM), so
+         * the indices reached are [IDX + spanLo, LIM - 1 + spanHi]; proving
+         * both ends here lets each site drop a compare and a branch, which is
+         * 10 of the ~39 instructions a five-point stencil executes per cell.
+         *
+         * Skipped when the loop will not run at all: LIM <= IDX makes the
+         * lower end of that interval meaningless, and deoptimising an empty
+         * loop would hand the whole rest of the function to the interpreter
+         * for no reason. */
+        unsigned sl = e->hoist[i].slot;
+        if (!e->osr || !e->hoist[i].rangeOk) continue;
+        if (!e->spanOk[sl] || e->spanLo[sl] > e->spanHi[sl]) continue;
+        if (!e->spanSeen[sl] || e->spanBase[sl] != e->hoist[i].rVar) continue;
+        /* localIn, not localHomeX: the counter and the end are temporaries the
+         * emitter hands out per loop, and they often miss out on a register
+         * entirely. A load apiece is nothing here -- this runs once per entry
+         * to the compiled loop, not once per iteration -- and requiring homes
+         * made the guard decline on every stencil that has one. */
+        unsigned rCur = localIn(e, e->hoist[i].rCur, JIT_SCRATCH_B);
+        unsigned rEnd = localIn(e, e->hoist[i].rEnd, JIT_SCRATCH_C);
+
+        /* The counter has not necessarily started at the range's own start --
+         * OSR is entered on a back edge, so the loop may be half run -- but
+         * that only narrows the interval, and narrowing is sound. Skipped
+         * entirely when nothing is left to run: deoptimising an empty loop
+         * would hand the rest of the function to the interpreter for nothing. */
+        emit(e, jaiA64SubsXReg(31, rCur, rEnd));
+        unsigned empty = e->count;
+        emit(e, jaiA64BCond(JAI_A64_GE, 0));
+
+        /* emitAddSubImm carries the sign itself, so the span goes in as it
+         * stands: cur + spanLo is the first index the loop still reaches, and
+         * end - 1 + spanHi the last. */
+        emitAddSubImm(e, JIT_SCRATCH_A, rCur, (int64_t)e->spanLo[sl], false);
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+        branchOnDeoptAt(e, JAI_A64_LT, off, false);
+
+        emitAddSubImm(e, JIT_SCRATCH_A, rEnd, (int64_t)e->spanHi[sl] - 1,
+                      false);
+        emit(e, jaiA64SubsXUxtw(31, JIT_SCRATCH_A, e->hoist[i].countReg));
+        branchOnDeoptAt(e, JAI_A64_HS, off, false);
+
+        if (empty < e->count && e->count <= JIT_MAX_INSTS) {
+            e->code[empty] = jaiA64BCond(JAI_A64_GE,
+                                         (int32_t)(e->count - empty));
+        }
     }
 }
 
@@ -5309,6 +5483,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                             (int)slot)) {
                 return false;
             }
+            /* The seed of the index shape: this entry IS this local, offset
+             * zero. See Emit::idxKnown. */
+            if (e->localKind[slot] == SLOT_INT && slot <= UINT8_MAX) {
+                unsigned at = e->valueDepth - 1;
+                e->idxKnown |= 1u << at;
+                e->idxBase[at] = (uint8_t)slot;
+                e->idxOff[at]  = 0;
+            }
             if (e->localKind[slot] == SLOT_FLOAT && !e->dynamicLocal[slot] &&
                 fpWorthLoading(e, code, off + 3, stop)) {
                 unsigned idx = e->valueDepth - 1;
@@ -6580,6 +6762,29 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                          pendingImm12(e, e->valueDepth - 1, &kimm);
             if (foldK) e->kPend &= ~(1u << (e->valueDepth - 1));
 
+            /* Carried through the arithmetic: see Emit::idxKnown. Only the
+             * folded-literal form, which is exactly what `xs[j - 1]` and
+             * `xs[j + 1]` compile to, and only while the offset stays small --
+             * the loop head's guard has to add it to a count without
+             * overflowing, and a bound keeps that argument short. The overflow
+             * branch below deoptimises, so a shape that survives to the
+             * subscript describes arithmetic that actually happened. */
+            bool    idxCarry     = false;
+            uint8_t idxCarryBase = 0;
+            int32_t idxCarryOff  = 0;
+            if (foldK && e->valueDepth >= 2 &&
+                (e->idxKnown & (1u << (e->valueDepth - 2))) != 0 &&
+                kimm >= -4096 && kimm <= 4096) {
+                unsigned at = e->valueDepth - 2;
+                int64_t sum = (int64_t)e->idxOff[at] +
+                              (op == OP_SUB ? -kimm : kimm);
+                if (sum >= -4096 && sum <= 4096) {
+                    idxCarry     = true;
+                    idxCarryBase = e->idxBase[at];
+                    idxCarryOff  = (int32_t)sum;
+                }
+            }
+
             if (!popValue(e, &rb, &kb)) return false;
             if (!popValue(e, &ra, &ka)) return false;
             if (ka != kb) return false;   /* no implicit widening here */
@@ -6589,6 +6794,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * wrong answer rather than a decline. */
             if (ka != SLOT_INT || op == OP_DIV) return false;
             if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+            if (idxCarry) {
+                unsigned at = e->valueDepth - 1;
+                e->idxKnown |= 1u << at;
+                e->idxBase[at] = idxCarryBase;
+                e->idxOff[at]  = idxCarryOff;
+            }
             unsigned rd = pushReg(e) - 1;
             /* rd is the first operand's own register (two off, one on), so
              * inside a `try` the sum computes elsewhere: the overflow guard
@@ -6926,6 +7137,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                                        : e->localSeen[slot],
                                 (int)slot)) {
                     return false;
+                }
+                /* Same seed as OP_GET_LOCAL, and this is the arm that matters:
+                 * the emitter fuses `xs[j]` into GET_LOCAL2, so every subscript
+                 * in a stencil arrives here and nowhere else. */
+                if (e->localKind[slot] == SLOT_INT && slot <= UINT8_MAX) {
+                    unsigned at = e->valueDepth - 1;
+                    e->idxKnown |= 1u << at;
+                    e->idxBase[at] = (uint8_t)slot;
+                    e->idxOff[at]  = 0;
                 }
                 if (e->localKind[slot] == SLOT_FLOAT &&
                     !e->dynamicLocal[slot] &&
@@ -9171,6 +9391,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             unsigned rIdx = pushReg(e) - 1;
             unsigned rList = valueXReg(e, e->valueDepth - 2);
+            bool gHoisted = false;
 
             Value seenList = e->stackSeen[e->depth - 2];
             if (!IS_LIST(seenList)) {
@@ -9217,6 +9438,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* One `ldp` for both header fields: `items` at +16, `count`/`capacity` the adjacent int32s at +24, so
              * the pair's second half is `count | capacity << 32` and the bounds test reads it with uxtw -- one instruction per element read (life does nine per cell). */
             noteSlotIndexed(e, e->stackLocal[e->depth - 2]);
+            {
+                int32_t gOff = 0;
+                uint8_t gBase = 0;
+                bool gShaped = boundsCoveredAtHead(e, e->stackLocal[e->depth - 2],
+                                                   e->valueDepth - 1, &gOff,
+                                                   &gBase);
+                noteIndexSpan(e, e->stackLocal[e->depth - 2], gShaped, gOff,
+                              gBase);
+                gHoisted = gShaped;
+            }
             ListAccess gAcc = listAccessFor(e, rList,
                                             e->stackLocal[e->depth - 2],
                                             kind, JIT_SCRATCH_D);
@@ -9238,7 +9469,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else {
                 emitListHeader(e, rList, gItems, gCount);
             }
-            emitBoundsNormalise(e, rIdx, gCount, JIT_SCRATCH_B, true);
+            if (gHoisted) {
+                /* The head proved it. Only the normalisation copy is left, and
+                 * a shaped index is non-negative by that same proof, so even
+                 * that is just a move. */
+                emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
+            } else {
+                emitBoundsNormalise(e, rIdx, gCount, JIT_SCRATCH_B, true);
+            }
 
             /* Both arms below leave JIT_SCRATCH_C on the PAYLOAD rather than
              * on the element, which is what lets one load serve them: a boxed
@@ -9364,6 +9602,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             unsigned rList = valueXReg(e, e->valueDepth - 3);
 
             noteSlotIndexed(e, e->stackLocal[e->depth - 3]);
+            bool sHoisted;
+            {
+                int32_t sOff = 0;
+                uint8_t sBase = 0;
+                sHoisted = boundsCoveredAtHead(e, e->stackLocal[e->depth - 3],
+                                               e->valueDepth - 2, &sOff,
+                                               &sBase);
+                noteIndexSpan(e, e->stackLocal[e->depth - 3], sHoisted, sOff,
+                              sBase);
+            }
             ListAccess sAcc = listAccessFor(e, rList, e->stackLocal[e->depth - 3],
                                             vk, JIT_SCRATCH_D);
             /* Exactly what jaiListStoreAccepts allows, and for its reason: an
@@ -9384,7 +9632,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else {
                 emitListHeader(e, rList, sItems, sCount);
             }
-            emitBoundsNormalise(e, rIdx, sCount, JIT_SCRATCH_B, true);
+            if (sHoisted) {
+                emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
+            } else {
+                emitBoundsNormalise(e, rIdx, sCount, JIT_SCRATCH_B, true);
+            }
 
             int sSkip = listDispatchBegin(e, &sAcc, rList, JIT_SCRATCH_A);
             emitElemStoreAt(e, sAcc.stg, sItems, JIT_SCRATCH_B, vtag, rVal);
@@ -11470,6 +11722,14 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     e.elemSample = elemSample;
     e.elemMixed  = elemMixed;
     e.elemStg    = elemStg;
+    /* See Emit::rangeHead. */
+    if (top + 9u <= (uint32_t)fn->chunk.count &&
+        fn->chunk.code[top] == OP_FOR_RANGE_BIND) {
+        e.rangeHead = true;
+        e.rangeVar  = jaiReadU16(fn->chunk.code + top + 3);
+        e.rangeCur  = jaiReadU16(fn->chunk.code + top + 5);
+        e.rangeEnd  = jaiReadU16(fn->chunk.code + top + 7);
+    }
     e.osrTop = top;
     e.osrEnd = end;
     e.base = 0;
@@ -11546,6 +11806,10 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         probe.iterKind = iterKind; probe.elemSample = elemSample;
         probe.elemMixed = elemMixed;
         probe.elemStg = elemStg;
+        probe.rangeHead = e.rangeHead;
+        probe.rangeVar  = e.rangeVar;
+        probe.rangeCur  = e.rangeCur;
+        probe.rangeEnd  = e.rangeEnd;
         probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
         probe.noInline = noInline;
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
@@ -11559,6 +11823,10 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             probe.slotWriteLo[i] = UINT32_MAX;
             probe.slotIndexLo[i] = UINT32_MAX;
+            probe.spanLo[i]   = INT32_MAX;
+            probe.spanHi[i]   = INT32_MIN;
+            probe.spanOk[i]   = true;
+            probe.spanSeen[i] = false;
         }
         memcpy(probe.nullableLocal, nullable, sizeof probe.nullableLocal);
         for (unsigned i = 0; i < e.locals; i++) {
@@ -11681,6 +11949,11 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 e.slotIndexLo[i]  = probe.slotIndexLo[i];
                 e.slotIndexHi[i]  = probe.slotIndexHi[i];
                 e.slotIndexUse[i] = probe.slotIndexUse[i];
+                e.spanLo[i]       = probe.spanLo[i];
+                e.spanHi[i]       = probe.spanHi[i];
+                e.spanOk[i]       = probe.spanOk[i];
+                e.spanBase[i]     = probe.spanBase[i];
+                e.spanSeen[i]     = probe.spanSeen[i];
             }
             e.clobberCount = probe.clobberCount;
             e.clobberSpill = probe.clobberSpill;
