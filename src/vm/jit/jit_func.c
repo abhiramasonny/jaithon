@@ -10039,6 +10039,41 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     off += 2;
                     break;
                 }
+                /* `ord(c)` on a one-byte ASCII string is that byte, which is
+                 * the inverse of the string-index arm above and restricted the
+                 * same way: a multi-byte scalar needs decoding, and an empty
+                 * or longer string is an error nOrd raises. All three deopt to
+                 * the interpreter, which finishes the call properly.
+                 *
+                 * Worth an arm because it is the ONLY builtin json_parse
+                 * declines on -- 141 of its 73 declined sites name it, and
+                 * every one takes the whole enclosing loop down with it. A
+                 * scanner reads its input a character at a time and asks what
+                 * that character is; that is the shape. */
+                if (strcmp(nm, "ord") == 0 && ak == SLOT_OBJ &&
+                    IS_STRING(e->stackSeen[e->depth - 1])) {
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, ar,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                    branchOnDeoptInstStart(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, ar,
+                                       (unsigned)offsetof(ObjString, length)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 1));
+                    branchOnDeoptInstStart(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, ar,
+                                       (unsigned)offsetof(ObjString, chars)));
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_A, 0));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 128));
+                    branchOnDeoptInstStart(e, JAI_A64_HS);
+                    /* The argument's register is not written until every guard
+                     * has passed, so a bail still reconstructs the call with
+                     * the string the program passed. */
+                    emit(e, jaiA64MovX(ar, JIT_SCRATCH_A));
+                    e->stack[e->depth - 1] = SLOT_INT;
+                    dropCalleeEntry(e);
+                    off += 2;
+                    break;
+                }
                 bool toFloat = strcmp(nm, "float") == 0;
                 bool toInt   = strcmp(nm, "int") == 0;
                 if (toFloat && ak == SLOT_INT) {
