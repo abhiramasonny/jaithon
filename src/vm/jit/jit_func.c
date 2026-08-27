@@ -747,17 +747,6 @@ typedef struct {
          * where every subscript actually happens. */
         bool     rangeOk;
         uint16_t rVar, rCur, rEnd;
-        /* A bounds-only entry carries no header: itemsReg and countReg are
-         * unset and every subscript still loads the header for itself. It
-         * exists because the two halves of a hoist have very different prices.
-         * Keeping items+count live costs a REGISTER PAIR for the whole loop,
-         * and in the function tier -- where locals already occupy the
-         * callee-saved bank -- that cost more than the two instructions per
-         * access it saved: 0.876x on a list walk, 0.834x on a sieve. The
-         * bounds guard needs nothing live. It reads `count` once at the head
-         * into a scratch, proves the whole iteration space in range, and lets
-         * every access drop its compare and branch. */
-        bool     boundsOnly;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
@@ -2703,23 +2692,7 @@ static bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi) {
  * `slot`, or -1. `curOffset` is checked against the loop the entry was made
  * for, so an entry the walk has already left cannot be picked up again by a
  * later loop that happens to name the same slot. */
-/* The hoisted HEADER covering `slot` here, or -1. A bounds-only entry has no
- * header to offer and is invisible to this; boundsHoistFor is its counterpart. */
 static int hoistFor(const Emit *e, int slot) {
-    if (slot < 0 || e->inlining) return -1;
-    for (unsigned i = 0; i < e->hoistCount; i++) {
-        if (e->hoist[i].slot != (uint8_t)slot) continue;
-        if (e->hoist[i].boundsOnly) continue;
-        if (e->curOffset < e->hoist[i].top) continue;
-        if (e->curOffset >= e->hoist[i].end) continue;
-        return (int)i;
-    }
-    return -1;
-}
-
-/* Any entry covering `slot` here, header or not: what the bounds guard is
- * recorded against. */
-static int boundsHoistFor(const Emit *e, int slot) {
     if (slot < 0 || e->inlining) return -1;
     for (unsigned i = 0; i < e->hoistCount; i++) {
         if (e->hoist[i].slot != (uint8_t)slot) continue;
@@ -2795,31 +2768,24 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
  * The loop chosen is the OUTERMOST one the slot is invariant across, so the
  * load runs as rarely as the proof allows. */
 static void planHoists(Emit *e, ObjFunction *fn) {
-    if (e->measuring) return;
+    if (e->measuring || !e->osr) return;
     const Chunk *c = &fn->chunk;
-    /* The loop tier searches its own window; the function tier has none and
-     * searches the whole body. */
-    const uint32_t from = e->osr ? e->osrTop : 0u;
-    const uint32_t to   = e->osr ? e->osrEnd : (uint32_t)c->count;
 
     struct { uint32_t top, end, use; uint8_t slot; } cand[JIT_MAX_SLOTS + 1];
     unsigned ncand = 0;
 
     for (unsigned s = 0; s < e->locals && s <= JIT_MAX_SLOTS; s++) {
         if (e->localKind[s] != SLOT_LIST) continue;
-        /* localHomeX, not slotXReg: an unspilled function-tier local sits at a
-         * fixed callee-saved offset and has no slotXReg entry at all, which is
-         * what silently kept that whole tier out of here. */
-        if (localHomeX(e, s) == 0) continue;   /* no register to load from */
+        if (e->slotXReg[s] == 0) continue;   /* no register to load from */
         if (e->slotIndexUse[s] == 0) continue;
         uint32_t bestTop = 0, bestEnd = 0;
-        for (int at = (int)from; at < (int)to;) {
+        for (int at = (int)e->osrTop; at < (int)e->osrEnd;) {
             int len = instructionLength(c, at);
             if (len <= 0) break;
             uint32_t lt = (uint32_t)at;
             uint32_t le = loopBodyEnd(c, lt);
             at += len;
-            if (le == 0 || le <= lt || le > to) continue;
+            if (le == 0 || le <= lt || le > e->osrEnd) continue;
             /* Every subscript of this slot inside the loop... */
             if (e->slotIndexLo[s] < lt || e->slotIndexHi[s] >= le) continue;
             /* ...and no write to it anywhere in the loop. */
@@ -2840,41 +2806,26 @@ static void planHoists(Emit *e, ObjFunction *fn) {
         ncand++;
     }
 
-    /* Busiest slot first, and a candidate takes a header only while the pool
-     * can pay for one. Everything after that still gets a bounds-only entry:
-     * the guard is worth having on its own, and it is free of registers. */
-    while (e->hoistCount < JIT_MAX_HOIST) {
+    while (e->hoistCount < JIT_MAX_HOIST &&
+           e->hoistPoolCount - e->hoistTaken >= 2u) {
         unsigned pick = ncand, bestUse = 0;
         for (unsigned i = 0; i < ncand; i++) {
             if (cand[i].use > bestUse) { bestUse = cand[i].use; pick = i; }
         }
         if (pick == ncand) break;
         cand[pick].use = 0;                  /* taken */
-
+        unsigned rI = e->hoistPool[e->hoistTaken++];
+        unsigned rC = e->hoistPool[e->hoistTaken++];
+        if (rI < e->scratchRoom) e->scratchRoom = rI;
+        if (rC < e->scratchRoom) e->scratchRoom = rC;
+        e->hoist[e->hoistCount].top      = cand[pick].top;
+        e->hoist[e->hoistCount].end      = cand[pick].end;
+        e->hoist[e->hoistCount].slot     = cand[pick].slot;
+        e->hoist[e->hoistCount].itemsReg = (uint8_t)rI;
+        e->hoist[e->hoistCount].countReg = (uint8_t)rC;
+        e->hoist[e->hoistCount].rangeOk  = false;
         uint32_t ht = cand[pick].top;
-        /* A bounds guard is only emittable over a counted range, so a
-         * candidate that is neither header-hoistable nor range-headed is not
-         * worth an entry at all. */
-        bool ranged = ht + 9u <= (uint32_t)c->count &&
-                      c->code[ht] == OP_FOR_RANGE_BIND;
-        bool header = e->osr && e->hoistPoolCount - e->hoistTaken >= 2u;
-        if (!header && !ranged) continue;
-
-        unsigned rI = 0, rC = 0;
-        if (header) {
-            rI = e->hoistPool[e->hoistTaken++];
-            rC = e->hoistPool[e->hoistTaken++];
-            if (rI < e->scratchRoom) e->scratchRoom = rI;
-            if (rC < e->scratchRoom) e->scratchRoom = rC;
-        }
-        e->hoist[e->hoistCount].top        = cand[pick].top;
-        e->hoist[e->hoistCount].end        = cand[pick].end;
-        e->hoist[e->hoistCount].slot       = cand[pick].slot;
-        e->hoist[e->hoistCount].itemsReg   = (uint8_t)rI;
-        e->hoist[e->hoistCount].countReg   = (uint8_t)rC;
-        e->hoist[e->hoistCount].boundsOnly = !header;
-        e->hoist[e->hoistCount].rangeOk    = false;
-        if (ranged) {
+        if (ht + 9u <= (uint32_t)c->count && c->code[ht] == OP_FOR_RANGE_BIND) {
             e->hoist[e->hoistCount].rangeOk = true;
             e->hoist[e->hoistCount].rVar = jaiReadU16(c->code + ht + 3);
             e->hoist[e->hoistCount].rCur = jaiReadU16(c->code + ht + 5);
@@ -2920,7 +2871,7 @@ static bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
      * nothing at all and measure exactly 1.000x. */
     if (e->measuring) return true;
     if (!e->spanOk[slot] || e->spanLo[slot] > e->spanHi[slot]) return false;
-    int h = boundsHoistFor(e, slot);
+    int h = hoistFor(e, slot);
     if (h < 0 || !e->hoist[h].rangeOk) return false;
     /* The guard is emitted at THIS hoist's loop head, so it is that loop's
      * variable the index has to be measured against. */
@@ -2939,16 +2890,13 @@ static void emitHoistsAt(Emit *e, uint32_t off) {
     if (e->inlining) return;
     for (unsigned i = 0; i < e->hoistCount; i++) {
         if (e->hoist[i].top != off) continue;
-        if (!e->hoist[i].boundsOnly) {
-            /* Outside the loop, so the function tier pays its two instructions
-             * once per entry rather than per element. */
-            if (!e->osr) {
-                emitListBoxedGuard(e, localHomeX(e, e->hoist[i].slot),
-                                   JIT_SCRATCH_A);
-            }
-            emitListHeader(e, localHomeX(e, e->hoist[i].slot),
-                           e->hoist[i].itemsReg, e->hoist[i].countReg);
+        /* Outside the loop, so the function tier pays its two instructions
+         * once per entry rather than per element. */
+        if (!e->osr) {
+            emitListBoxedGuard(e, e->slotXReg[e->hoist[i].slot], JIT_SCRATCH_A);
         }
+        emitListHeader(e, e->slotXReg[e->hoist[i].slot],
+                       e->hoist[i].itemsReg, e->hoist[i].countReg);
 
         /* And, once, the bounds every subscript of this slot inside the loop
          * would otherwise check for itself. The counter runs [IDX, LIM), so
@@ -2961,7 +2909,7 @@ static void emitHoistsAt(Emit *e, uint32_t off) {
          * loop would hand the whole rest of the function to the interpreter
          * for no reason. */
         unsigned sl = e->hoist[i].slot;
-        if (!e->hoist[i].rangeOk) continue;
+        if (!e->osr || !e->hoist[i].rangeOk) continue;
         if (!e->spanOk[sl] || e->spanLo[sl] > e->spanHi[sl]) continue;
         if (!e->spanSeen[sl] || e->spanBase[sl] != e->hoist[i].rVar) continue;
         /* localIn, not localHomeX: the counter and the end are temporaries the
@@ -2990,17 +2938,7 @@ static void emitHoistsAt(Emit *e, uint32_t off) {
 
         emitAddSubImm(e, JIT_SCRATCH_A, rEnd, (int64_t)e->spanHi[sl] - 1,
                       false);
-        /* A bounds-only entry keeps no count register, so read it here. The
-         * load costs one instruction ONCE per loop entry and buys back the
-         * register pair whose whole-loop cost is what sank the header hoist in
-         * the function tier. */
-        unsigned rCount = e->hoist[i].countReg;
-        if (e->hoist[i].boundsOnly) {
-            rCount = JIT_SCRATCH_D;
-            emit(e, jaiA64LdrW(rCount, localHomeX(e, sl),
-                               (unsigned)offsetof(ObjList, count)));
-        }
-        emit(e, jaiA64SubsXUxtw(31, JIT_SCRATCH_A, rCount));
+        emit(e, jaiA64SubsXUxtw(31, JIT_SCRATCH_A, e->hoist[i].countReg));
         branchOnDeoptAt(e, JAI_A64_HS, off, false);
 
         if (empty < e->count && e->count <= JIT_MAX_INSTS) {
