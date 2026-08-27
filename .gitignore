@@ -62,3 +62,7 @@ __pycache__/
 /docs/notes/
 /docs/RESUME.md
 /docs/repro/
+
+# Agent research and working notes. Local only -- GitHub stays free of them,
+# same rule spec/ follows.
+docs/
