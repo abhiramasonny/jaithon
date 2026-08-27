@@ -578,7 +578,6 @@ typedef struct {
      * width, so this is as much a commitment as an instance slot's class. The
      * function tier samples nothing and leaves every entry BOXED, which is the
      * storage a list built by compiled code always has. */
-    uint8_t   localStg[JIT_MAX_SLOTS + 1];
     /* Storage of the list an iterKind 2 head walks, from the same sample. */
     uint8_t   elemStg;
     /* Which of those pins the emission is allowed to BELIEVE. Decided once,
@@ -1367,6 +1366,20 @@ static bool localInRange(Emit *e, unsigned slot) {
     if (slot < e->base || slot >= e->base + e->locals) return false;
     if (slot > e->maxSlotUsed) e->maxSlotUsed = slot;
     return true;
+}
+
+/* The ListStore the frame's slot is backed by, or BOXED for anything else.
+ *
+ * Read one slot at a time, and only once the walk has decided the slot holds a
+ * LIST -- the same hazard as the kind sweep above, and the storage sweep this
+ * replaces had it too: it dereferenced every slot carrying a VAL_OBJ tag,
+ * including the untouched ones. */
+static uint8_t localStgOf(const Emit *e, unsigned slot) {
+    if (slot > JIT_MAX_SLOTS || e->observed == NULL) return LIST_STORE_BOXED;
+    if (e->localKind[slot] != SLOT_LIST) return LIST_STORE_BOXED;
+    Value v = e->observed[slot];
+    if (!IS_LIST(v)) return LIST_STORE_BOXED;
+    return AS_LIST(v)->stg;
 }
 
 static bool localObserved(Emit *e, unsigned slot) {
@@ -2471,7 +2484,7 @@ static ListAccess listAccessFor(Emit *e, unsigned rList, int slot,
     ListAccess a;
     if (e->osr && slot >= 0 && slot <= (int)JIT_MAX_SLOTS &&
         e->localStgPin[slot]) {
-        a.stg = e->localStg[slot];
+        a.stg = localStgOf(e, slot);
         a.alt = a.stg;
         a.dynamic = false;
         return a;
@@ -11457,12 +11470,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     e.elemSample = elemSample;
     e.elemMixed  = elemMixed;
     e.elemStg    = elemStg;
-    /* From the live frame, which is the whole reason the loop tier can pin a
-     * storage at all: the function tier compiles with no values in hand. */
-    for (unsigned i = 0; i < (unsigned)fn->maxSlots && i <= JIT_MAX_SLOTS; i++) {
-        e.localStg[i] = IS_LIST(slots[i]) ? AS_LIST(slots[i])->stg
-                                          : (uint8_t)LIST_STORE_BOXED;
-    }
     e.osrTop = top;
     e.osrEnd = end;
     e.base = 0;
@@ -11485,6 +11492,19 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     for (unsigned i = 0; i < e.locals; i++) {
         Value v = slots[i];
         e.localTyped[i] = true;
+        /* A frame's slots run to fn->maxSlots, and the ones the program has
+         * not reached yet hold whatever the last frame at that depth left --
+         * including a VAL_OBJ tag over a NULL pointer. IS_LIST and IS_INSTANCE
+         * both dereference before they test, so without this the COMPILER
+         * reads Obj::type off address zero: EXC_BAD_ACCESS inside
+         * compileOsrOnce, once in eight runs of tests/bench/jaiframe/frameops
+         * and never in the test suite, because it needs a slot that is both
+         * stale and untouched at the moment a loop goes hot. */
+        if (IS_OBJ(v) && AS_OBJ(v) == NULL) {
+            e.localKind[i] = SLOT_OPAQUE;
+            e.localTyped[i] = false;
+            continue;
+        }
         if (IS_INT(v))        e.localKind[i] = SLOT_INT;
         else if (IS_FLOAT(v)) e.localKind[i] = SLOT_FLOAT;
         else if (IS_BOOL(v))  e.localKind[i] = SLOT_BOOL;
@@ -11526,7 +11546,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         probe.iterKind = iterKind; probe.elemSample = elemSample;
         probe.elemMixed = elemMixed;
         probe.elemStg = elemStg;
-        memcpy(probe.localStg, e.localStg, sizeof probe.localStg);
         probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
         probe.noInline = noInline;
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
@@ -12107,7 +12126,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
          * own, and demanding a storage of it here would refuse entry to a loop
          * the body would have run correctly. */
         uint8_t stg = e.localKind[i] == SLOT_LIST && e.localStgPin[i]
-                          ? e.localStg[i]
+                          ? localStgOf(&e, i)
                           : (uint8_t)LIST_STG_ANY;
         form->kinds[i] = (uint8_t)((unsigned)e.localKind[i] | ((unsigned)stg << 4));
     }
