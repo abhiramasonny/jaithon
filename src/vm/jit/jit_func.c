@@ -8988,7 +8988,67 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             Value seen = localObserved(e, slot) ? e->observed[slot]
                                                 : e->localSeen[slot];
             if (!IS_INSTANCE(seen)) {
-                return subWhy(e, "no live receiver to read local %u's field off", slot);
+                /* No sample -- but the DECLARATION may still say enough, and
+                 * the receiver is a proven instance either way: localKind is
+                 * SLOT_INST or SLOT_MAYBE_INST with a pinned class, and the
+                 * null check above has already run. Only the field's own kind
+                 * was missing.
+                 *
+                 * The sibling arm at OP_GET_FIELD has had this since the
+                 * accessor-then-field-read chain was fixed; this one did not,
+                 * and the asymmetry was worth **5.2% of parser.jai's
+                 * interpreted work** by exact attribution -- the largest single
+                 * reason left once the declared-ANY fields were given a code.
+                 *
+                 * Everything below is the same shape as there: the tag is
+                 * guarded, a list or str is proved by Obj.type as well because
+                 * VAL_OBJ is every heap object, and a str carries an interned
+                 * empty string as a sample so the arms downstream that ask
+                 * `stringOperand` can fire. */
+                SlotKind lkind;
+                unsigned ltag;
+                if (!jitDeclaredFieldKindEnabled() ||
+                    !declaredScalarFieldKind(info->typeId, &lkind, &ltag)) {
+                    return subWhy(e,
+                        "no live receiver to read local %u's field off, and its "
+                        "declared kind (%u) is not one this predicts",
+                        slot, (unsigned)info->typeId);
+                }
+                unsigned lbase = (unsigned)offsetof(ObjInstance, fields) +
+                                 (unsigned)info->slot * (unsigned)sizeof(Value);
+                unsigned lrr = localIn(e, slot, JIT_SCRATCH_C);
+                /* Guarded before anything is pushed, so a deopt resumes at this
+                 * instruction with the interpreter's stack untouched. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, lrr, lbase));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ltag));
+                branchOnDeopt(e, JAI_A64_NE);
+                Value lprobe = NULL_VAL;
+                if (lkind == SLOT_LIST || info->typeId == FIELD_KIND_STR) {
+                    unsigned want = lkind == SLOT_LIST ? (unsigned)OBJ_LIST
+                                                       : (unsigned)OBJ_STRING;
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_B, lrr, lbase + 8));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, want));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    if (want == (unsigned)OBJ_STRING) {
+                        ObjString *empty = jaiStringIntern("", 0);
+                        if (empty == NULL) return false;
+                        lprobe = OBJ_VAL((Obj *)empty);
+                    }
+                }
+                if (!pushValue3(e, lkind, 0, NULL, lprobe, -1)) return false;
+                if (!IS_NULL(lprobe)) {
+                    e->stackObjType[e->depth - 1] = (uint8_t)(OBJ_STRING + 1);
+                }
+                if (lkind == SLOT_BOOL) {
+                    /* One byte: BOOL_VAL writes only the union's bool member. */
+                    emit(e, jaiA64LdrByte(pushReg(e) - 1, lrr, lbase + 8));
+                } else {
+                    emit(e, jaiA64LdrX(pushReg(e) - 1, lrr, lbase + 8));
+                }
+                off += 8;
+                break;
             }
             ObjInstance *inst = AS_INSTANCE(seen);
             if (info->slot >= inst->fieldCount) {

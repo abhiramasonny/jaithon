@@ -26,7 +26,7 @@
 #: with a real function in it -- confirmed the hard way while investigating
 #: this fix, where `_push` turned out to be two unrelated functions of that
 #: name in the self-hosted compiler (see docs/agents/cleared-compiler.md).
-# jit-compiles: jfk_read_line, jfk_read_scale, jfk_read_ready, jfk_read_marks, jfk_read_label
+# jit-compiles: jfk_read_line, jfk_read_scale, jfk_read_ready, jfk_read_marks, jfk_read_label, jfk_read_via_local
 from std.test import assert_eq, assert_near, assert_true
 
 class JfkInner {
@@ -88,6 +88,15 @@ fn jfk_read_marks(o: JfkOuter) -> int { return len(jfk_inner_of(o).marks) }
 
 fn jfk_read_label(o: JfkOuter) -> int { return jfk_inner_of(o).label.len() }
 
+#: The LOCAL-receiver twin. Binding the predicted instance to a local first
+#: takes OP_GET_FIELD_LOCAL rather than OP_GET_FIELD, and that arm had no
+#: declared-kind fallback at all -- the asymmetry was worth 5.2% of parser.jai's
+#: interpreted work and 22 compiled bodies.
+fn jfk_read_via_local(o: JfkOuter) -> int {
+    let inner = jfk_inner_of(o)
+    return inner.line + inner.label.len() + len(inner.marks)
+}
+
 #: Settles jfk_inner_of into its own standalone compiled form, called from
 #: OUTSIDE any of the three readers, before any of them run: a reader's own
 #: warm-up loop calls jfk_inner_of once per iteration too, so without this
@@ -134,6 +143,21 @@ fn jfk_warm_label(o: JfkOuter) -> int {
         t += jfk_read_label(o)
     }
     return t
+}
+
+fn jfk_warm_via_local(o: JfkOuter) -> int {
+    var t = 0
+    for _i in 0..200 {
+        t += jfk_read_via_local(o)
+    }
+    return t
+}
+
+pub fn test_fields_read_off_a_predicted_local() -> void {
+    let outer = JfkOuter(JfkInner(11, 0.5, true))
+    #: 11 + len("abc") + len([7,8,9]).
+    assert_eq(jfk_warm_via_local(outer), 17 * 200, "warm")
+    assert_eq(jfk_read_via_local(outer), 17, "and after")
 }
 
 pub fn test_str_field_off_a_predicted_receiver() -> void {
