@@ -6329,6 +6329,24 @@ static bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop) {
     return true;
 }
 
+/* Why an arm jumps to `unarmedOpcode` instead of returning a reason.
+ *
+ * Every opcode added to the switch converts what used to be the `default`
+ * case's partial walk into an outright refusal, and that is a regression: a
+ * body that compiled a prefix and interpreted the rest now compiles none of
+ * it. Adding `not` alone cost 80 whole-body declines in the resolver, all of
+ * them the measuring pass seeing SLOT_INT where a bool would later be.
+ *
+ * It also makes each arm's kill switch honest. With a hard refusal the "off"
+ * side of an A/B declines the body, which is worse than the no-arm behaviour
+ * it stands in for, and every ratio measured against it is inflated.
+ *
+ * The jump has to land in `default` rather than in a helper: the unarmed path
+ * emits an unconditional branch, so the fall-through edge is gone and the walk
+ * has to be told (`afterUncond`). A helper returning "I handled it" cannot say
+ * that. */
+
+
 /* Where the body proper starts. A defaulted parameter compiles to a thunk of
  * its own at the TOP of the chunk with the body hopped to over an
  * unconditional jump -- `fn matches(x: int, want: int = -1)` is exactly
@@ -6849,8 +6867,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     break;
                 }
                 if (built != (uint8_t)(OBJ_DICT + 1)) {
-                    return subWhy(e, "an elem-kind stamp on a %s",
-                                  slotKindName(e->stack[e->depth - 1]));
+                    goto unarmedOpcode;
                 }
                 unsigned dr = valueXReg(e, e->valueDepth - 1);
                 /* The prediction came from the build instruction just below,
@@ -8998,9 +9015,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * `not in` is the same call with the sense flipped, in its own
              * entry point rather than an argc flag -- a wider descriptor would
              * name a stack entry past the operands. */
-            if (!jitMembership()) return subWhy(e, "the membership arm is off");
-            if (!e->callsOut) return subWhy(e, "the body cannot call out");
-            if (e->depth < 2) return subWhy(e, "not enough operands");
+            if (!jitMembership() || !e->callsOut || e->depth < 2) {
+                goto unarmedOpcode;
+            }
             if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
                                 code[off] == OP_IN ? (void *)&jitContains
                                                    : (void *)&jitNotContains)) {
@@ -9036,12 +9053,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             bool isDict = code[off] == OP_BUILD_DICT;
             unsigned n = jaiReadU16(code + off + 1);
             unsigned operands = isDict ? n * 2u : n;
-            if (!jitTuple()) return subWhy(e, "the container arm is off");
-            if (operands > JIT_MAX_ARGS_OUT) {
-                return subWhy(e, "a %u-element literal", n);
+            if (!jitTuple() || operands > JIT_MAX_ARGS_OUT || !e->callsOut ||
+                e->depth < operands) {
+                goto unarmedOpcode;
             }
-            if (!e->callsOut) return subWhy(e, "the body cannot call out");
-            if (e->depth < operands) return subWhy(e, "not enough operands");
             if (!emitDescriptor(e, NULL_VAL, e->depth - operands, operands,
                                 isDict ? (void *)&jitBuildDict
                                        : (void *)&jitBuildSet)) {
@@ -9074,10 +9089,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * THE WALK, and `let p = (x, y)` in a loop body is common enough
              * that the whole body after it ran interpreted. */
             unsigned n = jaiReadU16(code + off + 1);
-            if (!jitTuple()) return subWhy(e, "the tuple arm is switched off");
-            if (n > JIT_MAX_ARGS_OUT) return subWhy(e, "a %u-element tuple", n);
-            if (!e->callsOut) return subWhy(e, "the body cannot call out");
-            if (e->depth < n) return subWhy(e, "not enough operands");
+            if (!jitTuple() || n > JIT_MAX_ARGS_OUT || !e->callsOut ||
+                e->depth < n) {
+                goto unarmedOpcode;
+            }
             if (!emitDescriptor(e, NULL_VAL, e->depth - n, n,
                                 (void *)&jitBuildTuple)) {
                 return false;
@@ -9106,11 +9121,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              *
              * No arm existed, so `not` ENDED THE WALK the way OP_NEG did:
              * `if not a` in a loop was 23,252,579 interpreted instructions. */
-            if (!jitNegate()) return subWhy(e, "the unary arm is switched off");
-            if (e->depth < 1) return subWhy(e, "nothing to negate");
-            if (e->stack[e->depth - 1] != SLOT_BOOL) {
-                return subWhy(e, "`not` of a %s",
-                              slotKindName(e->stack[e->depth - 1]));
+            if (!jitNegate() || e->depth < 1 ||
+                e->stack[e->depth - 1] != SLOT_BOOL) {
+                goto unarmedOpcode;
             }
             {
                 unsigned nr = pushReg(e) - 1;
@@ -9123,11 +9136,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
         case OP_BNOT: {
             /* `~x` is `x ^ -1`, and the model has already proved the int. */
-            if (!jitNegate()) return subWhy(e, "the unary arm is switched off");
-            if (e->depth < 1) return subWhy(e, "nothing to complement");
-            if (e->stack[e->depth - 1] != SLOT_INT) {
-                return subWhy(e, "`~` of a %s",
-                              slotKindName(e->stack[e->depth - 1]));
+            if (!jitNegate() || e->depth < 1 ||
+                e->stack[e->depth - 1] != SLOT_INT) {
+                goto unarmedOpcode;
             }
             {
                 unsigned nr = pushReg(e) - 1;
@@ -9143,12 +9154,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * the type and does nothing else. The model has already proved it,
              * so this emits nothing at all; the point is only that the walk
              * does not stop here. */
-            if (!jitNegate()) return subWhy(e, "the unary arm is switched off");
-            if (e->depth < 1) return subWhy(e, "nothing to sign");
-            if (e->stack[e->depth - 1] != SLOT_INT &&
-                e->stack[e->depth - 1] != SLOT_FLOAT) {
-                return subWhy(e, "unary `+` on a %s",
-                              slotKindName(e->stack[e->depth - 1]));
+            if (!jitNegate() || e->depth < 1 ||
+                (e->stack[e->depth - 1] != SLOT_INT &&
+                 e->stack[e->depth - 1] != SLOT_FLOAT)) {
+                goto unarmedOpcode;
             }
             off += 1;
             break;
@@ -12347,8 +12356,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         default:
-            /* An opcode this tier does not speak: interpreted from here, rather
-             * than the whole function interpreted. See emitUnarmedDeopt. */
+        unarmedOpcode:
+            /* An opcode this tier does not speak -- or an arm that cannot emit
+             * for the shape in front of it: interpreted from here, rather than
+             * the whole function interpreted. See emitUnarmedDeopt. */
             if (!emitUnarmedDeopt(e, &fn->chunk, &off, stop)) {
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s declined at %s\n",

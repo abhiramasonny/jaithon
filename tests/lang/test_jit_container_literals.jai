@@ -7,8 +7,13 @@
 #:
 #: Measured in one binary through `JAITHON_JIT_TUPLE`:
 #:
-#:   {"a": i & 3, "b": i & 7}   38,000,320 ->  7,443    0.21s -> 0.17s   1.2x
-#:   {i & 3, i & 7}             34,000,320 -> 24,560    0.46s -> 0.31s   1.4x
+#:   {"a": i & 3, "b": i & 7}   18,021,998 -> 41,510    0.19s -> 0.13s    1.45x
+#:   {i & 3, i & 7}             18,005,774 -> 18,270    0.20s -> 0.145s   1.4x
+#:
+#: Nine samples each, and worth saying why: three samples put the set literal
+#: at 0.29/0.31/0.18 against 0.20, which reads as a regression. Load average
+#: was above 4 with other work on the machine. The switched-off side takes the
+#: unarmed path, so these are ratios against no arm at all.
 #:
 #: The clock moves less than the instruction count because allocating the dict
 #: is most of what the microbenchmark does -- the arm cannot make jaiDictNew

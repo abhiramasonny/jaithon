@@ -4,8 +4,11 @@
 #: point on. Measured in one binary through `JAITHON_JIT_MEMBERSHIP` and
 #: `JAITHON_JIT_TUPLE`:
 #:
-#:   (i & 15, i & 7)     40,000,320 -> 66,858     0.11s -> 0.05s   2.2x
-#:   (i & 7) in xs       21,250,327 -> 566,117    0.05s -> 0.03s   1.7x
+#:   (i & 15, i & 7)     24,018,742 -> 46,378       0.12s -> 0.055s  2.2x
+#:   (i & 7) in xs        9,824,657 -> 1,363,630    0.08s -> 0.03s   2.7x
+#:
+#: The switched-off side takes the unarmed path, so these are ratios against no
+#: arm at all -- see the note above `unarmedOpcode`.
 #:
 #: Neither arm makes the operation itself faster. `in` calls out to the very
 #: same `jaiContainsOp` the interpreter runs, and the tuple to `jaiTupleNew`;

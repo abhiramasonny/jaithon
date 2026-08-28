@@ -6,8 +6,12 @@
 #:
 #:   -(i & 255)          48,000,320 -> 2,310,930    0.09s -> 0.01s   9x
 #:   -x on floats        38,000,322 ->   253,666    0.10s -> 0.01s  10x
-#:   not a               41,000,320 -> 2,494,614    0.08s -> 0.01s   8x
-#:   ~(i & 255)          22,000,320 -> 2,576,408    0.04s -> 0.01s   4x
+#:   not a               23,107,814 -> 1,450,119    0.08s -> 0.01s   8x
+#:   ~(i & 255)          12,169,798 ->    52,249    0.06s -> 0.01s   6x
+#:
+#: The switched-off side of that A/B takes the same unarmed path the `default`
+#: case used to, so these are ratios against no arm at all rather than against
+#: a declined body -- see the note above `unarmedOpcode`.
 #:
 #: `not` is an xor with one, because SLOT_BOOL's contract is "0 or 1 in a
 #: register" and the interpreter REQUIREs a bool. `~x` is an xor with -1. Unary
