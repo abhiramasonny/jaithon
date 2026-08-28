@@ -20,6 +20,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <string.h>
 
 #include "native/native.h"
@@ -40,6 +41,134 @@ static void dispatchTraceTick(int isGraph) {
     }
     if (!gDispatchTraceOn) return;
     if (isGraph) gDispatchTraceGraph++; else gDispatchTraceKernel++;
+}
+
+/* ------------------------------------------------------------------ */
+/* Occupancy meter                                                      */
+/* ------------------------------------------------------------------ */
+
+/* How much of the wall clock the GPU was actually working, per process.
+ *
+ * The question this exists to answer is not "which device should run this" --
+ * that one is largely settled here, and settled correctly. It is "how much of
+ * the time is either side idle waiting for the other", which nothing in this
+ * tree could report. The knob that would fix an idle GPU
+ * (JAITHON_GPU_AUTO_COMMIT, see autoCommitThreshold) is off by default
+ * precisely because one global threshold is +5% on jaicv and -26% on
+ * jaitensor, and there was no way to see which side of that a given workload
+ * sits on.
+ *
+ * Off unless JAITHON_GPU_METER is set, and the increments themselves are
+ * gated, not merely the printing, so an ordinary run pays one predictable
+ * not-taken branch per command buffer.
+ *
+ * THE SUM IS NOT THE ANSWER. JAI_GPU_MAX_IN_FLIGHT is 16 and flushAsyncLocked
+ * keeps that many buffers running at once, so adding their durations counts
+ * the same wall nanosecond up to sixteen times and reports occupancy above
+ * 1.0. Spans are recorded raw and merged at report time. */
+#define JAI_METER_MAX 262144
+
+typedef struct {
+    double   start;      /* MTLCommandBuffer.GPUStartTime, seconds */
+    double   end;
+    uint32_t dispatches;
+} MeterSpan;
+
+static MeterSpan        gMeterSpans[JAI_METER_MAX];
+static _Atomic uint32_t gMeterSpanCount;
+static _Atomic uint64_t gMeterHostWaitNs;
+static _Atomic uint32_t gMeterHostWaits;
+static _Atomic uint64_t gMeterHostWaitMaxNs;
+static _Atomic uint32_t gMeterDropped;
+static double           gMeterWallStart;
+static int              gMeterOn = -1;
+
+static double meterNow(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void meterReport(void);
+
+static int meterOn(void) {
+    if (gMeterOn < 0) {
+        gMeterOn = getenv("JAITHON_GPU_METER") != NULL ? 1 : 0;
+        if (gMeterOn) {
+            gMeterWallStart = meterNow();
+            atexit(meterReport);
+        }
+    }
+    return gMeterOn;
+}
+
+/* One finished command buffer. Called from Metal's completion thread for the
+ * async path and inline for the four synchronous ones, so the slot claim is
+ * atomic and the write is to a slot nobody else owns. */
+static void meterNote(id<MTLCommandBuffer> done, uint32_t dispatches) {
+    if (!meterOn() || done == nil) return;
+    const uint32_t slot = atomic_fetch_add(&gMeterSpanCount, 1u);
+    if (slot >= JAI_METER_MAX) { atomic_fetch_add(&gMeterDropped, 1u); return; }
+    gMeterSpans[slot].start      = done.GPUStartTime;
+    gMeterSpans[slot].end        = done.GPUEndTime;
+    gMeterSpans[slot].dispatches = dispatches;
+}
+
+static void meterHostWait(uint64_t ns) {
+    if (!meterOn()) return;
+    atomic_fetch_add(&gMeterHostWaitNs, ns);
+    atomic_fetch_add(&gMeterHostWaits, 1u);
+    uint64_t seen = atomic_load(&gMeterHostWaitMaxNs);
+    while (ns > seen &&
+           !atomic_compare_exchange_weak(&gMeterHostWaitMaxNs, &seen, ns)) { }
+}
+
+static int meterSpanCmp(const void *a, const void *b) {
+    const double x = ((const MeterSpan *)a)->start;
+    const double y = ((const MeterSpan *)b)->start;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static void meterReport(void) {
+    uint32_t n = atomic_load(&gMeterSpanCount);
+    if (n > JAI_METER_MAX) n = JAI_METER_MAX;
+    const double wall = meterNow() - gMeterWallStart;
+
+    /* Sort by start and merge overlaps -- see the note above on why a sum
+     * would be wrong. Also reports the sum, because sum/union is exactly the
+     * average depth of the pipeline and that is the number that says whether
+     * more in-flight buffers would help. */
+    qsort(gMeterSpans, n, sizeof gMeterSpans[0], meterSpanCmp);
+    double busy = 0.0, raw = 0.0, curS = 0.0, curE = 0.0;
+    uint64_t dispatches = 0;
+    bool open = false;
+    for (uint32_t i = 0; i < n; i++) {
+        const double s = gMeterSpans[i].start, e = gMeterSpans[i].end;
+        dispatches += gMeterSpans[i].dispatches;
+        if (e <= s) continue;
+        raw += e - s;
+        if (!open) { curS = s; curE = e; open = true; continue; }
+        if (s <= curE) { if (e > curE) curE = e; continue; }
+        busy += curE - curS;
+        curS = s; curE = e;
+    }
+    if (open) busy += curE - curS;
+
+    const double waitS = (double)atomic_load(&gMeterHostWaitNs) * 1e-9;
+    fprintf(stderr,
+            "\n[gpu meter] wall %.1f ms | gpu busy %.1f ms | occupancy %.3f\n"
+            "             buffers %u  dispatches %llu  pipeline depth %.2f\n"
+            "             host waits %u  waiting %.1f ms  longest %.1f ms\n",
+            wall * 1e3, busy * 1e3, wall > 0.0 ? busy / wall : 0.0,
+            n, (unsigned long long)dispatches, busy > 0.0 ? raw / busy : 0.0,
+            atomic_load(&gMeterHostWaits), waitS * 1e3,
+            (double)atomic_load(&gMeterHostWaitMaxNs) * 1e-6);
+    const uint32_t dropped = atomic_load(&gMeterDropped);
+    if (dropped != 0) {
+        fprintf(stderr, "             %u buffers past the %d-span cap were not"
+                        " counted; occupancy is a LOWER bound\n",
+                dropped, JAI_METER_MAX);
+    }
 }
 
 /* Below this much arithmetic the upload, encode and queue wait cost more than
@@ -1431,6 +1560,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
         [encoder endEncoding];
         [commands commit];
         [commands waitUntilCompleted];
+        meterNote(commands, 1u);
         return [commands status] == MTLCommandBufferStatusCompleted;
     }
 }
@@ -1502,8 +1632,9 @@ static void commitOpenLocked(void) {
     if (gAsyncCommands == nil) return;
     [gAsyncEncoder endEncoding];
     const uint64_t mine = gOpenBatch;
+    const uint32_t encoded = gOpenEncoded;
     [gAsyncCommands addCompletedHandler:^(id<MTLCommandBuffer> done) {
-        (void)done;
+        meterNote(done, encoded);
         noteDone(mine);
     }];
     [gAsyncCommands commit];
@@ -1602,15 +1733,29 @@ bool jaiGpuSynchronize(void) {
  * of that outstanding falls back to draining the queue. */
 bool jaiGpuWaitFor(JaiGpuBuffer *b) {
     if (b == NULL) return true;
-    if (!fineSyncEnabled() || gQueue == nil) return jaiGpuSynchronize();
+    /* The other half of occupancy: an idle GPU and a blocked host are the two
+     * ways a pipeline loses time, and only one of them shows up in the span
+     * union above. */
+    const double waitFrom = meterOn() ? meterNow() : 0.0;
+    if (!fineSyncEnabled() || gQueue == nil) {
+        const bool ok = jaiGpuSynchronize();
+        if (waitFrom != 0.0) {
+            meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
+        }
+        return ok;
+    }
 
     uint64_t want = 0;
     @synchronized(gQueue) {
         if (gMlpSide != 0 || gMlpAccSide != 0 || gMlp3Side != 0) want = UINT64_MAX;
         else if (b->lastBatch > doneBatch()) want = b->lastBatch;
     }
-    if (want == UINT64_MAX) return jaiGpuSynchronize();
-    if (want == 0) return true;
+    if (want == UINT64_MAX) {
+        const bool ok = jaiGpuSynchronize();
+        if (waitFrom != 0.0) meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
+        return ok;
+    }
+    if (want == 0) return true;   /* nothing pending: not a wait */
 
     @autoreleasepool {
         NSArray<id<MTLCommandBuffer>> *pending = nil;
@@ -1631,10 +1776,16 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
         }
         for (id<MTLCommandBuffer> commands in pending) {
             [commands waitUntilCompleted];
-            if ([commands status] != MTLCommandBufferStatusCompleted) return false;
+            if ([commands status] != MTLCommandBufferStatusCompleted) {
+                if (waitFrom != 0.0) {
+                    meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
+                }
+                return false;
+            }
         }
         if (reached != 0) noteDone(reached);
     }
+    if (waitFrom != 0.0) meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
     return true;
 }
 
@@ -4335,6 +4486,7 @@ static bool deviceElementwise(id<MTLComputePipelineState> pipeline,
 
         [commands commit];
         [commands waitUntilCompleted];
+        meterNote(commands, 1u);
 
         if ([commands status] != MTLCommandBufferStatusCompleted)
             return false;
@@ -4441,6 +4593,7 @@ static bool deviceMatMul(const double *a, const double *b, double *out,
 
         [commands commit];
         [commands waitUntilCompleted];
+        meterNote(commands, 1u);
 
         if ([commands status] != MTLCommandBufferStatusCompleted)
             return false;
@@ -4520,6 +4673,7 @@ static bool deviceReduceSum(const double *a, size_t n, double *out) {
 
         [commands commit];
         [commands waitUntilCompleted];
+        meterNote(commands, 1u);
 
         if ([commands status] != MTLCommandBufferStatusCompleted)
             return false;
