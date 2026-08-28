@@ -10934,7 +10934,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 if (dkind == SLOT_INST) {
                     /* Two shapes in one dict cannot be told apart by the tag,
-                     * and the walk above only sampled a prefix. */
+                     * and the walk above only sampled a prefix.
+                     *
+                     * The object type comes first, for the reason the shared
+                     * return path gives: VAL_OBJ covers every heap object, and
+                     * reading `klass` off a string lands in its length/hash and
+                     * dereferences it. A dict holding a Box under one key and a
+                     * str under another SEGFAULTED the VM from ordinary code --
+                     * `d[k]` in any body hot enough to compile.
+                     *
+                     * The tag test above cannot stand in for this: it is the
+                     * same test the sampled prefix already passed. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, drd,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 1), true);
                     emit(e, jaiA64LdrX(JIT_SCRATCH_A, drd,
                                        (unsigned)offsetof(ObjInstance, klass)));
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
