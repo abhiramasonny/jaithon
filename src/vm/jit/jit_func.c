@@ -10900,25 +10900,32 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                          * FIELD whose kind only the declaration knows. Measured
                          * flat on the clock.
                          *
-                         * THE CHAIN, measured link by link, because that is the
-                         * only useful thing to leave behind here:
+                         * THE CHAIN, re-measured 2026-08-28 after the field
+                         * kinds landed, because it is the only useful thing to
+                         * leave behind here. Arming this refusal and asking
+                         * `JAI_JIT_CHAIN=1` what `_fuse_at` hits next gives:
                          *
-                         *   1. this refusal -- armed, `_fuse_at` moves on;
-                         *   2. `OP_GET_INDEX: the container has kind object,
-                         *      not list` -- a declared `list[T]` FIELD, armed
-                         *      below in declaredScalarFieldKind, worth +5
-                         *      compiled bodies and still flat;
-                         *   3. the same message again, and this time it is not
-                         *      a field at all: `w` is the result of a CALL
-                         *      whose return kind is predicted SLOT_OBJ rather
-                         *      than SLOT_LIST.
+                         *   1. this refusal
+                         *   2..6. `OP_GET_INDEX: the container has kind object,
+                         *         not list`, FIVE TIMES, at offsets 124, 442,
+                         *         682, 973 and 1233 -- every `code.data[i]` in
+                         *         the body.
                          *
-                         * Both of the first two were built and measured
-                         * TOGETHER -- 0.31s and 0.61s either way on lexer.jai
-                         * and parser.jai, four samples, twice. Clearing two
-                         * links of a three-link chain buys nothing, which is
-                         * the rule this tier keeps teaching. Start at link 3,
-                         * the call return kind, or not at all. */
+                         * That is five instances of ONE cause, not five causes:
+                         * `code.data` is declared a list and the tier has it as
+                         * a bare object, so one fix clears all five. Which also
+                         * means arming THIS refusal on its own is worth nothing
+                         * and was measured so -- 58,104,810 interpreted
+                         * instructions against 58,041,246 with it off, i.e.
+                         * marginally worse.
+                         *
+                         * So: fix the list-typed field first. Then this becomes
+                         * the last link rather than the first, and the pair is
+                         * worth measuring together. The arm itself is four
+                         * lines -- `jaiInvokeMethodByName` resolves against any
+                         * receiver and `len` returns an int whatever it is
+                         * called on, so it needs no sample, only a guard on
+                         * what comes back. */
                         return subWhy(e, "`.%s()` on an object with no sample "
                                       "and no known type", oNameChars);
                     }
