@@ -5587,6 +5587,17 @@ static const NativeResult kNativeResults[] = {
  * measurements go wrong -- each switch invalidates __jaicache__, and three
  * people measuring one change tonight two-binary got 3.9x, 100x and 6%
  * SLOWER for what a switch settled in one command. */
+/* JAITHON_JIT_LIST_RESULT=0 turns off the predicted result for a list method
+ * that is neither a field read nor discarded, for a one-binary A/B. */
+static bool jitListResult(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_LIST_RESULT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static bool jitListScalarResult(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -9487,14 +9498,46 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             /* What comes back: a field-reading builtin says so itself (`len`
              * is the list's count); anything whose result is dropped on the
-             * next instruction needs no kind at all. Nothing else -- a call's
-             * result can't be guarded, since the call already happened and a
-             * wrong guess has nowhere to go. */
+             * next instruction needs no kind at all.
+             *
+             * Nothing else -- and the stated reason for that, "a wrong guess
+             * has nowhere to go", is no longer true. The SLOT_OBJ arm below
+             * predicts from InlineCache::resultKind and resumes AFTER the call
+             * with the result read out of the descriptor
+             * (branchOnDeoptAt's `lastFromDesc`), which is exactly the
+             * somewhere. This arm never got the same treatment, so every list
+             * method that is neither a field read nor discarded declines the
+             * whole body: `xs.enumerate()` costs
+             * docs/probes/p25_enumerate.jai its 12,800,326 interpreted
+             * instructions here.
+             *
+             * Worth doing only for the methods that are CHEAP next to the loop
+             * around them -- `contains`, `index`, `count` on a short list.
+             * `enumerate`, `map`, `filter` and `sorted` all allocate a list per
+             * call, and rows for that shape were built and measured at zero
+             * (docs/research/FALSIFIED-list-returning-builtins.md). */
             bool discarded = (off + 7 < count && code[off + 7] == OP_POP);
             const JaiJitFieldRead *lfr = jaiJitFieldReadFor(
                 OBJ_LIST, AS_STRING(nameVal)->chars, AS_STRING(nameVal)->length,
                 argc);
-            if (lfr == NULL && !discarded) return false;
+            SlotKind lrkind = SLOT_INT;
+            unsigned lrtag = VAL_INT;
+            uint8_t lrObjType = 0;
+            if (lfr == NULL && !discarded) {
+                /* Predicted from the site's own feedback and guarded after the
+                 * call, exactly as the SLOT_OBJ arm below does it. */
+                if (!jitListResult()) {
+                    return subWhy(e, "`list.%s` is neither a field read nor "
+                                     "discarded", AS_STRING(nameVal)->chars);
+                }
+                uint8_t lfb = jaiInvokeResultFeedback(
+                    &fn->chunk, jaiReadU16(code + off + 5), probe);
+                if (!feedbackSlotKind(lfb, &lrkind, &lrtag, &lrObjType)) {
+                    return subWhy(e, "`list.%s` has no usable result kind (%s)",
+                                  AS_STRING(nameVal)->chars,
+                                  jaiFeedbackName(lfb));
+                }
+            }
 
             /* `xs.len()` on a list is one field read. Through the descriptor it meant a GC root push/pop, a
              * bound-method resolve, an arity check and a native call just to read a 32-bit count -- paid every iteration of the ordinary `while i < xs.len()` loop. SLOT_LIST is the type guard, already made. */
@@ -9517,7 +9560,25 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValue(e, &r, NULL)) return false;
             }
             e->wroteHeap = true;
-            off += 8;      /* the OP_POP this consumed */
+            if (discarded) {
+                off += 8;      /* the OP_POP this consumed */
+                break;
+            }
+            if (!pushValue(e, lrkind, 0, NULL)) return false;
+            if (lrkind == SLOT_OBJ) e->stackObjType[e->depth - 1] = lrObjType;
+            unsigned lrat = e->descOffset +
+                            (unsigned)offsetof(JitCallDesc, result);
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, lrat));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, lrtag));
+            branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 7), true);
+            /* One byte for a bool: BOOL_VAL writes only the union's `boolean`
+             * member, and every SLOT_BOOL consumer tests the whole word. */
+            if (lrkind == SLOT_BOOL) {
+                emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, lrat + 8));
+            } else {
+                emit(e, jaiA64LdrX(pushReg(e) - 1, 31, lrat + 8));
+            }
+            off += 7;
             break;
         }
 
