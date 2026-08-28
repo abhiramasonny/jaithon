@@ -56,6 +56,7 @@ stopped : OP_JUMP_IF_CMP_FALSE
 stopped : OP_JUMP_IF_CMP_LOCAL_K
 stopped : OP_JUMP_IF_FALSE
 stopped : OP_NE
+stopped : OP_NOT: `not` of a int
 stopped : OP_RETURN
 stopped : a builtin with no known result kind
 stopped : a local of no known kind
@@ -77,8 +78,10 @@ stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 4 and 2) have kinds o
 stopped: OP_FOR_RANGE_BIND: loop variable in local 19 has kind float, not int
 stopped: OP_GET_FIELD
 stopped: OP_GET_FIELD_LOCAL: no live receiver to read local 17's field off
+stopped: OP_GET_GLOBAL at 120 ended the walk, so the branch to offset 56 (OP_BIND) has nowhere to land
 stopped: OP_GET_INDEX: the container has kind instance, not list
 stopped: OP_GET_INDEX: the container has kind object, not list
+stopped: OP_GET_UPVALUE
 stopped: OP_INVOKE
 stopped: OP_INVOKE: `dict.get` has no usable result kind (instance)
 stopped: OP_INVOKE: `dict.get` has no usable result kind (never observed)
