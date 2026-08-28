@@ -62,6 +62,9 @@ PARTIAL = re.compile(
 )
 #: `[jit] <fn> declined at OP_X` -- the default case's own message.
 DECLINED_AT = re.compile(r"^\[jit\] (\S+) declined at (OP_\w+)$")
+#: `[jit] chain <fn>:` then indented numbered links, from JAI_JIT_CHAIN=1.
+CHAIN_HEAD = re.compile(r"^\[jit\] chain (\S+):$")
+CHAIN_LINK = re.compile(r"^\[jit\]   (?:(\d+)\. )?(.*)$")
 #: `attrib <fn> <count> <pct>%` from --stats with JAI_JIT_ATTRIB=1.
 ATTRIB = re.compile(r"^attrib (\S+)\s+(\d+)\s+([\d.]+)%$")
 ATTRIB_TOTAL = re.compile(r"^attrib-total (\d+) of (\d+) \((\d+) unattributed\)$")
@@ -99,6 +102,9 @@ class Report:
         self.attrib: dict[str, int] = {}
         self.attrib_total = 0
         self.attrib_unattributed = 0
+        #: fn -> the chain of refusals, in order. Only populated with --chain.
+        self.chains: dict[str, list[str]] = {}
+        self._chain_fn: str | None = None
         self.lines = 0
 
     def feed(self, line: str) -> None:
@@ -114,6 +120,20 @@ class Report:
         if not line.startswith("[jit] "):
             return
         self.lines += 1
+
+        m = CHAIN_HEAD.match(line)
+        if m:
+            self._chain_fn = m.group(1)
+            #: Last one wins. A body is retried and the last attempt is the one
+            #: that describes where it actually ended up.
+            self.chains[self._chain_fn] = []
+            return
+        if self._chain_fn is not None:
+            m = CHAIN_LINK.match(line)
+            if m and (m.group(1) or m.group(2).startswith("...")):
+                self.chains[self._chain_fn].append(fold(m.group(2)))
+                return
+            self._chain_fn = None
 
         m = COMPILED.match(line)
         if m:
@@ -185,6 +205,10 @@ def main() -> int:
                         choices=("run", "check"),
                         help="how to invoke jaithon on FILE (default: run)")
     parser.add_argument("file", nargs="?", help="the program to report on")
+    parser.add_argument("--chain", action="store_true",
+                        help="for each costly body, the WHOLE chain of refusals "
+                             "it would have to clear -- not just the first. "
+                             "Costs one extra compile per link per body.")
     parser.add_argument("--limit", type=int, default=12,
                         help="rows per table (default 12)")
     parser.add_argument("--jaithon", default=str(ROOT / "jaithon"))
@@ -216,6 +240,8 @@ def main() -> int:
     #: rankings. It costs a branch per instruction and only works alongside
     #: --stats, which is why both are set here and neither is on by default.
     env["JAI_JIT_ATTRIB"] = "1"
+    if args.chain:
+        env["JAI_JIT_CHAIN"] = "1"
     done = subprocess.run(command, cwd=ROOT, env=env,
                           capture_output=True, text=True)
 
@@ -313,8 +339,35 @@ def main() -> int:
         print("  loop only when the OSR sampler lands on it, so a short program "
               "can finish first.")
 
+    if args.chain and report.chains and report.attrib:
+        print()
+        print(f"{BOLD}what each costly body would have to clear{RESET}")
+        print(f"{DIM}A refusal is a chain: clearing one link moves the body to "
+              f"the next one and\nbuys nothing. Three separate changes measured "
+              f"exactly zero for that reason.\nEach link below is a real "
+              f"recompile, not a guess.{RESET}")
+        ranked = sorted(report.attrib.items(), key=lambda kv: -kv[1])
+        shown = 0
+        for fn, count in ranked:
+            if fn not in report.chains:
+                continue
+            share = (100.0 * count / report.attrib_total
+                     if report.attrib_total else 0.0)
+            print(f"  {BOLD}{fn}{RESET} {DIM}({share:.1f}% of interpreted "
+                  f"work){RESET}")
+            for link in report.chains[fn]:
+                print(f"      {link}")
+            shown += 1
+            if shown >= max(1, args.limit // 3):
+                break
+        if shown == 0:
+            print("  (none of the costly bodies produced a chain -- they may "
+                  "all be compiling)")
+
     print()
-    print(f"{DIM}JAI_JIT_WHY=1 for the raw decisions this summarises.{RESET}")
+    print(f"{DIM}JAI_JIT_WHY=1 for the raw decisions this summarises."
+          f"{'' if args.chain else '  --chain for the whole refusal chain.'}"
+          f"{RESET}")
     return done.returncode
 
 

@@ -3892,8 +3892,8 @@ static void reportChain(const Emit *proto, Emit *first, ObjClosure *closure,
         memcpy(probe.chainSkip, skips, n * sizeof skips[0]);
         probe.chainSkipCount = n;
         if (compileBody(&probe, closure)) {
-            fprintf(stderr, "[jit]   %u. compiles, once the %u above are "
-                            "cleared\n", link, n);
+            fprintf(stderr, "[jit]   %u. compiles, once the %u above %s "
+                            "cleared\n", link, n, n == 1 ? "is" : "are");
             return;
         }
         /* Refusing again at the SAME offset means the unarmed path cannot step
