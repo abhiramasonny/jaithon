@@ -526,6 +526,17 @@ typedef struct {
     uint32_t  stackShape[JIT_MAX_STACK];
     ObjClass *stackClass[JIT_MAX_STACK];
     Value     stackSeen[JIT_MAX_STACK];
+    /* The object type this SLOT_OBJ entry is expected to have, as ObjType + 1,
+     * or 0 for "no expectation". For results the tier produces itself and so
+     * has no Value to sample -- an f-string's, a builtin method's predicted
+     * from its site's feedback, a `str()` call's -- where the type is known
+     * even though the object does not exist until run time.
+     *
+     * A PREDICTION, not a proof: every consumer already re-checks Obj.type and
+     * deoptimises on a miss, so this only chooses which guard to emit. That is
+     * why it survives a branch merge and is not listed in clearStackProofs --
+     * see the contrast drawn at stackAscii below. */
+    uint8_t   stackObjType[JIT_MAX_STACK];
     int       stackLocal[JIT_MAX_STACK];
     /* This entry is not merely a string by sample -- it came out of the shared
      * one-byte ASCII table, so it IS an interned ObjString, and the guards a
@@ -1873,6 +1884,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackAscii[e->depth] = false;
     e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
+    e->stackObjType[e->depth] = 0;
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
@@ -1936,6 +1948,7 @@ static bool pushSelf(Emit *e) {
     e->stackAscii[e->depth] = false;
     e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
+    e->stackObjType[e->depth] = 0;
     e->stack[e->depth++] = SLOT_SELF;
     return true;
 }
@@ -2003,6 +2016,7 @@ static void dropCalleeEntry(Emit *e) {
      * about the result that replaced it. */
     e->stackAscii[e->depth - 2] = e->stackAscii[e->depth - 1];
     e->stackUnit[e->depth - 2]  = e->stackUnit[e->depth - 1];
+    e->stackObjType[e->depth - 2] = e->stackObjType[e->depth - 1];
     e->depth--;
 }
 
@@ -3250,7 +3264,11 @@ static const char *jaiFeedbackName(uint8_t fb) {
     return "something the tier does not name";
 }
 
-static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
+/* `objType` reports the ObjType the feedback named, as ObjType + 1, or 0 when
+ * the result is not an object. See Emit::stackObjType for what it is for. */
+static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag,
+                             uint8_t *objType) {
+    *objType = 0;
     switch (fb) {
     case 1u + VAL_INT:   *k = SLOT_INT;   *tag = VAL_INT;   return true;
     case 1u + VAL_FLOAT: *k = SLOT_FLOAT; *tag = VAL_FLOAT; return true;
@@ -3271,6 +3289,7 @@ static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
      * else, which is exactly SLOT_OBJ. The tag guard below is the whole of
      * what makes that sound: whatever object comes back, it is an object. */
     *k = SLOT_OBJ; *tag = VAL_OBJ;
+    *objType = (uint8_t)(fb - JAI_FB_OBJ + 1u);
     return true;
 }
 
@@ -3385,7 +3404,8 @@ static bool siteInvokeResultKind(const Chunk *chunk, uint16_t cacheIdx,
         merged = jaiFeedbackMerge(merged, ic->resultKind[w]);
     }
     if (merged == JAI_FB_NONE || merged == JAI_FB_MIXED) return false;
-    return feedbackSlotKind(merged, k, tag);
+    uint8_t objType;
+    return feedbackSlotKind(merged, k, tag, &objType);
 }
 
 /* The same test feedbackSlotKind applies to a call's result, as a predicate on a Value: is this a heap
@@ -3418,7 +3438,8 @@ static bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
         return true;
     }
     unsigned tag;
-    return feedbackSlotKind(fb, k, &tag);
+    uint8_t objType;
+    return feedbackSlotKind(fb, k, &tag, &objType);
 }
 
 static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
@@ -7087,6 +7108,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->stackAscii[e->depth - 1] = false;
                     e->stackNullLit[e->depth - 1] = false;
                     e->stackUnit[e->depth - 1]  = false;
+                    e->stackObjType[e->depth - 1] = 0;
                 } else if (k != SLOT_FLOAT) {
                     e->whyNot = "a type guard the kinds cannot settle";
                     return false;
@@ -7131,6 +7153,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValue(e, &drop, NULL)) return false;
             }
             if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
+            /* jitFormat always builds a string, and there is no Value to carry
+             * as a sample, so the expectation is recorded instead: without it
+             * `f"{a}-{b}".len()` declined the loop around it at the very next
+             * instruction ("an invoke on an object with nothing to look at"). */
+            e->stackObjType[e->depth - 1] = (uint8_t)(OBJ_STRING + 1);
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
@@ -8744,15 +8771,41 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 /* Built-in method on a receiver typed only as "some object" (dict/string/set/tuple). Three things:
                  * WHICH METHOD -- from the observed receiver, like the SLOT_LIST arm below (a builtin is a function of receiver-type + name). THAT IT'S STILL THAT TYPE -- SLOT_OBJ pins nothing (`for x in [d, "s"]` mixes types), so the object type is guarded before anything is consumed; a miss resumes with receiver+args untouched. WHAT COMES BACK -- predicted via InlineCache::resultKind (no per-call-site feedback existed before), and the tag guard after the call is what makes the prediction sound, deopting to the instruction AFTER the call since it already happened. */
                 Value oseen = e->stackSeen[ridx];
+                bool  oProbe = false;
                 if (!IS_OBJ(oseen)) {
-                    e->whyNot = "an invoke on an object with nothing to look at";
-                    return false;
+                    /* No sample, but the model may still know the TYPE -- an
+                     * f-string's result, or an earlier invoke's predicted from
+                     * its site's feedback. A probe of that type answers the
+                     * method lookup just as well, exactly as the SLOT_LIST arm
+                     * below builds an empty list for the same reason. Only
+                     * strings are probed: they are the types this tier
+                     * currently learns without a Value, and a probe has to be
+                     * something cheap and permanent to make.
+                     *
+                     * The object type is guarded at run time below either way,
+                     * so the probe chooses a guard and never deletes one. */
+                    if (e->stackObjType[ridx] == (uint8_t)(OBJ_STRING + 1)) {
+                        ObjString *empty = jaiStringIntern("", 0);
+                        if (empty == NULL) return false;
+                        oseen = OBJ_VAL((Obj *)empty);
+                        oProbe = true;
+                    } else {
+                        e->whyNot = "an invoke on an object with nothing to "
+                                    "look at";
+                        return false;
+                    }
                 }
                 if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
                 Value oname = fn->chunk.constants.data[nameIdx];
                 if (!IS_STRING(oname)) return false;
                 Value obound;
-                if (!jaiBuiltinMethod(oseen, AS_STRING(oname), &obound)) {
+                /* Rooted across the lookup: resolving allocates the bound
+                 * wrapper, and a probe interned a moment ago is otherwise
+                 * unreachable. Only the native is kept, and that outlives it. */
+                if (oProbe) jaiGCPushRoot(oseen);
+                bool oFound = jaiBuiltinMethod(oseen, AS_STRING(oname), &obound);
+                if (oProbe) jaiGCPopRoot();
+                if (!oFound) {
                     /* Names the pair, since which builtin is missing is the
                      * whole question and the bare reason only says that one
                      * was. */
@@ -8776,10 +8829,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 bool odiscarded = (off + 7 < count && code[off + 7] == OP_POP);
                 SlotKind orkind = SLOT_INT;
                 unsigned owantTag = VAL_INT;
+                uint8_t  orObjType = 0;
                 if (ofr == NULL && !odiscarded) {
                     uint8_t fb = jaiInvokeResultFeedback(
                         &fn->chunk, jaiReadU16(code + off + 5), oseen);
-                    if (!feedbackSlotKind(fb, &orkind, &owantTag)) {
+                    if (!feedbackSlotKind(fb, &orkind, &owantTag, &orObjType)) {
                         /* Which of the three it is decides what to do about
                          * it: nothing recorded means the window never opened,
                          * mixed means the site really does return two things,
@@ -8820,6 +8874,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     break;
                 }
                 if (!pushValue(e, orkind, 0, NULL)) return false;
+                /* The feedback named the object type, and nothing else will:
+                 * the result does not exist until run time, so there is no
+                 * sample. `s.lower().len()` chains two invokes and the second
+                 * declined the loop for want of exactly this. */
+                if (orkind == SLOT_OBJ) {
+                    e->stackObjType[e->depth - 1] = orObjType;
+                }
                 unsigned orat = e->descOffset +
                                 (unsigned)offsetof(JitCallDesc, result);
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, orat));
