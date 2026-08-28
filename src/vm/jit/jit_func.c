@@ -11127,8 +11127,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!e->pendingRange) {
                 if (e->depth == 0) return false;
                 if (e->stack[e->depth - 1] != SLOT_LIST) {
-                    e->whyNot = "iterating something other than a list or range";
-                    return false;
+                    /* Named: 4.3% of parser.jai's interpreted work sat behind
+                     * this and it said nothing about WHAT was being iterated,
+                     * which is the entire question. */
+                    Value itSeen = e->stackSeen[e->depth - 1];
+                    return subWhy(e, "iterating a %s, not a list or a range",
+                                  IS_OBJ(itSeen)
+                                      ? jaiTypeNameStatic(itSeen)
+                                      : slotKindName(e->stack[e->depth - 1]));
                 }
                 if (!e->callsOut) return false;
                 /* Carry one element forward: the loop variable's kind comes
