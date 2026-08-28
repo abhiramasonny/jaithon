@@ -4,13 +4,23 @@ connected_components at 836 stopped: more than 8 instance slots to pin
 stopped : OP_BUILD_LIST
 stopped : OP_CALL
 stopped : OP_DIV
+stopped : OP_FOR_ITER_BIND: loop variable in local 4 has kind int, not bool
+stopped : OP_FOR_ITER_BIND: loop variable in local 4 has kind int, not instance
+stopped : OP_FOR_ITER_BIND: loop variable in local 5 has kind int, not instance
+stopped : OP_FOR_ITER_BIND: loop variable in local 6 has kind object, not instance
+stopped : OP_FOR_RANGE_BIND: loop variable in local 7 has kind float, not int
 stopped : OP_GET_FIELD
+stopped : OP_GET_FIELD: `allocate` is not a field of Column
+stopped : OP_GET_FIELD: `from_list` is not a field of Mat
+stopped : OP_GET_FIELD: `null_of` is not a field of Value
+stopped : OP_GET_FIELD: `nulls` is not a field of Column
+stopped : OP_GET_FIELD: `of_int` is not a field of Value
+stopped : OP_GET_FIELD: `of` is not a field of Index
 stopped : OP_GET_FIELD_LOCAL
 stopped : OP_GET_FIELD_LOCAL: `_replace` is not a field of DataFrame
 stopped : OP_GET_FIELD_LOCAL: `astype` is not a field of NDArray
 stopped : OP_GET_FIELD_LOCAL: `copy_lanes` is not a field of Column
 stopped : OP_GET_FIELD_LOCAL: `inputs` is not a field of Tensor
-stopped : OP_GET_FIELD_LOCAL: `object` is not a field of Parser
 stopped : OP_GET_FIELD_LOCAL: `view` is not a field of NDArray
 stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 1's field off
 stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 4's field off
@@ -18,26 +28,30 @@ stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 5's field off
 stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 7's field off
 stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 8's field off
 stopped : OP_GET_FIELD_LOCAL: no live receiver to read local 9's field off
-stopped : OP_GET_FIELD_LOCAL: receiver local 10 is kind 0, not an instance
-stopped : OP_GET_FIELD_LOCAL: receiver local 4 is kind 0, not an instance
-stopped : OP_GET_FIELD_LOCAL: receiver local 4 is kind 5, not an instance
-stopped : OP_GET_FIELD_LOCAL: receiver local 5 is kind 0, not an instance
-stopped : OP_GET_FIELD_LOCAL: receiver local 7 is kind 0, not an instance
-stopped : OP_GET_FIELD_LOCAL: receiver local 8 is kind 0, not an instance
-stopped : OP_GET_FIELD_LOCAL: receiver local 9 is kind 0, not an instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 10 has kind int, not instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 4 has kind int, not instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 4 has kind opaque, not instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 5 has kind int, not instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 7 has kind int, not instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 8 has kind int, not instance
+stopped : OP_GET_FIELD_LOCAL: receiver local 9 has kind int, not instance
 stopped : OP_GET_INDEX: no live list to read an element kind off
-stopped : OP_GET_INDEX: the container is kind 0, not a list
-stopped : OP_GET_INDEX: the container is kind 13, not a list
-stopped : OP_GET_INDEX: the container is kind 3, not a list
+stopped : OP_GET_INDEX: the container has kind instance-or-null, not list
+stopped : OP_GET_INDEX: the container has kind int, not list
+stopped : OP_GET_INDEX: the container has kind object, not list
 stopped : OP_GET_INDEX: the live list is empty, so there is no exemplar
 stopped : OP_INVOKE
+stopped : OP_INVOKE: `Agg.counts_rows` is not a builtin of the observed receiver's type
+stopped : OP_INVOKE: `Dtype.is_dictionary` is not a builtin of the observed receiver's type
+stopped : OP_INVOKE: `Dtype.is_numeric` is not a builtin of the observed receiver's type
+stopped : OP_INVOKE: `Dtype.is_wide` is not a builtin of the observed receiver's type
+stopped : OP_INVOKE: `dict.get` has no usable result kind (mixed)
 stopped : OP_ITER_RANGE
 stopped : OP_JUMP_IF_CMP_FALSE
 stopped : OP_JUMP_IF_CMP_LOCAL_K
 stopped : OP_JUMP_IF_FALSE
 stopped : OP_NE
 stopped : OP_RETURN
-stopped : a builtin whose result kind has not been observed
 stopped : a builtin with no known result kind
 stopped : a local of no known kind
 stopped : a local was given two different kinds
@@ -45,37 +59,33 @@ stopped : a parameter is sometimes null
 stopped : a type guard the kinds cannot settle
 stopped : an `is` against something other than null
 stopped : an invoke on an object with nothing to look at
-stopped : an invoke that is not a builtin of the observed receiver's type
 stopped : callee's return kind not usable
 stopped : iterating a list with nothing to look at
 stopped : iterating something other than a list or range
-stopped : loop variable took two kinds
 stopped : pushing a kind the tier cannot store
 stopped : the operand model disagrees with the bytecode
 stopped : too many roots
 stopped: OP_CALL
+stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 4 and 2) have kinds object and instance
+stopped: OP_FOR_RANGE_BIND: loop variable in local 19 has kind float, not int
 stopped: OP_GET_FIELD
-stopped: OP_GET_FIELD_LOCAL: no live receiver to read local 17's field off
-stopped: OP_GET_INDEX: the container is kind 13, not a list
-stopped: OP_GET_INDEX: the container is kind 2, not a list
+stopped: OP_GET_INDEX: the container has kind instance, not list
+stopped: OP_GET_INDEX: the container has kind object, not list
 stopped: OP_INVOKE
-stopped: OP_INVOKE: 4 arguments, past the cap of 3
+stopped: OP_INVOKE: `dict.get` has no usable result kind (never observed)
 stopped: OP_JUMP_IF_CMP_FALSE
 stopped: OP_POP
-stopped: a builtin whose result kind has not been observed
-stopped: a builtin with no known result kind
 stopped: a call that can raise inside a try
+stopped: a local of no known kind
 stopped: a local was given two different kinds
 stopped: a return inside an OSR loop
 stopped: a type guard the kinds cannot settle
 stopped: an append reaching past the model
 stopped: an indirect callee compiled against an older module
 stopped: an unpinned receiver's result kind
-stopped: call argc
 stopped: callee is not a compiled global function
 stopped: callee's return class not on record
 stopped: callee's return kind not usable
-stopped: loop variable took two kinds
 stopped: more incoming arguments than argument registers (10 locals, 3 stack)
 stopped: more live values than there are callee-saved registers
 stopped: offset 63 is reached with two different operand stacks

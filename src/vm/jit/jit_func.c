@@ -9353,8 +9353,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
             if (!adoptLocalKind(e, slot, SLOT_INT, 0, NULL)) {
-                return subWhy(e, "loop variable in local %u is already a %s, "
-                                 "not an int", slot,
+                return subWhy(e, "loop variable in local %u has kind %s, "
+                                 "not int", slot,
                               slotKindName(e->localKind[slot]));
             }
             if (slot == 0) e->usesSlot0 = true;
@@ -9514,8 +9514,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     } else { e->whyNot = "element kind unknown"; return false; }
 
                     if (!adoptLocalKindSeen(e, fslot, ek, esh, ecl, sample)) {
-                        return subWhy(e, "loop variable in local %u is already "
-                                         "a %s, not a %s", fslot,
+                        return subWhy(e, "loop variable in local %u has kind "
+                                         "%s, not %s", fslot,
                                       slotKindName(e->localKind[fslot]),
                                       slotKindName(ek));
                     }
@@ -9738,8 +9738,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->localTyped[slot] = false;
                 }
                 if (!adoptLocalKindSeen(e, slot, ek, esh, ecl, sample)) {
-                    return subWhy(e, "loop variable in local %u is already a "
-                                     "%s, not a %s", slot,
+                    return subWhy(e, "loop variable in local %u has kind %s, "
+                                     "not %s", slot,
                                   slotKindName(e->localKind[slot]),
                                   slotKindName(ek));
                 }
@@ -9968,7 +9968,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (!adoptLocalKindSeen(e, pslotA, pk[0], 0, NULL, pseen[0]) ||
                 !adoptLocalKindSeen(e, pslotB, pk[1], 0, NULL, pseen[1])) {
                 return subWhy(e, "a pair's loop variables (locals %u and %u) "
-                                 "are already %s and %s", pslotA, pslotB,
+                                 "have kinds %s and %s", pslotA, pslotB,
                               slotKindName(e->localKind[pslotA]),
                               slotKindName(e->localKind[pslotB]));
             }
@@ -11092,8 +11092,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     if (done > 0) { off += 2; break; }
                     /* Names it: the table in kNativeResults is what would have
                      * to grow, and the reason alone never said which row. */
-                    return subWhy(e, "`%s` has no known result kind for a %s "
-                                     "argument", nm, slotKindName(ak));
+                    return subWhy(e, "`%s` has no known result kind for an "
+                                     "argument of kind %s", nm,
+                                  slotKindName(ak));
                 }
                 /* The result stays in the argument's register, so the claims
                  * made about what WAS in it go with it. */
