@@ -51,6 +51,7 @@ stopped : OP_INVOKE: `list.enumerate` has no usable result kind (never observed)
 stopped : OP_INVOKE: a module member that has not compiled
 stopped : OP_INVOKE: a receiver of kind class
 stopped : OP_INVOKE: a receiver of kind int
+stopped : OP_INVOKE: a static that has not compiled
 stopped : OP_ITER_RANGE
 stopped : OP_JUMP_IF_CMP_FALSE
 stopped : OP_JUMP_IF_CMP_LOCAL_K
@@ -88,6 +89,7 @@ stopped: OP_INVOKE: `dict.get` has no usable result kind (never observed)
 stopped: OP_INVOKE: a module member that has not compiled
 stopped: OP_INVOKE: a receiver of kind class
 stopped: OP_INVOKE: a receiver of kind int
+stopped: OP_INVOKE: a static that has not compiled
 stopped: OP_JUMP_IF_CMP_FALSE
 stopped: OP_POP
 stopped: a call that can raise inside a try
