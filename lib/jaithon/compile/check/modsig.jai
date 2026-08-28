@@ -116,6 +116,7 @@ pub class SigLoader {
     var _by_file: dict[int, ModuleSig]
     var _next_file_id: int
     var _visiting: list[str]
+    var _partial: bool
 
     #: Build a loader. `first_file_id` leaves 0 to the file being checked.
     pub fn init(self, search: list[str] = [], first_file_id: int = 1) {
@@ -124,6 +125,7 @@ pub class SigLoader {
         self._by_file = {}
         self._next_file_id = first_file_id
         self._visiting = []
+        self._partial = false
     }
 
     #: Load, or return the cached, signature of the module `dotted` names, from
@@ -155,10 +157,19 @@ pub class SigLoader {
     #: The declaration `name` denotes in `sig`, and the module that declares it —
     #: its annotations are read in that namespace, not the re-exporter's.
     pub fn find(self, sig: ModuleSig, name: str) -> tuple[Node?, ModuleSig] {
+        self._partial = false
         let found = self._find_in(sig, name, MAX_REEXPORT_DEPTH)
         let owner = found[1]
         if owner is null { return (null, sig) }
         return (found[0], owner)
+    }
+
+    #: Whether the last `find` searched a surface it could not see all of: a
+    #: module that did not parse, a re-export whose source is missing, a cycle,
+    #: or the re-export budget running out. A null decl means "absent" only
+    #: when this is false; otherwise the loader simply did not get to look.
+    pub fn partial(self) -> bool {
+        return self._partial
     }
 
     #: The signature parsed from `file_id`, or null when that file is not one.
@@ -174,7 +185,11 @@ pub class SigLoader {
     }
 
     fn _find_in(self, sig: ModuleSig, name: str, depth: int) -> tuple[Node?, ModuleSig?] {
-        if depth <= 0 or sig.path in self._visiting { return (null, null) }
+        if depth <= 0 or sig.path in self._visiting {
+            self._partial = true
+            return (null, null)
+        }
+        if sig.program is null { self._partial = true }
         for entry in sig.decls {
             if entry.name == name { return (entry.decl, sig) }
         }
@@ -189,13 +204,19 @@ pub class SigLoader {
         for entry in sig.reexports {
             if entry.local != name { continue }
             let next = self.load(entry.source, here)
-            if next is null { continue }
+            if next is null {
+                self._partial = true
+                continue
+            }
             let found = self._find_in(next, entry.remote, depth - 1)
             if found[0] is not null { return found }
         }
         for wildcard in sig.wildcards {
             let next = self.load(wildcard, here)
-            if next is null { continue }
+            if next is null {
+                self._partial = true
+                continue
+            }
             let found = self._find_in(next, name, depth - 1)
             if found[0] is not null { return found }
         }
@@ -286,10 +307,54 @@ fn _collect(sig: ModuleSig, stmts: list[Node]) -> void {
             NodeKind.TraitDecl => { _add_decl(sig, node.opt_text("name"), node, true) }
             NodeKind.EnumDecl => { _add_decl(sig, node.opt_text("name"), node, true) }
             NodeKind.TypeDecl => { _add_decl(sig, node.opt_text("name"), node, false) }
-            NodeKind.Import => { _add_edge(sig, node) }
+            NodeKind.VarDecl => { _add_var_decl(sig, node) }
+            NodeKind.Import => {
+                _add_edge(sig, node)
+                _add_import_decl(sig, node)
+            }
             NodeKind.FromImport => { _add_import(sig, node) }
             _ => { }
         }
+    }
+}
+
+#: A top-level `import x.y as z` (or unaliased `import x.y`) binds `z` (or
+#: `y`) in the module's own scope same as any other top-level statement, and
+#: the runtime module object exposes every one of those -- `import .fft as
+#: fft` inside `jainum/mod.jai` is the only reason `nn.fft.rfft(...)` resolves
+#: after `import jainum as nn`. Without this, `find()` cannot see `fft` as a
+#: member of `jainum` at all, and `_module_member`/`_bind_imported` would
+#: report it unknown even though it genuinely is one.
+fn _add_import_decl(sig: ModuleSig, node: Node) -> void {
+    let path = node.opt_text("path")
+    if path is null { return }
+    _add_decl(sig, node.opt_text("alias") ?? _tail_of(path), node, false)
+}
+
+fn _tail_of(dotted: str) -> str {
+    let cut = dotted.rfind(".")
+    if cut < 0 { return dotted }
+    return dotted[cut + 1:]
+}
+
+#: A top-level `let`/`const`/`var`, e.g. `pub const PI: float = 3.14159...`.
+#: A destructuring pattern (`pub let (WIDTH, HEIGHT) = (640, 480)`) binds every
+#: one of its names at module scope and the runtime exports every one of them,
+#: so all of them are recorded: leaving them out makes `find()` miss a name the
+#: module genuinely has, which is now an error rather than silence.
+fn _add_var_decl(sig: ModuleSig, node: Node) -> void {
+    _add_pattern_names(sig, node.child("pattern"), node)
+}
+
+fn _add_pattern_names(sig: ModuleSig, pattern: Node?, node: Node) -> void {
+    if pattern is null { return }
+    if pattern.kind == NodeKind.PatBind {
+        _add_decl(sig, pattern.opt_text("name"), node, false)
+        return
+    }
+    if pattern.kind != NodeKind.PatTuple and pattern.kind != NodeKind.PatList { return }
+    for element in pattern.child_list("elems") {
+        _add_pattern_names(sig, element, node)
     }
 }
 

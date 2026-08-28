@@ -6,6 +6,7 @@
 from jaithon.ast import Node, NodeKind, Span, TypeExpr, TypeKind
 from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
+from jaithon.compile.check.expr import E0410_UNKNOWN_MEMBER
 from jaithon.compile.check.modsig import MODULE_EXT, ModuleSig, SigImport, SigLoader
 from jaithon.compile.check.modsig import absolute, default_search_path, dirname
 from jaithon.compile.check.modsig import resolve_module_path
@@ -339,8 +340,15 @@ fn _module_member(c: Ctx, node: Node?, name: str) -> (Type, Node?) {
 
     let found = loader.find(sig, name)
     let decl = found[0]
-    # Defined at run time, or private: `any` is the honest answer.
-    if decl is null { return (u.t_any, null) }
+    # `sig` loaded, so its public surface is fully known here: a miss is the
+    # module genuinely not having `name`, not "defined at run time". Still
+    # answer `any` so the caller keeps checking the rest of the expression.
+    if decl is null {
+        if not loader.partial() {
+            c.error(E0410_UNKNOWN_MEMBER, node.span, f"`{dotted}` has no member `{name}`")
+        }
+        return (u.t_any, null)
+    }
 
     match decl.kind {
         NodeKind.FnDecl => { return (_foreign_function_type(c, found[1], decl), decl) }
@@ -731,7 +739,17 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
 
     let found = loader.find(sig, remote)
     let decl = found[0]
-    if decl is null { return }
+    if decl is null {
+        # `sig` loaded (the caller only reaches `_bind_imported` once it has),
+        # so this is `remote` genuinely missing from its exports, not a
+        # signature that failed to load -- report it rather than leave the
+        # name silently unbound.
+        if loader.partial() { return }
+        let raw_span: any? = item.get("span", null)
+        let span = if raw_span is Span { raw_span } else { Span(0, 0, 0) }
+        c.error(E0410_UNKNOWN_MEMBER, span, f"`{sig.dotted}` has no member `{remote}`")
+        return
+    }
     let owner = found[1]
     if not _same_module(owner, sig) { _register_module_types(c, owner) }
 
