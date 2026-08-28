@@ -3866,7 +3866,16 @@ static bool declaredScalarFieldKind(uint32_t typeId, SlotKind *k, unsigned *tag)
      * `code.data[i]` is a field read the tier could not classify, and behind
      * that one refusal sat eleven functions and 14.27% of one file's
      * interpreted work. */
+    /* Predicts that the field IS a list, and cannot predict what is IN it: the
+     * index arm below wants an element exemplar and a prediction has no value
+     * to take one from. So `d.items` compiles and `d.items[i]` still declines,
+     * which is why clearing this link alone did not free `_fuse_at`. */
     case FIELD_KIND_LIST:  *k = SLOT_LIST;  *tag = VAL_OBJ;   return true;
+    /* A declared `str`. Same two-guard shape as the list above, and worth its
+     * own row because a string entry carrying a SAMPLE unlocks the arms below
+     * it -- `.len()`, `==` on interned pointers, the ordering leaf call -- all
+     * of which ask `stringOperand`, which asks the sample and not the kind. */
+    case FIELD_KIND_STR:   *k = SLOT_OBJ;   *tag = VAL_OBJ;   return true;
     default: return false;
     }
 }
@@ -9644,10 +9653,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned dtag;
                 if (!jitDeclaredFieldKindEnabled() ||
                     !declaredScalarFieldKind(info->typeId, &dkind, &dtag)) {
+                    /* The declared kind is NAMED, because which one it is
+                     * decides the work: a scalar wants a row in
+                     * declaredScalarFieldKind, an ANY wants nothing at all,
+                     * and the census could not tell them apart. */
                     return subWhy(e,
                         "no live receiver to read `%s` off, and its declared "
-                        "kind is not one this predicts",
-                        AS_STRING(nameVal)->chars);
+                        "kind (%u) is not one this predicts",
+                        AS_STRING(nameVal)->chars, (unsigned)info->typeId);
                 }
                 unsigned dbase = (unsigned)offsetof(ObjInstance, fields) +
                                  (unsigned)info->slot * (unsigned)sizeof(Value);
@@ -9659,20 +9672,41 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, drr, dbase));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, dtag));
                 branchOnDeopt(e, JAI_A64_NE);
-                if (dkind == SLOT_LIST) {
-                    /* VAL_OBJ said "a heap object" and no more. Prove OBJ_LIST
-                     * before the entry claims to be one, or the next arm reads
-                     * ObjList's count out of a string's header. */
+                Value dprobe = NULL_VAL;
+                if (dkind == SLOT_LIST || info->typeId == FIELD_KIND_STR) {
+                    /* VAL_OBJ said "a heap object" and no more. Prove the
+                     * actual type before the entry claims to be one, or the
+                     * next arm reads ObjList's count out of a string's header
+                     * -- the hole that segfaulted the VM through the
+                     * dict-index arm. */
+                    unsigned want = dkind == SLOT_LIST ? (unsigned)OBJ_LIST
+                                                       : (unsigned)OBJ_STRING;
                     emit(e, jaiA64LdrX(JIT_SCRATCH_B, drr, dbase + 8));
                     emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
                                        (unsigned)offsetof(Obj, type)));
-                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, want));
                     branchOnDeopt(e, JAI_A64_NE);
+                    if (want == (unsigned)OBJ_STRING) {
+                        /* A probe, not an observation: the arms below ask
+                         * `stringOperand`, which reads the SAMPLE rather than
+                         * the kind, so a string entry without one is a string
+                         * nothing can do anything with. The guard just emitted
+                         * is what makes the probe honest -- it chooses an arm
+                         * and never removes a check. Same device the invoke
+                         * arm uses for a receiver it knows only the type of. */
+                        ObjString *empty = jaiStringIntern("", 0);
+                        if (empty == NULL) return false;
+                        dprobe = OBJ_VAL((Obj *)empty);
+                    }
                 }
                 unsigned dpopped;
                 SlotKind dkr;
                 if (!popValue(e, &dpopped, &dkr)) return false;
-                if (!pushValue3(e, dkind, 0, NULL, NULL_VAL, -1)) return false;
+                if (!pushValue3(e, dkind, 0, NULL, dprobe, -1)) return false;
+                if (!IS_NULL(dprobe)) {
+                    e->stackObjType[e->depth - 1] =
+                        (uint8_t)(OBJ_STRING + 1);
+                }
                 if (dkind == SLOT_FLOAT &&
                     fpWorthLoading(e, code, off + 6, stop)) {
                     unsigned idx = e->valueDepth - 1;
