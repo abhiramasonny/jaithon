@@ -38,8 +38,8 @@ static bool argSet(Value v, int index, const char *fnName, ObjSet **out) {
 static bool missingKeyError(const char *fnName, const char *role, Value key) {
     ObjString *text = jaiValueToRepr(key);
     if (text == NULL) return false;      /* the repr raised; that error stands */
-    return jaiThrow(vm.cKeyError, "%s(): %s not found: %s", fnName, role,
-                    text->chars);
+    return jaiThrow(vm.cKeyError, "%s(): %s not found: %.*s", fnName, role,
+                    (int)text->length, text->chars);
 }
 
 static ObjList *setElements(ObjSet *s) {

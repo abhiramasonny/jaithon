@@ -324,8 +324,8 @@ static bool nPrimCast(int argc, Value *args, Value *out) {
         ObjString *want = jaiValueToStr(args[1]);
         if (want == NULL) return false;
         jaiGCPushRoot(OBJ_VAL(want));
-        (void)jaiThrow(vm.cTypeError, "cannot cast %s to %s",
-                       jaiTypeNameStatic(args[0]), want->chars);
+        (void)jaiThrow(vm.cTypeError, "cannot cast %s to %.*s",
+                       jaiTypeNameStatic(args[0]), (int)want->length, want->chars);
         jaiGCPopRoot();
         return false;
     }
@@ -364,8 +364,8 @@ static bool nPrimGetMethod(int argc, Value *args, Value *out) {
     Value member;
     if (!jaiGetProperty(args[0], name, &member)) return false;
     if (!jaiBuiltinIsCallable(member))
-        return jaiThrow(vm.cAttributeError, "'%s' has no method '%s'",
-                        jaiTypeNameStatic(args[0]), name->chars);
+        return jaiThrow(vm.cAttributeError, "'%s' has no method '%.*s'",
+                        jaiTypeNameStatic(args[0]), (int)name->length, name->chars);
     *out = member;
     return true;
 }

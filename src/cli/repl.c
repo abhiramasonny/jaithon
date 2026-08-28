@@ -395,13 +395,17 @@ static void metaVars(void) {
             jaiClearException();
             printf("  %-16s <unprintable>\n", name->chars);
         } else if (text->length <= 57) {
-            printf("  %-16s %s\n", name->chars, text->chars);
+            /* text is a repr, which can be a view into a growing
+             * concatenation buffer whose NUL a later append moved past
+             * (object_string.c); take its length rather than trust %s to
+             * find the end. */
+            printf("  %-16s %.*s\n", name->chars, (int)text->length, text->chars);
         } else {
             size_t cut = jaiUtf8Offset(text->chars, text->length, 57);
             if (cut < text->length)
                 printf("  %-16s %.*s...\n", name->chars, (int)cut, text->chars);
             else
-                printf("  %-16s %s\n", name->chars, text->chars);
+                printf("  %-16s %.*s\n", name->chars, (int)text->length, text->chars);
         }
 
         ++shown;

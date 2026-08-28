@@ -19,6 +19,17 @@ bool jaiIOThrowErrno2(int err, const char *what, const char *from,
 
 /* --- paths ------------------------------------------------------------- */
 
+/* A NUL-terminated C string for `path`: `path->chars` itself when already
+ * terminated, otherwise a malloc'd copy stashed in `*tmp` (NULL when none was
+ * needed) for the caller to release with jaiIOPathDone. Despite the name this
+ * is not path-specific -- anything reaching a native as an argument can be an
+ * unterminated concatenation view (see jaiStringTerminated's comment in
+ * object.h), and a plain malloc'd copy needs no GC root to stay valid across
+ * however many further calls and allocations the rest of the native function
+ * makes, unlike jaiStringTerminated's result. So this is reused across
+ * builtins_io.c/fs.c/process.c for anything else that ends up in a
+ * NUL-scanning libc call and has to survive more than one immediate use: an
+ * open() mode, an os_env() name or value, an os_spawn() argv entry or cwd. */
 const char *jaiIOPathCStr(ObjString *path, char **tmp);
 void jaiIOPathDone(char *tmp);
 

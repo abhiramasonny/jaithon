@@ -33,12 +33,24 @@
 
 typedef struct {
     const char **items;
+    /* Parallel to `items`, one slot per entry (never the NULL terminator):
+     * jaiIOPathCStr(s, &owned[i]) leaves NULL there when `items[i]` could
+     * borrow `s->chars` directly, or a malloc'd copy that owns[i] then has to
+     * free. Freeing here, not the ObjStrings, is what lets `items` survive
+     * every allocation os_spawn() makes between building argv and actually
+     * calling execvp with it. */
+    char       **owned;
     int          count;      /* entries, not counting the NULL terminator */
 } CStrVec;
 
 static void cstrVecFree(CStrVec *v) {
+    if (v->owned != NULL) {
+        for (int i = 0; i < v->count; i++) jaiIOPathDone(v->owned[i]);
+        JAI_FREE_ARRAY(char *, v->owned, v->count);
+    }
     if (v->items != NULL) JAI_FREE_ARRAY(const char *, v->items, v->count + 1);
     v->items = NULL;
+    v->owned = NULL;
     v->count = 0;
 }
 
@@ -54,7 +66,9 @@ static bool argvFromList(ObjList *list, CStrVec *out) {
                         "os_spawn(): the command must name a program to run");
 
     out->items = JAI_ALLOC(const char *, (size_t)list->count + 1);
+    out->owned = JAI_ALLOC(char *, (size_t)list->count);
     out->count = list->count;
+    for (int i = 0; i < list->count; i++) out->owned[i] = NULL;
     for (int i = 0; i < list->count; i++) {
         if (!IS_STRING(jaiListGet(list, i))) {
             cstrVecFree(out);
@@ -64,7 +78,11 @@ static bool argvFromList(ObjList *list, CStrVec *out) {
         }
         ObjString *s = AS_STRING(jaiListGet(list, i));
         if (!checkExecText(s, "an argument")) { cstrVecFree(out); return false; }
-        out->items[i] = s->chars;
+        /* execvp() reads every argv element to a NUL. `s` reached here as a
+         * list element, not necessarily interned or a literal -- exactly the
+         * caller-supplied-string case jaiStringTerminated's header warns
+         * about -- so it may be an unterminated concatenation view. */
+        out->items[i] = jaiIOPathCStr(s, &out->owned[i]);
     }
     out->items[list->count] = NULL;
     return true;
@@ -94,6 +112,7 @@ static bool envFromDict(ObjDict *dict, EnvVec *out) {
     jaiGCPushRoot(OBJ_VAL(items));
 
     out->vec.items   = JAI_ALLOC(const char *, (size_t)items->count + 1);
+    out->vec.owned   = NULL;   /* every entry below is built by hand, not jaiIOPathCStr */
     out->vec.count   = items->count;
     out->owned       = JAI_ALLOC(char *, (size_t)items->count);
     out->ownedSizes  = JAI_ALLOC(size_t, (size_t)items->count);
@@ -113,9 +132,14 @@ static bool envFromDict(ObjDict *dict, EnvVec *out) {
         if (!checkExecText(key, "an environment name") ||
             !checkExecText(val, "an environment value")) { ok = false; break; }
         if (memchr(key->chars, '=', key->length) != NULL) {
+            /* jaiStringCStr, not key->chars: this is the one place in the loop
+             * that reads to a NUL rather than to an explicit length, and the
+             * result is consumed immediately by this one jaiThrow call, with
+             * no allocation between the two -- exactly what jaiStringCStr's
+             * header says it's for. */
             ok = jaiThrow(vm.cValueError,
                           "os_spawn(): the environment name '%s' contains '='",
-                          key->chars);
+                          jaiStringCStr(key));
             break;
         }
         size_t size = (size_t)key->length + 1 + (size_t)val->length + 1;
@@ -253,9 +277,14 @@ static bool nOsSpawn(int argc, Value *args, Value *out) {
                         jaiTypeNameStatic(args[1]));
     ObjDict *options = AS_DICT(args[1]);
 
-    CStrVec argv = { NULL, 0 };
+    CStrVec argv = { NULL, NULL, 0 };
     if (!argvFromList(command, &argv)) return false;
 
+    /* chdir()s in the child to a NUL-scanned pointer (process.c), so `cwd`
+     * needs the same treatment as each argv entry above; cwdTmp outlives
+     * every allocation between here and the jaiProcessSpawn() call below,
+     * which a plain malloc'd copy does for free. */
+    char *cwdTmp = NULL;
     const char *cwd = NULL;
     Value option;
     if (spawnOption(options, "cwd", &option)) {
@@ -267,17 +296,22 @@ static bool nOsSpawn(int argc, Value *args, Value *out) {
             cstrVecFree(&argv);
             return false;
         }
-        cwd = AS_STRING(option)->chars;
+        cwd = jaiIOPathCStr(AS_STRING(option), &cwdTmp);
     }
 
-    EnvVec env = { { NULL, 0 }, NULL, NULL, 0 };
+    EnvVec env = { { NULL, NULL, 0 }, NULL, NULL, 0 };
     bool hasEnv = false;
     if (spawnOption(options, "env", &option)) {
         if (!IS_DICT(option)) {
             cstrVecFree(&argv);
+            jaiIOPathDone(cwdTmp);
             return jaiThrow(vm.cTypeError, "os_spawn(): `env` must be a dict");
         }
-        if (!envFromDict(AS_DICT(option), &env)) { cstrVecFree(&argv); return false; }
+        if (!envFromDict(AS_DICT(option), &env)) {
+            cstrVecFree(&argv);
+            jaiIOPathDone(cwdTmp);
+            return false;
+        }
         hasEnv = true;
     }
 
@@ -287,6 +321,7 @@ static bool nOsSpawn(int argc, Value *args, Value *out) {
         if (!IS_STRING(option)) {
             cstrVecFree(&argv);
             if (hasEnv) envVecFree(&env);
+            jaiIOPathDone(cwdTmp);
             return jaiThrow(vm.cTypeError, "os_spawn(): `stdin` must be a str");
         }
         stdinText = AS_STRING(option)->chars;
@@ -302,6 +337,7 @@ static bool nOsSpawn(int argc, Value *args, Value *out) {
                                             hasEnv ? env.vec.items : NULL,
                                             stdinText, stdinLen, stream,
                                             &spawned, &failure);
+    jaiIOPathDone(cwdTmp);
     const char *program = argv.items[0];
     char programCopy[512];
     snprintf(programCopy, sizeof programCopy, "%s", program);

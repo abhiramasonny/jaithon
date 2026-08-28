@@ -87,8 +87,18 @@ static bool nOsEnv(int argc, Value *args, Value *out) {
     if (!jaiArgString(args[0], 1, "os_env", &name)) return false;
     if (!checkVariableName(name)) return false;
 
+    /* `name` (and `value` below) reach here as arguments, not necessarily
+     * interned literals: getenv/setenv/unsetenv all scan to a NUL, so an
+     * unterminated view needs the same malloc'd-copy treatment jaiIOPathCStr
+     * already gives a path. Malloc, not jaiStringTerminated: the copy has to
+     * outlive several further calls in this function, and a plain owned
+     * buffer sidesteps having to root it across all of them. */
+    char *nameTmp = NULL;
+    const char *cname = jaiIOPathCStr(name, &nameTmp);
+
     if (argc == 1) {
-        const char *value = getenv(name->chars);
+        const char *value = getenv(cname);
+        jaiIOPathDone(nameTmp);
         if (value == NULL) {
             *out = NULL_VAL;
             return true;
@@ -99,21 +109,36 @@ static bool nOsEnv(int argc, Value *args, Value *out) {
         return true;
     }
 
+    bool ok = true;
     errno = 0;
     if (IS_NULL(args[1])) {
-        if (unsetenv(name->chars) != 0)
-            return jaiThrow(vm.cOSError, "os_env(): cannot unset '%s': %s",
-                            name->chars, strerror(errno));
+        if (unsetenv(cname) != 0) {
+            int err = errno;
+            ok = jaiThrow(vm.cOSError, "os_env(): cannot unset '%s': %s",
+                          cname, strerror(err));
+        }
     } else {
         ObjString *value;
-        if (!jaiArgString(args[1], 2, "os_env", &value)) return false;
-        if (memchr(value->chars, '\0', value->length) != NULL)
+        if (!jaiArgString(args[1], 2, "os_env", &value)) {
+            jaiIOPathDone(nameTmp);
+            return false;
+        }
+        if (memchr(value->chars, '\0', value->length) != NULL) {
+            jaiIOPathDone(nameTmp);
             return jaiThrow(vm.cValueError,
                             "os_env(): the value contains a NUL byte");
-        if (setenv(name->chars, value->chars, 1) != 0)
-            return jaiThrow(vm.cOSError, "os_env(): cannot set '%s': %s",
-                            name->chars, strerror(errno));
+        }
+        char *valueTmp = NULL;
+        const char *cvalue = jaiIOPathCStr(value, &valueTmp);
+        int rc = setenv(cname, cvalue, 1);
+        int err = errno;
+        jaiIOPathDone(valueTmp);
+        if (rc != 0)
+            ok = jaiThrow(vm.cOSError, "os_env(): cannot set '%s': %s",
+                          cname, strerror(err));
     }
+    jaiIOPathDone(nameTmp);
+    if (!ok) return false;
     *out = NULL_VAL;
     return true;
 }
@@ -199,8 +224,16 @@ static bool nOsChdir(int argc, Value *args, Value *out) {
     if (!jaiIOCheckPath(path, "os_chdir")) return false;
 
     errno = 0;
-    if (chdir(path->chars) != 0)
-        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot enter", path->chars);
+    char *tmp = NULL;
+    const char *cpath = jaiIOPathCStr(path, &tmp);
+    int rc = chdir(cpath);
+    int err = errno;
+    if (rc != 0) {
+        bool thrown = jaiIOThrowErrno(err != 0 ? err : EIO, "cannot enter", cpath);
+        jaiIOPathDone(tmp);
+        return thrown;
+    }
+    jaiIOPathDone(tmp);
     *out = NULL_VAL;
     return true;
 }
@@ -227,9 +260,16 @@ static bool nIoListdir(int argc, Value *args, Value *out) {
 
     int count = 0;
     errno = 0;
-    char **entries = jaiListDir(path->chars, &count);
-    if (entries == NULL)
-        return jaiIOThrowErrno(errno != 0 ? errno : ENOENT, "cannot list", path->chars);
+    char *tmp = NULL;
+    const char *cpath = jaiIOPathCStr(path, &tmp);
+    char **entries = jaiListDir(cpath, &count);
+    int err = errno;
+    if (entries == NULL) {
+        bool thrown = jaiIOThrowErrno(err != 0 ? err : ENOENT, "cannot list", cpath);
+        jaiIOPathDone(tmp);
+        return thrown;
+    }
+    jaiIOPathDone(tmp);
     if (count < 0) count = 0;
 
     ObjList *names = jaiListNew(count);
@@ -270,11 +310,26 @@ static bool nIoMkdir(int argc, Value *args, Value *out) {
 
     errno = 0;
     if (parents) {
-        if (!jaiMakeDirs(path->chars))
-            return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot create",
-                              path->chars);
+        /* jaiMakeDirs walks and NUL-scans the path itself (splitting it on
+         * every '/'), unlike mkdirAt below, so it needs the same malloc'd
+         * copy jaiIOPathCStr already gives that one. */
+        char *tmp = NULL;
+        const char *cpath = jaiIOPathCStr(path, &tmp);
+        bool made = jaiMakeDirs(cpath);
+        int err = errno;
+        if (!made) {
+            bool thrown = jaiIOThrowErrno(err != 0 ? err : EIO, "cannot create", cpath);
+            jaiIOPathDone(tmp);
+            return thrown;
+        }
+        jaiIOPathDone(tmp);
     } else if (mkdirAt(path) != 0) {
-        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot create", path->chars);
+        int err = errno;
+        char *tmp = NULL;
+        const char *cpath = jaiIOPathCStr(path, &tmp);
+        bool thrown = jaiIOThrowErrno(err != 0 ? err : EIO, "cannot create", cpath);
+        jaiIOPathDone(tmp);
+        return thrown;
     }
     *out = NULL_VAL;
     return true;
@@ -290,9 +345,15 @@ static bool nIoRemove(int argc, Value *args, Value *out) {
     char *rmTmp = NULL;
     const char *rmPath = jaiIOPathCStr(path, &rmTmp);
     int rmRc = remove(rmPath);
+    int err = errno;
+    if (rmRc != 0) {
+        /* rmPath, not path->chars: freeing rmTmp first would leave this read
+         * the same unterminated-view hazard jaiIOPathCStr exists to avoid. */
+        bool thrown = jaiIOThrowErrno(err != 0 ? err : EIO, "cannot remove", rmPath);
+        jaiIOPathDone(rmTmp);
+        return thrown;
+    }
     jaiIOPathDone(rmTmp);
-    if (rmRc != 0)
-        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot remove", path->chars);
     *out = NULL_VAL;
     return true;
 }
@@ -309,11 +370,16 @@ static bool nIoRename(int argc, Value *args, Value *out) {
     const char *fromP = jaiIOPathCStr(from, &fromTmp);
     const char *toP = jaiIOPathCStr(to, &toTmp);
     int mvRc = rename(fromP, toP);
+    int err = errno;
+    if (mvRc != 0) {
+        bool thrown = jaiIOThrowErrno2(err != 0 ? err : EIO, "cannot rename",
+                           fromP, toP);
+        jaiIOPathDone(fromTmp);
+        jaiIOPathDone(toTmp);
+        return thrown;
+    }
     jaiIOPathDone(fromTmp);
     jaiIOPathDone(toTmp);
-    if (mvRc != 0)
-        return jaiIOThrowErrno2(errno != 0 ? errno : EIO, "cannot rename",
-                           from->chars, to->chars);
     *out = NULL_VAL;
     return true;
 }
@@ -332,12 +398,19 @@ static bool nIoStat(int argc, Value *args, Value *out) {
     char *stTmp = NULL;
     const char *stPath = jaiIOPathCStr(path, &stTmp);
     int stRc = follow ? stat(stPath, &info) : lstat(stPath, &info);
-    jaiIOPathDone(stTmp);
+    int err = errno;
     if (stRc != 0) {
         /* Only "nothing there" is an answer; a broken lookup is still an error. */
-        if (errno == ENOENT || errno == ENOTDIR) { *out = NULL_VAL; return true; }
-        return jaiIOThrowErrno(errno, "cannot stat", path->chars);
+        if (err == ENOENT || err == ENOTDIR) {
+            jaiIOPathDone(stTmp);
+            *out = NULL_VAL;
+            return true;
+        }
+        bool thrown = jaiIOThrowErrno(err, "cannot stat", stPath);
+        jaiIOPathDone(stTmp);
+        return thrown;
     }
+    jaiIOPathDone(stTmp);
 
     const char *kind = S_ISREG(info.st_mode)    ? "file"
                        : S_ISDIR(info.st_mode)  ? "dir"

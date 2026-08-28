@@ -306,3 +306,83 @@ fn test_pack_argb_refuses_a_ragged_pixel_count() -> void {
     assert_throws(ValueError, || values.pack_argb(0, 10, 3))
     assert_throws(ValueError, || values.pack_argb(0, 9, 2))
 }
+
+#: A kernel source built the way a generator builds one: a few lines
+#: accumulated with `+`, then one chunk longer than all of them together.
+#:
+#: The shape matters, and is the whole reason the test below bites. A growing
+#: concatenation writes into a shared buffer that is allocated at twice the
+#: length it was created for, so a buffer never holds more than twice what it
+#: has room for -- append more than that slack and the concatenation copies
+#: into a fresh buffer instead of writing in place. Ending with a chunk longer
+#: than everything before it forces exactly that copy, which leaves the
+#: returned string at the front of a buffer with its own length again in
+#: slack. Without that, whether the append below lands in the shared buffer at
+#: all is an accident of how the pieces happened to add up: the first version
+#: of this test built a 178-byte source into a 190-byte buffer, and the
+#: 19-byte append did not fit, so it copied and proved nothing.
+let APPEND_HEAD: list[str] = ["#include <metal_stdlib>", "using namespace metal;"]
+
+let APPEND_BODY = """
+kernel void probe_add_one(device float* v [[buffer(0)]],
+                          uint i [[thread_position_in_grid]]) {
+    v[i] = v[i] + 1.0f;
+}
+
+kernel void probe_double(device float* v [[buffer(0)]],
+                         uint i [[thread_position_in_grid]]) {
+    v[i] = v[i] * 2.0f;
+}
+"""
+
+let APPEND_SUFFIX = "\n||| appended past the source |||\n"
+
+fn build_appendable_source() -> str {
+    var text = ""
+    for line in APPEND_HEAD { text = text + line + "\n" }
+    return text + APPEND_BODY
+}
+
+#: Compiling a source that something has since appended to compiles the source,
+#: not the source plus the appended bytes.
+#:
+#: A concatenation makes a growing string cheap by writing the new bytes past
+#: the view it was handed, inside the buffer they share. Every older view still
+#: ends where it did and still reads the same bytes, so nothing in the language
+#: can tell. What the older view loses is the NUL after it, which the append
+#: overwrote. `gpu_compile` used to hand `chars` straight to the Metal
+#: compiler, which reads to the first NUL -- so it compiled this source plus
+#: whatever had been appended after it and failed on the appended bytes.
+#:
+#: Not hypothetical: jaitensor memoises its generated Metal source, briefly
+#: concatenated that memoised string to build a cache key, and the very next
+#: `Kernel.compile` failed with `expected unqualified-id ,1,2,4,8,16|16|256|2`
+#: -- the key's own bytes. 73 of its 178 tests failed until `gpu_compile` went
+#: through `jaiStringCStr`.
+#:
+#: The compile has to come after the append and has to be of the OLDER string.
+#: The result of the append is a fresh view and is perfectly terminated; it is
+#: the string that was appended TO that is left short a terminator.
+fn test_compiling_a_source_that_was_appended_to_ignores_the_appended_bytes() -> void {
+    if not gpu.is_available() { return }
+
+    let source = build_appendable_source()
+    assert_true(
+        APPEND_BODY.len() > source.len() - APPEND_BODY.len(),
+        "the tail must outweigh the head, or the buffer has no slack"
+    )
+
+    #: Read back rather than measured: asking only for the length of a
+    #: concatenation lets the optimiser answer without performing it, and then
+    #: there is no append and nothing to find.
+    let appended = source + APPEND_SUFFIX
+    assert_true(appended.ends_with(APPEND_SUFFIX), "the append must have happened")
+    assert_true(appended.starts_with(source), "the append must have kept the source")
+
+    let kernel = gpu.Kernel.compile(source, "probe_add_one")
+    let values = gpu.Buffer.of([1.0, 2.0, 3.0])
+    defer { kernel.free() }
+    defer { values.free() }
+    kernel.dispatch([values], 3)
+    assert_eq(values.download(), [2.0, 3.0, 4.0])
+}

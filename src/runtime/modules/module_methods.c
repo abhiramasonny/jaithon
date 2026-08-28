@@ -123,7 +123,8 @@ bool jaiModuleMethod(Value receiver, ObjString *name, Value *out) {
 
     Value hidden;
     if (jaiModuleGet(m, name, &hidden))
-        return jaiThrow(vm.cImportError, "'%s' is not exported by module '%s'",
-                        name->chars, m->name != NULL ? m->name->chars : "?");
+        return jaiThrow(vm.cImportError, "'%.*s' is not exported by module '%s'",
+                        (int)name->length, name->chars,
+                        m->name != NULL ? m->name->chars : "?");
     return false;
 }

@@ -350,8 +350,8 @@ static bool nIntConv(int argc, Value *args, Value *out) {
             break;
         }
         return jaiThrow(vm.cValueError,
-                        "invalid literal for int() with base %lld: '%s'",
-                        (long long)base, text->chars);
+                        "invalid literal for int() with base %lld: '%.*s'",
+                        (long long)base, (int)text->length, text->chars);
     }
 
     switch (jaiValueType(v)) {
@@ -408,8 +408,8 @@ static bool nFloatConv(int argc, Value *args, Value *out) {
             *out = FLOAT_VAL(parsed);
             return true;
         }
-        return jaiThrow(vm.cValueError, "invalid literal for float(): '%s'",
-                        text->chars);
+        return jaiThrow(vm.cValueError, "invalid literal for float(): '%.*s'",
+                        (int)text->length, text->chars);
     }
     return jaiBuiltinArgTypeError(1, "float", "int, float, bool or str", v);
 }
@@ -978,11 +978,14 @@ static bool nAssertEq(int argc, Value *args, Value *out) {
     }
 
     if (message != NULL) {
-        (void)jaiThrow(vm.cAssertionError, "%s: expected %s, got %s",
-                       message->chars, expected->chars, actual->chars);
+        (void)jaiThrow(vm.cAssertionError, "%.*s: expected %.*s, got %.*s",
+                       (int)message->length, message->chars,
+                       (int)expected->length, expected->chars,
+                       (int)actual->length, actual->chars);
     } else {
-        (void)jaiThrow(vm.cAssertionError, "assert_eq failed: expected %s, got %s",
-                       expected->chars, actual->chars);
+        (void)jaiThrow(vm.cAssertionError, "assert_eq failed: expected %.*s, got %.*s",
+                       (int)expected->length, expected->chars,
+                       (int)actual->length, actual->chars);
     }
     jaiGCPopRoots(message != NULL ? 3 : 2);
     return false;

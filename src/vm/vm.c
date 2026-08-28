@@ -646,8 +646,8 @@ static bool methodPermitted(ObjClass *klass, ObjString *name, bool raise) {
     if (!jaiClassRestrictedMethod(klass, name, &mi)) return true;
     if (accessPermitted(mi.owner, mi.visibility)) return true;
     if (!raise) return false;
-    return jaiThrow(vm.cAttributeError, "method '%s' of class '%s' is %s",
-                    name->chars,
+    return jaiThrow(vm.cAttributeError, "method '%.*s' of class '%s' is %s",
+                    (int)name->length, name->chars,
                     mi.owner != NULL && mi.owner->name != NULL
                         ? mi.owner->name->chars : "?",
                     mi.visibility == VIS_PROTECTED ? "protected" : "private");
@@ -741,7 +741,14 @@ static bool moduleMember(ObjModule *m, ObjString *name, Value *out,
 
 /* Shared implementation of `receiver.name` for reads. `ic`, when non-NULL, is
  * filled on a plain instance-field hit so the next execution skips all of
- * this. `raise` selects between "AttributeError" and "quietly false". */
+ * this. `raise` selects between "AttributeError" and "quietly false".
+ *
+ * `name` here is not always the compiler's own interned identifier: get_field
+ * and get_method (builtins_prim.c) call in with whatever ObjString the
+ * program passed as the field name, which can be a view into a growing
+ * concatenation buffer whose NUL a later, unrelated append moved past
+ * (object_string.c). Every message below takes name->length instead of
+ * trusting %s to find where it ends. */
 static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
                             bool raise, InlineCache *ic) {
     if (name == NULL) return false;
@@ -768,15 +775,15 @@ static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
                 !accessPermitted(fieldOwner(klass, name), info->visibility)) {
                 if (!raise) return false;
                 return jaiThrow(vm.cAttributeError,
-                                "field '%s' of class '%s' is private",
-                                name->chars,
+                                "field '%.*s' of class '%s' is private",
+                                (int)name->length, name->chars,
                                 klass->name != NULL ? klass->name->chars : "?");
             }
             if (info->slot >= inst->fieldCount) {
                 if (!raise) return false;
                 return jaiThrow(vm.cAttributeError,
-                                "field '%s' is not present on this instance",
-                                name->chars);
+                                "field '%.*s' is not present on this instance",
+                                (int)name->length, name->chars);
             }
             if (ic != NULL && klass != NULL) {
                 /* Only monomorphic-to-polymorphic growth; a megamorphic site
@@ -804,10 +811,10 @@ static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
             return true;
         }
         if (!raise) return false;
-        return jaiThrow(vm.cAttributeError, "'%s' object has no attribute '%s'",
+        return jaiThrow(vm.cAttributeError, "'%s' object has no attribute '%.*s'",
                         klass != NULL && klass->name != NULL ? klass->name->chars
                                                              : "instance",
-                        name->chars);
+                        (int)name->length, name->chars);
     }
 
     if (IS_CLASS(receiver)) {
@@ -817,9 +824,9 @@ static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
             return methodPermitted(klass, name, raise);
         }
         if (!raise) return false;
-        return jaiThrow(vm.cAttributeError, "class '%s' has no member '%s'",
+        return jaiThrow(vm.cAttributeError, "class '%s' has no member '%.*s'",
                         klass->name != NULL ? klass->name->chars : "?",
-                        name->chars);
+                        (int)name->length, name->chars);
     }
 
     if (IS_MODULE(receiver)) {
@@ -829,14 +836,16 @@ static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
         if (!raise) return false;
         if (hidden) {
             return jaiThrow(vm.cImportError,
-                            "'%s' is not exported by module '%s'", name->chars,
+                            "'%.*s' is not exported by module '%s'",
+                            (int)name->length, name->chars,
                             m->name != NULL ? m->name->chars : "?");
         }
         /* Reading `mod.members` without calling it has to find the same
          * introspection helpers `mod.members()` does. */
         if (jaiBuiltinMethod(receiver, name, out)) return true;
-        return jaiThrow(vm.cAttributeError, "module '%s' has no member '%s'",
-                        m->name != NULL ? m->name->chars : "?", name->chars);
+        return jaiThrow(vm.cAttributeError, "module '%s' has no member '%.*s'",
+                        m->name != NULL ? m->name->chars : "?",
+                        (int)name->length, name->chars);
     }
 
     if (IS_ENUM(receiver)) {
@@ -860,10 +869,10 @@ static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
             return true;
         }
         if (!raise) return false;
-        return jaiThrow(vm.cAttributeError, "enum '%s' has no variant '%s'",
+        return jaiThrow(vm.cAttributeError, "enum '%s' has no variant '%.*s'",
                         AS_ENUM(receiver)->name != NULL
                             ? AS_ENUM(receiver)->name->chars : "?",
-                        name->chars);
+                        (int)name->length, name->chars);
     }
 
     if (IS_ENUM_VAL(receiver)) {
@@ -884,16 +893,16 @@ static bool getPropertyInto(Value receiver, ObjString *name, Value *out,
             return true;
         }
         if (!raise) return false;
-        return jaiThrow(vm.cAttributeError, "'%s' has no member '%s'",
-                        jaiTypeNameStatic(receiver), name->chars);
+        return jaiThrow(vm.cAttributeError, "'%s' has no member '%.*s'",
+                        jaiTypeNameStatic(receiver), (int)name->length, name->chars);
     }
 
     /* str, list, dict, ... : the built-in method tables hand back a bound
      * native, so the call path downstream is identical to a user method. */
     if (jaiBuiltinMethod(receiver, name, out)) return true;
     if (!raise) return false;
-    return jaiThrow(vm.cAttributeError, "'%s' object has no attribute '%s'",
-                    jaiTypeNameStatic(receiver), name->chars);
+    return jaiThrow(vm.cAttributeError, "'%s' object has no attribute '%.*s'",
+                    jaiTypeNameStatic(receiver), (int)name->length, name->chars);
 }
 
 bool jaiGetProperty(Value receiver, ObjString *name, Value *out) {
@@ -907,6 +916,9 @@ static bool throwFieldKind(const FieldInfo *info, Value v) {
                     jaiFieldKindName(info->typeId));
 }
 
+/* Mirrors getPropertyInto's note: set_field (builtins_prim.c) reaches here
+ * with a program-computed name too, so every message below takes
+ * name->length rather than trust %s to find where it ends. */
 bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
     if (name == NULL) return false;
 
@@ -929,22 +941,23 @@ bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
         if (info == NULL) {
             /* Spec §7.1: fields are declared, never conjured by assignment. */
             return jaiThrow(vm.cAttributeError,
-                            "'%s' object has no field '%s'; fields must be "
+                            "'%s' object has no field '%.*s'; fields must be "
                             "declared in the class body",
                             klass != NULL && klass->name != NULL
                                 ? klass->name->chars : "instance",
-                            name->chars);
+                            (int)name->length, name->chars);
         }
         if (info->visibility != VIS_PUBLIC &&
                 !accessPermitted(fieldOwner(klass, name), info->visibility)) {
             return jaiThrow(vm.cAttributeError,
-                            "field '%s' of class '%s' is private", name->chars,
+                            "field '%.*s' of class '%s' is private",
+                            (int)name->length, name->chars,
                             klass->name != NULL ? klass->name->chars : "?");
         }
         if (info->slot >= inst->fieldCount) {
             return jaiThrow(vm.cAttributeError,
-                            "field '%s' is not present on this instance",
-                            name->chars);
+                            "field '%.*s' is not present on this instance",
+                            (int)name->length, name->chars);
         }
         /* The checker could not have caught this: reaching a field through an
          * `any` receiver means it did not know the class, so it did not know
@@ -962,9 +975,9 @@ bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
         Value existing;
         if (!jaiTableGetInterned(&klass->statics, name, &existing)) {
             return jaiThrow(vm.cAttributeError,
-                            "class '%s' has no static member '%s'",
+                            "class '%s' has no static member '%.*s'",
                             klass->name != NULL ? klass->name->chars : "?",
-                            name->chars);
+                            (int)name->length, name->chars);
         }
         jaiGCPushRoot(receiver);
         jaiGCPushRoot(value);
@@ -977,15 +990,17 @@ bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
         ObjModule *m = AS_MODULE(receiver);
         Value existing;
         if (!jaiModuleGet(m, name, &existing)) {
-            return jaiThrow(vm.cAttributeError, "module '%s' has no member '%s'",
-                            m->name != NULL ? m->name->chars : "?", name->chars);
+            return jaiThrow(vm.cAttributeError, "module '%s' has no member '%.*s'",
+                            m->name != NULL ? m->name->chars : "?",
+                            (int)name->length, name->chars);
         }
         jaiModuleSet(m, name, value);
         return true;
     }
 
     return jaiThrow(vm.cAttributeError,
-                    "cannot set attribute '%s' on a '%s' value", name->chars,
+                    "cannot set attribute '%.*s' on a '%s' value",
+                    (int)name->length, name->chars,
                     jaiTypeNameStatic(receiver));
 }
 

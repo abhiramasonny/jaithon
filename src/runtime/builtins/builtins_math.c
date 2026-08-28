@@ -836,13 +836,25 @@ static bool nTimeFormat(int argc, Value *args, Value *out) {
         return true;
     }
 
+    /* `format` reaches here as an argument, not necessarily interned or a
+     * literal, and strftime scans it to a NUL. The terminated form is reused
+     * below across the fast path, the growth loop -- which allocates on the
+     * JAI heap via jaiStringNew on every successful strftime -- and the final
+     * error message, so it is rooted for the whole function rather than
+     * trusted to outlive those allocations unrooted, exactly as nGpuCompile
+     * roots jaiStringTerminated's result. */
+    ObjString *formatTerm = jaiStringTerminated(format);
+    if (formatTerm == NULL) return false;
+    jaiGCPushRoot(OBJ_VAL(formatTerm));
+    const char *cformat = formatTerm->chars;
+
     /* Most formatted timestamps fit here: avoid allocator traffic entirely. */
     char stackBuffer[128];
-    size_t written =
-        strftime(stackBuffer, sizeof stackBuffer, format->chars, &parts);
+    size_t written = strftime(stackBuffer, sizeof stackBuffer, cformat, &parts);
 
     if (written > 0) {
         ObjString *text = jaiStringNew(stackBuffer, written);
+        jaiGCPopRoot();
         if (text == NULL) return false;
         *out = OBJ_VAL(text);
         return true;
@@ -851,11 +863,12 @@ static bool nTimeFormat(int argc, Value *args, Value *out) {
     size_t capacity = 256;
     for (;;) {
         char *buffer = JAI_ALLOC(char, capacity);
-        written = strftime(buffer, capacity, format->chars, &parts);
+        written = strftime(buffer, capacity, cformat, &parts);
 
         if (written > 0) {
             ObjString *text = jaiStringNew(buffer, written);
             JAI_FREE_ARRAY(char, buffer, capacity);
+            jaiGCPopRoot();
             if (text == NULL) return false;
             *out = OBJ_VAL(text);
             return true;
@@ -863,10 +876,13 @@ static bool nTimeFormat(int argc, Value *args, Value *out) {
 
         JAI_FREE_ARRAY(char, buffer, capacity);
 
-        if (capacity >= 65536)
-            return jaiThrow(vm.cValueError,
+        if (capacity >= 65536) {
+            bool thrown = jaiThrow(vm.cValueError,
                             "time_format(): '%s' produces more than 64 KiB",
-                            format->chars);
+                            cformat);
+            jaiGCPopRoot();
+            return thrown;
+        }
 
         capacity <<= 1;
     }
@@ -886,24 +902,48 @@ static bool nTimeParse(int argc, Value *args, Value *out) {
     parts.tm_mday = 1;
     parts.tm_isdst = -1;
 
-    if (strptime(text->chars, format->chars, &parts) == NULL)
-        return jaiThrow(vm.cValueError, "time_parse(): '%s' does not match '%s'",
-                        text->chars, format->chars);
+    /* Both `text` and `format` are caller arguments, not necessarily interned,
+     * and strptime scans both to a NUL in one call -- the same shape as
+     * nGpuCompile's source/entry pair. Both rooted, and rooted BEFORE the
+     * second is made: a terminated copy is reachable from nothing, so making
+     * format's copy could collect text's. */
+    ObjString *textTerm = jaiStringTerminated(text);
+    if (textTerm == NULL) return false;
+    jaiGCPushRoot(OBJ_VAL(textTerm));
+    ObjString *formatTerm = jaiStringTerminated(format);
+    if (formatTerm == NULL) { jaiGCPopRoot(); return false; }
+    jaiGCPushRoot(OBJ_VAL(formatTerm));
+    const char *ctext = textTerm->chars;
+    const char *cformat = formatTerm->chars;
+
+    bool matched = strptime(ctext, cformat, &parts) != NULL;
+    if (!matched) {
+        bool thrown = jaiThrow(vm.cValueError,
+                        "time_parse(): '%s' does not match '%s'", ctext, cformat);
+        jaiGCPopRoots(2);
+        return thrown;
+    }
 
     int64_t seconds;
     if (utc) {
-        if (!tmToUnix(&parts, &seconds))
-            return jaiThrow(vm.cOverflowError,
+        if (!tmToUnix(&parts, &seconds)) {
+            bool thrown = jaiThrow(vm.cOverflowError,
                             "time_parse(): '%s' is out of range for a timestamp",
-                            text->chars);
+                            ctext);
+            jaiGCPopRoots(2);
+            return thrown;
+        }
     } else {
         time_t local = mktime(&parts);
-        if (local == (time_t)-1)
-            return jaiThrow(vm.cValueError,
-                            "time_parse(): '%s' is not a valid local time",
-                            text->chars);
+        if (local == (time_t)-1) {
+            bool thrown = jaiThrow(vm.cValueError,
+                            "time_parse(): '%s' is not a valid local time", ctext);
+            jaiGCPopRoots(2);
+            return thrown;
+        }
         seconds = (int64_t)local;
     }
+    jaiGCPopRoots(2);
     *out = INT_VAL(seconds);
     return true;
 }

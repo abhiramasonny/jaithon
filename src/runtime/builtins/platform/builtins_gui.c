@@ -67,8 +67,13 @@ static bool nGuiWindowOpen(int argc, Value *args, Value *out) {
                         "gui_window_open(): target_fps must be non-negative, got %lld",
                         (long long)targetFPS);
 
-    JaiWindow *window = jaiWindowOpen((int)width, (int)height, title->chars,
-                                      (int)targetFPS);
+    /* jaiWindowOpen (native/apple/gui.m etc.) builds the OS title synchronously
+     * from this pointer and keeps none of it, so a single unrooted
+     * jaiStringCStr() -- consumed entirely inside this one call, nothing else
+     * allocating in between -- is enough; `title` is a caller argument, not
+     * necessarily interned, so it may be an unterminated concatenation view. */
+    JaiWindow *window = jaiWindowOpen((int)width, (int)height,
+                                      jaiStringCStr(title), (int)targetFPS);
     if (window == NULL)
         return jaiThrow(vm.cRuntimeError,
                         "gui_window_open(): the window could not be created");
@@ -367,7 +372,9 @@ static bool nGuiSetTitle(int argc, Value *args, Value *out) {
     if (!requireWindow(args[0], 1, "gui_set_title", &w)) return false;
     ObjString *title;
     if (!jaiArgString(args[1], 2, "gui_set_title", &title)) return false;
-    jaiWindowSetTitle(w->window, title->chars);
+    /* Same reasoning as gui_window_open above: consumed synchronously by one
+     * call, so the unrooted form is enough. */
+    jaiWindowSetTitle(w->window, jaiStringCStr(title));
     *out = NULL_VAL;
     return true;
 }

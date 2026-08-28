@@ -125,12 +125,33 @@ bool jaiIOCheckPath(ObjString *path, const char *fnName) {
 typedef struct {
     FILE       *handle;
     ObjFile    *file;
+    /* Only set for the three standard descriptors, whose names are C literals.
+     * A `file`'s name is never cached here: it has to survive to wherever an
+     * error is eventually thrown, which is arbitrarily far past this struct's
+     * construction and past any number of GC-allocating calls in between --
+     * exactly the "two calls in a row" hazard jaiStringTerminated warns about,
+     * except stretched across a whole function instead of two adjacent lines.
+     * streamDisplayName() below reads it fresh, immediately before the one
+     * jaiThrow() call that consumes it, which is the only point a bare
+     * jaiStringCStr() result is good for. */
     const char *name;
 } Stream;
 
+/* `f->path` may have lost its terminator to a later concatenation elsewhere
+ * in the program since this file was opened, so every read of it for display
+ * goes through here rather than `f->path->chars` directly. */
+static const char *filePathDisplay(const ObjFile *f) {
+    return f->path != NULL ? jaiStringCStr(f->path) : "<file>";
+}
+
 static bool throwClosed(const ObjFile *f, const char *fnName) {
     return jaiThrow(vm.cIOError, "%s(): the file '%s' is closed", fnName,
-                    f->path != NULL ? f->path->chars : "?");
+                    filePathDisplay(f));
+}
+
+/* The display name for `s`, resolved fresh: see the comment on Stream.name. */
+static const char *streamDisplayName(const Stream *s) {
+    return s->file != NULL ? filePathDisplay(s->file) : s->name;
 }
 
 static bool resolveStream(Value v, int index, const char *fnName, Stream *out) {
@@ -139,7 +160,7 @@ static bool resolveStream(Value v, int index, const char *fnName, Stream *out) {
         if (f->closed || f->handle == NULL) return throwClosed(f, fnName);
         out->handle = f->handle;
         out->file = f;
-        out->name = f->path != NULL ? f->path->chars : "<file>";
+        out->name = NULL;   /* unused for a file stream; see streamDisplayName */
         return true;
     }
     if (IS_INT(v)) {
@@ -167,7 +188,7 @@ static bool requireStreamAccess(const Stream *s, bool wantRead,
               (wantRead ? s->file->readable : s->file->writable);
     if (ok) return true;
     return jaiThrow(vm.cIOError, "%s(): '%s' is not open for %s", fnName,
-                    s->name, wantRead ? "reading" : "writing");
+                    streamDisplayName(s), wantRead ? "reading" : "writing");
 }
 
 /* Operations that manipulate the handle itself need the object, not a stream:
@@ -192,7 +213,7 @@ static bool streamError(Stream *s, JaiBuf *buf, const char *what) {
     int err = errno;
     clearerr(s->handle);
     jaiBufFree(buf);
-    (void)jaiIOThrowErrno(err != 0 ? err : EIO, what, s->name);
+    (void)jaiIOThrowErrno(err != 0 ? err : EIO, what, streamDisplayName(s));
     return true;
 }
 
@@ -273,25 +294,45 @@ static bool nIoOpen(int argc, Value *args, Value *out) {
     if (!jaiArgString(args[0], 1, "open", &path)) return false;
     if (!jaiIOCheckPath(path, "open")) return false;
 
+    /* `mode` reaches here as an argument, not a literal: modeIsKnown() runs
+     * strcmp against it, and an unterminated view would let that read past
+     * the buffer it lives in looking for a NUL that isn't there. Through
+     * jaiIOPathCStr like `path` below -- a malloc'd copy needs no GC root, so
+     * unlike jaiStringTerminated it stays valid across every use in this
+     * function without pairing a push with each return. */
+    char *modeTmp = NULL;
     const char *mode = "r";
     if (argc >= 2 && !IS_NULL(args[1])) {
         ObjString *modeText;
         if (!jaiArgString(args[1], 2, "open", &modeText)) return false;
-        mode = modeText->chars;
+        mode = jaiIOPathCStr(modeText, &modeTmp);
     }
-    if (!modeIsKnown(mode))
-        return jaiThrow(vm.cValueError,
+    if (!modeIsKnown(mode)) {
+        bool thrown = jaiThrow(vm.cValueError,
                         "open(): invalid mode '%s'; expected one of "
                         "r w a rb wb ab r+ w+ a+", mode);
+        jaiIOPathDone(modeTmp);
+        return thrown;
+    }
 
     errno = 0;
     char *pathTmp = NULL;
-    FILE *handle = fopen(jaiIOPathCStr(path, &pathTmp), mode);
+    const char *cpath = jaiIOPathCStr(path, &pathTmp);
+    FILE *handle = fopen(cpath, mode);
+    if (handle == NULL) {
+        int err = errno;
+        bool thrown = jaiIOThrowErrno(err != 0 ? err : EIO, "cannot open", cpath);
+        jaiIOPathDone(pathTmp);
+        jaiIOPathDone(modeTmp);
+        return thrown;
+    }
     jaiIOPathDone(pathTmp);
-    if (handle == NULL)
-        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot open", path->chars);
 
+    /* jaiFileNew scans `mode` to a NUL of its own (readable/writable/binary
+     * flags) but keeps no pointer into it, so modeTmp can be freed right
+     * after this call returns. */
     *out = OBJ_VAL(jaiFileNew(handle, path, mode));
+    jaiIOPathDone(modeTmp);
     return true;
 }
 
@@ -423,7 +464,7 @@ static bool nIoWrite(int argc, Value *args, Value *out) {
     if (written != length) {
         int err = errno;
         clearerr(s.handle);
-        return jaiIOThrowErrno(err != 0 ? err : EIO, "cannot write to", s.name);
+        return jaiIOThrowErrno(err != 0 ? err : EIO, "cannot write to", streamDisplayName(&s));
     }
     *out = INT_VAL((int64_t)written);
     return true;
@@ -447,7 +488,7 @@ static bool nIoClose(int argc, Value *args, Value *out) {
     errno = 0;
     if (fclose(handle) != 0)
         return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot close",
-                          file->path != NULL ? file->path->chars : "?");
+                          filePathDisplay(file));
     return true;
 }
 
@@ -474,14 +515,17 @@ static bool nIoSeek(int argc, Value *args, Value *out) {
                         (long long)whence);
     }
 
-    const char *name = file->path != NULL ? file->path->chars : "?";
+    /* Resolved fresh at each throw, not cached in a local: see the comment on
+     * Stream.name above. */
     errno = 0;
     if (fseeko(file->handle, (off_t)offset, origin) != 0)
-        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot seek in", name);
+        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot seek in",
+                          filePathDisplay(file));
 
     off_t position = ftello(file->handle);
     if (position < 0)
-        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot seek in", name);
+        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot seek in",
+                          filePathDisplay(file));
     *out = INT_VAL((int64_t)position);
     return true;
 }
@@ -496,7 +540,7 @@ static bool nIoTell(int argc, Value *args, Value *out) {
     off_t position = ftello(file->handle);
     if (position < 0)
         return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot read the position of",
-                          file->path != NULL ? file->path->chars : "?");
+                          filePathDisplay(file));
     *out = INT_VAL((int64_t)position);
     return true;
 }
@@ -508,7 +552,7 @@ static bool nIoFlush(int argc, Value *args, Value *out) {
 
     errno = 0;
     if (fflush(s.handle) != 0)
-        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot flush", s.name);
+        return jaiIOThrowErrno(errno != 0 ? errno : EIO, "cannot flush", streamDisplayName(&s));
     *out = NULL_VAL;
     return true;
 }
@@ -552,7 +596,7 @@ static bool nFileWriteLine(int argc, Value *args, Value *out) {
     if (!ok) {
         int err = errno;
         clearerr(s.handle);
-        return jaiIOThrowErrno(err != 0 ? err : EIO, "cannot write to", s.name);
+        return jaiIOThrowErrno(err != 0 ? err : EIO, "cannot write to", streamDisplayName(&s));
     }
     *out = INT_VAL((int64_t)written + 1);
     return true;
