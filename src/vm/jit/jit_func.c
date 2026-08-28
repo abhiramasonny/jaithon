@@ -537,6 +537,17 @@ typedef struct {
      * why it survives a branch merge and is not listed in clearStackProofs --
      * see the contrast drawn at stackAscii below. */
     uint8_t   stackObjType[JIT_MAX_STACK];
+    /* An exemplar of what THIS list entry's elements are, for a list the body
+     * built itself and so has no live sample of. `OP_BUILD_LIST` knows the kind
+     * of everything it just popped; nothing downstream does, because the list
+     * does not exist until run time.
+     *
+     * A prediction of the same standing as stackSeen: whatever reads it emits
+     * the guard it would have emitted anyway. For an int, float or bool the
+     * exemplar is a synthesised immediate and so has no lifetime at all; for an
+     * object it is the element's own live sample, which was already being held
+     * here and is reachable for the same reasons it was. */
+    Value     stackElem[JIT_MAX_STACK];
     int       stackLocal[JIT_MAX_STACK];
     /* This entry is not merely a string by sample -- it came out of the shared
      * one-byte ASCII table, so it IS an interned ObjString, and the guards a
@@ -1890,6 +1901,7 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
     e->stackObjType[e->depth] = 0;
+    e->stackElem[e->depth] = NULL_VAL;
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
@@ -1954,6 +1966,7 @@ static bool pushSelf(Emit *e) {
     e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
     e->stackObjType[e->depth] = 0;
+    e->stackElem[e->depth] = NULL_VAL;
     e->stack[e->depth++] = SLOT_SELF;
     return true;
 }
@@ -2022,6 +2035,7 @@ static void dropCalleeEntry(Emit *e) {
     e->stackAscii[e->depth - 2] = e->stackAscii[e->depth - 1];
     e->stackUnit[e->depth - 2]  = e->stackUnit[e->depth - 1];
     e->stackObjType[e->depth - 2] = e->stackObjType[e->depth - 1];
+    e->stackElem[e->depth - 2] = e->stackElem[e->depth - 1];
     e->depth--;
 }
 
@@ -5258,6 +5272,53 @@ static bool exemplarKind(Value elem, SlotKind *kind, unsigned *tag,
     return false;
 }
 
+/* An exemplar for the elements a freshly-built list is about to hold.
+ *
+ * `[1, 2, 3]` has no live list to sample -- the list does not exist until the
+ * compiled code runs -- but the model knows the kind of every entry that went
+ * into it. For a scalar that is enough: a synthesised zero of the right kind
+ * answers every question the iterate arm asks of a sample, and being an
+ * immediate it has no lifetime to worry about. For an object the element's own
+ * sample is reused, which was already being held on the operand stack.
+ *
+ * All `n` must agree, and an instance must agree on its class too, for the same
+ * reason the dict walk insists on it: a mispredicted element kind deoptimises on
+ * every read, which is worse than not compiling at all.
+ *
+ * Returns false when the list is empty (a comprehension's accumulator) or the
+ * elements disagree -- in both cases there is simply nothing to predict. */
+static bool buildListExemplar(const Emit *e, unsigned first, unsigned n,
+                              Value *out) {
+    if (n == 0) return false;
+    Value chosen = NULL_VAL;
+    for (unsigned i = 0; i < n; i++) {
+        unsigned idx = first + i;
+        Value here;
+        switch (e->stack[idx]) {
+        case SLOT_INT:   here = INT_VAL(0);        break;
+        case SLOT_FLOAT: here = FLOAT_VAL(0.0);    break;
+        case SLOT_BOOL:  here = BOOL_VAL(false);   break;
+        case SLOT_OBJ:
+        case SLOT_LIST:
+        case SLOT_INST:
+            here = e->stackSeen[idx];
+            if (!IS_OBJ(here) || AS_OBJ(here) == NULL) return false;
+            break;
+        default:
+            return false;
+        }
+        if (i == 0) { chosen = here; continue; }
+        if (jaiValueType(here) != jaiValueType(chosen)) return false;
+        if (IS_OBJ(here) && OBJ_TYPE(here) != OBJ_TYPE(chosen)) return false;
+        if (IS_INSTANCE(here) &&
+            AS_INSTANCE(here)->klass != AS_INSTANCE(chosen)->klass) {
+            return false;
+        }
+    }
+    *out = chosen;
+    return true;
+}
+
 /* One value out of a live dict, and only if every value in it agrees.
  *
  * A LIST is sampled at index 0 alone, because a list's elements are usually
@@ -7167,6 +7228,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->stackNullLit[e->depth - 1] = false;
                     e->stackUnit[e->depth - 1]  = false;
                     e->stackObjType[e->depth - 1] = 0;
+                    e->stackElem[e->depth - 1] = NULL_VAL;
                 } else if (k != SLOT_FLOAT) {
                     e->whyNot = "a type guard the kinds cannot settle";
                     return false;
@@ -8411,6 +8473,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (n > JIT_MAX_ARGS_OUT) return false;
             if (!e->callsOut) return false;
             if (e->depth < n) return false;
+            Value elemSeen = NULL_VAL;
+            if (!buildListExemplar(e, e->depth - n, n, &elemSeen)) {
+                elemSeen = NULL_VAL;
+            }
             if (!emitDescriptor(e, NULL_VAL, e->depth - n, n,
                                 (void *)&jitBuildList)) {
                 return false;
@@ -8420,6 +8486,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValue(e, &r, NULL)) return false;
             }
             if (!pushValue(e, SLOT_LIST, 0, NULL)) return false;
+            /* Computed BEFORE the pops above, since it reads the entries they
+             * remove. See buildListExemplar for why the list itself cannot
+             * answer this. */
+            e->stackElem[e->depth - 1] = elemSeen;
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
@@ -9161,6 +9231,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (IS_LIST(srcv) && AS_LIST(srcv)->count > 0) {
                     sample = jaiListGet(AS_LIST(srcv), 0);
                 }
+                /* A list this body built has no live sample to read an element
+                 * off -- it does not exist yet -- but OP_BUILD_LIST recorded
+                 * what went into it. `[expr for x in [a, b, c]]` is the shape
+                 * that wanted this: the source list is a literal built one
+                 * instruction earlier, and without it every comprehension over
+                 * one ran interpreted. */
+                if (IS_NULL(sample)) sample = e->stackElem[e->depth - 1];
                 if (IS_NULL(sample)) {
                     e->whyNot = "iterating a list with nothing to look at";
                     return false;
@@ -9276,8 +9353,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 return false;
             }
             if (!adoptLocalKind(e, slot, SLOT_INT, 0, NULL)) {
-                e->whyNot = "loop variable took two kinds";
-                return false;
+                return subWhy(e, "loop variable in local %u is already a %s, "
+                                 "not an int", slot,
+                              slotKindName(e->localKind[slot]));
             }
             if (slot == 0) e->usesSlot0 = true;
 
@@ -9436,8 +9514,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     } else { e->whyNot = "element kind unknown"; return false; }
 
                     if (!adoptLocalKindSeen(e, fslot, ek, esh, ecl, sample)) {
-                        e->whyNot = "loop variable took two kinds";
-                        return false;
+                        return subWhy(e, "loop variable in local %u is already "
+                                         "a %s, not a %s", fslot,
+                                      slotKindName(e->localKind[fslot]),
+                                      slotKindName(ek));
                     }
 
                     /* Only OP_GET_ITER's list arm makes a shape-nonzero
@@ -9658,8 +9738,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     e->localTyped[slot] = false;
                 }
                 if (!adoptLocalKindSeen(e, slot, ek, esh, ecl, sample)) {
-                    e->whyNot = "loop variable took two kinds";
-                    return false;
+                    return subWhy(e, "loop variable in local %u is already a "
+                                     "%s, not a %s", slot,
+                                  slotKindName(e->localKind[slot]),
+                                  slotKindName(ek));
                 }
                 e->iterSlot = slot;
                 e->iterExit = (uint32_t)((int32_t)(off + 5) + jump);
@@ -9885,8 +9967,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             if (!adoptLocalKindSeen(e, pslotA, pk[0], 0, NULL, pseen[0]) ||
                 !adoptLocalKindSeen(e, pslotB, pk[1], 0, NULL, pseen[1])) {
-                e->whyNot = "loop variable took two kinds";
-                return false;
+                return subWhy(e, "a pair's loop variables (locals %u and %u) "
+                                 "are already %s and %s", pslotA, pslotB,
+                              slotKindName(e->localKind[pslotA]),
+                              slotKindName(e->localKind[pslotB]));
             }
 
             unsigned rIter = pairHead ? JIT_PAIR_ITER_REG : pushReg(e) - 1;
@@ -12589,7 +12673,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            uint8_t iterKind, Value elemSample, bool elemMixed,
                            uint8_t elemStg,
                            bool wholeBody, bool noInline,
-                           const bool *nullable, bool *needNullable);
+                           const bool *nullable, bool *needNullable,
+                           const bool *dynamic, bool *needDynamic);
 
 /* The loop tier had no retry at all, where the function tier has had one since
  * `nullableLocal` existed: a slot the walk cannot settle on one kind for simply
@@ -12621,17 +12706,30 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                        bool wholeBody, bool noInline) {
     bool nullable[JIT_MAX_SLOTS + 1];
     bool needNullable[JIT_MAX_SLOTS + 1];
+    /* Same ledger the function tier has kept since it grew one: a slot given
+     * two kinds does not give the loop up, it asks to carry its tag and the
+     * walk runs again with that decided from the start. OSR had the nullable
+     * half of this and not the dynamic half, and a comprehension is exactly
+     * what needed it -- the front end reuses one slot for the loop variable and
+     * for the result, so `[x * 2 for x in xs]` seeds the slot as a list from
+     * the previous iteration and then binds an int into it. Three attempts,
+     * because a body can want both widenings and neither implies the other. */
+    bool dynamic[JIT_MAX_SLOTS + 1];
+    bool needDynamic[JIT_MAX_SLOTS + 1];
     memset(nullable, 0, sizeof nullable);
-    for (int attempt = 0; attempt < 2; attempt++) {
+    memset(dynamic, 0, sizeof dynamic);
+    for (int attempt = 0; attempt < 3; attempt++) {
         memset(needNullable, 0, sizeof needNullable);
+        memset(needDynamic, 0, sizeof needDynamic);
         if (compileOsrOnce(closure, top, slots, iterKind, elemSample, elemMixed,
                            elemStg, wholeBody, noInline, nullable,
-                           needNullable)) {
+                           needNullable, dynamic, needDynamic)) {
             return true;
         }
         bool grew = false;
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             if (needNullable[i] && !nullable[i]) { nullable[i] = true; grew = true; }
+            if (needDynamic[i] && !dynamic[i]) { dynamic[i] = true; grew = true; }
         }
         if (!grew) return false;
     }
@@ -12642,7 +12740,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            uint8_t iterKind, Value elemSample, bool elemMixed,
                            uint8_t elemStg,
                            bool wholeBody, bool noInline,
-                           const bool *nullable, bool *needNullable) {
+                           const bool *nullable, bool *needNullable,
+                           const bool *dynamic, bool *needDynamic) {
     bool hasIter = iterKind != 0;
     ObjFunction *fn = closure->fn;
     if (!isInstructionStart(&fn->chunk, top)) return false;
@@ -12695,6 +12794,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     e.chunkDepthCount = fn->chunk.count + 1;
     e.savedCount = JIT_MAX_SAVED;
     memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
+    memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
     /* Each slot takes the kind it holds right now. The entry re-checks them on
      * every later entry, so this is a specialisation, not an assumption. */
     for (unsigned i = 0; i < e.locals; i++) {
@@ -12777,6 +12877,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             probe.spanSeen[i] = false;
         }
         memcpy(probe.nullableLocal, nullable, sizeof probe.nullableLocal);
+        memcpy(probe.dynamicLocal, dynamic, sizeof probe.dynamicLocal);
         for (unsigned i = 0; i < e.locals; i++) {
             probe.localKind[i]  = e.localKind[i];
             probe.localShape[i] = e.localShape[i];
@@ -12961,6 +13062,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
              * request for a wider one has to travel back to the retry loop
              * from here. */
             memcpy(needNullable, probe.needNullable, sizeof probe.needNullable);
+            memcpy(needDynamic, probe.needDynamic, sizeof probe.needDynamic);
         }
         for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
     }
@@ -13074,6 +13176,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     if (!compileBody(&e, closure) || e.failed) {
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             if (e.needNullable[i]) needNullable[i] = true;
+            if (e.needDynamic[i])  needDynamic[i]  = true;
         }
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
