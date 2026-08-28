@@ -2185,6 +2185,22 @@ static bool jitDeoptStress(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_MODULE_CALLS=0 turns off the module-member call arm at OP_INVOKE,
+ * so the two shapes can be compared inside ONE binary -- alternating two builds
+ * cannot be trusted here, since each switch invalidates __jaicache__ and every
+ * sample then pays a stdlib recompile.
+ *
+ * Default ON. Read once: a body compiled with the arm and a body compiled
+ * without it must not coexist in one run. */
+static bool jitModuleCalls(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_MODULE_CALLS");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* JAITHON_JIT_SPLIT_STRESS=1 puts the split bank's boundary into every OSR body
  * that can take one, instead of only the ones that pay for it -- the same idea
  * as JAITHON_JIT_DEOPT_STRESS, for the same reason.
@@ -4983,6 +4999,75 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     return true;
 }
 
+/* What a descriptor call does with its result, once the arguments are consumed:
+ * the predicted kind types the entry pushed for it, the tag that actually comes
+ * back is checked, and a surprise deopts to the instruction AFTER the call --
+ * which has happened and must not happen twice.
+ *
+ * Shared by the global-call and module-call arms below. They differ only in
+ * what they consume before it and in how the callee was resolved; from the
+ * descriptor's `result` onwards there is nothing to tell them apart. */
+static bool emitCallOutResult(Emit *e, SlotKind rk, uint32_t rshape,
+                              ObjClass *rcls, uint32_t after) {
+    if (!pushValue(e, rk, rshape, rcls)) return false;
+
+    unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+    if (rk == SLOT_MAYBE_INST) {
+        emitMaybeInstResult(e, pushReg(e) - 1, rat, rshape, after);
+        return true;
+    }
+    unsigned wantTag = rk == SLOT_INT   ? VAL_INT
+                     : rk == SLOT_FLOAT ? VAL_FLOAT
+                     : rk == SLOT_BOOL  ? VAL_BOOL
+                     : rk == SLOT_NULL  ? VAL_NULL
+                                        : VAL_OBJ;
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
+    branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    /* A null carries no payload worth loading, but the register still stands
+     * for the entry and a deopt materialises it, so it gets a defined zero
+     * rather than whatever the descriptor happened to leave behind. */
+    if (rk == SLOT_NULL) emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
+    /* A byte, not a word: BOOL_VAL writes the union's `bool` member and leaves
+     * the other seven bytes of the payload indeterminate, so a 64-bit load
+     * brings back whatever the slot held before. The register stands for a
+     * bool from here on and everything downstream tests it against zero, so
+     * those bytes read as true -- `values.map(|v| is_nan(v))` came back all
+     * true over a list with no NaN in it. Every other descriptor return site
+     * already splits the two; this one did not. */
+    else if (rk == SLOT_BOOL) emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
+    else emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+    if (rk == SLOT_INST) {
+        /* The tag says "an object", which is not "an instance of this class",
+         * and every field offset resolved against the entry below assumes it
+         * is. The object type is checked before `klass` is read for the same
+         * reason it is at the invoke arm: VAL_OBJ covers every heap object and
+         * a returned string's header is shorter than an instance's. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(ObjInstance, klass)));
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                           (unsigned)offsetof(ObjClass, shapeId)));
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    } else if (rk == SLOT_LIST) {
+        /* Same hazard as SLOT_INST above: a callee entered with another
+         * specialisation runs interpreted and may return any type, so
+         * VAL_OBJ alone does not prove the payload is a list before
+         * downstream code reads ObjList's fields off it unguarded. */
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    }
+    e->wroteHeap = true;
+    return true;
+}
+
 /* A call to a global function that has itself compiled. Its return kind types
  * the result; the tag that actually comes back is checked, and a surprise
  * deopts to the instruction after the call, since the call has happened. */
@@ -5046,63 +5131,111 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     }
     if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_FUNC) return false;
     e->depth--;
-    if (!pushValue(e, rk, rshape, rcls)) return false;
+    return emitCallOutResult(e, rk, rshape, rcls, after);
+}
 
-    unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
-    if (rk == SLOT_MAYBE_INST) {
-        emitMaybeInstResult(e, pushReg(e) - 1, rat, rshape, after);
-        return true;
+/* `math.sqrt(x)` is not a method call. It is a global call whose callee is
+ * resolved through ANOTHER module, so what was missing was never the call
+ * machinery -- it is the pinning.
+ *
+ * Two guards, in this order, both before anything is consumed so a miss resumes
+ * at the invoke with the receiver and the arguments untouched:
+ *
+ *   THIS module. OP_GET_GLOBAL loads `math` by address behind a VAL_OBJ tag
+ *   guard, and the arm's own object-type guard would only prove "some module",
+ *   so the receiver is compared against the ObjModule this compiled against.
+ *   Everything below -- the version word's address, the resolved closure --
+ *   belongs to that one module.
+ *
+ *   STILL this binding. ObjModule::version is the counter for a memoised
+ *   global VALUE or a resolved callee, and it is the one that moves when
+ *   `math.sqrt = f` overwrites the member (jaiModuleSet bumps it because a
+ *   closure is not inert). `globals.keyVersion` is the WRONG counter here and
+ *   would be silent: overwriting an existing key never moves its entry, which
+ *   is the whole reason keyVersion exists. Guarding it per call rather than
+ *   at entry also covers a rebinding from inside the loop, which the entry
+ *   check by itself does not -- see the note at OP_SET_GLOBAL.
+ *
+ * The callee must have compiled. The standing warning at OP_GET_GLOBAL says
+ * admitting a callee whose jitFunc is NULL MISCOMPILES for a reason nobody has
+ * written down; this arm does not cross it, and pays nothing for that --
+ * `math.sqrt` compiles long before any loop calling it does.
+ *
+ * The receiver is dropped rather than passed: a module is not an argument. */
+static bool emitModuleCall(Emit *e, ObjModule *m, Value calleeVal,
+                           unsigned ridx, unsigned argc, uint32_t after) {
+    ObjFunction *cfn = AS_CLOSURE(calleeVal)->fn;
+    if (cfn->jitFunc == NULL) {
+        return subWhy(e, "a module member that has not compiled");
     }
-    unsigned wantTag = rk == SLOT_INT   ? VAL_INT
-                     : rk == SLOT_FLOAT ? VAL_FLOAT
-                     : rk == SLOT_BOOL  ? VAL_BOOL
-                     : rk == SLOT_NULL  ? VAL_NULL
-                                        : VAL_OBJ;
-    emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, rat));
-    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wantTag));
-    branchOnDeoptAt(e, JAI_A64_NE, after, true);
-    /* A null carries no payload worth loading, but the register still stands
-     * for the entry and a deopt materialises it, so it gets a defined zero
-     * rather than whatever the descriptor happened to leave behind. */
-    if (rk == SLOT_NULL) emit(e, jaiA64MovzX(pushReg(e) - 1, 0, 0));
-    /* A byte, not a word: BOOL_VAL writes the union's `bool` member and leaves
-     * the other seven bytes of the payload indeterminate, so a 64-bit load
-     * brings back whatever the slot held before. The register stands for a
-     * bool from here on and everything downstream tests it against zero, so
-     * those bytes read as true -- `values.map(|v| is_nan(v))` came back all
-     * true over a list with no NaN in it. Every other descriptor return site
-     * already splits the two; this one did not. */
-    else if (rk == SLOT_BOOL) emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
-    else emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
-    if (rk == SLOT_INST) {
-        /* The tag says "an object", which is not "an instance of this class",
-         * and every field offset resolved against the entry below assumes it
-         * is. The object type is checked before `klass` is read for the same
-         * reason it is at the invoke arm: VAL_OBJ covers every heap object and
-         * a returned string's header is shorter than an instance's. */
-        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
-                           (unsigned)offsetof(Obj, type)));
-        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
-        branchOnDeoptAt(e, JAI_A64_NE, after, true);
-        emit(e, jaiA64LdrX(JIT_SCRATCH_A, pushReg(e) - 1,
-                           (unsigned)offsetof(ObjInstance, klass)));
-        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
-                           (unsigned)offsetof(ObjClass, shapeId)));
-        emitConst64(e, JIT_SCRATCH_B, (int64_t)rshape);
-        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
-        branchOnDeoptAt(e, JAI_A64_NE, after, true);
-    } else if (rk == SLOT_LIST) {
-        /* Same hazard as SLOT_INST above: a callee entered with another
-         * specialisation runs interpreted and may return any type, so
-         * VAL_OBJ alone does not prove the payload is a list before
-         * downstream code reads ObjList's fields off it unguarded. */
-        emit(e, jaiA64LdrW(JIT_SCRATCH_A, pushReg(e) - 1,
-                           (unsigned)offsetof(Obj, type)));
-        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
-        branchOnDeoptAt(e, JAI_A64_NE, after, true);
+    /* WHICH RECORD SAYS WHAT COMES BACK, and it is not the obvious one.
+     * `jitFunc != NULL` does NOT make `jitReturnKind` a fact: it is stored
+     * unconditionally at the end of a compile, so a body whose walk never
+     * reached an OP_RETURN -- one that compiled a prefix and bails -- leaves it
+     * at the SLOT_INT a zeroed Emit starts on. math.sqrt and math.sin are both
+     * exactly that (`sawReturn=0`, `obsReturnKind=float`), so trusting the
+     * compiled kind here predicted int, the tag guard below failed on the first
+     * call, and the loop left compiled code every iteration: p27 did not move at
+     * all. The interpreter's own per-callee record is a measured fact and is
+     * asked first; the compiled kind stands in only when there is none.
+     *
+     * Either way it is a prediction, and the tag guard after the call is what
+     * makes it sound -- the same contract emitGlobalCall states. */
+    SlotKind rk = SLOT_NULL;
+    uint32_t rshape = 0;
+    ObjClass *rcls = NULL;
+    if (!observedReturnKind(cfn, &rk, &rshape)) {
+        rk = (SlotKind)cfn->jitReturnKind;
+        rshape = cfn->jitReturnShape;
     }
-    e->wroteHeap = true;
-    return true;
+    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
+        rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
+        rk != SLOT_OBJ && rk != SLOT_NULL) {
+        return subWhy(e, "a module member's return kind (%d)", (int)rk);
+    }
+    if ((rk == SLOT_INST || rk == SLOT_MAYBE_INST) &&
+        (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL)) {
+        return subWhy(e, "a module member's return class is not on record");
+    }
+    /* Every entry this consumes, receiver included, has to be one the
+     * descriptor can pass -- asked HERE rather than left to emitDescriptor,
+     * which refuses only after the guards below have been emitted and would
+     * turn a graceful decline into a whole-body one. It also settles the
+     * register arithmetic: the receiver is named by counting back from the top
+     * of the value bank, which is the same thing as counting back from the top
+     * of the model only while every entry between them holds a register, and
+     * every kind admitted here does. */
+    for (unsigned i = 0; i <= argc; i++) {
+        SlotKind k = e->stack[ridx + i];
+        if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
+            k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
+            return subWhy(e, "a module call over an entry of kind %d", (int)k);
+        }
+    }
+    /* Past here the guards are emitted, so a later refusal stops the compile
+     * rather than falling back onto a half-written instruction stream. */
+
+    settleAll(e);
+    unsigned rRecv = valueXReg(e, e->valueDepth - argc - 1);
+    emitConst64(e, JIT_SCRATCH_C, (int64_t)(uintptr_t)m);
+    emit(e, jaiA64SubsXReg(31, rRecv, JIT_SCRATCH_C));
+    branchOnDeopt(e, JAI_A64_NE);
+
+    emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&m->version);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+    emitConst64(e, JIT_SCRATCH_B, (int64_t)(uint32_t)m->version);
+    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+    branchOnDeopt(e, JAI_A64_NE);
+
+    if (!emitDescriptor(e, calleeVal, ridx + 1, argc, (void *)&jitCallOut)) {
+        return false;
+    }
+    for (unsigned i = 0; i <= argc; i++) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) return false;
+    }
+    return emitCallOutResult(e, rk, rshape, rcls, after);
 }
 
 /* Emit a method's body directly, when that body is one expression.
@@ -9138,7 +9271,47 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 Value onative = IS_BOUND(obound) ? AS_BOUND(obound)->method
                                                  : obound;
-                if (!IS_NATIVE(onative)) return false;
+                if (!IS_NATIVE(onative)) {
+                    /* A module member written in Jaithon lands here: `math.sqrt`
+                     * is a CLOSURE wrapping __prim__.f64_sqrt, not a builtin,
+                     * and so is every other one. See emitModuleCall -- it is a
+                     * global call through another module, not a method call.
+                     *
+                     * NOT a bound one. `onative` above has already thrown the
+                     * receiver away, which is right for the builtin arm below
+                     * (callNativeAt reads args[0], and the receiver is already
+                     * in the callee slot) and wrong here, because emitModuleCall
+                     * DROPS the receiver as well: nothing is left to be `self`.
+                     * A module member whose value is a bound method --
+                     * `pub let handler = obj.method` -- then called the unbound
+                     * closure with the first argument where `self` belongs, and
+                     * `self.base` raised "'fn' object has no attribute 'base'"
+                     * on code the interpreter answers correctly. Declining is
+                     * enough: the shape is rare and the descriptor would have to
+                     * carry `obound`, not `onative`, to do better. */
+                    if (IS_MODULE(oseen) && !IS_BOUND(obound) &&
+                        IS_CLOSURE(onative) && jitModuleCalls()) {
+                        if (!emitModuleCall(e, AS_MODULE(oseen), onative, ridx,
+                                            argc, (uint32_t)(off + 7))) {
+                            return false;
+                        }
+                        if (getenv("JAI_JIT_WHY")) {
+                            fprintf(stderr, "[jit] module call %s.%s at %d\n",
+                                    AS_MODULE(oseen)->name != NULL
+                                        ? AS_MODULE(oseen)->name->chars : "?",
+                                    AS_STRING(oname)->chars, off);
+                        }
+                        off += 7;
+                        break;
+                    }
+                    /* Named, because bare this was invisible: the census only
+                     * ever said "OP_INVOKE", and p27_float_math cost a night to
+                     * trace to `math.sqrt` being an ordinary function. */
+                    return subWhy(e, "%s.%s is a %s, not a builtin",
+                                  jaiTypeNameStatic(oseen),
+                                  AS_STRING(oname)->chars,
+                                  jaiTypeNameStatic(onative));
+                }
 
                 /* A builtin that only reads a field of its receiver needs
                  * neither the feedback nor the call: the type guard below is
@@ -12229,9 +12402,12 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
+    /* declineReason, not e.whyNot: an arm that noted only a whySub used to
+     * print "an unsupported operand form", which is how math.sqrt's own body
+     * managed to stop on a named refusal and report nothing. */
     if (!compileBody(&e, closure) && getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s stopped: %s\n", fn->name ? fn->name->chars : "<anon>",
-                e.whyNot ? e.whyNot : "an unsupported operand form");
+                declineReason(&e));
     }
     if (e.failed || e.whyNot != NULL)
         { jitFree(map, depths, chunkDepth, fn->chunk.count + 1); return false; }
