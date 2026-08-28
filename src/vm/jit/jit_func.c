@@ -13326,6 +13326,22 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 fn->name ? fn->name->chars : "<anon>", e.arity, e.locals,
                 e.count, e.savedCount, (int)e.spilled, e.xLocals, e.fpLocals,
                 e.fixupCount, e.deoptCount, body.maxValue, e.base);
+        /* A partial compile used to be entirely silent: emitUnarmedDeopt
+         * interprets from an unsupported opcode ONWARD rather than declining
+         * the body, so "compiled" was printed for a body of which two
+         * instructions were compiled and forty were not. That is how OP_NEG
+         * stayed hidden long enough to cost 9x, and it was only ever visible
+         * when a forward branch happened to dangle past the stopping point.
+         *
+         * Naming it here turns "which opcode should I arm next" from a manual
+         * audit into a grep. */
+        if (e.unarmedOp != 0) {
+            fprintf(stderr,
+                    "[jit] %s walked only to %s at %u -- the rest of the body "
+                    "is interpreted\n",
+                    fn->name ? fn->name->chars : "<anon>",
+                    jaiOpName((OpCode)e.unarmedOp), e.unarmedAt);
+        }
     }
     fn->jitFunc = entry;
     return true;
@@ -14272,6 +14288,15 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         fprintf(stderr, "[jit] osr %s at %u: %u instructions iter=%u\n",
                 fn->name ? fn->name->chars : "<anon>", top, e.count,
                 (unsigned)iterKind);
+        /* Same reason as the function tier's line: a loop that walked two
+         * instructions and interpreted the other forty reported success. */
+        if (e.unarmedOp != 0) {
+            fprintf(stderr,
+                    "[jit] osr %s at %u walked only to %s at %u -- the rest of "
+                    "the loop is interpreted\n",
+                    fn->name ? fn->name->chars : "<anon>", top,
+                    jaiOpName((OpCode)e.unarmedOp), e.unarmedAt);
+        }
     }
     /* The same dump the whole-function tier has. A compiled loop is where most
      * of the time goes, so it is the code most worth reading, and until now it
