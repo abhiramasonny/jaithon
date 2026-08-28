@@ -514,6 +514,20 @@ jit-fusion-check:
 branch-table-check:
 	@python3 scripts/branch_table_check.py
 
+# What the tier covers, one ordinary idiom at a time. Each probe in docs/probes/
+# is a single hot loop; the script runs it with the tier on and with
+# JAITHON_NO_JIT=1 and reads the ratio. It answers the question the decline
+# census cannot: a census ranks by FREQUENCY and is not hotness-correct -- it
+# put 168 `dict.get` refusals at the top, every one in a setup path that runs
+# once per process. Probes are hot by construction.
+#
+# Not in `test`: docs/ is untracked, so the probes are not guaranteed present,
+# and one probe is a KNOWN gap (a nullable scalar, see
+# docs/research/PLAN-nullable-scalars.md) that would fail a gate for ever.
+.PHONY: jit-coverage
+jit-coverage: $(TARGET)
+	@./scripts/jit_coverage.sh
+
 # The JIT's decline census, collapsed to distinct reasons and compared against a
 # recorded baseline. A NEW reason means the tier stopped compiling something it
 # used to; a reason that disappears is fine and needs no commit. Coverage only:
