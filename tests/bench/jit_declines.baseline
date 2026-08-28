@@ -1,6 +1,7 @@
 <anonymous> at 19 stopped: OP_GET_UPVALUE
 _check_variable_name at 49 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 _clear_grad at 11 stopped: a local was given two different kinds
+_clear_grad at 11 stopped: local 2 was given two kinds, instance and instance-or-null
 _collect_intermediates at 10 stopped: a local was given two different kinds
 _collect_intermediates at 10 stopped: an `is` against something other than null
 _fit_fused_async at 421 stopped: more than 8 instance slots to pin
@@ -11,18 +12,24 @@ _product at 681 stopped: OP_GET_GLOBAL: `_encode` is not a compiled global funct
 _result_shape at 7 stopped: an append reaching past the model
 _run_compiled_epoch at 192 stopped: a local of no known kind
 _run_compiled_epoch at 192 stopped: a local was given two different kinds
+_run_compiled_epoch at 192 stopped: local 14 was given two kinds, instance and instance-or-null
+_run_compiled_epoch at 192 stopped: local 15 was given two kinds, instance and instance-or-null
 _run_epoch at 318 stopped: a local of no known kind
 _run_epoch at 318 stopped: a local was given two different kinds
+_run_epoch at 318 stopped: local 14 was given two kinds, instance and instance-or-null
+_run_epoch at 318 stopped: local 15 was given two kinds, instance and instance-or-null
 _run_network at 85 stopped: OP_GET_GLOBAL: `_log2` is not a compiled global function
 _run_network at 85 stopped: OP_GET_GLOBAL: `kernel_of` is not a compiled global function
 _shape_of at 87 stopped: an append reaching past the model
 _uniform_step at 57 stopped: a return inside an OSR loop
 _zero_grad at 11 stopped: a local was given two different kinds
+_zero_grad at 11 stopped: local 2 was given two kinds, instance and instance-or-null
 aggregate at 100 stopped: more live values than there are callee-saved registers
 borrow_lanes at 24 stopped: OP_GET_INDEX: the container has kind object, not list
 broadcast_shapes at 46 stopped: an append reaching past the model
 broadcast_shapes at 79 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 build_pyramid at 27 stopped: OP_GET_GLOBAL: `pyr_down` is not a compiled global function
+build_source at 14 stopped: OP_GET_GLOBAL: `instantiate` is not a compiled global function
 cat at 124 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 cat at 171 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 cat at 700 stopped: more live values than there are callee-saved registers
@@ -36,6 +43,9 @@ element_count at 40 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled globa
 element_is_solid at 94 stopped: a return inside an OSR loop
 encode at 46 stopped: a local was given two different kinds
 encode at 46 stopped: callee's return kind not usable
+encode at 46 stopped: local 17 was given two kinds, instance and int
+encode at 46 stopped: local 18 was given two kinds, instance and int
+encode at 46 stopped: local 19 was given two kinds, instance and int
 fit at 151 stopped: OP_INVOKE: a static that has not compiled
 frames at 21 stopped: OP_GET_FIELD
 gather at 100 stopped: an append reaching past the model
@@ -55,6 +65,7 @@ inpaint at 459 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global fun
 join at 15 stopped: OP_GET_GLOBAL: `_is_absolute_text` is not a compiled global function
 load_cache at 66 stopped: OP_GET_GLOBAL: `plan_from_text` is not a compiled global function
 load_cache at 66 stopped: a local was given two different kinds
+main at 12 stopped: OP_GET_GLOBAL: `adder` is not a compiled global function
 main at 121 stopped: OP_INVOKE: `dict.get` has no usable result kind (never observed)
 main at 158 stopped: OP_GET_GLOBAL: `count_occurrences` is not a compiled global function
 main at 2176 stopped: more than 16 instance slots to pin
@@ -62,6 +73,7 @@ main at 27 stopped: callee's return class not on record
 main at 412 stopped: OP_GET_GLOBAL: `block` is not a compiled global function
 main at 555 stopped: OP_GET_GLOBAL: `block` is not a compiled global function
 main at 58 stopped: OP_GET_GLOBAL: `step` is not a compiled global function
+main at 61 stopped: OP_FOR_ITER_BIND: loop variable in local 6 has kind instance, not instance
 norm at 342 stopped: OP_GET_GLOBAL: `channel_stats` is not a compiled global function
 normalize_axes at 28 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 once at 60 stopped: OP_GET_INDEX: the container has kind object, not list
@@ -91,10 +103,13 @@ run at 61 stopped: OP_INVOKE: a module member that has not compiled
 run at 61 stopped: an indirect callee compiled against an older module
 run at 64 stopped: a local was given two different kinds
 run at 64 stopped: an indirect callee compiled against an older module
+run at 64 stopped: local 5 was given two kinds, instance and int
+run at 64 stopped: local 7 was given two kinds, instance and int
 run at 75 stopped: an indirect call whose result kind is not scalar
 run at 75 stopped: an indirect callee compiled against an older module
 run_scalar at 168 stopped: an indirect callee compiled against an older module
 run_scalar at 47 stopped: an indirect callee compiled against an older module
+space_out at 27 stopped: OP_POP
 spread_flags at 23 stopped: an append reaching past the model
 spread_flags at 88 stopped: an append reaching past the model
 stack_lanes at 170 stopped: a local of no known kind
@@ -176,6 +191,44 @@ stopped : an invoke on an object with nothing to look at
 stopped : callee's return kind not usable
 stopped : iterating a list with nothing to look at
 stopped : iterating something other than a list or range
+stopped : local 1 was given two kinds, instance-or-null and instance
+stopped : local 1 was given two kinds, int and object
+stopped : local 1 was given two kinds, list and int
+stopped : local 11 was given two kinds, instance-or-null and instance
+stopped : local 12 was given two kinds, instance and float
+stopped : local 12 was given two kinds, int and instance
+stopped : local 13 was given two kinds, int and float
+stopped : local 14 was given two kinds, int and float
+stopped : local 19 was given two kinds, int and float
+stopped : local 2 was given two kinds, float and int
+stopped : local 3 was given two kinds, instance and instance
+stopped : local 3 was given two kinds, int and float
+stopped : local 3 was given two kinds, int and list
+stopped : local 4 was given two kinds, instance and float
+stopped : local 4 was given two kinds, instance and int
+stopped : local 4 was given two kinds, instance and list
+stopped : local 4 was given two kinds, int and bool
+stopped : local 4 was given two kinds, int and float
+stopped : local 4 was given two kinds, int and list
+stopped : local 4 was given two kinds, object and list
+stopped : local 5 was given two kinds, instance and int
+stopped : local 5 was given two kinds, int and instance
+stopped : local 5 was given two kinds, int and list
+stopped : local 6 was given two kinds, instance and float
+stopped : local 6 was given two kinds, instance and list
+stopped : local 6 was given two kinds, int and float
+stopped : local 6 was given two kinds, int and list
+stopped : local 6 was given two kinds, list and int
+stopped : local 7 was given two kinds, int and instance
+stopped : local 7 was given two kinds, int and list
+stopped : local 7 was given two kinds, list and object
+stopped : local 8 was given two kinds, instance and instance
+stopped : local 8 was given two kinds, int and instance
+stopped : local 9 was given two kinds, instance and list
+stopped : local 9 was given two kinds, int and float
+stopped : local 9 was given two kinds, int and instance
+stopped : local 9 was given two kinds, int and list
+stopped : local 9 was given two kinds, list and int
 stopped : pushing a kind the tier cannot store
 stopped : the operand model disagrees with the bytecode
 stopped : too many roots
@@ -230,6 +283,7 @@ transpose at 43 stopped: an append reaching past the model
 validity_of at 102 stopped: OP_POP
 value_columns at 19 stopped: OP_GET_GLOBAL: `supports` is not a compiled global function
 visit_for_backward at 50 stopped: OP_CALL
+walk at 100 stopped: OP_CALL
 walk at 163 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 4 and 2) have kinds object and instance
 walk at 163 stopped: OP_TYPE_GUARD: a `JNode` guard on a object
 walk at 163 stopped: a type guard the kinds cannot settle

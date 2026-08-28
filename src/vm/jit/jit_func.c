@@ -624,6 +624,9 @@ typedef struct {
      * deoptimises on a miss, so this only chooses which guard to emit. That is
      * why it survives a branch merge and is not listed in clearStackProofs --
      * see the contrast drawn at stackAscii below. */
+    /* The kind that could not be adopted into a local already typed otherwise;
+     * read only by kindClash, to say WHICH two kinds disagreed. */
+    SlotKind  clashKind;
     /* See emitUnarmedDeopt: the opcode and offset the walk stopped at, so the
      * fixup pass can name the cause and not just the symptom. */
     uint8_t   unarmedOp;
@@ -3895,8 +3898,14 @@ static const char *declineReason(Emit *e) {
 }
 
 static const char *kindClash(Emit *e, unsigned slot) {
+    /* WHICH two kinds, not just which slot. The slot number says where to look
+     * and the pair says what to do about it: an int meeting a float is a
+     * widening the tier could learn, an instance meeting a list is a genuinely
+     * polymorphic local and nothing will help it. Without the pair, ~290 of
+     * these across four compiler files were one undifferentiated heap. */
     snprintf(e->whyBuf, sizeof e->whyBuf,
-             "a local was given two different kinds (slot %u)", slot);
+             "local %u was given two kinds, %s and %s", slot,
+             slotKindName(e->localKind[slot]), slotKindName(e->clashKind));
     return e->whyBuf;
 }
 
@@ -13256,10 +13265,12 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
         e->localShape[slot] == shape &&
         !e->nullableLocal[slot] && !e->dynamicLocal[slot]) {
         e->needNullable[slot] = true;
+        e->clashKind = kind;
         return false;
     }
     if (!e->dynamicLocal[slot]) {
         e->needDynamic[slot] = true;
+        e->clashKind = kind;
         return false;
     }
     e->localKind[slot]  = kind;
