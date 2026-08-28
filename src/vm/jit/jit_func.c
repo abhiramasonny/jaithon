@@ -69,6 +69,10 @@ static uintptr_t stackLimit(void) {
 /* Deopt stubs dominate this size: each writes out every local and live stack entry. `merge` silently needed 512 -- hence the diagnostics. */
 #define JIT_MAX_INSTS 20000u
 #define JIT_MAX_FIXUPS 6000u
+/* How many links of a refusal chain JAI_JIT_CHAIN will walk out. Each costs one
+ * extra compile of the body, and a chain longer than this is not a backlog item
+ * anybody is going to clear in one go. */
+#define JIT_MAX_CHAIN 8u
 #define JIT_SCRATCH_A    9u
 #define JIT_SCRATCH_B   10u
 #define JIT_SCRATCH_C   11u
@@ -1001,6 +1005,19 @@ typedef struct {
     } grow[JIT_MAX_GROW];
     unsigned  growCount;
     uint32_t  curOffset;
+    /* Diagnostic only (JAI_JIT_CHAIN=1). Offsets this walk must not try to arm,
+     * so that a body which refuses at one instruction can be walked PAST it to
+     * find what it would refuse at next.
+     *
+     * A refusal is a chain, and the single most expensive question about this
+     * tier is "what would this body stop at next?" -- answered until now by
+     * building the fix and re-running, which is a day per link and how three
+     * separate changes came to measure exactly zero. Forcing the unarmed path
+     * at a known offset and recompiling answers it in a second, and it reuses
+     * a well-tested mechanism rather than continuing a walk whose model has
+     * gone inconsistent (which segfaults). */
+    uint32_t  chainSkip[JIT_MAX_CHAIN];
+    unsigned  chainSkipCount;
     /* Model as it stood at the start of `curOffset`, before that instruction's own pushes -- a guard fires
      * mid-instruction and the interpreter resumes at its start, so this is what's live there (see deoptSite). */
     unsigned  instDepth;
@@ -3831,6 +3848,76 @@ static bool declaredScalarFieldKind(uint32_t typeId, SlotKind *k, unsigned *tag)
  * arm off, reproducing the pre-fix decline for an A/B inside one binary --
  * same cached-getenv idiom as jitDeoptStress above, but default ON since this
  * is a fix, not a stress knob. */
+static bool compileBody(Emit *e, ObjClosure *closure);
+static const char *declineReason(Emit *e);
+
+/* JAI_JIT_CHAIN=1: print the whole chain of refusals a body would hit, not just
+ * the first one.
+ *
+ * "What would this body stop at NEXT?" is the question that decides whether an
+ * arm is worth building, and until now it was answered by BUILDING the arm and
+ * re-running -- a day per link, and how three separate changes came to measure
+ * exactly zero after clearing one link of a longer chain.
+ *
+ * The mechanism is deliberately dumb: recompile the body with the offending
+ * offset forced onto the unarmed path, and see what it says next. That reuses a
+ * path the tier already exercises constantly, rather than continuing a walk
+ * whose model has gone inconsistent -- which was tried, and segfaults.
+ *
+ * Diagnostic only. Each link costs one extra compile of one body, and nothing
+ * here runs unless the env var is set. */
+static bool jitChainOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAI_JIT_CHAIN");
+        cached = (v != NULL && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static void reportChain(const Emit *proto, Emit *first, ObjClosure *closure,
+                        ObjFunction *fn) {
+    static Emit probe;
+    uint32_t skips[JIT_MAX_CHAIN];
+    unsigned n = 0;
+    const char *name = fn->name != NULL ? fn->name->chars : "<anon>";
+
+    fprintf(stderr, "[jit] chain %s:\n", name);
+    fprintf(stderr, "[jit]   1. %s  (at %u)\n", declineReason(first),
+            first->curOffset);
+    skips[n++] = first->curOffset;
+
+    for (unsigned link = 2; link <= JIT_MAX_CHAIN; link++) {
+        memcpy(&probe, proto, sizeof probe);
+        memcpy(probe.chainSkip, skips, n * sizeof skips[0]);
+        probe.chainSkipCount = n;
+        if (compileBody(&probe, closure)) {
+            fprintf(stderr, "[jit]   %u. compiles, once the %u above are "
+                            "cleared\n", link, n);
+            return;
+        }
+        /* Refusing again at the SAME offset means the unarmed path cannot step
+         * over that instruction: deoptSite has nowhere to resume, which is a
+         * real property of the instruction and not an artefact of this probe.
+         * Say so rather than numbering it as the next link, because it is not
+         * one -- it is where the walk stops being able to look. */
+        if (probe.curOffset == skips[n - 1]) {
+            fprintf(stderr,
+                    "[jit]   ... cannot look past link %u: stepping over it "
+                    "gives \"%s\"\n", n, declineReason(&probe));
+            return;
+        }
+        fprintf(stderr, "[jit]   %u. %s  (at %u)\n", link,
+                declineReason(&probe), probe.curOffset);
+        if (n >= JIT_MAX_CHAIN) {
+            fprintf(stderr, "[jit]   ... and the chain runs longer than %u\n",
+                    JIT_MAX_CHAIN);
+            return;
+        }
+        skips[n++] = probe.curOffset;
+    }
+}
+
 static bool jitDeclaredFieldKindEnabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -6893,6 +6980,25 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         }
         uint8_t op = code[off];
         afterUncond = !jaiOpFallsThrough(op);
+        /* Walked out of the way for the chain diagnostic; see Emit::chainSkip.
+         * Never set in an ordinary compile. */
+        for (unsigned ci = 0; ci < e->chainSkipCount; ci++) {
+            if (e->chainSkip[ci] == (uint32_t)off) {
+                e->curOffset = (uint32_t)off;
+                e->lastOp = op;
+                /* Settled first, as a branch join is. The ordinary unarmed path
+                 * is only ever reached from an arm that declined BEFORE
+                 * touching the model, whereas this one steps over an
+                 * instruction whose arm may have left a value deferred or in
+                 * the FP bank -- and the deopt record cannot describe those.
+                 * Without this the diagnostic reported "a deferred value
+                 * reached a guard" as the second link of every chain, which is
+                 * an artefact of the skip and not a fact about the program. */
+                fpSyncAll(e);
+                settleAll(e);
+                goto unarmedOpcode;
+            }
+        }
         /* Whose regions these are matters: inside an inline the offsets are the
          * callee's while every guard resumes at the CALLER's call site, so the
          * caller's answer is the one that stands. inlineGlobalCall/inlineMethod
@@ -13621,6 +13727,9 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     body.savedCount = JIT_MAX_SAVED;
     body.frameBytes = 16 + 8 * JIT_MAX_SAVED + 8;   /* 16-aligned below */
     body.frameBytes = (body.frameBytes + 15u) & ~15u;
+    /* Snapshot before the walk, so the chain diagnostic can re-run it. */
+    static Emit chainProto;
+    if (jitChainOn()) memcpy(&chainProto, &body, sizeof body);
     if (!compileBody(&body, closure)) {
         memcpy(needDynamic, body.needDynamic, sizeof body.needDynamic);
         memcpy(needNullable, body.needNullable, sizeof body.needNullable);
@@ -13629,6 +13738,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                     fn->name ? fn->name->chars : "<anon>",
                     declineReason(&body));
         }
+        if (jitChainOn()) reportChain(&chainProto, &body, closure, fn);
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
