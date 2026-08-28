@@ -51,6 +51,75 @@ def precision_of(route: str) -> str:
     return "f16" if "16" in tail else "f32"
 
 
+
+#: How loaded the machine is, and by what. A ratio taken on a contended machine
+#: is not a measurement, and the failure is silent: the same two jaitensor rows
+#: spread 3.9% and 2.4% when sampled inside one quiet process and 145% and 47%
+#: with eight competing processes and nothing else changed. `mediaanalysisd` is
+#: called out by name because it is the repeat offender on this hardware -- it
+#: takes the GPU for photo analysis and has swung a suite from 43s to 780s.
+LOAD_CEILING = float(os.environ.get("BENCH_LOAD_CEILING", "2.5"))
+
+
+def machine_load() -> tuple[float, float]:
+    """(load average over 1 minute, total %CPU held by mediaanalysisd)."""
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        return (0.0, 0.0)
+    hog = 0.0
+    try:
+        done = subprocess.run(["ps", "-Ao", "pcpu,comm"], capture_output=True,
+                              text=True, timeout=10)
+        for line in done.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and "mediaanalysisd" in parts[1]:
+                hog += float(parts[0])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return (load, hog)
+
+
+def preflight() -> str | None:
+    """A refusal message when the machine is too busy to measure on, else None.
+
+    Refusing is the point. The commonest way this suite produces a wrong number
+    is not a bug in it -- it is being run while something else has the machine,
+    and then the number is quoted. `BENCH_ANY_LOAD=1` is the escape hatch, the
+    same shape `run_bench.sh` already uses to refuse a debug build.
+    """
+    if os.environ.get("BENCH_ANY_LOAD") == "1":
+        return None
+    load, hog = machine_load()
+    if load <= LOAD_CEILING and hog < 40.0:
+        return None
+    detail = f"load average {load:.1f}"
+    if hog >= 40.0:
+        detail += f", mediaanalysisd at {hog:.0f}% CPU"
+    return (f"the machine is too busy to measure on ({detail}; the ceiling is "
+            f"{LOAD_CEILING:.1f}).\n"
+            f"       Wait for it to settle, or set BENCH_ANY_LOAD=1 to run "
+            f"anyway and have the table say so.")
+
+
+def binary_id(root: Path, command: list[str]) -> str | None:
+    """A hash of the binary a command runs, so a rebuild mid-run is visible.
+
+    It happened four times in one night here, and every sample taken across the
+    change is silently comparing two different programs.
+    """
+    for token in command:
+        candidate = (root / token).resolve()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            try:
+                with open(candidate, "rb") as handle:
+                    import hashlib
+                    return hashlib.sha256(handle.read()).hexdigest()[:12]
+            except OSError:
+                return None
+    return None
+
+
 def parse(output: str) -> dict[str, tuple[float, str, str]]:
     found: dict[str, tuple[float, str, str]] = {}
     for line in output.splitlines():
@@ -89,7 +158,7 @@ def listing(command: list[str], cwd: Path, level: str) -> list[str]:
 
 
 def collect(mine: list[str], theirs: list[str], rows: list[str], runs: int,
-            cwd: Path, level: str):
+            cwd: Path, level: str, load_seen: list | None = None):
     """Time every row on both sides, alternating, one row a process."""
     ours: dict[str, list[float]] = {name: [] for name in rows}
     peer: dict[str, list[float]] = {name: [] for name in rows}
@@ -104,6 +173,8 @@ def collect(mine: list[str], theirs: list[str], rows: list[str], runs: int,
             if sys.stderr.isatty():
                 sys.stderr.write(f"\r\033[K  {name} ({done_count} of {total})")
                 sys.stderr.flush()
+            if load_seen is not None:
+                load_seen.append(machine_load())
             for side, command, into in ((True, mine, ours), (False, theirs, peer)):
                 found = one(command + [name], cwd, level)
                 if name not in found:
@@ -164,9 +235,23 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        refusal = preflight()
+        if refusal is not None:
+            print(f"error: {refusal}", file=sys.stderr)
+            return 1
+        before_id = binary_id(args.root, ours_command)
+        load_seen = [machine_load()]
         mine, theirs, checks = collect(
-            ours_command, peer_command, order, args.runs, args.root, args.level
+            ours_command, peer_command, order, args.runs, args.root, args.level,
+            load_seen,
         )
+        load_seen.append(machine_load())
+        after_id = binary_id(args.root, ours_command)
+        if before_id is not None and after_id is not None and before_id != after_id:
+            print(f"error: the binary changed mid-run ({before_id} -> "
+                  f"{after_id}); every sample straddling that is comparing two "
+                  f"different programs. Re-run.", file=sys.stderr)
+            return 1
     except BenchError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
@@ -196,6 +281,14 @@ def main() -> int:
         f"{total_theirs / total_mine:>8.2f}x{RESET}"
     )
     print(f"{DIM}{args.footer}{RESET}")
+    #: The table carries the conditions it was taken under, so it cannot be
+    #: quoted out of them. A ratio without the load is not a measurement.
+    loads = [entry[0] for entry in load_seen]
+    hogs = [entry[1] for entry in load_seen]
+    verdict = ("CONTENDED -- treat these numbers as indicative only"
+               if max(loads) > LOAD_CEILING or max(hogs) >= 40.0 else "quiet")
+    print(f"{DIM}load {min(loads):.1f}-{max(loads):.1f} during the run, "
+          f"mediaanalysisd peak {max(hogs):.0f}% CPU; {verdict}{RESET}")
     return 0
 
 

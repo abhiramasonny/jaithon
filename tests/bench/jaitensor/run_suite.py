@@ -57,10 +57,66 @@ class Samples:
         return statistics.median(self.seconds)
 
     @property
-    def cv(self) -> float:
+    def cv(self) -> float | None:
+        """None when there is no spread to speak of, not 0.0.
+
+        One sample has no coefficient of variation, and printing 0.0% for it
+        reads as perfect precision when it is the absence of a measurement.
+        `--runs 1` reported that for every row.
+        """
         if len(self.seconds) < 2 or self.median <= 0.0:
-            return 0.0
+            return None
         return 100.0 * statistics.stdev(self.seconds) / self.median
+
+
+
+#: Shared with tests/bench/run_suite.py, and kept in step with it deliberately:
+#: a jaitensor row taken on a contended machine is the one most likely to be
+#: quoted, because the GPU rows are the interesting ones. The same two rows
+#: spread 3.9% and 2.4% sampled inside one quiet process and 145% and 47% with
+#: eight competing processes.
+LOAD_CEILING = float(os.environ.get("BENCH_LOAD_CEILING", "2.5"))
+
+
+def machine_load() -> tuple[float, float]:
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        return (0.0, 0.0)
+    hog = 0.0
+    try:
+        done = subprocess.run(["ps", "-Ao", "pcpu,comm"], capture_output=True,
+                              text=True, timeout=10)
+        for line in done.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and "mediaanalysisd" in parts[1]:
+                hog += float(parts[0])
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return (load, hog)
+
+
+def preflight() -> str | None:
+    if os.environ.get("BENCH_ANY_LOAD") == "1":
+        return None
+    load, hog = machine_load()
+    if load <= LOAD_CEILING and hog < 40.0:
+        return None
+    detail = f"load average {load:.1f}"
+    if hog >= 40.0:
+        detail += f", mediaanalysisd at {hog:.0f}% CPU"
+    return (f"the machine is too busy to measure on ({detail}; the ceiling is "
+            f"{LOAD_CEILING:.1f}). Wait for it to settle, or set "
+            f"BENCH_ANY_LOAD=1 to run anyway and have the table say so.")
+
+
+def binary_sha(path: str) -> str | None:
+    try:
+        import hashlib
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()[:12]
+    except OSError:
+        return None
 
 
 def parse_records(stdout: str, command: list[str]) -> list[Record]:
@@ -221,8 +277,8 @@ def render(
         print(
             f"{name:<24} {duration(jtime):>9} "
             f"{(duration(ptime) if right is not None else '—'):>9} "
-            f"{left.cv:>6.1f}% "
-            f"{(f'{right.cv:.1f}%' if right is not None else '—'):>7} "
+            f"{(f'{left.cv:.1f}%' if left.cv is not None else '—'):>7}"
+            f"{(f'{right.cv:.1f}%' if right is not None and right.cv is not None else '—'):>7} "
             f"{rate(left.flops, jtime, 1e9):>10} "
             f"{(rate(right.flops, ptime, 1e9) if right is not None else '—'):>10} "
             f"{rate(left.samples, jtime):>10} "
@@ -334,11 +390,30 @@ def main() -> int:
     if args.runs < 1:
         parser.error("--runs must be positive")
 
+    refusal = preflight()
+    if refusal is not None:
+        print(f"jaitensor bench: {refusal}", file=sys.stderr)
+        return 1
+    before = binary_sha(args.jaithon)
+    seen = [machine_load()]
     try:
         order, jai, peer = collect_interleaved(
             args.jaithon, args.python, args.root, args.level, args.runs
         )
+        seen.append(machine_load())
+        after = binary_sha(args.jaithon)
+        if before is not None and after is not None and before != after:
+            print(f"jaitensor bench: the binary changed mid-run ({before} -> "
+                  f"{after}); samples straddling that compare two different "
+                  f"programs. Re-run.", file=sys.stderr)
+            return 1
         render(order, jai, peer, args.build_kind, args.level, args.runs)
+        loads = [entry[0] for entry in seen]
+        hogs = [entry[1] for entry in seen]
+        verdict = ("CONTENDED -- treat these numbers as indicative only"
+                   if max(loads) > LOAD_CEILING or max(hogs) >= 40.0 else "quiet")
+        print(f"load {min(loads):.1f}-{max(loads):.1f} during the run, "
+              f"mediaanalysisd peak {max(hogs):.0f}% CPU; {verdict}")
     except BenchError as error:
         print(f"jaitensor bench: {error}", file=sys.stderr)
         return 1
