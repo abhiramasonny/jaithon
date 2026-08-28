@@ -2293,6 +2293,23 @@ static bool jitModuleCalls(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_CLASS_CALLS=0 turns off the static-member call arm at OP_INVOKE,
+ * for the same reason jitModuleCalls exists: the two shapes have to be
+ * comparable inside ONE binary. Alternating two builds is not an A/B here --
+ * every switch invalidates __jaicache__ and each sample then pays a stdlib
+ * recompile, which is larger than the effect being measured.
+ *
+ * Default ON. Read once, so a body compiled with the arm and a body compiled
+ * without it cannot coexist in one run. */
+static bool jitClassCalls(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_CLASS_CALLS");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* JAITHON_JIT_SPLIT_STRESS=1 puts the split bank's boundary into every OSR body
  * that can take one, instead of only the ones that pay for it -- the same idea
  * as JAITHON_JIT_DEOPT_STRESS, for the same reason.
@@ -5357,6 +5374,127 @@ static bool emitModuleCall(Emit *e, ObjModule *m, Value calleeVal,
         unsigned r;
         if (!popValue(e, &r, NULL)) return false;
     }
+    return emitCallOutResult(e, rk, rshape, rcls, after);
+}
+
+/* `Klass.static_method(args)` -- an OP_INVOKE whose receiver is a CLASS. The
+ * same job emitModuleCall does for `math.sqrt(x)`, and for the same reason: a
+ * member of another namespace, resolved at compile time, called with the
+ * receiver DROPPED. The interpreter drops it too. resolveInvokeTarget (vm.c)
+ * leaves the class in slot 0 and reports `isMethod == false`, so the call goes
+ * through invokeCallable and the closure's first parameter is the first
+ * ARGUMENT, not the class -- which is exactly what jitCallOut does with a
+ * descriptor holding argc arguments and no receiver.
+ *
+ * Three things differ from the module case, and only the third is machinery.
+ *
+ *   THE RECEIVER NEEDS NO GUARD. A module receiver is loaded from a global by
+ *   address behind a bare VAL_OBJ tag check, so emitModuleCall has to compare
+ *   it against the one ObjModule it compiled against. A class receiver is not
+ *   in a register at all: SLOT_CLASS holds nothing (holdsRegister says so) and
+ *   the ObjClass came from OP_GET_GLOBAL's `globalClass` arm, which resolves it
+ *   BY VALUE and is retired wholesale by the module version check at entry if
+ *   the name is rebound. There is nothing here that could be a different class
+ *   at run time than it was at compile time.
+ *
+ *   THE MEMBER IS RESOLVED OUT OF `klass->statics`, DIRECTLY. Not through
+ *   jaiBuiltinMethod, and not through anything that can hand back a BoundMethod
+ *   to unwrap: unwrapping one and then dropping the receiver as this arm does
+ *   loses both halves and calls an unbound closure with the first real argument
+ *   sitting where `self` belongs. Only an IS_CLOSURE value straight out of the
+ *   table is admitted. `klass->methods` is deliberately NOT consulted -- see
+ *   the call site, which declines an instance method named through the class.
+ *
+ *   WHAT RETIRES THE BAKED CALLEE is `klass->statics.version`, and it is a
+ *   counter that already exists rather than a new one. `Klass.name = v` reaches
+ *   jaiSetProperty's IS_CLASS arm, which requires the key to be present already
+ *   and then calls jaiTableSetInterned -- an overwrite, which never moves an
+ *   entry and so never bumps `keyVersion` (that is the whole point of the
+ *   keyVersion/version split; see the same trap written up at emitModuleCall).
+ *   It does bump `version`, because tableSetHashed bumps it on every value
+ *   write. And every event that moves keyVersion -- rehash, delete, clear --
+ *   bumps `version` too, so this one word subsumes the address guard the
+ *   static-FIELD arm needs a separate emitStaticsGuard for.
+ *
+ *   Coarser than it has to be: writing any OTHER static of the same class bumps
+ *   it as well, and the callee is retired for a write that could not have
+ *   changed it. That is a deopt, not a wrong answer, and it costs nothing today
+ *   because no arm compiles a static STORE -- a loop that writes a static
+ *   declines before it gets here.
+ *
+ * Guarding a version rather than the callee POINTER is also what makes this
+ * GC-safe. Comparing `entry->value` against the baked ObjClosure* would pass if
+ * the original closure were collected after a rebind and a fresh object landed
+ * at the same address; the version has moved by then, so the guard fires before
+ * the stale pointer is ever loaded. */
+static bool emitClassCall(Emit *e, ObjClass *klass, Value calleeVal,
+                          unsigned ridx, unsigned argc, uint32_t after) {
+    ObjFunction *cfn = AS_CLOSURE(calleeVal)->fn;
+    if (cfn->jitFunc == NULL) {
+        return subWhy(e, "a static that has not compiled");
+    }
+    /* Which record says what comes back: emitModuleCall's finding, and it is
+     * not the obvious one. `jitFunc != NULL` does NOT make `jitReturnKind` a
+     * fact -- it is stored unconditionally at the end of a compile, so a body
+     * whose walk never reached an OP_RETURN leaves it at the SLOT_INT a zeroed
+     * Emit starts on. The interpreter's own per-callee record is a measured
+     * fact and is asked first; the compiled kind stands in only when there is
+     * none. Either way it is a prediction, and emitCallOutResult's tag guard
+     * after the call is what makes it sound. */
+    SlotKind rk = SLOT_NULL;
+    uint32_t rshape = 0;
+    ObjClass *rcls = NULL;
+    if (!observedReturnKind(cfn, &rk, &rshape)) {
+        rk = (SlotKind)cfn->jitReturnKind;
+        rshape = cfn->jitReturnShape;
+    }
+    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
+        rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
+        rk != SLOT_OBJ && rk != SLOT_NULL) {
+        return subWhy(e, "a static's return kind (%s)", slotKindName(rk));
+    }
+    if ((rk == SLOT_INST || rk == SLOT_MAYBE_INST) &&
+        (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL)) {
+        return subWhy(e, "a static's return class is not on record");
+    }
+    /* The ARGUMENTS only. The receiver is skipped where emitModuleCall checks
+     * it, because a class entry holds no register and emitDescriptorStatus
+     * already knows how to bake one -- but it is never passed here, so even
+     * that does not arise. Asked HERE rather than left to emitDescriptor, which
+     * refuses only after the guard below has been emitted and would turn a
+     * graceful decline into a whole-body one. */
+    for (unsigned i = 1; i <= argc; i++) {
+        SlotKind k = e->stack[ridx + i];
+        if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
+            k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
+            return subWhy(e, "a static call over an argument of kind %s",
+                          slotKindName(k));
+        }
+    }
+    /* Past here the guard is emitted, so a later refusal stops the compile
+     * rather than falling back onto a half-written instruction stream. */
+
+    settleAll(e);
+    emitConst64(e, JIT_SCRATCH_D,
+                (int64_t)(uintptr_t)&klass->statics.version);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+    emitConst64(e, JIT_SCRATCH_B, (int64_t)(uint32_t)klass->statics.version);
+    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+    branchOnDeopt(e, JAI_A64_NE);
+
+    if (!emitDescriptor(e, calleeVal, ridx + 1, argc, (void *)&jitCallOut)) {
+        return false;
+    }
+    for (unsigned i = 0; i < argc; i++) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) return false;
+    }
+    /* The receiver held no register, so dropping it is the whole of popping it
+     * -- popValue would refuse it via holdsRegister. Same as the static-field
+     * arm at OP_GET_FIELD. */
+    if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_CLASS) return false;
+    e->depth--;
     return emitCallOutResult(e, rk, rshape, rcls, after);
 }
 
@@ -9481,6 +9619,90 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * sitting under the argument. */
                 unsigned drop;
                 if (!popValue(e, &drop, NULL)) return false;
+                off += 7;
+                break;
+            }
+
+            /* `Klass.static_method(x)`. NOT a field read plus a call, which is
+             * what an earlier attempt at this assumed and why it measured
+             * nothing: the compiler emits OP_GET_GLOBAL "Box" and then an
+             * OP_INVOKE whose receiver is the class, so an arm in OP_GET_FIELD
+             * never sees it. See emitClassCall. */
+            if (rk == SLOT_CLASS && jitClassCalls()) {
+                ObjClass *scls = e->stackClass[ridx];
+                if (scls == NULL) {
+                    return subWhy(e, "a class receiver the model did not pin");
+                }
+                if (nameIdx >= (uint32_t)fn->chunk.constants.count) {
+                    return subWhy(e, "the member name is not in the pool");
+                }
+                Value sname = fn->chunk.constants.data[nameIdx];
+                if (!IS_STRING(sname)) {
+                    return subWhy(e, "the member name is not a string");
+                }
+                Value smember;
+                if (!jaiTableGetInterned(&scls->statics, AS_STRING(sname),
+                                         &smember)) {
+                    /* The interpreter's own order: statics first, then
+                     * `methods`. An instance method IS reachable this way and
+                     * must not be admitted -- resolveInvokeTarget hands the
+                     * bare closure to invokeCallable with the CLASS sitting in
+                     * slot 0, so `self` is the class and the body raises the
+                     * moment it touches a field ("class 'Box' has no member
+                     * 'v'", measured). Compiling that faithfully would take a
+                     * receiver this arm exists to drop, and the reward would be
+                     * a faster way to reach the same exception. */
+                    Value smeth;
+                    if (jaiTableGetInterned(&scls->methods, AS_STRING(sname),
+                                            &smeth)) {
+                        return subWhy(e, "`%s.%s` is an instance method reached "
+                                         "through the class",
+                                      scls->name != NULL ? scls->name->chars
+                                                         : "?",
+                                      AS_STRING(sname)->chars);
+                    }
+                    return subWhy(e, "`%s` is not a static of %s",
+                                  AS_STRING(sname)->chars,
+                                  scls->name != NULL ? scls->name->chars : "?");
+                }
+                /* Visibility is the interpreter's methodPermitted, and it is
+                 * NOT a compile-time property in general: accessPermitted reads
+                 * the running frame's owner class. A non-public static DOES
+                 * reach here -- the checker rejects `Box.hidden(i)` from
+                 * outside with E0701, but a `static fn` with no `pub` called
+                 * from a method of its own class type-checks and runs. This arm
+                 * resolves once and never calls methodPermitted again, so
+                 * admitting one would be skipping a check the interpreter makes
+                 * on every call. Restricted means non-public, which is the
+                 * whole condition.
+                 *
+                 * Reached, not hypothetical: `Hidden.walk` in
+                 * tests/lang/test_jit_class_call.jai stops here, and the
+                 * targeted suites hit it nine times. */
+                MethodInfo smi;
+                if (jaiClassRestrictedMethod(scls, AS_STRING(sname), &smi)) {
+                    return subWhy(e, "`%s.%s` is not public",
+                                  scls->name != NULL ? scls->name->chars : "?",
+                                  AS_STRING(sname)->chars);
+                }
+                /* A closure straight out of the table, never a bound method and
+                 * never a native: this arm drops the receiver, and both of the
+                 * others want one. See emitClassCall's second paragraph. */
+                if (!IS_CLOSURE(smember)) {
+                    return subWhy(e, "`%s.%s` is a %s, not a function",
+                                  scls->name != NULL ? scls->name->chars : "?",
+                                  AS_STRING(sname)->chars,
+                                  jaiTypeNameStatic(smember));
+                }
+                if (!emitClassCall(e, scls, smember, ridx, argc,
+                                   (uint32_t)(off + 7))) {
+                    return false;
+                }
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] static call %s.%s at %d\n",
+                            scls->name != NULL ? scls->name->chars : "?",
+                            AS_STRING(sname)->chars, off);
+                }
                 off += 7;
                 break;
             }
