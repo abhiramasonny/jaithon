@@ -4179,6 +4179,46 @@ static bool emitStringConcat(Emit *e, Value sample) {
 /* Put a local on the model stack, the way OP_GET_LOCAL does, for an arm that
  * needs stack operands but was handed slot numbers. Only the general X path --
  * a float local wants OP_GET_LOCAL's FP handling and no caller here has one. */
+/* `x == null` where the model calls x an object -- a string, a list, a dict.
+ *
+ * The arm already mixes SLOT_INST with SLOT_MAYBE_INST because both are a
+ * pointer or a zero in a register. A SLOT_OBJ is the same shape, and stronger:
+ * emitTagFor gives it VAL_OBJ unconditionally, so its register never holds a
+ * zero and the answer is always "not null" -- which is exactly what comparing
+ * it against the null literal's zero register produces.
+ *
+ * EQUALITY ONLY. `x < null` is a TypeError in the interpreter, and compiling it
+ * as a register compare would answer where it should raise.
+ *
+ * SLOT_OBJ ONLY, and that is the load-bearing half. A SLOT_INT is also "never
+ * null", but its register holds a NUMBER -- and zero is a perfectly good int,
+ * so `0 == null` would compare equal and answer true. Only a kind whose
+ * register holds a pointer may be compared against the null literal's zero.
+ *
+ * 108 declines across four compiler files, in `_parse_postfix`,
+ * `_parse_decorators`, `lookup_type_name` and their kin -- the shape is
+ * `if tok == null` on something the model did not name more precisely. */
+static bool jitNullPair(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_NULL_PAIR");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool nullLiteralPair(const Emit *e, uint8_t op, SlotKind ka, SlotKind kb) {
+    if (!jitNullPair()) return false;
+    if (op != OP_EQ && op != OP_NE) return false;
+    if (e->depth < 2) return false;
+    if (ka == SLOT_OBJ && kb == SLOT_MAYBE_INST &&
+        e->stackNullLit[e->depth - 1]) {
+        return true;
+    }
+    return kb == SLOT_OBJ && ka == SLOT_MAYBE_INST &&
+           e->stackNullLit[e->depth - 2];
+}
+
 static bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],
@@ -7611,7 +7651,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
             /* Operands are read without popping them off the model: a NaN sends this back to the interpreter,
              * whose stack still has them. Popping first once left the model two entries short, so the re-run comparison silently read whatever was underneath -- a bug that surfaced one line later instead of not at all. */
-            if (e->depth < 2) return false;
+            if (e->depth < 2) return subWhy(e, "a compare with nothing under it");
             SlotKind ka = e->stack[e->depth - 2], kb = e->stack[e->depth - 1];
             /* `node == null` puts an instance beside a maybe-instance. Both
              * are a pointer or zero in a register, so the compare is the same
@@ -7619,11 +7659,21 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (ka != kb) {
                 bool mixable =
                     (ka == SLOT_INST && kb == SLOT_MAYBE_INST) ||
-                    (ka == SLOT_MAYBE_INST && kb == SLOT_INST);
-                if (!mixable) return false;
+                    (ka == SLOT_MAYBE_INST && kb == SLOT_INST) ||
+                    nullLiteralPair(e, op, ka, kb);
+                /* Named: 92 declines across four compiler files said only
+                 * "OP_EQ", and the two operands' kinds are the entire question
+                 * at this arm. */
+                if (!mixable) {
+                    return subWhy(e, "a compare of a %s with a %s",
+                                  slotKindName(ka), slotKindName(kb));
+                }
                 ka = kb = SLOT_MAYBE_INST;
             }
-            if (!holdsRegister(ka)) return false;
+            if (!holdsRegister(ka)) {
+                return subWhy(e, "a compare of two %ss, which hold no register",
+                              slotKindName(ka));
+            }
             /* Read through xHeldIn, not straight out of the bank: an operand
              * that is a plain read of a local is still in the local's own
              * register. See popValue. */
@@ -7907,16 +7957,25 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_JUMP_IF_CMP_FALSE: {
             uint8_t  cmp  = code[off + 1];
             int16_t  jump = jaiReadI16(code + off + 2);
-            if (e->depth < 2) return false;
+            if (e->depth < 2) return subWhy(e, "a compare with nothing under it");
             SlotKind ka = e->stack[e->depth - 2], kb = e->stack[e->depth - 1];
             if (ka != kb) {
                 bool mixable =
                     (ka == SLOT_INST && kb == SLOT_MAYBE_INST) ||
-                    (ka == SLOT_MAYBE_INST && kb == SLOT_INST);
-                if (!mixable) return false;
+                    (ka == SLOT_MAYBE_INST && kb == SLOT_INST) ||
+                    nullLiteralPair(e, cmp, ka, kb);
+                /* Named for the same reason as the unfused twin above: the two
+                 * operands' kinds are the entire question at this arm. */
+                if (!mixable) {
+                    return subWhy(e, "a compare of a %s with a %s",
+                                  slotKindName(ka), slotKindName(kb));
+                }
                 ka = kb = SLOT_MAYBE_INST;
             }
-            if (!holdsRegister(ka)) return false;
+            if (!holdsRegister(ka)) {
+                return subWhy(e, "a compare of two %ss, which hold no register",
+                              slotKindName(ka));
+            }
             /* See the OP_LT..OP_GE arm: operands are read through xHeldIn, a
              * literal right-hand side becomes the compare's own immediate,
              * and the paths that guard settle first. */
@@ -7924,7 +7983,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             bool foldCmp2 = ka == SLOT_INT &&
                             pendingImm12(e, e->valueDepth - 1, &kcmp2);
             unsigned cond;
-            if (!negatedCondition(cmp, &cond)) return false;
+            if (!negatedCondition(cmp, &cond)) {
+                return subWhy(e, "a fused compare whose condition has no "
+                              "negation");
+            }
             if (ka == SLOT_FLOAT) {
                 /* fcmp's answers for the ordered comparisons are not the
                  * signed-integer ones: less-than is MI and less-or-equal is

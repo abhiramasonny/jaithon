@@ -43,6 +43,7 @@ gather at 135 stopped: an append reaching past the model
 gather at 65 stopped: an append reaching past the model
 get_gaussian_kernel at 137 stopped: an append reaching past the model
 get_gaussian_kernel at 266 stopped: OP_INVOKE: a module member that has not compiled
+get_structuring_element at 229 stopped: OP_INVOKE: a module member that has not compiled
 init at 161 stopped: OP_GET_INDEX: the container has kind instance, not list
 init at 19 stopped: an append reaching past the model
 init at 237 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
@@ -151,6 +152,8 @@ stopped : OP_INVOKE: a receiver of kind int
 stopped : OP_INVOKE: a static that has not compiled
 stopped : OP_ITER_RANGE
 stopped : OP_JUMP_IF_CMP_FALSE
+stopped : OP_JUMP_IF_CMP_FALSE: a compare of a int with a float
+stopped : OP_JUMP_IF_CMP_FALSE: a compare of a int with a instance-or-null
 stopped : OP_JUMP_IF_CMP_FALSE: a comparison of list with list
 stopped : OP_JUMP_IF_CMP_FALSE: a comparison of object with object
 stopped : OP_JUMP_IF_CMP_LOCAL_K
@@ -228,6 +231,7 @@ validity_of at 102 stopped: OP_POP
 value_columns at 19 stopped: OP_GET_GLOBAL: `supports` is not a compiled global function
 visit_for_backward at 50 stopped: OP_CALL
 walk at 163 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 4 and 2) have kinds object and instance
+walk at 163 stopped: OP_TYPE_GUARD: a `JNode` guard on a object
 walk at 163 stopped: a type guard the kinds cannot settle
 warm at 31 stopped: an indirect callee compiled against an older module
 warmup at 18 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
