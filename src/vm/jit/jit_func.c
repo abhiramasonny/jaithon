@@ -7762,7 +7762,17 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                          op == OP_JUMP_IF_TRUE_KEEP);
             bool wantTrue = (op == OP_JUMP_IF_TRUE ||
                              op == OP_JUMP_IF_TRUE_KEEP);
-            if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_BOOL) return false;
+            if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_BOOL) {
+                /* Named because the bare refusal was unreadable in a census:
+                 * `_is_ident_cont` -- `c.is_alnum() or c == "_"`, called per
+                 * character by the lexer -- reported only "OP_JUMP_IF_TRUE_KEEP"
+                 * while three OSR loops retried it 80 times each waiting for it
+                 * to compile. */
+                return subWhy(e, "a branch on a %s, not a bool",
+                              e->depth > 0
+                                  ? slotKindName(e->stack[e->depth - 1])
+                                  : "empty stack");
+            }
             unsigned r = pushReg(e) - 1;
             if (!keep) {
                 unsigned popped;
@@ -12188,12 +12198,26 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         break;
                     }
                     if (e->failed) return false;
-                    e->whyNot =
-                        (gslot != NULL && !IS_CLOSURE(gvv) &&
-                         !IS_CLASS(gvv) && !IS_NATIVE(gvv))
-                            ? "a global of a kind the tier has no slot for"
-                            : "callee is not a compiled global function";
-                    return false;
+                    /* Named, because this is the top state-level refusal by
+                     * attempt count -- 406 in one file, 82 of them retries of
+                     * a single loop -- and "callee is not a compiled global
+                     * function" gave the reader nothing to act on. Which
+                     * callee it is decides whether this is a tier-ordering
+                     * problem that resolves itself or a function that never
+                     * compiles at all. */
+                    Value gNameVal = nameIdx < (uint32_t)fn->chunk.constants.count
+                                         ? fn->chunk.constants.data[nameIdx]
+                                         : NULL_VAL;
+                    const char *gName = IS_STRING(gNameVal)
+                                            ? AS_STRING(gNameVal)->chars
+                                            : "?";
+                    if (gslot != NULL && !IS_CLOSURE(gvv) && !IS_CLASS(gvv) &&
+                        !IS_NATIVE(gvv)) {
+                        return subWhy(e, "`%s` is a global of a kind the tier "
+                                      "has no slot for", gName);
+                    }
+                    return subWhy(e, "`%s` is not a compiled global function",
+                                  gName);
                 }
                 if (e->depth >= JIT_MAX_STACK) return false;
                 e->stackShape[e->depth] = 0;
@@ -14590,7 +14614,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             if (e.needDynamic[i])  needDynamic[i]  = true;
         }
         if (getenv("JAI_JIT_WHY")) {
-            fprintf(stderr, "[jit] osr at %u stopped: %s\n", top,
+            fprintf(stderr, "[jit] osr %s at %u stopped: %s\n",
+                    fn->name ? fn->name->chars : "<anon>", top,
                     declineReason(&e));
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);

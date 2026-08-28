@@ -1,7 +1,87 @@
+<anonymous> at 19 stopped: OP_GET_UPVALUE
+_check_variable_name at 49 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+_clear_grad at 11 stopped: a local was given two different kinds
+_collect_intermediates at 10 stopped: an `is` against something other than null
 _fit_fused_async at 421 stopped: more than 8 instance slots to pin
+_forward at 20 stopped: an unpinned receiver's result kind
+_fused_relu_layers at 127 stopped: a return inside an OSR loop
+_plan at 28 stopped: an append reaching past the model
+_product at 681 stopped: OP_GET_GLOBAL: `_encode` is not a compiled global function
+_result_shape at 7 stopped: an append reaching past the model
+_run_compiled_epoch at 192 stopped: a local of no known kind
+_run_compiled_epoch at 192 stopped: a local was given two different kinds
+_run_epoch at 318 stopped: a local of no known kind
+_run_epoch at 318 stopped: a local was given two different kinds
+_run_network at 85 stopped: OP_GET_GLOBAL: `kernel_of` is not a compiled global function
+_shape_of at 87 stopped: an append reaching past the model
+_uniform_step at 57 stopped: a return inside an OSR loop
+_zero_grad at 11 stopped: a local was given two different kinds
+aggregate at 100 stopped: more live values than there are callee-saved registers
+broadcast_shapes at 46 stopped: an append reaching past the model
+cat at 124 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+cat at 171 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+cat at 700 stopped: more live values than there are callee-saved registers
+concat_columns at 60 stopped: OP_JUMP_IF_CMP_FALSE
 connected_components at 776 stopped: more than 8 instance slots to pin
 connected_components at 836 stopped: more than 8 instance slots to pin
+distance_transform at 433 stopped: OP_ADD
+edge_preserving_filter at 317 stopped: an exponent other than 0.5
+element_count at 40 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+element_is_solid at 94 stopped: a return inside an OSR loop
+encode at 46 stopped: a local was given two different kinds
+encode at 46 stopped: callee's return kind not usable
+fit at 151 stopped: OP_INVOKE: a static that has not compiled
+frames at 21 stopped: OP_GET_FIELD
+gather at 135 stopped: an append reaching past the model
+gather at 65 stopped: an append reaching past the model
+get_gaussian_kernel at 137 stopped: an append reaching past the model
+get_gaussian_kernel at 266 stopped: OP_INVOKE: a module member that has not compiled
+init at 161 stopped: OP_GET_INDEX: the container has kind instance, not list
+init at 19 stopped: an append reaching past the model
+init at 237 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+init at 356 stopped: an append reaching past the model
+init at 40 stopped: an append reaching past the model
+init at 86 stopped: an append reaching past the model
+inpaint at 459 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
+load_cache at 66 stopped: OP_GET_GLOBAL: `plan_from_text` is not a compiled global function
+load_cache at 66 stopped: a local was given two different kinds
+main at 121 stopped: OP_INVOKE: `dict.get` has no usable result kind (never observed)
+main at 158 stopped: OP_GET_GLOBAL: `count_occurrences` is not a compiled global function
 main at 2176 stopped: more than 16 instance slots to pin
+main at 27 stopped: callee's return class not on record
+main at 412 stopped: OP_GET_GLOBAL: `block` is not a compiled global function
+main at 58 stopped: OP_GET_GLOBAL: `step` is not a compiled global function
+norm at 342 stopped: OP_GET_GLOBAL: `channel_stats` is not a compiled global function
+normalize_axes at 28 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+once at 60 stopped: OP_GET_INDEX: the container has kind object, not list
+once at 66 stopped: OP_GET_INDEX: the container has kind object, not list
+once at 66 stopped: callee's return kind not usable
+order at 416 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
+pad2d at 82 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+place at 25 stopped: OP_CALL
+radix_order at 146 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
+rank_filter at 139 stopped: a return inside an OSR loop
+reduce_leading at 150 stopped: OP_GET_GLOBAL: `cached_kernel` is not a compiled global function
+repeats_for at 12 stopped: an indirect callee compiled against an older module
+repeats_for at 141 stopped: a type guard the kinds cannot settle
+repeats_for at 229 stopped: OP_GET_GLOBAL: `matmul` is not a compiled global function
+repeats_for at 229 stopped: a type guard the kinds cannot settle
+repeats_for at 72 stopped: an indirect callee compiled against an older module
+repeats_for at 79 stopped: an indirect callee compiled against an older module
+repeats_for at 84 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
+run at 110 stopped: OP_INVOKE: a receiver of kind int
+run at 196 stopped: an indirect callee compiled against an older module
+run at 43 stopped: an indirect callee compiled against an older module
+run at 61 stopped: OP_INVOKE: a module member that has not compiled
+run at 61 stopped: an indirect callee compiled against an older module
+run at 64 stopped: a local was given two different kinds
+run at 64 stopped: an indirect callee compiled against an older module
+run at 75 stopped: an indirect callee compiled against an older module
+run_scalar at 168 stopped: an indirect callee compiled against an older module
+run_scalar at 47 stopped: an indirect callee compiled against an older module
+spread_flags at 23 stopped: an append reaching past the model
+stage_axis at 72 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
+step at 4 stopped: OP_GET_GLOBAL: `apply_update` is not a compiled global function
 stopped : OP_BUILD_LIST
 stopped : OP_CALL
 stopped : OP_DIV
@@ -56,6 +136,7 @@ stopped : OP_ITER_RANGE
 stopped : OP_JUMP_IF_CMP_FALSE
 stopped : OP_JUMP_IF_CMP_LOCAL_K
 stopped : OP_JUMP_IF_FALSE
+stopped : OP_JUMP_IF_FALSE: a branch on a int, not a bool
 stopped : OP_NE
 stopped : OP_NOT: `not` of a int
 stopped : OP_RETURN
@@ -110,3 +191,17 @@ stopped: more incoming arguments than argument registers (10 locals, 3 stack)
 stopped: more live values than there are callee-saved registers
 stopped: offset 63 is reached with two different operand stacks
 stopped: too many roots
+storm at 18 stopped: a call that can raise inside a try
+time_attn at 182 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
+time_attn at 289 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
+time_attn at 418 stopped: OP_GET_INDEX: the container has kind object, not list
+time_shape at 254 stopped: a type guard the kinds cannot settle
+time_shape at 349 stopped: a type guard the kinds cannot settle
+time_shape at 503 stopped: OP_GET_INDEX: the container has kind object, not list
+trace_all at 225 stopped: OP_GET_GLOBAL: `next_start` is not a compiled global function
+transpose at 43 stopped: an append reaching past the model
+validity_of at 102 stopped: OP_POP
+value_columns at 19 stopped: OP_GET_GLOBAL: `supports` is not a compiled global function
+visit_for_backward at 50 stopped: OP_CALL
+warm at 31 stopped: an indirect callee compiled against an older module
+warmup at 18 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
