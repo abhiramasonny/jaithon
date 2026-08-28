@@ -17,6 +17,15 @@
 #: string allocation is the whole cost and compiling the loop around it buys
 #: nothing measurable. The win is the body, not the operator.
 #:
+#: And a second control, so nobody goes looking for a win that is not there:
+#: `check --no-cache` on parser.jai and lexer.jai does NOT move (0.55s and
+#: 0.28s either way, four samples, twice), even though parser.jai holds 28 of
+#: these. The same note already stands above the stack form's arm for the same
+#: reason -- the bodies holding those concats decline for other reasons anyway,
+#: so freeing this one changes nothing there. This arm pays where a loop builds
+#: a string AND does something else, which is the lexer shape, not the parser
+#: one.
+#:
 #: The operands arrive as slot numbers and `emitStringConcat` wants stack
 #: entries, so they are pushed first -- the cost the fusion existed to avoid,
 #: and nothing beside a call that allocates. Both operands are guarded inside
