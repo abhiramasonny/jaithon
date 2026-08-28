@@ -51,6 +51,7 @@ init at 356 stopped: an append reaching past the model
 init at 40 stopped: an append reaching past the model
 init at 86 stopped: an append reaching past the model
 inpaint at 459 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
+join at 15 stopped: OP_GET_GLOBAL: `_is_absolute_text` is not a compiled global function
 load_cache at 66 stopped: OP_GET_GLOBAL: `plan_from_text` is not a compiled global function
 load_cache at 66 stopped: a local was given two different kinds
 main at 121 stopped: OP_INVOKE: `dict.get` has no usable result kind (never observed)
@@ -82,16 +83,19 @@ repeats_for at 84 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compil
 reset_state at 4 stopped: OP_INVOKE: `dict.get` has no usable result kind (instance)
 run at 110 stopped: OP_INVOKE: a receiver of kind int
 run at 110 stopped: an indirect callee compiled against an older module
+run at 196 stopped: an indirect call whose result kind is not scalar
 run at 196 stopped: an indirect callee compiled against an older module
 run at 43 stopped: an indirect callee compiled against an older module
 run at 61 stopped: OP_INVOKE: a module member that has not compiled
 run at 61 stopped: an indirect callee compiled against an older module
 run at 64 stopped: a local was given two different kinds
 run at 64 stopped: an indirect callee compiled against an older module
+run at 75 stopped: an indirect call whose result kind is not scalar
 run at 75 stopped: an indirect callee compiled against an older module
 run_scalar at 168 stopped: an indirect callee compiled against an older module
 run_scalar at 47 stopped: an indirect callee compiled against an older module
 spread_flags at 23 stopped: an append reaching past the model
+spread_flags at 88 stopped: an append reaching past the model
 stack_lanes at 170 stopped: a local of no known kind
 stage_axis at 72 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
 step at 4 stopped: OP_GET_GLOBAL: `apply_update` is not a compiled global function
@@ -156,6 +160,9 @@ stopped : OP_NE
 stopped : OP_NE: a comparison of list with list
 stopped : OP_NOT: `not` of a int
 stopped : OP_RETURN
+stopped : OP_TYPE_GUARD
+stopped : OP_TYPE_GUARD: a `list` guard on a object
+stopped : OP_TYPE_GUARD: a `str` guard on a object
 stopped : a builtin with no known result kind
 stopped : a local of no known kind
 stopped : a local was given two different kinds

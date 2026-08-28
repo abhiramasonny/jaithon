@@ -4466,6 +4466,15 @@ static void emitMaybeInstResult(Emit *e, unsigned dst, unsigned rat,
     emit(e, jaiA64MovX(dst, JIT_SCRATCH_D));
 }
 
+static bool jitAnyGuard(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ANY_GUARD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static bool jitReturnKnownOn(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -8071,9 +8080,49 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
             } else if ((strcmp(tn, "int") == 0 && k == SLOT_INT) ||
                        (strcmp(tn, "bool") == 0 && k == SLOT_BOOL)) {
+            } else if (jitAnyGuard() && strcmp(tn, "list") == 0 &&
+                       k == SLOT_LIST) {
+                /* SLOT_LIST is a guarded fact, not a hope: every arm that puts
+                 * one on the stack has already proved OBJ_LIST, because VAL_OBJ
+                 * covers every heap object and the shared return path says so
+                 * in as many words. `jaiTypeNameStatic` calls an ObjList "list"
+                 * (value.c), which is the name this guard compares against, so
+                 * there is nothing left to check.
+                 *
+                 * Same exposure as the `float`/`int`/`bool` cases above and no
+                 * more: all four reason from the type NAME, and a module global
+                 * shadowing one of those names with a class would change what
+                 * the interpreter does. That is the arm's existing contract. */
+            } else if (jitAnyGuard() && k == SLOT_INST &&
+                       e->stackClass[e->depth - 1] != NULL &&
+                       e->stackClass[e->depth - 1]->name != NULL &&
+                       strcmp(e->stackClass[e->depth - 1]->name->chars, tn) == 0) {
+                /* The pinned class IS the one the boundary names. Like
+                 * SLOT_LIST this is a guarded fact -- every arm that puts a
+                 * SLOT_INST on the stack with a class pinned has emitted the
+                 * shapeId check that proves it -- so the guard has nothing left
+                 * to do.
+                 *
+                 * An exact name match is sufficient, not necessary:
+                 * jaiValueMatchesType also accepts a subclass and a trait
+                 * implementer, so anything this does not recognise still
+                 * declines rather than being waved through. The names that
+                 * turn up are `Tensor`, `Mat` and `NDArray` -- the ML packages
+                 * annotate their boundaries, so one of these sat in the middle
+                 * of a hot body and declined all of it. */
+            } else if (jitAnyGuard() && strcmp(tn, "any") == 0) {
+                /* `any` is satisfied by every value, so this guard is a no-op
+                 * for every kind -- not a narrowing the tier is guessing at.
+                 * jaiValueMatchesType returns true for the name "any" before
+                 * looking at the subject at all (vm.c), which is what makes
+                 * emitting nothing here the same thing the interpreter does.
+                 *
+                 * It is common enough to matter because `dict[str, any]` is how
+                 * this compiler carries AST records: a parameter or return
+                 * declared `any` put one of these in the middle of a body and
+                 * declined all of it. */
             } else {
-                e->whyNot = "a type guard the kinds cannot settle";
-                return false;
+                return subWhy(e, "a `%s` guard on a %s", tn, slotKindName(k));
             }
             off += 4;
             break;
