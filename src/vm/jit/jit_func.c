@@ -5567,6 +5567,58 @@ static const NativeResult kNativeResults[] = {
      * refused either way and the row only buys an allocation. */
 };
 
+/* `sum`, `min` and `max` over a LIST answer with the element's own kind: an int
+ * list sums to an int and a float list to a float (checked against `type_of`,
+ * not assumed). So unlike every row in kNativeResults their result is a
+ * property of the ARGUMENT, and the table cannot state it.
+ *
+ * Worth the separate arm because they are cheap next to the loop around them,
+ * which is the test a builtin row has to pass -- `sorted` is not, and its rows
+ * were built and discarded for measuring zero
+ * (docs/research/FALSIFIED-list-returning-builtins.md). A five-element `sum` is
+ * five adds; `docs/probes/p20_sum_min_max.jai` ran 17,000,327 interpreted
+ * instructions, i.e. the whole loop, on account of this one refusal.
+ *
+ * The exemplar comes from a live list if the model has one and otherwise from
+ * `stackElem`, which is what OP_BUILD_LIST recorded -- the same two sources the
+ * iterate arm reads, in the same order. */
+/* JAITHON_JIT_LIST_SCALAR=0 turns the arm below off, so it can be A/B'd inside
+ * ONE binary. Not a nicety: two-binary comparisons are where this tree's
+ * measurements go wrong -- each switch invalidates __jaicache__, and three
+ * people measuring one change tonight two-binary got 3.9x, 100x and 6%
+ * SLOWER for what a switch settled in one command. */
+static bool jitListScalarResult(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_LIST_SCALAR");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool listScalarResult(const Emit *e, const char *nm, unsigned argc,
+                             SlotKind *kind, uint8_t *tag) {
+    if (!jitListScalarResult()) return false;
+    if (argc != 1 && !(argc == 2 && strcmp(nm, "sum") == 0)) return false;
+    if (strcmp(nm, "sum") != 0 && strcmp(nm, "min") != 0 &&
+        strcmp(nm, "max") != 0) {
+        return false;
+    }
+    unsigned idx = e->depth - argc;
+    if (e->stack[idx] != SLOT_LIST) return false;
+
+    Value elem = NULL_VAL;
+    Value seen = e->stackSeen[idx];
+    if (IS_LIST(seen) && AS_LIST(seen)->count > 0) {
+        elem = jaiListGet(AS_LIST(seen), 0);
+    }
+    if (IS_NULL(elem)) elem = e->stackElem[idx];
+
+    if (IS_INT(elem))   { *kind = SLOT_INT;   *tag = VAL_INT;   return true; }
+    if (IS_FLOAT(elem)) { *kind = SLOT_FLOAT; *tag = VAL_FLOAT; return true; }
+    return false;
+}
+
 /* 1 emitted, 0 no row for this builtin, -1 the emit failed. */
 static int emitNativeResultCall(Emit *e, Value cv, const char *nm,
                                 unsigned argc, uint32_t afterIp) {
@@ -5576,6 +5628,7 @@ static int emitNativeResultCall(Emit *e, Value cv, const char *nm,
      * `int()` inside one. */
     if (e->inlining) return 0;
 
+    NativeResult derived;
     const NativeResult *nr = NULL;
     for (size_t i = 0; i < sizeof kNativeResults / sizeof kNativeResults[0]; i++) {
         if (kNativeResults[i].argc == argc &&
@@ -5584,7 +5637,16 @@ static int emitNativeResultCall(Emit *e, Value cv, const char *nm,
             break;
         }
     }
-    if (nr == NULL) return 0;
+    if (nr == NULL) {
+        SlotKind dk;
+        uint8_t dtag;
+        if (!listScalarResult(e, nm, argc, &dk, &dtag)) return 0;
+        derived.name = nm;
+        derived.argc = argc;
+        derived.kind = dk;
+        derived.tag  = dtag;
+        nr = &derived;
+    }
 
     if (!emitDescriptor(e, cv, e->depth - argc, argc, (void *)&jitCallOut)) {
         return -1;
