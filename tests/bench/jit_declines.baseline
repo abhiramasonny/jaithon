@@ -1,6 +1,7 @@
 <anonymous> at 19 stopped: OP_GET_UPVALUE
 _check_variable_name at 49 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 _clear_grad at 11 stopped: a local was given two different kinds
+_collect_intermediates at 10 stopped: a local was given two different kinds
 _collect_intermediates at 10 stopped: an `is` against something other than null
 _fit_fused_async at 421 stopped: more than 8 instance slots to pin
 _forward at 20 stopped: an unpinned receiver's result kind
@@ -12,17 +13,21 @@ _run_compiled_epoch at 192 stopped: a local of no known kind
 _run_compiled_epoch at 192 stopped: a local was given two different kinds
 _run_epoch at 318 stopped: a local of no known kind
 _run_epoch at 318 stopped: a local was given two different kinds
+_run_network at 85 stopped: OP_GET_GLOBAL: `_log2` is not a compiled global function
 _run_network at 85 stopped: OP_GET_GLOBAL: `kernel_of` is not a compiled global function
 _shape_of at 87 stopped: an append reaching past the model
 _uniform_step at 57 stopped: a return inside an OSR loop
 _zero_grad at 11 stopped: a local was given two different kinds
 aggregate at 100 stopped: more live values than there are callee-saved registers
+borrow_lanes at 24 stopped: OP_GET_INDEX: the container has kind object, not list
 broadcast_shapes at 46 stopped: an append reaching past the model
 broadcast_shapes at 79 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+build_pyramid at 27 stopped: OP_GET_GLOBAL: `pyr_down` is not a compiled global function
 cat at 124 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 cat at 171 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 cat at 700 stopped: more live values than there are callee-saved registers
 concat_columns at 60 stopped: OP_JUMP_IF_CMP_FALSE
+concat_columns at 60 stopped: OP_JUMP_IF_CMP_FALSE: a comparison of object with object
 connected_components at 776 stopped: more than 8 instance slots to pin
 connected_components at 836 stopped: more than 8 instance slots to pin
 distance_transform at 433 stopped: OP_ADD
@@ -33,6 +38,7 @@ encode at 46 stopped: a local was given two different kinds
 encode at 46 stopped: callee's return kind not usable
 fit at 151 stopped: OP_INVOKE: a static that has not compiled
 frames at 21 stopped: OP_GET_FIELD
+gather at 100 stopped: an append reaching past the model
 gather at 135 stopped: an append reaching past the model
 gather at 65 stopped: an append reaching past the model
 get_gaussian_kernel at 137 stopped: an append reaching past the model
@@ -72,6 +78,7 @@ repeats_for at 72 stopped: an indirect callee compiled against an older module
 repeats_for at 79 stopped: an indirect callee compiled against an older module
 repeats_for at 84 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
 run at 110 stopped: OP_INVOKE: a receiver of kind int
+run at 110 stopped: an indirect callee compiled against an older module
 run at 196 stopped: an indirect callee compiled against an older module
 run at 43 stopped: an indirect callee compiled against an older module
 run at 61 stopped: OP_INVOKE: a module member that has not compiled
@@ -82,6 +89,7 @@ run at 75 stopped: an indirect callee compiled against an older module
 run_scalar at 168 stopped: an indirect callee compiled against an older module
 run_scalar at 47 stopped: an indirect callee compiled against an older module
 spread_flags at 23 stopped: an append reaching past the model
+stack_lanes at 170 stopped: a local of no known kind
 stage_axis at 72 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
 step at 4 stopped: OP_GET_GLOBAL: `apply_update` is not a compiled global function
 stopped : OP_BUILD_LIST
@@ -136,10 +144,13 @@ stopped : OP_INVOKE: a receiver of kind int
 stopped : OP_INVOKE: a static that has not compiled
 stopped : OP_ITER_RANGE
 stopped : OP_JUMP_IF_CMP_FALSE
+stopped : OP_JUMP_IF_CMP_FALSE: a comparison of list with list
+stopped : OP_JUMP_IF_CMP_FALSE: a comparison of object with object
 stopped : OP_JUMP_IF_CMP_LOCAL_K
 stopped : OP_JUMP_IF_FALSE
 stopped : OP_JUMP_IF_FALSE: a branch on a int, not a bool
 stopped : OP_NE
+stopped : OP_NE: a comparison of list with list
 stopped : OP_NOT: `not` of a int
 stopped : OP_RETURN
 stopped : a builtin with no known result kind

@@ -7416,7 +7416,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
                 branchOnOverflow(e, 2u, JAI_A64_NE);
             } else {
-                return false;
+                return subWhy(e, "arithmetic on a %s", slotKindName(ka));
             }
             localOut(e, slot, rd);
             off += 3;
@@ -7466,7 +7466,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXReg(rd, ra, rb));
                 branchOnOverflow(e, 1u, JAI_A64_VS);
             } else {
-                return false;
+                return subWhy(e, "arithmetic on a %s", slotKindName(ka));
             }
             localOut(e, slot, rd);
             off += 3;
@@ -7693,7 +7693,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                        stringOperand(e, e->depth - 1)) {
                 emitStringOrder(e);
             } else {
-                return false;
+                /* Named: this closed the compare chain with a bare refusal, so
+                 * a census showed 80 declines reading only "OP_NE", with
+                 * nothing in them to act on. */
+                return subWhy(e, "a comparison of %s with %s",
+                              slotKindName(e->stack[e->depth - 2]),
+                              slotKindName(e->stack[e->depth - 1]));
             }
             unsigned dropA, dropB;
             /* Raw: the compare has read both, they are going away, and
@@ -7944,7 +7949,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                        stringOperand(e, e->depth - 1)) {
                 emitStringOrder(e);
             } else {
-                return false;
+                /* Named: this closed the compare chain with a bare refusal, so
+                 * a census showed 80 declines reading only "OP_NE", with
+                 * nothing in them to act on. */
+                return subWhy(e, "a comparison of %s with %s",
+                              slotKindName(e->stack[e->depth - 2]),
+                              slotKindName(e->stack[e->depth - 1]));
             }
             unsigned dropA2, dropB2;
             if (!popValue(e, &dropB2, NULL)) return false;
@@ -8024,7 +8034,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!pushValue3(e, SLOT_OBJ, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, (int64_t)(uintptr_t)AS_OBJ(k));
             } else {
-                return false;
+                return subWhy(e, "a constant of a kind the tier cannot hold");
             }
             off += 4;
             break;
