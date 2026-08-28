@@ -32,7 +32,7 @@
 #: `emitStringConcat`, so a site whose locals stop being strings deopts at this
 #: instruction with both of them untouched; a site handed strings, then lists,
 #: then ints answers the same as the interpreter under every stress mode.
-# jit-compiles: scan
+# jit-compiles: scan, double, prefixed
 from std.test import assert_eq, assert_true
 
 #: Above JAI_JIT_THRESHOLD entries.
@@ -56,6 +56,34 @@ fn add2(a: any, b: any) -> any {
     return a + b
 }
 
+#: BOTH OPERANDS THE SAME LOCAL. Each is pushed onto the model stack in turn,
+#: and a local with a home register is BORROWED rather than copied -- so this
+#: shape borrows the same home twice and then asks emitStringConcat's
+#: `settleAll` to materialise both. Worth a test of its own precisely because it
+#: is the one that would go wrong quietly.
+fn double(rounds: int) -> int {
+    var s = "ab"
+    var i = 0
+    while i < rounds {
+        s = s + s
+        if s.len() > 4096 { s = "ab" }
+        i += 1
+    }
+    return s.len()
+}
+
+#: One operand a PARAMETER and the other a local, which take different paths to
+#: a register.
+fn prefixed(head: str, rounds: int) -> int {
+    var s = ""
+    var i = 0
+    while i < rounds {
+        s = head + s
+        i += 1
+    }
+    return s.len()
+}
+
 pub fn test_a_loop_that_builds_a_string() -> void {
     var total = 0
     var call = 0
@@ -72,6 +100,30 @@ pub fn test_the_string_is_actually_built() -> void {
     assert_eq(scan(0), 0, "no rounds")
     assert_eq(scan(1), 0 + 3 + 1, "one round appends once")
     assert_eq(scan(17), 1240 + 120 + 0 + 3 + 2, "seventeen appends twice")
+}
+
+pub fn test_both_operands_the_same_local() -> void {
+    var total = 0
+    var call = 0
+    while call < CALLS {
+        total += double(6)
+        call += 1
+    }
+    #: "ab" doubled six times is 2 * 2^6 = 128 characters.
+    assert_eq(total, 128 * CALLS, "doubling")
+    assert_eq(double(0), 2, "no rounds")
+    assert_eq(double(1), 4, "one round")
+}
+
+pub fn test_a_parameter_and_a_local() -> void {
+    var total = 0
+    var call = 0
+    while call < CALLS {
+        total += prefixed("xy", 4)
+        call += 1
+    }
+    assert_eq(total, 8 * CALLS, "four two-character prefixes")
+    assert_eq(prefixed("", 4), 0, "an empty prefix")
 }
 
 pub fn test_the_same_site_handed_other_types() -> void {
