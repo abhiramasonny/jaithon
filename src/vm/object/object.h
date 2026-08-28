@@ -541,6 +541,14 @@ struct ObjFunction {
     uint8_t     jitParamKind[8];
     uint32_t    jitParamShape[8];
     uint8_t     jitReturnKind;
+    /* Whether the compile that wrote `jitReturnKind` actually REACHED an
+     * OP_RETURN. It is stored unconditionally at the end of a compile, so a
+     * body that compiled a prefix and took the unarmed path before any return
+     * leaves it at the SLOT_INT a zeroed Emit starts on -- indistinguishable
+     * from a proven int, and a lie to anything that treats it as a contract
+     * rather than a prediction. emitDirectCall is exactly that: it branches
+     * straight in and takes the callee's raw x0 with no tag guard. */
+    bool        jitReturnKnown;
     uint32_t    jitReturnShape;   /* class shape when the kind is an instance */
     uint8_t     jitArgBase;    /* first slot passed in: 0 for a method */
     uint8_t     jitArgCount;

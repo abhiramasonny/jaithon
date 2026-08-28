@@ -4466,6 +4466,15 @@ static void emitMaybeInstResult(Emit *e, unsigned dst, unsigned rat,
     emit(e, jaiA64MovX(dst, JIT_SCRATCH_D));
 }
 
+static bool jitReturnKnownOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_RETURN_KNOWN");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
                            unsigned argc, uint32_t callOff, uint32_t after,
@@ -4527,6 +4536,20 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     }
     /* SLOT_NULL: a `-> void` function. Epilogue leaves x0 zero, so the pushed entry has a fixed tag and
      * zero payload -- same treatment a self-call to a void function gets. Refusing it declined every caller of a procedure, which in nbody is the whole of `main`. */
+    /* A callee whose walk never reached an OP_RETURN has no return kind to be
+     * the contract, only the SLOT_INT of a zeroed Emit. `_is_ident_start` in
+     * the lexer walks only to OP_GET_GLOBAL at offset 0 -- a cold `throw` on
+     * its first instruction -- and still claimed to return an int, which made
+     * `_is_ident_start(c) or _is_digit(c)` decline on "a branch on a int, not
+     * a bool" and left `_ident_run_end`'s OSR loop retrying it eighty times.
+     *
+     * Declining here is not a coverage loss: the caller falls back to the
+     * guarded emitGlobalCall path, which asks the interpreter's own
+     * observation first and gets the right answer. */
+    if (!cfn->jitReturnKnown && jitReturnKnownOn()) {
+        e->whyNot = "a direct callee whose walk never reached a return";
+        return false;
+    }
     SlotKind rk = (SlotKind)cfn->jitReturnKind;
     ObjClass *rcls = NULL;
     /* SLOT_MAYBE_INST rides with SLOT_INST here and needs no guard of its own:
@@ -5364,16 +5387,29 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
      * A recursive function is the ordinary way to reach this -- the loop being
      * compiled is inside the very function the call names, so there is nothing
      * for `jitReturnKind` to have been written by yet. */
+    /* Observed first, compiled kind second -- the order the sibling site at
+     * emitGlobalCall spells out, and which this one did not have.
+     *
+     * `jitFunc != NULL` does not make `jitReturnKind` a fact; it is stored
+     * unconditionally at the end of a compile, so a body that compiled a
+     * PREFIX and took the unarmed path before any OP_RETURN advertises the
+     * SLOT_INT a zeroed Emit starts on. That is not hypothetical here:
+     * `_is_ident_start` in the lexer walks only to OP_GET_GLOBAL at offset 0
+     * -- a cold `throw` on its first instruction -- so it compiles nothing and
+     * still claims to return an int. `_is_ident_cont`, which is
+     * `_is_ident_start(c) or _is_digit(c)`, then declined on "a branch on a
+     * int, not a bool", and `_ident_run_end`'s OSR loop retried it eighty
+     * times waiting for a function that could never compile.
+     *
+     * A refusal is a chain, and this was three links of one. */
     SlotKind rk = SLOT_NULL;
     uint32_t rshape = 0;
     ObjClass *rcls = NULL;
-    bool haveKind;
-    if (cfn->jitFunc != NULL) {
+    bool haveKind = observedReturnKind(cfn, &rk, &rshape);
+    if (!haveKind && cfn->jitFunc != NULL) {
         rk = (SlotKind)cfn->jitReturnKind;
         rshape = cfn->jitReturnShape;
         haveKind = true;
-    } else {
-        haveKind = observedReturnKind(cfn, &rk, &rshape);
     }
     if (haveKind && (rk == SLOT_INST || rk == SLOT_MAYBE_INST) &&
         (rshape == 0 || !jaiClassForShape(rshape, &rcls) || rcls == NULL)) {
@@ -13937,6 +13973,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         fn->jitParamShape[i] = e.localShape[i + e.base];
     }
     fn->jitReturnKind = (uint8_t)e.returnKind;
+    fn->jitReturnKnown = e.sawReturn;
     fn->jitReturnShape = e.returnShape;
     if (e.returnKind == SLOT_INST && e.returnShape != 0) {
         ObjClass *rc = NULL;

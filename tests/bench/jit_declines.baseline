@@ -18,6 +18,7 @@ _uniform_step at 57 stopped: a return inside an OSR loop
 _zero_grad at 11 stopped: a local was given two different kinds
 aggregate at 100 stopped: more live values than there are callee-saved registers
 broadcast_shapes at 46 stopped: an append reaching past the model
+broadcast_shapes at 79 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 cat at 124 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 cat at 171 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 cat at 700 stopped: more live values than there are callee-saved registers
@@ -50,6 +51,7 @@ main at 158 stopped: OP_GET_GLOBAL: `count_occurrences` is not a compiled global
 main at 2176 stopped: more than 16 instance slots to pin
 main at 27 stopped: callee's return class not on record
 main at 412 stopped: OP_GET_GLOBAL: `block` is not a compiled global function
+main at 555 stopped: OP_GET_GLOBAL: `block` is not a compiled global function
 main at 58 stopped: OP_GET_GLOBAL: `step` is not a compiled global function
 norm at 342 stopped: OP_GET_GLOBAL: `channel_stats` is not a compiled global function
 normalize_axes at 28 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
