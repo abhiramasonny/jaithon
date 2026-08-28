@@ -3535,6 +3535,45 @@ static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
     return false;
 }
 
+/* A scalar field's DECLARED kind (FieldInfo::typeId, OP_FIELD_DEF's bits 4-7,
+ * spec Sec3.7), for a receiver with a pinned class but no sample Value to read
+ * `inst->fields[slot]` off -- OP_GET_FIELD's twin of OP_ELEM_KIND's own use of
+ * the same bits (see that case) rather than a sampled container.
+ *
+ * Not a new promise: OP_SET_FIELD's guard (jaiKindAccepts, vm.c) already
+ * refuses any store that disagrees with this field's declared kind, so a
+ * caller here is only reading a fact the runtime enforces on every write, and
+ * the tag is checked again at the load below regardless -- a stale or wrong
+ * record still deopts rather than answers.
+ *
+ * INT/FLOAT/BOOL only. FIELD_KIND_LIST names the box but not the element, so
+ * admitting it here would still leave a consumer that iterates the field with
+ * nothing to look at (the "iterating a list with nothing to look at" refusal,
+ * unresolved either way); FIELD_KIND_INSTANCE names no specific class to guard
+ * against; FIELD_KIND_ANY and FIELD_KIND_STR/DICT promise nothing scalar. All
+ * four are left to the sampled path, unchanged. */
+static bool declaredScalarFieldKind(uint32_t typeId, SlotKind *k, unsigned *tag) {
+    switch (typeId) {
+    case FIELD_KIND_INT:   *k = SLOT_INT;   *tag = VAL_INT;   return true;
+    case FIELD_KIND_FLOAT: *k = SLOT_FLOAT; *tag = VAL_FLOAT; return true;
+    case FIELD_KIND_BOOL:  *k = SLOT_BOOL;  *tag = VAL_BOOL;  return true;
+    default: return false;
+    }
+}
+
+/* JAITHON_JIT_FIELD_DECL_KIND=0 turns declaredScalarFieldKind's OP_GET_FIELD
+ * arm off, reproducing the pre-fix decline for an A/B inside one binary --
+ * same cached-getenv idiom as jitDeoptStress above, but default ON since this
+ * is a fix, not a stress knob. */
+static bool jitDeclaredFieldKindEnabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FIELD_DECL_KIND");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* A callee that is not this function: only a class, whose result is an
  * instance of a shape known here. Anything else would need a guard on a return
  * value nothing can predict. */
@@ -8336,7 +8375,56 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             const FieldInfo *info = jaiClassFieldInfo(klass, AS_STRING(nameVal));
             if (info == NULL || info->isStatic) return false;
-            if (!IS_INSTANCE(seen)) return false;
+            if (!IS_INSTANCE(seen)) {
+                /* No sample to classify the field from. The commonest cause
+                 * is a receiver OP_INVOKE itself predicted: `klass` came from
+                 * observedReturnKind's shape (or a compiled callee's
+                 * jitReturnShape) by way of jaiClassForShape, which pins the
+                 * class exactly, but pushValue leaves `seen` at NULL_VAL
+                 * because there is no actual instance behind a prediction,
+                 * only a shape id -- `self._peek().kind`, `self._chunk().depth`
+                 * and every other zero-arg-accessor-then-field-read chain in
+                 * the self-hosted front end is this shape, and it declined
+                 * outright before this arm existed. See declaredScalarFieldKind
+                 * for why only a scalar can be predicted from here. */
+                SlotKind dkind;
+                unsigned dtag;
+                if (!jitDeclaredFieldKindEnabled() ||
+                    !declaredScalarFieldKind(info->typeId, &dkind, &dtag)) {
+                    return subWhy(e,
+                        "no live receiver to read `%s` off, and its declared "
+                        "kind is not one this predicts",
+                        AS_STRING(nameVal)->chars);
+                }
+                unsigned dbase = (unsigned)offsetof(ObjInstance, fields) +
+                                 (unsigned)info->slot * (unsigned)sizeof(Value);
+                unsigned drr = valueBankReg(e, e->valueDepth - 1);
+                /* Guard BEFORE the receiver comes off the model, as the
+                 * sampled path below does: a deopt here resumes at this
+                 * instruction, and the interpreter's stack still has the
+                 * receiver on it. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, drr, dbase));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, dtag));
+                branchOnDeopt(e, JAI_A64_NE);
+                unsigned dpopped;
+                SlotKind dkr;
+                if (!popValue(e, &dpopped, &dkr)) return false;
+                if (!pushValue3(e, dkind, 0, NULL, NULL_VAL, -1)) return false;
+                if (dkind == SLOT_FLOAT &&
+                    fpWorthLoading(e, code, off + 6, stop)) {
+                    unsigned idx = e->valueDepth - 1;
+                    emit(e, jaiA64LdrD(fpRegAt(e, idx), drr, dbase + 8));
+                    fpClaim(e, idx);
+                } else if (dkind == SLOT_BOOL) {
+                    /* One byte, for the reason given at the local-receiver
+                     * arm: BOOL_VAL writes only the union's bool member. */
+                    emit(e, jaiA64LdrByte(pushReg(e) - 1, drr, dbase + 8));
+                } else {
+                    emit(e, jaiA64LdrX(pushReg(e) - 1, drr, dbase + 8));
+                }
+                off += 6;
+                break;
+            }
             ObjInstance *inst = AS_INSTANCE(seen);
             if (info->slot >= inst->fieldCount) return false;
             Value fieldVal = inst->fields[info->slot];
