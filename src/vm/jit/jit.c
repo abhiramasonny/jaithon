@@ -122,6 +122,21 @@ JaiJitOutcome jaiJitEnter(ObjClosure *closure, Value *slotBase) {
             return jaiJitEnterFunc(closure, slotBase);
         }
         if (!compileReturnNull(fn) && !compileAccessor(fn)) {
+            /* Five, and it is not arbitrary -- 40 was measured and is worse.
+             *
+             * The tempting story is that this budget gets spent on TRANSIENT
+             * failures: a body declines because a callee has not compiled yet,
+             * burns its five attempts, and is refused forever even though the
+             * callee compiles a moment later. `_is_ident_cont` in the lexer
+             * looks exactly like that -- five declines, then three OSR loops
+             * retrying it eighty times each, waiting.
+             *
+             * It is not what happens. Raising the cap to 40 compiles seven more
+             * bodies in `check --no-cache parser.jai` (290 -> 297) and does NOT
+             * compile any of the three that block those loops, while the extra
+             * attempts cost 0.56s -> 0.67s, **20% slower**, reproduced in an
+             * interleaved A/B. Retrying is not free and the bodies that fail
+             * here mostly fail for reasons that do not resolve. */
             if (++fn->jitAttempts >= 5) fn->jitRefused = true;
             else fn->entryCount = 0;
             return JAI_JIT_DECLINED;
