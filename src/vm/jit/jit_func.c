@@ -732,6 +732,11 @@ typedef struct {
      * it changes only when a live entry's address or key could move (new key, rehash, delete, clear). ObjModule::version (used by the function-tier entry check) is neither necessary nor sufficient here. */
     JaiTable *globalsTable;
     uint32_t  globalsKeyVersion;
+    /* Same plan, one class's `statics` table (OP_GET_FIELD's SLOT_CLASS arm):
+     * a body that reads static fields off two different classes declines the
+     * second rather than pretend one table's keyVersion stands for both. */
+    JaiTable *staticsTable;
+    uint32_t  staticsKeyVersion;
     bool      callsOut;
     /* Set the moment anything is emitted that can destroy x0..x8 while the
      * body is still running: a call out, or one of the two stubs that call and
@@ -3224,6 +3229,59 @@ static void emitGlobalsGuard(Emit *e) {
     uint32_t at = e->globalsKeyVersion;
     emitConst64(e, JIT_SCRATCH_D,
                 (int64_t)(uintptr_t)&e->globalsTable->keyVersion);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+    if (at <= 0xfffu) {
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, at));
+    } else {
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)at);
+        emit(e, jaiA64SubsX(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+    }
+    branchOnDeopt(e, JAI_A64_NE);
+}
+
+/* JAITHON_JIT_STATIC_FIELD=0 turns the SLOT_CLASS arm of OP_GET_FIELD off, so
+ * the same binary can be A/B'd around it without a rebuild -- same idiom as
+ * jaiListUnboxOn's JAITHON_LIST_UNBOX (object_collection.c) and
+ * jitPicEnabled's JAITHON_JIT_PIC. Read once: OP_GET_FIELD is hot enough that
+ * an uncached getenv on every static access would be its own cost. */
+static bool jitStaticFieldEnabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_STATIC_FIELD");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* `klass->statics` is a JaiTable exactly like a module's globals table (same
+ * struct, same keyVersion), so a static field is read the same way a module
+ * global is read BY ADDRESS above: bake the JaiEntry*, not the value. A
+ * static is reassignable at runtime -- jaiSetProperty's IS_CLASS arm (vm.c)
+ * takes any value with no isLet check, and the checker's own
+ * _check_field_assign skips its immutability error whenever `static_access`
+ * is true, so `let` buys no promise here that the interpreter or the checker
+ * actually keeps. Nothing below may bake the VALUE, only its address, behind
+ * the same two guards a module global stands on. One table per body, same
+ * plan as globalsTable -- see that field's comment on the struct. */
+static JaiEntry *staticFieldSlot(Emit *e, ObjClass *klass, ObjString *name) {
+    JaiTable *t = &klass->statics;
+    JaiEntry *slot = jaiTableFindEntryInterned(t, name);
+    if (slot == NULL) return NULL;
+    if (e->staticsTable == NULL) {
+        e->staticsTable = t;
+        e->staticsKeyVersion = t->keyVersion;
+    } else if (e->staticsTable != t) {
+        return NULL;
+    }
+    return slot;
+}
+
+/* emitGlobalsGuard's counterpart for e->staticsTable: not hoisted, for the
+ * same reason. */
+static void emitStaticsGuard(Emit *e) {
+    uint32_t at = e->staticsKeyVersion;
+    emitConst64(e, JIT_SCRATCH_D,
+                (int64_t)(uintptr_t)&e->staticsTable->keyVersion);
     emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
     if (at <= 0xfffu) {
         emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, at));
@@ -8078,6 +8136,112 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     off += 6;
                     break;
                 }
+            }
+
+            /* `Klass.STATIC_NAME`: a static field read off a class object
+             * known at compile time. The receiver came from OP_GET_GLOBAL's
+             * `globalClass` arm (the only producer of SLOT_CLASS -- see its
+             * comment: "resolved now and pinned by the module version check
+             * at entry" and "occupies no register, baked into the call
+             * sequence"), so `klass` here is not a guess.
+             *
+             * What is NOT known at compile time is the static's VALUE: it
+             * lives in `klass->statics`, a plain JaiTable exactly like a
+             * module's globals table, reassignable at any point after class
+             * definition (see staticFieldSlot's comment -- `isLet` is not
+             * enforced by the interpreter or the checker for a static, only
+             * for an INSTANCE field written through `self`). So this reads it
+             * the same way OP_GET_GLOBAL reads a plain module global BY
+             * ADDRESS: the JaiEntry* is baked, and two guards (the table
+             * hasn't rehashed, the value still has the kind observed at
+             * compile time) stand between the load and trusting it. A wrong
+             * guess, or a rebind between compile and this call, deopts; nothing
+             * here can return a stale or mistyped answer.
+             *
+             * REACH. `TokenFlags.AFTER_NEWLINE` in Lexer._push
+             * (lib/jaithon/compile/lexer.jai) -- 10/10 attempts hit this
+             * exact gap with no secondary reason (docs/agents/fix-1.md). */
+            if (jitStaticFieldEnabled() && e->stack[e->depth - 1] == SLOT_CLASS) {
+                if (klass == NULL) {
+                    return subWhy(e, "a static receiver with no class pinned");
+                }
+                if (nameIdx >= (uint32_t)fn->chunk.constants.count) {
+                    return subWhy(e, "the field name is not in the pool");
+                }
+                Value sNameVal = fn->chunk.constants.data[nameIdx];
+                if (!IS_STRING(sNameVal)) {
+                    return subWhy(e, "the field name is not a string");
+                }
+                ObjString *sname = AS_STRING(sNameVal);
+
+                const FieldInfo *sinfo = jaiClassFieldInfo(klass, sname);
+                if (sinfo == NULL) {
+                    return subWhy(e, "`%s` is not a field of %s", sname->chars,
+                                  klass->name ? klass->name->chars : "?");
+                }
+                if (!sinfo->isStatic) {
+                    return subWhy(e, "`%s` is an instance field, not a static",
+                                  sname->chars);
+                }
+
+                JaiEntry *sslot = staticFieldSlot(e, klass, sname);
+                if (sslot == NULL) {
+                    return subWhy(e, "`%s` has no static storage, or is a "
+                                  "second class's statics in one body",
+                                  sname->chars);
+                }
+                Value sseen = sslot->value;
+
+                SlotKind sk = SLOT_OPAQUE;
+                uint32_t sshape = 0;
+                ObjClass *sfcls = NULL;
+                if (!globalKind(sseen, &sk, &sshape, &sfcls)) {
+                    return subWhy(e, "static `%s` is a kind this tier cannot "
+                                  "hold", sname->chars);
+                }
+
+                /* Named ahead of the guards, same reason as OP_GET_GLOBAL's
+                 * BY-ADDRESS arm: they run against the model as it is now. */
+                unsigned dst = valueXReg(e, e->valueDepth);
+                unsigned stag = sk == SLOT_INT   ? VAL_INT
+                              : sk == SLOT_FLOAT ? VAL_FLOAT
+                              : sk == SLOT_BOOL  ? VAL_BOOL
+                                                 : VAL_OBJ;
+
+                emitStaticsGuard(e);
+                emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)sslot);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(JaiEntry, value)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, stag));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(JaiEntry, value) + 8u));
+                if (sk == SLOT_INST || sk == SLOT_LIST) {
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                          (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B,
+                                           sk == SLOT_INST ? OBJ_INSTANCE
+                                                            : OBJ_LIST));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
+                if (sk == SLOT_INST) {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                       (unsigned)offsetof(ObjInstance, klass)));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                       (unsigned)offsetof(ObjClass, shapeId)));
+                    emitConst64(e, JIT_SCRATCH_A, (int64_t)sshape);
+                    emit(e, jaiA64SubsX(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
+
+                /* The receiver held no register (SLOT_CLASS -- see its
+                 * comment on the enum): dropping it is the whole of popping
+                 * it. popValue would refuse it via holdsRegister. */
+                e->depth--;
+                if (!pushValue3(e, sk, sshape, sfcls, sseen, -1)) return false;
+                emit(e, jaiA64MovX(dst, JIT_SCRATCH_C));
+                off += 6;
+                break;
             }
 
             /* And, as at the local-receiver arm, a maybe-instance reads like an
