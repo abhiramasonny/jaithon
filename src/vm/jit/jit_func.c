@@ -10833,21 +10833,39 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
             /* A plain function, resolved now and pinned by the same
-             * module-version check. Only one that has itself compiled.
+             * module-version check. Only one that has itself compiled -- and
+             * the reason is NOT soundness, which is what this comment used to
+             * say and what two separate investigations went looking for.
              *
-             * The stated reason is the return kind, and that reason alone no
-             * longer holds: `emitGlobalCall` learned to fall back on what the
-             * interpreter has watched the callee return. The check is kept
-             * anyway, because dropping it MISCOMPILES. It was tried: every
-             * mutually recursive group declines here -- `value`, `object`,
-             * `array`, `integer` and `walk` are the whole of
-             * tests/bench/json_parse's parser and not one of them ever
-             * compiles -- and admitting them makes the self-hosted parser
-             * unable to parse, with tests/stdlib reporting "expected a newline
-             * after this statement" on ordinary source. Whatever the descriptor
-             * path assumes about a callee that has compiled, it is not only the
-             * return kind, and it is not written down. Do not remove this
-             * without finding out what. */
+             * The miscompile it used to warn about is real and is FIXED. It was
+             * never a property of the callee: a descriptor `result` holding a
+             * bool was loaded eight bytes wide where BOOL_VAL writes one, so
+             * `false` came back with dirty high bytes and read as true. That is
+             * why the corruption was one-directional and looked deterministic
+             * in a lexer -- delta-debugging 63 admitted callees reduced it to
+             * `_is_alpha` alone. Both sites are closed: the ordinary return in
+             * 5036099, the verdict-4 slow stub in emitSelfSlowStubs above.
+             * docs/agents/uncompiled-callee.md has the reduction.
+             *
+             * With both fixed, dropping the check is SOUND -- 1274 green plain,
+             * under JAITHON_NO_JIT, deopt stress and split stress -- and it
+             * does let the mutually recursive groups in: json_parse's `value`,
+             * `object`, `array` and `integer` all reach the tier.
+             *
+             * It is kept because it is FASTER, which nobody had measured.
+             * Declining here falls into emitUnarmedDeopt just below, which
+             * interprets from this instruction ONWARD rather than giving the
+             * whole body up. Admitting the callee skips that escape hatch, and
+             * the body then walks on to a refusal that takes all of it --
+             * `value` itself stops at "callee's return kind not usable". Net on
+             * `check --no-cache parser.jai`, stable across three runs each:
+             * 284 function-tier bodies with the check, 275 without. Five bodies
+             * gained, fourteen lost. json_parse's own wall clock does not move
+             * (0.05s either way) and neither does the compiler's.
+             *
+             * So: removable, and not worth removing. If the unarmed-deopt path
+             * ever stops being the better half of that trade, this is one line.
+             */
             Value gv;
             ObjFunction *gfn = globalFunction(closure, nameIdx, &gv);
             if (gfn == NULL || gfn->jitFunc == NULL) {
