@@ -45,9 +45,25 @@ check)
         echo "FAIL: no baseline; run 'capture' first"
         exit 1
     fi
-    tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+    # Confirm a candidate before failing on it. Some reasons are properties of
+    # the RUN, not of the code -- "`X` is not a compiled global function" and
+    # "a module member that has not compiled" both depend on which body the
+    # tier reached first, and the OSR tier compiles on a 250us sampling timer.
+    # A single census failed two runs in three against a baseline captured from
+    # six, with a different reason each time, which is a gate nobody can act on.
+    #
+    # A real regression reproduces. Only a reason new in EVERY census counts.
+    tmp=$(mktemp); confirm=$(mktemp)
+    trap 'rm -f "$tmp" "$confirm"' EXIT
     census > "$tmp"
     new=$(comm -13 "$BASELINE" "$tmp")
+    if [[ -n "$new" ]]; then
+        for _i in $(seq "${CHECK_CONFIRM_RUNS:-2}"); do
+            [[ -z "$new" ]] && break
+            census > "$confirm"
+            new=$(comm -12 <(printf '%s\n' "$new") <(comm -13 "$BASELINE" "$confirm"))
+        done
+    fi
     gone=$(comm -23 "$BASELINE" "$tmp")
     [[ -n "$gone" ]] && { echo "note: these declines no longer occur (good):";
                           printf '  %s\n' "$gone"; }

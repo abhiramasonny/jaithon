@@ -46,6 +46,7 @@ get_gaussian_kernel at 266 stopped: OP_INVOKE: a module member that has not comp
 init at 161 stopped: OP_GET_INDEX: the container has kind instance, not list
 init at 19 stopped: an append reaching past the model
 init at 237 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+init at 326 stopped: an append reaching past the model
 init at 356 stopped: an append reaching past the model
 init at 40 stopped: an append reaching past the model
 init at 86 stopped: an append reaching past the model
@@ -72,11 +73,13 @@ rank_filter at 139 stopped: a return inside an OSR loop
 reduce_leading at 150 stopped: OP_GET_GLOBAL: `cached_kernel` is not a compiled global function
 repeats_for at 12 stopped: an indirect callee compiled against an older module
 repeats_for at 141 stopped: a type guard the kinds cannot settle
+repeats_for at 170 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
 repeats_for at 229 stopped: OP_GET_GLOBAL: `matmul` is not a compiled global function
 repeats_for at 229 stopped: a type guard the kinds cannot settle
 repeats_for at 72 stopped: an indirect callee compiled against an older module
 repeats_for at 79 stopped: an indirect callee compiled against an older module
 repeats_for at 84 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
+reset_state at 4 stopped: OP_INVOKE: `dict.get` has no usable result kind (instance)
 run at 110 stopped: OP_INVOKE: a receiver of kind int
 run at 110 stopped: an indirect callee compiled against an older module
 run at 196 stopped: an indirect callee compiled against an older module
@@ -208,6 +211,7 @@ storm at 18 stopped: a call that can raise inside a try
 time_attn at 182 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
 time_attn at 289 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
 time_attn at 418 stopped: OP_GET_INDEX: the container has kind object, not list
+time_shape at 254 stopped: OP_GET_GLOBAL: `matmul` is not a compiled global function
 time_shape at 254 stopped: a type guard the kinds cannot settle
 time_shape at 349 stopped: a type guard the kinds cannot settle
 time_shape at 503 stopped: OP_GET_INDEX: the container has kind object, not list
@@ -216,5 +220,7 @@ transpose at 43 stopped: an append reaching past the model
 validity_of at 102 stopped: OP_POP
 value_columns at 19 stopped: OP_GET_GLOBAL: `supports` is not a compiled global function
 visit_for_backward at 50 stopped: OP_CALL
+walk at 163 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 4 and 2) have kinds object and instance
+walk at 163 stopped: a type guard the kinds cannot settle
 warm at 31 stopped: an indirect callee compiled against an older module
 warmup at 18 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
