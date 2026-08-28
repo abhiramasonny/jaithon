@@ -10465,6 +10465,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * WHICH METHOD -- from the observed receiver, like the SLOT_LIST arm below (a builtin is a function of receiver-type + name). THAT IT'S STILL THAT TYPE -- SLOT_OBJ pins nothing (`for x in [d, "s"]` mixes types), so the object type is guarded before anything is consumed; a miss resumes with receiver+args untouched. WHAT COMES BACK -- predicted via InlineCache::resultKind (no per-call-site feedback existed before), and the tag guard after the call is what makes the prediction sound, deopting to the instruction AFTER the call since it already happened. */
                 Value oseen = e->stackSeen[ridx];
                 bool  oProbe = false;
+                /* Read before the refusal below can fire, so the refusal can
+                 * name the method. Without the name it said only "an invoke on
+                 * an object with nothing to look at", which is the top
+                 * STATE refusal by attributed cost -- 9.2% of the interpreted
+                 * work in one file sat behind it with nothing to act on. */
+                Value oNameEarly =
+                    nameIdx < (uint32_t)fn->chunk.constants.count
+                        ? fn->chunk.constants.data[nameIdx] : NULL_VAL;
+                const char *oNameChars =
+                    IS_STRING(oNameEarly) ? AS_STRING(oNameEarly)->chars : "?";
                 if (!IS_OBJ(oseen)) {
                     /* No sample, but the model may still know the TYPE -- an
                      * f-string's result, or an earlier invoke's predicted from
@@ -10483,9 +10493,28 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         oseen = OBJ_VAL((Obj *)empty);
                         oProbe = true;
                     } else {
-                        e->whyNot = "an invoke on an object with nothing to "
-                                    "look at";
-                        return false;
+                        /* Naming the method is what priced this: the census
+                         * showed `.len()` and nothing else, and the attribution
+                         * instrument put **14.27% of lexer.jai's interpreted
+                         * work** in eleven functions behind it.
+                         *
+                         * An arm for it was built and REVERTED. jaiInvokeByName
+                         * resolves against any receiver, and `len` returns an
+                         * int whatever it is called on, so the call compiles --
+                         * but the bodies still do not. `_fuse_at` moves to the
+                         * very next instruction, `OP_GET_INDEX: the container
+                         * has kind object, not list`, whose own cause is a
+                         * FIELD whose kind only the declaration knows. Measured
+                         * flat on the clock and three compiled bodies WORSE
+                         * (313 -> 310).
+                         *
+                         * So the 14.27% is real and is gated behind a chain at
+                         * least three links long. Clearing one link of a chain
+                         * buys nothing; that is the rule this tier keeps
+                         * teaching. Whoever picks this up should start at the
+                         * field kind, not here. */
+                        return subWhy(e, "`.%s()` on an object with no sample "
+                                      "and no known type", oNameChars);
                     }
                 }
                 if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;

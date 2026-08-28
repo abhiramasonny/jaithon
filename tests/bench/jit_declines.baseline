@@ -7,6 +7,7 @@ _collect_intermediates at 10 stopped: an `is` against something other than null
 _fit_fused_async at 421 stopped: more than 8 instance slots to pin
 _forward at 20 stopped: an unpinned receiver's result kind
 _fused_relu_layers at 127 stopped: a return inside an OSR loop
+_index_layout at 82 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 _plan at 28 stopped: an append reaching past the model
 _product at 681 stopped: OP_GET_GLOBAL: `_encode` is not a compiled global function
 _result_shape at 7 stopped: an append reaching past the model
@@ -39,6 +40,7 @@ connected_components at 776 stopped: more than 8 instance slots to pin
 connected_components at 836 stopped: more than 8 instance slots to pin
 distance_transform at 433 stopped: OP_ADD
 edge_preserving_filter at 317 stopped: an exponent other than 0.5
+element_count at 10 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 element_count at 40 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 element_is_solid at 94 stopped: a return inside an OSR loop
 encode at 46 stopped: a local was given two different kinds
@@ -61,6 +63,7 @@ init at 326 stopped: an append reaching past the model
 init at 356 stopped: an append reaching past the model
 init at 40 stopped: an append reaching past the model
 init at 86 stopped: an append reaching past the model
+init at 98 stopped: an append reaching past the model
 inpaint at 459 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
 join at 15 stopped: OP_GET_GLOBAL: `_is_absolute_text` is not a compiled global function
 load_cache at 66 stopped: OP_GET_GLOBAL: `plan_from_text` is not a compiled global function
@@ -155,6 +158,8 @@ stopped : OP_GET_INDEX: the container has kind int, not list
 stopped : OP_GET_INDEX: the container has kind object, not list
 stopped : OP_GET_INDEX: the live list is empty, so there is no exemplar
 stopped : OP_INVOKE
+stopped : OP_INVOKE: `.get()` on an object with no sample and no known type
+stopped : OP_INVOKE: `.len()` on an object with no sample and no known type
 stopped : OP_INVOKE: `Agg.counts_rows` is not a builtin of the observed receiver's type
 stopped : OP_INVOKE: `Dtype.is_dictionary` is not a builtin of the observed receiver's type
 stopped : OP_INVOKE: `Dtype.is_numeric` is not a builtin of the observed receiver's type
