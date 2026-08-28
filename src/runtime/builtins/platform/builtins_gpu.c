@@ -502,9 +502,26 @@ static bool nGpuCompile(int argc, Value *args, Value *out) {
     if (!jaiArgString(args[0], 1, "gpu_compile", &source)) return false;
     if (!jaiArgString(args[1], 2, "gpu_compile", &entry)) return false;
 
+    /* Through jaiStringCStr, not `chars`: the Metal compiler reads until a NUL,
+     * and a string somebody has since appended to is a VIEW of a buffer whose
+     * next byte is no longer one. Concatenation writes past the view it was
+     * handed and marks the older view unterminated, which is sound for every
+     * Jaithon-level use and wrong for exactly this one -- jaitensor caches its
+     * generated Metal source, and appending to that cached string made the very
+     * next compile fail on the bytes that had been appended after it. */
     char errors[GPU_ERROR_BUFFER];
-    JaiGpuKernel *kernel = jaiGpuCompile(source->chars, entry->chars, errors,
-                                         sizeof errors);
+    /* Both rooted, and rooted BEFORE the second is made: a terminated copy is
+     * reachable from nothing, so making the entry point's copy could collect
+     * the source's. */
+    ObjString *sourceText = jaiStringTerminated(source);
+    if (sourceText == NULL) return false;
+    jaiGCPushRoot(OBJ_VAL((Obj *)sourceText));
+    ObjString *entryText = jaiStringTerminated(entry);
+    if (entryText == NULL) { jaiGCPopRoot(); return false; }
+    jaiGCPushRoot(OBJ_VAL((Obj *)entryText));
+    JaiGpuKernel *kernel = jaiGpuCompile(sourceText->chars, entryText->chars,
+                                         errors, sizeof errors);
+    jaiGCPopRoots(2);
     if (kernel == NULL)
         return jaiThrow(vm.cValueError, "gpu_compile(): %s",
                         errors[0] != '\0' ? errors : "the kernel did not build");

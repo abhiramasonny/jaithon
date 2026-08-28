@@ -620,20 +620,48 @@ fn cache_path() -> Path {
     return Path(home_dir()).join(".cache", "jaithon", "gemm-plans.tsv")
 }
 
-#: Bumped whenever the kernels or the tile configurations change.
+var _epochs: dict[str, str] = {}
+
+#: What the cached plans were measured against, as a digest of the thing itself.
 #:
 #: A cached plan is a measurement of a set of candidates that no longer exists
 #: once that set changes, and nothing would ever re-measure it: the entry is
-#: found, believed, and used forever. Making the epoch part of the key retires
-#: every old entry the first time a changed build runs, which costs one tuning
-#: pass and is the only thing that keeps a stale answer from outliving the
-#: kernel it was about.
-let TUNE_EPOCH = 3
+#: found, believed, and used forever. Making this part of the key retires every
+#: old entry the first time a changed build runs, which costs one tuning pass.
+#:
+#: This used to be a hand-bumped integer, and that is the failure it was meant
+#: to prevent, one level up: edit a kernel, forget the bump, and every plan on
+#: the machine is stale and never re-measured -- silently, since a stale plan
+#: still computes the right answer, only slower. Derived from `source_for`, it
+#: covers every kernel body and every tile parameter, because `instantiate`
+#: substitutes those into the text. The three constants that steer the choice
+#: without appearing in the source are appended by hand.
+fn tune_epoch(element: str) -> str {
+    let existing = _epochs.get(element, null)
+    if existing is not null { return existing }
+    #: The two are hashed separately and combined, rather than concatenated.
+    #: Appending to the memoised source does not corrupt it -- a concatenation
+    #: writes PAST the view it was handed, and every older view still ends
+    #: where it did. What it does do is leave that older view no longer
+    #: NUL-terminated, and `gpu_compile` used to hand `chars` to the Metal
+    #: compiler as a C string: the next `Kernel.compile` read past the end of
+    #: the source and failed on `,1,2,4,8,16|16|256|2`. Fixed in
+    #: builtins_gpu.c, but hashing the two separately is both cheaper and
+    #: leaves the memoised string alone, so it stays that way.
+    var extra = f"|{MIN_TILES}|{TARGET_GROUPS}|{TUNE_RUNOFF}"
+    for candidate in SPLIT_CANDIDATES { extra = extra + f",{candidate}" }
+    #: FNV-1a over the bytes (jaiHashBytes), so it is the same number in every
+    #: process on every machine -- which it has to be, for a file on disk.
+    let digest = f"{(hash(source_for(element)) ^ hash(extra)) & 0x7FFFFFFFFFFF}"
+    _epochs[element] = digest
+    return digest
+}
 
 fn shape_key(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> str {
     let a_flag = if trans_a { 1 } else { 0 }
     let b_flag = if trans_b { 1 } else { 0 }
-    let prefix = f"{gpu.device_name()}\tv{TUNE_EPOCH}\t{element_type()}"
+    let element = element_type()
+    let prefix = f"{gpu.device_name()}\tv{tune_epoch(element)}\t{element}"
     return f"{prefix}\t{rows}\t{inner}\t{columns}\t{a_flag}\t{b_flag}"
 }
 

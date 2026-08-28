@@ -277,13 +277,21 @@ static ObjString *strSliceOver(ObjStrBuf *buf, size_t length) {
     return s;
 }
 
-const char *jaiStringCStr(ObjString *s) {
-    if (!JAI_STR_UNTERMINATED(s)) return s->chars;
+ObjString *jaiStringTerminated(ObjString *s) {
+    if (!JAI_STR_UNTERMINATED(s)) return s;
     /* Somebody appended past this view, so the byte after it is no longer a
      * NUL. The bytes up to `length` are still exactly right, so a fresh copy
      * of them is a correct C string. */
-    ObjString *copy = jaiStringNew(s->chars, s->length);
-    return copy != NULL ? copy->chars : "";
+    return jaiStringNew(s->chars, s->length);
+}
+
+/* The copy this may make is REACHABLE FROM NOTHING, so the pointer is good only
+ * until the next allocation. Two calls in a row can collect the first answer
+ * before the second returns. A caller that needs two, or that allocates before
+ * it is done reading, must use jaiStringTerminated and root what it gets. */
+const char *jaiStringCStr(ObjString *s) {
+    ObjString *terminated = jaiStringTerminated(s);
+    return terminated != NULL ? terminated->chars : "";
 }
 
 ObjString *jaiStringConcat(ObjString *a, ObjString *b) {

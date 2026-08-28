@@ -62,6 +62,9 @@ typedef struct ObjStrBuf {
 /* A NUL-terminated view of `s`, copying only when a later append overwrote the
  * terminator. Use this anywhere a bare `char *` is handed to printf or str*. */
 const char *jaiStringCStr(ObjString *s);
+/* The rooting-safe half of jaiStringCStr: the same string when it is already
+ * terminated, otherwise a fresh terminated copy the caller can root. */
+ObjString *jaiStringTerminated(ObjString *s);
 
 /* Interning: every string literal and identifier the compiler or the
  * deserialiser produces goes through the intern table, so that for interned
