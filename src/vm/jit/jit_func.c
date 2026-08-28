@@ -4407,6 +4407,41 @@ static DiscardKind discardedAfter(const uint8_t *code, int at, int count) {
     return DISCARD_NO;
 }
 
+/* The RETURN_NULL half of an OP_POP_RETURN_NULL that followed a call whose
+ * result nothing observes.
+ *
+ * The fused opcode carries the function's return with it, so it cannot be
+ * stepped over the way a bare OP_POP is -- doing that would drop the return
+ * entirely. This is OP_RETURN_NULL's arm, unchanged, factored out because the
+ * same escape hatch appears at four sites in the invoke family and duplicating
+ * it four times is how three of them came to be missing the fix in the first
+ * place.
+ *
+ * Returns false having set whyNot; the caller returns false. On true the caller
+ * must advance by 8 and set `afterUncond`, because an invoke falls through and
+ * a return does not. */
+static bool emitFusedReturnNull(Emit *e, ObjFunction *fn) {
+    if (e->osr) {
+        e->whyNot = "a return inside an OSR loop";
+        return false;
+    }
+    if ((fn->flags & FN_INIT) != 0) {
+        /* An initialiser's return yields the object, not null, and wants
+         * slot 0 -- a different arm entirely. */
+        e->whyNot = "a discarded call fused with an initialiser's return";
+        return false;
+    }
+    if (e->sawReturn && e->returnKind != SLOT_NULL) {
+        e->whyNot = "two different return kinds";
+        return false;
+    }
+    e->sawReturn  = true;
+    e->returnKind = SLOT_NULL;
+    emit(e, jaiA64MovzX(0, 0, 0));
+    emitEpilogue(e, 0);
+    return true;
+}
+
 static bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],
@@ -10591,8 +10626,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (rcls == NULL) {
                     SlotKind rkind;
                     unsigned rtag;
-                    const bool discarded =
-                        (off + 7 < count && code[off + 7] == OP_POP);
+                    const DiscardKind udisc = discardedAfter(code, off + 7, count);
+                    const bool discarded = udisc != DISCARD_NO;
                     const uint16_t invokeCache = jaiReadU16(code + off + 5);
                     const bool havePrediction =
                         siteInvokeResultKind(&fn->chunk, invokeCache,
@@ -10631,6 +10666,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     }
                     e->wroteHeap = true;
                     if (!havePrediction) {
+                        if (udisc == DISCARD_POP_RETURN) {
+                            if (!emitFusedReturnNull(e, fn)) return false;
+                            off += 8;
+                            afterUncond = true;
+                            continue;
+                        }
                         off += 8;          /* the OP_POP this consumed */
                         break;
                     }
@@ -10739,33 +10780,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                      * predicted or guarded about it. */
                     e->wroteHeap = true;
                     if (mdisc == DISCARD_POP_RETURN) {
-                        /* The fused form carries the function's return with it,
-                         * so stepping over it the way a bare OP_POP is stepped
-                         * over would drop the return entirely. Emit that half
-                         * here -- it is OP_RETURN_NULL's arm, unchanged. */
-                        if (e->osr) {
-                            e->whyNot = "a return inside an OSR loop";
-                            return false;
-                        }
-                        if ((fn->flags & FN_INIT) != 0) {
-                            /* An initialiser's return yields the object, not
-                             * null, and wants slot 0 -- a different arm. */
-                            e->whyNot = "a discarded call fused with an "
-                                        "initialiser's return";
-                            return false;
-                        }
-                        if (e->sawReturn && e->returnKind != SLOT_NULL) {
-                            e->whyNot = "two different return kinds";
-                            return false;
-                        }
-                        e->sawReturn  = true;
-                        e->returnKind = SLOT_NULL;
-                        emit(e, jaiA64MovzX(0, 0, 0));
-                        emitEpilogue(e, 0);
+                        if (!emitFusedReturnNull(e, fn)) return false;
                         off += 8;
-                        /* Nothing after a return falls through, and the flag
-                         * was set from OP_INVOKE at the top of the walk, which
-                         * does. */
                         afterUncond = true;
                         continue;
                     }
@@ -10978,7 +10994,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     OBJ_TYPE(oseen), AS_STRING(oname)->chars,
                     AS_STRING(oname)->length, argc);
 
-                bool odiscarded = (off + 7 < count && code[off + 7] == OP_POP);
+                DiscardKind odisc = discardedAfter(code, off + 7, count);
+                bool odiscarded = odisc != DISCARD_NO;
                 SlotKind orkind = SLOT_INT;
                 unsigned owantTag = VAL_INT;
                 uint8_t  orObjType = 0;
@@ -11022,6 +11039,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 e->wroteHeap = true;
                 if (odiscarded) {
+                    if (odisc == DISCARD_POP_RETURN) {
+                        if (!emitFusedReturnNull(e, fn)) return false;
+                        off += 8;
+                        afterUncond = true;
+                        continue;
+                    }
                     off += 8;          /* the OP_POP this consumed */
                     break;
                 }
@@ -11100,7 +11123,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * `enumerate`, `map`, `filter` and `sorted` all allocate a list per
              * call, and rows for that shape were built and measured at zero
              * (docs/research/FALSIFIED-list-returning-builtins.md). */
-            bool discarded = (off + 7 < count && code[off + 7] == OP_POP);
+            DiscardKind ldisc = discardedAfter(code, off + 7, count);
+            bool discarded = ldisc != DISCARD_NO;
             const JaiJitFieldRead *lfr = jaiJitFieldReadFor(
                 OBJ_LIST, AS_STRING(nameVal)->chars, AS_STRING(nameVal)->length,
                 argc);
@@ -11145,6 +11169,12 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             }
             e->wroteHeap = true;
             if (discarded) {
+                if (ldisc == DISCARD_POP_RETURN) {
+                    if (!emitFusedReturnNull(e, fn)) return false;
+                    off += 8;
+                    afterUncond = true;
+                    continue;
+                }
                 off += 8;      /* the OP_POP this consumed */
                 break;
             }
