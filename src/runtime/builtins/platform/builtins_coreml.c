@@ -33,9 +33,19 @@ static bool nCoreMLOpen(int argc, Value *args, Value *out) {
                         "coreml_open(): compute units must be 0 to 3, got %lld",
                         (long long)units);
 
+    /* Through jaiStringTerminated, not AS_CSTRING: the path reaches CoreML as a
+     * C string, and a string somebody has since appended to is a VIEW of a
+     * growing buffer whose NUL the append moved past (object_string.c). A path
+     * built by concatenation and then extended opened the wrong file, or none.
+     * Same bug and same fix as gpu_compile in this directory; rooted because
+     * jaiStringTerminated's copy is reachable from nothing. */
+    ObjString *pathStr = jaiStringTerminated(AS_STRING(args[0]));
+    if (pathStr == NULL) return false;
+    jaiGCPushRoot(OBJ_VAL((Obj *)pathStr));
     char trouble[COREML_ERROR_BUFFER];
-    JaiCoreMLModel *model = jaiCoreMLOpen(AS_CSTRING(args[0]), (int)units,
+    JaiCoreMLModel *model = jaiCoreMLOpen(pathStr->chars, (int)units,
                                           trouble, sizeof(trouble));
+    jaiGCPopRoot();
     if (model == NULL) {
         return jaiThrow(vm.cRuntimeError, "coreml_open(): %s",
                         trouble[0] != '\0' ? trouble : "no CoreML on this machine");
