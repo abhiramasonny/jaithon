@@ -713,9 +713,15 @@ typedef enum {
      * It is a HINT and not a contract: jaiKindAccepts deliberately accepts
      * everything for it, because tightening a run-time check that has always
      * passed would reject code that works today -- the same reason
-     * FIELD_KIND_FLOAT accepts an int. The compiled tier is the only reader,
-     * and it GUARDS the tag, so a field that turns out to hold an int or a null
-     * deoptimises rather than misbehaving.
+     * FIELD_KIND_FLOAT accepts an int.
+     *
+     * That turns out to cost nothing, and the reason is worth writing down: the
+     * ASSIGNMENT to such a field is already guarded at the language level, so a
+     * scalar cannot reach one even through `any` -- it raises
+     * "expected 'Tint' but got 'int'" before the field is written. The one miss
+     * the tier can actually see is a NULL in a nullable field, VAL_NULL rather
+     * than VAL_OBJ, and its tag guard deopts on that. Both are exercised in
+     * tests/lang/test_jit_field_decl_kind.jai.
      *
      * Worth having because a field the tier cannot classify is a whole-body
      * decline: 8 bodies and 4.5-4.9% of the interpreted work in each of

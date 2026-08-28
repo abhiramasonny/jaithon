@@ -27,7 +27,9 @@
 #: this fix, where `_push` turned out to be two unrelated functions of that
 #: name in the self-hosted compiler (see docs/agents/cleared-compiler.md).
 # jit-compiles: jfk_read_line, jfk_read_scale, jfk_read_ready, jfk_read_marks, jfk_read_label, jfk_read_via_local
-from std.test import assert_eq, assert_near, assert_true
+from std.test import assert_eq, assert_near, assert_true, assert_throws
+
+enum JfkTint { Warm, Cool }
 
 class JfkInner {
     pub var line: int
@@ -51,6 +53,10 @@ class JfkInner {
     #: the length at run time, so a probe of "" cannot make it read a longer
     #: string as one byte.
     pub var label: str
+    #: A user type: FIELD_KIND_DECLARED, claiming only "a heap object".
+    pub var tint: JfkTint
+    #: The nullable twin, which is the only miss the tag guard can see.
+    pub var next: JfkInner?
 
     fn init(self, line: int, scale: float, ready: bool) {
         self.line = line
@@ -58,6 +64,8 @@ class JfkInner {
         self.ready = ready
         self.marks = [7, 8, 9]
         self.label = "abc"
+        self.tint = JfkTint.Warm
+        self.next = null
     }
 }
 
@@ -151,6 +159,54 @@ fn jfk_warm_via_local(o: JfkOuter) -> int {
         t += jfk_read_via_local(o)
     }
     return t
+}
+
+#: A field the declaration promises is a heap object, plus the nullable twin
+#: that is the only miss the tier can actually see.
+#: Routed through `any` so the checker cannot reject it statically -- the point
+#: is what the RUN TIME does with a value the declaration forbids.
+fn jfk_put_tint(i: JfkInner, v: any) -> void {
+    i.tint = v
+}
+
+fn jfk_tint_of(o: JfkOuter) -> any {
+    return jfk_inner_of(o).tint
+}
+
+fn jfk_next_of(o: JfkOuter) -> any {
+    let inner = jfk_inner_of(o)
+    return inner.next
+}
+
+fn jfk_warm_tint(o: JfkOuter) -> int {
+    var t = 0
+    for _i in 0..200 {
+        if jfk_tint_of(o) == JfkTint.Warm { t += 1 }
+        if jfk_next_of(o) == null { t += 1 }
+    }
+    return t
+}
+
+pub fn test_a_user_typed_field_and_its_nullable_twin() -> void {
+    let outer = JfkOuter(JfkInner(11, 0.5, true))
+    assert_eq(jfk_warm_tint(outer), 400, "warm and null, every round")
+    assert_true(jfk_tint_of(outer) == JfkTint.Warm, "the enum came back")
+    assert_true(jfk_next_of(outer) == null, "and the empty link")
+
+    #: The ASSIGNMENT is guarded at the language level, so a scalar cannot reach
+    #: a user-typed field even through `any`. The tier's VAL_OBJ prediction is
+    #: therefore backed by more than its own guard.
+    assert_throws(
+        TypeError,
+        || jfk_put_tint(JfkInner(11, 0.5, true), 7),
+        "an int cannot reach a JfkTint field at all"
+    )
+
+    #: The reachable miss is a null in the nullable field: VAL_NULL is not
+    #: VAL_OBJ, so the read deopts rather than answering.
+    let linked = JfkInner(1, 0.0, false)
+    linked.next = JfkInner(2, 0.0, false)
+    assert_true(linked.next != null, "a present link reads back")
 }
 
 pub fn test_fields_read_off_a_predicted_local() -> void {
