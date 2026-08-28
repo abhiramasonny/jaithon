@@ -268,6 +268,49 @@ static int jitNotContains(JitCallDesc *d) {
     return 0;
 }
 
+/* `{a: 1, b: 2}`. Keys and values alternate in the operand list, which is the
+ * order the interpreter reads them in, so the args array is used as-is.
+ *
+ * jaiDictSet hashes the key and can raise on an unhashable one, so the root
+ * range goes down and a raise comes back as 1 for the descriptor's threw
+ * branch. */
+static int jitBuildDict(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    ObjDict *dict = jaiDictNew();
+    jaiGCPushRoot(OBJ_VAL(dict));
+    for (int64_t i = 0; i + 1 < d->argc; i += 2) {
+        (void)jaiDictSet(dict, d->args[i], d->args[i + 1]);
+        if (vm.hasException) {
+            jaiGCPopRoot();
+            jaiGCPopRootRange();
+            return 1;
+        }
+    }
+    jaiGCPopRoot();
+    jaiGCPopRootRange();
+    d->result = OBJ_VAL(dict);
+    return 0;
+}
+
+/* `{a, b}`. Same shape, one operand per element. */
+static int jitBuildSet(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    ObjSet *set = jaiSetNew();
+    jaiGCPushRoot(OBJ_VAL(set));
+    for (int64_t i = 0; i < d->argc; i++) {
+        (void)jaiSetAdd(set, d->args[i]);
+        if (vm.hasException) {
+            jaiGCPopRoot();
+            jaiGCPopRootRange();
+            return 1;
+        }
+    }
+    jaiGCPopRoot();
+    jaiGCPopRootRange();
+    d->result = OBJ_VAL(set);
+    return 0;
+}
+
 static int jitBuildTuple(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjTuple *tuple = jaiTupleNew(d->args, (int)d->argc);
@@ -6789,8 +6832,43 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * cost the whole function. OP_BUILD_LIST pushes SLOT_LIST, which is
              * exactly what the emitter puts this opcode after. */
             if (e->stack[e->depth - 1] != SLOT_LIST) {
-                e->whyNot = "elem-kind target is not a known list";
-                return false;
+                /* The interpreter stamps a dict's two nibbles as well, and
+                 * does NOTHING for any other container -- "an unstamped
+                 * container is simply unguarded". Both of those are arms.
+                 *
+                 * They became reachable the day the dict and set literals got
+                 * arms of their own: before that the walk stopped AT the
+                 * literal, so this opcode was never reached with a non-list on
+                 * top. `var d: dict[str, int] = {}` in a hot body then
+                 * declined the WHOLE function, which is strictly worse than
+                 * the partial walk it replaced. */
+                uint8_t built = e->stackObjType[e->depth - 1];
+                if (built == (uint8_t)(OBJ_SET + 1) ||
+                    built == (uint8_t)(OBJ_TUPLE + 1)) {
+                    off += 2;
+                    break;
+                }
+                if (built != (uint8_t)(OBJ_DICT + 1)) {
+                    return subWhy(e, "an elem-kind stamp on a %s",
+                                  slotKindName(e->stack[e->depth - 1]));
+                }
+                unsigned dr = valueXReg(e, e->valueDepth - 1);
+                /* The prediction came from the build instruction just below,
+                 * but a guard costs two instructions and does not depend on
+                 * the emitter keeping them adjacent. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, dr,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+                branchOnDeoptInstStart(e, JAI_A64_NE);
+                emitConst64(e, JIT_SCRATCH_A, (int64_t)((packed >> 4) & 0xFu));
+                emit(e, jaiA64StrByte(JIT_SCRATCH_A, dr,
+                                      (unsigned)offsetof(ObjDict, keyKind)));
+                emitConst64(e, JIT_SCRATCH_A, (int64_t)(packed & 0xFu));
+                emit(e, jaiA64StrByte(JIT_SCRATCH_A, dr,
+                                      (unsigned)offsetof(ObjDict, valKind)));
+                e->wroteHeap = true;
+                off += 2;
+                break;
             }
             unsigned r = valueXReg(e, e->valueDepth - 1);
             emitConst64(e, JIT_SCRATCH_A, (int64_t)(packed & 0xFu));
@@ -8947,6 +9025,45 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_BUILD_DICT:
+        case OP_BUILD_SET: {
+            /* The remaining container literals, on the OP_BUILD_LIST template.
+             *
+             * Both were top of the partial-walk census over the self-hosted
+             * parser: `_node(kind, span, fields: dict = {})` builds a dict for
+             * every AST node, and the walk stopped there sixteen times in one
+             * file. */
+            bool isDict = code[off] == OP_BUILD_DICT;
+            unsigned n = jaiReadU16(code + off + 1);
+            unsigned operands = isDict ? n * 2u : n;
+            if (!jitTuple()) return subWhy(e, "the container arm is off");
+            if (operands > JIT_MAX_ARGS_OUT) {
+                return subWhy(e, "a %u-element literal", n);
+            }
+            if (!e->callsOut) return subWhy(e, "the body cannot call out");
+            if (e->depth < operands) return subWhy(e, "not enough operands");
+            if (!emitDescriptor(e, NULL_VAL, e->depth - operands, operands,
+                                isDict ? (void *)&jitBuildDict
+                                       : (void *)&jitBuildSet)) {
+                return false;
+            }
+            for (unsigned i = 0; i < operands; i++) {
+                unsigned r;
+                if (!popValue(e, &r, NULL)) return false;
+            }
+            if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
+            /* SLOT_OBJ does not say which container this is, and OP_ELEM_KIND
+             * comes straight after a literal and has to know. */
+            e->stackObjType[e->depth - 1] =
+                (uint8_t)((isDict ? OBJ_DICT : OBJ_SET) + 1);
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            e->wroteHeap = true;
+            off += 3;
+            break;
+        }
+
         case OP_BUILD_TUPLE: {
             /* Same shape as OP_BUILD_LIST above, and simpler: jaiTupleNew
              * copies the operands itself and cannot throw. No exemplar is
@@ -8970,6 +9087,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!popValue(e, &r, NULL)) return false;
             }
             if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
+            e->stackObjType[e->depth - 1] = (uint8_t)(OBJ_TUPLE + 1);
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
