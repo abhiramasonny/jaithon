@@ -150,6 +150,12 @@ void jaiMethodCacheInit(void);
  * a second spelling of it. */
 bool jaiIndexGet(Value container, Value index, Value *out);
 
+/* `x in c` and `x not in c`, exported for the same reason: the tier's OP_IN arm
+ * runs the interpreter's own containment, so a container it does not know still
+ * behaves and still throws the interpreter's message. Returns false having
+ * thrown. */
+bool jaiContainsOp(Value container, Value element, bool *out);
+
 /* OP_GET_SLICE's semantics, callable from the compiled tier. */
 bool jaiSliceGet(Value container, Value startValue, Value stopValue,
                  Value stepValue, bool hasStart, bool hasStop, bool hasStep,

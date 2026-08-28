@@ -15,14 +15,8 @@
 #: does nothing else -- and the whole point of the arm is that the walk does not
 #: stop there.
 #:
-#: `-x`, which had no arm at all.
-#:
-#: OP_NEG appeared only in `inlinableBody`'s whitelist, so in an ordinary body
-#: it fell through to `default` and ENDED THE WALK -- everything after a
-#: negation ran interpreted. `-(i & 255)` in a loop was 48,000,320 interpreted
-#: instructions and 2,310,930 after, **9x** on the clock (0.09s to 0.01s); the
-#: float form 38,000,322 and 253,666, **10x** (0.10s to 0.01s). Measured in one
-#: binary through `JAITHON_JIT_NEGATE`.
+#: OP_NEG was the one that surfaced the class: it appeared only in
+#: `inlinableBody`'s whitelist, so an ordinary body fell through to `default`.
 #:
 #: It hid because `emitUnarmedDeopt` is silent by design -- the point of it is
 #: to interpret from an unsupported opcode ONWARD rather than decline the whole

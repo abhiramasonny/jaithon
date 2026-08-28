@@ -2225,7 +2225,7 @@ JAI_INLINE bool valuesEqualFast(Value a, Value b, bool *equal) {
 }
 
 /* `element in container`. */
-static bool containsOp(Value container, Value element, bool *out) {
+bool jaiContainsOp(Value container, Value element, bool *out) {
     if (IS_STRING(container)) {
         if (!IS_STRING(element)) {
             return jaiThrow(vm.cTypeError,
@@ -4337,7 +4337,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
         bool wantIn = (instStart[0] == OP_IN);
         SAVE_STATE();
         bool contains = false;
-        if (!containsOp(stackTop[-1], stackTop[-2], &contains)) goto vmThrow;
+        if (!jaiContainsOp(stackTop[-1], stackTop[-2], &contains)) goto vmThrow;
         LOAD_STATE();
         DROP(2);
         PUSH(BOOL_VAL(contains == wantIn));

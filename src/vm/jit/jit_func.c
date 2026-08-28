@@ -245,6 +245,37 @@ static int jitBuildList(JitCallDesc *d) {
     return 0;
 }
 
+/* `x in c`. The needle is args[0] and the container args[1], matching the
+ * operand order the interpreter peeks. The answer is stored as a Value so the
+ * one-byte BOOL_VAL member is the thing the caller's LdrByte reads -- see the
+ * SLOT_BOOL result convention in emitDescriptorStatus.
+ *
+ * Roots go down because a container's __contains__ can run Jaithon code and
+ * therefore collect. Returns 1 having thrown. */
+static int jitContains(JitCallDesc *d) {
+    bool contains = false;
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    bool ok = jaiContainsOp(d->args[1], d->args[0], &contains);
+    jaiGCPopRootRange();
+    if (!ok) return 1;
+    d->result = BOOL_VAL(contains);
+    return 0;
+}
+
+static int jitNotContains(JitCallDesc *d) {
+    if (jitContains(d) != 0) return 1;
+    d->result = BOOL_VAL(!AS_BOOL(d->result));
+    return 0;
+}
+
+static int jitBuildTuple(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    ObjTuple *tuple = jaiTupleNew(d->args, (int)d->argc);
+    jaiGCPopRootRange();
+    d->result = OBJ_VAL(tuple);
+    return 0;
+}
+
 /* `a + b` on two strings. Both operands are guarded for OBJ_STRING at the call
  * site, so this is jaiStringConcat and nothing else -- the general arithmetic()
  * fallback would have to be answered with a tag test on the result, and there
@@ -5636,6 +5667,24 @@ static const NativeResult kNativeResults[] = {
  * people measuring one change tonight two-binary got 3.9x, 100x and 6%
  * SLOWER for what a switch settled in one command. */
 /* JAITHON_JIT_NEGATE=0 turns off the OP_NEG arm, for a one-binary A/B. */
+static bool jitMembership(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_MEMBERSHIP");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool jitTuple(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_TUPLE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static bool jitNegate(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -8849,6 +8898,78 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * remove. See buildListExemplar for why the list itself cannot
              * answer this. */
             e->stackElem[e->depth - 1] = elemSeen;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            e->wroteHeap = true;
+            off += 3;
+            break;
+        }
+
+        case OP_IN:
+        case OP_NOT_IN: {
+            /* `x in c`. No arm existed, so a membership test ENDED THE WALK:
+             * `if k in seen` is the shape of every dedup loop in the corpus and
+             * everything after it ran interpreted.
+             *
+             * The containment itself is not made faster -- it is the same
+             * jaiContainsOp the interpreter runs, called out to. What the arm
+             * buys is the body around it, which is the whole point of a row
+             * over a call that is cheap next to its loop.
+             *
+             * `not in` is the same call with the sense flipped, in its own
+             * entry point rather than an argc flag -- a wider descriptor would
+             * name a stack entry past the operands. */
+            if (!jitMembership()) return subWhy(e, "the membership arm is off");
+            if (!e->callsOut) return subWhy(e, "the body cannot call out");
+            if (e->depth < 2) return subWhy(e, "not enough operands");
+            if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
+                                code[off] == OP_IN ? (void *)&jitContains
+                                                   : (void *)&jitNotContains)) {
+                return false;
+            }
+            for (unsigned i = 0; i < 2; i++) {
+                unsigned r;
+                if (!popValue(e, &r, NULL)) return false;
+            }
+            if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
+            emit(e, jaiA64LdrByte(pushReg(e) - 1, 31,
+                                  e->descOffset +
+                                      (unsigned)offsetof(JitCallDesc, result) +
+                                      8));
+            /* Containment is not pure: a class can define __contains__, so the
+             * call may run Jaithon code that writes. Leaving this unset marked
+             * every body holding an `in` jitFuncNoWrite, which lets a direct
+             * caller finish the callee by RE-RUNNING it from the start on a
+             * bail -- and re-running the writes with it. */
+            e->wroteHeap = true;
+            off += 1;
+            break;
+        }
+
+        case OP_BUILD_TUPLE: {
+            /* Same shape as OP_BUILD_LIST above, and simpler: jaiTupleNew
+             * copies the operands itself and cannot throw. No exemplar is
+             * kept -- a tuple has no element arm to feed, so the entry is a
+             * plain SLOT_OBJ.
+             *
+             * Worth an arm only because there was none: a tuple build ENDED
+             * THE WALK, and `let p = (x, y)` in a loop body is common enough
+             * that the whole body after it ran interpreted. */
+            unsigned n = jaiReadU16(code + off + 1);
+            if (!jitTuple()) return subWhy(e, "the tuple arm is switched off");
+            if (n > JIT_MAX_ARGS_OUT) return subWhy(e, "a %u-element tuple", n);
+            if (!e->callsOut) return subWhy(e, "the body cannot call out");
+            if (e->depth < n) return subWhy(e, "not enough operands");
+            if (!emitDescriptor(e, NULL_VAL, e->depth - n, n,
+                                (void *)&jitBuildTuple)) {
+                return false;
+            }
+            for (unsigned i = 0; i < n; i++) {
+                unsigned r;
+                if (!popValue(e, &r, NULL)) return false;
+            }
+            if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
