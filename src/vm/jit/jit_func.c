@@ -4370,6 +4370,43 @@ static bool nullLiteralPair(const Emit *e, uint8_t op, SlotKind ka, SlotKind kb)
            e->stackNullLit[e->depth - 2];
 }
 
+/* Does the instruction after a call throw its result away?
+ *
+ * `OP_POP` is the obvious spelling and the only one this used to test for. But
+ * `lib/jaithon/compile/opt/peephole.jai` fuses `Pop; ReturnNull` into
+ * OP_POP_RETURN_NULL at the default -O2, so a `-> void` method called as the
+ * LAST STATEMENT of a branch never matched -- and that is the commonest place
+ * such a call appears. The escape hatch was written against un-optimised
+ * bytecode.
+ *
+ * It cost more than any other single miss in the tier. `_scan_token`'s
+ * `self._line_continuation()` -- a `-> void` method on a backslash branch no
+ * source file in this tree even takes -- declined the whole lexer entry point:
+ * 2,607,687 interpreted instructions, 7.6% of one file, from five compile
+ * attempts before the retry budget ran out.
+ *
+ * `discardedAfter` reports WHICH, because the fused form has to emit the
+ * return half itself rather than simply stepping over the pop. */
+typedef enum { DISCARD_NO, DISCARD_POP, DISCARD_POP_RETURN } DiscardKind;
+
+static bool jitFusedDiscard(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FUSED_DISCARD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static DiscardKind discardedAfter(const uint8_t *code, int at, int count) {
+    if (at >= count) return DISCARD_NO;
+    if (code[at] == OP_POP) return DISCARD_POP;
+    if (code[at] == OP_POP_RETURN_NULL && jitFusedDiscard()) {
+        return DISCARD_POP_RETURN;
+    }
+    return DISCARD_NO;
+}
+
 static bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],
@@ -10663,7 +10700,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 /* A result the very next instruction pops needs no kind at all -- which is every `-> void`
                  * method called as a statement, and the reason a parser's `self.skip()` used to decline the
                  * function around it. Same relaxation the builtin arm below already makes. */
-                bool mdiscarded = (off + 7 < count && code[off + 7] == OP_POP);
+                DiscardKind mdisc = discardedAfter(code, off + 7, count);
+                bool mdiscarded = mdisc != DISCARD_NO;
                 if (!haveKind && !mdiscarded) {
                     e->whyNot = "callee's return kind not usable";
                     return false;
@@ -10700,6 +10738,37 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     /* Nothing observes the result, so nothing has to be
                      * predicted or guarded about it. */
                     e->wroteHeap = true;
+                    if (mdisc == DISCARD_POP_RETURN) {
+                        /* The fused form carries the function's return with it,
+                         * so stepping over it the way a bare OP_POP is stepped
+                         * over would drop the return entirely. Emit that half
+                         * here -- it is OP_RETURN_NULL's arm, unchanged. */
+                        if (e->osr) {
+                            e->whyNot = "a return inside an OSR loop";
+                            return false;
+                        }
+                        if ((fn->flags & FN_INIT) != 0) {
+                            /* An initialiser's return yields the object, not
+                             * null, and wants slot 0 -- a different arm. */
+                            e->whyNot = "a discarded call fused with an "
+                                        "initialiser's return";
+                            return false;
+                        }
+                        if (e->sawReturn && e->returnKind != SLOT_NULL) {
+                            e->whyNot = "two different return kinds";
+                            return false;
+                        }
+                        e->sawReturn  = true;
+                        e->returnKind = SLOT_NULL;
+                        emit(e, jaiA64MovzX(0, 0, 0));
+                        emitEpilogue(e, 0);
+                        off += 8;
+                        /* Nothing after a return falls through, and the flag
+                         * was set from OP_INVOKE at the top of the walk, which
+                         * does. */
+                        afterUncond = true;
+                        continue;
+                    }
                     off += 8;          /* the OP_POP this consumed */
                     break;
                 }
