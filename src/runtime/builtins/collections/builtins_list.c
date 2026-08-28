@@ -238,6 +238,14 @@ static bool listLen(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool listIsEmpty(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *self;
+    if (!selfList(args, "list.is_empty", &self)) return false;
+    *out = BOOL_VAL(self->count == 0);
+    return true;
+}
+
 static bool listPush(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -856,14 +864,14 @@ static bool listEnumerate(int argc, Value *args, Value *out) {
     return true;
 }
 
-static bool listChunk(int argc, Value *args, Value *out) {
+static bool listChunks(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
-    if (!selfList(args, "list.chunk", &self)) return false;
+    if (!selfList(args, "list.chunks", &self)) return false;
     int64_t size;
-    if (!jaiArgInt(args[1], 1, "list.chunk", &size)) return false;
+    if (!jaiArgInt(args[1], 1, "list.chunks", &size)) return false;
     if (size <= 0) {
-        return jaiThrow(vm.cValueError, "list.chunk(): size must be positive, got %lld",
+        return jaiThrow(vm.cValueError, "list.chunks(): size must be positive, got %lld",
                         (long long)size);
     }
 
@@ -994,10 +1002,43 @@ static const char *const kSelfValueFrom[]  = {"self", "value", "from"};
 static const char *const kSelfInitialFn[]  = {"self", "initial", "combine"};
 static const char *const kSelfSlice[]      = {"self", "start", "stop", "step"};
 
+/* `xs.at(i)` and `xs.set(i, v)`, the method spellings of `xs[i]` and
+ * `xs[i] = v`. `tuple.at` and `bytes.at` both exist, so a list was the only
+ * sequence without one.
+ *
+ * Wrappers rather than table rows onto primListGet/primListSet directly:
+ * those number their arguments from the PRIM call shape and would report
+ * `list_get(): argument 2`, where a method has to say `list.at(): argument 1`.
+ * That mismatch is the small version of the bug that made `str.slice` read
+ * past the stack -- a native reused across two registrations has to agree with
+ * both of them. */
+static bool listAt(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *self;
+    if (!selfList(args, "list.at", &self)) return false;
+    int at;
+    if (!jaiSeqIndexArg(args[1], 1, "list.at", self->count, &at)) return false;
+    *out = jaiListGet(self, at);
+    return true;
+}
+
+static bool listSet(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *self;
+    if (!selfList(args, "list.set", &self)) return false;
+    int at;
+    if (!jaiSeqIndexArg(args[1], 1, "list.set", self->count, &at)) return false;
+    jaiListPut(self, at, args[2]);
+    jaiListTouch(self);
+    *out = NULL_VAL;
+    return true;
+}
+
 static const JaiSeqMethod kListMethods[] = {
     JAI_METHOD_KW("all",    listAll,    1, 2, kSelfPredicate),
     JAI_METHOD_KW("any",    listAny,    1, 2, kSelfPredicate),
-    JAI_METHOD("chunk",     listChunk,     2, 2),
+    JAI_METHOD("at",        listAt,        2, 2),
+    JAI_METHOD("chunks",    listChunks,    2, 2),
     JAI_METHOD("clear",     listClear,     1, 1),
     JAI_METHOD("contains",  listContains,  2, 2),
     JAI_METHOD("copy",      listCopy,      1, 1),
@@ -1010,6 +1051,7 @@ static const JaiSeqMethod kListMethods[] = {
     JAI_METHOD("for_each",  listForEach,   2, 2),
     JAI_METHOD_KW("index",  listIndex,  2, 3, kSelfValueFrom),
     JAI_METHOD("insert",    listInsert,    3, 3),
+    JAI_METHOD("is_empty",  listIsEmpty,   1, 1),
     JAI_METHOD("iter",      jaiSeqValueIter,     1, 1),
     JAI_METHOD_KW("join",   listJoin,   1, 2, kSelfSeparator),
     JAI_METHOD_KW("last",   listLast,   1, 2, kSelfDefault),
@@ -1023,6 +1065,7 @@ static const JaiSeqMethod kListMethods[] = {
     JAI_METHOD("remove",    listRemove,    2, 2),
     JAI_METHOD("remove_at", listRemoveAt,  2, 2),
     JAI_METHOD("reverse",   listReverse,   1, 1),
+    JAI_METHOD("set",       listSet,       3, 3),
     JAI_METHOD("reversed",  listReversed,  1, 1),
     JAI_METHOD("shuffle",   listShuffle,   1, 1),
     JAI_METHOD_KW("slice",  listSlice,  1, 4, kSelfSlice),

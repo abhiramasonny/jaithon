@@ -384,9 +384,16 @@ Value jaiBindNative(Value receiver, const char *name, JaiNativeFn fn,
     return bindNativeSlow(receiver, name, fn,
                           minArity, maxArity, paramNames, hash);
 }
+#ifdef JAI_DEBUG
+static void assertMethodTablesInSync(void);
+#endif
+
 void jaiMethodTablesInit(void) {
     resetNativeCache();
     (void)ensureNativeAnchor();   /* a no-op until the builtins module exists */
+#ifdef JAI_DEBUG
+    assertMethodTablesInSync();
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -481,21 +488,26 @@ bool jaiBuiltinMethod(Value receiver, ObjString *name, Value *out) {
 /* ------------------------------------------------------------------ */
 
 static const char *const kStrMethodNames[] = {
-    "at", "capitalize", "center", "chars", "code_at", "contains", "count",
-    "encode", "ends_with", "find", "format", "index", "is_alnum", "is_alpha",
-    "is_digit", "is_empty", "is_lower", "is_space", "is_upper", "iter", "join",
-    "len", "lines", "lower", "lstrip", "pad_left", "pad_right", "repeat",
-    "replace", "reversed", "rfind", "rstrip", "slice", "split", "splitlines",
-    "starts_with", "strip", "title", "to_float", "to_int", "to_str", "upper",
+    "capitalize", "center", "chars", "contains", "count", "ends_with", "find",
+    "format", "index", "is_alnum", "is_alpha", "is_digit", "is_empty",
+    "is_lower", "is_space", "is_upper", "iter", "join", "len", "lower",
+    "lstrip", "pad_left", "pad_right", "repeat", "replace", "rfind", "rstrip",
+    "slice", "split", "splitlines", "starts_with", "strip", "title",
+    "to_float", "to_int", "to_str", "upper",
 };
 
+/* `clone`, `concat`, `find`, `fold` and `position` were advertised and have
+ * never existed. Each is a second name for something that does: `copy`,
+ * `extend` (and `a + b`), `index`/`filter`, `reduce`, `index`. `find` was the
+ * one worth not guessing -- predicate or value, index or element, throw or
+ * null -- and the two spellings that DO exist already cover both readings. */
 static const char *const kListMethodNames[] = {
-    "all", "any", "append", "at", "chunks", "clear", "clone", "concat",
-    "contains", "copy", "count", "drop", "enumerate", "extend", "filter",
-    "find", "first", "flatten", "fold", "index", "insert", "is_empty", "iter",
-    "join", "last", "len", "map", "max", "min", "pop", "position", "push",
-    "reduce", "remove", "reverse", "reversed", "set", "shuffle", "slice",
-    "sort", "sorted", "sum", "take", "to_list", "unique", "zip",
+    "all", "any", "at", "chunks", "clear", "contains",
+    "copy", "count", "enumerate", "extend", "filter", "first",
+    "flatten", "index", "insert", "is_empty", "iter", "join", "last",
+    "len", "map", "max", "min", "pop", "push", "reduce", "remove",
+    "reverse", "reversed", "set", "shuffle", "slice", "sort", "sorted", "sum",
+    "unique", "zip",
 };
 
 static const char *const kDictMethodNames[] = {
@@ -511,8 +523,8 @@ static const char *const kSetMethodNames[] = {
 };
 
 static const char *const kTupleMethodNames[] = {
-    "at", "contains", "count", "first", "get", "index", "is_empty", "iter",
-    "last", "len", "second", "slice", "to_list",
+    "at", "contains", "count", "get", "index", "is_empty", "iter", "len",
+    "to_list",
 };
 
 static const char *const kRangeMethodNames[] = {
@@ -544,10 +556,17 @@ static const char *const kModuleMethodNames[] = {
     "get", "has", "members", "name", "path",
 };
 
+/* The adapter surface deliberately lives in `lib/std/iter`, whose `iter(xs)`
+ * wrapper is what `.chunks(2).collect()` is a method of. The runtime `ObjIter`
+ * has only ever carried `collect`, `drop`, `iter`, `next` and `take`, and
+ * advertising eight adapters it has never had is the bug this table is being
+ * repaired for. `to_list` additionally duplicates `collect`, which is the name
+ * LANGUAGE.md uses. Anything wanted later belongs in `std.iter`, not here.
+ *
+ * `iter` goes the other way: it is implemented (builtins_seq.c) and works, and
+ * was missing from this list, so `dir()` hid it. */
 static const char *const kIterMethodNames[] = {
-    "all", "any", "chain", "collect", "count", "drop", "enumerate", "filter",
-    "find", "fold", "last", "map", "next", "nth", "peekable", "take",
-    "to_list", "zip",
+    "collect", "drop", "iter", "next", "take",
 };
 
 #define NAME_TABLE(table)                                                      \
@@ -605,3 +624,130 @@ ObjList *jaiBuiltinMethodNames(Value receiver) {
     jaiGCPopRoots(2);
     return names;
 }
+
+#ifdef JAI_DEBUG
+/* ------------------------------------------------------------------ */
+/* Debug-build self-check: advertised names vs. runtime dispatch        */
+/* ------------------------------------------------------------------ */
+
+/* The k*MethodNames[] tables above and the k*Methods[] dispatch tables
+ * scattered across src/runtime/builtins/ (four incompatible shapes: the
+ * JaiSeqMethod/JAI_METHOD tables the collections sources share, the bare
+ * JaiStrMethodEntry literals str and bytes use, builtins_math.c's file-local
+ * MethodEntry/METHOD_ENTRY for int and float, and the FILE_METHOD/
+ * MODULE_METHOD strcmp chains for file and module) are two hand-maintained
+ * lists of the same 12 receiver kinds' methods, kept in sync by nobody. They
+ * drifted: 46 names advertised here (list.is_empty, iter.map, str.slice,
+ * ...) type-checked and then raised AttributeError at a user's run time,
+ * because ./jaithon check never consults either table (see
+ * docs/agents/methods-single-source.md) and dir() -- the only real reader of
+ * these lists -- silently drops whatever candidatesFor() offers that
+ * lookupFor() refuses, so the gap was invisible short of trying every name.
+ *
+ * Unifying the four shapes into one generated table was rejected as too
+ * expensive for what this bug needs (see the doc above): four parsers for
+ * four incompatible C shapes, a new build step, and a decision on whether to
+ * commit generated output, to fix a problem this cheaper check also fixes.
+ * Instead: reuse the exact lookupFor/candidatesFor pair jaiBuiltinMethodNames
+ * uses to build dir()'s answer, but assert presence instead of silently
+ * filtering it. One representative, harmless instance per receiver kind
+ * (an empty list, a closed-handle file, ...) is enough, because every
+ * lookup* function decides presence by name and (for the few that check it)
+ * receiver *kind*, never by a receiver's contents.
+ *
+ * This runs once, at every debug-build startup -- before any user code, so
+ * drift aborts the process for the developer who introduced it, not for a
+ * user running a script months later. It costs nothing in a release build
+ * (this whole function is compiled out under NDEBUG, which JAI_DEBUG and
+ * RELEASE_CFLAGS never both define) and nothing meaningful in a debug one:
+ * a dozen small allocations and 218 table lookups (every advertised name,
+ * summed across all twelve receiver kinds), once, at startup. */
+static void assertMethodTablesInSync(void) {
+    ObjList *emptyList = jaiListNew(0);
+    jaiGCPushRoot(OBJ_VAL(emptyList));
+    ObjString *emptyStr = jaiStringInternC("");
+    jaiGCPushRoot(OBJ_VAL(emptyStr));
+    ObjBytes *emptyBytes = jaiBytesNew(NULL, 0);
+    jaiGCPushRoot(OBJ_VAL(emptyBytes));
+    ObjTuple *emptyTuple = jaiTupleNew(NULL, 0);
+    jaiGCPushRoot(OBJ_VAL(emptyTuple));
+    ObjDict *emptyDict = jaiDictNew();
+    jaiGCPushRoot(OBJ_VAL(emptyDict));
+    ObjSet *emptySet = jaiSetNew();
+    jaiGCPushRoot(OBJ_VAL(emptySet));
+    ObjRange *emptyRange = jaiRangeNew(0, 0, 1, false);
+    jaiGCPushRoot(OBJ_VAL(emptyRange));
+    /* A NULL handle is a real, closed-file state (see object.c's OBJ_FILE
+     * free case) -- no filesystem I/O happens here. */
+    ObjFile *dummyFile = jaiFileNew(NULL, NULL, "r");
+    jaiGCPushRoot(OBJ_VAL(dummyFile));
+    ObjIter *emptyIter = jaiIterNew(ITER_LIST, OBJ_VAL(emptyList));
+    jaiGCPushRoot(OBJ_VAL(emptyIter));
+    enum { kRootCount = 9 };
+
+    /* vm.builtins is live by the time jaiMethodTablesInit runs: jaiVMInit
+     * assigns it before calling jaiRegisterAllBuiltins (see vm.c). */
+    struct { const char *kind; Value receiver; } probes[] = {
+        {"int",    INT_VAL(0)},
+        {"float",  FLOAT_VAL(0.0)},
+        {"str",    OBJ_VAL(emptyStr)},
+        {"list",   OBJ_VAL(emptyList)},
+        {"dict",   OBJ_VAL(emptyDict)},
+        {"set",    OBJ_VAL(emptySet)},
+        {"tuple",  OBJ_VAL(emptyTuple)},
+        {"range",  OBJ_VAL(emptyRange)},
+        {"bytes",  OBJ_VAL(emptyBytes)},
+        {"file",   OBJ_VAL(dummyFile)},
+        {"module", OBJ_VAL(vm.builtins)},
+        {"iter",   OBJ_VAL(emptyIter)},
+    };
+
+    char report[4096];
+    size_t used = 0;
+    report[0] = '\0';
+    int missing = 0;
+
+    for (size_t p = 0; p < sizeof(probes) / sizeof(probes[0]); p++) {
+        Value receiver = probes[p].receiver;
+        MethodLookup lookup = lookupFor(receiver);
+        int count = 0;
+        const char *const *candidates = candidatesFor(receiver, &count);
+        if (lookup == NULL || candidates == NULL) continue;
+
+        for (int i = 0; i < count; i++) {
+            ObjString *name = jaiStringInternC(candidates[i]);
+            Value bound;
+            if (lookup(receiver, name, &bound)) continue;
+
+            missing++;
+            int n = snprintf(report + used, sizeof(report) - used, "%s%s.%s",
+                             used > 0 ? ", " : "", probes[p].kind,
+                             candidates[i]);
+            if (n > 0 && (size_t)n < sizeof(report) - used) {
+                used += (size_t)n;
+            } else {
+                used = sizeof(report) - 1;   /* stop appending; report is full */
+            }
+        }
+    }
+
+    jaiGCPopRoots(kRootCount);
+
+    if (missing > 0) {
+        /* Names the two ways out, because whoever trips this has just added
+         * one line to a table and will want to be told which they meant. */
+        JAI_PANIC("%d builtin method name%s advertised in k*MethodNames[] "
+                 "(builtins.c) %s no matching entry in the runtime dispatch "
+                 "table that dir() and method calls actually use, so "
+                 "`jaithon check` accepts a call to %s and `jaithon run` then "
+                 "raises AttributeError. Missing (kind.name): %s. Either "
+                 "implement %s in the matching k*Methods[] table, or drop the "
+                 "name from k*MethodNames[]. See "
+                 "docs/agents/methods-single-source.md.",
+                 missing, missing == 1 ? "" : "s",
+                 missing == 1 ? "has" : "have",
+                 missing == 1 ? "it" : "them", report,
+                 missing == 1 ? "it" : "them");
+    }
+}
+#endif /* JAI_DEBUG */

@@ -80,6 +80,11 @@ ObjIter *jaiIterNew(IterKind kind, Value source) {
                 it->limit = (int64_t)AS_STRING(source)->length;
             break;
 
+        case ITER_BYTES:
+            if (IS_BYTES(source))
+                it->limit = (int64_t)AS_BYTES(source)->length;
+            break;
+
         case ITER_DICT_KEYS:
         case ITER_DICT_ITEMS:
             if (IS_DICT(source)) {
@@ -202,6 +207,18 @@ bool jaiIterNext(ObjIter *it, Value *out) {
             if (index >= it->limit) return false;
 
             *out = AS_TUPLE(it->source)->items[index];
+            it->index = index + 1;
+            return true;
+        }
+
+        /* bytes has no mutator in its method table (kBytesMethods), so unlike
+         * ITER_LIST this needs no version snapshot -- there is nothing that
+         * could change out from under it between two next() calls. */
+        case ITER_BYTES: {
+            const int64_t index = it->index;
+            if (index >= it->limit) return false;
+
+            *out = INT_VAL(AS_BYTES(it->source)->data[index]);
             it->index = index + 1;
             return true;
         }
@@ -334,6 +351,10 @@ bool jaiGetIter(Value v, Value *out) {
 
             case OBJ_STRING:
                 *out = OBJ_VAL(jaiIterNew(ITER_STRING, v));
+                return true;
+
+            case OBJ_BYTES:
+                *out = OBJ_VAL(jaiIterNew(ITER_BYTES, v));
                 return true;
 
             case OBJ_DICT:

@@ -42,6 +42,7 @@
  * siblings.
  */
 
+#include "runtime/builtins/collections/builtins_seq.h"
 #include "runtime/builtins/text/builtins_str_methods.h"
 
 #include "vm/gc.h"
@@ -238,6 +239,20 @@ static bool strLen(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* A scalar count of zero implies a byte length of zero and back, so the byte
+ * length answers this without the UTF-8 scan jaiStringScalarCount would do. */
+static bool strIsEmpty(int argc, Value *args, Value *out) {
+    ObjString *s;
+    if (!strReceiver(argc, args, "is_empty", &s)) return false;
+    *out = BOOL_VAL(s->length == 0);
+    return true;
+}
+
+/* Forward-declared: defined below with the rest of the __prim__ surface, and
+ * bound into kStrMethods as `slice` unchanged -- str_slice already takes the
+ * receiver as args[0] the way a method call does. */
+static bool primStrSlice(int argc, Value *args, Value *out);
+
 /* ------------------------------------------------------------------ */
 /* Method table                                                         */
 /* ------------------------------------------------------------------ */
@@ -269,6 +284,9 @@ static const JaiStrMethodEntry kStrMethods[] = {
     {"is_space",    strIsSpace,      1,  1, NULL},
     {"is_upper",    strIsUpper,      1,  1, NULL},
     {"is_lower",    strIsLower,      1,  1, NULL},
+    {"is_empty",    strIsEmpty,      1,  1, NULL},
+    {"iter",        jaiSeqValueIter, 1,  1, NULL},
+    {"slice",       primStrSlice,    1,  4, NULL},
     {"pad_left",    strPadLeft,      2,  3, NULL},
     {"pad_right",   strPadRight,     2,  3, NULL},
     {"center",      strCenter,       2,  3, NULL},
@@ -437,16 +455,34 @@ bool jaiStrSliceBound(Value v, const char *name, int64_t fallback,
     return jaiArgInt(v, 1, name, out);
 }
 
+/* Every optional argument is read behind its own `argc` test, because this body
+ * now has TWO registrations with different minimum arities: `__prim__.str_slice`
+ * is registered (3, 4) and always supplies start and stop, while the `slice`
+ * METHOD is registered (1, 4) and need not. `callNativeAt` does not pad a
+ * missing optional -- it hands the native the raw stack window and a count -- so
+ * reading args[1] unconditionally read whatever the previous expression left
+ * behind, and `"hello".slice(1)` answered "e" instead of "ello" when a
+ * four-argument call happened to precede it.
+ *
+ * The siblings this was modelled on are already argc-aware for the same reason:
+ * listSlice's optIntArgAt and bytesSlice's jaiStrOptInt. This was the one that
+ * was not. Any native reused across two registrations has to be. */
 static bool primStrSlice(int argc, Value *args, Value *out) {
     ObjString *s;
-    if (!jaiArgString(args[0], 0, "str_slice", &s)) return false;
+    if (!jaiArgString(args[0], 0, "str.slice", &s)) return false;
     int64_t step = 1;
-    if (argc > 3 && !jaiStrSliceBound(args[3], "str_slice", 1, &step)) return false;
+    if (argc > 3 && !jaiStrSliceBound(args[3], "str.slice", 1, &step)) return false;
     int64_t defaultStart = (step < 0) ? INT64_MAX : 0;
     int64_t defaultStop  = (step < 0) ? INT64_MIN : INT64_MAX;
-    int64_t start, stop;
-    if (!jaiStrSliceBound(args[1], "str_slice", defaultStart, &start)) return false;
-    if (!jaiStrSliceBound(args[2], "str_slice", defaultStop, &stop)) return false;
+    int64_t start = defaultStart, stop = defaultStop;
+    if (argc > 1 &&
+        !jaiStrSliceBound(args[1], "str.slice", defaultStart, &start)) {
+        return false;
+    }
+    if (argc > 2 &&
+        !jaiStrSliceBound(args[2], "str.slice", defaultStop, &stop)) {
+        return false;
+    }
 
     ObjString *result = jaiStringSlice(s, start, stop, step);
     if (result == NULL) return false;

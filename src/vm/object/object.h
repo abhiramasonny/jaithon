@@ -891,8 +891,9 @@ bool       jaiModuleIsExported(ObjModule *m, ObjString *name);
  * ITER_TRAIT drives std.core's `trait Iterator`, whose `next` ends by returning
  * null. Both are user objects, and a class may implement either. */
 typedef enum {
-    ITER_LIST, ITER_TUPLE, ITER_STRING, ITER_DICT_KEYS, ITER_DICT_ITEMS,
-    ITER_SET, ITER_RANGE, ITER_USER, ITER_TRAIT, ITER_GENERATOR
+    ITER_LIST, ITER_TUPLE, ITER_STRING, ITER_BYTES, ITER_DICT_KEYS,
+    ITER_DICT_ITEMS, ITER_SET, ITER_RANGE, ITER_USER, ITER_TRAIT,
+    ITER_GENERATOR
 } IterKind;
 
 struct ObjIter {

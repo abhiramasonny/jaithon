@@ -2,6 +2,7 @@
 
 #include <math.h>
 
+#include "runtime/builtins/collections/builtins_seq.h"
 #include "runtime/builtins/text/builtins_str.h"
 #include "runtime/methods.h"
 #include "runtime/parallel.h"
@@ -61,6 +62,26 @@ static bool bytesLen(int argc, Value *args, Value *out) {
     ObjBytes *b;
     if (!bytesReceiver(argc, args, "len", &b)) return false;
     *out = INT_VAL((int64_t)b->length);
+    return true;
+}
+
+static bool bytesIsEmpty(int argc, Value *args, Value *out) {
+    ObjBytes *b;
+    if (!bytesReceiver(argc, args, "is_empty", &b)) return false;
+    *out = BOOL_VAL(b->length == 0);
+    return true;
+}
+
+/* Same bounds check and IndexError shape as tuple.at (builtins_seq.c) --
+ * both are jaiSeqIndexArg with the method's own name substituted in. Returns
+ * an int the way `b[i]` does (vm.c's indexGet on OBJ_BYTES). */
+static bool bytesAt(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjBytes *b;
+    if (!bytesReceiver(argc, args, "at", &b)) return false;
+    int at;
+    if (!jaiSeqIndexArg(args[1], 1, "bytes.at", (int)b->length, &at)) return false;
+    *out = INT_VAL(b->data[at]);
     return true;
 }
 
@@ -262,6 +283,14 @@ static bool bytesConcat(int argc, Value *args, Value *out) {
 
 static const JaiStrMethodEntry kBytesMethods[] = {
     {"len",         bytesLen,        1,  1, NULL},
+    {"is_empty",    bytesIsEmpty,    1,  1, NULL},
+    {"at",          bytesAt,         2,  2, NULL},
+    /* `get` is an alias of `at`, the same way tuple's pair are: the classifier
+     * asked whether it meant `at` or a default-on-miss like `dict.get`, and
+     * answering it the other way for bytes alone would leave one sequence
+     * type inconsistent with the rest. */
+    {"get",         bytesAt,         2,  2, NULL},
+    {"iter",        jaiSeqValueIter, 1,  1, NULL},
     {"decode",      bytesDecode,     1,  1, NULL},
     {"to_list",     bytesToList,     1,  1, NULL},
     {"hex",         bytesHex,        1,  1, NULL},

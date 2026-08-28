@@ -378,6 +378,27 @@ static bool tupleGet(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* Same bounds check and IndexError shape as tuple.get, just under the name
+ * the indexing operator's method form is meant to have -- see bytes.at
+ * (builtins_bytes.c), which matches this exactly for its own receiver. */
+static bool tupleAt(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjTuple *self;
+    if (!selfTuple(args, "tuple.at", &self)) return false;
+    int at;
+    if (!jaiSeqIndexArg(args[1], 1, "tuple.at", (int)self->count, &at)) return false;
+    *out = self->items[at];
+    return true;
+}
+
+static bool tupleIsEmpty(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjTuple *self;
+    if (!selfTuple(args, "tuple.is_empty", &self)) return false;
+    *out = BOOL_VAL(self->count == 0);
+    return true;
+}
+
 static bool tupleContains(int argc, Value *args, Value *out) {
     (void)argc;
 
@@ -485,6 +506,14 @@ static bool rangeLen(int argc, Value *args, Value *out) {
     ObjRange *self;
     if (!selfRange(args, "range.len", &self)) return false;
     *out = INT_VAL(jaiRangeLength(self));
+    return true;
+}
+
+static bool rangeIsEmpty(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjRange *self;
+    if (!selfRange(args, "range.is_empty", &self)) return false;
+    *out = BOOL_VAL(jaiRangeLength(self) == 0);
     return true;
 }
 
@@ -731,10 +760,12 @@ static bool iterCollect(int argc, Value *args, Value *out) {
 /* ------------------------------------------------------------------ */
 
 static const JaiSeqMethod kTupleMethods[] = {
+    JAI_METHOD("at",       tupleAt,       2, 2),
     JAI_METHOD("contains", tupleContains, 2, 2),
     JAI_METHOD("count",    tupleCount,    2, 2),
     JAI_METHOD("get",      tupleGet,      2, 2),
     JAI_METHOD("index",    tupleIndex,    2, 2),
+    JAI_METHOD("is_empty", tupleIsEmpty,  1, 1),
     JAI_METHOD("iter",     jaiSeqValueIter,     1, 1),
     JAI_METHOD("len",      tupleLen,      1, 1),
     JAI_METHOD("to_list",  tupleToList,   1, 1),
@@ -742,6 +773,7 @@ static const JaiSeqMethod kTupleMethods[] = {
 
 static const JaiSeqMethod kRangeMethods[] = {
     JAI_METHOD("contains", rangeContains, 2, 2),
+    JAI_METHOD("is_empty", rangeIsEmpty,  1, 1),
     JAI_METHOD("iter",     jaiSeqValueIter,     1, 1),
     JAI_METHOD("len",      rangeLen,      1, 1),
     JAI_METHOD("reversed", rangeReversed, 1, 1),
