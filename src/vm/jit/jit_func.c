@@ -81,7 +81,18 @@ static uintptr_t stackLimit(void) {
 /* Calling out of compiled code                                         */
 /* ------------------------------------------------------------------ */
 
-#define JIT_MAX_ARGS_OUT 4
+/* How many Values one call out of compiled code can carry. It bounds four
+ * things at once: a descriptor call's arguments, an invoke's (receiver + this
+ * minus one), an f-string's parts, and the fields a simple constructor stores.
+ *
+ * Was 4. The self-hosted compiler checking parser.jai stopped at
+ * "OP_INVOKE: 5 arguments, past the cap of 3" eighty times at ONE osr loop --
+ * a hot one -- and also wanted six and seven elsewhere; 8 covers every arity
+ * that corpus asks for. The price is 4 more Values (64 bytes) on the frame of
+ * every compiled body that calls out, which is stack, never touched beyond
+ * what is used, and leaves the frame under the 504 bytes that keep the cheap
+ * stp-pre prologue. */
+#define JIT_MAX_ARGS_OUT 8
 
 /* Values first in JitCallDesc so every field is 8-aligned and the emitted stores can use scaled forms. */
 typedef struct JitCallDesc {
