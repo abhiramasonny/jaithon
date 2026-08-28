@@ -16,6 +16,13 @@ from std.test import assert_eq, assert_throws
 
 let ROUNDS = 400
 
+#: Above JAI_JIT_THRESHOLD entries. The marker below names the FUNCTION tier,
+#: which compiles at a count of entries; a body merely looped over many times
+#: can only be caught by the OSR tier's 250us sampling timer, which a fast
+#: machine does not trip -- and that is why these markers had silently stopped
+#: holding.
+let WARM_CALLS = 200
+
 fn sum_codepoints(text: str, rounds: int) -> int {
     var total = 0
     var round = 0
@@ -48,6 +55,12 @@ fn count_digits(text: str, rounds: int) -> int {
 pub fn test_ascii_matches_the_interpreter() -> void {
     let text = "abc123"
     #: 97 + 98 + 99 + 49 + 50 + 51
+    var call = 0
+    while call < WARM_CALLS {
+        assert_eq(sum_codepoints(text, 1), 444)
+        assert_eq(count_digits(text, 1), 3)
+        call += 1
+    }
     assert_eq(sum_codepoints(text, ROUNDS), 444 * ROUNDS)
     assert_eq(count_digits(text, ROUNDS), 3 * ROUNDS)
 }

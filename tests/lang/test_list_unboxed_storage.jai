@@ -27,6 +27,13 @@ from std.test import assert_eq, assert_true
 
 let ROUNDS = 400
 
+#: Above JAI_JIT_THRESHOLD entries. The marker below names the FUNCTION tier,
+#: which compiles at a count of entries; a body merely looped over many times
+#: can only be caught by the OSR tier's 250us sampling timer, which a fast
+#: machine does not trip -- and that is why these markers had silently stopped
+#: holding.
+let WARM_CALLS = 200
+
 fn sum_ints(values: list[int], rounds: int) -> int {
     var total = 0
     var round = 0
@@ -85,10 +92,20 @@ pub fn test_unboxed_reads_survive_the_tier() -> void {
 
     var floats: list[float] = []
     for index in 0..64 { floats.push(index % 7 * 1.0) }
+    var fcall = 0
+    while fcall < WARM_CALLS {
+        assert_true(sum_floats(floats, 1) == 189.0)
+        fcall += 1
+    }
     assert_eq(sum_floats(floats, ROUNDS), 189.0 * ROUNDS)
 
     var flags: list[bool] = []
     for index in 0..64 { flags.push(index % 3 == 0) }
+    var bcall = 0
+    while bcall < WARM_CALLS {
+        assert_eq(count_flags(flags, 1), 22)
+        bcall += 1
+    }
     assert_eq(count_flags(flags, ROUNDS), 22 * ROUNDS)
 }
 

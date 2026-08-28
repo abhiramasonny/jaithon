@@ -42,6 +42,13 @@ from std.test import assert_eq, assert_near, assert_throws
 
 #: `any` rather than `int` because the whole point is that a value may widen the
 #: accumulator out from under the compiled kind.
+
+#: Above JAI_JIT_THRESHOLD entries. The marker names the FUNCTION tier, which
+#: compiles at a count of entries; a body merely looped over many times can only
+#: be caught by the OSR tier's 250us sampling timer, which a fast machine does
+#: not trip -- and that is why this marker had silently stopped holding.
+let WARM_CALLS = 200
+
 fn sum_values(d: dict) -> any {
     var acc = 0
     for (_k, v) in d.items() { acc += v }
@@ -293,11 +300,21 @@ fn many_keys(n: int) -> dict[str, int] {
 
 fn test_an_osr_entry_at_a_pair_head_binds_both_halves() -> void {
     let d = many_keys(400)
+    var call = 0
+    while call < WARM_CALLS {
+        assert_eq(one_call_sum(d, 1), "k399/79800")
+        call += 1
+    }
     assert_eq(one_call_sum(d, 3000), "k399/239400000")
 }
 
 fn test_an_osr_pair_loop_leaves_the_stack_where_it_found_it() -> void {
     let d = many_keys(60)
+    var call = 0
+    while call < WARM_CALLS {
+        assert_eq(nested(d, 1), 3132900)
+        call += 1
+    }
     assert_eq(nested(d, 300), 939870000)
 }
 

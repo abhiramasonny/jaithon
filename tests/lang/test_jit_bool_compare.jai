@@ -16,6 +16,9 @@ from std.test import assert_eq, assert_true
 
 let REPS = 60
 
+#: Above JAI_JIT_THRESHOLD entries.
+let WARM_CALLS = 200
+
 fn count_crossings(ys: list[float], py: float, rounds: int) -> int {
     var crossings = 0
     var r = 0
@@ -105,6 +108,15 @@ fn test_every_comparison_of_two_bools() -> void {
     #: eq 2, ne 2, lt 1, le 3, gt 1, ge 3.
     let wanted = [2, 2, 1, 3, 1, 3]
     assert_eq(count_matching_flags(1), wanted, "one round, cold")
+    #: Entered many times, not merely looped many times. The marker names the
+    #: FUNCTION tier, which compiles at a count of ENTRIES; a body reached only
+    #: by looping depends on the OSR tier's 250us sampling timer, which a fast
+    #: machine need not trip -- so the marker was passing or failing by luck.
+    var call = 0
+    while call < WARM_CALLS {
+        let _ = count_matching_flags(1)
+        call += 1
+    }
     let rounds = 40_000
     let counted = count_matching_flags(rounds)
     for index in 0..wanted.len() {

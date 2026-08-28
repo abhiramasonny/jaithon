@@ -215,15 +215,34 @@ def check_file(path, problems, oks):
     if missing:
         return   # running the file cannot answer for a function it lacks
 
-    stdout, stderr, code = run_target(path)
-    if code != 0:
-        problems.append(f"{rel(path)}: exited {code} running under "
-                         f"JAI_JIT_WHY=1 -- fix the test before its "
-                         f"compile coverage can be trusted\n"
-                         f"{indent(stdout)}{indent(stderr)}")
-        return
-
-    compiled, osr = collect_reached(stderr)
+    # Run more than once, and treat a marker as held if ANY run saw it.
+    #
+    # The OSR tier compiles on a 250us ITIMER_PROF sample, so whether it catches
+    # a given loop is a property of the machine that day, not of the code. A
+    # single run made this checker report a different function on each
+    # invocation -- three consecutive full runs gave "ok", then one_call_sum,
+    # then walk_the_chain -- which is a gate nobody can act on. "Stopped
+    # compiling" has to mean it stopped in EVERY run.
+    #
+    # A marker whose body is entered above JAI_JIT_THRESHOLD reaches the
+    # function tier by a count and is stable on the first run, so this costs
+    # nothing for the markers that are written well and rescues the rest.
+    attempts = int(os.environ.get("JIT_COMPILE_CHECK_RUNS", "3"))
+    compiled, osr = {}, set()
+    for attempt in range(max(1, attempts)):
+        stdout, stderr, code = run_target(path)
+        if code != 0:
+            problems.append(f"{rel(path)}: exited {code} running under "
+                             f"JAI_JIT_WHY=1 -- fix the test before its "
+                             f"compile coverage can be trusted\n"
+                             f"{indent(stdout)}{indent(stderr)}")
+            return
+        seen_compiled, seen_osr = collect_reached(stderr)
+        for name, arities in seen_compiled.items():
+            compiled.setdefault(name, set()).update(arities)
+        osr |= seen_osr
+        if all(n in osr or n in compiled for n in names):
+            break
     for n in names:
         want_arity = fns[n]
         if n in osr:

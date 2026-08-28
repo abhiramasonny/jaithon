@@ -25,6 +25,10 @@ from std.test import assert_eq, assert_throws
 
 let ROUNDS = 300
 
+#: Above JAI_JIT_THRESHOLD entries, so the bodies the marker names reach the
+#: compiled tier by a count rather than by a timer.
+let WARM_CALLS = 200
+
 fn build(count: int) -> list[int] {
     var values: list[int] = []
     for index in 0..count { values.push(index * 3 % 17) }
@@ -74,6 +78,13 @@ pub fn test_stencil_matches_the_long_way_round() -> void {
     for index in 1..63 {
         expected = expected + row[index] + row[index - 1] + row[index + 1]
     }
+    #: Entered WARM_CALLS times for the same reason as walk_forward below: the
+    #: marker names the function tier, and the function tier counts entries.
+    var call = 0
+    while call < WARM_CALLS {
+        assert_eq(stencil_sum(row, 64, 1), expected)
+        call += 1
+    }
     assert_eq(stencil_sum(row, 64, ROUNDS), expected * ROUNDS)
 }
 
@@ -83,6 +94,17 @@ pub fn test_a_range_past_the_end_still_raises() -> void {
     #: list of forty, and only then handed a range of sixty.
     var expected = 0
     for index in 0..40 { expected = expected + values[index] }
+    #: ENTERED many times, not merely looped many times. `walk_forward` is
+    #: called three times in this file, so only the OSR tier could ever compile
+    #: it -- and OSR fires on a 250us sampling timer, which twelve thousand fast
+    #: iterations do not trip on a quiet machine. The marker above therefore
+    #: asserted something timing-dependent and had silently stopped holding.
+    #: The function tier compiles at a COUNT of entries, so this is stable.
+    var call = 0
+    while call < WARM_CALLS {
+        assert_eq(walk_forward(values, 40, 1), expected)
+        call += 1
+    }
     assert_eq(walk_forward(values, 40, ROUNDS), expected * ROUNDS)
     assert_throws(IndexError, fn() {
         walk_forward(values, 60, 1)

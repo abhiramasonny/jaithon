@@ -24,6 +24,12 @@ from std.test import assert_eq, assert_true
 
 let ROUNDS = 300
 
+#: Above JAI_JIT_THRESHOLD entries. The marker names the FUNCTION tier, which
+#: compiles at a count of entries; a body merely looped over many times can only
+#: be caught by the OSR tier's 250us sampling timer, which a fast machine does
+#: not trip -- and that is why this marker had silently stopped holding.
+let WARM_CALLS = 200
+
 trait Shape {
     fn area(self, n: int) -> int
 }
@@ -257,6 +263,12 @@ pub fn test_a_float_return_lands_in_the_right_bank() -> void {
     while round < ROUNDS {
         expect = expect + float(round) * (10.0 * 0.5 + 10.0 * 0.25)
         round += 1
+    }
+    var call = 0
+    let one = 10.0 * 0.5 + 10.0 * 0.25
+    while call < WARM_CALLS {
+        assert_true(sum_reals(reals, 1) == 0.0 * one)
+        call += 1
     }
     assert_eq(sum_reals(reals, ROUNDS), expect)
 }
