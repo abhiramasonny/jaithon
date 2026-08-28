@@ -550,6 +550,10 @@ typedef struct {
      * deoptimises on a miss, so this only chooses which guard to emit. That is
      * why it survives a branch merge and is not listed in clearStackProofs --
      * see the contrast drawn at stackAscii below. */
+    /* See emitUnarmedDeopt: the opcode and offset the walk stopped at, so the
+     * fixup pass can name the cause and not just the symptom. */
+    uint8_t   unarmedOp;
+    uint32_t  unarmedAt;
     uint8_t   stackObjType[JIT_MAX_STACK];
     /* An exemplar of what THIS list entry's elements are, for a list the body
      * built itself and so has no live sample of. `OP_BUILD_LIST` knows the kind
@@ -5631,6 +5635,16 @@ static const NativeResult kNativeResults[] = {
  * measurements go wrong -- each switch invalidates __jaicache__, and three
  * people measuring one change tonight two-binary got 3.9x, 100x and 6%
  * SLOWER for what a switch settled in one command. */
+/* JAITHON_JIT_NEGATE=0 turns off the OP_NEG arm, for a one-binary A/B. */
+static bool jitNegate(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_NEGATE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* JAITHON_JIT_LIST_RESULT=0 turns off the predicted result for a list method
  * that is neither a field read nor discarded, for a one-binary A/B. */
 static bool jitListResult(void) {
@@ -6171,6 +6185,13 @@ static bool skipResumeOk(const Emit *e, uint32_t at) {
 }
 
 static bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop) {
+    /* Remembered for the fixup pass. When this stops the walk before a forward
+     * branch's target, that branch cannot be resolved and the error reported is
+     * "a branch to an offset this walk never emitted" -- which names the
+     * SYMPTOM. The opcode that actually stopped the walk is the cause, and
+     * without it the reader has a bytecode offset and no idea why. */
+    e->unarmedOp = e->lastOp;
+    e->unarmedAt = e->curOffset;
     if (e->inlining) {
         /* Half an inlined body cannot be taken back, and the caller reads the
          * result out of the model -- past a deopt there is none. */
@@ -8834,6 +8855,67 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             e->wroteHeap = true;
             off += 3;
             break;
+        }
+
+        case OP_NEG: {
+            /* `-x`. There was no arm at all, for either kind: OP_NEG appeared
+             * only in inlinableBody's whitelist, so in an ordinary body it fell
+             * to `default` and ENDED THE WALK -- everything after a negation
+             * ran interpreted. `-(i & 255)` in a loop was 28,394,773
+             * interpreted instructions and the float form 18,034,610.
+             *
+             * It hid because emitUnarmedDeopt is silent by design (the point of
+             * it is to interpret from here rather than decline the body), so
+             * nothing was ever printed. What surfaced it was a DIFFERENT
+             * message: `is_inf`'s `x == INF or x == -INF` records a forward
+             * branch to its OP_RETURN before reaching the negation, and once
+             * the walk stops that branch has nowhere to land. The fixup pass
+             * now names the opcode that ended the walk, which is how a
+             * confusing "branch to offset 25" became "OP_NEG at 23". Every
+             * guarded function in std.math goes through `_require_finite` and
+             * so through `is_inf`. */
+            if (!jitNegate()) {
+                return subWhy(e, "the negate arm is switched off");
+            }
+            if (e->depth < 1) return subWhy(e, "nothing to negate");
+            SlotKind nk = e->stack[e->depth - 1];
+            if (nk == SLOT_INT) {
+                /* `subs` off zero both negates and reports the one input that
+                 * cannot be: INT64_MIN overflows, and the interpreter raises
+                 * the OverflowError on re-entry.
+                 *
+                 * Into a SCRATCH first, and moved only once the guard has
+                 * passed -- the same discipline the `abs` arm states, and the
+                 * reason is this instruction resumes at its own START. Writing
+                 * the operand's register before the guard hands the deopt
+                 * record a value that has ALREADY been negated, and the
+                 * interpreter negates it again: `neg_int(5)` returned 5.
+                 * Only JAITHON_JIT_DEOPT_STRESS=1 finds it, because in
+                 * ordinary running the guard fires only on INT64_MIN, which is
+                 * its own negation and so hides the mistake. */
+                unsigned nr = pushReg(e) - 1;
+                emit(e, jaiA64SubsX(JIT_SCRATCH_A, JAI_A64_XZR, nr));
+                branchOnDeoptInstStart(e, JAI_A64_VS);
+                emit(e, jaiA64MovX(nr, JIT_SCRATCH_A));
+                off += 1;
+                break;
+            }
+            if (nk == SLOT_FLOAT) {
+                /* Straight in the bank. IEEE negation is the sign bit and
+                 * cannot fail, so there is no guard and nothing to raise --
+                 * -0.0 and NaN both come out of `fneg` the way the interpreter
+                 * produces them. */
+                unsigned nd = fpOperand(e, e->valueDepth - 1);
+                unsigned drop;
+                if (!popValueRaw(e, &drop, NULL)) return false;
+                if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
+                unsigned nidx = e->valueDepth - 1;
+                emit(e, jaiA64FnegD(fpRegAt(e, nidx), nd));
+                fpClaim(e, nidx);
+                off += 1;
+                break;
+            }
+            return subWhy(e, "negating a %s", slotKindName(nk));
         }
 
         case OP_POW: {
@@ -12420,6 +12502,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     /* A self-call cannot reproduce slot 0: no register holds the callee. A
      * body that both recurses and reads slot 0 is not compiled. */
     if (body.usesSlot0 && body.hasSelfCall) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: a body that both recurses and reads slot 0\n",
+                    fn->name ? fn->name->chars : "<anon>");
+        }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
@@ -12586,6 +12672,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     e.chunkDepth = chunkDepth;
     e.chunkDepthCount = fn->chunk.count + 1;
     if (!seedLocals(&e, slotBase)) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: its locals could not be seeded on the real pass\n",
+                    fn->name ? fn->name->chars : "<anon>");
+        }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
@@ -12899,11 +12989,36 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             target = 0;
         } else {
             if (f->targetOffset > (uint32_t)fn->chunk.count) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s stopped: a branch target past the end of the chunk\n",
+                            fn->name ? fn->name->chars : "<anon>");
+                }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
             target = map[f->targetOffset];
             if (target < 0) {
+                if (getenv("JAI_JIT_WHY")) {
+                    if (e.unarmedOp != 0) {
+                        fprintf(stderr, "[jit] %s stopped: %s at %u ended the "
+                                "walk, so the branch to offset %u (%s) has "
+                                "nowhere to land\n",
+                                fn->name ? fn->name->chars : "<anon>",
+                                jaiOpName((OpCode)e.unarmedOp), e.unarmedAt,
+                                f->targetOffset,
+                                f->targetOffset < (uint32_t)fn->chunk.count
+                                    ? jaiOpName((OpCode)fn->chunk.code[f->targetOffset])
+                                    : "past the end");
+                    } else {
+                        fprintf(stderr, "[jit] %s stopped: a branch to offset "
+                                "%u, which this walk never emitted (%s)\n",
+                                fn->name ? fn->name->chars : "<anon>",
+                                f->targetOffset,
+                                f->targetOffset < (uint32_t)fn->chunk.count
+                                    ? jaiOpName((OpCode)fn->chunk.code[f->targetOffset])
+                                    : "past the end");
+                    }
+                }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
