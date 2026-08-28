@@ -208,6 +208,14 @@ int main(int argc, char **argv)
 
     vm.debugTrace = opts.traceExec;
     vm.countInstructions = opts.traceExec || opts.showStats;
+    /* Env rather than a flag, because it is a diagnostic for whoever is reading
+     * the tier and not part of the CLI's contract. It only does anything when
+     * the counter above is already on, so `--stats` is the gate. */
+    {
+        const char *attrib = getenv("JAI_JIT_ATTRIB");
+        vm.attributeInstructions = vm.countInstructions && attrib != NULL &&
+                                   attrib[0] != '\0' && attrib[0] != '0';
+    }
     vm.gcStress = opts.gcStress;
     vm.gcStressEvery = opts.gcStressEvery;
     vm.releaseMode = opts.run.codegen.stripAsserts;

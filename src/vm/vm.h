@@ -80,6 +80,16 @@ typedef struct VM {
      * the dispatch macro cost 1-3% of every benchmark, so it's only kept when
      * something will read it (--stats, --trace-exec). */
     bool         countInstructions;
+    /* Attribute each interpreted instruction to the function running it, so a
+     * census can be ranked by where the work IS rather than by how often a
+     * refusal was printed. Only ever read under countInstructions, and set from
+     * JAI_JIT_ATTRIB=1, so it costs one predictable branch on a path that is
+     * already off in every build that matters.
+     *
+     * It exists because ranking by refusal frequency is not ranking by cost:
+     * 168 refusals in one census were all once-per-process kernel setup and
+     * were worth nothing, while eighty retries of one loop were worth 15x. */
+    bool         attributeInstructions;
     bool         debugGC;
     bool         gcStress;
     unsigned     gcStressEvery;   /* see GCState::stressEvery */
@@ -88,6 +98,11 @@ typedef struct VM {
 
     /* Statistics */
     uint64_t     instructionCount;
+    /* Functions that have run at least one interpreted instruction, in first-
+     * touch order. Registered from the dispatch path, so the list is the
+     * working set and not the whole program. */
+    struct ObjFunction **attributed;
+    unsigned     attributedCount, attributedCap;
     uint64_t     callCount;
     uint64_t     allocCount;
     uint64_t     icHits, icMisses;

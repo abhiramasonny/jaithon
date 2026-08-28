@@ -3681,12 +3681,44 @@ JAI_INLINE PairStep iterStepPairFast(ObjIter *it, Value *a, Value *b) {
     do {                                                                       \
         if (JAI_UNLIKELY(countInsts)) {                                        \
             vm.instructionCount++;                                             \
+            if (JAI_UNLIKELY(vm.attributeInstructions)) {                      \
+                attributeInstruction(frame);                                   \
+            }                                                                  \
             if (vm.debugTrace) {                                               \
                 vm.stackTop = stackTop;                                        \
                 traceInstruction(frame, ip);                                   \
             }                                                                  \
         }                                                                      \
     } while (0)
+
+/* Charge one interpreted instruction to the function whose frame is running.
+ *
+ * Exact rather than sampled: `sum(fn->interpCount) == vm.instructionCount` is
+ * the invariant, and scripts/jit_report.py leans on it, so a frame shape this
+ * misses would show up as a shortfall rather than as a quietly wrong ranking.
+ *
+ * The first-touch list is what makes the dump possible at all -- there is no
+ * global registry of ObjFunctions, and walking the GC heap for one would be a
+ * much larger hammer than this needs. */
+static void attributeInstruction(CallFrame *frame) {
+    if (frame == NULL || frame->closure == NULL) return;
+    ObjFunction *fn = frame->closure->fn;
+    if (fn == NULL) return;
+    if (fn->interpCount == 0) {
+        if (vm.attributedCount == vm.attributedCap) {
+            unsigned grown = vm.attributedCap < 64 ? 64 : vm.attributedCap * 2;
+            ObjFunction **wider = (ObjFunction **)realloc(
+                vm.attributed, grown * sizeof *wider);
+            /* Out of room simply stops registering: the counts stay exact for
+             * everything already listed, and the dump says so. */
+            if (wider == NULL) { fn->interpCount++; return; }
+            vm.attributed = wider;
+            vm.attributedCap = grown;
+        }
+        vm.attributed[vm.attributedCount++] = fn;
+    }
+    fn->interpCount++;
+}
 
 static void traceInstruction(CallFrame *frame, const uint8_t *ip) {
     jaiVMPrintStack(stdout);
@@ -7045,6 +7077,40 @@ void jaiVMPrintStats(FILE *out) {
 #ifdef JAI_ALLOC_CENSUS
     jaiAllocPrintCensus(out);
 #endif
+    if (vm.attributeInstructions && vm.attributedCount > 0) {
+        /* Sorted here rather than in the reader, because the reader would have
+         * to parse it back; and reported with the SHORTFALL, because the whole
+         * value of this table is that it can be summed. A frame shape the
+         * dispatch path misses shows up as a gap rather than as a ranking that
+         * is quietly wrong. */
+        unsigned n = vm.attributedCount;
+        for (unsigned i = 1; i < n; i++) {
+            ObjFunction *key = vm.attributed[i];
+            unsigned j = i;
+            while (j > 0 && vm.attributed[j - 1]->interpCount < key->interpCount) {
+                vm.attributed[j] = vm.attributed[j - 1];
+                j--;
+            }
+            vm.attributed[j] = key;
+        }
+        uint64_t summed = 0;
+        for (unsigned i = 0; i < n; i++) summed += vm.attributed[i]->interpCount;
+        for (unsigned i = 0; i < n; i++) {
+            ObjFunction *fn = vm.attributed[i];
+            if (fn->interpCount == 0) continue;
+            fprintf(out, "attrib %-40s %12" PRIu64 "  %6.2f%%\n",
+                    fn->name != NULL ? fn->name->chars : "<anon>",
+                    fn->interpCount,
+                    vm.instructionCount > 0
+                        ? 100.0 * (double)fn->interpCount
+                              / (double)vm.instructionCount
+                        : 0.0);
+        }
+        fprintf(out, "attrib-total %" PRIu64 " of %" PRIu64 " (%" PRIu64
+                     " unattributed)\n",
+                summed, vm.instructionCount,
+                vm.instructionCount > summed ? vm.instructionCount - summed : 0);
+    }
     fprintf(out, "vm: %" PRIu64 " instructions, %" PRIu64 " calls, %" PRIu64
                  " allocations\n",
             vm.instructionCount, vm.callCount, vm.allocCount);

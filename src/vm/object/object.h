@@ -540,6 +540,10 @@ struct ObjFunction {
      * The entry guard re-checks every one on every call. */
     uint8_t     jitParamKind[8];
     uint32_t    jitParamShape[8];
+    /* Interpreted instructions executed in THIS function's frames. Written only
+     * under VM::attributeInstructions; see its note for why counting is not the
+     * same as ranking. */
+    uint64_t    interpCount;
     uint8_t     jitReturnKind;
     /* Whether the compile that wrote `jitReturnKind` actually REACHED an
      * OP_RETURN. It is stored unconditionally at the end of a compile, so a

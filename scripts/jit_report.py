@@ -62,6 +62,9 @@ PARTIAL = re.compile(
 )
 #: `[jit] <fn> declined at OP_X` -- the default case's own message.
 DECLINED_AT = re.compile(r"^\[jit\] (\S+) declined at (OP_\w+)$")
+#: `attrib <fn> <count> <pct>%` from --stats with JAI_JIT_ATTRIB=1.
+ATTRIB = re.compile(r"^attrib (\S+)\s+(\d+)\s+([\d.]+)%$")
+ATTRIB_TOTAL = re.compile(r"^attrib-total (\d+) of (\d+) \((\d+) unattributed\)$")
 
 OPCODE = re.compile(r"^(OP_\w+)(?::\s*(.*))?$")
 
@@ -91,9 +94,23 @@ class Report:
         self.attempts: collections.Counter = collections.Counter()
         self.opcode_attempts: collections.Counter = collections.Counter()
         self.partial_attempts: collections.Counter = collections.Counter()
+        #: fn -> interpreted instructions executed in its frames. Exact when
+        #: present: the VM asserts sum(attrib) == instructionCount.
+        self.attrib: dict[str, int] = {}
+        self.attrib_total = 0
+        self.attrib_unattributed = 0
         self.lines = 0
 
     def feed(self, line: str) -> None:
+        m = ATTRIB.match(line)
+        if m:
+            self.attrib[m.group(1)] = int(m.group(2))
+            return
+        m = ATTRIB_TOTAL.match(line)
+        if m:
+            self.attrib_total = int(m.group(2))
+            self.attrib_unattributed = int(m.group(3))
+            return
         if not line.startswith("[jit] "):
             return
         self.lines += 1
@@ -185,7 +202,7 @@ def main() -> int:
     if passthrough:
         command = passthrough
     elif args.file:
-        command = [args.jaithon, args.mode]
+        command = [args.jaithon, args.mode, "--stats"]
         if args.mode == "check":
             command.append("--no-cache")
         command.append(args.file)
@@ -194,11 +211,19 @@ def main() -> int:
 
     env = os.environ.copy()
     env["JAI_JIT_WHY"] = "1"
+    #: The attribution table is what turns "which refusal is printed most" into
+    #: "where the interpreted work actually is", and those are different
+    #: rankings. It costs a branch per instruction and only works alongside
+    #: --stats, which is why both are set here and neither is on by default.
+    env["JAI_JIT_ATTRIB"] = "1"
     done = subprocess.run(command, cwd=ROOT, env=env,
                           capture_output=True, text=True)
 
     report = Report()
     for line in done.stderr.splitlines():
+        report.feed(line)
+    #: --stats writes to stdout and JAI_JIT_WHY to stderr.
+    for line in done.stdout.splitlines():
         report.feed(line)
 
     if report.lines == 0:
@@ -218,6 +243,32 @@ def main() -> int:
     print(f"  {len(report.osr):>6}  loops compiled (OSR)")
     print(f"  {len(partial):>6}  bodies compiled only up to a point")
     print(f"  {len(declined):>6}  bodies not compiled at all")
+
+    if report.attrib:
+        print()
+        print(f"{BOLD}where the interpreted work is{RESET}")
+        print(f"{DIM}exact, not sampled -- the VM asserts these sum to the "
+              f"instruction count\n({report.attrib_unattributed} unattributed). "
+              f"This is the ranking that matters: a refusal\nprinted a hundred "
+              f"times in code that runs once is worth nothing.{RESET}")
+        ranked = sorted(report.attrib.items(), key=lambda kv: -kv[1])
+        for fn, count in ranked[:args.limit]:
+            share = (100.0 * count / report.attrib_total
+                     if report.attrib_total else 0.0)
+            if fn in report.partial:
+                op, at = report.partial[fn]
+                verdict = f"partial, stops at {op}@{at}"
+            elif fn in reached:
+                verdict = "compiled"
+            elif fn in report.stopped:
+                verdict = report.stopped[fn]
+            else:
+                verdict = "never considered"
+            print(f"  {count:>12}  {share:>5.1f}%  {fn:<28} {verdict}")
+        if len(ranked) > args.limit:
+            rest = sum(c for _, c in ranked[args.limit:])
+            print(f"{DIM}  {rest:>12}  {100.0 * rest / report.attrib_total:>5.1f}%"
+                  f"  in {len(ranked) - args.limit} further functions{RESET}")
 
     table(
         "why a body was not compiled",
