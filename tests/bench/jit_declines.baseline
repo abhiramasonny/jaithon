@@ -1,6 +1,7 @@
 _fit_fused_async at 421 stopped: more than 8 instance slots to pin
 connected_components at 776 stopped: more than 8 instance slots to pin
 connected_components at 836 stopped: more than 8 instance slots to pin
+main at 2176 stopped: more than 16 instance slots to pin
 stopped : OP_BUILD_LIST
 stopped : OP_CALL
 stopped : OP_DIV
@@ -46,6 +47,7 @@ stopped : OP_INVOKE: `Dtype.is_dictionary` is not a builtin of the observed rece
 stopped : OP_INVOKE: `Dtype.is_numeric` is not a builtin of the observed receiver's type
 stopped : OP_INVOKE: `Dtype.is_wide` is not a builtin of the observed receiver's type
 stopped : OP_INVOKE: `dict.get` has no usable result kind (mixed)
+stopped : OP_INVOKE: `list.enumerate` has no usable result kind (never observed)
 stopped : OP_INVOKE: a module member that has not compiled
 stopped : OP_INVOKE: a receiver of kind class
 stopped : OP_INVOKE: a receiver of kind int
@@ -68,11 +70,13 @@ stopped : iterating something other than a list or range
 stopped : pushing a kind the tier cannot store
 stopped : the operand model disagrees with the bytecode
 stopped : too many roots
+stopped: OP_ADD
 stopped: OP_CALL
 stopped: OP_FOR_ITER_BIND: loop variable in local 6 has kind instance, not instance
 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 4 and 2) have kinds object and instance
 stopped: OP_FOR_RANGE_BIND: loop variable in local 19 has kind float, not int
 stopped: OP_GET_FIELD
+stopped: OP_GET_FIELD_LOCAL: no live receiver to read local 17's field off
 stopped: OP_GET_INDEX: the container has kind instance, not list
 stopped: OP_GET_INDEX: the container has kind object, not list
 stopped: OP_INVOKE
@@ -88,6 +92,7 @@ stopped: a local of no known kind
 stopped: a local was given two different kinds
 stopped: a return inside an OSR loop
 stopped: a type guard the kinds cannot settle
+stopped: an `is` against something other than null
 stopped: an append reaching past the model
 stopped: an exponent other than 0.5
 stopped: an indirect callee compiled against an older module
