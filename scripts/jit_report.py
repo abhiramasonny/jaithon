@@ -296,6 +296,32 @@ def main() -> int:
             print(f"{DIM}  {rest:>12}  {100.0 * rest / report.attrib_total:>5.1f}%"
                   f"  in {len(ranked) - args.limit} further functions{RESET}")
 
+    #: The ranking that actually picks work: each reason weighted by the
+    #: interpreted work sitting behind it. Attempts is a proxy for hotness and a
+    #: good one, but this is the thing itself -- and the two disagree. A reason
+    #: printed a hundred times in code that runs once per process scores near
+    #: zero here and near the top there.
+    if report.attrib and report.attrib_total:
+        weighted: collections.Counter = collections.Counter()
+        for fn, count in report.attrib.items():
+            reason = None
+            if fn in report.partial:
+                op, _at = report.partial[fn]
+                reason = f"(partial) {op}"
+            elif fn not in reached and fn in report.stopped:
+                reason = report.stopped[fn]
+            if reason is not None:
+                weighted[reason] += count
+        if weighted:
+            print()
+            print(f"{BOLD}what it would be worth clearing{RESET}")
+            print(f"{DIM}each reason weighted by the interpreted work behind it, "
+                  f"not by how often\nit was printed. This is the ranking that "
+                  f"picks work; attempts is a proxy for it.{RESET}")
+            for reason, count in weighted.most_common(args.limit):
+                share = 100.0 * count / report.attrib_total
+                print(f"  {share:>5.1f}%  {count:>12}  {reason}")
+
     table(
         "why a body was not compiled",
         [(n, r) for r, n in report.attempts.most_common()],

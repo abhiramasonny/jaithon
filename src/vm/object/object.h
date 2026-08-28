@@ -706,6 +706,21 @@ typedef enum {
     FIELD_KIND_LIST     = 5,
     FIELD_KIND_DICT     = 6,
     FIELD_KIND_INSTANCE = 7,
+    /* Declared with a USER type name -- a class, an enum, a trait, or an alias
+     * for one. Everything the language can put behind such a name is a heap
+     * object, which is all this claims and all the tier assumes.
+     *
+     * It is a HINT and not a contract: jaiKindAccepts deliberately accepts
+     * everything for it, because tightening a run-time check that has always
+     * passed would reject code that works today -- the same reason
+     * FIELD_KIND_FLOAT accepts an int. The compiled tier is the only reader,
+     * and it GUARDS the tag, so a field that turns out to hold an int or a null
+     * deoptimises rather than misbehaving.
+     *
+     * Worth having because a field the tier cannot classify is a whole-body
+     * decline: 8 bodies and 4.5-4.9% of the interpreted work in each of
+     * lexer.jai, parser.jai and resolve.jai, measured by exact attribution. */
+    FIELD_KIND_DECLARED = 8,
 } FieldKind;
 
 /* "any", "int", … -- for diagnostics and for the disassembler. */

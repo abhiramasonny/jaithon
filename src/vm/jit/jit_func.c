@@ -3876,6 +3876,14 @@ static bool declaredScalarFieldKind(uint32_t typeId, SlotKind *k, unsigned *tag)
      * it -- `.len()`, `==` on interned pointers, the ordering leaf call -- all
      * of which ask `stringOperand`, which asks the sample and not the kind. */
     case FIELD_KIND_STR:   *k = SLOT_OBJ;   *tag = VAL_OBJ;   return true;
+    /* A user type name. VAL_OBJ is exactly what it promises and exactly what
+     * the tag guard proves, so no second guard is wanted -- unlike the list and
+     * str rows above, this one does not claim a particular ObjType.
+     *
+     * A field holding NULL deopts here, which is the honest cost: a field
+     * declared `Foo` is null only before its init assigns it, and a field never
+     * assigned at all would deopt on every read rather than answer wrongly. */
+    case FIELD_KIND_DECLARED: *k = SLOT_OBJ; *tag = VAL_OBJ;   return true;
     default: return false;
     }
 }

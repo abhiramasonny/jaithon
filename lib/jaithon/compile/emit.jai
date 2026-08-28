@@ -2900,7 +2900,16 @@ fn _field_kind_code(declared: TypeExpr?, type_params: list[str]) -> int {
         if n == "list" { return 5 }
         if n == "dict" { return 6 }
         if n == "any" { return 0 }
-        return 0
+        #: A user type name -- a class, an enum, a trait, or an alias for one.
+        #: Everything the language can put behind such a name is a heap object,
+        #: which is all code 8 claims. It is a hint for the compiled tier, which
+        #: guards it; the run-time check accepts everything for it, because
+        #: tightening a check that has always passed would reject code that
+        #: works today.
+        #:
+        #: A TYPE PARAMETER is excluded above and must stay excluded: `T` can be
+        #: an int.
+        return 8
     }
 
     if t.kind == TypeKind.Generic {

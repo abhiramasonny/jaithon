@@ -271,6 +271,9 @@ bool jaiKindAccepts(uint32_t kind, Value v) {
     case FIELD_KIND_LIST:     return IS_LIST(v);
     case FIELD_KIND_DICT:     return IS_DICT(v);
     case FIELD_KIND_INSTANCE: return IS_INSTANCE(v) || IS_NULL(v);
+    /* Deliberately accepts everything; see its note in object.h. It exists to
+     * tell the compiled tier what to guard, not to add a rejection here. */
+    case FIELD_KIND_DECLARED: return true;
     }
     return true;
 }
@@ -296,6 +299,8 @@ const char *jaiFieldKindName(uint32_t kind) {
     case FIELD_KIND_LIST:     return "list";
     case FIELD_KIND_DICT:     return "dict";
     case FIELD_KIND_INSTANCE: return "instance";
+    /* Names itself "any" because that is what it enforces. */
+    case FIELD_KIND_DECLARED:
     case FIELD_KIND_ANY:      break;
     }
     /* An unrecognised code is a newer encoding read by an older binary, and
