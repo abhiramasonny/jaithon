@@ -56,7 +56,9 @@ class JfkOuter {
 fn jfk_inner_of(o: JfkOuter) -> JfkInner { return o.inner }
 
 fn jfk_read_line(o: JfkOuter) -> int { return jfk_inner_of(o).line }
+
 fn jfk_read_scale(o: JfkOuter) -> float { return jfk_inner_of(o).scale }
+
 fn jfk_read_ready(o: JfkOuter) -> bool { return jfk_inner_of(o).ready }
 
 #: Settles jfk_inner_of into its own standalone compiled form, called from

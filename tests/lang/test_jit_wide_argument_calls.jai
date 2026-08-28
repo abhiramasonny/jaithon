@@ -18,12 +18,14 @@ let CALLS = 100
 
 class Acc {
     var total: int
+
     fn init(self) -> void { self.total = 0 }
+
     pub fn add5(self, a: int, b: int, c: int, d: int, e: int) -> int {
         return a + b + c + d + e
     }
-    pub fn add7(self, a: int, b: int, c: int, d: int, e: int, f: int,
-                g: int) -> int {
+
+    pub fn add7(self, a: int, b: int, c: int, d: int, e: int, f: int, g: int) -> int {
         return a + b + c + d + e + f + g
     }
 }
@@ -36,6 +38,7 @@ class Wide {
     var c: int
     var d: int
     var e: int
+
     fn init(self, a: int, b: int, c: int, d: int, e: int) -> void {
         self.a = a
         self.b = b
@@ -43,6 +46,7 @@ class Wide {
         self.d = d
         self.e = e
     }
+
     pub fn sum(self) -> int { return self.a + self.b + self.c + self.d + self.e }
 }
 

@@ -23,6 +23,7 @@ let CALLS = 100
 
 class Point {
     var x: int
+
     fn init(self, x: int) -> void { self.x = x }
 }
 

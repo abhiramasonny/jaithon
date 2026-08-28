@@ -36,12 +36,43 @@ from std.test import assert_len, assert_true
 #: other five (at, code_at, encode, lines, reversed) are simply gone from the
 #: advertised list.
 let STR_ADVERTISED = [
-    "capitalize", "center", "chars", "contains", "count", "ends_with", "find",
-    "format", "index", "is_alnum", "is_alpha", "is_digit", "is_empty",
-    "is_lower", "is_space", "is_upper", "iter", "join", "len", "lower",
-    "lstrip", "pad_left", "pad_right", "repeat", "replace", "rfind", "rstrip",
-    "slice", "split", "splitlines", "starts_with", "strip", "title",
-    "to_float", "to_int", "to_str", "upper",
+    "capitalize",
+    "center",
+    "chars",
+    "contains",
+    "count",
+    "ends_with",
+    "find",
+    "format",
+    "index",
+    "is_alnum",
+    "is_alpha",
+    "is_digit",
+    "is_empty",
+    "is_lower",
+    "is_space",
+    "is_upper",
+    "iter",
+    "join",
+    "len",
+    "lower",
+    "lstrip",
+    "pad_left",
+    "pad_right",
+    "repeat",
+    "replace",
+    "rfind",
+    "rstrip",
+    "slice",
+    "split",
+    "splitlines",
+    "starts_with",
+    "strip",
+    "title",
+    "to_float",
+    "to_int",
+    "to_str",
+    "upper",
 ]
 let STR_UNCERTAIN: list[str] = []
 
@@ -51,12 +82,43 @@ let STR_UNCERTAIN: list[str] = []
 #: from the advertised list, each a second name for something that exists.
 #: Nothing is UNCERTAIN any more -- every gap got a ruling.
 let LIST_ADVERTISED = [
-    "all", "any", "at", "chunks", "clear", "contains",
-    "copy", "count", "enumerate", "extend", "filter", "first",
-    "flatten", "index", "insert", "is_empty", "iter", "join", "last",
-    "len", "map", "max", "min", "pop", "push", "reduce", "remove",
-    "reverse", "reversed", "set", "shuffle", "slice", "sort", "sorted", "sum",
-    "unique", "zip",
+    "all",
+    "any",
+    "at",
+    "chunks",
+    "clear",
+    "contains",
+    "copy",
+    "count",
+    "enumerate",
+    "extend",
+    "filter",
+    "first",
+    "flatten",
+    "index",
+    "insert",
+    "is_empty",
+    "iter",
+    "join",
+    "last",
+    "len",
+    "map",
+    "max",
+    "min",
+    "pop",
+    "push",
+    "reduce",
+    "remove",
+    "reverse",
+    "reversed",
+    "set",
+    "shuffle",
+    "slice",
+    "sort",
+    "sorted",
+    "sum",
+    "unique",
+    "zip",
 ]
 let LIST_UNCERTAIN: list[str] = []
 
@@ -64,7 +126,14 @@ let LIST_UNCERTAIN: list[str] = []
 #: first/last/second/slice are gone from the advertised list. No UNCERTAIN
 #: entries for tuple -- all six of its gap names got a ruling.
 let TUPLE_ADVERTISED = [
-    "at", "contains", "count", "get", "index", "is_empty", "iter", "len",
+    "at",
+    "contains",
+    "count",
+    "get",
+    "index",
+    "is_empty",
+    "iter",
+    "len",
     "to_list",
 ]
 let TUPLE_UNCERTAIN: list[str] = []
@@ -72,8 +141,15 @@ let TUPLE_UNCERTAIN: list[str] = []
 #: Mirrors kRangeMethodNames. is_empty is implemented below; nothing else in
 #: range's table changed.
 let RANGE_ADVERTISED = [
-    "contains", "is_empty", "iter", "len", "reversed", "start", "step",
-    "stop", "to_list",
+    "contains",
+    "is_empty",
+    "iter",
+    "len",
+    "reversed",
+    "start",
+    "step",
+    "stop",
+    "to_list",
 ]
 let RANGE_UNCERTAIN: list[str] = []
 
@@ -81,8 +157,17 @@ let RANGE_UNCERTAIN: list[str] = []
 #: `get` is now an alias of `at` -- the same answer tuple's pair already got,
 #: rather than leaving one sequence type inconsistent with the rest.
 let BYTES_ADVERTISED = [
-    "at", "concat", "contains", "decode", "get", "hex", "is_empty", "iter",
-    "len", "slice", "to_list",
+    "at",
+    "concat",
+    "contains",
+    "decode",
+    "get",
+    "hex",
+    "is_empty",
+    "iter",
+    "len",
+    "slice",
+    "to_list",
 ]
 let BYTES_UNCERTAIN: list[str] = []
 
@@ -92,36 +177,46 @@ let BYTES_UNCERTAIN: list[str] = []
 #: peekable/to_list are all gone from the advertised list. `iter` goes the
 #: other way: implemented, working, and previously missing here, so `dir()`
 #: hid it.
-let ITER_ADVERTISED = [
-    "collect", "drop", "iter", "next", "take",
-]
+let ITER_ADVERTISED = ["collect", "drop", "iter", "next", "take"]
 let ITER_UNCERTAIN: list[str] = []
 
-fn assert_advertised_methods_work(type_name: str, receiver: any,
-                                  advertised: list[str],
-                                  uncertain: list[str]) -> void {
+fn assert_advertised_methods_work(
+    type_name: str,
+    receiver: any,
+    advertised: list[str],
+    uncertain: list[str]
+) -> void {
     let live = dir(receiver)
     var broken: list[str] = []
     for name in advertised {
         if uncertain.contains(name) { continue }
         if not live.contains(name) { broken.push(name) }
     }
-    assert_len(broken, 0,
+    assert_len(
+        broken,
+        0,
         f"{type_name} advertises these but the runtime does not implement " +
-            f"them, so calling them raises AttributeError: {broken}")
+            f"them, so calling them raises AttributeError: {broken}"
+    )
 }
 
-fn assert_uncertain_names_are_still_gaps(type_name: str, receiver: any,
-                                         uncertain: list[str]) -> void {
+fn assert_uncertain_names_are_still_gaps(
+    type_name: str,
+    receiver: any,
+    uncertain: list[str]
+) -> void {
     let live = dir(receiver)
     var resolved: list[str] = []
     for name in uncertain {
         if live.contains(name) { resolved.push(name) }
     }
-    assert_len(resolved, 0,
+    assert_len(
+        resolved,
+        0,
         f"{type_name} lists these as UNCERTAIN (still a gap) in " +
             "docs/agents/methods-classify.md, but the runtime now implements " +
-            f"them -- update the classification and this test: {resolved}")
+            f"them -- update the classification and this test: {resolved}"
+    )
 }
 
 fn test_str_advertised_methods_are_all_implemented() -> void {

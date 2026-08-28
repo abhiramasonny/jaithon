@@ -17,7 +17,9 @@ let CALLS = 100
 
 class Tag {
     var id: int
+
     fn init(self, id: int) -> void { self.id = id }
+
     pub fn value(self) -> int { return self.id }
 }
 
