@@ -39,15 +39,28 @@ class BenchError(RuntimeError):
     pass
 
 
-def parse(output: str) -> dict[str, tuple[float, str]]:
-    found: dict[str, tuple[float, str]] = {}
+# The route field is "<intent>/<what actually ran>". Only the second half is a
+# fact; the first is what the benchmark asked for, and on this hardware the two
+# differ often enough to matter. A route naming a 16-bit element ran at f16, and
+# anything else at f32. No slash means the benchmark has one precision and the
+# question does not arise -- do not guess from the intent label.
+def precision_of(route: str) -> str:
+    if "/" not in route:
+        return ""
+    tail = route.rsplit("/", 1)[-1]
+    return "f16" if "16" in tail else "f32"
+
+
+def parse(output: str) -> dict[str, tuple[float, str, str]]:
+    found: dict[str, tuple[float, str, str]] = {}
     for line in output.splitlines():
         if not line.startswith("jtb\t"):
             continue
         parts = line.split("\t")
         if len(parts) < 6:
             raise BenchError(f"malformed record: {line!r}")
-        found[parts[1]] = (float(parts[2]), parts[5])
+        route = parts[6] if len(parts) > 6 else ""
+        found[parts[1]] = (float(parts[2]), parts[5], route)
     if not found:
         raise BenchError("no records")
     return found
@@ -81,6 +94,8 @@ def collect(mine: list[str], theirs: list[str], rows: list[str], runs: int,
     ours: dict[str, list[float]] = {name: [] for name in rows}
     peer: dict[str, list[float]] = {name: [] for name in rows}
     checks: dict[str, str] = {}
+    ours_route: dict[str, str] = {}
+    peer_route: dict[str, str] = {}
     total = runs * len(rows)
     done_count = 0
     for index in range(runs):
@@ -93,12 +108,24 @@ def collect(mine: list[str], theirs: list[str], rows: list[str], runs: int,
                 found = one(command + [name], cwd, level)
                 if name not in found:
                     raise BenchError(f"{'jaicv' if side else 'opencv'} did not report {name}")
-                seconds, check = found[name]
+                seconds, check, route = found[name]
                 into[name].append(seconds)
                 if check != "ok":
                     checks[name] = check
+                (ours_route if side else peer_route)[name] = precision_of(route)
     if sys.stderr.isatty():
         sys.stderr.write("\r\033[K")
+    #: A row whose two sides ran at different precisions is not a like-for-like
+    #: ratio, and reading it as one has cost real time: jaitensor's tuner picks
+    #: fp32 for most GEMM shapes while the peer's autocast is pinned to fp16, so
+    #: three rows read as narrow losses when they were in fact 200x more
+    #: accurate answers -- 1.4e-5 against 2.7e-3 relative to a float64
+    #: reference. Nothing in the harness could see it, because nothing compared
+    #: the two sides.
+    for name in rows:
+        mine_p, peer_p = ours_route.get(name, ""), peer_route.get(name, "")
+        if mine_p and peer_p and mine_p != peer_p and name not in checks:
+            checks[name] = f"{mine_p} vs {peer_p}"
     return (
         {name: statistics.median(values) for name, values in ours.items()},
         {name: statistics.median(values) for name, values in peer.items()},

@@ -125,7 +125,11 @@ def main() -> None:
         scaled = seconds / counted * repeats
         flops = 2 * rows * inner * columns * repeats
         check = "ok" if valid else "invalid"
-        print(f"jtb\t{name}\t{scaled:.9f}\t{flops}\t0\t{check}\tamp-f16-f32/mps")
+        # autocast(float16) is unconditional here, so unlike jaitensor -- whose
+        # tuner picks per shape and picks fp32 for most of them -- every row on
+        # this side really does run at half. Saying so is what lets the suite
+        # notice when the two sides are not answering the same question.
+        print(f"jtb\t{name}\t{scaled:.9f}\t{flops}\t0\t{check}\tamp-f16-f32/mps-f16")
 
 
 if __name__ == "__main__":
