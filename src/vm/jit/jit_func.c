@@ -323,6 +323,33 @@ static int jitBuildTuple(JitCallDesc *d) {
     return 0;
 }
 
+/* `a == b` on two heap objects the tier can say nothing else about.
+ *
+ * The interpreter's own equality, so an `__eq__` behaves and a comparison that
+ * raises raises the same message. It can therefore allocate and throw: roots go
+ * down, and 1 comes back for the descriptor's threw branch.
+ *
+ * This is the LAST arm in each equality chain on purpose. Every arm above it
+ * answers without a call -- interned string pointers, a folded enum unit, two
+ * registers -- and each is strictly better where it applies. */
+static int jitValuesEqual(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    bool equal = jaiValuesEqual(d->args[0], d->args[1]);
+    jaiGCPopRootRange();
+    if (vm.hasException) return 1;
+    d->result = BOOL_VAL(equal);
+    return 0;
+}
+
+static bool jitObjEquality(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_OBJ_EQ");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* `a + b` on two strings. Both operands are guarded for OBJ_STRING at the call
  * site, so this is jaiStringConcat and nothing else -- the general arithmetic()
  * fallback would have to be answered with a tag test on the result, and there
@@ -7946,8 +7973,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                        stringOperand(e, e->depth - 2) &&
                        stringOperand(e, e->depth - 1)) {
                 emitStringOrder(e);
-            } else {
-                /* Named: this closed the compare chain with a bare refusal, so
+            } else if ((op == OP_EQ || op == OP_NE) && ka == SLOT_OBJ &&
+                       jitObjEquality() && e->callsOut && !e->inlining) {
+                /* Two heap objects and nothing above could name them. Rather
+                 * than decline the whole body for one comparison, call the
+                 * interpreter's equality and carry on.
+                 *
+                 * `self._kind() == kind` on two TokenKinds is the shape, and it
+                 * is the SHORTEST CHAIN ON A HOT BODY in the self-hosted front
+                 * end: `_check` is one refusal away from compiling and carries
+                 * 3.2% of the interpreted work in lexer.jai. The enum arm
+                 * above cannot help it -- that one needs one side to be a
+                 * FOLDED constant, and here both are values.
+                 *
+                 * Leaves NZCV from a compare of the result against one, which
+                 * is what the shared tail below expects, so this arm ends the
+                 * same way every other arm in the chain does. */
+                settleAll(e);
+                if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
+                                    (void *)&jitValuesEqual)) {
+                    return false;
+                }
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, 31,
+                                      e->descOffset +
+                                          (unsigned)offsetof(JitCallDesc,
+                                                             result) + 8));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 1));
+                e->wroteHeap = true;
+            } else {                /* Named: this closed the compare chain with a bare refusal, so
                  * a census showed 80 declines reading only "OP_NE", with
                  * nothing in them to act on. */
                 return subWhy(e, "a comparison of %s with %s",
@@ -8214,8 +8267,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                        stringOperand(e, e->depth - 2) &&
                        stringOperand(e, e->depth - 1)) {
                 emitStringOrder(e);
-            } else {
-                /* Named: this closed the compare chain with a bare refusal, so
+            } else if ((cmp == OP_EQ || cmp == OP_NE) && ka == SLOT_OBJ &&
+                       jitObjEquality() && e->callsOut && !e->inlining) {
+                /* Two heap objects and nothing above could name them. Rather
+                 * than decline the whole body for one comparison, call the
+                 * interpreter's equality and carry on.
+                 *
+                 * `self._kind() == kind` on two TokenKinds is the shape, and it
+                 * is the SHORTEST CHAIN ON A HOT BODY in the self-hosted front
+                 * end: `_check` is one refusal away from compiling and carries
+                 * 3.2% of the interpreted work in lexer.jai. The enum arm
+                 * above cannot help it -- that one needs one side to be a
+                 * FOLDED constant, and here both are values.
+                 *
+                 * Leaves NZCV from a compare of the result against one, which
+                 * is what the shared tail below expects, so this arm ends the
+                 * same way every other arm in the chain does. */
+                settleAll(e);
+                if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
+                                    (void *)&jitValuesEqual)) {
+                    return false;
+                }
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, 31,
+                                      e->descOffset +
+                                          (unsigned)offsetof(JitCallDesc,
+                                                             result) + 8));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 1));
+                e->wroteHeap = true;
+            } else {                /* Named: this closed the compare chain with a bare refusal, so
                  * a census showed 80 declines reading only "OP_NE", with
                  * nothing in them to act on. */
                 return subWhy(e, "a comparison of %s with %s",
