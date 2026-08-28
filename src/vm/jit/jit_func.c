@@ -9392,7 +9392,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
 
-            if (rk != SLOT_LIST) return false;
+            if (rk != SLOT_LIST) {
+                /* The last arm. Naming the kind is what turns a bare
+                 * "OP_INVOKE" in the census into something actionable: every
+                 * receiver kind the arms above do not take lands here, and a
+                 * class is the biggest of them -- `Klass.static_method(x)` is
+                 * an invoke on a SLOT_CLASS receiver, not the field read plus
+                 * call it looks like, and docs/probes/p33_static_call.jai runs
+                 * 72,434,801 interpreted instructions on account of it. */
+                return subWhy(e, "a receiver of kind %s", slotKindName(rk));
+            }
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value nameVal = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(nameVal)) return false;
