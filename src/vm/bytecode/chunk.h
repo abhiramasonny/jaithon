@@ -367,7 +367,31 @@ int    jaiLtv1Count(const uint8_t *stream, size_t len);
 
 typedef enum { IC_EMPTY = 0, IC_MONO, IC_POLY, IC_MEGA } ICState;
 
-#define JAI_IC_WAYS 4
+/* Ways per call-site inline cache.
+ *
+ * Four until the compiled tier learned to read them. A site that overflows is
+ * marked IC_MEGA and stops caching ALTOGETHER (see sMegaCache in vm.c), and
+ * with four ways a trait with eight implementations overflows immediately --
+ * which is what tests/bench/poly_dispatch is. The old comment argued against
+ * widening on the grounds that it "costs every cache in every chunk memory for
+ * a case almost none of them see". That was correct when nothing but the
+ * interpreter read a way. The polymorphic inline cache reads them now, so the
+ * trade is a different one and was re-measured rather than re-quoted:
+ *
+ *   poly_dispatch   1.860x     object_dispatch  1.001x
+ *   graph_bfs       1.204x     life             0.987x
+ *   json_parse      1.165x
+ *
+ * against +8.6 MB of peak RSS on a self-hosted compile of parser.jai
+ * (94.0 -> 102.6 MB), with allocation counts unchanged. Eight ways also takes
+ * poly_dispatch's loop to within 4.8% of the same loop with ONE receiver
+ * class, so there is very little left above it.
+ *
+ * Measured in blocks, not alternating: two builds have different fingerprints
+ * and switching between them invalidates __jaicache__, so an A,B,A,B harness
+ * charges every sample a full standard-library recompile and reads this
+ * change as 1.16x. */
+#define JAI_IC_WAYS 8
 
 /* What an OP_INVOKE site was observed to RETURN, one byte per way. Only ever a
  * PREDICTION -- the tag guard emitted alongside it is what makes it sound, so a
@@ -429,10 +453,14 @@ typedef struct {
     Value    cached[JAI_IC_WAYS];    /* bound method for INVOKE sites */
 } InlineCache;
 
-/* The two observation bytes were meant to be free. If a field is ever added
- * that pushes shapeId past offset 8, every chunk in the program pays for it and
- * nothing else says so. */
-_Static_assert(offsetof(InlineCache, shapeId) == 8,
+/* The two observation bytes were meant to be free, and still are: state,
+ * count, resultKind[JAI_IC_WAYS], obsBudget and obsPad fill exactly the
+ * padding before shapeId's four-byte alignment. The assert is not that the
+ * offset is 8 -- it moved to 12 when the ways went from four to eight, which
+ * is the width itself being paid for and is accounted above -- but that
+ * NOTHING ELSE has been slipped in beside them. A field that pushes shapeId
+ * past this bound costs every chunk in the program and nothing else says so. */
+_Static_assert(offsetof(InlineCache, shapeId) == 4 + JAI_IC_WAYS,
                "InlineCache observation bytes must fit shapeId's padding");
 
 typedef struct {
