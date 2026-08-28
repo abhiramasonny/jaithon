@@ -415,6 +415,30 @@ typedef enum {
 #define JIT_FP_FIRST_SAVED 8u
 #define JIT_FP_MAX_SAVED   8u
 
+/* A SlotKind's name, for JAI_JIT_WHY. Several refusals used to print the raw
+ * enumerator ("the container is kind 13, not a list"), which names the one
+ * thing a reader of the message cannot look up. */
+static const char *slotKindName(SlotKind k) {
+    switch (k) {
+    case SLOT_INT:        return "int";
+    case SLOT_FLOAT:      return "float";
+    case SLOT_INST:       return "instance";
+    case SLOT_MAYBE_INST: return "instance-or-null";
+    case SLOT_SELF:       return "self";
+    case SLOT_OPAQUE:     return "opaque";
+    case SLOT_CLOSURE:    return "closure";
+    case SLOT_CLASS:      return "class";
+    case SLOT_FUNC:       return "function";
+    case SLOT_NATIVE:     return "builtin";
+    case SLOT_ITER:       return "iterator";
+    case SLOT_BOOL:       return "bool";
+    case SLOT_NULL:       return "null";
+    case SLOT_OBJ:        return "object";
+    case SLOT_LIST:       return "list";
+    }
+    return "an unnamed kind";
+}
+
 static bool holdsRegister(SlotKind k) {
     return k != SLOT_SELF && k != SLOT_CLASS && k != SLOT_FUNC &&
            k != SLOT_NATIVE;
@@ -3184,6 +3208,25 @@ static void emitVersionBump(Emit *e, ObjModule *m) {
 
 /* Predicted stack kind + guard tag for a recorded OP_INVOKE result; false when the tier has no use
  * for the byte. SLOT_INST is deliberately excluded: it carries a class shape this byte can't encode, and admitting it would silently lose the shape every field offset was resolved against. Class/closure/native excluded too -- they have register-free stack kinds of their own. */
+/* What an InlineCache::resultKind byte says, for JAI_JIT_WHY. A site the tier
+ * refuses for want of a result kind is refused for one of three quite different
+ * reasons, and the fix differs for each. */
+static const char *jaiFeedbackName(uint8_t fb) {
+    if (fb == JAI_FB_NONE) return "never observed";
+    if (fb == JAI_FB_MIXED) return "mixed";
+    if (fb >= JAI_FB_OBJ && fb < JAI_FB_OBJ + (unsigned)OBJ_TYPE_COUNT) {
+        return jaiObjTypeName((ObjType)(fb - JAI_FB_OBJ));
+    }
+    switch ((ValueType)(fb - 1u)) {
+    case VAL_NULL:  return "null";
+    case VAL_BOOL:  return "bool";
+    case VAL_INT:   return "int";
+    case VAL_FLOAT: return "float";
+    default: break;
+    }
+    return "something the tier does not name";
+}
+
 static bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag) {
     switch (fb) {
     case 1u + VAL_INT:   *k = SLOT_INT;   *tag = VAL_INT;   return true;
@@ -3532,19 +3575,45 @@ static bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
                            d + (unsigned)offsetof(JitCallDesc, callee) + 8));
     }
 
+    /* The value index of the first argument. Counted rather than derived from
+     * `depth - valueDepth`, which is the number of register-free entries below
+     * `depth` ANYWHERE: a class argument is one of those, and every argument
+     * above it would then be read out of the wrong register. */
+    unsigned vidx = e->valueDepth;
+    for (unsigned idx = first; idx < e->depth; idx++) {
+        if (holdsRegister(e->stack[idx])) vidx--;
+    }
+
     /* The arguments, which for an invoke begin with the receiver. */
     for (unsigned i = 0; i < nargs; i++) {
         unsigned idx = first + i;
         SlotKind k = e->stack[idx];
+        unsigned at = d + (unsigned)offsetof(JitCallDesc, args) +
+                      i * (unsigned)sizeof(Value);
+        /* A class occupies no register -- it is a constant of the module, and
+         * the class the interpreter would have found is the one the model
+         * recorded. Baking it is the same trust the callee slot above already
+         * takes, and it is what lets `isinstance(x, T)` be called at all. */
+        if (k == SLOT_CLASS) {
+            ObjClass *argCls = e->stackClass[idx];
+            if (argCls == NULL) {
+                e->whyNot = "a class argument the model did not pin";
+                return false;
+            }
+            emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+            emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, at));
+            emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)argCls);
+            emit(e, jaiA64StrX(JIT_SCRATCH_A, 31, at + 8));
+            continue;
+        }
         if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
             k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
             k != SLOT_ITER && k != SLOT_MAYBE_INST) {
             e->whyNot = "an argument kind this call cannot pass";
             return false;
         }
-        unsigned at = d + (unsigned)offsetof(JitCallDesc, args) +
-                      i * (unsigned)sizeof(Value);
-        unsigned reg = valueBankReg(e, idx - (e->depth - e->valueDepth));
+        unsigned reg = valueBankReg(e, vidx);
+        vidx++;
         /* A maybe-instance's tag is not a property of its kind, and this Value
          * reaches jaiCallValue: writing VAL_OBJ over a zero payload would hand
          * the interpreter a null pointer dressed as an object. */
@@ -5060,6 +5129,104 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
      * entries are the caller's and their registers are gone. */
     if (e->depth != depth0) { e->failed = true; return false; }
     return false;
+}
+
+/* Builtins whose result kind is a property of the FUNCTION and not of its
+ * arguments: `str(x)` is a string whatever x is, `len(x)` is an int, `bool(x)`
+ * is a bool. That is the only thing the surrounding body needs to know, so the
+ * call can be an ordinary call out and everything around it stays compiled.
+ *
+ * Worth having because the alternative was not a slower call but no compiled
+ * body at all -- one `str()` in a loop declined the whole enclosing function.
+ * A probe doing `str(i % 10_000)` per iteration ran 90,000,323 interpreted
+ * instructions against 1,231 for the f-string spelling of the same thing.
+ *
+ * The kinds are read off the natives in builtins_core.c, and the returned tag
+ * is guarded regardless: a wrong row here costs a deopt, never an answer. */
+typedef struct {
+    const char *name;
+    unsigned    argc;
+    SlotKind    kind;
+    uint8_t     tag;
+} NativeResult;
+
+static const NativeResult kNativeResults[] = {
+    { "str",        1, SLOT_OBJ,  VAL_OBJ  },
+    { "repr",       1, SLOT_OBJ,  VAL_OBJ  },
+    { "chr",        1, SLOT_OBJ,  VAL_OBJ  },
+    { "type_of",    1, SLOT_OBJ,  VAL_OBJ  },
+    { "len",        1, SLOT_INT,  VAL_INT  },
+    { "hash",       1, SLOT_INT,  VAL_INT  },
+    { "id",         1, SLOT_INT,  VAL_INT  },
+    { "ord",        1, SLOT_INT,  VAL_INT  },
+    { "int",        1, SLOT_INT,  VAL_INT  },
+    { "int",        2, SLOT_INT,  VAL_INT  },
+    { "bool",       1, SLOT_BOOL, VAL_BOOL },
+    { "callable",   1, SLOT_BOOL, VAL_BOOL },
+    { "isinstance", 2, SLOT_BOOL, VAL_BOOL },
+    /* No `range` row. It would emit, but the loop that consumes the result
+     * declines one instruction later ("iterating something other than a list
+     * or range") because SLOT_OBJ does not say `range` -- so the body is
+     * refused either way and the row only buys an allocation. */
+};
+
+/* 1 emitted, 0 no row for this builtin, -1 the emit failed. */
+static int emitNativeResultCall(Emit *e, Value cv, const char *nm,
+                                unsigned argc, uint32_t afterIp) {
+    /* inlinableBody admits OP_CALL only for the two builtins the tier emits as
+     * a single instruction, on the grounds that an inlined body cannot call.
+     * Refusing here keeps that true even if a constant string reaches an
+     * `int()` inside one. */
+    if (e->inlining) return 0;
+
+    const NativeResult *nr = NULL;
+    for (size_t i = 0; i < sizeof kNativeResults / sizeof kNativeResults[0]; i++) {
+        if (kNativeResults[i].argc == argc &&
+            strcmp(kNativeResults[i].name, nm) == 0) {
+            nr = &kNativeResults[i];
+            break;
+        }
+    }
+    if (nr == NULL) return 0;
+
+    if (!emitDescriptor(e, cv, e->depth - argc, argc, (void *)&jitCallOut)) {
+        return -1;
+    }
+    for (unsigned i = 0; i < argc; i++) {
+        /* A class argument occupies no register, so there is nothing to pop --
+         * only the entry to drop. */
+        if (e->depth > 0 && !holdsRegister(e->stack[e->depth - 1])) {
+            e->depth--;
+            continue;
+        }
+        unsigned r;
+        if (!popValue(e, &r, NULL)) { e->whyNot = "call argument"; return -1; }
+    }
+    if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_NATIVE) {
+        e->whyNot = "callee was not where it should be";
+        return -1;
+    }
+    e->depth--;
+    if (!pushValue(e, nr->kind, 0, NULL)) return -1;
+
+    unsigned at = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, at));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, nr->tag));
+    /* Resumes AFTER the call, taking the result from the descriptor: the
+     * native has already run and may have written, so re-running it is not on
+     * offer. `lastFromDesc` is what hands the interpreter the Value the native
+     * actually produced, whatever tag it turned out to have. */
+    branchOnDeoptAt(e, JAI_A64_NE, afterIp, true);
+    /* A bool is ONE byte of the Value union; reading eight would carry the
+     * neighbouring bytes of the result slot into the register. */
+    if (nr->kind == SLOT_BOOL) {
+        emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, at + 8));
+    } else {
+        emit(e, jaiA64LdrX(pushReg(e) - 1, 31, at + 8));
+    }
+    /* A call is an effect: no bail may follow it. */
+    e->wroteHeap = true;
+    return 1;
 }
 
 static bool emitCallOut(Emit *e, unsigned argc) {
@@ -7241,8 +7408,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * it (`if node == null { return 0 }`) but the tier doesn't track that, so the guard stands and costs one compare against zero; a null arriving for real just deopts. */
             if (e->localKind[slot] != SLOT_INST &&
                 e->localKind[slot] != SLOT_MAYBE_INST) {
-                return subWhy(e, "receiver local %u is kind %d, not an instance",
-                              slot, (int)e->localKind[slot]);
+                return subWhy(e, "receiver local %u is a %s, not an instance",
+                              slot, slotKindName(e->localKind[slot]));
             }
             if (e->localClass[slot] == NULL) {
                 return subWhy(e, "receiver local %u has no pinned class", slot);
@@ -8501,9 +8668,13 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!IS_STRING(oname)) return false;
                 Value obound;
                 if (!jaiBuiltinMethod(oseen, AS_STRING(oname), &obound)) {
-                    e->whyNot = "an invoke that is not a builtin of the "
-                                "observed receiver's type";
-                    return false;
+                    /* Names the pair, since which builtin is missing is the
+                     * whole question and the bare reason only says that one
+                     * was. */
+                    return subWhy(e, "`%s.%s` is not a builtin of the observed "
+                                     "receiver's type",
+                                  jaiTypeNameStatic(oseen),
+                                  AS_STRING(oname)->chars);
                 }
                 Value onative = IS_BOUND(obound) ? AS_BOUND(obound)->method
                                                  : obound;
@@ -8524,9 +8695,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     uint8_t fb = jaiInvokeResultFeedback(
                         &fn->chunk, jaiReadU16(code + off + 5), oseen);
                     if (!feedbackSlotKind(fb, &orkind, &owantTag)) {
-                        e->whyNot = "a builtin whose result kind has not been "
-                                    "observed";
-                        return false;
+                        /* Which of the three it is decides what to do about
+                         * it: nothing recorded means the window never opened,
+                         * mixed means the site really does return two things,
+                         * and a named type means the tier has no slot for it. */
+                        return subWhy(e, "`%s.%s` has no usable result kind (%s)",
+                                      jaiTypeNameStatic(oseen),
+                                      AS_STRING(oname)->chars,
+                                      jaiFeedbackName(fb));
                     }
                 }
 
@@ -9724,8 +9900,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * range, or an element not the kind seen at compile time, goes back to the interpreter -- reading an element has no effect, so resuming at this instruction is always sound. */
             if (e->depth < 2) return subWhy(e, "the model is only %u deep", e->depth);
             if (e->stack[e->depth - 2] != SLOT_LIST) {
-                return subWhy(e, "the container is kind %d, not a list",
-                              (int)e->stack[e->depth - 2]);
+                return subWhy(e, "the container is a %s, not a list",
+                              slotKindName(e->stack[e->depth - 2]));
             }
             if (e->stack[e->depth - 1] != SLOT_INT) {
                 return subWhy(e, "the subscript is kind %d, not an int",
@@ -10345,8 +10521,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 bool isMax = strcmp(nm, "max") == 0;
                 if (argc == 2) {
                     if (!isMin && !isMax) {
-                        e->whyNot = "a builtin with no known result kind";
-                        return false;
+                        int done = emitNativeResultCall(e, cv, nm, argc,
+                                                        (uint32_t)(off + 2));
+                        if (done < 0) return false;
+                        if (done > 0) { off += 2; break; }
+                        return subWhy(e, "`%s` has no known result kind", nm);
                     }
                     if (e->stack[e->depth - 1] != SLOT_INT ||
                         e->stack[e->depth - 2] != SLOT_INT) {
@@ -10433,8 +10612,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     emit(e, jaiA64FcvtzsXD(ar, fpOperand(e, e->valueDepth - 1)));
                 } else if (!((toFloat && ak == SLOT_FLOAT) ||
                              (toInt && ak == SLOT_INT))) {
-                    e->whyNot = "a builtin with no known result kind";
-                    return false;
+                    int done = emitNativeResultCall(e, cv, nm, argc,
+                                                    (uint32_t)(off + 2));
+                    if (done < 0) return false;
+                    if (done > 0) { off += 2; break; }
+                    /* Names it: the table in kNativeResults is what would have
+                     * to grow, and the reason alone never said which row. */
+                    return subWhy(e, "`%s` has no known result kind for a %s "
+                                     "argument", nm, slotKindName(ak));
                 }
                 /* The result stays in the argument's register. */
                 e->stack[e->depth - 1] = toFloat ? SLOT_FLOAT : SLOT_INT;
