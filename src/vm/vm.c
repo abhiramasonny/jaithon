@@ -6853,6 +6853,8 @@ void jaiVMInit(void) {
     vm.allocCount = 0;
     vm.icHits = 0;
     vm.icMisses = 0;
+    vm.jitPicAdmits = 0;
+    vm.jitPicRefusals = 0;
 
     sRunDepth = 0;
     sFinallyPending = 0;
@@ -7033,5 +7035,10 @@ void jaiVMPrintStats(FILE *out) {
             vm.instructionCount, vm.callCount, vm.allocCount);
     fprintf(out, "inline caches: %" PRIu64 " hits, %" PRIu64 " misses (%.1f%%)\n",
             vm.icHits, vm.icMisses, hitRate);
+    uint64_t picTries = vm.jitPicAdmits + vm.jitPicRefusals;
+    double picRate = picTries > 0
+        ? (100.0 * (double)vm.jitPicAdmits / (double)picTries) : 0.0;
+    fprintf(out, "jit pic: %" PRIu64 " admitted, %" PRIu64 " refused (%.1f%%)\n",
+            vm.jitPicAdmits, vm.jitPicRefusals, picRate);
     jaiGCPrintStats(out);
 }

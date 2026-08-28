@@ -91,6 +91,13 @@ typedef struct VM {
     uint64_t     callCount;
     uint64_t     allocCount;
     uint64_t     icHits, icMisses;
+    /* The one-way PIC in jit_func.c's OP_INVOKE arm: how many unpinned-
+     * receiver call sites it compiled a shape-guarded direct branch for
+     * (jitPicAdmits) versus declined and left to jitInvokeByName alone
+     * (jitPicRefusals). JAITHON_JIT_PIC=0 stops it engaging at all, so
+     * these are the only way to tell it fired without instrumenting a
+     * benchmark by hand. */
+    uint64_t     jitPicAdmits, jitPicRefusals;
 
     /* GC state; see gc.h */
     struct GCState *gc;

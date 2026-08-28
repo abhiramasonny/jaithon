@@ -54,6 +54,7 @@ stopped : pushing a kind the tier cannot store
 stopped : the operand model disagrees with the bytecode
 stopped : too many roots
 stopped: OP_CALL
+stopped: OP_GET_FIELD
 stopped: OP_GET_FIELD_LOCAL: no live receiver to read local 17's field off
 stopped: OP_GET_INDEX: the container is kind 13, not a list
 stopped: OP_GET_INDEX: the container is kind 2, not a list

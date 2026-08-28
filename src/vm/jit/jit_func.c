@@ -4148,6 +4148,242 @@ static bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     return true;
 }
 
+/* JAITHON_JIT_PIC=0 turns the one-way inline cache below off, so the same
+ * binary can be A/B'd around it without a rebuild -- same idiom as
+ * jaiListUnboxOn's JAITHON_LIST_UNBOX (object_collection.c) and
+ * jaiJitEnabled's JAITHON_NO_JIT. Read once: this sits on every unpinned
+ * OP_INVOKE, and an uncached getenv there is its own cost (see
+ * jitReconTrace above). */
+static bool jitPicEnabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_PIC");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* Mirrors every decision emitDirectCall makes before it commits to emitting,
+ * for the one way this cache is about to speculate on. By the time the shape
+ * compare below is in the instruction stream a decline has nowhere to fall
+ * back to but e->failed, so this runs FIRST and answers instead of finding
+ * out the hard way. */
+static bool jitPic1Admissible(Emit *e, ObjFunction *caller, ObjFunction *cfn,
+                              unsigned ridx, unsigned argc, uint32_t shape) {
+    if (cfn->module != caller->module) return false;
+    if (caller->module == NULL ||
+        cfn->jitFuncModuleVersion != caller->module->version) {
+        return false;
+    }
+    if (cfn->jitArgBase != 0u) return false;
+    unsigned nargs = argc + 1u;
+    unsigned calleeArgs = (unsigned)cfn->jitArgCount;
+    bool wantsClosure = calleeArgs == nargs + 1u;
+    if (!wantsClosure && calleeArgs != nargs) return false;
+    if (calleeArgs > JIT_MAX_ARITY) return false;
+    if (wantsClosure &&
+        (SlotKind)cfn->jitParamKind[nargs] != SLOT_CLOSURE) {
+        return false;
+    }
+    /* The receiver is the callee's slot 0, and the branch about to be
+     * emitted is the proof of its class -- so the parameter the callee was
+     * specialised for has to be that same class, not merely some instance. */
+    if ((SlotKind)cfn->jitParamKind[0] != SLOT_INST) return false;
+    if (cfn->jitParamShape[0] != shape) return false;
+    for (unsigned i = 1; i < nargs; i++) {
+        unsigned idx = ridx + i;
+        SlotKind have = e->stack[idx];
+        SlotKind want = (SlotKind)cfn->jitParamKind[i];
+        if (!holdsRegister(have)) return false;
+        if (want == SLOT_OPAQUE) continue;   /* never read; see seedLocals */
+        if (want == SLOT_MAYBE_INST) {
+            if (have != SLOT_INST && have != SLOT_MAYBE_INST) return false;
+        } else if (have != want) {
+            return false;
+        }
+        if ((want == SLOT_INST || want == SLOT_MAYBE_INST) &&
+            e->stackShape[idx] != cfn->jitParamShape[i]) {
+            return false;
+        }
+    }
+    /* A callee that writes is finished in the interpreter from a selfSlow
+     * record, and this arm takes one of its own -- the same budget a pinned
+     * direct call draws from. */
+    if (!cfn->jitFuncNoWrite && e->selfSlowCount >= JIT_MAX_SELF_SLOW) {
+        return false;
+    }
+    return true;
+}
+
+/* The compile-time half of a ONE-WAY inline cache: what the model could not
+ * pin about a receiver, read off the site's own InlineCache instead.
+ *
+ * One way only, and only the FIRST shape this site ever recorded --
+ * ic->cached[0] / ic->shapeId[0] -- not the whole walk over every way a
+ * polymorphic cache holds. The receiver's class is loaded once and compared
+ * against that one shape; a hit branches straight into the recorded callee's
+ * compiled entry exactly as a pinned receiver already does (emitDirectCall).
+ * A miss -- every OTHER class at a polymorphic site, and the common case at a
+ * megamorphic one -- falls through to jitInvokeByName, which is exactly what
+ * the site emits today and is unchanged by any of this.
+ *
+ * The compare is not a guard and a miss is not a deopt: both sides of it run
+ * BEFORE the call, so nothing has happened yet that must not happen twice.
+ * That is the whole reason this needs no deopt record of its own, unlike the
+ * call inside it (emitDirectCall still takes one, for what the CALL can do
+ * after it starts).
+ *
+ * `havePrediction`/`rkind` is the fall-through's own prediction
+ * (siteInvokeResultKind), which the one way must also return: only a
+ * register-only kind (SLOT_INT/FLOAT/BOOL) is admitted, because those are the
+ * only ones that carry no class shape for the two paths to disagree about --
+ * see feedbackSlotKind's exclusion of SLOT_INST. `*toEnd` comes back holding
+ * the arm's own branch to the merge point, for the caller to patch once it
+ * has emitted the fall-through after it.
+ *
+ * Returns false having emitted nothing whenever there was something to
+ * cleanly decline, so the caller can still take the descriptor path alone --
+ * UNLESS e->failed, which means the shape compare is already in the stream
+ * and there is nowhere left to fall back to (mirrors emitDirectCall's own
+ * rule, since this arm ends by calling into it). */
+static bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
+                           unsigned argc, uint32_t callOff, uint32_t after,
+                           int siteCache, bool havePrediction, SlotKind rkind,
+                           int *toEnd) {
+    if (!havePrediction) {
+        return subWhy(e, "no predicted result kind to join the arm on");
+    }
+    if (rkind != SLOT_INT && rkind != SLOT_FLOAT && rkind != SLOT_BOOL) {
+        return subWhy(e, "an unpinned receiver returning something with a shape");
+    }
+    if (siteCache < 0 || fn->chunk.caches == NULL ||
+        siteCache >= fn->chunk.cacheCount) {
+        return subWhy(e, "no inline cache recorded for this site");
+    }
+    const InlineCache *ic = &fn->chunk.caches[siteCache];
+    if (ic->state != IC_MONO && ic->state != IC_POLY) {
+        return subWhy(e, "the site's cache is empty or has gone megamorphic");
+    }
+    if (ic->count == 0) return subWhy(e, "the site's cache has no way filled");
+    if (ridx + argc + 1u > JIT_MAX_STACK) {
+        return subWhy(e, "past the stack depth the model can describe");
+    }
+    /* Way 0: whichever class this site saw FIRST. A later way is never
+     * tried -- one arm, not the whole cache -- so a site that warmed up on
+     * its second-most-common class speculates on the wrong one and simply
+     * never hits; still sound, just not the best guess the cache holds. */
+    if (ic->payload[0] != 0) {
+        /* What the cache settles is which method a shape resolves to, not
+         * whether THIS caller may call it -- one site can present as two
+         * classes at different visibilities, so the interpreter re-decides
+         * that on every hit and nothing emitted here can. */
+        return subWhy(e, "way 0's method needs a visibility recheck");
+    }
+    Value cv = ic->cached[0];
+    if (!IS_CLOSURE(cv)) {
+        return subWhy(e, "way 0's cached value is not a closure");
+    }
+    ObjFunction *cf = AS_CLOSURE(cv)->fn;
+    if (cf->jitFunc == NULL) {
+        return subWhy(e, "way 0's callee has no compiled entry to branch into");
+    }
+    if ((SlotKind)cf->jitReturnKind != rkind || cf->jitReturnShape != 0) {
+        return subWhy(e, "way 0's callee return kind disagrees with the site's");
+    }
+    ObjClass *cc = NULL;
+    if (!jaiClassForShape(ic->shapeId[0], &cc) || cc == NULL) {
+        return subWhy(e, "way 0's shape names no live class");
+    }
+    if (!jitPic1Admissible(e, fn, cf, ridx, argc, ic->shapeId[0])) {
+        return subWhy(e, "way 0 is not directly callable here");
+    }
+    /* Either verdict path inside the arm can come back with an exception
+     * pending; same obligation emitDirectCall itself checks first. */
+    if (!raiseExitAllowed(e, "a call that can raise inside a try")) return false;
+
+    /* Everything in its home before the first branch: the arm and the
+     * fall-through are a join and have to agree about where every value is.
+     * An entry left in the float bank would have to agree about that too,
+     * and no dispatch in the suite has one, so this declines rather than
+     * growing a case nothing exercises. */
+    settleAll(e);
+    fpReleaseAll(e);
+    if (e->fpLive != 0) {
+        return subWhy(e, "an unpinned receiver with a value in the float bank");
+    }
+
+    /* Past here the shape compare is in the stream and the site is
+     * committed: a failure below stops the compile rather than falling
+     * back. */
+    unsigned rreg = valueXReg(e, ridx - (e->depth - e->valueDepth));
+    emit(e, jaiA64LdrX(JIT_SCRATCH_A, rreg,
+                       (unsigned)offsetof(ObjInstance, klass)));
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                       (unsigned)offsetof(ObjClass, shapeId)));
+    emitConst64(e, JIT_SCRATCH_B, (int64_t)ic->shapeId[0]);
+    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+    int miss = (int)e->count;
+    emit(e, jaiA64BCond(JAI_A64_NE, 0));
+
+    /* The model as the fall-through must find it again: emitDirectCall
+     * consumes the receiver and the arguments and pushes a result, and the
+     * fall-through's own descriptor call has to see the SAME depth and
+     * valueDepth it would have without any of this, or the two paths
+     * disagree about where the result lands. */
+    unsigned  saveDepth      = e->depth;
+    unsigned  saveValueDepth = e->valueDepth;
+    SlotKind  saveKind [JIT_MAX_STACK];
+    uint32_t  saveShape[JIT_MAX_STACK];
+    ObjClass *saveClass[JIT_MAX_STACK];
+    Value     saveSeen [JIT_MAX_STACK];
+    memcpy(saveKind,  e->stack,      sizeof saveKind);
+    memcpy(saveShape, e->stackShape, sizeof saveShape);
+    memcpy(saveClass, e->stackClass, sizeof saveClass);
+    memcpy(saveSeen,  e->stackSeen,  sizeof saveSeen);
+
+    /* True on this arm alone, which is why it is also what the CALL's own
+     * deopt records (inside emitDirectCall, for what happens after the call
+     * starts -- not for this compare) should say: the branch just above
+     * proved it. */
+    e->stack[ridx]      = SLOT_INST;
+    e->stackShape[ridx] = ic->shapeId[0];
+    e->stackClass[ridx] = cc;
+
+    if (!emitDirectCall(e, fn, cf, cv, -1, ridx, argc, callOff, after, true)) {
+        /* jitPic1Admissible said it would take this and it did not: the
+         * branch into it is already emitted, so there is nowhere left to
+         * fall back to. */
+        e->failed = true;
+        return false;
+    }
+    *toEnd = (int)e->count;
+    emit(e, jaiA64B(0));
+    /* Same condition as the placeholder (NE: skip the call on a shape that
+     * doesn't match), now with the real offset -- flipping it to EQ here
+     * would call `cf` on every receiver whose shape DIDN'T match way 0,
+     * reading its fields at Add's layout on a Mul/Negate/Trail instance, and
+     * skip the call on the one receiver that actually proved out. That is
+     * what test_mixed_list_runs_every_class caught: a wrong answer, not a
+     * crash, because the read lands inside the instance's own allocation. */
+    e->code[miss] = jaiA64BCond(JAI_A64_NE, (int32_t)((int)e->count - miss));
+
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] pic 1-way (of %u recorded) at %u\n",
+                (unsigned)ic->count, callOff);
+    }
+
+    /* The fall-through runs with the receiver and the arguments untouched,
+     * so the caller emits its descriptor path against the model as it was
+     * before any of this. */
+    e->depth      = saveDepth;
+    e->valueDepth = saveValueDepth;
+    memcpy(e->stack,      saveKind,  sizeof saveKind);
+    memcpy(e->stackShape, saveShape, sizeof saveShape);
+    memcpy(e->stackClass, saveClass, sizeof saveClass);
+    memcpy(e->stackSeen,  saveSeen,  sizeof saveSeen);
+    return true;
+}
+
 static bool compileBody(Emit *e, ObjClosure *closure);
 static int instructionLength(const Chunk *c, int off);
 
@@ -7968,14 +8204,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     unsigned rtag;
                     const bool discarded =
                         (off + 7 < count && code[off + 7] == OP_POP);
+                    const uint16_t invokeCache = jaiReadU16(code + off + 5);
                     const bool havePrediction =
-                        siteInvokeResultKind(&fn->chunk,
-                                             jaiReadU16(code + off + 5),
+                        siteInvokeResultKind(&fn->chunk, invokeCache,
                                              &rkind, &rtag);
                     if (!havePrediction && !discarded) {
                         e->whyNot = "an unpinned receiver's result kind";
                         return false;
                     }
+
+                    /* The site's own inline cache first: the ONE class it
+                     * saw first gets a compare and a direct branch into its
+                     * compiled entry, and only a receiver that isn't that
+                     * class pays for the descriptor below -- which, absent
+                     * this, is every receiver. See emitInvokePic1. */
+                    int picToEnd = -1;
+                    if (jitPicEnabled()) {
+                        if (emitInvokePic1(e, fn, ridx, argc, (uint32_t)off,
+                                          (uint32_t)(off + 7),
+                                          (int)invokeCache, havePrediction,
+                                          havePrediction ? rkind : SLOT_NULL,
+                                          &picToEnd)) {
+                            vm.jitPicAdmits++;
+                        } else {
+                            if (e->failed) return false;
+                            vm.jitPicRefusals++;
+                        }
+                    }
+
                     if (!emitDescriptor(e, mname, ridx, argc + 1,
                                         (void *)&jitInvokeByName)) {
                         return false;
@@ -7999,6 +8255,15 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         emit(e, jaiA64LdrByte(pushReg(e) - 1, 31, rat + 8));
                     } else {
                         emit(e, jaiA64LdrX(pushReg(e) - 1, 31, rat + 8));
+                    }
+                    /* The merge: the one way branched here rather than round
+                     * the descriptor, arriving with the same entry in the
+                     * same register this path just loaded -- the whole of
+                     * what the two paths had to agree about for the arm to
+                     * be emitted at all. */
+                    if (picToEnd >= 0) {
+                        e->code[picToEnd] =
+                            jaiA64B((int32_t)((int)e->count - picToEnd));
                     }
                     off += 7;
                     break;
