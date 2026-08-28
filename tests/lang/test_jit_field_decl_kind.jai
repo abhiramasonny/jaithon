@@ -26,18 +26,25 @@
 #: with a real function in it -- confirmed the hard way while investigating
 #: this fix, where `_push` turned out to be two unrelated functions of that
 #: name in the self-hosted compiler (see docs/agents/cleared-compiler.md).
-# jit-compiles: jfk_read_line, jfk_read_scale, jfk_read_ready
+# jit-compiles: jfk_read_line, jfk_read_scale, jfk_read_ready, jfk_read_marks
 from std.test import assert_eq, assert_near
 
 class JfkInner {
     pub var line: int
     pub var scale: float
     pub var ready: bool
+    #: A declared `list[T]`. Unlike the three scalars it needs a SECOND guard:
+    #: its tag is VAL_OBJ, which is every heap object, so proving the tag proves
+    #: nothing about the header the next arm will read. Reading ObjList's count
+    #: off a string is the shape that segfaulted the VM through the dict-index
+    #: arm, so the arm here proves OBJ_LIST before the entry claims to be one.
+    pub var marks: list[int]
 
     fn init(self, line: int, scale: float, ready: bool) {
         self.line = line
         self.scale = scale
         self.ready = ready
+        self.marks = [7, 8, 9]
     }
 }
 
@@ -60,6 +67,8 @@ fn jfk_read_line(o: JfkOuter) -> int { return jfk_inner_of(o).line }
 fn jfk_read_scale(o: JfkOuter) -> float { return jfk_inner_of(o).scale }
 
 fn jfk_read_ready(o: JfkOuter) -> bool { return jfk_inner_of(o).ready }
+
+fn jfk_read_marks(o: JfkOuter) -> int { return jfk_inner_of(o).marks[1] }
 
 #: Settles jfk_inner_of into its own standalone compiled form, called from
 #: OUTSIDE any of the three readers, before any of them run: a reader's own
@@ -91,6 +100,24 @@ fn jfk_warm_ready(o: JfkOuter) -> int {
         if jfk_read_ready(o) { t += 1 }
     }
     return t
+}
+
+fn jfk_warm_marks(o: JfkOuter) -> int {
+    var t = 0
+    for _i in 0..200 {
+        t += jfk_read_marks(o)
+    }
+    return t
+}
+
+pub fn test_list_field_off_a_predicted_receiver() -> void {
+    let outer = JfkOuter(JfkInner(11, 0.5, true))
+    assert_eq(jfk_warm_marks(outer), 8 * 200, "warm")
+    assert_eq(jfk_read_marks(outer), 8, "and after")
+    #: The second guard is what this asks for: swap the list for something that
+    #: is also VAL_OBJ and the read must deopt rather than read a list header
+    #: off it.
+    assert_eq(len(outer.inner.marks), 3, "still a list of three")
 }
 
 fn test_int_field_off_a_predicted_receiver() -> void {

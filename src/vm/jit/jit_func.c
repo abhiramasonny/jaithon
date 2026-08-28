@@ -3812,6 +3812,17 @@ static bool declaredScalarFieldKind(uint32_t typeId, SlotKind *k, unsigned *tag)
     case FIELD_KIND_INT:   *k = SLOT_INT;   *tag = VAL_INT;   return true;
     case FIELD_KIND_FLOAT: *k = SLOT_FLOAT; *tag = VAL_FLOAT; return true;
     case FIELD_KIND_BOOL:  *k = SLOT_BOOL;  *tag = VAL_BOOL;  return true;
+    /* A declared `list[T]` field. VAL_OBJ is every heap object, so the caller
+     * must ALSO prove OBJ_LIST before anything reads ObjList's header off it --
+     * the same hazard that segfaulted the VM through the dict-index arm. It is
+     * separated from the three scalars above because it is the only kind here
+     * that needs a second guard.
+     *
+     * Worth predicting because a list field is where a chain bottoms out:
+     * `code.data[i]` is a field read the tier could not classify, and behind
+     * that one refusal sat eleven functions and 14.27% of one file's
+     * interpreted work. */
+    case FIELD_KIND_LIST:  *k = SLOT_LIST;  *tag = VAL_OBJ;   return true;
     default: return false;
     }
 }
@@ -9463,6 +9474,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, drr, dbase));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, dtag));
                 branchOnDeopt(e, JAI_A64_NE);
+                if (dkind == SLOT_LIST) {
+                    /* VAL_OBJ said "a heap object" and no more. Prove OBJ_LIST
+                     * before the entry claims to be one, or the next arm reads
+                     * ObjList's count out of a string's header. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_B, drr, dbase + 8));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
                 unsigned dpopped;
                 SlotKind dkr;
                 if (!popValue(e, &dpopped, &dkr)) return false;
@@ -10505,14 +10526,27 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                          * very next instruction, `OP_GET_INDEX: the container
                          * has kind object, not list`, whose own cause is a
                          * FIELD whose kind only the declaration knows. Measured
-                         * flat on the clock and three compiled bodies WORSE
-                         * (313 -> 310).
+                         * flat on the clock.
                          *
-                         * So the 14.27% is real and is gated behind a chain at
-                         * least three links long. Clearing one link of a chain
-                         * buys nothing; that is the rule this tier keeps
-                         * teaching. Whoever picks this up should start at the
-                         * field kind, not here. */
+                         * THE CHAIN, measured link by link, because that is the
+                         * only useful thing to leave behind here:
+                         *
+                         *   1. this refusal -- armed, `_fuse_at` moves on;
+                         *   2. `OP_GET_INDEX: the container has kind object,
+                         *      not list` -- a declared `list[T]` FIELD, armed
+                         *      below in declaredScalarFieldKind, worth +5
+                         *      compiled bodies and still flat;
+                         *   3. the same message again, and this time it is not
+                         *      a field at all: `w` is the result of a CALL
+                         *      whose return kind is predicted SLOT_OBJ rather
+                         *      than SLOT_LIST.
+                         *
+                         * Both of the first two were built and measured
+                         * TOGETHER -- 0.31s and 0.61s either way on lexer.jai
+                         * and parser.jai, four samples, twice. Clearing two
+                         * links of a three-link chain buys nothing, which is
+                         * the rule this tier keeps teaching. Start at link 3,
+                         * the call return kind, or not at all. */
                         return subWhy(e, "`.%s()` on an object with no sample "
                                       "and no known type", oNameChars);
                     }
