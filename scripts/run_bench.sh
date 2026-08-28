@@ -241,13 +241,20 @@ if [[ "$SUITE" == "jaitensor" ]]; then
             "note: no python with torch was found, so the peer column will be empty." \
             "      Set JAITENSOR_PYTHON to one that has it to get a comparison." >&2
     fi
+    # CAPTURE_BASELINE=1 rewrites tests/bench/jaitensor/baseline.tsv from this
+    # run. It refuses on a contended machine, because a floor taken under load
+    # is the machine's floor and not the code's -- and this file is quoted as
+    # though it were the code's.
+    capture=()
+    [[ "${CAPTURE_BASELINE:-}" == "1" ]] && capture=(--capture-baseline)
     exec python3 "$ROOT/tests/bench/jaitensor/run_suite.py" \
         --root "$ROOT" \
         --jaithon "$JAITHON" \
         --python "$py" \
         --level "$LEVEL" \
         --runs "$RUNS" \
-        --build-kind "$BUILD_KIND"
+        --build-kind "$BUILD_KIND" \
+        "${capture[@]}"
 fi
 
 printf '%sbuilding ports...%s\r' "$DIM" "$RESET"

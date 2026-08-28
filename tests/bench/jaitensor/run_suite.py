@@ -230,6 +230,55 @@ def rate(work: int, seconds: float, scale: float = 1.0) -> str:
     return f"{work / seconds / scale:.1f}"
 
 
+
+#: A committed baseline, so "did my change move this row" is answerable.
+#:
+#: Without one the only figure with any history is the live `total_p / total_j`
+#: over the same run, which regresses against nothing. What is stored per row is
+#: the MINIMUM, not the median: on this machine the minimum reproduces to about
+#: 5% across sessions and the median does not, because a contended rep drags the
+#: median and leaves the floor alone.
+BASELINE = Path(__file__).with_name("baseline.tsv")
+
+
+def read_baseline() -> dict[str, float]:
+    rows: dict[str, float] = {}
+    try:
+        with open(BASELINE, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    try:
+                        rows[parts[0]] = float(parts[1])
+                    except ValueError:
+                        continue
+    except OSError:
+        pass
+    return rows
+
+
+def write_baseline(order: list[str], jai: dict[str, Samples], level: str,
+                   load: float) -> None:
+    lines = [
+        "# jaitensor per-row floor, seconds. Captured on a QUIET machine -- a row",
+        "# taken under load is not evidence and this file is quoted as if it were.",
+        "# The MINIMUM, not the median: the floor reproduces to ~5% across sessions",
+        "# and the median does not. Recapture with --capture-baseline, and do it as",
+        "# its own commit so a later diff does not absorb the drift.",
+        f"# level={level} load={load:.1f}",
+        "#",
+        "# row\tfloor_seconds",
+    ]
+    for name in order:
+        lines.append(f"{name}\t{min(jai[name].seconds):.9f}")
+    BASELINE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"wrote {BASELINE.name}: {len(order)} rows at level {level}, "
+          f"load {load:.1f}")
+
+
 def render(
     order: list[str],
     jai: dict[str, Samples],
@@ -238,13 +287,14 @@ def render(
     level: str,
     runs: int,
 ) -> None:
+    baseline = read_baseline()
     print(f"{build_kind} build, {level}, median of {runs} (CV shows run-to-run spread)")
     print(
         f"{'benchmark':<24} {'jaithon':>9} {'python3':>9} {'j CV':>7} {'p CV':>7} "
         f"{'j GFLOPS':>10} {'p GFLOPS':>10} {'j samp/s':>10} {'p samp/s':>10} "
-        f"{'speedup':>9}   result  route"
+        f"{'speedup':>9} {'vs base':>8}   result  route"
     )
-    print("─" * 150)
+    print("─" * 160)
 
     total_j = 0.0
     total_p = 0.0
@@ -263,6 +313,15 @@ def render(
             )
         jtime = left.median
         ptime = right.median if right is not None else 0.0
+        #: Compared floor to floor, and only flagged outside a 10% band. A
+        #: smaller band would fire on the machine rather than on the code: the
+        #: floor reproduces to about 5% across sessions here.
+        base = baseline.get(name)
+        if base is None or base <= 0.0:
+            delta = "—"
+        else:
+            moved = (min(left.seconds) - base) / base
+            delta = f"{moved * 100:+.0f}%" if abs(moved) > 0.10 else "ok"
         speed = f"{ptime / jtime:.2f}x" if right is not None else "—"
         # An em dash when the workload does not report one. It used to fall
         # back to "fused-mlp", which is a real route the conv benchmarks do not
@@ -283,7 +342,7 @@ def render(
             f"{(rate(right.flops, ptime, 1e9) if right is not None else '—'):>10} "
             f"{rate(left.samples, jtime):>10} "
             f"{(rate(right.samples, ptime) if right is not None else '—'):>10} "
-            f"{speed:>9}   ok      {route}"
+            f"{speed:>9} {delta:>8}   ok      {route}"
         )
         total_j += jtime
         total_flops += left.flops
@@ -386,6 +445,10 @@ def main() -> int:
     parser.add_argument("--level", choices=("easy", "medium", "hard"), required=True)
     parser.add_argument("--runs", type=int, required=True)
     parser.add_argument("--build-kind", default="unattributed")
+    parser.add_argument("--capture-baseline", action="store_true",
+                        help="rewrite baseline.tsv from this run; refuses on a "
+                             "contended machine, because a floor taken under "
+                             "load is not a floor")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
@@ -410,10 +473,20 @@ def main() -> int:
         render(order, jai, peer, args.build_kind, args.level, args.runs)
         loads = [entry[0] for entry in seen]
         hogs = [entry[1] for entry in seen]
+        contended = max(loads) > LOAD_CEILING or max(hogs) >= 40.0
         verdict = ("CONTENDED -- treat these numbers as indicative only"
-                   if max(loads) > LOAD_CEILING or max(hogs) >= 40.0 else "quiet")
+                   if contended else "quiet")
+        #: The footer goes out before anything can fail, so a refused capture
+        #: still tells you what the machine was doing when it refused.
         print(f"load {min(loads):.1f}-{max(loads):.1f} during the run, "
               f"mediaanalysisd peak {max(hogs):.0f}% CPU; {verdict}")
+        if args.capture_baseline:
+            if contended:
+                print(f"jaitensor bench: refusing to capture a baseline at load "
+                      f"{max(loads):.1f}; the floor would be the machine's, not "
+                      f"the code's.", file=sys.stderr)
+                return 1
+            write_baseline(order, jai, args.level, max(loads))
     except BenchError as error:
         print(f"jaitensor bench: {error}", file=sys.stderr)
         return 1
