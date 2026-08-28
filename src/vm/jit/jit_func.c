@@ -4176,6 +4176,37 @@ static bool emitStringConcat(Emit *e, Value sample) {
     return true;
 }
 
+/* Put a local on the model stack, the way OP_GET_LOCAL does, for an arm that
+ * needs stack operands but was handed slot numbers. Only the general X path --
+ * a float local wants OP_GET_LOCAL's FP handling and no caller here has one. */
+static bool pushLocalAsValue(Emit *e, unsigned slot) {
+    if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
+                    e->localClass[slot],
+                    localObserved(e, slot) ? e->observed[slot]
+                                           : e->localSeen[slot],
+                    (int)slot)) {
+        return false;
+    }
+    unsigned home = localHomeX(e, slot);
+    if (home != 0) {
+        xBorrowLocal(e, e->valueDepth - 1, home);
+    } else {
+        unsigned dst = pushReg(e) - 1;
+        unsigned src = localIn(e, slot, dst);
+        if (src != dst) emit(e, jaiA64MovX(dst, src));
+    }
+    return true;
+}
+
+static bool jitConcatLocals(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_CONCAT_LOCALS");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* A builtin whose whole body is a load from its receiver (jit_field_read.h).
  * The caller has already guarded that the receiver is `fr->type`, so the load
  * is the entire call: no callee Value, no argument Value, no root fill, no
@@ -7045,10 +7076,48 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_ADD_LOCALS: {
             unsigned a = jaiReadU16(code + off + 1);
             unsigned b = jaiReadU16(code + off + 3);
-            if (!localInRange(e, a) || !localInRange(e, b)) return false;
+            if (!localInRange(e, a) || !localInRange(e, b)) {
+                return subWhy(e, "a fused add of a local the model does not "
+                              "cover");
+            }
             SlotKind ka2 = e->localKind[a];
-            if (ka2 != e->localKind[b]) return false;
-            if (ka2 != SLOT_INT && ka2 != SLOT_FLOAT) return false;
+            /* Named: this was 148 declines across four compiler files reading
+             * only "OP_ADD_LOCALS", with nothing in them to act on. */
+            if (ka2 != e->localKind[b]) {
+                return subWhy(e, "a fused add of a %s and a %s",
+                              slotKindName(ka2), slotKindName(e->localKind[b]));
+            }
+            if (ka2 == SLOT_OBJ && jitConcatLocals() && e->callsOut &&
+                !e->inlining) {
+                /* `out = out + piece` -- string building, and the fused form is
+                 * the one real code emits. The stack `+` already had a concat
+                 * arm; this opcode did not, so an OSR loop doing the commonest
+                 * thing a lexer does declined WHOLE: the probe is 4,001,920
+                 * interpreted instructions and the census showed 28 of these in
+                 * parser.jai alone reading only "a fused add of two objects".
+                 *
+                 * The operands are slot numbers here and emitStringConcat wants
+                 * stack entries, so they are pushed first. That is the cost the
+                 * fusion existed to avoid, and it is nothing next to a call
+                 * that allocates a string. Both operands are guarded inside
+                 * emitStringConcat, so a sample that turns out wrong deopts at
+                 * this instruction with both locals untouched. */
+                Value sa = localObserved(e, a) ? e->observed[a]
+                                               : e->localSeen[a];
+                Value sb = localObserved(e, b) ? e->observed[b]
+                                               : e->localSeen[b];
+                if (IS_STRING(sa) && IS_STRING(sb)) {
+                    if (a == 0 || b == 0) e->usesSlot0 = true;
+                    if (!pushLocalAsValue(e, a)) return false;
+                    if (!pushLocalAsValue(e, b)) return false;
+                    if (!emitStringConcat(e, sa)) return false;
+                    off += 5;
+                    break;
+                }
+            }
+            if (ka2 != SLOT_INT && ka2 != SLOT_FLOAT) {
+                return subWhy(e, "a fused add of two %ss", slotKindName(ka2));
+            }
             if (a == 0 || b == 0) e->usesSlot0 = true;
             if (!pushValue(e, ka2, 0, NULL)) return false;
             if (ka2 == SLOT_FLOAT && !e->dynamicLocal[a] &&
