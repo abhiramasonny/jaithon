@@ -5877,6 +5877,15 @@ static const NativeResult kNativeResults[] = {
  * people measuring one change tonight two-binary got 3.9x, 100x and 6%
  * SLOWER for what a switch settled in one command. */
 /* JAITHON_JIT_NEGATE=0 turns off the OP_NEG arm, for a one-binary A/B. */
+static bool jitSoftField(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SOFT_FIELD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static bool jitMembership(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -8267,12 +8276,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->localClass[slot] == NULL) {
                 return subWhy(e, "receiver local %u has no pinned class", slot);
             }
-            if (e->localKind[slot] == SLOT_MAYBE_INST) {
-                unsigned rcv = localIn(e, slot, JIT_SCRATCH_A);
-                emit(e, jaiA64SubsXImm(31, rcv, 0));
-                branchOnDeopt(e, JAI_A64_EQ);
-            }
-            if (slot == 0) e->usesSlot0 = true;
+            /* The name is resolved BEFORE the receiver guard is emitted, so
+             * that a name this arm cannot read reaches `unarmedOpcode` with
+             * nothing half-emitted -- the unarmed path takes over at the start
+             * of an instruction. */
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) {
                 return subWhy(e, "the field name is not in the pool");
             }
@@ -8284,13 +8291,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* The commonest of the four by a wide margin, and the one that
              * reads as a puzzle without being named: `self.method` is a METHOD,
              * and jaiClassFieldInfo only knows fields, so every
-             * `return self.m(x)` written as a value lands here. */
+             * `return self.m(x)` written as a value lands here.
+             *
+             * It is 88 of resolve.jai's 104 OP_GET_FIELD_LOCAL declines, and
+             * every one is the same shape: a keyword call to a private method,
+             * `self._error(code, start, end, msg, help: "...")`. A keyword
+             * argument rules out OP_INVOKE, so codegen has to materialise the
+             * callee, and reading a method name as a value lands here.
+             *
+             * Those calls are on ERROR paths -- the lexer reaching a malformed
+             * token -- which is what makes the unarmed path the right answer
+             * rather than a decline, and the same reason OP_GET_GLOBAL takes it
+             * for `throw ValueError(...)`. Softening a HOT refusal is a loss:
+             * the same change on OP_GET_INDEX's `d[k]` measured 18% slower,
+             * because a body that deopts every iteration costs more than one
+             * that is simply interpreted. Cold is the whole condition. */
             if (info == NULL) {
+                if (!e->osr && jitSoftField()) goto unarmedOpcode;
                 return subWhy(e, "`%s` is not a field of %s",
                               AS_STRING(nameVal)->chars,
                               e->localClass[slot]->name
                                   ? e->localClass[slot]->name->chars : "?");
             }
+            if (e->localKind[slot] == SLOT_MAYBE_INST) {
+                unsigned rcv = localIn(e, slot, JIT_SCRATCH_A);
+                emit(e, jaiA64SubsXImm(31, rcv, 0));
+                branchOnDeopt(e, JAI_A64_EQ);
+            }
+            if (slot == 0) e->usesSlot0 = true;
             if (info->isStatic) {
                 return subWhy(e, "`%s` is a static", AS_STRING(nameVal)->chars);
             }
