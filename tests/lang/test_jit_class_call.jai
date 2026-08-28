@@ -20,12 +20,19 @@
 #:
 #: What this file holds down:
 #:
-#:   THE BINDING. `klass->statics.version` retires the baked callee. It is
-#:   the counter that moves when `Box.make = other` overwrites the member --
-#:   `keyVersion` does NOT, because overwriting an existing key never moves
-#:   its entry, and a body pinned on keyVersion would call the old closure
-#:   for ever. test_a_rebound_static_is_picked_up is that case: with the
-#:   version guard removed it answers 400008 where 2000000 is correct.
+#:   THE BINDING. The arm re-reads the static out of its table entry on
+#:   every call and compares it against the closure it compiled against, so
+#:   `Box.make = other` is seen. test_a_rebound_static_is_picked_up is that
+#:   case: with the guard removed it answers 400008 where 2000000 is
+#:   correct, which is what makes it a test of the guard rather than of the
+#:   interpreter.
+#:
+#:   It read `klass->statics.version` instead until that was found unsound:
+#:   the counter is 32 bits and bumps on EVERY static write, so 2^32 writes
+#:   -- about 84 seconds of an ordinary `Klass.counter = n` loop -- wrap it
+#:   back onto the baked value and the callee goes stale silently. A test
+#:   for that costs a minute and a half, so it lives as a probe rather than
+#:   here; see docs/agents/REVIEW-class-calls.md.
 #:
 #:   WHAT IS NOT ADMITTED. An instance method IS reachable through the class
 #:   -- `Box.twice(4)` resolves and runs -- but it gets the CLASS as `self`
@@ -37,7 +44,7 @@
 #: expectations and the plain run proves the compiled code agrees. Under
 #: `JAITHON_JIT_DEOPT_STRESS=1` every guard fires on every iteration, which
 #: is what turns a wrong resume point into a wrong answer: the arguments are
-#: still on the interpreter's stack at the version guard, and the call has
+#: still on the interpreter's stack at the binding guard, and the call has
 #: already happened at the result's tag guard, so a deopt that resumed at the
 #: invoke rather than after it would call twice.
 #:

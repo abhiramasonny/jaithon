@@ -5405,30 +5405,38 @@ static bool emitModuleCall(Emit *e, ObjModule *m, Value calleeVal,
  *   table is admitted. `klass->methods` is deliberately NOT consulted -- see
  *   the call site, which declines an instance method named through the class.
  *
- *   WHAT RETIRES THE BAKED CALLEE is `klass->statics.version`, and it is a
- *   counter that already exists rather than a new one. `Klass.name = v` reaches
- *   jaiSetProperty's IS_CLASS arm, which requires the key to be present already
- *   and then calls jaiTableSetInterned -- an overwrite, which never moves an
- *   entry and so never bumps `keyVersion` (that is the whole point of the
- *   keyVersion/version split; see the same trap written up at emitModuleCall).
- *   It does bump `version`, because tableSetHashed bumps it on every value
- *   write. And every event that moves keyVersion -- rehash, delete, clear --
- *   bumps `version` too, so this one word subsumes the address guard the
- *   static-FIELD arm needs a separate emitStaticsGuard for.
+ *   WHAT RETIRES THE BAKED CALLEE is the BINDING itself, re-read from the
+ *   statics entry on every call and compared against the closure this site was
+ *   compiled against. `Klass.name = v` reaches jaiSetProperty's IS_CLASS arm,
+ *   which requires the key to be present already and then overwrites in place,
+ *   so the entry never moves and reading it back asks the direct question: is
+ *   this still what I compiled for.
  *
- *   Coarser than it has to be: writing any OTHER static of the same class bumps
- *   it as well, and the callee is retired for a write that could not have
- *   changed it. That is a deopt, not a wrong answer, and it costs nothing today
- *   because no arm compiles a static STORE -- a loop that writes a static
- *   declines before it gets here.
+ *   It was a COUNTER first -- `klass->statics.version`, which tableSetHashed
+ *   bumps on every value write -- and that was unsound. The field is uint32_t
+ *   (table.h) and nothing filters the bump the way jaiModuleSet filters
+ *   ObjModule::version through jaiValueIsInertGlobal, so an ordinary
+ *   `Klass.counter = n` loop drives it at 51M writes/sec, measured. Land the
+ *   count exactly 2^32 on from the bake and the guard reads the value it baked
+ *   while the binding has changed: `Box.make` rebound after 2^32 writes
+ *   answered 400008, against 2000000 from the interpreter, from the arm
+ *   switched off, and from a control one write short. That is about 84 seconds
+ *   of a loop any program might contain, not an unreachable corner.
  *
- * Guarding a version rather than the callee POINTER is also what makes this
- * GC-safe. Comparing `entry->value` against the baked ObjClosure* would pass if
- * the original closure were collected after a rebind and a fresh object landed
- * at the same address; the version has moved by then, so the guard fires before
- * the stale pointer is ever loaded. */
-static bool emitClassCall(Emit *e, ObjClass *klass, Value calleeVal,
-                          unsigned ridx, unsigned argc, uint32_t after) {
+ *   Reading the binding is also strictly less trigger-happy than the counter,
+ *   which retired the callee whenever any OTHER static of the same class was
+ *   written. It costs 1.8% of the win (0.551s -> 0.561s on a 32M-call probe
+ *   against 1.130s with the arm off).
+ *
+ * `keyVersion` is still needed, for a different job: it makes the entry ADDRESS
+ * trustworthy. It moves on rehash, delete and clear -- never on an overwrite
+ * (table.c: insertAt bumps it only for a NEW key) -- so unlike `version` a
+ * running program cannot drive it. It is the guard the static-FIELD arm stands
+ * on, baked per site here rather than through e->staticsTable so that a body
+ * naming two classes still compiles both. */
+static bool emitClassCall(Emit *e, ObjClass *klass, JaiEntry *slot,
+                          Value calleeVal, unsigned ridx, unsigned argc,
+                          uint32_t after) {
     ObjFunction *cfn = AS_CLOSURE(calleeVal)->fn;
     if (cfn->jitFunc == NULL) {
         return subWhy(e, "a static that has not compiled");
@@ -5477,9 +5485,30 @@ static bool emitClassCall(Emit *e, ObjClass *klass, Value calleeVal,
 
     settleAll(e);
     emitConst64(e, JIT_SCRATCH_D,
-                (int64_t)(uintptr_t)&klass->statics.version);
+                (int64_t)(uintptr_t)&klass->statics.keyVersion);
     emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
-    emitConst64(e, JIT_SCRATCH_B, (int64_t)(uint32_t)klass->statics.version);
+    emitConst64(e, JIT_SCRATCH_B, (int64_t)(uint32_t)klass->statics.keyVersion);
+    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+    branchOnDeopt(e, JAI_A64_NE);
+
+    /* The tag before the pointer, so a static rebound to an int whose payload
+     * happened to equal the closure's address is not called as if it were the
+     * closure.
+     *
+     * Comparing against the LIVE binding is also what makes address recycling
+     * harmless rather than dangerous. If the old closure were collected and a
+     * new object took its address, the object bound NOW is the one at that
+     * address, and emitDescriptor's callee slot goes through jaiCallValue,
+     * which dispatches on the value dynamically -- including raising, if what
+     * is bound there is not callable. */
+    emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)slot);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                       (unsigned)offsetof(JaiEntry, value)));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, VAL_OBJ));
+    branchOnDeopt(e, JAI_A64_NE);
+    emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                       (unsigned)offsetof(JaiEntry, value) + 8u));
+    emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(calleeVal));
     emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
     branchOnDeopt(e, JAI_A64_NE);
 
@@ -9694,7 +9723,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                   AS_STRING(sname)->chars,
                                   jaiTypeNameStatic(smember));
                 }
-                if (!emitClassCall(e, scls, smember, ridx, argc,
+                /* The ENTRY, not just the value: the guard reads the
+                 * binding back out of this slot on every call. */
+                JaiEntry *sslot =
+                    jaiTableFindEntryInterned(&scls->statics, AS_STRING(sname));
+                if (sslot == NULL) {
+                    return subWhy(e, "a static with no table entry");
+                }
+                if (!emitClassCall(e, scls, sslot, smember, ridx, argc,
                                    (uint32_t)(off + 7))) {
                     return false;
                 }
