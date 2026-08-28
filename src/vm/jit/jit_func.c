@@ -8546,7 +8546,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * for `throw ValueError(...)`. Softening a HOT refusal is a loss:
              * the same change on OP_GET_INDEX's `d[k]` measured 18% slower,
              * because a body that deopts every iteration costs more than one
-             * that is simply interpreted. Cold is the whole condition. */
+             * that is simply interpreted. Cold is the whole condition.
+             *
+             * `!e->osr` is the same rule again, and measured too: inside a loop
+             * nothing is cold. Dropping that guard compiles six MORE bodies in
+             * resolve.jai (277 -> 283) and cancels the win -- 0.272s becomes
+             * 0.274-0.294s against 0.274-0.284s for the hard refusal, where the
+             * non-OSR-only form was a clean 3%. A loop that deopts inside
+             * itself pays the entry and the exit every iteration. */
             if (info == NULL) {
                 if (!e->osr && jitSoftField()) goto unarmedOpcode;
                 return subWhy(e, "`%s` is not a field of %s",
