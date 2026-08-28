@@ -420,10 +420,15 @@ typedef struct {
 
 /* Instance-typed slots one compiled loop may pin a class shape on. A (slot,
  * shape) pair list rather than a shape beside every kind: 40 shapes per form
- * times JAI_OSR_MAX forms is 640 bytes on every ObjFunction, and a loop with
- * more than eight distinct instance locals does not exist in this tree. A form
- * that would need more is refused rather than compiled unguarded. */
-#define JAI_OSR_SHAPES 8
+ * times JAI_OSR_MAX forms would be 640 bytes on every ObjFunction. A form that
+ * would need more is refused rather than compiled unguarded.
+ *
+ * Was 8, on the grounds that "a loop with more than eight distinct instance
+ * locals does not exist in this tree". It does: jaicv's `connected_components`
+ * has two such heads and each is refused eighty times in one `imgproc` run.
+ * Sixteen costs 5 bytes a shape times 4 forms = 160 more bytes on every
+ * ObjFunction. */
+#define JAI_OSR_SHAPES 16
 
 /* A compiled loop: where it starts, and what each slot must hold to enter. */
 typedef struct {

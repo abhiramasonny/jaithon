@@ -46,6 +46,20 @@ static uintptr_t stackLimit(void) {
 
 #define JIT_FIRST_SAVED 19u   /* x19..x28 are callee-saved and ours */
 #define JIT_MAX_SAVED   10u
+/* How many live values one call out can root, which is NOT the register budget
+ * above even though it was the same number for a long time. The register count
+ * is a hardware fact: x19..x28 is ten and cannot be more. The root count is the
+ * length of an ARRAY on the frame, and what it bounds is mostly LOCALS --
+ * emitRootFill walks every object-kind local, and a local that earned no
+ * register lives in memory, so the count is not tied to the ten at all.
+ *
+ * Sharing the constant made "too many roots" one of the hottest refusals in
+ * jaicv: eighty attempts at each of five offsets in one `imgproc` run, on a
+ * package whose functions routinely hold a dozen Mats. The price of the split
+ * is 14 more Values (224 bytes) on the frame of a body that calls out, which
+ * carries it past the 504 bytes that keep the cheap stp-pre prologue -- one or
+ * two extra instructions once per body, against a whole body compiling. */
+#define JIT_MAX_ROOTS   24u
 /* Model entries, not register count -- an inlined body's operand-stack entries live in their own bank, wider than x19..x28. */
 #define JIT_MAX_STACK   20u
 /* Slots the compile-time model can describe, not the register budget: a declared frame can be wider
@@ -99,7 +113,7 @@ typedef struct JitCallDesc {
     /* link/nroots come first so `roots` sits at a fixed offset from the chain head; link != NULL means this descriptor is on the collector's walk chain. */
     struct JitCallDesc *link;
     int64_t nroots;
-    Value   roots[JIT_MAX_SAVED];
+    Value   roots[JIT_MAX_ROOTS];
     Value   callee;
     Value   args[JIT_MAX_ARGS_OUT];
     Value   result;
@@ -3674,6 +3688,32 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
  * OP_FOR_ITER_BIND no longer makes -- the default test sent `exhausted` to the throw stub, which found no pending exception and died on "internal error: failed operation raised nothing". Kept because any helper with a three-way answer needs it, and because the lesson is not rediscoverable from the code. */
 /* Root-fills the descriptor: shared by the descriptor path (a C helper pushes them) and the self-call
  * path (the emitted code links the descriptor onto the collector's frame chain instead, since a bare `bl` pushes nothing). */
+/* JAITHON_JIT_SHAPE_LIMIT=8 puts the OSR instance-shape cap back where it was,
+ * for a one-binary A/B. The array in JaiOsrForm is always the wider one, so
+ * only the refusal moves. */
+static unsigned jitShapeLimit(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SHAPE_LIMIT");
+        cached = (v != NULL) ? atoi(v) : (int)JAI_OSR_SHAPES;
+        if (cached < 1 || cached > (int)JAI_OSR_SHAPES) cached = (int)JAI_OSR_SHAPES;
+    }
+    return (unsigned)cached;
+}
+
+/* JAITHON_JIT_ROOT_LIMIT=10 puts the root cap back where it was when it shared
+ * the register budget, for a one-binary A/B. The ARRAY is always the wider one,
+ * so only the refusal moves. */
+static unsigned jitRootLimit(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ROOT_LIMIT");
+        cached = (v != NULL) ? atoi(v) : (int)JIT_MAX_ROOTS;
+        if (cached < 1 || cached > (int)JIT_MAX_ROOTS) cached = (int)JIT_MAX_ROOTS;
+    }
+    return (unsigned)cached;
+}
+
 static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
     unsigned nroots = 0;
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
@@ -3684,7 +3724,9 @@ static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
             e->localKind[slot] != SLOT_MAYBE_INST) {
             continue;
         }
-        if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
+        if (nroots >= jitRootLimit()) {
+            e->whyNot = "too many roots"; return false;
+        }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
                       nroots * (unsigned)sizeof(Value);
         unsigned rslot = localIn(e, slot, JIT_SCRATCH_C);
@@ -3708,7 +3750,9 @@ static bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
             k != SLOT_ITER && k != SLOT_MAYBE_INST) {
             continue;
         }
-        if (nroots >= JIT_MAX_SAVED) { e->whyNot = "too many roots"; return false; }
+        if (nroots >= jitRootLimit()) {
+            e->whyNot = "too many roots"; return false;
+        }
         unsigned at = d + (unsigned)offsetof(JitCallDesc, roots) +
                       nroots * (unsigned)sizeof(Value);
         emitTagFor(e, k, reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
@@ -11157,16 +11201,27 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * does let the mutually recursive groups in: json_parse's `value`,
              * `object`, `array` and `integer` all reach the tier.
              *
-             * It is kept because it is FASTER, which nobody had measured.
-             * Declining here falls into emitUnarmedDeopt just below, which
-             * interprets from this instruction ONWARD rather than giving the
-             * whole body up. Admitting the callee skips that escape hatch, and
-             * the body then walks on to a refusal that takes all of it --
-             * `value` itself stops at "callee's return kind not usable". Net on
-             * `check --no-cache parser.jai`, stable across three runs each:
-             * 284 function-tier bodies with the check, 275 without. Five bodies
-             * gained, fourteen lost. json_parse's own wall clock does not move
-             * (0.05s either way) and neither does the compiler's.
+             * It is kept because removing it does not pay, which nobody had
+             * measured. Net on `check --no-cache parser.jai`, stable across
+             * three runs each: 284 function-tier bodies with the check, 275
+             * without -- five gained, fourteen lost. An independent measurement
+             * at a different commit found the same direction (265 to 258, seven
+             * gained and thirteen lost). json_parse's own wall clock does not
+             * move (0.05s either way) and neither does the compiler's.
+             *
+             * TWO things make it come out that way, and the second is the one
+             * that is easy to miss. Declining here falls into emitUnarmedDeopt
+             * just below, which interprets from this instruction ONWARD rather
+             * than giving the whole body up; admitting the callee skips that
+             * escape hatch and the body walks on to a refusal that costs all of
+             * it -- `value` itself then stops at "callee's return kind not
+             * usable". AND: admitting callees earlier changes how much
+             * interpreted work happens before OTHER, unrelated functions cross
+             * their own call-count hotness threshold in a fixed workload, so
+             * some fall short of a threshold they used to clear and others
+             * clear one they used to miss. The name sets differ in both
+             * directions for that reason, and neither count is a general
+             * verdict about the tier.
              *
              * So: removable, and not worth removing. If the unarmed-deopt path
              * ever stops being the better half of that trade, this is one line.
@@ -13888,12 +13943,12 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         SlotKind k = e.localKind[i];
         if (k != SLOT_INST && k != SLOT_MAYBE_INST) continue;
         if (e.localShape[i] == 0) continue;   /* no class pinned to this slot */
-        if (form->shapeCount >= JAI_OSR_SHAPES) {
+        if (form->shapeCount >= jitShapeLimit()) {
             if (getenv("JAI_JIT_WHY")) {
-                fprintf(stderr, "[jit] osr %s at %u stopped: more than %d "
+                fprintf(stderr, "[jit] osr %s at %u stopped: more than %u "
                         "instance slots to pin\n",
                         fn->name ? fn->name->chars : "<anon>", top,
-                        JAI_OSR_SHAPES);
+                        jitShapeLimit());
             }
             return false;
         }
