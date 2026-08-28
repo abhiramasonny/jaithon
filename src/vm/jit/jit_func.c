@@ -11061,6 +11061,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                      * the string the program passed. */
                     emit(e, jaiA64MovX(ar, JIT_SCRATCH_A));
                     e->stack[e->depth - 1] = SLOT_INT;
+                    /* The entry keeps its register and changes kind, so the
+                     * claims made about the STRING that was in it go with it. */
+                    e->stackObjType[e->depth - 1] = 0;
+                    e->stackElem[e->depth - 1] = NULL_VAL;
                     dropCalleeEntry(e);
                     off += 2;
                     break;
@@ -11091,8 +11095,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     return subWhy(e, "`%s` has no known result kind for a %s "
                                      "argument", nm, slotKindName(ak));
                 }
-                /* The result stays in the argument's register. */
+                /* The result stays in the argument's register, so the claims
+                 * made about what WAS in it go with it. */
                 e->stack[e->depth - 1] = toFloat ? SLOT_FLOAT : SLOT_INT;
+                e->stackObjType[e->depth - 1] = 0;
+                e->stackElem[e->depth - 1] = NULL_VAL;
                 dropCalleeEntry(e);
                 off += 2;
                 break;
