@@ -80,6 +80,7 @@ static _Atomic uint64_t gMeterHostWaitNs;
 static _Atomic uint32_t gMeterHostWaits;
 static _Atomic uint64_t gMeterHostWaitMaxNs;
 static _Atomic uint32_t gMeterDropped;
+static _Atomic uint32_t gMeterMpsSwaps;
 static double           gMeterWallStart;
 static int              gMeterOn = -1;
 
@@ -112,6 +113,16 @@ static void meterNote(id<MTLCommandBuffer> done, uint32_t dispatches) {
     gMeterSpans[slot].start      = done.GPUStartTime;
     gMeterSpans[slot].end        = done.GPUEndTime;
     gMeterSpans[slot].dispatches = dispatches;
+}
+
+/* MPSGraph is handed the open command buffer and may commit it and hand back a
+ * different root (see the two MPSCommandBuffer sites). Anything it committed
+ * that way never carried our completion handler, so its GPU time is not in the
+ * span set. We cannot see that work; we can at least count the swaps and refuse
+ * to report an occupancy that pretends otherwise. */
+static void meterNoteMpsSwap(void) {
+    if (!meterOn()) return;
+    atomic_fetch_add(&gMeterMpsSwaps, 1u);
 }
 
 static void meterHostWait(uint64_t ns) {
@@ -163,6 +174,12 @@ static void meterReport(void) {
             n, (unsigned long long)dispatches, busy > 0.0 ? raw / busy : 0.0,
             atomic_load(&gMeterHostWaits), waitS * 1e3,
             (double)atomic_load(&gMeterHostWaitMaxNs) * 1e-6);
+    const uint32_t swaps = atomic_load(&gMeterMpsSwaps);
+    if (swaps != 0) {
+        fprintf(stderr, "             %u MPSGraph command-buffer swaps: that"
+                        " work is NOT in the span set, so occupancy is a"
+                        " LOWER bound\n", swaps);
+    }
     const uint32_t dropped = atomic_load(&gMeterDropped);
     if (dropped != 0) {
         fprintf(stderr, "             %u buffers past the %d-span cap were not"
@@ -1913,6 +1930,7 @@ static bool encodeGraphOnAsync(MPSGraph *graph,
                 targetOperations:nil
                resultsDictionary:results
              executionDescriptor:execDesc];
+    if (mps.rootCommandBuffer != gAsyncCommands) meterNoteMpsSwap();
     gAsyncCommands = mps.rootCommandBuffer;
     gAsyncEncoder = nil;
     return gAsyncCommands != nil;
@@ -2695,6 +2713,7 @@ static bool encodeMlpExecutableOnAsyncArrays(
     } else {
         return false;
     }
+    if (mps.rootCommandBuffer != gAsyncCommands) meterNoteMpsSwap();
     gAsyncCommands = mps.rootCommandBuffer;
     gAsyncEncoder = nil;
     return gAsyncCommands != nil;
