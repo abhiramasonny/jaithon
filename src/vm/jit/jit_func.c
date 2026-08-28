@@ -2668,6 +2668,133 @@ static void emitOneByteString(Emit *e, unsigned at, unsigned reg, unsigned dst) 
     emit(e, jaiA64LdrByte(dst, dst, 0));
 }
 
+/* A/B switch, default on, and not optional: the machine runs several agents at
+ * once, so before and after have to be the same binary minutes apart rather
+ * than two binaries. JAITHON_JIT_STRCMP=0 puts the arm below back to the
+ * decline it was, with nothing else changed. */
+static bool jitStrCmpOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_STRCMP");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* PROTOTYPE, second switch: send `==`/`!=` to the leaf call when the operands
+ * are not KNOWN interned, instead of letting the pointer arm compile a guard
+ * that deoptimises on every iteration. Default on; JAITHON_JIT_STRCMP_EQ=0
+ * restores the arm exactly as proposed. */
+static bool jitStrCmpEqOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_STRCMP_EQ");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* A sample that is interned says the site is an interned-string site, which is
+ * a prediction the pointer arm's own subFlag guard already checks. What it is
+ * used for here is only which arm to emit. */
+static bool knownInternedString(const Emit *e, unsigned at) {
+    if (e->stackAscii[at]) return true;
+    Value v = e->stackSeen[at];
+    return IS_STRING(v) && JAI_STR_INTERNED(AS_STRING(v));
+}
+
+/* True when the pointer arm should stand aside for the leaf call at this
+ * equality site: the leaf call has to be available (same switch, same
+ * inlining rule) and at least one operand must not be known interned. */
+static bool preferLeafEquality(const Emit *e, unsigned da, unsigned db) {
+    if (!jitStrCmpEqOn() || !jitStrCmpOn() || e->inlining) return false;
+    return !(knownInternedString(e, da) && knownInternedString(e, db));
+}
+
+/* `a <=> b` for two strings whose lengths nothing knows, as a guarded LEAF
+ * call. Leaves NZCV set from `cmp x0, #0`, which is the shape every other arm
+ * in these switches leaves behind, so the `cset` or the branch after it is
+ * unchanged and all six operators come out of the one sequence: the order is
+ * -1, 0 or 1, and `a OP b` is `order OP 0` for every one of them.
+ *
+ * WHY THIS IS NOT THE PREDICTION THE ONE-BYTE ARM REFUSED. That comment says a
+ * sample can lie -- OP_GET_INDEX hands its result the RECEIVER as a sample --
+ * so a general compare compiled on a guess about LENGTH would deopt every
+ * iteration, which is worse than never compiling the body. Nothing here
+ * predicts a length. `Obj.type == OBJ_STRING` is EXACT: every string passes it,
+ * so there is no deopt loop, and the sample is used only to decide that the
+ * arm is worth emitting at all.
+ *
+ * WHY A LEAF AND NOT A DESCRIPTOR. jaiStringOrder allocates nothing, roots
+ * nothing and cannot re-enter the interpreter, so it needs none of the dozen
+ * stores, the root fill or the collector-chain link a descriptor call pays --
+ * far more than an eleven-byte memcmp costs, and it would have measured zero
+ * or worse. Modelled on the jitInstanceAlloc call in emitCallOut, which is a
+ * leaf for the same reason.
+ *
+ * WHAT IT CLOBBERS, and how each is accounted for:
+ *   - x0..x17 and x30, per AAPCS64. The operand stack is in x0..x8 whenever
+ *     the body is otherwise call-free (Emit::scratchValues) or split
+ *     (Emit::splitAt), so this goes through noteScratchClobber like every
+ *     other call out: the measuring pass records the site, which turns
+ *     scratchValues off for the whole body and puts the split boundary at or
+ *     above this depth, and the real pass fails the compile if it reaches here
+ *     with values in scratch anyway. It also retires the field-kind memos,
+ *     which over-retires (this callee writes no field) and costs a tag guard.
+ *   - v16.. -- the FP half of the operand bank is caller-saved on purpose.
+ *     fpSyncAll below writes every live float entry back to its X home first.
+ *     Float LOCALS are in v8..v15, which the ABI preserves.
+ *   - x13..x17, which planHoists spends on loop-invariant list headers. The
+ *     same noteScratchClobber recorded the offset, so regionCalls reports this
+ *     loop as calling and no header is hoisted out of it; the ratchet in
+ *     noteScratchClobber fails the compile if the two passes ever disagree.
+ *   - x30, saved by emitFrameEnter at entry on every path.
+ * The body is NOT call-free for register planning afterwards, and that is the
+ * real price of this arm: a body whose only call is this one loses x0..x8 for
+ * its operand stack and can decline for want of registers where it used to
+ * compile. Measured anyway -- see docs/agents/string-compare.md. */
+static void emitStringOrder(Emit *e) {
+    unsigned da = e->depth - 2, db = e->depth - 1;
+    /* Settled before anything is read: the guards record deopts, which cannot
+     * describe a deferred entry, and the call would destroy a borrowed one. */
+    settleAll(e);
+    fpSyncAll(e);
+    unsigned ra = valueXReg(e, e->valueDepth - 2);
+    unsigned rb = valueXReg(e, e->valueDepth - 1);
+
+    /* Both operands, before either is consumed, so a miss resumes at this
+     * instruction with the pair still on the interpreter's stack -- and the
+     * interpreter then raises whatever the operator raises for the pair it
+     * actually has. */
+    for (unsigned side = 0; side < 2; side++) {
+        /* What the ASCII table produced is a string by construction; see the
+         * same skip in OP_EQ. */
+        if (e->stackAscii[side == 0 ? da : db]) continue;
+        unsigned r = side == 0 ? ra : rb;
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, r, (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+        branchOnDeopt(e, JAI_A64_NE);
+    }
+
+    /* Into x0/x1 without assuming where the operands live. The split bank puts
+     * entries in x0..x8, and although this call's own depth is what the
+     * boundary is chosen from, a `mov` that reads a register it has already
+     * written is a miscompile rather than a decline -- so the aliasing is
+     * handled instead of argued away. */
+    if (rb == 0) {
+        emit(e, jaiA64MovX(JIT_SCRATCH_C, rb));
+        rb = JIT_SCRATCH_C;
+    }
+    if (ra != 0) emit(e, jaiA64MovX(0, ra));
+    if (rb != 1) emit(e, jaiA64MovX(1, rb));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jaiStringOrder);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    /* The whole of x0: jaiStringOrder returns int64_t precisely so this does
+     * not have to trust the top half of a 32-bit return. */
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+}
+
 static int instructionLength(const Chunk *c, int off);
 
 /* One past the LAST back edge to `top`, or 0 if nothing branches back there.
@@ -7479,7 +7606,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXReg(31, ra, rb));
             } else if ((op == OP_EQ || op == OP_NE) && ka == SLOT_OBJ &&
                        IS_STRING(e->stackSeen[e->depth - 2]) &&
-                       IS_STRING(e->stackSeen[e->depth - 1])) {
+                       IS_STRING(e->stackSeen[e->depth - 1]) &&
+                       !preferLeafEquality(e, e->depth - 2, e->depth - 1)) {
                 /* This path guards, so nothing may still be deferred when it
                  * does -- settled here, at the top of the path, which is where
                  * the settling is unconditionally executed. */
@@ -7515,6 +7643,19 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emitOneByteString(e, e->depth - 2, ra, JIT_SCRATCH_C);
                 emitOneByteString(e, e->depth - 1, rb, JIT_SCRATCH_D);
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
+            /* Two strings of any length, all six operators, through the leaf
+             * call. LAST of the string arms on purpose: the identity arm above
+             * answers `==` with no call at all, and the one-byte arm answers an
+             * ordering with two byte loads, so both are strictly better where
+             * they apply and this is only what they leave behind.
+             *
+             * Not inside an inlined body. Its entries are in x0..x8
+             * (inlineOwnBank) and a call would run over them; declining here
+             * leaves that case exactly as it was. */
+            } else if (jitStrCmpOn() && ka == SLOT_OBJ && !e->inlining &&
+                       stringOperand(e, e->depth - 2) &&
+                       stringOperand(e, e->depth - 1)) {
+                emitStringOrder(e);
             } else {
                 return false;
             }
@@ -7718,7 +7859,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXReg(31, ra, rb));
             } else if ((cmp == OP_EQ || cmp == OP_NE) && ka == SLOT_OBJ &&
                        IS_STRING(e->stackSeen[e->depth - 2]) &&
-                       IS_STRING(e->stackSeen[e->depth - 1])) {
+                       IS_STRING(e->stackSeen[e->depth - 1]) &&
+                       !preferLeafEquality(e, e->depth - 2, e->depth - 1)) {
                 settleAll(e);          /* this path guards */
                 unsigned rb = valueXReg(e, e->valueDepth - 1);
                 unsigned ra = valueXReg(e, e->valueDepth - 2);
@@ -7747,6 +7889,14 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 emitOneByteString(e, e->depth - 2, ra, JIT_SCRATCH_C);
                 emitOneByteString(e, e->depth - 1, rb, JIT_SCRATCH_D);
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
+            /* See the same arm in OP_LT..OP_GE. This is the one the probe
+             * hits: `if a < b { .. }` fuses its compare into the branch, and
+             * without it here the unfused twin compiles and the shape anyone
+             * actually writes still declines. */
+            } else if (jitStrCmpOn() && ka == SLOT_OBJ && !e->inlining &&
+                       stringOperand(e, e->depth - 2) &&
+                       stringOperand(e, e->depth - 1)) {
+                emitStringOrder(e);
             } else {
                 return false;
             }
@@ -8172,11 +8322,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * difference here is that one side is a constant, so its interning is settled at compile time and
              * only the local needs guarding. Nothing has been written yet, so a guard resumes at this very
              * instruction. */
+            Value kLocalSeen = localObserved(e, slot) ? e->observed[slot]
+                                                     : e->localSeen[slot];
+            bool kLocalInterned = IS_STRING(kLocalSeen) &&
+                                  JAI_STR_INTERNED(AS_STRING(kLocalSeen));
             if ((cmp == OP_EQ || cmp == OP_NE) &&
                 e->localKind[slot] == SLOT_OBJ && IS_STRING(k) &&
                 JAI_STR_INTERNED(AS_STRING(k)) &&
-                IS_STRING(localObserved(e, slot) ? e->observed[slot]
-                                                 : e->localSeen[slot])) {
+                IS_STRING(kLocalSeen) &&
+                !(jitStrCmpEqOn() && jitStrCmpOn() && !e->inlining &&
+                  !kLocalInterned)) {
                 if (slot == 0) e->usesSlot0 = true;
                 settleAll(e);          /* this path guards */
                 unsigned rs = localIn(e, slot, JIT_SCRATCH_C);
@@ -8192,6 +8347,46 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 branchOnDeopt(e, JAI_A64_EQ);
                 emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(k));
                 emit(e, jaiA64SubsXReg(31, rs, JIT_SCRATCH_B));
+                branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
+                off += 9;
+                break;
+            }
+
+            /* `if word < "middle"`, and `==` against a constant the arm above
+             * declined because it is not interned. Same leaf call as the arm
+             * at OP_JUMP_IF_CMP_FALSE, after the peephole folded the local and
+             * the constant into one instruction -- which is what every parser
+             * and every dispatch-on-a-name in this language actually emits, so
+             * without this the unfused twin compiles and the shape anyone
+             * types still declines.
+             *
+             * The LOCAL is the left operand and the constant the right; the
+             * interpreter's own arm spells that out, and reversing it would be
+             * a silent wrong answer for four of the six operators rather than
+             * a crash. The constant needs no guard: it is a string the emitter
+             * is holding, so only the local's Obj.type is in question. */
+            if (jitStrCmpOn() && !e->inlining && IS_STRING(k) &&
+                e->localKind[slot] == SLOT_OBJ &&
+                IS_STRING(localObserved(e, slot) ? e->observed[slot]
+                                                 : e->localSeen[slot])) {
+                if (slot == 0) e->usesSlot0 = true;
+                settleAll(e);          /* this path guards */
+                fpSyncAll(e);          /* and calls; see emitStringOrder */
+                unsigned rs = localIn(e, slot, JIT_SCRATCH_C);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rs,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                branchOnDeopt(e, JAI_A64_NE);
+                /* rs is a local's home (x19..) or JIT_SCRATCH_C, never x0 --
+                 * but the test costs nothing and a `mov` reading a register it
+                 * has already written is a miscompile, not a decline. */
+                if (rs != 0) emit(e, jaiA64MovX(0, rs));
+                emitConst64(e, 1, (int64_t)(uintptr_t)AS_OBJ(k));
+                emitConst64(e, JIT_SCRATCH_A,
+                            (int64_t)(uintptr_t)&jaiStringOrder);
+                noteScratchClobber(e);
+                emit(e, jaiA64Blr(JIT_SCRATCH_A));
+                emit(e, jaiA64SubsXImm(31, 0, 0));
                 branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
                 off += 9;
                 break;

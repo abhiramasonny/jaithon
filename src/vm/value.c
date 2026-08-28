@@ -505,13 +505,19 @@ static bool compareWithLt(Value a, Value b, int *out) {
     return true;
 }
 
-static bool compareStrings(ObjString *a, ObjString *b, int *out) {
-    if (a == b) { *out = 0; return true; }
+/* Declared in value.h, where the reason it is int64_t and the reason it is a
+ * leaf are written down. Kept as the ONE string ordering in the tree: the
+ * compiled tier calls this very function, so `a < b` cannot mean two things.
+ *
+ * `==` is the same question: order zero is exactly jaiStringEquals. Two
+ * distinct interned strings, which that one answers false without reading a
+ * byte, differ in their bytes by construction, so memcmp answers false too. */
+int64_t jaiStringOrder(const ObjString *a, const ObjString *b) {
+    if (a == b) return 0;
     uint32_t n = a->length < b->length ? a->length : b->length;
     int c = n == 0 ? 0 : memcmp(a->chars, b->chars, n);
-    if (c != 0) { *out = c < 0 ? -1 : 1; return true; }
-    *out = a->length == b->length ? 0 : (a->length < b->length ? -1 : 1);
-    return true;
+    if (c != 0) return c < 0 ? -1 : 1;
+    return a->length == b->length ? 0 : (a->length < b->length ? -1 : 1);
 }
 
 bool jaiValueCompare(Value a, Value b, int *out) {
@@ -542,7 +548,8 @@ bool jaiValueCompare(Value a, Value b, int *out) {
 
     if (ta == VAL_OBJ && tb == VAL_OBJ &&
         AS_OBJ(a)->type == OBJ_STRING && AS_OBJ(b)->type == OBJ_STRING) {
-        return compareStrings(AS_STRING(a), AS_STRING(b), out);
+        *out = (int)jaiStringOrder(AS_STRING(a), AS_STRING(b));
+        return true;
     }
 
     return compareWithLt(a, b, out);

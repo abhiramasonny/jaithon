@@ -152,6 +152,21 @@ bool jaiValuesEqual(Value a, Value b);
 bool jaiValuesIdentical(Value a, Value b);
 uint64_t jaiValueHash(Value v, bool *ok);
 bool jaiValueCompare(Value a, Value b, int *out);
+/* The order two strings are in: negative, zero or positive, by BYTE. The one
+ * implementation -- jaiValueCompare's string arm calls it, and so does the
+ * compiled tier, which needs an entry point taking two ObjString pointers that
+ * it can reach with a bare `blr`.
+ *
+ * A LEAF, and that is the whole point: it allocates nothing, roots nothing,
+ * throws nothing and cannot re-enter the interpreter, so compiled code calls
+ * it without a descriptor. Returns int64_t rather than int because the arm64
+ * ABI leaves the top half of x0 undefined for a 32-bit return, and the caller
+ * emitted in jit_func.c compares the whole register.
+ *
+ * By byte, not by scalar: `s[i]` indexes SCALARS, but every ordering in this
+ * language has been memcmp's, and for well-formed UTF-8 the two agree anyway
+ * -- byte order is code-point order. */
+int64_t jaiStringOrder(const ObjString *a, const ObjString *b);
 ObjString *jaiTypeName(Value v);
 const char *jaiTypeNameStatic(Value v);
 ObjString *jaiValueToStr(Value v);
