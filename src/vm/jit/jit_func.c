@@ -372,6 +372,18 @@ static int jitGetSlice(JitCallDesc *d) {
     return ok ? 0 : 1;
 }
 
+/* Dict read. Calls the interpreter's own OP_GET_INDEX so a missing key raises
+ * the KeyError it would have raised, with the message it would have used --
+ * naming the key -- rather than a second spelling of the same error that has to
+ * be kept in step with it. Pure apart from that throw, but it can allocate the
+ * exception, so the roots go down first. */
+static int jitGetIndexDict(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    bool ok = jaiIndexGet(d->args[0], d->args[1], &d->result);
+    jaiGCPopRootRange();
+    return ok ? 0 : 1;
+}
+
 /* Dict store: unlike a list store there's no offset to normalise, it's a table probe either way --
  * this only saves the dispatch and indexSet's type ladder, not the probe itself. */
 static int jitSetIndexDict(JitCallDesc *d) {
@@ -5142,6 +5154,68 @@ static bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
     return false;
 }
 
+/* The kind a container's elements may be held as, read off ONE live element.
+ *
+ * The sample specialises and the tag guard at the read site confirms: a
+ * container that later holds something else deoptimises rather than being
+ * answered wrongly. An instance carries its class too, since a tag check alone
+ * cannot tell two shapes apart. */
+static bool exemplarKind(Value elem, SlotKind *kind, unsigned *tag,
+                         ObjClass **cls, uint32_t *shape) {
+    *cls = NULL;
+    *shape = 0;
+    if (IS_INT(elem))        { *kind = SLOT_INT;   *tag = VAL_INT;   return true; }
+    if (IS_FLOAT(elem))      { *kind = SLOT_FLOAT; *tag = VAL_FLOAT; return true; }
+    if (IS_BOOL(elem))       { *kind = SLOT_BOOL;  *tag = VAL_BOOL;  return true; }
+    if (IS_LIST(elem))       { *kind = SLOT_LIST;  *tag = VAL_OBJ;   return true; }
+    if (rawObjValue(elem))   { *kind = SLOT_OBJ;   *tag = VAL_OBJ;   return true; }
+    if (IS_INSTANCE(elem) && AS_INSTANCE(elem)->klass != NULL) {
+        *kind  = SLOT_INST;
+        *tag   = VAL_OBJ;
+        *cls   = AS_INSTANCE(elem)->klass;
+        *shape = (*cls)->shapeId;
+        return true;
+    }
+    return false;
+}
+
+/* One value out of a live dict, and only if every value in it agrees.
+ *
+ * A LIST is sampled at index 0 alone, because a list's elements are usually
+ * built by one loop and a wrong guess costs a deopt per read. A dict is not:
+ * `{"name": "x", "count": 3}` is an ordinary dict and its values disagree, so
+ * predicting off the first entry would deoptimise every iteration -- measured
+ * elsewhere at 5.7x worse than declining outright (chunk.h states the same for
+ * an invoke's result). Refusing a mixed dict is the point of the walk.
+ *
+ * Capped, so compiling a body that indexes a large dict does not walk it. Past
+ * the cap the guard still holds; only the prediction is made on a prefix. */
+#define JIT_DICT_SAMPLE_MAX 256u
+
+static bool dictUniformValue(ObjDict *dict, Value *out) {
+    const JaiTable *t = &dict->table;
+    if (t->entries == NULL || t->count <= 0) return false;
+    bool have = false;
+    Value first = NULL_VAL;
+    unsigned seen = 0;
+    for (int i = 0; i < t->capacity && seen < JIT_DICT_SAMPLE_MAX; i++) {
+        /* A live entry is one with a nonnegative order; empty and tombstoned
+         * slots both carry a negative one (see table.c's entryIsLive). */
+        if (t->entries[i].order < 0) continue;
+        Value v = t->entries[i].value;
+        seen++;
+        if (!have) { first = v; have = true; continue; }
+        if (jaiValueType(v) != jaiValueType(first)) return false;
+        if (IS_OBJ(v) && OBJ_TYPE(v) != OBJ_TYPE(first)) return false;
+        if (IS_INSTANCE(v) && AS_INSTANCE(v)->klass != AS_INSTANCE(first)->klass) {
+            return false;
+        }
+    }
+    if (!have) return false;
+    *out = first;
+    return true;
+}
+
 /* Builtins whose result kind is a property of the FUNCTION and not of its
  * arguments: `str(x)` is a string whatever x is, `len(x)` is an int, `bool(x)`
  * is a bool. That is the only thing the surrounding body needs to know, so the
@@ -7419,7 +7493,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * it (`if node == null { return 0 }`) but the tier doesn't track that, so the guard stands and costs one compare against zero; a null arriving for real just deopts. */
             if (e->localKind[slot] != SLOT_INST &&
                 e->localKind[slot] != SLOT_MAYBE_INST) {
-                return subWhy(e, "receiver local %u is a %s, not an instance",
+                return subWhy(e, "receiver local %u has kind %s, not instance",
                               slot, slotKindName(e->localKind[slot]));
             }
             if (e->localClass[slot] == NULL) {
@@ -9910,8 +9984,84 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* Index normalised as jaiNormalizeIndex does it, one unsigned compare covering both ends. Out of
              * range, or an element not the kind seen at compile time, goes back to the interpreter -- reading an element has no effect, so resuming at this instruction is always sound. */
             if (e->depth < 2) return subWhy(e, "the model is only %u deep", e->depth);
+            if (e->stack[e->depth - 2] == SLOT_OBJ &&
+                IS_DICT(e->stackSeen[e->depth - 2])) {
+                /* `d[k]`, the read half of the OP_SET_INDEX dict arm below.
+                 * Without it a loop that reads a dict ran interpreted end to
+                 * end: `t += d["a"]` two million times was 16,280,472
+                 * interpreted instructions and 1,684 once this landed.
+                 *
+                 * Predicted off a live sample and guarded, as the list arm is,
+                 * except that the sample must be UNIFORM across the dict --
+                 * see dictUniformValue for why a dict is not a list here. */
+                unsigned dsidx = e->depth - 2;
+                Value dsample;
+                if (!dictUniformValue(AS_DICT(e->stackSeen[dsidx]), &dsample)) {
+                    return subWhy(e, "the live dict is empty or holds more than "
+                                     "one kind of value");
+                }
+                SlotKind dkind;
+                unsigned dtag;
+                ObjClass *dcls;
+                uint32_t dshape;
+                if (!exemplarKind(dsample, &dkind, &dtag, &dcls, &dshape)) {
+                    return subWhy(e, "a dict value of a kind the tier cannot hold");
+                }
+                /* SLOT_OBJ pins nothing, so the container is proved to be a
+                 * dict before anything is consumed: a miss resumes with the
+                 * dict and the key both still on the interpreter's stack. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A,
+                                   valueXReg(e, e->valueDepth - 2),
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                if (!emitDescriptor(e, NULL_VAL, dsidx, 2,
+                                    (void *)&jitGetIndexDict)) {
+                    return false;
+                }
+                for (unsigned i = 0; i < 2; i++) {
+                    unsigned drop;
+                    if (!popValue(e, &drop, NULL)) return false;
+                }
+                /* The sample travels with the entry, as the list arm's does:
+                 * without it `names["first"].len()` is an invoke on an object
+                 * the model cannot name, and the body declines one instruction
+                 * after the read it just learned to make. */
+                if (!pushValue3(e, dkind, dshape, dcls, dsample, -1)) {
+                    return false;
+                }
+
+                unsigned drat = e->descOffset +
+                                (unsigned)offsetof(JitCallDesc, result);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, drat));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, dtag));
+                /* Resumes AFTER the read. The lookup itself is pure, but it may
+                 * have raised and been caught, and re-running it would be a
+                 * second probe of a table the handler could have changed. */
+                branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 1), true);
+                unsigned drd = pushReg(e) - 1;
+                if (dkind == SLOT_BOOL) {
+                    emit(e, jaiA64LdrByte(drd, 31, drat + 8));
+                } else {
+                    emit(e, jaiA64LdrX(drd, 31, drat + 8));
+                }
+                if (dkind == SLOT_INST) {
+                    /* Two shapes in one dict cannot be told apart by the tag,
+                     * and the walk above only sampled a prefix. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, drd,
+                                       (unsigned)offsetof(ObjInstance, klass)));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                       (unsigned)offsetof(ObjClass, shapeId)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, dshape));
+                    branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)(off + 1), false);
+                }
+                e->wroteHeap = true;
+                off += 1;
+                break;
+            }
             if (e->stack[e->depth - 2] != SLOT_LIST) {
-                return subWhy(e, "the container is a %s, not a list",
+                return subWhy(e, "the container has kind %s, not list",
                               slotKindName(e->stack[e->depth - 2]));
             }
             if (e->stack[e->depth - 1] != SLOT_INT) {

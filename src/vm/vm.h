@@ -145,6 +145,11 @@ void jaiMethodCacheRemoveWhite(void);
  * key collides. Called by jaiVMInit. */
 void jaiMethodCacheInit(void);
 
+/* OP_GET_INDEX's semantics, callable from the compiled tier -- so the tier's
+ * dict arm raises the interpreter's own KeyError, message and all, rather than
+ * a second spelling of it. */
+bool jaiIndexGet(Value container, Value index, Value *out);
+
 /* OP_GET_SLICE's semantics, callable from the compiled tier. */
 bool jaiSliceGet(Value container, Value startValue, Value stopValue,
                  Value stepValue, bool hasStart, bool hasStop, bool hasStep,

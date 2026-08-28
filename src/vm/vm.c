@@ -2368,7 +2368,7 @@ JAI_INLINE bool indexGetFast(Value container, Value index, Value *out) {
     return false;
 }
 
-static bool indexGet(Value container, Value index, Value *out) {
+bool jaiIndexGet(Value container, Value index, Value *out) {
     if (IS_LIST(container)) {
         if (!IS_INT(index)) {
             return jaiThrow(vm.cTypeError, "list indices must be int, not '%s'",
@@ -5728,7 +5728,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
             VM_NEXT();
         }
         SAVE_STATE();
-        if (!indexGet(stackTop[-2], stackTop[-1], &result)) goto vmThrow;
+        if (!jaiIndexGet(stackTop[-2], stackTop[-1], &result)) goto vmThrow;
         LOAD_STATE();
         DROP(2);
         PUSH(result);
