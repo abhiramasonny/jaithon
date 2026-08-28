@@ -68,6 +68,7 @@ inpaint at 459 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global fun
 join at 15 stopped: OP_GET_GLOBAL: `_is_absolute_text` is not a compiled global function
 load_cache at 66 stopped: OP_GET_GLOBAL: `plan_from_text` is not a compiled global function
 load_cache at 66 stopped: a local was given two different kinds
+load_cache at 66 stopped: local 2 was given two kinds, list and object
 main at 12 stopped: OP_GET_GLOBAL: `adder` is not a compiled global function
 main at 121 stopped: OP_INVOKE: `dict.get` has no usable result kind (never observed)
 main at 158 stopped: OP_GET_GLOBAL: `count_occurrences` is not a compiled global function
@@ -85,6 +86,7 @@ once at 66 stopped: callee's return kind not usable
 order at 416 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
 pad2d at 82 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 place at 25 stopped: OP_CALL
+prepare_state at 4 stopped: OP_GET_GLOBAL: `state_for` is not a compiled global function
 radix_order at 146 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
 rank_filter at 139 stopped: a return inside an OSR loop
 reduce_leading at 150 stopped: OP_GET_GLOBAL: `cached_kernel` is not a compiled global function
