@@ -4494,6 +4494,26 @@ static bool jitStrIter(void) {
     return cached != 0;
 }
 
+/* What an unarmed opcode was ABOUT, when the opcode alone does not say.
+ *
+ * `walked only to OP_GET_GLOBAL at 53` names the instruction and not the
+ * question. The question is WHICH global, because that is what decides whether
+ * the stop is the deliberate one on a cold `throw` path or a callee that could
+ * have compiled: `sqrt` and `floor` each stop at one, and together they are
+ * 4.2% of the jaicv benchmark's interpreted work. */
+static const char *unarmedDetail(const ObjFunction *fn, uint8_t op,
+                                 uint32_t at) {
+    if (op != OP_GET_GLOBAL) return "";
+    if ((size_t)at + 4 > (size_t)fn->chunk.count) return "";
+    uint32_t idx = jaiReadU24(fn->chunk.code + at + 1);
+    if (idx >= (uint32_t)fn->chunk.constants.count) return "";
+    Value name = fn->chunk.constants.data[idx];
+    if (!IS_STRING(name)) return "";
+    static char buf[96];
+    snprintf(buf, sizeof buf, " (`%s`)", AS_STRING(name)->chars);
+    return buf;
+}
+
 static bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],
@@ -14789,10 +14809,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
          * audit into a grep. */
         if (e.unarmedOp != 0) {
             fprintf(stderr,
-                    "[jit] %s walked only to %s at %u -- the rest of the body "
+                    "[jit] %s walked only to %s%s at %u -- the rest of the body "
                     "is interpreted\n",
                     fn->name ? fn->name->chars : "<anon>",
-                    jaiOpName((OpCode)e.unarmedOp), e.unarmedAt);
+                    jaiOpName((OpCode)e.unarmedOp),
+                    unarmedDetail(fn, e.unarmedOp, e.unarmedAt), e.unarmedAt);
         }
     }
     fn->jitFunc = entry;
@@ -15745,10 +15766,11 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
          * instructions and interpreted the other forty reported success. */
         if (e.unarmedOp != 0) {
             fprintf(stderr,
-                    "[jit] osr %s at %u walked only to %s at %u -- the rest of "
+                    "[jit] osr %s at %u walked only to %s%s at %u -- the rest of "
                     "the loop is interpreted\n",
                     fn->name ? fn->name->chars : "<anon>", top,
-                    jaiOpName((OpCode)e.unarmedOp), e.unarmedAt);
+                    jaiOpName((OpCode)e.unarmedOp),
+                    unarmedDetail(fn, e.unarmedOp, e.unarmedAt), e.unarmedAt);
         }
     }
     /* The same dump the whole-function tier has. A compiled loop is where most
