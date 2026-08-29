@@ -6659,7 +6659,13 @@ static bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
     }
     bool nullable = (e->returnKind == SLOT_INST && k == SLOT_MAYBE_INST) ||
                     (e->returnKind == SLOT_MAYBE_INST && k == SLOT_INST);
-    if (!nullable) return false;
+    /* Named, because bare this was the whole of what a census said about
+     * OP_RETURN: which two kinds a body cannot agree on is the entire question,
+     * and an instance meeting a nullable instance is already merged above. */
+    if (!nullable) {
+        return subWhy(e, "a body returning both %s and %s",
+                      slotKindName(e->returnKind), slotKindName(k));
+    }
     if (e->returnShape != shape) e->returnShape = 0;
     e->returnKind = SLOT_MAYBE_INST;
     return true;
@@ -13615,7 +13621,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             uint32_t rsh = e->depth > 0 ? e->stackShape[e->depth - 1] : 0;
             unsigned r;
             SlotKind k;
-            if (!popValue(e, &r, &k)) return false;
+            if (e->depth == 0) return subWhy(e, "a return with an empty stack");
+            if (!popValue(e, &r, &k)) {
+                return subWhy(e, "returning a %s, which holds no register",
+                              slotKindName(e->stack[e->depth - 1]));
+            }
             /* One return kind per function: the entry point rebuilds a Value
              * from it, and it cannot rebuild two. */
             if (!mergeReturnKind(e, k, rsh)) return false;
