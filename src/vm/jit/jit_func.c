@@ -380,14 +380,33 @@ static int jitMakeRangeIter(JitCallDesc *d) {
     return 0;
 }
 
+/* The iterator for a `for` whose source the caller has already proved. A string
+ * yields one-CHARACTER strings and a list its elements; both are the same
+ * ObjIter the interpreter builds, so nothing here is a second implementation.
+ *
+ * The fallthrough RAISES rather than returning 1 quietly. Returning 1 without
+ * setting an exception is what the caller reads as "the callee threw", and the
+ * VM then reports `internal error: failed operation raised nothing` -- 104 test
+ * failures with no useful message, which is how this arm's first draft
+ * announced that it had reached here with a string. */
 static int jitMakeIter(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     Value src = d->args[0];
-    IterKind k = IS_LIST(src) ? ITER_LIST : ITER_LIST;
+    IterKind k;
+    if (IS_LIST(src)) {
+        k = ITER_LIST;
+    } else if (IS_STRING(src)) {
+        k = ITER_STRING;
+    } else {
+        jaiGCPopRootRange();
+        (void)jaiThrow(vm.cTypeError, "'%s' is not iterable",
+                       jaiTypeNameStatic(src));
+        return 1;
+    }
     ObjIter *it = jaiIterNew(k, src);
     d->result = OBJ_VAL(it);
     jaiGCPopRootRange();
-    return IS_LIST(src) ? 0 : 1;
+    return 0;
 }
 
 /* OP_GET_ITER_ITEMS' dict case: the lazy view `for (k, v) in d.items()` walks,
@@ -4440,6 +4459,15 @@ static bool emitFusedReturnNull(Emit *e, ObjFunction *fn) {
     emit(e, jaiA64MovzX(0, 0, 0));
     emitEpilogue(e, 0);
     return true;
+}
+
+static bool jitStrIter(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_STR_ITER");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
 }
 
 static bool pushLocalAsValue(Emit *e, unsigned slot) {
@@ -11232,11 +11260,23 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_GET_ITER: {
             if (!e->pendingRange) {
                 if (e->depth == 0) return false;
-                if (e->stack[e->depth - 1] != SLOT_LIST) {
+                Value itSeen = e->stackSeen[e->depth - 1];
+                /* `for c in text`. The iterator itself is the same call the
+                 * list path makes -- jaiGetIter takes anything iterable -- so
+                 * the only new thing a string needs is an element exemplar and
+                 * a proof that it IS a string.
+                 *
+                 * Worth an arm because it is a ONE-LINK chain on a hot body:
+                 * `JAI_JIT_CHAIN=1` says `_scan_identifier` compiles the moment
+                 * this is cleared, and character loops are what a lexer is
+                 * made of. */
+                const bool strIter = jitStrIter() &&
+                                     e->stack[e->depth - 1] == SLOT_OBJ &&
+                                     IS_STRING(itSeen);
+                if (e->stack[e->depth - 1] != SLOT_LIST && !strIter) {
                     /* Named: 4.3% of parser.jai's interpreted work sat behind
                      * this and it said nothing about WHAT was being iterated,
                      * which is the entire question. */
-                    Value itSeen = e->stackSeen[e->depth - 1];
                     return subWhy(e, "iterating a %s, not a list or a range",
                                   IS_OBJ(itSeen)
                                       ? jaiTypeNameStatic(itSeen)
@@ -11246,10 +11286,31 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 /* Carry one element forward: the loop variable's kind comes
                  * from it, and the iterator itself says nothing about what it
                  * will yield. */
-                Value srcv = e->stackSeen[e->depth - 1];
+                Value srcv = itSeen;
                 Value sample = NULL_VAL;
                 if (IS_LIST(srcv) && AS_LIST(srcv)->count > 0) {
                     sample = jaiListGet(AS_LIST(srcv), 0);
+                }
+                if (strIter) {
+                    /* Prove OBJ_STRING before the exemplar claims the elements
+                     * are strings. VAL_OBJ is every heap object, and an
+                     * exemplar the value does not match is how the next arm
+                     * comes to read the wrong header.
+                     *
+                     * The exemplar is an interned EMPTY string, not the first
+                     * character: a string yields one-CHARACTER elements, and a
+                     * character is not always one byte. Claiming one byte would
+                     * send multi-byte text down the one-byte arm, which guards
+                     * the length and would therefore deopt once per iteration.
+                     * Empty says "a string" and claims nothing else. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A,
+                                       valueXReg(e, e->valueDepth - 1),
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    ObjString *empty = jaiStringIntern("", 0);
+                    if (empty == NULL) return false;
+                    sample = OBJ_VAL((Obj *)empty);
                 }
                 /* A list this body built has no live sample to read an element
                  * off -- it does not exist yet -- but OP_BUILD_LIST recorded
