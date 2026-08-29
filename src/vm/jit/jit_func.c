@@ -8584,6 +8584,38 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             } else if ((strcmp(tn, "int") == 0 && k == SLOT_INT) ||
                        (strcmp(tn, "bool") == 0 && k == SLOT_BOOL)) {
             } else if (jitAnyGuard() && strcmp(tn, "list") == 0 &&
+                       k == SLOT_OBJ) {
+                /* A declared `list` boundary on a value the model has only as
+                 * "some heap object". Unlike the cases below this one is not a
+                 * no-op: it NARROWS. Proving OBJ_LIST here turns the entry into
+                 * a SLOT_LIST, and every list arm downstream -- indexing,
+                 * iteration, `len` -- asks for exactly that.
+                 *
+                 * The guard is what makes the narrowing honest. VAL_OBJ covers
+                 * every heap object, so without the Obj.type check the next arm
+                 * would read ObjList's header off whatever this is, which is
+                 * the hole that segfaulted the VM through the dict-index arm.
+                 *
+                 * A deopt here resumes AT this instruction with the operand
+                 * still on the interpreter's stack, so a miss costs nothing
+                 * beyond the exit.
+                 *
+                 * WORTH ZERO ON ITS OWN, and recorded as such: it takes the
+                 * "a `list` guard on a object" refusal in the jaicv benchmark
+                 * from four to none, and `min_enclosing_circle`'s attributed
+                 * interpreted work does not move -- the body goes from
+                 * declining HERE to declining one instruction later, at
+                 * `OP_GET_INDEX: the container has kind int, not list`, after
+                 * which JAI_JIT_CHAIN says it compiles. Kept because it is six
+                 * guarded lines that narrow rather than guess, and because the
+                 * link it exposes is the one being worked next. */
+                unsigned gr = valueXReg(e, e->valueDepth - 1);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, gr,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                branchOnDeopt(e, JAI_A64_NE);
+                e->stack[e->depth - 1] = SLOT_LIST;
+            } else if (jitAnyGuard() && strcmp(tn, "list") == 0 &&
                        k == SLOT_LIST) {
                 /* SLOT_LIST is a guarded fact, not a hope: every arm that puts
                  * one on the stack has already proved OBJ_LIST, because VAL_OBJ
