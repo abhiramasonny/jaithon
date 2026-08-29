@@ -677,6 +677,21 @@ typedef struct {
     /* The kind that could not be adopted into a local already typed otherwise;
      * read only by kindClash, to say WHICH two kinds disagreed. */
     SlotKind  clashKind;
+    /* A slot asked to be widened or made dynamic, with the walk carrying on
+     * anyway so the REST of them are found in the same pass. The attempt is
+     * already lost when this is set; it exists so ONE retry fixes every
+     * clashing slot instead of one per attempt.
+     *
+     * The budget is five attempts and each clash used to cost one, so a body
+     * with four clashing locals spent four of them before it could even try:
+     * `lead_with_extremes` in jaicv has exactly that, and `thick_contours`
+     * carries 13% of the jaicv benchmark's interpreted work behind the same
+     * thing.
+     *
+     * MEASURING PASS ONLY. Carrying on after a clash leaves the model and the
+     * emitted code disagreeing, which is fine when the output is discarded and
+     * segfaults when it is not -- that was measured, not guessed. */
+    bool      pendingRetry;
     /* See emitUnarmedDeopt: the opcode and offset the walk stopped at, so the
      * fixup pass can name the cause and not just the symptom. */
     uint8_t   unarmedOp;
@@ -4056,6 +4071,15 @@ static const char *declineReason(Emit *e) {
     if (e->whySub[0] == '\0') return name;
     snprintf(e->whyBuf, sizeof e->whyBuf, "%s: %s", name, e->whySub);
     return e->whyBuf;
+}
+
+static bool jitCollectClashes(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_COLLECT_CLASHES");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
 }
 
 static const char *kindClash(Emit *e, unsigned slot) {
@@ -13799,11 +13823,23 @@ static bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
         !e->nullableLocal[slot] && !e->dynamicLocal[slot]) {
         e->needNullable[slot] = true;
         e->clashKind = kind;
+        if (e->measuring && jitCollectClashes()) {
+            e->pendingRetry = true;
+            e->localKind[slot] = SLOT_MAYBE_INST;
+            return true;
+        }
         return false;
     }
     if (!e->dynamicLocal[slot]) {
         e->needDynamic[slot] = true;
         e->clashKind = kind;
+        if (e->measuring && jitCollectClashes()) {
+            e->pendingRetry = true;
+            e->localKind[slot]  = kind;
+            e->localShape[slot] = shape;
+            e->localClass[slot] = klass;
+            return true;
+        }
         return false;
     }
     e->localKind[slot]  = kind;
@@ -14094,7 +14130,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     /* Snapshot before the walk, so the chain diagnostic can re-run it. */
     static Emit chainProto;
     if (jitChainOn()) memcpy(&chainProto, &body, sizeof body);
-    if (!compileBody(&body, closure)) {
+    if (!compileBody(&body, closure) || body.pendingRetry) {
         memcpy(needDynamic, body.needDynamic, sizeof body.needDynamic);
         memcpy(needNullable, body.needNullable, sizeof body.needNullable);
         if (getenv("JAI_JIT_WHY")) {
