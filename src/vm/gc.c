@@ -9,8 +9,46 @@
 #include "vm/vm.h"
 #include "vm/jit/jit.h"
 
-#define JAI_GC_DEFAULT_GROW_FACTOR 2.0
+/* Was 2.0. On `check --no-cache lib/jaithon/compile/parser.jai`, 2.0 does 9
+ * collections where the first 4 are near-zero-yield full-heap walks over
+ * still-live compiler/stdlib-bootstrap state (docs/gc-profile.md #1) and the
+ * rest still re-mark/re-sweep a ~64% still-live fraction every cycle (#2) --
+ * a bigger growth factor amortises that fixed cost over fewer collections
+ * without changing what gets marked or swept. 4.0 does 4 collections and
+ * roughly halves total collector pause (paired-interleaved A/B, non-
+ * overlapping across 7 rounds: 42.9-48.0ms -> 23.1-27.6ms, #4).
+ *
+ * THE MEMORY COST, measured rather than called modest -- peak RSS, three and
+ * two paired samples:
+ *   check --no-cache parser.jai   99.6-100.6 MB -> 107.2-110.0 MB   (+9%)
+ *   jaicv imgproc (BENCH_LEVEL=easy)  788-954 MB -> 1039-1052 MB    (+20%)
+ * That is the trade: roughly an eighth off the wall of a `check` for roughly
+ * a tenth more resident memory, and a fifth more on a workload already at a
+ * gigabyte. Worth it at these sizes, and the reason not to reach for 8.0.
+ * End-to-end wall on `check --no-cache parser.jai`, four interleaved pairs:
+ * 0.49/0.48/0.47/0.45 -> 0.42/0.41/0.39/0.43, -12.7%.
+ *
+ * Picked over the larger 8.0/16.0 candidates (which
+ * measured even less pause) because those showed the heap sometimes just
+ * never collecting again before the process exits, 2-3x the live set at
+ * process end in the samples taken; this is a global default, not a knob for
+ * one command. JAITHON_GC_GROWTH=<factor> overrides it for re-measuring. */
+#define JAI_GC_DEFAULT_GROW_FACTOR 4.0
 #define JAI_GC_DEFAULT_MIN_HEAP    ((size_t)1 << 20)
+
+/* JAITHON_GC_GROWTH=<factor> overrides the default 2.0 for an A/B, cached
+ * from one getenv+strtod so it costs nothing per collection. Investigation
+ * only (docs/gc-profile.md) -- gc->growFactor stays the real per-instance
+ * knob for anything that wants to set it in code. */
+static double gcGrowthEnvOverride(void) {
+    static double cached = -1.0;
+    if (cached < 0.0) {
+        const char *s = getenv("JAITHON_GC_GROWTH");
+        double v = s != NULL ? strtod(s, NULL) : 0.0;
+        cached = v > 1.0 ? v : 0.0;
+    }
+    return cached;
+}
 
 GCState *jaiGCActive;
 bool jaiGCInCollect;
@@ -34,12 +72,24 @@ static bool gcStressDue(GCState *g) {
     g->stressTick = 0;
     return true;
 }
-static bool gcVerboseOn(const GCState *g) { return g->verbose || vm.debugGC; }
+/* JAITHON_GC_VERBOSE=1 turns on the "-- gc begin/sweep/end" trace below with
+ * no rebuild -- one cached getenv, not a getenv per collection. Investigating
+ * collection frequency (docs/gc-profile.md) needed this and there was no
+ * existing switch: g->verbose has no CLI flag wired to it, and vm.debugGC is
+ * never set anywhere in the tree. */
+static bool gcVerboseOn(const GCState *g) {
+    static int envOn = -1;
+    if (envOn < 0) envOn = getenv("JAITHON_GC_VERBOSE") != NULL;
+    return g->verbose || vm.debugGC || envOn;
+}
 
 static size_t gcLiveBytes(const GCState *g) { (void)g; return jaiHeapBytes; }
 
 static size_t gcNextThreshold(const GCState *g, size_t live) {
-    double factor = g->growFactor > 1.0 ? g->growFactor : JAI_GC_DEFAULT_GROW_FACTOR;
+    double envFactor = gcGrowthEnvOverride();
+    double factor = envFactor > 1.0 ? envFactor
+                  : g->growFactor > 1.0 ? g->growFactor
+                  : JAI_GC_DEFAULT_GROW_FACTOR;
     double target = (double)live * factor;
     size_t next = target >= (double)SIZE_MAX ? SIZE_MAX : (size_t)target;
     size_t floorBytes = g->minHeap != 0 ? g->minHeap : JAI_GC_DEFAULT_MIN_HEAP;
@@ -137,6 +187,11 @@ void jaiGCEnable(bool enabled) {
 #ifdef JAI_ALLOC_CENSUS
 uint64_t jaiGCMarked, jaiGCSwept, jaiGCSweptDead;
 double   jaiGCMarkSec, jaiGCInternSec, jaiGCSweepSec;
+/* mark ms above is root-scan + trace combined; this splits it further, since
+ * "the roots include every module's globals table, the JIT's descriptor
+ * chain, and the frame stack" is a claim about ROOT SCANNING specifically,
+ * not about tracing the graph those roots reach. */
+double   jaiGCRootSec, jaiGCTraceSec;
 #endif
 
 void jaiGCMarkObject(Obj *obj) {
@@ -500,9 +555,14 @@ void jaiGCCollect(void) {
     double t0 = jaiClockMonotonic();
 #endif
     markRoots(g);
+#ifdef JAI_ALLOC_CENSUS
+    double tRoot = jaiClockMonotonic();
+#endif
     traceReferences(g);
 #ifdef JAI_ALLOC_CENSUS
     double t1 = jaiClockMonotonic();
+    jaiGCRootSec  += tRoot - t0;
+    jaiGCTraceSec += t1 - tRoot;
 #endif
 
     JaiTable *interned = jaiInternTable();
@@ -644,6 +704,8 @@ void jaiGCPrintStats(FILE *out) {
     fprintf(out, "  swept total     : %llu\n", (unsigned long long)jaiGCSwept);
     fprintf(out, "  swept dead      : %llu\n", (unsigned long long)jaiGCSweptDead);
     fprintf(out, "  mark ms         : %.3f\n", jaiGCMarkSec * 1000.0);
+    fprintf(out, "    root-scan ms  : %.3f\n", jaiGCRootSec * 1000.0);
+    fprintf(out, "    trace ms      : %.3f\n", jaiGCTraceSec * 1000.0);
     fprintf(out, "  intern ms       : %.3f\n", jaiGCInternSec * 1000.0);
     fprintf(out, "  sweep ms        : %.3f\n", jaiGCSweepSec * 1000.0);
 #endif
