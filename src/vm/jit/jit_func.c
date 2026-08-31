@@ -13737,8 +13737,29 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                            (unsigned)offsetof(JaiEntry, value)));
                         emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
                         branchOnDeopt(e, JAI_A64_NE);
-                        emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_D,
-                                           (unsigned)offsetof(JaiEntry, value) + 8u));
+                        if (gk == SLOT_BOOL) {
+                            /* A byte, not a word. BOOL_VAL writes the union's
+                             * one-byte `bool` member and leaves the other seven
+                             * bytes of the payload indeterminate, so an 8-byte
+                             * load brings back whatever the slot held before.
+                             * Every consumer tests the whole register against
+                             * zero, so those bytes decide the answer.
+                             *
+                             * This read a module-level `var` as FALSE once the
+                             * body compiled: `std.fmt`'s `_colors_enabled` is
+                             * true, and `green()` returned uncoloured text from
+                             * the 65th call onward -- exactly
+                             * JAI_JIT_THRESHOLD. A silent wrong answer, not a
+                             * crash, and it had been in the tree long enough
+                             * that a parallel test run turned it up by
+                             * accident. emitCallOutResult's SLOT_BOOL arm has
+                             * always split the two; this site never did. */
+                            emit(e, jaiA64LdrByte(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                                  (unsigned)offsetof(JaiEntry, value) + 8u));
+                        } else {
+                            emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                               (unsigned)offsetof(JaiEntry, value) + 8u));
+                        }
                         if (gk == SLOT_INST || gk == SLOT_LIST) {
                             /* VAL_OBJ is every heap object; the tag alone doesn't confirm the specific type, so it's checked before the class pointer is read. */
                             emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C,
