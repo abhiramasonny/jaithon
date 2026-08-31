@@ -217,12 +217,35 @@ static bool streamError(Stream *s, JaiBuf *buf, const char *what) {
     return true;
 }
 
+/* A read cut short by a signal is not an error, and this VM raises signals of
+ * its own: the JIT samples at 1 kHz on ITIMER_PROF, so any blocking read from
+ * a pipe or a terminal is liable to be interrupted. `fread` reports that as a
+ * short read with the stream's error flag set and errno EINTR, and
+ * streamError below turns it into an IOError.
+ *
+ * It surfaced as "cannot read from '<stdout>': Interrupted system call" while
+ * a parent process read 32 children's output, and got dramatically more likely
+ * under JAITHON_JIT_DEOPT_STRESS, which lengthens the windows a read sits in.
+ * Nothing about it is specific to that program -- any Jaithon code reading a
+ * pipe while the sampler runs could see it. `SA_RESTART` is set on the SIGPROF
+ * handler and did not prevent it, so the retry belongs here. */
+static bool readInterrupted(Stream *s) {
+    if (!ferror(s->handle) || errno != EINTR) return false;
+    clearerr(s->handle);
+    errno = 0;
+    return true;
+}
+
 static bool readAllInto(Stream *s, JaiBuf *buf, const char *what) {
     char chunk[8192];
     for (;;) {
+        errno = 0;
         size_t got = fread(chunk, 1, sizeof chunk, s->handle);
         if (got > 0) jaiBufAppend(buf, chunk, got);
-        if (got < sizeof chunk) break;
+        if (got < sizeof chunk) {
+            if (readInterrupted(s)) continue;
+            break;
+        }
     }
     return !streamError(s, buf, what);
 }
@@ -232,12 +255,16 @@ static bool readCountInto(Stream *s, size_t want, JaiBuf *buf, const char *what)
     char chunk[8192];
     while (want > 0) {
         size_t ask = want < sizeof chunk ? want : sizeof chunk;
+        errno = 0;
         size_t got = fread(chunk, 1, ask, s->handle);
         if (got > 0) {
             jaiBufAppend(buf, chunk, got);
             want -= got;
         }
-        if (got < ask) break;
+        if (got < ask) {
+            if (readInterrupted(s)) continue;
+            break;
+        }
     }
     return !streamError(s, buf, what);
 }
