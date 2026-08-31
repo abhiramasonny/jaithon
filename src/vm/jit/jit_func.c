@@ -1771,11 +1771,47 @@ static uint8_t localStgOf(const Emit *e, unsigned slot) {
     return AS_LIST(v)->stg;
 }
 
+/* Whether `e->observed[slot]` may be READ, which is not the same question as
+ * whether the slot is in the observed window -- there may be no observed frame
+ * at all. Eight call sites spell `localObserved(e, slot) ? e->observed[slot]
+ * : e->localSeen[slot]`, and every one of them dereferenced a NULL
+ * `observed` whenever the walk ran without a live frame.
+ *
+ * It crashed the COMPILER, not compiled code: EXC_BAD_ACCESS at address 0 in
+ * compileBody, reading `e->observed[slot]` for the interned-string compare at
+ * OP_JUMP_IF_CMP_LOCAL_K. Reproduced under JAITHON_JIT_DEOPT_STRESS with 32+
+ * files in one run; the stress only makes it likely, it is not the cause.
+ * `localStgOf` above has always guarded `e->observed == NULL` for the same
+ * reason, with its own note about the segfault that taught it.
+ *
+ * The window test keeps its `maxSlotUsed` side effect: register planning reads
+ * it, and a missing observed frame says nothing about which slots the body
+ * touches. */
 static bool localObserved(Emit *e, unsigned slot) {
-    if (e->osr) return slot < e->locals;
+    if (e->osr) return slot < e->locals && e->observed != NULL;
     if (slot < e->base || slot > e->arity) return false;
     if (slot > e->maxSlotUsed) e->maxSlotUsed = slot;
-    return true;
+    return e->observed != NULL;
+}
+
+
+/* The live value for a slot, or NULL_VAL when there is none.
+ *
+ * NEVER returns a VAL_OBJ over a null pointer. An OSR frame's slots run to
+ * fn->maxSlots and the ones the program has not reached yet hold whatever the
+ * last frame at that depth left behind -- a stale tag with a dead pointer
+ * among them -- and every IS_STRING / IS_LIST / IS_INSTANCE macro dereferences
+ * `Obj::type` to answer. Reading one crashed the COMPILER: EXC_BAD_ACCESS at
+ * address 0 inside compileBody, reproducible under JAITHON_JIT_DEOPT_STRESS.
+ *
+ * Eight sites spelled this ternary out by hand and none of them checked. They
+ * all go through here now, so a ninth cannot be written without the check.
+ * localStgOf has guarded the same hazard since a sweep read `Obj::type` off
+ * address zero once in eight runs. */
+static Value seenLocal(Emit *e, unsigned slot) {
+    Value v = localObserved(e, slot) ? e->observed[slot] : e->localSeen[slot];
+    if (IS_OBJ(v) && AS_OBJ(v) == NULL) return NULL_VAL;
+    return v;
 }
 
 static unsigned closureReg(const Emit *e) {
@@ -4763,8 +4799,7 @@ static const char *unarmedDetail(const ObjFunction *fn, uint8_t op,
 static bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],
-                    localObserved(e, slot) ? e->observed[slot]
-                                           : e->localSeen[slot],
+                    seenLocal(e, slot),
                     (int)slot)) {
         return false;
     }
@@ -7807,8 +7842,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (slot == 0) e->usesSlot0 = true;
             if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                             e->localClass[slot],
-                            localObserved(e, slot) ? e->observed[slot]
-                                                   : e->localSeen[slot],
+                            seenLocal(e, slot),
                             (int)slot)) {
                 return false;
             }
@@ -7932,10 +7966,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * that allocates a string. Both operands are guarded inside
                  * emitStringConcat, so a sample that turns out wrong deopts at
                  * this instruction with both locals untouched. */
-                Value sa = localObserved(e, a) ? e->observed[a]
-                                               : e->localSeen[a];
-                Value sb = localObserved(e, b) ? e->observed[b]
-                                               : e->localSeen[b];
+                Value sa = seenLocal(e, a);
+                Value sb = seenLocal(e, b);
                 if (IS_STRING(sa) && IS_STRING(sb)) {
                     if (a == 0 || b == 0) e->usesSlot0 = true;
                     if (!pushLocalAsValue(e, a)) return false;
@@ -9440,14 +9472,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * difference here is that one side is a constant, so its interning is settled at compile time and
              * only the local needs guarding. Nothing has been written yet, so a guard resumes at this very
              * instruction. */
-            Value kLocalSeen = localObserved(e, slot) ? e->observed[slot]
-                                                     : e->localSeen[slot];
-            bool kLocalInterned = IS_STRING(kLocalSeen) &&
+            Value kLocalSeen = seenLocal(e, slot);
+            /* seenLocal has already dropped a VAL_OBJ over a null pointer,
+             * which is what an unreached slot can hold. */
+            bool kSeenString = IS_STRING(kLocalSeen);
+            bool kLocalInterned = kSeenString &&
                                   JAI_STR_INTERNED(AS_STRING(kLocalSeen));
             if ((cmp == OP_EQ || cmp == OP_NE) &&
                 e->localKind[slot] == SLOT_OBJ && IS_STRING(k) &&
                 JAI_STR_INTERNED(AS_STRING(k)) &&
-                IS_STRING(kLocalSeen) &&
+                kSeenString &&
                 !(jitStrCmpEqOn() && jitStrCmpOn() && !e->inlining &&
                   !kLocalInterned)) {
                 if (slot == 0) e->usesSlot0 = true;
@@ -9485,8 +9519,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * is holding, so only the local's Obj.type is in question. */
             if (jitStrCmpOn() && !e->inlining && IS_STRING(k) &&
                 e->localKind[slot] == SLOT_OBJ &&
-                IS_STRING(localObserved(e, slot) ? e->observed[slot]
-                                                 : e->localSeen[slot])) {
+                IS_STRING(seenLocal(e, slot))) {
                 if (slot == 0) e->usesSlot0 = true;
                 settleAll(e);          /* this path guards */
                 fpSyncAll(e);          /* and calls; see emitStringOrder */
@@ -9645,8 +9678,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
 
             /* Field type is read off the LIVE receiver, so the tier specialises to what the program actually
              * stores rather than a declaration -- only possible for a parameter (hence the arity cap above): a local assigned further in has no value yet to look at. */
-            Value seen = localObserved(e, slot) ? e->observed[slot]
-                                                : e->localSeen[slot];
+            Value seen = seenLocal(e, slot);
             if (!IS_INSTANCE(seen)) {
                 /* No sample -- but the DECLARATION may still say enough, and
                  * the receiver is a proven instance either way: localKind is
@@ -9869,8 +9901,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 if (slot == 0) e->usesSlot0 = true;
                 if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                                 e->localClass[slot],
-                                localObserved(e, slot) ? e->observed[slot]
-                                                       : e->localSeen[slot],
+                                seenLocal(e, slot),
                                 (int)slot)) {
                     return false;
                 }
