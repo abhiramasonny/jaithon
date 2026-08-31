@@ -781,6 +781,11 @@ typedef struct {
     Value     localSeen[JIT_MAX_SLOTS + 1];
     /* stackElemDecl carried across the bind that named this local. */
     uint8_t   localElemDecl[JIT_MAX_SLOTS + 1];
+    /* And stackObjType, for the same reason and by the same route. Without it
+     * a callee's observed return type survives exactly as long as the value
+     * stays on the operand stack: `let w = window_of(...)` then `w.len()`
+     * loses it at the bind, which is every use that matters. */
+    uint8_t   localObjType[JIT_MAX_SLOTS + 1];
     Value    *observed;
     bool      assumedIntReturn;
     unsigned  depth;
@@ -2115,6 +2120,9 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackElemDecl[e->depth] =
         (fromLocal >= 0 && fromLocal <= (int)JIT_MAX_SLOTS)
             ? e->localElemDecl[fromLocal] : 0;
+    e->stackObjType[e->depth] =
+        (fromLocal >= 0 && fromLocal <= (int)JIT_MAX_SLOTS)
+            ? e->localObjType[fromLocal] : 0;
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
@@ -3696,6 +3704,17 @@ static void emitModuleGuard(Emit *e) {
     branchOnDeopt(e, JAI_A64_NE);
 }
 
+/* Off drops the callee's observed object type again, so the difference is
+ * measurable in one binary. */
+static bool retObjTypeOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_RET_OBJTYPE");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 /* Off puts the refusal back, so a body reading `math.PI` can be measured both
  * ways in one binary. */
 static bool moduleFieldOn(void) {
@@ -3915,10 +3934,20 @@ static bool rawObjValue(Value v) {
  * (ObjFunction::obsReturnKind). Same contract as feedbackSlotKind's: a prediction the caller must guard.
  * SLOT_INST is admissible here where it is not there, because a per-callee record can carry the class
  * shape a one-byte-per-way cache cannot -- and the shape is guarded after the call like the tag. */
+/* `objType` may be NULL. It is ObjType + 1 when the record says the callee
+ * returns a particular heap object, and 0 otherwise.
+ *
+ * It used to be computed and dropped on the floor -- feedbackSlotKind filled a
+ * local that nothing read. So a callee OBSERVED to return a list handed its
+ * caller SLOT_OBJ and NO type, and `w.len()` on the result then refused with
+ * "an object with no sample and no known type" even though the record said
+ * plainly that it was a list. That refusal was 18.4% of the interpreted work
+ * on the self-hosted compiler, the largest by a factor of seven. */
 static bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
-                               uint32_t *shape) {
+                               uint32_t *shape, uint8_t *objType) {
     uint8_t fb = cfn->obsReturnKind;
     *shape = 0;
+    if (objType != NULL) *objType = 0;
     if (fb == 1u + (unsigned)VAL_NULL) { *k = SLOT_NULL; return true; }
     if (fb == JAI_FB_OBJ + (unsigned)OBJ_INSTANCE) {
         if (cfn->obsReturnShape == 0) return false;
@@ -3927,8 +3956,10 @@ static bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
         return true;
     }
     unsigned tag;
-    uint8_t objType;
-    return feedbackSlotKind(fb, k, &tag, &objType);
+    uint8_t seenType = 0;
+    if (!feedbackSlotKind(fb, k, &tag, &seenType)) return false;
+    if (objType != NULL) *objType = seenType;
+    return true;
 }
 
 static bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls) {
@@ -5772,8 +5803,14 @@ static bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
  * what they consume before it and in how the callee was resolved; from the
  * descriptor's `result` onwards there is nothing to tell them apart. */
 static bool emitCallOutResult(Emit *e, SlotKind rk, uint32_t rshape,
-                              ObjClass *rcls, uint32_t after) {
+                              ObjClass *rcls, uint32_t after, uint8_t robj) {
     if (!pushValue(e, rk, rshape, rcls)) return false;
+    /* A PREDICTION recorded on the entry, not a guard: every consumer of a
+     * SLOT_OBJ checks Obj.type for itself before it reads anything, so this
+     * only ever chooses which guard to emit and never deletes one. */
+    if (retObjTypeOn() && rk == SLOT_OBJ && e->depth > 0) {
+        e->stackObjType[e->depth - 1] = robj;
+    }
 
     unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
     if (rk == SLOT_MAYBE_INST) {
@@ -5880,7 +5917,8 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     SlotKind rk = SLOT_NULL;
     uint32_t rshape = 0;
     ObjClass *rcls = NULL;
-    bool haveKind = observedReturnKind(cfn, &rk, &rshape);
+    uint8_t robj = 0;
+    bool haveKind = observedReturnKind(cfn, &rk, &rshape, &robj);
     if (!haveKind && cfn->jitFunc != NULL) {
         rk = (SlotKind)cfn->jitReturnKind;
         rshape = cfn->jitReturnShape;
@@ -5908,7 +5946,7 @@ static bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     }
     if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_FUNC) return false;
     e->depth--;
-    return emitCallOutResult(e, rk, rshape, rcls, after);
+    return emitCallOutResult(e, rk, rshape, rcls, after, robj);
 }
 
 /* `math.sqrt(x)` is not a method call. It is a global call whose callee is
@@ -5961,7 +5999,8 @@ static bool emitModuleCall(Emit *e, ObjModule *m, Value calleeVal,
     SlotKind rk = SLOT_NULL;
     uint32_t rshape = 0;
     ObjClass *rcls = NULL;
-    if (!observedReturnKind(cfn, &rk, &rshape)) {
+    uint8_t robj = 0;
+    if (!observedReturnKind(cfn, &rk, &rshape, &robj)) {
         rk = (SlotKind)cfn->jitReturnKind;
         rshape = cfn->jitReturnShape;
     }
@@ -6012,7 +6051,7 @@ static bool emitModuleCall(Emit *e, ObjModule *m, Value calleeVal,
         unsigned r;
         if (!popValue(e, &r, NULL)) return false;
     }
-    return emitCallOutResult(e, rk, rshape, rcls, after);
+    return emitCallOutResult(e, rk, rshape, rcls, after, robj);
 }
 
 /* `Klass.static_method(args)` -- an OP_INVOKE whose receiver is a CLASS. The
@@ -6090,7 +6129,8 @@ static bool emitClassCall(Emit *e, ObjClass *klass, JaiEntry *slot,
     SlotKind rk = SLOT_NULL;
     uint32_t rshape = 0;
     ObjClass *rcls = NULL;
-    if (!observedReturnKind(cfn, &rk, &rshape)) {
+    uint8_t robj = 0;
+    if (!observedReturnKind(cfn, &rk, &rshape, &robj)) {
         rk = (SlotKind)cfn->jitReturnKind;
         rshape = cfn->jitReturnShape;
     }
@@ -6162,7 +6202,7 @@ static bool emitClassCall(Emit *e, ObjClass *klass, JaiEntry *slot,
      * arm at OP_GET_FIELD. */
     if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_CLASS) return false;
     e->depth--;
-    return emitCallOutResult(e, rk, rshape, rcls, after);
+    return emitCallOutResult(e, rk, rshape, rcls, after, robj);
 }
 
 /* Emit a method's body directly, when that body is one expression.
@@ -8030,6 +8070,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             if (e->stackElemDecl[e->depth - 1] != 0) {
                 e->localElemDecl[slot] = e->stackElemDecl[e->depth - 1];
             }
+            e->localObjType[slot] = e->stackObjType[e->depth - 1];
             if (!e->fpOff && !e->dynamicLocal[slot] &&
                 e->stack[e->depth - 1] == SLOT_FLOAT &&
                 (e->fpLive & (1u << (e->valueDepth - 1)))) {
@@ -11027,7 +11068,7 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                     rshape = mfn->jitReturnShape;
                     haveKind = true;
                 } else {
-                    haveKind = observedReturnKind(mfn, &rkind, &rshape);
+                    haveKind = observedReturnKind(mfn, &rkind, &rshape, NULL);
                 }
                 if (haveKind &&
                     (rkind == SLOT_INST || rkind == SLOT_MAYBE_INST) &&
