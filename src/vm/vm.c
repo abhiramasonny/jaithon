@@ -3426,6 +3426,29 @@ static Obj *classSpecInstantiate(Value spec) {
 
 #ifdef JAI_OPCODE_STATS
 uint64_t jaiOpCounts[OP_COUNT];
+/* Successor pairs: jaiOpPairs[a][b] is how often opcode b was dispatched
+ * immediately after a. Dumped as `pair A B count share` beside the per-opcode
+ * rows, where share is B's fraction of everything that followed A.
+ *
+ * The per-opcode counts say which instructions are hot; only this says which
+ * DISPATCH is predictable, which is the question VM_NEXT_HINT below exists to
+ * answer and the five hint sites in this file were picked by hand without.
+ *
+ * MEASURED AND FOUND NOT TO MATTER, 2026-08-31, which is the useful part.
+ * Checking parser.jai the census names a chain the `match` lowering walks
+ * 1.35M times each at ~100% -- OP_ENUM_TAG -> OP_SWAP_POP ->
+ * OP_MATCH_CONST_POP -> OP_POP -- plus OP_MATCH_TYPE_POP -> OP_GET_LOCAL
+ * (1,354,485, 100%), OP_LIST_APPEND -> OP_LOOP (379,584, 100%) and
+ * OP_IS -> OP_JUMP_IF_FALSE (332,845, 94.4%). Hinting all seven, about 7.7M
+ * of the run's 43M dispatches, measured FLAT: ten iterations per arm in one
+ * binary behind a runtime gate, 5.25/5.16/5.14 s against 5.26/5.15/5.16 s.
+ *
+ * So the interpreter is not branch-bound here. `runLoop` is 26.7% of a
+ * sampling profile, and that is the opcodes doing their work, not the shared
+ * indirect branch mispredicting. Do not spend another session on dispatch
+ * threading without a measurement that contradicts this. */
+uint64_t jaiOpPairs[OP_COUNT][OP_COUNT];
+uint8_t  jaiPrevOp;
 #endif
 
 #ifdef JAI_PROP_STATS
@@ -3441,6 +3464,8 @@ uint64_t jaiPropRecv[32];
 #  ifdef JAI_OPCODE_STATS
 #    define VM_NEXT()      do { DISPATCH_TRACE(); instStart = ip;                \
                                 jaiOpCounts[*ip]++;                              \
+                                jaiOpPairs[jaiPrevOp][*ip]++;                    \
+                                jaiPrevOp = *ip;                                 \
                                 goto *jaiDispatchTable[*ip++]; } while (0)
 #  else
 #    define VM_NEXT()      do { DISPATCH_TRACE(); instStart = ip;                \
@@ -3465,6 +3490,8 @@ uint64_t jaiPropRecv[32];
 #    define VM_NEXT_HINT(nextOp)                                               \
         do { DISPATCH_TRACE(); instStart = ip;                                 \
              jaiOpCounts[*ip]++;                                               \
+             jaiOpPairs[jaiPrevOp][*ip]++;                                     \
+             jaiPrevOp = *ip;                                                  \
              if (JAI_LIKELY(*ip == (nextOp))) { ip++; goto L_##nextOp; }       \
              goto *jaiDispatchTable[*ip++]; } while (0)
 #  else
@@ -7067,6 +7094,17 @@ void jaiVMPrintStats(FILE *out) {
                 fprintf(out, "op %3d %-24s %10" PRIu64 "  %5.2f%%\n", i,
                         jaiOpName((OpCode)i), jaiOpCounts[i],
                         100.0 * (double)jaiOpCounts[i] / (double)tot);
+        for (int a = 0; a < OP_COUNT; a++) {
+            uint64_t from = 0;
+            for (int b = 0; b < OP_COUNT; b++) from += jaiOpPairs[a][b];
+            if (from == 0) continue;
+            for (int b = 0; b < OP_COUNT; b++)
+                if (jaiOpPairs[a][b] > 0)
+                    fprintf(out, "pair %-24s %-24s %10" PRIu64 "  %5.1f%%\n",
+                            jaiOpName((OpCode)a), jaiOpName((OpCode)b),
+                            jaiOpPairs[a][b],
+                            100.0 * (double)jaiOpPairs[a][b] / (double)from);
+        }
     }
 #endif
 #ifdef JAI_PROP_STATS
