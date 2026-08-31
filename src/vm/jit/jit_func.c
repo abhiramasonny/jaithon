@@ -3704,6 +3704,28 @@ static void emitModuleGuard(Emit *e) {
     branchOnDeopt(e, JAI_A64_NE);
 }
 
+/* Off leaves an observed list return as SLOT_OBJ, so the promotion can be
+ * measured apart from the probe that precedes it. */
+static bool retListKindOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_RET_LIST");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* Off refuses a predicted-list receiver again, so the probe and the plumbing
+ * that feeds it can be measured apart. */
+static bool listProbeOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_LIST_PROBE");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 /* Off drops the callee's observed object type again, so the difference is
  * measurable in one binary. */
 static bool retObjTypeOn(void) {
@@ -3959,6 +3981,20 @@ static bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
     uint8_t seenType = 0;
     if (!feedbackSlotKind(fb, k, &tag, &seenType)) return false;
     if (objType != NULL) *objType = seenType;
+    /* A list earns the stronger kind here, where a per-way cache's byte cannot:
+     * this is the per-callee record, the same reason SLOT_INST is admissible
+     * above. It costs nothing to guard -- emitCallOutResult already emits the
+     * OBJ_LIST check for SLOT_LIST -- and it is the difference between `w[2]`
+     * compiling and refusing, since a subscript wants a list and SLOT_OBJ is
+     * only "some object".
+     *
+     * `_fuse_at` is `let w = window_of(...)` then `w.len()` and `w[1]`,
+     * `w[2]`, `w[3]`. Answering the method lookup alone left every subscript
+     * still refusing; this is the other half of that pair. */
+    if (retListKindOn() && *k == SLOT_OBJ &&
+        seenType == (uint8_t)(OBJ_LIST + 1)) {
+        *k = SLOT_LIST;
+    }
     return true;
 }
 
@@ -11230,47 +11266,69 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                         if (empty == NULL) return false;
                         oseen = OBJ_VAL((Obj *)empty);
                         oProbe = true;
+                    } else if (listProbeOn() &&
+                               e->stackObjType[ridx] == (uint8_t)(OBJ_LIST + 1)) {
+                        /* A predicted list. The type comes from the callee's
+                         * own observed return record, which is what
+                         * `let w = window_of(...)` gives -- `window_of` is
+                         * declared `-> list[int]`, compiles, and has always
+                         * had OBJ_LIST on record; the caller simply threw it
+                         * away (see observedReturnKind).
+                         *
+                         * An empty list rather than an interned constant: the
+                         * probe only has to answer WHICH builtin `.len` is,
+                         * and it is rooted across the lookup exactly as the
+                         * string probe is, with only the resolved native kept.
+                         * The receiver's object type is guarded at run time
+                         * below either way, so this chooses a guard and never
+                         * deletes one. */
+                        ObjList *probe = jaiListNew(0);
+                        if (probe == NULL) return false;
+                        oseen = OBJ_VAL((Obj *)probe);
+                        oProbe = true;
                     } else {
                         /* Naming the method is what priced this: the census
                          * showed `.len()` and nothing else, and the attribution
                          * instrument put **14.27% of lexer.jai's interpreted
                          * work** in eleven functions behind it.
                          *
-                         * An arm for it was built and REVERTED. jaiInvokeByName
-                         * resolves against any receiver, and `len` returns an
-                         * int whatever it is called on, so the call compiles --
-                         * but the bodies still do not. `_fuse_at` moves to the
-                         * very next instruction, `OP_GET_INDEX: the container
-                         * has kind object, not list`, whose own cause is a
-                         * FIELD whose kind only the declaration knows. Measured
-                         * flat on the clock.
+                         * THE CHAIN, re-derived 2026-08-30 by actually clearing
+                         * the links rather than probing them (see the memory
+                         * note on why a probed link can be an artefact). For
+                         * `_fuse_at`, which is `let w = window_of(...)` then
+                         * `w.len()` and `w[1]`, `w[2]`, `w[3]`:
                          *
-                         * THE CHAIN, re-measured 2026-08-28 after the field
-                         * kinds landed, because it is the only useful thing to
-                         * leave behind here. Arming this refusal and asking
-                         * `JAI_JIT_CHAIN=1` what `_fuse_at` hits next gives:
+                         *   1. `.len()` on a receiver with no sample. Cleared:
+                         *      the callee's OBSERVED return record already said
+                         *      OBJ_LIST and observedReturnKind was dropping it
+                         *      on the floor. An empty-list probe answers the
+                         *      lookup, as the string probe already did.
+                         *   2. `w[2]`: the container has kind object, not list.
+                         *      Cleared: promote an observed list return to
+                         *      SLOT_LIST, which emitCallOutResult was already
+                         *      emitting the OBJ_LIST guard for.
+                         *   3. `w[2]`: no live list to read an element kind
+                         *      off. NOT cleared. A call result has no declared
+                         *      element type on record anywhere -- `window_of`
+                         *      is declared `-> list[int]` and nothing carries
+                         *      the `int`. That needs a new record, either the
+                         *      declared element kind (a SEEDED emit.jai change)
+                         *      or an observed one on ObjFunction.
                          *
-                         *   1. this refusal
-                         *   2..6. `OP_GET_INDEX: the container has kind object,
-                         *         not list`, FIVE TIMES, at offsets 124, 442,
-                         *         682, 973 and 1233 -- every `code.data[i]` in
-                         *         the body.
+                         * MEASURED, links 1 and 2 together, one binary through
+                         * JAITHON_JIT_LIST_PROBE and JAITHON_JIT_RET_LIST, four
+                         * paired runs of `check --no-cache parser.jai`:
+                         *   off 58,069,566  58,188,736  58,038,914  58,503,867
+                         *   on  58,929,750  58,075,894  57,560,941  57,301,824
+                         * Flat. Three of four favour it and the mean moves
+                         * 0.4%, which is inside the spread -- because link 3
+                         * still declines the body.
                          *
-                         * That is five instances of ONE cause, not five causes:
-                         * `code.data` is declared a list and the tier has it as
-                         * a bare object, so one fix clears all five. Which also
-                         * means arming THIS refusal on its own is worth nothing
-                         * and was measured so -- 58,104,810 interpreted
-                         * instructions against 58,041,246 with it off, i.e.
-                         * marginally worse.
-                         *
-                         * So: fix the list-typed field first. Then this becomes
-                         * the last link rather than the first, and the pair is
-                         * worth measuring together. The arm itself is four
-                         * lines -- `jaiInvokeMethodByName` resolves against any
-                         * receiver and `len` returns an int whatever it is
-                         * called on, so it needs no sample, only a guard on
-                         * what comes back. */
+                         * KEPT anyway, on the same reasoning as the enum fold
+                         * above: the refusal is now accurate rather than
+                         * misleading, and links 1 and 2 are prerequisites for
+                         * link 3 being worth anything. Do not re-measure these
+                         * two alone and expect a number. */
                         /* Say WHICH type was predicted, if any. "no known
                          * type" hid the difference between a receiver the
                          * model knows nothing about and one it knows is a
