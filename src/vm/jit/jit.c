@@ -205,7 +205,13 @@ void jaiJitStartSampling(void) {
      *
      *   interpreted   57,180,449 -> 58,567,440   +1.4M = +0.004s
      *   signal cost   ~0.047s    -> ~0.012s      -0.035s
-     *   measured wall 0.76 0.77  -> 0.73 0.72 0.72
+     *   measured wall 0.76 0.77  -> 0.73 0.72 0.72   (first pass, -5%)
+     *
+     * Re-measured on a quiet machine, four interleaved pairs in one binary:
+     *   250us  0.78 0.77 0.80 0.82
+     *   1000us 0.74 0.78 0.77 0.78
+     * Three of four favour it and the mean moves -3.2%. Take 3%, not 5% --
+     * the first pass was the optimistic end of the spread.
      *
      * Same 327 bodies compiled either way; only OSR loops enter slightly
      * later. 4000us was tried and is where it turns: jaicv's interpreted work
