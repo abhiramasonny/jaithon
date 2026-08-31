@@ -581,8 +581,21 @@ struct ObjFunction {
     /* One form per loop head, not one per function. `main` in `sieve` has
      * four loops and only the first ever compiled, because a second offset met
      * `osrTop != top` and was refused: the loop that does the sieving was
-     * interpreted for the life of the program. */
-    JaiOsrForm  osrForms[JAI_OSR_MAX];
+     * interpreted for the life of the program.
+     *
+     * NULL until the first form this function ever records. An inline
+     * `JaiOsrForm[JAI_OSR_MAX]` cost every ObjFunction in the program 1344
+     * bytes -- sizeof(JaiOsrForm) 168 times JAI_OSR_MAX 8 -- whether or not the
+     * JIT ever looked at it, and one jaicv run compiles 75 loops across
+     * thousands of functions. Allocated for JAI_OSR_MAX entries the first time
+     * compileOsrOnce in jit_func.c records a form, same width the inline array
+     * always was, so osrFormCap()'s runtime cap (JAITHON_JIT_OSR_FORMS) still
+     * only restricts how many of those entries get used. Freed in
+     * jaiFreeObject alongside paramNames/exceptions/defaultOffsets, the same
+     * lifetime as every other heap member here. Holds a code pointer and plain
+     * bytes -- no Value -- so blackenFunction in gc.c marks it exactly as much
+     * as it did when it was inline: not at all. */
+    JaiOsrForm *osrForms;
     uint8_t     osrCount;
     /* Attempts so far. One look is not enough: a body can only use a callee's
      * return kind once that callee has itself compiled, and which of them have
