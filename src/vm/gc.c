@@ -139,25 +139,6 @@ uint64_t jaiGCMarked, jaiGCSwept, jaiGCSweptDead;
 double   jaiGCMarkSec, jaiGCInternSec, jaiGCSweepSec;
 #endif
 
-#ifdef JAI_GC_ROOT_CENSUS
-/* Temporary. Two questions the fixed-entry count alone cannot answer:
- * how many table slots the always-rewalked roots cost, and how many OBJECTS
- * the transitive closure of those roots costs. */
-uint64_t jaiRcModules, jaiRcGlobals, jaiRcExports, jaiRcClassEntries;
-uint64_t jaiRcClosureModules, jaiRcClosureRest, jaiRcColl;
-static int jaiRcOn(void) {
-    static int cached = -1;
-    if (cached < 0) { const char *e = getenv("JAI_GC_ROOT_CENSUS"); cached = (e && *e && *e != '0'); }
-    return cached;
-}
-static uint64_t jaiRcCount(const JaiTable *t) {
-    if (t->entries == NULL) return 0;
-    uint64_t n = 0;
-    for (int i = 0; i < t->orderCount; ++i) if (t->order[i] >= 0) n++;
-    return n;
-}
-#endif
-
 void jaiGCMarkObject(Obj *obj) {
     if (obj == NULL || obj->isMarked) return;
     obj->isMarked = true;
@@ -235,12 +216,6 @@ static void blackenClass(ObjClass *c) {
     jaiGCMark((Obj *)c->qualifiedName);
     jaiGCMark((Obj *)c->superclass);
 
-#ifdef JAI_GC_ROOT_CENSUS
-    if (jaiRcOn())
-        jaiRcClassEntries += jaiRcCount(&c->methods) + jaiRcCount(&c->statics) +
-                             jaiRcCount(&c->getters) + jaiRcCount(&c->setters) +
-                             jaiRcCount(&c->restricted);
-#endif
     jaiTableMark(&c->methods);
     jaiTableMark(&c->statics);
     jaiTableMark(&c->getters);
@@ -362,13 +337,6 @@ static void blackenObject(Obj *obj) {
         jaiGCMark((Obj *)module->name);
         jaiGCMark((Obj *)module->path);
         jaiGCMark((Obj *)module->body);
-#ifdef JAI_GC_ROOT_CENSUS
-        if (jaiRcOn()) {
-            jaiRcModules++;
-            jaiRcGlobals += jaiRcCount(&module->globals);
-            jaiRcExports += jaiRcCount(&module->exports);
-        }
-#endif
         jaiTableMark(&module->globals);
         jaiTableMark(&module->exports);
         break;
@@ -426,18 +394,6 @@ static void markWellKnownClasses(void) {
         jaiGCMark((Obj *)classes[i]);
 }
 
-static int jaiRcSkipModules;
-static int jaiRcReverse(void) {
-    static int cached = -1;
-    if (cached < 0) { const char *e = getenv("JAI_GC_RC_REVERSE"); cached = (e && *e && *e != '0'); }
-    return cached;
-}
-static void markModuleRoots(void) {
-    jaiTableMark(&vm.modules);
-    jaiGCMark((Obj *)vm.mainModule);
-    jaiGCMark((Obj *)vm.builtins);
-}
-
 static void markRoots(GCState *g) {
     if (vm.stack != NULL) {
         for (Value *slot = vm.stack; slot < vm.stackTop; slot++)
@@ -460,7 +416,9 @@ static void markRoots(GCState *g) {
     markValues(vm.defers.data, vm.defers.count);
     markStrings(vm.modulePath.data, vm.modulePath.count);
 
-    if (!jaiRcSkipModules) markModuleRoots();
+    jaiTableMark(&vm.modules);
+    jaiGCMark((Obj *)vm.mainModule);
+    jaiGCMark((Obj *)vm.builtins);
     jaiGCMarkVal(vm.pendingException);
 
     markInternedNames();
@@ -541,49 +499,8 @@ void jaiGCCollect(void) {
 #ifdef JAI_ALLOC_CENSUS
     double t0 = jaiClockMonotonic();
 #endif
-#ifdef JAI_GC_ROOT_CENSUS
-    if (jaiRcOn()) {
-        uint64_t m0 = jaiGCMarked, g0 = jaiRcGlobals, e0 = jaiRcExports;
-        uint64_t c0 = jaiRcClassEntries, n0 = jaiRcModules;
-        uint64_t modClosure, rest;
-        if (jaiRcReverse()) {
-            jaiRcSkipModules = 1;
-            markRoots(g);
-            traceReferences(g);
-            rest = jaiGCMarked - m0;
-            jaiRcSkipModules = 0;
-            markModuleRoots();
-            traceReferences(g);
-            modClosure = jaiGCMarked - m0 - rest;
-        } else {
-            markModuleRoots();
-            traceReferences(g);
-            modClosure = jaiGCMarked - m0;
-            markRoots(g);
-            traceReferences(g);
-            rest = jaiGCMarked - m0 - modClosure;
-        }
-        jaiRcClosureModules += modClosure;
-        jaiRcClosureRest += rest;
-        jaiRcColl++;
-        fprintf(stderr,
-            "RC coll=%llu modules=%llu globals=%llu exports=%llu classEnt=%llu "
-            "fixed=%llu closureModules=%llu rest=%llu total=%llu\n",
-            (unsigned long long)jaiRcColl,
-            (unsigned long long)(jaiRcModules - n0),
-            (unsigned long long)(jaiRcGlobals - g0),
-            (unsigned long long)(jaiRcExports - e0),
-            (unsigned long long)(jaiRcClassEntries - c0),
-            (unsigned long long)((jaiRcGlobals - g0) + (jaiRcExports - e0) + (jaiRcClassEntries - c0)),
-            (unsigned long long)modClosure,
-            (unsigned long long)rest,
-            (unsigned long long)(modClosure + rest));
-    } else
-#endif
-    {
     markRoots(g);
     traceReferences(g);
-    }
 #ifdef JAI_ALLOC_CENSUS
     double t1 = jaiClockMonotonic();
 #endif
