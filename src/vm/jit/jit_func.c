@@ -9928,19 +9928,34 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * the compile either. */
             if (e->stack[e->depth - 1] != SLOT_INST &&
                 e->stack[e->depth - 1] != SLOT_MAYBE_INST) {
-                return false;
+                return subWhy(e, "a receiver of kind %s, not an instance",
+                              slotKindName(e->stack[e->depth - 1]));
             }
-            if (klass == NULL) return false;
+            if (klass == NULL) {
+                return subWhy(e, "an instance receiver with no class pinned");
+            }
             if (e->stack[e->depth - 1] == SLOT_MAYBE_INST) {
                 emit(e, jaiA64SubsXImm(31, valueBankReg(e, e->valueDepth - 1), 0));
                 branchOnDeopt(e, JAI_A64_EQ);
             }
-            if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
+            if (nameIdx >= (uint32_t)fn->chunk.constants.count) {
+                return subWhy(e, "the field name is not in the pool");
+            }
             Value nameVal = fn->chunk.constants.data[nameIdx];
-            if (!IS_STRING(nameVal)) return false;
+            if (!IS_STRING(nameVal)) {
+                return subWhy(e, "the field name is not a string");
+            }
 
             const FieldInfo *info = jaiClassFieldInfo(klass, AS_STRING(nameVal));
-            if (info == NULL || info->isStatic) return false;
+            if (info == NULL) {
+                return subWhy(e, "`%s` is not a field of %s",
+                              AS_STRING(nameVal)->chars,
+                              klass->name ? klass->name->chars : "that class");
+            }
+            if (info->isStatic) {
+                return subWhy(e, "`%s` is a static, not an instance field",
+                              AS_STRING(nameVal)->chars);
+            }
             if (!IS_INSTANCE(seen)) {
                 /* No sample to classify the field from. The commonest cause
                  * is a receiver OP_INVOKE itself predicted: `klass` came from
@@ -10027,7 +10042,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
             ObjInstance *inst = AS_INSTANCE(seen);
-            if (info->slot >= inst->fieldCount) return false;
+            if (info->slot >= inst->fieldCount) {
+                return subWhy(e, "the sampled instance has fewer fields than "
+                                 "its class declares");
+            }
             Value fieldVal = inst->fields[info->slot];
 
             SlotKind kind;
@@ -10046,7 +10064,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 tag  = VAL_OBJ;
                 fcls = IS_INSTANCE(fieldVal) ? AS_INSTANCE(fieldVal)->klass
                                              : klass;
-                if (fcls == NULL) return false;
+                if (fcls == NULL) {
+                    return subWhy(e, "a nullable field with no class to guard");
+                }
             }
             /* As in OP_GET_FIELD_LOCAL: an object-typed field is held raw
              * rather than declining the enclosing function, and a list earns
@@ -10060,7 +10080,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * the union's one-byte member. */
             else if (IS_BOOL(fieldVal)) { kind = SLOT_BOOL; tag = VAL_BOOL; }
             else if (rawObjValue(fieldVal)) { kind = SLOT_OBJ;  tag = VAL_OBJ; }
-            else return false;
+            else {
+                return subWhy(e, "a field holding %s, which has no arm",
+                              jaiTypeNameStatic(fieldVal));
+            }
 
             unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
                              (unsigned)info->slot * (unsigned)sizeof(Value);
