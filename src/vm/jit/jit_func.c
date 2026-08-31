@@ -3992,6 +3992,22 @@ static void reportChain(const Emit *proto, Emit *first, ObjClosure *closure,
     const char *name = fn->name != NULL ? fn->name->chars : "<anon>";
 
     fprintf(stderr, "[jit] chain %s:\n", name);
+    /* Link 1 is a fact. Everything below it is a PROBE, and the probe is not
+     * the same thing as a fix.
+     *
+     * Stepping over an instruction takes the unarmed path, which abandons the
+     * rest of that straight-line block and can only resume at a later
+     * independently-reachable jump target. If a bind lived in the abandoned
+     * part, the walk reaches the next link with that local never bound at all
+     * -- and then reports a refusal ("local N has kind int, not instance")
+     * that a genuinely fixed link 1 would never have produced. One night's
+     * `.len()` chain read that way and the link 2 it named was an artefact.
+     *
+     * So: chase link 1. Treat the rest as a hint about where to look next,
+     * never as a list of things that must all be cleared. */
+    fprintf(stderr, "[jit]   (link 1 is measured; the links below are probed "
+                    "by forcing it unarmed,\n[jit]    which skips the rest of "
+                    "its block -- treat them as hints, not facts)\n");
     fprintf(stderr, "[jit]   1. %s  (at %u)\n", declineReason(first),
             first->curOffset);
     skips[n++] = first->curOffset;
