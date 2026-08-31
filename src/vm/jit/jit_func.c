@@ -576,6 +576,17 @@ typedef enum {
 #define JIT_FP_FIRST_SAVED 8u
 #define JIT_FP_MAX_SAVED   8u
 
+/* Off puts the refusal back, so the declared-element route can be measured
+ * against the sample-only one in the same binary. */
+static bool elemDeclOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("JAITHON_JIT_ELEM_DECL");
+        on = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 /* A SlotKind's name, for JAI_JIT_WHY. Several refusals used to print the raw
  * enumerator ("the container is kind 13, not a list"), which names the one
  * thing a reader of the message cannot look up. */
@@ -708,6 +719,19 @@ typedef struct {
      * object it is the element's own live sample, which was already being held
      * here and is reachable for the same reasons it was. */
     Value     stackElem[JIT_MAX_STACK];
+    /* The element type this list was DECLARED with, as a FieldKind + 1, or 0
+     * for "nothing was declared". A fact rather than a prediction: the
+     * emitter stamps it with OP_ELEM_KIND while the list is still empty, and
+     * the interpreter's jaiListSpecialise pins the storage from the same byte.
+     *
+     * It exists because a sample cannot. A local built inside the body -- and
+     * then filled by a callee that mutates it through the alias, never
+     * reassigning it -- holds nothing at the moment the tier looks, so
+     * stackSeen is empty for the whole life of the compile. That is not a gap
+     * to be closed by sampling harder; the value provably does not exist yet.
+     * jaicv's `min_area_rect` is exactly that shape and was the single largest
+     * refusal on the benchmark. */
+    uint8_t   stackElemDecl[JIT_MAX_STACK];
     int       stackLocal[JIT_MAX_STACK];
     /* This entry is not merely a string by sample -- it came out of the shared
      * one-byte ASCII table, so it IS an interned ObjString, and the guards a
@@ -755,6 +779,8 @@ typedef struct {
     /* Kept only so a field read on this local has something to read the field's type off; a local bound
      * from a list element has no argument to look at (why nbody's `advance`'s `bi` couldn't have its fields read). */
     Value     localSeen[JIT_MAX_SLOTS + 1];
+    /* stackElemDecl carried across the bind that named this local. */
+    uint8_t   localElemDecl[JIT_MAX_SLOTS + 1];
     Value    *observed;
     bool      assumedIntReturn;
     unsigned  depth;
@@ -2075,6 +2101,9 @@ static bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackUnit[e->depth]  = false;
     e->stackObjType[e->depth] = 0;
     e->stackElem[e->depth] = NULL_VAL;
+    e->stackElemDecl[e->depth] =
+        (fromLocal >= 0 && fromLocal <= (int)JIT_MAX_SLOTS)
+            ? e->localElemDecl[fromLocal] : 0;
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
@@ -2140,6 +2169,7 @@ static bool pushSelf(Emit *e) {
     e->stackUnit[e->depth]  = false;
     e->stackObjType[e->depth] = 0;
     e->stackElem[e->depth] = NULL_VAL;
+    e->stackElemDecl[e->depth] = 0;
     e->stack[e->depth++] = SLOT_SELF;
     return true;
 }
@@ -2209,6 +2239,7 @@ static void dropCalleeEntry(Emit *e) {
     e->stackUnit[e->depth - 2]  = e->stackUnit[e->depth - 1];
     e->stackObjType[e->depth - 2] = e->stackObjType[e->depth - 1];
     e->stackElem[e->depth - 2] = e->stackElem[e->depth - 1];
+    e->stackElemDecl[e->depth - 2] = e->stackElemDecl[e->depth - 1];
     e->depth--;
 }
 
@@ -7665,6 +7696,10 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 break;
             }
             unsigned r = valueXReg(e, e->valueDepth - 1);
+            /* The arm was already computing this byte and throwing it away.
+             * Keeping it is what lets a subscript of this list choose a load
+             * when no sample of it can exist. */
+            e->stackElemDecl[e->depth - 1] = (uint8_t)((packed & 0xFu) + 1u);
             emitConst64(e, JIT_SCRATCH_A, (int64_t)(packed & 0xFu));
             emit(e, jaiA64StrByte(JIT_SCRATCH_A, r,
                                   (unsigned)offsetof(ObjList, elemKind)));
@@ -7922,6 +7957,9 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                                     e->stackSeen[e->depth - 1])) {
                 e->whyNot = kindClash(e, slot);
                 return false;
+            }
+            if (e->stackElemDecl[e->depth - 1] != 0) {
+                e->localElemDecl[slot] = e->stackElemDecl[e->depth - 1];
             }
             if (!e->fpOff && !e->dynamicLocal[slot] &&
                 e->stack[e->depth - 1] == SLOT_FLOAT &&
@@ -10125,6 +10163,22 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * remove. See buildListExemplar for why the list itself cannot
              * answer this. */
             e->stackElem[e->depth - 1] = elemSeen;
+            /* The same exemplar as a KIND, which survives a bind into a local
+             * where the Value does not -- there is nowhere to root a Value per
+             * local, and a byte needs no rooting.
+             *
+             * A prediction, not a fact, unlike the OP_ELEM_KIND route: an
+             * undeclared literal gets boxed storage, so a later append may put
+             * anything in it. That is safe on the same terms as stackElem
+             * itself -- a boxed element is tag-checked at every read, so a
+             * changed kind deoptimises. `min_area_rect` builds
+             * `[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]` with no declared type and then
+             * subscripts it, which is the case that needed this. */
+            e->stackElemDecl[e->depth - 1] =
+                IS_INT(elemSeen)   ? (uint8_t)(FIELD_KIND_INT   + 1)
+              : IS_FLOAT(elemSeen) ? (uint8_t)(FIELD_KIND_FLOAT + 1)
+              : IS_BOOL(elemSeen)  ? (uint8_t)(FIELD_KIND_BOOL  + 1)
+                                   : (uint8_t)0;
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
@@ -12559,18 +12613,45 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             bool gHoisted = false;
 
             Value seenList = e->stackSeen[e->depth - 2];
+            SlotKind kind = SLOT_OPAQUE;
+            unsigned tag = VAL_OBJ;
+            ObjClass *elemClass = NULL;
+            uint32_t  elemShape = 0;
+            /* NULL_VAL on the declared route: there is no exemplar to carry,
+             * which is the whole reason that route exists. */
+            Value elem = NULL_VAL;
+            /* No sample, but the list was DECLARED. See Emit::stackElemDecl:
+             * for a body-local list filled through an alias there is nothing
+             * to sample and never will be, so the declaration is the only
+             * fact available -- and it is a fact, not a guess, because the
+             * same byte pins ObjList::stg while the list is still empty.
+             *
+             * Safe even if it were wrong: listAccessFor rejects a kind the
+             * pinned storage contradicts at compile time, and a dispatched
+             * access still tag-checks the boxed arm at run time, so a bad
+             * declaration deoptimises rather than misreading memory. */
+            if (!IS_LIST(seenList) && elemDeclOn()) {
+                SlotKind dk = SLOT_OPAQUE;
+                switch ((unsigned)e->stackElemDecl[e->depth - 2]) {
+                case FIELD_KIND_INT   + 1u: dk = SLOT_INT;   tag = VAL_INT;   break;
+                case FIELD_KIND_FLOAT + 1u: dk = SLOT_FLOAT; tag = VAL_FLOAT; break;
+                case FIELD_KIND_BOOL  + 1u: dk = SLOT_BOOL;  tag = VAL_BOOL;  break;
+                default: break;
+                }
+                if (dk != SLOT_OPAQUE) {
+                    kind = dk;
+                    goto haveElemKind;
+                }
+            }
             if (!IS_LIST(seenList)) {
                 return subWhy(e, "no live list to read an element kind off");
             }
+            {
             ObjList *sl = AS_LIST(seenList);
             if (sl->count <= 0) {
                 return subWhy(e, "the live list is empty, so there is no exemplar");
             }
-            Value elem = jaiListGet(sl, 0);
-            SlotKind kind;
-            unsigned tag;
-            ObjClass *elemClass = NULL;
-            uint32_t  elemShape = 0;
+            elem = jaiListGet(sl, 0);
             if (IS_INT(elem))        { kind = SLOT_INT;   tag = VAL_INT; }
             else if (IS_FLOAT(elem)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
             else if (IS_BOOL(elem))  { kind = SLOT_BOOL;  tag = VAL_BOOL; }
@@ -12599,6 +12680,8 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 elemClass = AS_INSTANCE(elem)->klass;
                 elemShape = elemClass->shapeId;
             } else return false;
+            }
+        haveElemKind:
 
             /* One `ldp` for both header fields: `items` at +16, `count`/`capacity` the adjacent int32s at +24, so
              * the pair's second half is `count | capacity << 32` and the bounds test reads it with uxtw -- one instruction per element read (life does nine per cell). */
