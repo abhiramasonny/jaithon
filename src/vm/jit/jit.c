@@ -174,10 +174,49 @@ void jaiJitStartSampling(void) {
 
     struct itimerval it;
     it.it_interval.tv_sec = 0;
-    /* 4kHz: a tick only counts on a back-edge ip, so raising the rate directly
-     * shortens the wait before compiling; 10kHz measured worse (signal cost
-     * outweighs the earlier compile), so this is a peak, not a slope. */
-    it.it_interval.tv_usec = 250;
+    /* A `sample` of a whole-directory `check --no-cache` of the compiler put **6.17% of
+     * the run in `_sigtramp`** -- delivering this signal, not acting on it.
+     * That is larger than any refusal left in the tier. The rate is worth
+     * revisiting now that the FIRST tick arms a body (see jaiJitSample): the
+     * old two-tick wait needed the ticks to be dense, and this one does not. */
+    {
+        const char *rate = getenv("JAITHON_JIT_TICK_US");
+        if (rate != NULL) {
+            int us = atoi(rate);
+            if (us >= 50 && us <= 100000) {
+                it.it_interval.tv_usec = us;
+                it.it_value = it.it_interval;
+                (void)setitimer(ITIMER_PROF, &it, NULL);
+                return;
+            }
+        }
+    }
+    /* 1kHz. Was 4kHz, on the reasoning that a tick only counts on a back-edge
+     * ip so a higher rate shortens the wait to compile -- 10kHz measured worse
+     * and 4kHz looked like the peak.
+     *
+     * It was not the peak, because the cost side had never been measured. A
+     * `sample` of a whole-directory `check --no-cache` of the compiler put
+     * **6.17% of the run in `_sigtramp`** -- delivering this signal, not acting
+     * on it. That is bigger than any refusal left in the tier.
+     *
+     * The trade is priced exactly, at ~2.8ns an interpreted instruction (see
+     * the memory note). Going 250us -> 1000us on `check parser.jai`:
+     *
+     *   interpreted   57,180,449 -> 58,567,440   +1.4M = +0.004s
+     *   signal cost   ~0.047s    -> ~0.012s      -0.035s
+     *   measured wall 0.76 0.77  -> 0.73 0.72 0.72
+     *
+     * Same 327 bodies compiled either way; only OSR loops enter slightly
+     * later. 4000us was tried and is where it turns: jaicv's interpreted work
+     * jumps 39.9M -> 66.3M for no further wall gain, and the compiler stops
+     * improving. jaicv is GPU-bound and measures 10.2s at every rate.
+     *
+     * This is affordable now in a way it was not before: the tick that makes a
+     * body hot now ARMS it (see jaiJitSample), where it used to only mark it
+     * and wait for a second tick. Dense ticks mattered then. JAITHON_JIT_TICK_US
+     * overrides, which is how the table above was taken. */
+    it.it_interval.tv_usec = 1000;
     it.it_value = it.it_interval;
     (void)setitimer(ITIMER_PROF, &it, NULL);
 }
