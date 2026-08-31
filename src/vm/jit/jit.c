@@ -188,8 +188,43 @@ void jaiJitStartSampling(void) {
  * costs microseconds, so there's little to gain by waiting longer. */
 #define JAI_JIT_HOT_TICKS 1
 
+/* Off restores the old two-tick wait, so the change can be measured in one
+ * binary rather than across two builds. */
+static bool jaiJitArmOnFirstTick(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("JAITHON_JIT_TICK_ARM");
+        on = (e != NULL && e[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 bool jaiJitSample(ObjClosure *closure, uint32_t offset) {
     ObjFunction *fn = closure->fn;
+    /* The tick that makes a body hot arrives on a back edge, which is exactly
+     * the entry point the attempt below needs -- so spend it, rather than
+     * waiting for the next one.
+     *
+     * Waiting cost `good_features_to_track` its whole compilation. It got one
+     * tick in the jaicv suite and never a second, because -- as its own
+     * comment says -- it is nothing but calls, so every later tick was
+     * consumed by a callee's back edge before it reached this frame. It ran
+     * 11,826,840 instructions interpreted, 17.1% of the benchmark, and the
+     * tier never so much as printed `considering` for it.
+     *
+     * A body that goes on to get many ticks only compiles sooner. The one that
+     * gets exactly one is the whole point, and there is no way to tell the two
+     * apart at the tick. JAI_JIT_HOT_TICKS has gone 20 to 3 to 1 on the same
+     * argument; this is the last step of it. */
+    if (fn->tickCount < JAI_JIT_HOT_TICKS) {
+        fn->tickCount++;
+        if (fn->tickCount == JAI_JIT_HOT_TICKS && getenv("JAI_JIT_TRACE")) {
+            fprintf(stderr, "[jit] hot: %s at offset %u\n",
+                    fn->name ? fn->name->chars : "<anon>", offset);
+        }
+        if (fn->tickCount < JAI_JIT_HOT_TICKS) return true;
+        if (!jaiJitArmOnFirstTick()) return true;
+    }
     if (fn->tickCount >= JAI_JIT_HOT_TICKS) {
         /* Already hot. A tick on a loop top is the OSR entry point, the only
          * moment interpreter state matches what compiled code expects: OP_LOOP
@@ -205,13 +240,6 @@ bool jaiJitSample(ObjClosure *closure, uint32_t offset) {
             frame->ip = fn->chunk.code + resumeAt;
         }
         return true;
-    }
-    if (fn->tickCount < JAI_JIT_HOT_TICKS) {
-        fn->tickCount++;
-        if (fn->tickCount == JAI_JIT_HOT_TICKS && getenv("JAI_JIT_TRACE")) {
-            fprintf(stderr, "[jit] hot: %s at offset %u\n",
-                    fn->name ? fn->name->chars : "<anon>", offset);
-        }
     }
     return true;
 }
