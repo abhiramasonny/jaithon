@@ -16149,6 +16149,13 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     if (entry == NULL) return false;
 
     if (fn->osrCount >= osrFormCap()) return false;
+    /* First form this function has ever recorded: fewer than 2% of functions
+     * ever get one, so the table is allocated here rather than inline on
+     * ObjFunction. Sized JAI_OSR_MAX regardless of osrFormCap()'s runtime cap
+     * -- the cap only restricts how many of these entries get used, the same
+     * as it did when the array was inline and fixed at this width. */
+    if (fn->osrForms == NULL)
+        fn->osrForms = JAI_ALLOC_ZEROED(JaiOsrForm, JAI_OSR_MAX);
     JaiOsrForm *form = &fn->osrForms[fn->osrCount];
     form->code  = entry;
     form->top   = top;

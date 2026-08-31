@@ -161,6 +161,15 @@ void jaiFreeObject(Obj *obj) {
         JAI_FREE_ARRAY(ObjString *, fn->paramNames, fn->paramCount);
         JAI_FREE_ARRAY(ExceptionEntry, fn->exceptions, fn->exceptionCount);
         JAI_FREE_ARRAY(uint32_t, fn->defaultOffsets, fn->defaultCount);
+        /* Guarded on NULL, unlike the three frees above: those always pair a
+         * NULL pointer with a zero count, so JAI_FREE_ARRAY's size math comes
+         * out as a no-op free(NULL). osrForms instead pairs NULL with
+         * JAI_OSR_MAX -- the width it is allocated at on first use, in
+         * jit_func.c's compileOsrOnce -- and freeing that width against a pointer
+         * that was never allocated would tell jaiRealloc's accounting a block
+         * existed that never did. */
+        if (fn->osrForms != NULL)
+            JAI_FREE_ARRAY(JaiOsrForm, fn->osrForms, JAI_OSR_MAX);
         JAI_FREE(ObjFunction, obj);
         return;
     }
