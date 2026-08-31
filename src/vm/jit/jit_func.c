@@ -108,9 +108,27 @@ static uintptr_t stackLimit(void) {
  * a hot one -- and also wanted six and seven elsewhere; 8 covers every arity
  * that corpus asks for. The price is 4 more Values (64 bytes) on the frame of
  * every compiled body that calls out, which is stack, never touched beyond
- * what is used, and leaves the frame under the 504 bytes that keep the cheap
- * stp-pre prologue. */
-#define JIT_MAX_ARGS_OUT 8
+ * what is used.
+ *
+ * Then 8 was not enough either, and the way that surfaced is worth keeping.
+ * Teaching OP_GET_GLOBAL to resolve the `__prim__` namespace made jaicv's
+ * `span` twice as slow, because `__prim__.fill_span(...)` takes TEN arguments
+ * and `fill_convex` eleven. While `__prim__` had no arm the walk took the SOFT
+ * unarmed path and skipped the receiver, all ten pushes and the invoke as one
+ * block, so span's prologue compiled; once it resolved, the walk reached this
+ * cap, which refuses HARD and declined the whole function.
+ *
+ * Two agents tried to dodge the wall with a lookahead that only resolves
+ * `__prim__` when the paired invoke would fit. That was refuted: it finds the
+ * FIRST invoke, not the paired one, so an argument containing its own method
+ * call walks straight back into the wall. Removing the wall is the fix.
+ *
+ * 12 covers `fill_convex`'s eleven. The price is 4 more Values (64 bytes) on
+ * a calling body's frame, and it carries that frame past the 504 bytes that
+ * keep the cheap stp-pre prologue -- which JIT_MAX_ROOTS above already does,
+ * for the same reason and at the same price: framePairFits() falls back to one
+ * or two extra instructions once per body, against a whole body compiling. */
+#define JIT_MAX_ARGS_OUT 12
 
 /* Values first in JitCallDesc so every field is 8-aligned and the emitted stores can use scaled forms. */
 typedef struct JitCallDesc {
@@ -6265,6 +6283,59 @@ static bool primNativeResultKind(const char *nm, unsigned argc, SlotKind *k) {
  * `raiseExitAllowed` branch already handles, message and all -- nothing about
  * going through a descriptor changes what the native itself decides to
  * raise. */
+/* Whether the `__prim__` read at `off` is paired with an OP_INVOKE this tier
+ * can actually compile. If it is not, the namespace is left unresolved so the
+ * read falls to the unarmed path exactly as it did before this arm existed --
+ * which for a call the tier cannot emit is strictly better than resolving it.
+ *
+ * WHY THIS EXISTS. `span` ends in `__prim__.fill_span(...)` with ten arguments
+ * and `fill_convex` with eleven. While `__prim__` had no arm the walk skipped
+ * receiver, pushes and invoke as ONE unarmed block and span's prologue
+ * compiled; resolving the namespace made the walk continue into those pushes
+ * and hit a wall it cannot pass -- the argc cap, then the result-kind
+ * whitelist, then the register budget, each a hard whole-body decline. span's
+ * interpreted work DOUBLED, 5,821,736 to 10,867,344, from arming a
+ * neighbouring opcode.
+ *
+ * PAIRING IS THE WHOLE DIFFICULTY, and an earlier attempt got it wrong: it
+ * took the FIRST OP_INVOKE after the read, which is not the paired one
+ * whenever an argument expression contains its own method call. When that
+ * inner invoke happened to be whitelisted the lookahead said yes and the OUTER
+ * one declined the body -- the very thing it was written to prevent.
+ *
+ * `chunkDepth` settles it exactly. It is the operand-stack depth BEFORE each
+ * instruction, so the invoke paired with this read is the one that consumes
+ * back to the depth the read started from: `chunkDepth[p] - (argc + 1) ==
+ * chunkDepth[off]`. A nested invoke inside an argument sits deeper and cannot
+ * match. Where the table is unavailable -- OSR, inlining -- the answer is no,
+ * which keeps the old unarmed behaviour rather than guessing. */
+static bool primInvokePairFits(const Emit *e, const Chunk *chunk, uint32_t off) {
+    if (e->chunkDepth == NULL || e->osr || e->inlining) return false;
+    if (off >= (uint32_t)e->chunkDepthCount) return false;
+    const int base = e->chunkDepth[off];
+    const uint8_t *code = chunk->code;
+    uint32_t p = off + 6;
+    while (p < (uint32_t)chunk->count) {
+        if (p >= (uint32_t)e->chunkDepthCount) return false;
+        if (code[p] == OP_INVOKE) {
+            unsigned argc = code[p + 4];
+            if (e->chunkDepth[p] - (int)(argc + 1u) == base) {
+                if (argc + 1u > (unsigned)JIT_MAX_ARGS_OUT) return false;
+                uint32_t nameIdx = jaiReadU24(code + p + 1);
+                if (nameIdx >= (uint32_t)chunk->constants.count) return false;
+                Value nm = chunk->constants.data[nameIdx];
+                if (!IS_STRING(nm)) return false;
+                SlotKind rk;
+                return primNativeResultKind(AS_STRING(nm)->chars, argc, &rk);
+            }
+        }
+        unsigned len = instructionLength(chunk, p);
+        if (len == 0) return false;
+        p += len;
+    }
+    return false;
+}
+
 static bool emitModuleNativeCall(Emit *e, ObjModule *m, Value calleeVal,
                                  unsigned ridx, unsigned argc, uint32_t after) {
     ObjNative *nat = AS_NATIVE(calleeVal);
@@ -6300,7 +6371,9 @@ static bool emitModuleNativeCall(Emit *e, ObjModule *m, Value calleeVal,
         unsigned r;
         if (!popValue(e, &r, NULL)) return false;
     }
-    return emitCallOutResult(e, rk, 0, NULL, after);
+    /* A __prim__ native's result kind comes from the whitelist, not from a
+     * callee record, so there is no observed object type to carry. */
+    return emitCallOutResult(e, rk, 0, NULL, after, 0);
 }
 
 /* `Klass.static_method(args)` -- an OP_INVOKE whose receiver is a CLASS. The
@@ -11614,9 +11687,32 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                  * globalNamespace side). */
                 if (IS_MODULE(oseen) && !IS_BOUND(obound) &&
                     IS_NATIVE(onative) && jitModuleNativeCalls()) {
+                    /* Refuse SOFTLY when nothing was emitted and the model is
+                     * untouched -- this is a NEW arm, so a hard refusal here
+                     * is worse than having no arm at all.
+                     *
+                     * Concretely: `span` ends in `__prim__.fill_span(...)`,
+                     * which is not on the result-kind whitelist. While
+                     * `__prim__` had no arm the walk took the unarmed path,
+                     * skipped the whole call as one block, and span's prologue
+                     * compiled. Declining hard here instead threw the body
+                     * away and DOUBLED span's interpreted work, 5,821,736 to
+                     * 10,867,344 -- a regression caused entirely by arming a
+                     * neighbouring opcode.
+                     *
+                     * Guarded on emitting nothing rather than on which refusal
+                     * fired, so a later refusal that has already written code
+                     * or moved the stack still declines hard, where resuming
+                     * would be unsound. */
+                    unsigned mnCount = e->count;
+                    unsigned mnDepth = e->depth;
                     if (!emitModuleNativeCall(e, AS_MODULE(oseen), onative,
                                               ridx, argc,
                                               (uint32_t)(off + 7))) {
+                        if (!e->failed && e->count == mnCount &&
+                            e->depth == mnDepth) {
+                            goto unarmedOpcode;
+                        }
                         return false;
                     }
                     if (getenv("JAI_JIT_WHY")) {
@@ -13584,9 +13680,11 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                      * guard that matters here: not this identity, but whether
                      * the MEMBER OP_INVOKE goes on to read has been rebound
                      * since compile. */
-                    ObjModule *ns = jitModuleNativeCalls()
-                                         ? globalNamespace(closure, nameIdx)
-                                         : NULL;
+                    ObjModule *ns =
+                        (jitModuleNativeCalls() &&
+                         primInvokePairFits(e, &fn->chunk, (uint32_t)off))
+                            ? globalNamespace(closure, nameIdx)
+                            : NULL;
                     if (ns != NULL) {
                         if (e->depth >= JIT_MAX_STACK) return false;
                         unsigned dst = valueXReg(e, e->valueDepth);
