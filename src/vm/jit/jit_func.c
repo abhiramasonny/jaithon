@@ -15008,6 +15008,19 @@ static int osrNoSlot(ObjFunction *fn, uint32_t top, unsigned slot,
 }
 
 
+/* How many compiled loops one body may keep. Only lets the old, smaller table
+ * be put back in the same binary, so the change can be measured against
+ * itself; the table itself is sized JAI_OSR_MAX. */
+static unsigned osrFormCap(void) {
+    static unsigned cap;
+    if (cap == 0) {
+        const char *e = getenv("JAITHON_JIT_OSR_FORMS");
+        unsigned want = (e != NULL) ? (unsigned)atoi(e) : JAI_OSR_MAX;
+        cap = (want >= 1 && want <= JAI_OSR_MAX) ? want : JAI_OSR_MAX;
+    }
+    return cap;
+}
+
 /* The record is sized JAI_OSR_SLOTS; this only lets the old, smaller cap be
  * put back in the same binary, so the change can be measured against itself. */
 static unsigned osrSlotCap(void) {
@@ -15803,7 +15816,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     uint8_t *entry = arenaEmit(arena, e.code, e.count);
     if (entry == NULL) return false;
 
-    if (fn->osrCount >= JAI_OSR_MAX) return false;
+    if (fn->osrCount >= osrFormCap()) return false;
     JaiOsrForm *form = &fn->osrForms[fn->osrCount];
     form->code  = entry;
     form->top   = top;
@@ -16051,7 +16064,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     if (form == NULL) {
         if (fn->osrRefused)
             return osrNo(fn, top, "the tier has given up on this body's loops");
-        if (fn->osrCount >= JAI_OSR_MAX)
+        if (fn->osrCount >= osrFormCap())
             return osrNo(fn, top, "no room left to record another loop form");
         /* This head's own share of the budget. See ObjFunction::osrMissTop for
          * why the count cannot be per function: the first loop to run spends
@@ -16060,7 +16073,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         for (unsigned i = 0; i < fn->osrMissCount; i++) {
             if (fn->osrMissTop[i] == top) { miss = i; break; }
         }
-        if (miss < JAI_OSR_MAX && fn->osrMissAttempts[miss] >= 5 * JAI_OSR_MAX) {
+        if (miss < osrFormCap() && fn->osrMissAttempts[miss] >= 5 * osrFormCap()) {
             /* This head is spent; other heads in the same body are not. */
             return osrNo(fn, top, "this loop head is out of compile attempts");
         }
@@ -16085,21 +16098,21 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                         elemMixed, elemStg, false, true)) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
-            if (miss == fn->osrMissCount && miss < JAI_OSR_MAX) {
+            if (miss == fn->osrMissCount && miss < osrFormCap()) {
                 fn->osrMissTop[miss]      = top;
                 fn->osrMissAttempts[miss] = 0;
                 fn->osrMissCount++;
             }
-            if (miss < JAI_OSR_MAX) fn->osrMissAttempts[miss]++;
+            if (miss < osrFormCap()) fn->osrMissAttempts[miss]++;
             /* The whole-function backstop, for a body with more uncompilable
              * heads than the table holds: without it those heads share the
              * untracked path and would be retried for the life of the run. */
-            if (++fn->osrAttempts >= 5 * JAI_OSR_MAX * JAI_OSR_MAX) {
+            if (++fn->osrAttempts >= 5 * osrFormCap() * osrFormCap()) {
                 fn->osrRefused = true;
-            } else if (fn->osrMissCount >= JAI_OSR_MAX) {
+            } else if (fn->osrMissCount >= osrFormCap()) {
                 bool allSpent = true;
-                for (unsigned i = 0; i < JAI_OSR_MAX; i++) {
-                    if (fn->osrMissAttempts[i] < 5 * JAI_OSR_MAX) {
+                for (unsigned i = 0; i < osrFormCap(); i++) {
+                    if (fn->osrMissAttempts[i] < 5 * osrFormCap()) {
                         allSpent = false;
                         break;
                     }

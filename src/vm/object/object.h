@@ -413,7 +413,7 @@ typedef struct {
     uint32_t typeConst;   /* constant index of the caught class, or UINT32_MAX for catch-all */
 } ExceptionEntry;
 
-#define JAI_OSR_MAX 4
+#define JAI_OSR_MAX 8
 /* Consecutive entry-guard failures on one loop head before it is left to
  * the interpreter. */
 #define JAI_OSR_GIVE_UP 8
@@ -588,7 +588,10 @@ struct ObjFunction {
      * return kind once that callee has itself compiled, and which of them have
      * depends on when the sampler happened to fire. Refusing forever on the
      * first miss made compilation depend on tick timing. */
-    uint8_t     osrAttempts;
+    /* uint16_t, not uint8_t: the backstop it feeds is 5 * JAI_OSR_MAX squared,
+     * which at JAI_OSR_MAX = 8 is 320 and never reachable in a byte. It would
+     * have wrapped and re-armed forever, so the body would never be retired. */
+    uint16_t    osrAttempts;
     /* Counted per loop head, not once per function: one counter starved every
      * other loop once the first one spent the budget, which was invisible
      * because a never-offered head reports no decline. Same attempts per head
