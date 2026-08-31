@@ -11230,6 +11230,16 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                          * receiver and `len` returns an int whatever it is
                          * called on, so it needs no sample, only a guard on
                          * what comes back. */
+                        /* Say WHICH type was predicted, if any. "no known
+                         * type" hid the difference between a receiver the
+                         * model knows nothing about and one it knows is a
+                         * list -- and those want opposite fixes. */
+                        if (e->stackObjType[ridx] != 0) {
+                            return subWhy(e,
+                                "`.%s()` on a predicted %s with no sample to "
+                                "probe", oNameChars,
+                                jaiObjTypeName((ObjType)(e->stackObjType[ridx] - 1)));
+                        }
                         return subWhy(e, "`.%s()` on an object with no sample "
                                       "and no known type", oNameChars);
                     }
