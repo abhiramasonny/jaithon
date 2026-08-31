@@ -760,6 +760,8 @@ static bool instanceField(Value v, const char *name, Value *out) {
 
 /* `Compiled.image` is a list of byte-sized ints (spec/BYTECODE.md §7 as seen
  * from Jaithon, which has no writable bytes type). */
+bool jaiSkipBodyOptimise = false;
+
 static ObjBytes *bytesFromByteList(ObjList *list, const char *path) {
     size_t count = list->count > 0 ? (size_t)list->count : 0;
     uint8_t *raw = JAI_ALLOC(uint8_t, count > 0 ? count : 1);
@@ -827,7 +829,7 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
      * with no line numbers and its tracebacks could not name a line. Every
      * caller therefore has to have registered its source and set
      * `module->sourceFileId` first. */
-    Value args[5];
+    Value args[6];
     args[0] = OBJ_VAL(jaiStringNew(source, length));
     jaiPushRoot(args[0]);
     args[1] = OBJ_VAL(jaiStringInternC(path));
@@ -835,9 +837,11 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
     args[2] = BOOL_VAL(false);         /* release  */
     args[3] = INT_VAL(fileId);         /* fileId   */
     args[4] = INT_VAL(optLevel);
+    /* `optimise_body`. See jaiSkipBodyOptimise. */
+    args[5] = BOOL_VAL(!jaiSkipBodyOptimise);
 
     Value produced = NULL_VAL;
-    bool called = jaiCallValue(entry, 5, args, &produced);
+    bool called = jaiCallValue(entry, 6, args, &produced);
     jaiPopRoots(2);
 
     if (!called) {

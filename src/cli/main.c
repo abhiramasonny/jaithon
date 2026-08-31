@@ -69,6 +69,16 @@ int jaiCliDispatch(const JaiCliOptions *opts)
     case CMD_EVAL:
         return cmdEval(opts);
     case CMD_CHECK:
+        /* `check` reports diagnostics and writes no `.jaic` -- verified: `run`
+         * leaves one beside the source, `check` leaves nothing -- so the body
+         * it emits has no consumer and optimising it is pure cost. Measured at
+         * 23% of the command's wall over parser.jai. */
+        {
+            /* Off restores the old behaviour in the same binary, so the change
+             * can be measured against itself rather than across two builds. */
+            const char *keep = getenv("JAITHON_CHECK_OPTIMISE");
+            jaiSkipBodyOptimise = !(keep != NULL && keep[0] != '0');
+        }
         return cmdCheck(opts);
     case CMD_BUILD:
         return cmdBuild(opts);

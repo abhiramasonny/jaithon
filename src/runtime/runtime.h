@@ -100,6 +100,13 @@ ObjFunction *jaiCompileSource(const char *source, size_t length,
 
 void jaiModuleNameFor(const char *path, char *out, size_t outSize);
 
+/* Set when the caller is going to throw the compiled body away, so the
+ * self-hosted front end can skip the bytecode optimiser. `check` is the only
+ * thing that sets it: it emits, optimises and writes no `.jaic`, which made
+ * every optimiser pass work with no consumer -- 23% of the command's wall
+ * time. Folding in the CHECKER is unaffected; only the rewriting goes. */
+extern bool jaiSkipBodyOptimise;
+
 ObjFunction *jaiSelfHostedCompileInto(const char *source, size_t length,
                                       const char *path, ObjModule *module,
                                       uint64_t hash, int optLevel);

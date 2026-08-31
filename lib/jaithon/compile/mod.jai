@@ -87,12 +87,39 @@ pub class Compiled {
 #: compile_source("let x = 1\n", "<doc>").ok()          # true
 #: compile_source("let x = y\n", "<doc>").ok()          # false, E0200
 #: ```
+#: Stands in for `optimize` when the caller is going to throw the body away.
+#:
+#: Not the same as `--O0`: `optimize` at level 0 still decodes every function
+#: and rebuilds it, which is the half of the optimiser that costs -- its own
+#: comment measures decode+rebuild at 317ms against 2.9s for every rewrite
+#: combined, over the standard library. Skipping the call is the only way to
+#: not pay it.
+fn _skip_optimize(proto: FuncProto, level: int) -> void { }
+
+#: `optimise_body` is false when nothing will run or cache the bytecode --
+#: `check` is the whole reason it exists. `check` emits, optimises, and writes
+#: NO `.jaic` (verified: `run` leaves an `m.jaic` beside the source, `check`
+#: leaves nothing), so every optimiser pass was work with no consumer.
+#:
+#: MEASURED, `check --no-cache` over parser.jai, four interleaved pairs in one
+#: binary through `JAITHON_CHECK_OPTIMISE`:
+#:   with the optimiser  0.62 0.62 0.64 0.60
+#:   without it          0.45 0.44 0.44 0.44
+#: -28.6% of the command's wall, no overlap. Interpreted instructions fall
+#: from about 60M to 43M on the same run, and 159 files -- 120 sources plus
+#: the whole `tests/errors` corpus -- produce byte-identical diagnostics
+#: either way.
+#:
+#: Deliberately separate from `opt_level`, which ALSO decides the checker's
+#: `fold_constants` below. Folding is semantics and stays on; only the
+#: bytecode rewriting goes away.
 pub fn compile_source(
     text: str,
     path: str,
     release: bool = false,
     file_id: int = 0,
-    opt_level: int = 2
+    opt_level: int = 2,
+    optimise_body: bool = true
 ) -> Compiled {
     let bag = DiagnosticBag()
     let result = Compiled(path, source_hash(text), bag)
@@ -107,6 +134,7 @@ pub fn compile_source(
     let checked = check_program(Universe(), program, resolution, bag, opt_level > 0, path)
     result.types = checked
 
+    let opt_pass = if optimise_body { optimize } else { _skip_optimize }
     let body = emit(
         program,
         resolution,
@@ -114,7 +142,7 @@ pub fn compile_source(
         release,
         module_name_for(path),
         opt_level,
-        optimize,
+        opt_pass,
         text,
         checked.enum_decls()
     )
