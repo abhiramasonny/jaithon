@@ -108,9 +108,27 @@ static uintptr_t stackLimit(void) {
  * a hot one -- and also wanted six and seven elsewhere; 8 covers every arity
  * that corpus asks for. The price is 4 more Values (64 bytes) on the frame of
  * every compiled body that calls out, which is stack, never touched beyond
- * what is used, and leaves the frame under the 504 bytes that keep the cheap
- * stp-pre prologue. */
-#define JIT_MAX_ARGS_OUT 8
+ * what is used.
+ *
+ * Then 8 was not enough either, and the way that surfaced is worth keeping.
+ * Teaching OP_GET_GLOBAL to resolve the `__prim__` namespace made jaicv's
+ * `span` twice as slow, because `__prim__.fill_span(...)` takes TEN arguments
+ * and `fill_convex` eleven. While `__prim__` had no arm the walk took the SOFT
+ * unarmed path and skipped the receiver, all ten pushes and the invoke as one
+ * block, so span's prologue compiled; once it resolved, the walk reached this
+ * cap, which refuses HARD and declined the whole function.
+ *
+ * Two agents tried to dodge the wall with a lookahead that only resolves
+ * `__prim__` when the paired invoke would fit. That was refuted: it finds the
+ * FIRST invoke, not the paired one, so an argument containing its own method
+ * call walks straight back into the wall. Removing the wall is the fix.
+ *
+ * 12 covers `fill_convex`'s eleven. The price is 4 more Values (64 bytes) on
+ * a calling body's frame, and it carries that frame past the 504 bytes that
+ * keep the cheap stp-pre prologue -- which JIT_MAX_ROOTS above already does,
+ * for the same reason and at the same price: framePairFits() falls back to one
+ * or two extra instructions once per body, against a whole body compiling. */
+#define JIT_MAX_ARGS_OUT 12
 
 /* Values first in JitCallDesc so every field is 8-aligned and the emitted stores can use scaled forms. */
 typedef struct JitCallDesc {
@@ -2441,6 +2459,27 @@ static bool jitClassCalls(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_MODULE_NATIVE=0 turns off BOTH halves of the `__prim__.f64_sqrt`
+ * arm at once -- OP_GET_GLOBAL's globalNamespace resolution and OP_INVOKE's
+ * emitModuleNativeCall -- so the two shapes compare inside ONE binary, same
+ * reason jitModuleCalls and jitClassCalls exist as their own switches:
+ * alternating two builds is not an A/B here, each rebuild invalidates
+ * __jaicache__ and the stdlib recompile it pays swamps the effect being
+ * measured. One switch for both halves because neither compiles anything
+ * useful alone -- OP_GET_GLOBAL pushing the namespace with nothing at
+ * OP_INVOKE able to consume it just moves the refusal one instruction later.
+ *
+ * Default ON. Read once, so a body compiled with the arm and a body compiled
+ * without it cannot coexist in one run. */
+static bool jitModuleNativeCalls(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_MODULE_NATIVE");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* JAITHON_JIT_SPLIT_STRESS=1 puts the split bank's boundary into every OSR body
  * that can take one, instead of only the ones that pay for it -- the same idea
  * as JAITHON_JIT_DEOPT_STRESS, for the same reason.
@@ -3579,6 +3618,38 @@ static ObjNative *globalNative(ObjClosure *closure, uint32_t nameIdx,
     if (!IS_NATIVE(bound)) return NULL;
     *out = bound;
     return AS_NATIVE(bound);
+}
+
+/* `__prim__`, resolved the same way globalNative resolves a bare builtin --
+ * the module first, so a real user binding is never mistaken for it -- except
+ * what sits at `vm.builtins`'s name is an ObjModule (a native namespace:
+ * jaiDefineNative's dotted names build one the first time a "ns.leaf" name
+ * registers, in namespaceFor/makeNamespace, builtins.c), not an ObjNative.
+ * `math.sqrt`'s own body is `__prim__.f64_sqrt(x)` -- lib/std/math.jai:218 --
+ * so this is not a hypothetical name, it is the one OP_GET_GLOBAL's own
+ * refusal message already names as "not a compiled global function" on every
+ * `__prim__.f64_*` body in the tree.
+ *
+ * Resolved BY VALUE, same as globalNative: nothing here is re-checked at run
+ * time beyond fn->module->version at entry (guards a later shadow), so this
+ * carries exactly the soundness globalNative already carries for a bare
+ * builtin -- no better, no worse. What DOES need a per-call guard is the
+ * MEMBER read through this namespace afterward, because `mod.attr = v` is
+ * real syntax for any module receiver (jaiSetProperty's IS_MODULE arm) and
+ * `__prim__` is reachable as a bare identifier -- see emitModuleNativeCall's
+ * m->version check for that half. */
+static ObjModule *globalNamespace(ObjClosure *closure, uint32_t nameIdx) {
+    ObjFunction *fn = closure->fn;
+    if (fn->module == NULL || vm.builtins == NULL) return NULL;
+    if (nameIdx >= (uint32_t)fn->chunk.constants.count) return NULL;
+    Value name = fn->chunk.constants.data[nameIdx];
+    if (!IS_STRING(name)) return NULL;
+    Value shadow;
+    if (jaiModuleGet(fn->module, AS_STRING(name), &shadow)) return NULL;
+    Value bound;
+    if (!jaiModuleGet(vm.builtins, AS_STRING(name), &bound)) return NULL;
+    if (!IS_MODULE(bound)) return NULL;
+    return AS_MODULE(bound);
 }
 
 static bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx) {
@@ -6088,6 +6159,221 @@ static bool emitModuleCall(Emit *e, ObjModule *m, Value calleeVal,
         if (!popValue(e, &r, NULL)) return false;
     }
     return emitCallOutResult(e, rk, rshape, rcls, after, robj);
+}
+
+/* What `__prim__.f64_sqrt` and its kin answer, since unlike a compiled
+ * closure a native carries no jitReturnKind/observedReturnKind to ask --
+ * emitModuleCall's whole "which record says what comes back" problem does not
+ * apply, because there is no record. Scoped to natives reached ONLY through a
+ * MODULE receiver (emitModuleNativeCall's one caller): every row here is one
+ * of lib/std/math.jai's own `__prim__.f64_*` callees, registered in
+ * builtins_math.c, none of which allocates or can throw past a domain check
+ * the CALLER (math.jai) already made before reaching the primitive -- see
+ * emitModuleNativeCall's own comment for how `sqrt`'s negative-argument raise
+ * stays correct despite that.
+ *
+ * A row missing here is a decline, not a wrong answer -- the tag guard
+ * downstream only matters for a row that IS present, same contract
+ * kNativeResults states above. frexp/modf are deliberately absent: both
+ * return `tuple[float, int]`, a kind this arm has no row shape for. */
+typedef struct {
+    const char *name;
+    unsigned    argc;
+    SlotKind    kind;
+} PrimNativeResult;
+
+static const PrimNativeResult kPrimNativeResults[] = {
+    { "f64_sqrt",     1, SLOT_FLOAT },
+    { "f64_exp",      1, SLOT_FLOAT },
+    { "f64_log",      1, SLOT_FLOAT },
+    { "f64_log2",     1, SLOT_FLOAT },
+    { "f64_log10",    1, SLOT_FLOAT },
+    { "f64_sin",      1, SLOT_FLOAT },
+    { "f64_cos",      1, SLOT_FLOAT },
+    { "f64_tan",      1, SLOT_FLOAT },
+    { "f64_asin",     1, SLOT_FLOAT },
+    { "f64_acos",     1, SLOT_FLOAT },
+    { "f64_atan",     1, SLOT_FLOAT },
+    { "f64_atan2",    2, SLOT_FLOAT },
+    { "f64_sinh",     1, SLOT_FLOAT },
+    { "f64_cosh",     1, SLOT_FLOAT },
+    { "f64_tanh",     1, SLOT_FLOAT },
+    { "f64_asinh",    1, SLOT_FLOAT },
+    { "f64_acosh",    1, SLOT_FLOAT },
+    { "f64_atanh",    1, SLOT_FLOAT },
+    { "f64_floor",    1, SLOT_FLOAT },
+    { "f64_ceil",     1, SLOT_FLOAT },
+    { "f64_trunc",    1, SLOT_FLOAT },
+    { "f64_round",    1, SLOT_FLOAT },
+    { "f64_fmod",     2, SLOT_FLOAT },
+    { "f64_pow",      2, SLOT_FLOAT },
+    { "f64_hypot",    2, SLOT_FLOAT },
+    { "f64_copysign", 2, SLOT_FLOAT },
+    { "f64_ldexp",    2, SLOT_FLOAT },
+    { "f64_erf",      1, SLOT_FLOAT },
+    { "f64_gamma",    1, SLOT_FLOAT },
+    { "f64_lgamma",   1, SLOT_FLOAT },
+    { "f64_is_nan",    1, SLOT_BOOL },
+    { "f64_is_inf",    1, SLOT_BOOL },
+    { "f64_is_finite", 1, SLOT_BOOL },
+};
+
+static bool primNativeResultKind(const char *nm, unsigned argc, SlotKind *k) {
+    for (size_t i = 0; i < sizeof kPrimNativeResults / sizeof kPrimNativeResults[0]; i++) {
+        if (kPrimNativeResults[i].argc == argc &&
+            strcmp(kPrimNativeResults[i].name, nm) == 0) {
+            *k = kPrimNativeResults[i].kind;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* `__prim__.f64_sqrt(x)` and its kin -- a NATIVE reached through a MODULE
+ * receiver, the other half of what emitModuleCall does for a Jaithon-written
+ * one (`math.sqrt`, wrapping this very call). Same shape, same reason: a
+ * member of another namespace, resolved at compile time, called with the
+ * receiver DROPPED -- resolveInvokeTarget's IS_MODULE arm (vm.c) hands back
+ * jaiBuiltinMethod's raw result with `isMethod` left false, so invokeCallable
+ * runs it as a PLAIN call, not a method call. jaiModuleMethod (module_methods.c)
+ * returns the ObjNative straight out of `m->globals` with no bound wrapper --
+ * `moduleExposes` succeeds on the first check because `__prim__`'s
+ * `exports.count` is 0 (nothing ever declares an export list for a namespace
+ * jaiDefineNative built, so every member reads as exposed) -- so `onative` at
+ * the call site already IS the plain native, never a bound one to unwrap.
+ *
+ * jitCallOut's jaiCallValue -> invokeCallable dispatches on OBJ_NATIVE with
+ * `args[0]` as the first REAL argument and no receiver slot at all (vm.c's
+ * `case OBJ_NATIVE:` in invokeCallable) -- exactly the descriptor
+ * emitDescriptor already builds from `ridx + 1, argc` for emitModuleCall's
+ * closures, so the same call-out helper reaches a native correctly with no
+ * changes of its own. The only work here is specific to a NATIVE: what it
+ * returns (kPrimNativeResults, since there is no jitReturnKind to ask) and the
+ * guards, which are NOT the same two as emitModuleCall's.
+ *
+ * THE RECEIVER IDENTITY GUARD emitModuleCall emits is *provably* redundant
+ * here and is skipped: `math`'s receiver register is loaded from a JaiEntry
+ * (globalSlot's "value case" arm), a genuinely runtime-variable location an
+ * import could rebind, so comparing it against the ObjModule compiled against
+ * is live work. `__prim__`'s register is instead loaded by
+ * `emitConst64(e, dst, ...)` directly in OP_GET_GLOBAL's globalNamespace
+ * branch -- a compile-time CONSTANT baked into the instruction stream, which
+ * cannot hold anything else at run time by construction, so re-checking it
+ * against itself would prove nothing a bug in the emitter could not also get
+ * wrong in the omitted check.
+ *
+ * `m->version` IS kept, and unlike the identity check it is NOT redundant:
+ * `mod.attr = v` is real syntax for any module receiver (jaiSetProperty's
+ * IS_MODULE arm, vm.c) and `__prim__` is reachable as a bare identifier --
+ * lib/std/math.jai names it in the open -- so `__prim__.f64_sqrt = something`
+ * is something a running program could actually do. jaiModuleSet bumps
+ * `m->version` on exactly that kind of write (ObjNative is not
+ * jaiValueIsInertGlobal), which is what retires this compiled form if it
+ * happens after the bake.
+ *
+ * `sqrt`'s own domain check (`if x < 0.0 { throw ValueError(...) }`,
+ * lib/std/math.jai:217) is ordinary Jaithon ahead of this call and compiles
+ * on its own merits -- ints/floats/branches/throw are all arms this tier
+ * already has -- so it is not this arm's problem to solve; declining THIS
+ * call alone (a too-wide argc, an unknown name) still leaves the raise
+ * compiled, and only the call after it falls back to the interpreter via
+ * emitUnarmedDeopt. `f64_sqrt` raising its OWN domain error for a negative
+ * input it should never see is still reachable and still correct either way:
+ * callNativeAt raises through the ordinary exception path jitCallOut's
+ * `raiseExitAllowed` branch already handles, message and all -- nothing about
+ * going through a descriptor changes what the native itself decides to
+ * raise. */
+/* Whether the `__prim__` read at `off` is paired with an OP_INVOKE this tier
+ * can actually compile. If it is not, the namespace is left unresolved so the
+ * read falls to the unarmed path exactly as it did before this arm existed --
+ * which for a call the tier cannot emit is strictly better than resolving it.
+ *
+ * WHY THIS EXISTS. `span` ends in `__prim__.fill_span(...)` with ten arguments
+ * and `fill_convex` with eleven. While `__prim__` had no arm the walk skipped
+ * receiver, pushes and invoke as ONE unarmed block and span's prologue
+ * compiled; resolving the namespace made the walk continue into those pushes
+ * and hit a wall it cannot pass -- the argc cap, then the result-kind
+ * whitelist, then the register budget, each a hard whole-body decline. span's
+ * interpreted work DOUBLED, 5,821,736 to 10,867,344, from arming a
+ * neighbouring opcode.
+ *
+ * PAIRING IS THE WHOLE DIFFICULTY, and an earlier attempt got it wrong: it
+ * took the FIRST OP_INVOKE after the read, which is not the paired one
+ * whenever an argument expression contains its own method call. When that
+ * inner invoke happened to be whitelisted the lookahead said yes and the OUTER
+ * one declined the body -- the very thing it was written to prevent.
+ *
+ * `chunkDepth` settles it exactly. It is the operand-stack depth BEFORE each
+ * instruction, so the invoke paired with this read is the one that consumes
+ * back to the depth the read started from: `chunkDepth[p] - (argc + 1) ==
+ * chunkDepth[off]`. A nested invoke inside an argument sits deeper and cannot
+ * match. Where the table is unavailable -- OSR, inlining -- the answer is no,
+ * which keeps the old unarmed behaviour rather than guessing. */
+static bool primInvokePairFits(const Emit *e, const Chunk *chunk, uint32_t off) {
+    if (e->chunkDepth == NULL || e->osr || e->inlining) return false;
+    if (off >= (uint32_t)e->chunkDepthCount) return false;
+    const int base = e->chunkDepth[off];
+    const uint8_t *code = chunk->code;
+    uint32_t p = off + 6;
+    while (p < (uint32_t)chunk->count) {
+        if (p >= (uint32_t)e->chunkDepthCount) return false;
+        if (code[p] == OP_INVOKE) {
+            unsigned argc = code[p + 4];
+            if (e->chunkDepth[p] - (int)(argc + 1u) == base) {
+                if (argc + 1u > (unsigned)JIT_MAX_ARGS_OUT) return false;
+                uint32_t nameIdx = jaiReadU24(code + p + 1);
+                if (nameIdx >= (uint32_t)chunk->constants.count) return false;
+                Value nm = chunk->constants.data[nameIdx];
+                if (!IS_STRING(nm)) return false;
+                SlotKind rk;
+                return primNativeResultKind(AS_STRING(nm)->chars, argc, &rk);
+            }
+        }
+        unsigned len = instructionLength(chunk, p);
+        if (len == 0) return false;
+        p += len;
+    }
+    return false;
+}
+
+static bool emitModuleNativeCall(Emit *e, ObjModule *m, Value calleeVal,
+                                 unsigned ridx, unsigned argc, uint32_t after) {
+    ObjNative *nat = AS_NATIVE(calleeVal);
+    SlotKind rk;
+    if (!primNativeResultKind(nat->name != NULL ? nat->name->chars : "",
+                              argc, &rk)) {
+        return subWhy(e, "`%s.%s`'s result kind is not on record",
+                      m->name != NULL ? m->name->chars : "?",
+                      nat->name != NULL ? nat->name->chars : "?");
+    }
+    for (unsigned i = 0; i <= argc; i++) {
+        SlotKind k = e->stack[ridx + i];
+        if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
+            k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
+            return subWhy(e, "a module call over an entry of kind %d", (int)k);
+        }
+    }
+    /* Past here the guard is emitted, so a later refusal stops the compile
+     * rather than falling back onto a half-written instruction stream. */
+
+    settleAll(e);
+    emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&m->version);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+    emitConst64(e, JIT_SCRATCH_B, (int64_t)(uint32_t)m->version);
+    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+    branchOnDeopt(e, JAI_A64_NE);
+
+    if (!emitDescriptor(e, calleeVal, ridx + 1, argc, (void *)&jitCallOut)) {
+        return false;
+    }
+    for (unsigned i = 0; i <= argc; i++) {
+        unsigned r;
+        if (!popValue(e, &r, NULL)) return false;
+    }
+    /* A __prim__ native's result kind comes from the whitelist, not from a
+     * callee record, so there is no observed object type to carry. */
+    return emitCallOutResult(e, rk, 0, NULL, after, 0);
 }
 
 /* `Klass.static_method(args)` -- an OP_INVOKE whose receiver is a CLASS. The
@@ -10829,7 +11115,28 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
             /* The argc cap is a fixed limit rather than a property of this
              * call, and it was indistinguishable in the census from every
              * other reason an invoke declines -- which is how it went a long
-             * time without anyone knowing how many sites it costs. */
+             * time without anyone knowing how many sites it costs.
+             *
+             * NOT softened, despite OP_GET_GLOBAL's own refusal being exactly
+             * this shape -- tried, and it does not buy what it looks like it
+             * should. `span`/`fill` (packages/jaicv/imgproc/drawing.jai) each
+             * call `__prim__.fill_span`/`fill_convex` at 10 and 11 arguments,
+             * past this cap; before globalNamespace existed that call never
+             * reached here (OP_GET_GLOBAL "__prim__" stopped the walk first,
+             * softly, and the body still compiled everything ahead of it).
+             * Once __prim__ resolves, softening THIS refusal the same way
+             * only trades it for an EARLIER one: the measuring pass that
+             * computes `body.maxValue` now walks all the way through the ten
+             * argument pushes before reaching (and skipping) this check,
+             * which is what overflows JIT_MAX_SAVED and fails "the operand
+             * stack alone exceeds the registers" instead -- a harder, whole-
+             * function-declining wall this file has no per-instruction answer
+             * for (raising JIT_MAX_SAVED or teaching the allocator to spill
+             * more of an argument list is a different, larger piece of work).
+             * Measured: softening this arm moved `span` from 12.71% to
+             * 13.60% of jaicv's interpreted work (BENCH_LEVEL=easy), not
+             * down -- so it is left hard, on purpose, rather than landed for
+             * a win it does not actually produce. */
             if (argc > JIT_MAX_ARGS_OUT - 1) {
                 return subWhy(e, "%u arguments, past the cap of %d",
                               argc, JIT_MAX_ARGS_OUT - 1);
@@ -11364,6 +11671,59 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 }
                 Value onative = IS_BOUND(obound) ? AS_BOUND(obound)->method
                                                  : obound;
+                /* `__prim__.f64_sqrt(x)` and its kin: a member reached
+                 * through a MODULE receiver that IS already a native --
+                 * jaiModuleMethod hands one back unwrapped (see
+                 * emitModuleNativeCall's comment for why), so `onative` here
+                 * skips the `!IS_NATIVE` block below entirely and would
+                 * otherwise fall into the generic native-with-a-receiver path
+                 * two arms down, which passes the MODULE as args[0] -- wrong,
+                 * since the interpreter drops it (resolveInvokeTarget leaves
+                 * `isMethod` false for a module receiver). Caught here, before
+                 * that path, for the same reason the closure arm below is
+                 * caught before it: on the same `IS_MODULE(oseen) &&
+                 * !IS_BOUND(obound)` condition, one kill switch for both
+                 * halves (jitModuleNativeCalls, OP_GET_GLOBAL's
+                 * globalNamespace side). */
+                if (IS_MODULE(oseen) && !IS_BOUND(obound) &&
+                    IS_NATIVE(onative) && jitModuleNativeCalls()) {
+                    /* Refuse SOFTLY when nothing was emitted and the model is
+                     * untouched -- this is a NEW arm, so a hard refusal here
+                     * is worse than having no arm at all.
+                     *
+                     * Concretely: `span` ends in `__prim__.fill_span(...)`,
+                     * which is not on the result-kind whitelist. While
+                     * `__prim__` had no arm the walk took the unarmed path,
+                     * skipped the whole call as one block, and span's prologue
+                     * compiled. Declining hard here instead threw the body
+                     * away and DOUBLED span's interpreted work, 5,821,736 to
+                     * 10,867,344 -- a regression caused entirely by arming a
+                     * neighbouring opcode.
+                     *
+                     * Guarded on emitting nothing rather than on which refusal
+                     * fired, so a later refusal that has already written code
+                     * or moved the stack still declines hard, where resuming
+                     * would be unsound. */
+                    unsigned mnCount = e->count;
+                    unsigned mnDepth = e->depth;
+                    if (!emitModuleNativeCall(e, AS_MODULE(oseen), onative,
+                                              ridx, argc,
+                                              (uint32_t)(off + 7))) {
+                        if (!e->failed && e->count == mnCount &&
+                            e->depth == mnDepth) {
+                            goto unarmedOpcode;
+                        }
+                        return false;
+                    }
+                    if (getenv("JAI_JIT_WHY")) {
+                        fprintf(stderr, "[jit] module native call %s.%s at %d\n",
+                                AS_MODULE(oseen)->name != NULL
+                                    ? AS_MODULE(oseen)->name->chars : "?",
+                                AS_STRING(oname)->chars, off);
+                    }
+                    off += 7;
+                    break;
+                }
                 if (!IS_NATIVE(onative)) {
                     /* A module member written in Jaithon lands here: `math.sqrt`
                      * is a CLOSURE wrapping __prim__.f64_sqrt, not a builtin,
@@ -13304,6 +13664,38 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
                 Value nv;
                 ObjNative *nat = globalNative(closure, nameIdx, &nv);
                 if (nat == NULL) {
+                    /* `__prim__` and any other native namespace: not a native
+                     * itself (globalNative already said so, correctly -- it
+                     * is an ObjModule), and not found by globalSlot below
+                     * either, because it lives in vm.builtins, not in this
+                     * function's own module -- that lookup would always come
+                     * back NULL for it, which is the whole reason every
+                     * `__prim__.f64_*` body used to stop here. Pushed as
+                     * SLOT_OBJ, register-resident, exactly the shape
+                     * `math.sqrt`'s own receiver (an IMPORTED module) already
+                     * reaches OP_INVOKE in -- except loaded as a bare
+                     * constant rather than through a JaiEntry, since nothing
+                     * re-binds the name `__prim__` itself the way an import
+                     * can be reassigned. See emitModuleNativeCall for the
+                     * guard that matters here: not this identity, but whether
+                     * the MEMBER OP_INVOKE goes on to read has been rebound
+                     * since compile. */
+                    ObjModule *ns =
+                        (jitModuleNativeCalls() &&
+                         primInvokePairFits(e, &fn->chunk, (uint32_t)off))
+                            ? globalNamespace(closure, nameIdx)
+                            : NULL;
+                    if (ns != NULL) {
+                        if (e->depth >= JIT_MAX_STACK) return false;
+                        unsigned dst = valueXReg(e, e->valueDepth);
+                        if (!pushValue3(e, SLOT_OBJ, 0, NULL,
+                                        OBJ_VAL((Obj *)ns), -1)) {
+                            return false;
+                        }
+                        emitConst64(e, dst, (int64_t)(uintptr_t)ns);
+                        off += 6;
+                        break;
+                    }
                     /* A global holding a plain value: storage is a JaiEntry whose address is fixed once it exists, so the
                      * load is one `ldr` behind two guards (table hasn't moved, value still has the compiled-for kind). Refusing this declined every loop reading a module-level variable -- most benchmarks, once they moved to module scope. */
                     Value gvv = NULL_VAL;
