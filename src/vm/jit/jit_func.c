@@ -1236,7 +1236,15 @@ typedef struct {
 } Emit;
 
 static void emit(Emit *e, uint32_t word) {
-    if (e->count >= JIT_MAX_INSTS) { e->failed = true; return; }
+    if (e->count >= JIT_MAX_INSTS) {
+        /* Named, because it said nothing at all: with no reason set,
+         * declineReason falls back to the bare name of the last opcode, so a
+         * body that outgrew the buffer was reported as refusing at whatever
+         * instruction it happened to be on. */
+        e->whyNot = "the body needs more instructions than the buffer holds";
+        e->failed = true;
+        return;
+    }
     e->code[e->count++] = word;
 }
 
@@ -14910,11 +14918,30 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         memcpy(needDynamic, body.needDynamic, sizeof body.needDynamic);
         memcpy(needNullable, body.needNullable, sizeof body.needNullable);
         if (getenv("JAI_JIT_WHY")) {
-            fprintf(stderr, "[jit] %s stopped (measuring): %s\n",
-                    fn->name ? fn->name->chars : "<anon>",
-                    declineReason(&body));
+            /* A RETRY IS NOT A REFUSAL, and printing it as one cost a whole
+             * session of analysis. This exit is `!compileBody(...) ||
+             * body.pendingRetry`: on the retry arm the walk SUCCEEDED and is
+             * only asking to run again with a clashing local widened, so
+             * nothing ever set a reason -- and declineReason then falls back
+             * to the name of whatever opcode happened to be last. `_fuse_at`,
+             * the largest single body on the compiler workload, was read as
+             * "declining at OP_RETURN" for exactly that reason. It declines
+             * nowhere near there. See Emit::pendingRetry. */
+            if (body.pendingRetry) {
+                fprintf(stderr,
+                        "[jit] %s asked to retry (measuring): a local wants a "
+                        "wider kind\n",
+                        fn->name ? fn->name->chars : "<anon>");
+            } else {
+                fprintf(stderr, "[jit] %s stopped (measuring): %s\n",
+                        fn->name ? fn->name->chars : "<anon>",
+                        declineReason(&body));
+            }
         }
-        if (jitChainOn()) reportChain(&chainProto, &body, closure, fn);
+        /* Chasing a chain from a retry walks a body that has not refused. */
+        if (jitChainOn() && !body.pendingRetry) {
+            reportChain(&chainProto, &body, closure, fn);
+        }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
