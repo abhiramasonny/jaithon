@@ -934,6 +934,17 @@ typedef struct {
      * second rather than pretend one table's keyVersion stands for both. */
     JaiTable *staticsTable;
     uint32_t  staticsKeyVersion;
+    /* And one imported module's globals, for `module.MEMBER`. Same plan again:
+     * one table per body, and a second module declines rather than pretend one
+     * keyVersion stands for both.
+     *
+     * `math.PI` was the single largest refusal left on the jaicv benchmark
+     * once the loop tier stopped throwing bodies away -- 4.6% of interpreted
+     * work in `min_area_rect` alone, which reads it once. Before this the
+     * receiver was a module, OP_GET_FIELD wanted an instance, and the whole
+     * function declined at a constant. */
+    JaiTable *modTable;
+    uint32_t  modKeyVersion;
     bool      callsOut;
     /* Set the moment anything is emitted that can destroy x0..x8 while the
      * body is still running: a call out, or one of the two stubs that call and
@@ -3652,6 +3663,48 @@ static JaiEntry *staticFieldSlot(Emit *e, ObjClass *klass, ObjString *name) {
         return NULL;
     }
     return slot;
+}
+
+/* A member of an imported module, resolved to the entry's address. The VALUE
+ * is never baked, only the address, behind the same keyVersion guard a global
+ * stands on -- a module global is assignable, so the tag is re-checked at every
+ * read and a rebind deoptimises. */
+static JaiEntry *moduleMemberSlot(Emit *e, ObjModule *m, ObjString *name) {
+    JaiTable *t = &m->globals;
+    JaiEntry *slot = jaiTableFindEntryInterned(t, name);
+    if (slot == NULL) return NULL;
+    if (e->modTable == NULL) {
+        e->modTable = t;
+        e->modKeyVersion = t->keyVersion;
+    } else if (e->modTable != t) {
+        return NULL;
+    }
+    return slot;
+}
+
+static void emitModuleGuard(Emit *e) {
+    uint32_t at = e->modKeyVersion;
+    emitConst64(e, JIT_SCRATCH_D,
+                (int64_t)(uintptr_t)&e->modTable->keyVersion);
+    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+    if (at <= 0xfffu) {
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, at));
+    } else {
+        emitConst64(e, JIT_SCRATCH_B, (int64_t)at);
+        emit(e, jaiA64SubsX(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+    }
+    branchOnDeopt(e, JAI_A64_NE);
+}
+
+/* Off puts the refusal back, so a body reading `math.PI` can be measured both
+ * ways in one binary. */
+static bool moduleFieldOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_MODULE_FIELD");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
 }
 
 /* emitGlobalsGuard's counterpart for e->staticsTable: not hoisted, for the
@@ -9926,6 +9979,54 @@ static bool compileBody(Emit *e, ObjClosure *closure) {
              * bodies decline for these two reasons. The enum receiver that stops
              * 110 more of them is the arm directly above, and it did not move
              * the compile either. */
+            /* `module.MEMBER`. The receiver is a module the walk has a live
+             * sample of, which is every imported module: OP_GET_GLOBAL just
+             * read it out of this body's own globals. Reading a constant off
+             * one used to decline the whole function. */
+            if (moduleFieldOn() && IS_MODULE(seen) &&
+                nameIdx < (uint32_t)fn->chunk.constants.count &&
+                IS_STRING(fn->chunk.constants.data[nameIdx])) {
+                ObjString *mname = AS_STRING(fn->chunk.constants.data[nameIdx]);
+                JaiEntry *mslot = moduleMemberSlot(e, AS_MODULE(seen), mname);
+                Value held = (mslot != NULL) ? mslot->value : NULL_VAL;
+                SlotKind mk = SLOT_OPAQUE;
+                unsigned mtag = VAL_OBJ;
+                if (mslot != NULL) {
+                    if (IS_INT(held))        { mk = SLOT_INT;   mtag = VAL_INT; }
+                    else if (IS_FLOAT(held)) { mk = SLOT_FLOAT; mtag = VAL_FLOAT; }
+                    else if (IS_BOOL(held))  { mk = SLOT_BOOL;  mtag = VAL_BOOL; }
+                    /* Objects are deliberately left out. A module member that
+                     * is a closure, class or native is a CALLEE, and the arms
+                     * that bake one by value rely on ObjModule::version, which
+                     * only retires a form at its next entry -- handing one out
+                     * through this path would be a wrong answer rather than a
+                     * decline. Scalars are inert and have no such problem. */
+                }
+                if (mk != SLOT_OPAQUE) {
+                    emitModuleGuard(e);
+                    unsigned mdrop;
+                    if (!popValue(e, &mdrop, NULL)) return false;
+                    if (!pushValue3(e, mk, 0, NULL, held, -1)) return false;
+                    unsigned mrd = pushReg(e) - 1;
+                    emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)mslot);
+                    /* The tag is re-checked every read: a module global is
+                     * assignable, so `math.PI = 3` must deoptimise rather than
+                     * hand back the old kind's payload. */
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(JaiEntry, value)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, mtag));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    if (mk == SLOT_BOOL) {
+                        emit(e, jaiA64LdrByte(mrd, JIT_SCRATCH_D,
+                                              (unsigned)offsetof(JaiEntry, value) + 8u));
+                    } else {
+                        emit(e, jaiA64LdrX(mrd, JIT_SCRATCH_D,
+                                           (unsigned)offsetof(JaiEntry, value) + 8u));
+                    }
+                    off += 6;
+                    break;
+                }
+            }
             if (e->stack[e->depth - 1] != SLOT_INST &&
                 e->stack[e->depth - 1] != SLOT_MAYBE_INST) {
                 return subWhy(e, "a receiver of kind %s, not an instance",
