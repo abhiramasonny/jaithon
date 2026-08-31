@@ -14975,6 +14975,59 @@ static const uint8_t *loopDepthFor(const Chunk *c, unsigned *count) {
     return gLoopDepth;
 }
 
+/* An OSR entry that refuses without a word makes the whole body invisible.
+ * It never reaches the tier's log, so a ranking can only say "never
+ * considered" and the reason is gone -- there is nowhere to look it up.
+ * `good_features_to_track` sat at 16.6% of the jaicv benchmark in exactly
+ * that state: hot, sampled, refused, and unnamed.
+ *
+ * Same wording and format as the body walker's refusals, so the report joins
+ * these to the interpreted-work attribution without knowing they came from a
+ * different path. */
+static int osrNo(ObjFunction *fn, uint32_t top, const char *why) {
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] osr %s at %u stopped: %s\n",
+                fn->name ? fn->name->chars : "<anon>", top, why);
+    }
+    return 0;
+}
+
+/* The entry guards, which say what the form wants and what the frame holds.
+ * A form that exists and is never entered looks identical to one that was
+ * never compiled unless the mismatch is named. */
+static int osrNoSlot(ObjFunction *fn, uint32_t top, unsigned slot,
+                     SlotKind want, Value held) {
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr,
+                "[jit] osr %s at %u stopped: slot %u holds %s, but the form "
+                "was compiled for %s\n",
+                fn->name ? fn->name->chars : "<anon>", top, slot,
+                jaiTypeNameStatic(held), slotKindName(want));
+    }
+    return 0;
+}
+
+
+/* The record is sized JAI_OSR_SLOTS; this only lets the old, smaller cap be
+ * put back in the same binary, so the change can be measured against itself. */
+static unsigned osrSlotCap(void) {
+    static unsigned cap;
+    if (cap == 0) {
+        const char *e = getenv("JAITHON_JIT_OSR_SLOTS");
+        unsigned want = (e != NULL) ? (unsigned)atoi(e) : JAI_OSR_SLOTS;
+        cap = (want >= 1 && want <= JAI_OSR_SLOTS) ? want : JAI_OSR_SLOTS;
+    }
+    return cap;
+}
+
+/* Same, for the compile path, which reports failure as a bool. Everything
+ * before the emitter refused without a word, so a body that never got past
+ * these looked to the log exactly like one that was never sampled. */
+static bool osrNoB(ObjFunction *fn, uint32_t top, const char *why) {
+    (void)osrNo(fn, top, why);
+    return false;
+}
+
 static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            uint8_t iterKind, Value elemSample, bool elemMixed,
                            uint8_t elemStg,
@@ -15050,12 +15103,20 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            const bool *dynamic, bool *needDynamic) {
     bool hasIter = iterKind != 0;
     ObjFunction *fn = closure->fn;
-    if (!isInstructionStart(&fn->chunk, top)) return false;
+    if (!isInstructionStart(&fn->chunk, top))
+        return osrNoB(fn, top, "the loop head is not an instruction boundary");
     uint32_t end = findLoopEnd(&fn->chunk, top, wholeBody);
-    if (end == 0 || end <= top) return false;
+    if (end == 0 || end <= top)
+        return osrNoB(fn, top, "no loop body could be found from this head");
     /* The entry re-checks every slot, so this is the size of that record --
      * nbody's advance declares nineteen. */
-    if (fn->maxSlots < 1 || (unsigned)fn->maxSlots > 40) return false;
+    if (fn->maxSlots < 1 || (unsigned)fn->maxSlots > osrSlotCap()) {
+        char said[96];
+        snprintf(said, sizeof said,
+                 "the body declares %u slots and an entry record holds %u",
+                 (unsigned)fn->maxSlots, osrSlotCap());
+        return osrNoB(fn, top, said);
+    }
 
     JaiCodeArena *arena = jaiJitArena();
     if (arena == NULL) return false;
@@ -15874,9 +15935,11 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     bool  elemMixed = false;
     uint8_t elemStg = (uint8_t)LIST_STORE_BOXED;
     if (hasIter) {
-        if (vm.stackTop <= frame->slots) return 0;
+        if (vm.stackTop <= frame->slots)
+            return osrNo(fn, top, "a for-loop head with an empty stack");
         Value it = vm.stackTop[-1];
-        if (!IS_ITER(it)) return 0;
+        if (!IS_ITER(it))
+            return osrNo(fn, top, "a for-loop head whose stack top is not an iterator");
         iter = AS_ITER(it);
         if (pairTop) {
             /* `for (k, v) in d.items()` at the top of the loop being entered.
@@ -15886,21 +15949,24 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
              * dict itself -- the head arm reads the first live entry out of it
              * for the component kinds, as the list head reads items[index]. */
             if (iter->kind != ITER_DICT_ITEMS || !IS_DICT(iter->source)) {
-                return 0;
+                return osrNo(fn, top,
+                             "a pair loop over something other than a live dict view");
             }
             elemSample = iter->source;
             iterKind = 3;
         } else if (iter->kind == ITER_RANGE && IS_RANGE(iter->source)) {
             /* Unit steps only -- that is what makes the yielded value start
              * plus the index. The start need not be 0; it is loaded at entry. */
-            if (AS_RANGE(iter->source)->step != 1) return 0;
+            if (AS_RANGE(iter->source)->step != 1)
+                return osrNo(fn, top, "a range with a step other than 1");
             /* Compiled head runs on `start + index` in one register, so the limit is biased by the start too (see
              * osrReserved). `limit` saturates at INT64_MAX for a range spanning the whole type, and a biased limit that wrapped would compare the wrong way round -- such a loop is left to the interpreter. */
             {
                 int64_t biased;
                 if (__builtin_add_overflow(AS_RANGE(iter->source)->start,
                                            iter->limit, &biased)) {
-                    return 0;
+                    return osrNo(fn, top,
+                                 "a range whose start-biased limit overflows");
                 }
             }
             iterKind = 1;
@@ -15909,7 +15975,8 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             /* Element the loop is about to bind, taken from the list itself: reading the loop variable's slot
              * instead gives whatever the previous iteration left there (nothing on the first entry), aiming the kind guard at the wrong type -- what crashed the first attempt at this. */
             int at = (int)iter->index;
-            if (at < 0 || at >= src->count) return 0;
+            if (at < 0 || at >= src->count)
+                return osrNo(fn, top, "a list loop already past its last element");
             elemSample = jaiListGet(src, at);
             elemStg = src->stg;
             iterKind = 2;
@@ -15961,10 +16028,11 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                  * The class scan no longer stops at the first mismatch: the
                  * null count needs the whole prefix, and the cap is what
                  * bounds the cost. */
-                if (nulls * 64 > scan) return 0;
+                if (nulls * 64 > scan)
+                    return osrNo(fn, top, "a list loop whose elements are too often null");
             }
         } else {
-            return 0;
+            return osrNo(fn, top, "an iterator kind with no loop-head arm");
         }
     }
 
@@ -15981,7 +16049,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         }
     }
     if (form == NULL) {
-        if (fn->osrRefused || fn->osrCount >= JAI_OSR_MAX) return 0;
+        if (fn->osrRefused)
+            return osrNo(fn, top, "the tier has given up on this body's loops");
+        if (fn->osrCount >= JAI_OSR_MAX)
+            return osrNo(fn, top, "no room left to record another loop form");
         /* This head's own share of the budget. See ObjFunction::osrMissTop for
          * why the count cannot be per function: the first loop to run spends
          * it, and every later loop in the same body is then refused a look. */
@@ -15990,7 +16061,8 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             if (fn->osrMissTop[i] == top) { miss = i; break; }
         }
         if (miss < JAI_OSR_MAX && fn->osrMissAttempts[miss] >= 5 * JAI_OSR_MAX) {
-            return 0;   /* this head is spent; other heads are not */
+            /* This head is spent; other heads in the same body are not. */
+            return osrNo(fn, top, "this loop head is out of compile attempts");
         }
         /* The whole body first, then just the part before the first
          * `continue`.
@@ -16034,33 +16106,43 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                 }
                 if (allSpent) fn->osrRefused = true;
             }
+            /* The compile printed its own reason on the way out. What it could
+             * not know is whether that was the attempt that retired the body,
+             * which is the difference between a loop that will be tried again
+             * and one nothing will look at for the rest of the run. */
+            if (fn->osrRefused) {
+                return osrNo(fn, top,
+                             "that attempt retired this body's loops for good");
+            }
             return 0;
         }
         form = &fn->osrForms[fn->osrCount - 1];
     }
-    if (fn->module == NULL || fn->module->version != fn->jitOsrModuleVersion) return 0;
+    if (fn->module == NULL || fn->module->version != fn->jitOsrModuleVersion)
+        return osrNo(fn, top, "the form was compiled against an older module");
 
     /* Every slot must still hold what it held when this was compiled. */
     for (unsigned i = 0; i < form->slots; i++) {
         Value v = frame->slots[i];
         SlotKind want = (SlotKind)(form->kinds[i] & 0x0Fu);
         if (want == SLOT_MAYBE_INST) {
-            if (!IS_NULL(v) && !IS_INSTANCE(v)) return 0;
+            if (!IS_NULL(v) && !IS_INSTANCE(v))
+                return osrNoSlot(fn, top, i, want, v);
             continue;
         }
         switch (want) {
-        case SLOT_INT:   if (!IS_INT(v))   return 0; break;
-        case SLOT_FLOAT: if (!IS_FLOAT(v)) return 0; break;
-        case SLOT_BOOL:  if (!IS_BOOL(v))  return 0; break;
+        case SLOT_INT:   if (!IS_INT(v))   return osrNoSlot(fn, top, i, want, v); break;
+        case SLOT_FLOAT: if (!IS_FLOAT(v)) return osrNoSlot(fn, top, i, want, v); break;
+        case SLOT_BOOL:  if (!IS_BOOL(v))  return osrNoSlot(fn, top, i, want, v); break;
         /* Storage is settled by osrFormStorageFits, which ran as part of
          * choosing this form: a body compiled against a boxed list reads a
          * Value every sixteen bytes, and the same body entered holding a
          * `list[int]` would read two elements as one tagged pair. */
-        case SLOT_LIST:  if (!IS_LIST(v))  return 0; break;
-        case SLOT_INST:  if (!IS_INSTANCE(v)) return 0; break;
+        case SLOT_LIST:  if (!IS_LIST(v))  return osrNoSlot(fn, top, i, want, v); break;
+        case SLOT_INST:  if (!IS_INSTANCE(v)) return osrNoSlot(fn, top, i, want, v); break;
         /* jitArgIn (function tier) has always checked this; the loop tier let it through via `default`, so a
          * slot compiled as "some object" could be entered holding an int and have its payload read as a pointer. Unexercised until something emitted a load off such a slot (the invoke arm's receiver guard, below). */
-        case SLOT_OBJ:   if (!IS_OBJ(v))   return 0; break;
+        case SLOT_OBJ:   if (!IS_OBJ(v))   return osrNoSlot(fn, top, i, want, v); break;
         default: break;   /* opaque: never read */
         }
     }
@@ -16071,9 +16153,11 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     for (unsigned i = 0; i < form->shapeCount; i++) {
         Value v = frame->slots[form->shapeSlot[i]];
         if (IS_NULL(v)) continue;    /* SLOT_MAYBE_INST, and it is the null */
-        if (!IS_INSTANCE(v)) return 0;
+        if (!IS_INSTANCE(v))
+            return osrNo(fn, top, "a slot pinned to a class no longer holds an instance");
         ObjClass *klass = AS_INSTANCE(v)->klass;
-        if (klass == NULL || klass->shapeId != form->shapeId[i]) return 0;
+        if (klass == NULL || klass->shapeId != form->shapeId[i])
+            return osrNo(fn, top, "a slot pinned to a class now holds a different one");
     }
 
     gDeopt.nstack = 0;
@@ -16083,7 +16167,8 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
      * function-tier stub's behind for whoever reads the record next. */
     gDeopt.skipLocals = 0;
     int64_t at = ((OsrFnIter)(uintptr_t)form->code)(frame->slots, iter);
-    if (at == -1) return 0;
+    if (at == -1)
+        return osrNo(fn, top, "the compiled loop bailed out at entry");
     if (at == -2) return 2;              /* an exception is pending */
     if (gDeopt.base != 0) vm.stackTop--;   /* the exhausted iterator */
     for (int64_t i = 0; i < gDeopt.nstack; i++) *vm.stackTop++ = gDeopt.stack[i];

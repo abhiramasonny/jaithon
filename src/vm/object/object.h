@@ -430,6 +430,18 @@ typedef struct {
  * ObjFunction. */
 #define JAI_OSR_SHAPES 16
 
+/* How many slots an entry record can re-check, and so the largest body the
+ * loop tier will look at.
+ *
+ * Was 40, which the log could not say out loud until the refusal was named.
+ * Once it could, one `imgproc` run showed 788 refusals at 41, 43 and 47 slots
+ * -- bodies over by single digits, including `good_features_to_track` at 16.6%
+ * of the benchmark's interpreted work. 64 is the emitter's own JIT_MAX_SLOTS,
+ * so nothing past it could compile anyway, and it costs 24 bytes a form times
+ * JAI_OSR_MAX = 96 more bytes on every ObjFunction. Same trade as raising
+ * JAI_OSR_SHAPES above, found the same way and in the same benchmark. */
+#define JAI_OSR_SLOTS 64
+
 /* A compiled loop: where it starts, and what each slot must hold to enter. */
 typedef struct {
     uint8_t  *code;
@@ -445,7 +457,7 @@ typedef struct {
      * class -- the element loads are emitted at one width -- and checking it
      * here rather than at every subscript is what keeps the boxed case as
      * cheap as it was. */
-    uint8_t   kinds[40];
+    uint8_t   kinds[JAI_OSR_SLOTS];
     /* For iterKind 2: the ListStore of the list the head iterator walks,
      * checked the same way and for the same reason. */
     uint8_t   iterStg;
