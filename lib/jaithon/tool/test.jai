@@ -20,6 +20,7 @@ from jaithon.compile.parser import parse
 from jaithon.compile.token import TokenKind
 from std.fmt import bold, green, red
 from std.io import Path, print_err, read_file
+from std.os import argv, cpu_count, spawn
 from std.test import Outcome, Report, Test, TestResult
 from std.time import Duration
 from .args import Arguments
@@ -234,6 +235,162 @@ pub fn run_doc_examples(path: str, filter: str?, verbose: bool) -> list[TestResu
 #:
 #: With no path, `tests` is searched (or `lib` when `--doc` is given). Exits
 #: 1 when anything failed — what the CI gate reads.
+
+#: Serialise one result onto a single line for a parent process to parse.
+#:
+#: Tabs separate the fields and newlines inside a message or traceback are
+#: escaped, because a failure's text is arbitrary and both characters occur in
+#: real tracebacks.
+fn _escape_field(text: str) -> str {
+    return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+}
+
+fn _unescape_field(text: str) -> str {
+    var out = ""
+    var index = 0
+    while index < text.len() {
+        let ch = text[index]
+        if ch == "\\" and index + 1 < text.len() {
+            let next = text[index + 1]
+            if next == "n" { out += "\n" } elif next == "t" { out += "\t" } else { out += next }
+            index += 2
+            continue
+        }
+        out += ch
+        index += 1
+    }
+    return out
+}
+
+fn _has_gc_stress(arguments: list[str]) -> bool {
+    for argument in arguments {
+        if argument.starts_with("--gc-stress") { return true }
+    }
+    return false
+}
+
+fn _outcome_code(outcome: Outcome) -> str {
+    if outcome == Outcome.Passed { return "P" }
+    if outcome == Outcome.Failed { return "F" }
+    if outcome == Outcome.Errored { return "E" }
+    return "S"
+}
+
+fn _outcome_of(code: str) -> Outcome {
+    if code == "P" { return Outcome.Passed }
+    if code == "F" { return Outcome.Failed }
+    if code == "E" { return Outcome.Errored }
+    return Outcome.Skipped
+}
+
+fn _emit_shard(results: list[TestResult]) -> void {
+    for result in results {
+        let fields = [
+            _outcome_code(result.outcome),
+            str(result.duration.to_nanos()),
+            _escape_field(result.suite),
+            _escape_field(result.name),
+            _escape_field(result.message),
+            _escape_field(result.trace),
+        ]
+        print("@@R " + "\t".join(fields))
+    }
+}
+
+fn _parse_shard(text: str) -> list[TestResult] {
+    let results: list[TestResult] = []
+    for line in text.split("\n") {
+        if not line.starts_with("@@R ") { continue }
+        let fields = line[4:].split("\t")
+        if fields.len() < 6 { continue }
+        results.push(
+            TestResult(
+                _unescape_field(fields[3]),
+                _unescape_field(fields[2]),
+                _outcome_of(fields[0]),
+                Duration(int(fields[1])),
+                _unescape_field(fields[4]),
+                _unescape_field(fields[5])
+            )
+        )
+    }
+    return results
+}
+
+#: Run each path in its own process, `limit` at a time.
+#:
+#: MEASURED: the jaicv suite is 100.0s in one process and 37.2s across eight,
+#: and 37.2s is what `test_against_opencv.jai` costs on its own -- so the
+#: parallelism is near-perfect and that one file is the whole remaining
+#: ceiling. Per-process startup does not eat it: three files cost 40.1s run
+#: separately against 41.6s in one process, because loading a module twice is
+#: cheaper than the suite is long.
+#:
+#: Processes rather than threads: the VM has one heap and one collector, and
+#: nothing about it is thread-safe.
+fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> list[TestResult] {
+    var running: list[any] = []
+    var captured: dict[str, str] = {}
+    #: Warnings a test file raises while compiling go to the CHILD's stderr.
+    #: Dropping them would make a parallel run quieter than a sequential one,
+    #: which is a real difference in output and was caught by diffing the two.
+    var noise: dict[str, str] = {}
+    var next_path = 0
+
+    #: Everything the process was invoked with EXCEPT the paths, so a worker
+    #: inherits flags this tool never parses -- `--gc-stress` is the one that
+    #: matters, since it belongs to the CLI rather than to `test`, and a
+    #: hand-built command silently dropped it. Rebuilding the command from
+    #: argv() means a flag added later needs no change here.
+    let own = argv()
+    var forwarded: list[str] = []
+    var index = 1
+    while index < own.len() {
+        let argument = own[index]
+        #: `test` itself, the paths, and any --jobs the caller gave: all
+        #: replaced below.
+        let is_path = not argument.starts_with("-")
+        let is_jobs = argument.starts_with("--jobs") or argument.starts_with("-j")
+        if not is_path and not is_jobs { forwarded.push(argument) }
+        index += 1
+    }
+
+    fn launch(path: str) -> void {
+        var command = [exe, "test", "--_shard", "--jobs=1"]
+        command.extend(forwarded)
+        command.push(path)
+        running.push((path, spawn(command)))
+    }
+
+    while next_path < paths.len() or running.len() > 0 {
+        while running.len() < limit and next_path < paths.len() {
+            launch(paths[next_path])
+            next_path += 1
+        }
+        #: `read_stdout` blocks until the child closes it, which is what makes
+        #: this a wait as well as a read. Draining the oldest first keeps the
+        #: reported order the same as the sequential runner's.
+        let (path, process) = running[0]
+        captured[path] = process.read_stdout()
+        noise[path] = process.read_stderr()
+        let _status = process.wait()
+        running = running[1:]
+    }
+
+    let results: list[TestResult] = []
+    for path in paths {
+        let text = captured.get(path) ?? ""
+        let found = _parse_shard(text)
+        if found.len() == 0 { continue }
+        let complaints = noise.get(path) ?? ""
+        if complaints.len() > 0 { print_err(complaints.rstrip()) }
+        if options.verbose { print(bold(module_name_of(path))) }
+        print(_file_line(path, found))
+        results.extend(found)
+    }
+    return results
+}
+
 pub fn main(args: list[str]) -> int {
     let options = _Options.parse(tail_arguments(args, "test"))
     if options.usage_error is not null {
@@ -247,6 +404,50 @@ pub fn main(args: list[str]) -> int {
     } else {
         expand_paths(options.paths, is_test_file)
     }
+    #: One file per core unless asked otherwise. A worker is always 1, which
+    #: is what stops it spawning workers of its own.
+    let wanted = if options.shard { 1 } else { options.jobs }
+    #: `--gc-stress` collects on (almost) every allocation, and the parallel
+    #: parent allocates for its own bookkeeping -- spawning, reading each
+    #: child's output, parsing it back into results. Under stress that
+    #: bookkeeping costs far more than the tests: two files that take 3.3s
+    #: sequentially had not finished after ten minutes. Stress runs are about
+    #: correctness rather than wall time, and the sequential path is the one
+    #: worth stressing, so they stay sequential.
+    let stressed = _has_gc_stress(argv())
+    let limit = if stressed { 1 } elif wanted > 0 { wanted } else { min(cpu_count(), paths.len()) }
+
+    if limit > 1 and paths.len() > 1 {
+        #: `args` here is the tool's own arguments, not the process's, so the
+        #: binary has to come from os.argv().
+        let exe = argv()[0]
+        let results = _run_sharded(exe, paths, options, limit)
+        if results.len() == 0 {
+            print_err("jaithon test: no tests found")
+            return 1
+        }
+        let report = Report(results)
+        report.print_summary()
+        return report.exit_code()
+    }
+
+    if options.shard {
+        #: A worker prints `@@R` lines and nothing else; the parent formats
+        #: the file lines and the summary so the output is byte-identical to
+        #: the sequential runner's.
+        var shard_results: list[TestResult] = []
+        for path in paths {
+            let found = if options.doc {
+                run_doc_examples(path, options.filter, false)
+            } else {
+                run_file(path, options.filter, false)
+            }
+            shard_results.extend(found)
+        }
+        _emit_shard(shard_results)
+        return 0
+    }
+
     let results: list[TestResult] = []
     for path in paths {
         if options.verbose { print(bold(module_name_of(path))) }
@@ -432,6 +633,12 @@ class _Options {
     pub var filter: str?
     pub var paths: list[str]
     pub var usage_error: str?
+    #: How many files to run at once. 0 means "pick one per core"; 1 keeps the
+    #: old single-process behaviour, which is what a worker runs under.
+    pub var jobs: int
+    #: Set on a worker. It runs exactly one file and prints its results as
+    #: `@@R` lines for the parent to parse, with no file line and no summary.
+    pub var shard: bool
 
     pub fn init(self) {
         self.verbose = false
@@ -439,6 +646,8 @@ class _Options {
         self.filter = null
         self.paths = []
         self.usage_error = null
+        self.jobs = 0
+        self.shard = false
     }
 
     pub static fn parse(args: list[str]) -> _Options {
@@ -459,6 +668,12 @@ class _Options {
                 if reader.is_bare(argument) { options.verbose = true }
             } elif argument.name == "--doc" {
                 if reader.is_bare(argument) { options.doc = true }
+            } elif argument.name == "--jobs" or argument.name == "-j" {
+                let value = reader.value_of(argument)
+                if value is null { break }
+                options.jobs = int(value)
+            } elif argument.name == "--_shard" {
+                if reader.is_bare(argument) { options.shard = true }
             } else {
                 reader.unknown(argument)
             }
