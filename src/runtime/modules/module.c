@@ -1173,9 +1173,28 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
     jaiPushRoot(OBJ_VAL(module));
 
     bool ok;
-    /* `check` promises "compile and type-check" (spec 8.5), and codegen is
-     * where the bytecode verifier runs, so it emits too and drops the body.
-     * One front end, one branch. */
+    /* `check` promises "compile and type-check" (spec 8.5), so it emits too
+     * and drops the body. One front end, one branch.
+     *
+     * The reason is NOT that codegen runs the bytecode verifier -- it does
+     * not. `jaiVerifyChunk` has exactly one caller in the tree,
+     * cli_cmd_build.c, so `check` never verifies anything. This comment said
+     * otherwise for long enough that it was quoted back as authority.
+     *
+     * The real reason is that EMIT REPORTS DIAGNOSTICS THE CHECKER DOES NOT.
+     * There are nine `_unsupported()` sites in lib/jaithon/compile/emit.jai
+     * for shapes the checker deliberately accepts and the instruction set
+     * cannot express -- `yield` and `await` (no generators), a generator
+     * expression (needs a coroutine), `from m import *` (the loader needs an
+     * explicit name list), and several pattern cases. Each is a clean E0902
+     * with the checker reporting nothing at all. Drop the emit and `check`
+     * starts passing files that cannot compile.
+     *
+     * Worth knowing before trying: NONE of those nine fires anywhere in
+     * lib/std, lib/jaithon, packages or tests, so a corpus diff over the tree
+     * comes back with zero differences and makes removing emit look safe.
+     * See tests/errors/import_star.jai, added to give that path one live
+     * example. */
     const JaiSourceFile *entryFile = jaiSourceGet(fileId);
     ObjFunction *checked = entryFile == NULL
                              ? NULL
