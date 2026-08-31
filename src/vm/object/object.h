@@ -594,7 +594,14 @@ struct ObjFunction {
      * jaiFreeObject alongside paramNames/exceptions/defaultOffsets, the same
      * lifetime as every other heap member here. Holds a code pointer and plain
      * bytes -- no Value -- so blackenFunction in gc.c marks it exactly as much
-     * as it did when it was inline: not at all. */
+     * as it did when it was inline: not at all.
+     *
+     * MEASURED here, not taken on report: sizeof(ObjFunction) 1744 -> 408, and
+     * peak RSS on `check --no-cache parser.jai`, three samples each side of a
+     * paired rebuild, 115.2/122.9/115.3 MB against 107.1/107.0/106.4 -- -7.2%
+     * on the median. An adversarial re-measure of the same change against an
+     * older base got -11.0%; the smaller number here is the honest one for
+     * this tree. */
     JaiOsrForm *osrForms;
     uint8_t     osrCount;
     /* Attempts so far. One look is not enough: a body can only use a callee's
