@@ -161,6 +161,15 @@ for src in "$ROOT"/tests/golden/*.jai; do
     [[ $GC_STRESS -eq 1 ]] && run_golden "$name (gc-stress)" "$src" "$expected" "$gc_flag"
     run_golden "$name (deopt-stress)" "$src" "$expected" "" \
         JAITHON_JIT_DEOPT_STRESS=1
+    # Every body compiles on its FIRST call instead of its 64th, so the golden
+    # actually exercises the compiled tier. Without this 40 of the 61 goldens
+    # compile nothing at all, and a differential against JAITHON_NO_JIT=1 over
+    # them compares the interpreter with itself -- which is how an empty
+    # initializer that returned null instead of the new object shipped. Results
+    # must be UNCHANGED; a difference here is a miscompile. See jaiJitThreshold
+    # in src/vm/jit/jit.h.
+    run_golden "$name (jit-first-call)" "$src" "$expected" "" \
+        JAITHON_JIT_THRESHOLD=1
     for level in -O0 -O1 -O3; do
         run_golden "$name ($level)" "$src" "$expected" "$level"
     done
