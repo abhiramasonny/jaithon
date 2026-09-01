@@ -73,8 +73,8 @@ fn wrap_round_trip(a: int, b: int, rounds: int) -> int {
     var bad = 0
     var i = 0
     while i < rounds {
-        if (a +% b) -% b != a { bad += 1 }
-        if (a -% b) +% b != a { bad += 1 }
+        if a +% b -% b != a { bad += 1 }
+        if a -% b +% b != a { bad += 1 }
         if a *% b != b *% a { bad += 1 }
         i += 1
     }
@@ -118,14 +118,10 @@ fn wrap_hash(seed: int, rounds: int) -> int {
 pub fn test_add_wraps_at_both_ends() -> void {
     var call = 0
     while call < CALLS {
-        assert_eq(wrap_add(math.INT_MAX, 1, ROUNDS), math.INT_MIN,
-                  "INT_MAX +% 1")
-        assert_eq(wrap_add(math.INT_MIN, -1, ROUNDS), math.INT_MAX,
-                  "INT_MIN +% -1")
-        assert_eq(wrap_add(math.INT_MAX, math.INT_MAX, ROUNDS), -2,
-                  "INT_MAX +% INT_MAX")
-        assert_eq(wrap_add(math.INT_MIN, math.INT_MIN, ROUNDS), 0,
-                  "INT_MIN +% INT_MIN")
+        assert_eq(wrap_add(math.INT_MAX, 1, ROUNDS), math.INT_MIN, "INT_MAX +% 1")
+        assert_eq(wrap_add(math.INT_MIN, -1, ROUNDS), math.INT_MAX, "INT_MIN +% -1")
+        assert_eq(wrap_add(math.INT_MAX, math.INT_MAX, ROUNDS), -2, "INT_MAX +% INT_MAX")
+        assert_eq(wrap_add(math.INT_MIN, math.INT_MIN, ROUNDS), 0, "INT_MIN +% INT_MIN")
         assert_eq(wrap_add(0, 0, ROUNDS), 0, "0 +% 0")
         assert_eq(wrap_add(-1, 1, ROUNDS), 0, "-1 +% 1")
         call += 1
@@ -135,16 +131,11 @@ pub fn test_add_wraps_at_both_ends() -> void {
 pub fn test_sub_wraps_at_both_ends() -> void {
     var call = 0
     while call < CALLS {
-        assert_eq(wrap_sub(math.INT_MIN, 1, ROUNDS), math.INT_MAX,
-                  "INT_MIN -% 1")
-        assert_eq(wrap_sub(math.INT_MAX, -1, ROUNDS), math.INT_MIN,
-                  "INT_MAX -% -1")
-        assert_eq(wrap_sub(0, math.INT_MIN, ROUNDS), math.INT_MIN,
-                  "0 -% INT_MIN")
-        assert_eq(wrap_sub(math.INT_MAX, math.INT_MIN, ROUNDS), -1,
-                  "INT_MAX -% INT_MIN")
-        assert_eq(wrap_sub(math.INT_MIN, math.INT_MAX, ROUNDS), 1,
-                  "INT_MIN -% INT_MAX")
+        assert_eq(wrap_sub(math.INT_MIN, 1, ROUNDS), math.INT_MAX, "INT_MIN -% 1")
+        assert_eq(wrap_sub(math.INT_MAX, -1, ROUNDS), math.INT_MIN, "INT_MAX -% -1")
+        assert_eq(wrap_sub(0, math.INT_MIN, ROUNDS), math.INT_MIN, "0 -% INT_MIN")
+        assert_eq(wrap_sub(math.INT_MAX, math.INT_MIN, ROUNDS), -1, "INT_MAX -% INT_MIN")
+        assert_eq(wrap_sub(math.INT_MIN, math.INT_MAX, ROUNDS), 1, "INT_MIN -% INT_MAX")
         assert_eq(wrap_sub(0, 0, ROUNDS), 0, "0 -% 0")
         call += 1
     }
@@ -155,24 +146,26 @@ pub fn test_mul_wraps_and_keeps_the_low_half() -> void {
     while call < CALLS {
         #: INT_MIN is its own negation: the one product `*` raises on and `*%`
         #: has no other answer for.
-        assert_eq(wrap_mul(math.INT_MIN, -1, ROUNDS), math.INT_MIN,
-                  "INT_MIN *% -1")
-        assert_eq(wrap_mul(-1, math.INT_MIN, ROUNDS), math.INT_MIN,
-                  "-1 *% INT_MIN")
+        assert_eq(wrap_mul(math.INT_MIN, -1, ROUNDS), math.INT_MIN, "INT_MIN *% -1")
+        assert_eq(wrap_mul(-1, math.INT_MIN, ROUNDS), math.INT_MIN, "-1 *% INT_MIN")
         assert_eq(wrap_mul(math.INT_MAX, 2, ROUNDS), -2, "INT_MAX *% 2")
         assert_eq(wrap_mul(math.INT_MIN, 2, ROUNDS), 0, "INT_MIN *% 2")
-        assert_eq(wrap_mul(math.INT_MAX, math.INT_MAX, ROUNDS), 1,
-                  "INT_MAX *% INT_MAX")
-        assert_eq(wrap_mul(math.INT_MIN, math.INT_MIN, ROUNDS), 0,
-                  "INT_MIN *% INT_MIN")
+        assert_eq(wrap_mul(math.INT_MAX, math.INT_MAX, ROUNDS), 1, "INT_MAX *% INT_MAX")
+        assert_eq(wrap_mul(math.INT_MIN, math.INT_MIN, ROUNDS), 0, "INT_MIN *% INT_MIN")
         #: The smallest square that does not fit: 3037000500 ** 2 is one step
         #: past INT_MAX, so the low half is negative.
-        assert_eq(wrap_mul(3037000500, 3037000500, ROUNDS),
-                  -9223372036709301616, "3037000500 squared")
+        assert_eq(
+            wrap_mul(3037000500, 3037000500, ROUNDS),
+            -9223372036709301616,
+            "3037000500 squared"
+        )
         assert_eq(wrap_mul(-1, -1, ROUNDS), 1, "-1 *% -1")
         assert_eq(wrap_mul(math.INT_MIN, 0, ROUNDS), 0, "INT_MIN *% 0")
-        assert_eq(wrap_mul(1103515245, 12345, ROUNDS), 13622895699525,
-                  "a product that fits is unchanged")
+        assert_eq(
+            wrap_mul(1103515245, 12345, ROUNDS),
+            13622895699525,
+            "a product that fits is unchanged"
+        )
         call += 1
     }
 }
@@ -203,8 +196,7 @@ pub fn test_a_wrapping_recurrence() -> void {
     while call < CALLS {
         assert_eq(wrap_hash(0, 1), 1442695040888963407, "one step from zero")
         assert_eq(wrap_hash(0, 16), -2566228959737388584, "sixteen steps")
-        assert_eq(wrap_hash(math.INT_MIN, 16), 6657143077117387224,
-                  "sixteen steps from INT_MIN")
+        assert_eq(wrap_hash(math.INT_MIN, 16), 6657143077117387224, "sixteen steps from INT_MIN")
         call += 1
     }
 }
@@ -240,12 +232,17 @@ fn wrap_in_a_try(a: int, b: int, rounds: int) -> int {
 pub fn test_wrapping_inside_a_protected_region() -> void {
     var call = 0
     while call < CALLS {
-        assert_eq(wrap_in_a_try(math.INT_MIN, -1, 8), -9223372036854775804,
-                  "eight steps, no raise")
-        assert_eq(wrap_in_a_try(math.INT_MAX, 3, ROUNDS), 9223372036854642953,
-                  "twelve steps, a raise every one")
-        assert_eq(wrap_in_a_try(0, 6364136223846793005, ROUNDS), 8547306004929263390,
-                  "twelve steps from zero")
+        assert_eq(wrap_in_a_try(math.INT_MIN, -1, 8), -9223372036854775804, "eight steps, no raise")
+        assert_eq(
+            wrap_in_a_try(math.INT_MAX, 3, ROUNDS),
+            9223372036854642953,
+            "twelve steps, a raise every one"
+        )
+        assert_eq(
+            wrap_in_a_try(0, 6364136223846793005, ROUNDS),
+            8547306004929263390,
+            "twelve steps from zero"
+        )
         call += 1
     }
 }
@@ -275,7 +272,9 @@ pub fn test_a_float_reaches_the_interpreter() -> void {
 
 class Wrapped {
     pub var n: int
+
     pub fn init(self, n: int) -> void { self.n = n }
+
     pub fn __add__(self, other: Wrapped) -> Wrapped {
         return Wrapped(self.n + other.n)
     }
