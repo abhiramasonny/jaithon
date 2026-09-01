@@ -759,12 +759,26 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                                     localFrameOff(&e, slot) + 8));
                 pr = JIT_SCRATCH_C;
             }
-            if (kind == SLOT_MAYBE_INST) {
+            /* Every object kind, not just maybe-instance. The prologue zeroes
+             * the REGISTER home of each local past the arity, and a register
+             * carries no tag -- so a deopt taken before the local is assigned
+             * pairs that zero with whatever tag `kind` implies. An
+             * unconditional VAL_OBJ there manufactures {VAL_OBJ, obj = NULL},
+             * which jaiJitEnterOsr's slot scan dereferences: IS_INSTANCE is
+             * tag-only in its first half, so it loads Obj.type off address 0.
+             * Reading the tag off the payload makes the zero say VAL_NULL,
+             * which is what the prologue's own argument arm already does. */
+            if (tag == VAL_OBJ) {
                 /* Not JIT_SCRATCH_C when C is holding the payload, which it is
                  * whenever the slot came from the frame or an FP home. */
                 unsigned spare = pr == JIT_SCRATCH_C ? JIT_SCRATCH_D
                                                      : JIT_SCRATCH_C;
-                emitTagFor(&e, kind, pr, JIT_SCRATCH_B, spare);
+                /* SLOT_MAYBE_INST, not `kind`: emitTagFor only emits the
+                 * payload-dependent csel for that kind, and a plain SLOT_INST
+                 * would go straight back to an unconditional VAL_OBJ. A local
+                 * that HAS been assigned is never null, so the csel picks the
+                 * same VAL_OBJ for it. */
+                emitTagFor(&e, SLOT_MAYBE_INST, pr, JIT_SCRATCH_B, spare);
             } else {
                 emit(&e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             }
