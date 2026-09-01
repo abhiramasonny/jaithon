@@ -309,7 +309,9 @@ distance the hardest to arrive at. A fuzzing census sampled 100 generated
 programs and **not one** of them emitted a `[jit] pic N-way` line under
 `JAI_JIT_WHY=1`; hand-written attempts at the obvious shapes missed it too.
 This section is what it actually takes, written down so nobody has to
-reconstruct it from the code a third time.
+reconstruct it from the code a third time. The generator has since been taught
+the shape and the same census now reads 76 of 100, which is the last
+subsection.
 
 ### The gate is one NULL
 
@@ -365,11 +367,31 @@ with all of the following true at once:
   returning something with a shape") and a *disagreement* between two classes
   merges to `JAI_FB_MIXED`, which takes the whole body down one step earlier
   with "an unpinned receiver's result kind".
+* **no wrapping operator anywhere a walk has to cross.** This directory has no
+  handler for `OP_ADD_WRAP`, `OP_SUB_WRAP` or `OP_MUL_WRAP` at all -- `grep`
+  finds them in `vm.c` and nowhere here -- so a walk stops dead at the first
+  one and everything after it is interpreted. That matters in two places and
+  is easy to miss in both. In the **loop body** a `+%` before the call means
+  the walk never reaches the call. In a **callee** it is worse than it looks:
+  the way is supposed to be dropped for having no return kind, but a callee
+  that wraps is also the shape that trips the gap recorded below, so it does
+  not cost the site one way -- it costs the site the arm. Three classes in one
+  list, one of whose methods computes `x *% self.k` and the other two of which
+  do not, eight runs each:
+
+      all three checked      pic 3-way, 8 of 8
+      one of three wrapping  pic 1-way twice, nothing the other six times,
+                             and "a direct callee whose walk never reached
+                             a return" in every run
+
+  So a method written for this arm folds with the checked `+ - *`, and stays
+  safe by bounding both operands with `%` rather than by wrapping. That is
+  what `tests/fuzz/progen.py`'s `step` is and why it exists.
 * **the callees are already compiled when the head compiles.** Each way needs
   `ObjFunction::jitFunc`, so every implementation must have passed
   `JAI_JIT_THRESHOLD` before the tick that compiles the loop lands. This is the
   one condition that is about *timing* rather than about the program, and it is
-  why one configuration below never sees the arm at all.
+  why the configuration below that samples fastest reaches the arm least often.
 * the rest is `jitPic1Admissible`, per way: a public method (`InlineCache::payload`
   is 0 -- a non-public one is cached with the byte set so the interpreter can
   re-run `methodPermitted`, which emitted code cannot), a closure rather than a
@@ -399,22 +421,26 @@ The smallest thing that reaches it is about a dozen lines: two classes with a
 list inside an outer repeat loop. Measured over the differential fuzzer's six
 configurations:
 
-| configuration | reaches the arm |
-| --- | --- |
-| default | yes |
-| `JAITHON_JIT_DEOPT_STRESS=1` | yes |
-| `JAITHON_JIT_SPLIT_STRESS=1` | yes |
-| `JAITHON_JIT_THRESHOLD=1` | yes -- the half-formed cache is not an obstacle |
-| `JAITHON_JIT_TICK_US=50` | **no** |
-| `JAITHON_NO_JIT=1` | n/a |
+| configuration | one 12-line probe | 100 generated programs |
+| --- | --- | --- |
+| default | yes | 43% |
+| `JAITHON_JIT_DEOPT_STRESS=1` | yes | 54% |
+| `JAITHON_JIT_SPLIT_STRESS=1` | yes | 53% |
+| `JAITHON_JIT_THRESHOLD=1` | yes -- a half-formed cache is not an obstacle | 50% |
+| `JAITHON_JIT_TICK_US=50` | **no** | 26% |
+| `JAITHON_NO_JIT=1` | n/a | n/a |
 
-`JAITHON_JIT_TICK_US=50` missing it is the ordering condition above, and it is
-worth stating plainly because that switch is otherwise the one that drives this
-tier hardest: at 50us the tick lands on the list head before the methods in the
-list have been called 64 times, so no way has a `jitFunc`, the arm answers "no
-way of this site's cache is usable", and the form that gets cached for the rest
-of the run has no cache in it. The fastest sampler is the configuration least
-able to reach the polymorphic call arm.
+The second column is `tests/fuzz/pic_rate.py`, and it is there because the
+first column on its own says something false. `JAITHON_JIT_TICK_US=50` really
+does miss the arm on the small probe, every run, and the reason is the ordering
+condition above: at 50us the tick lands on the list head before the methods in
+the list have been called 64 times, so no way has a `jitFunc`, the arm answers
+"no way of this site's cache is usable", and the form cached for the rest of
+the run has no cache in it. But "the fastest sampler cannot reach this arm" is
+the wrong conclusion to draw from one program. Across a corpus it reaches it in
+a quarter of them -- fewer than any other configuration, and not none. What the
+switch changes is a *race*, and a program with a longer warm-up before its list
+loop goes hot wins it.
 
 ### Why the obvious candidates do not
 
@@ -445,6 +471,37 @@ All four were tried and all four fail for reasons that are worth knowing.
 * **A monomorphic list.** `elemMixed` stays false and the head pins, exactly as
   intended: a one-class list should get the direct call, not a cache.
 
+### What the fuzzer emits, and what it measured
+
+`tests/fuzz/progen.py` now generates this shape on purpose, in `st_inst_list`,
+and `tests/fuzz/pic_rate.py` is the census that says whether it arrives -- one
+`[jit] pic` line counted per program, under each configuration the differential
+fuzzer runs. Same binary, same seeds, generator before and after:
+
+    seeds 1..100     before   after        seeds 201..300   before   after
+      default          0/100    43/100       default          0/100    51/100
+      tick             0/100    26/100       tick             0/100    31/100
+      deopt            0/100    54/100       deopt            0/100    63/100
+      split            0/100    53/100       split            0/100    60/100
+      thresh           0/100    50/100       thresh           0/100    55/100
+      any              0/100    76/100       any              0/100    83/100
+
+The old statement already emitted "a list of mixed classes walked by one loop"
+and still scored zero, which is the part worth remembering: the shape was
+right and three details were wrong. Its list was two or three elements drawn
+independently from one pool, so it was often monomorphic and never hot enough
+for the head to take a tick of its own; and its body folded with `acc = acc +%
+e.kind() +% e.geta()`, whose first `+%` stops the walk, on callees whose own
+bodies wrap. Fixing those three -- two distinct classes sampled without
+replacement, six or more elements, and a `pub fn step(self, x: int) -> int`
+whose body is checked arithmetic bounded by `%` -- is the whole difference
+between 0 and 76.
+
+Reaching the arm is not the same as finding anything in it. 1,800 programs x 6
+configurations after the change -- 300 at the default seeds and 1,500 more from
+seed 5000 -- report no disagreements. The arm is covered now; it is not yet
+known to be wrong anywhere.
+
 ### One gap, recorded rather than fixed
 
 `jitPic1Admissible` says it "mirrors every decision `emitDirectCall` makes
@@ -471,6 +528,13 @@ Removing the one wrapping multiply turns the same program into
 worth making, is one line in `jitPic1Admissible`: drop a way whose
 `jitReturnKnown` is false, the same way it already drops one whose module
 version has moved.
+
+The smallest form of it is three classes in one list where exactly one method
+wraps, which is worth having written down because it is now a shape the fuzzer
+can draw: eight runs give `pic 3-way` eight times with all three checked, and
+with one of the three wrapping give `pic 1-way` twice, nothing six times, and
+the decline in all eight. A site does not lose the wrapping way. It loses the
+arm, and the loop around it.
 
 ---
 

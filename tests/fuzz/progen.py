@@ -52,8 +52,14 @@ shapes that have broken it before:
   - field reads and writes, methods, `self.m()` calls, and overrides
   - a variable holding one class on one branch and another on the next, which
     is the inline cache's own path; every generated class answers kind(),
-    geta(), twice() and bump(k) precisely so that any two of them are legal at
-    the same call site and only the run-time value says which arrived
+    geta(), twice(), bump(k) and step(x) precisely so that any two of them are
+    legal at the same call site and only the run-time value says which arrived
+  - a `for` over a list holding two or more classes, which is the ONLY source
+    shape that reaches the polymorphic inline cache in src/vm/jit (see
+    st_inst_list, and src/vm/jit/README.md for why every other candidate
+    misses). Before it was generated deliberately the arm was reached by 0 of
+    100 generated programs; it is now reached by 76. tests/fuzz/pic_rate.py
+    is the census that says so
   - a nullable instance conditionally assigned, and an `any` that is an int on
     one path and an object on the other
   - lists, dicts, strings, indexing, recursion, match, lambdas
