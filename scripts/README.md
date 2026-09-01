@@ -17,6 +17,10 @@ check_packages.py       validate workspace package manifests and their deps
                          (make package-check)
 fixpoint_check.sh       compile each source twice, diff the images byte for
                          byte (make fixpoint-check)
+gate/                   checkers that pin a set nobody may quietly add to; see
+                         the note below the listing
+gate/kind_tag_check.py  pin every place the JIT builds a Value tag out of a
+                         compile-time SlotKind (make kind-tag-check)
 gen_seed.py             generate boot/seed.c from the compiler's .jaic images
                          (make reseed)
 install.sh              build jaithon and install it to a prefix (see
@@ -50,3 +54,13 @@ stage0_reseed.sh        reseed from a HEAD snapshot of lib/jaithon/compile
                          instead of the working compiler -- no make target,
                          run directly (see CONTRIBUTING.md)
 ```
+
+## `gate/`
+
+A checker in here enforces a rule that is mechanical but whose *exceptions* are
+a judgement, so it pins the current set in a manifest and fails on anything not
+in it -- in both directions, since a stale pin guards nothing. Each one takes
+`--write` to regenerate the mechanical columns, and each is written so that
+regenerating alone cannot make it green: the judgement column has to be filled
+in by a person. The script's own docstring says why the rule exists, and what
+it cannot see.
