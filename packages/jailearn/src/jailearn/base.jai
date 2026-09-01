@@ -40,6 +40,7 @@ from .base.reduce import row_argmin, row_extreme, row_topk, sort_columns
 from .base.distance import GRAM_LINEAR, GRAM_POLY, GRAM_RBF, GRAM_SIGMOID, gram
 from .base.distance import pairwise_sqdist
 from .base.classes import bincount, class_sums, class_sumsq, scatter_add_rows
+from .base.elementwise import affine_columns, count_equal, nan_mask, sum_to_host
 
 export { cached_kernel }
 export { Params, check_fitted, check_matrix, check_pair, check_width, param_bool }
@@ -51,6 +52,7 @@ export { log_sum_exp_rows, masked_column_mean, row_argmax, row_argmin, row_extre
 export { row_topk, sort_columns }
 export { GRAM_LINEAR, GRAM_POLY, GRAM_RBF, GRAM_SIGMOID, gram, pairwise_sqdist }
 export { bincount, class_sums, class_sumsq, scatter_add_rows }
+export { affine_columns, count_equal, nan_mask }
 
 #: How `model_selection` measures a fitted estimator: higher is better, always.
 #: It takes one of these rather than importing `metrics`, so a search can run
@@ -186,60 +188,6 @@ pub fn default_score(estimator: Estimator, x: Tensor, y: Tensor) -> float {
     column.free()
     if spread <= 0.0 { return 0.0 }
     return 1.0 - unexplained / spread
-}
-
-#: `x[i][j] * scale[j] + offset[j]`, which is every scaler's apply step.
-pub fn affine_columns(x: Tensor, scale: Tensor, offset: Tensor) -> Tensor {
-    check_matrix(x)
-    let width = x.shape[1]
-    if scale.size != width or offset.size != width {
-        throw ValueError(
-            f"scale and offset must be [{width}], got {scale.shape} and {offset.shape}"
-        )
-    }
-    let out = Tensor(x.shape)
-    base_kernel("base_affine_columns").dispatch_async(
-        [x.buffer(), scale.buffer(), offset.buffer(), out.buffer()],
-        x.size,
-        [x.size, width]
-    )
-    return out
-}
-
-#: How many positions hold the same value in both tensors.
-#:
-#: Counted by summing a mask in float32, so the answer is exact up to about
-#: sixteen million matches and then starts rounding. Accuracy over a test set
-#: that size is not the measurement anybody is taking.
-pub fn count_equal(a: Tensor, b: Tensor) -> int {
-    if a.size != b.size { throw ValueError(f"{a.shape} and {b.shape} have different sizes") }
-    let mask = Tensor([a.size])
-    base_kernel("base_mask_op").dispatch_async(
-        [a.buffer(), b.buffer(), mask.buffer()],
-        a.size,
-        [a.size, 0]
-    )
-    let total = sum_to_host(mask)
-    mask.free()
-    return int(total + 0.5)
-}
-
-#: 1 where `x` holds a NaN and 0 elsewhere, same shape as `x`.
-pub fn nan_mask(x: Tensor) -> Tensor {
-    let mask = Tensor(x.shape)
-    base_kernel("base_mask_op").dispatch_async(
-        [x.buffer(), x.buffer(), mask.buffer()],
-        x.size,
-        [x.size, 1]
-    )
-    return mask
-}
-
-fn sum_to_host(t: Tensor) -> float {
-    let total = jt.sum(t)
-    let value = total.download()[0]
-    total.free()
-    return value
 }
 
 #: `k` starting centres spread out by k-means++, as `[k, n_features]`.
