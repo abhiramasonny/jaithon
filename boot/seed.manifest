@@ -47,6 +47,7 @@ jaithon/compile/check/union.jai
 jaithon/compile/check/universe.jai
 jaithon/compile/diag.jai
 jaithon/compile/emit.jai
+jaithon/compile/emit/opcode.jai
 jaithon/compile/jaic.jai
 jaithon/compile/lexer.jai
 jaithon/compile/mod.jai
