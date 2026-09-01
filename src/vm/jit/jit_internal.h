@@ -1111,6 +1111,10 @@ int emitNativeResultCall(Emit *e, Value cv, const char *nm,
                                 unsigned argc, uint32_t afterIp);
 bool emitCallOut(Emit *e, unsigned argc);
 
+/* Defined in jit_list.c. */
+void emitListElemStore(Emit *e, uint8_t stg, unsigned vtag,
+                              unsigned rVal);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
