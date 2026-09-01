@@ -1142,6 +1142,7 @@ bool emitIsTest(Emit *e, uint8_t op, int *offp);
 bool emitJumpIfCmpFalse(Emit *e, const uint8_t *code, int *offp);
 bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
                          int *offp);
+JitArmResult emitMembership(Emit *e, const uint8_t *code, int *offp);
 
 /* Defined in jit_body_field.c. */
 bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp);

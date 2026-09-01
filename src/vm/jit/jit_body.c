@@ -1476,42 +1476,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
 
         case OP_IN:
         case OP_NOT_IN: {
-            /* `x in c`. No arm existed, so a membership test ENDED THE WALK:
-             * `if k in seen` is the shape of every dedup loop in the corpus and
-             * everything after it ran interpreted.
-             *
-             * The containment itself is not made faster -- it is the same
-             * jaiContainsOp the interpreter runs, called out to. What the arm
-             * buys is the body around it, which is the whole point of a row
-             * over a call that is cheap next to its loop.
-             *
-             * `not in` is the same call with the sense flipped, in its own
-             * entry point rather than an argc flag -- a wider descriptor would
-             * name a stack entry past the operands. */
-            if (!jitMembership() || !e->callsOut || e->depth < 2) {
-                goto unarmedOpcode;
-            }
-            if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
-                                code[off] == OP_IN ? (void *)&jitContains
-                                                   : (void *)&jitNotContains)) {
-                return false;
-            }
-            for (unsigned i = 0; i < 2; i++) {
-                unsigned r;
-                if (!popValue(e, &r, NULL)) return false;
-            }
-            if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
-            emit(e, jaiA64LdrByte(pushReg(e) - 1, 31,
-                                  e->descOffset +
-                                      (unsigned)offsetof(JitCallDesc, result) +
-                                      8));
-            /* Containment is not pure: a class can define __contains__, so the
-             * call may run Jaithon code that writes. Leaving this unset marked
-             * every body holding an `in` jitFuncNoWrite, which lets a direct
-             * caller finish the callee by RE-RUNNING it from the start on a
-             * bail -- and re-running the writes with it. */
-            e->wroteHeap = true;
-            off += 1;
+            JitArmResult r = emitMembership(e, code, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
