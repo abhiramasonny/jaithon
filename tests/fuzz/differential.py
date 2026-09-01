@@ -24,12 +24,14 @@ The configurations, and what each is for:
                                          and every OSR exit is taken
     split     JAITHON_JIT_SPLIT_STRESS=1 the split operand bank in every body
                                          that can take one
+    first     JAITHON_JIT_THRESHOLD=1    every body compiles on its FIRST call
+                                         instead of its 64th
 
-There is deliberately NO "compile on the first call" configuration, because
-there is no such switch: JAI_JIT_THRESHOLD is a compile-time 64 in jit.h and
-nothing reads an environment variable for it. Warming happens inside the
-generated program instead -- see progen.py -- and `tick` covers the "compile
-much sooner" axis for the tier that has a runtime knob.
+`tick` and `first` drive DIFFERENT TIERS and neither subsumes the other:
+`first` lowers the entry counter, which is the whole-function tier, while
+`tick` raises the sampler rate, which is the OSR loop tier. The nullable-local
+miscompile fixed on 2026-09-01 was CORRECT under `first` and WRONG under
+`tick`, which is what settled the question of running both.
 
 `--gc` adds a sixth, `--gc-stress=N`, which is worth running occasionally but
 is slow: a collection between almost every allocation.
@@ -69,6 +71,7 @@ MODES = [
     ("tick", {"JAITHON_JIT_TICK_US": "50"}, []),
     ("deopt", {"JAITHON_JIT_DEOPT_STRESS": "1"}, []),
     ("split", {"JAITHON_JIT_SPLIT_STRESS": "1"}, []),
+    ("first", {"JAITHON_JIT_THRESHOLD": "1"}, []),
 ]
 
 GC_MODE = ("gc", {}, ["--gc-stress=64"])
