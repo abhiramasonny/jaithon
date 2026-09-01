@@ -1,0 +1,46 @@
+# Declared include edges between src/ directories.
+# Checked by scripts/gate/layer_check.py, which explains what this is for.
+# Regenerate with: scripts/gate/layer_check.py --write
+
+cli -> native
+cli -> runtime
+cli -> runtime/modules
+cli -> vm/bytecode
+cli/commands -> cli
+cli/commands -> runtime/modules
+cli/commands -> vm/bytecode
+native -> common
+native/apple -> native
+native/apple -> runtime
+native/posix -> native
+runtime -> common
+runtime -> vm
+runtime -> vm/object
+runtime/builtins -> native
+runtime/builtins -> runtime
+runtime/builtins -> vm
+runtime/builtins -> vm/bytecode
+runtime/builtins -> vm/object
+runtime/builtins -> vm/trace
+runtime/modules -> common
+runtime/modules -> native
+runtime/modules -> runtime
+runtime/modules -> vm
+runtime/modules -> vm/bytecode
+runtime/modules -> vm/jit
+vm -> common
+vm -> runtime
+vm -> vm/bytecode
+vm -> vm/jit
+vm -> vm/object
+vm -> vm/trace
+vm/bytecode -> common
+vm/bytecode -> vm
+vm/bytecode -> vm/object
+vm/jit -> runtime
+vm/jit -> vm
+vm/jit -> vm/bytecode
+vm/jit -> vm/object
+vm/object -> vm
+vm/object -> vm/bytecode
+vm/trace -> vm/object

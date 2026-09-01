@@ -408,7 +408,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check jit-fusion-check branch-table-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check layer-check jit-fusion-check branch-table-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -470,6 +470,14 @@ gc-stress-test: $(TARGET)
 .PHONY: opcode-check
 opcode-check:
 	@python3 scripts/gate/opcode_table_check.py
+
+# The tree is layered, but the Makefile globs every .c into one binary, so
+# nothing stopped a file including across the layers. This pins the graph in
+# src/layers.manifest; a NEW edge has to be written down, which is the review
+# it had none of. Pure text, so it costs nothing to run on every `make test`.
+.PHONY: layer-check
+layer-check:
+	@python3 scripts/gate/layer_check.py
 
 # jaicv's recorded cases cover what OpenCV was asked to record, so an export
 # nobody recorded is an export nobody ran -- that is how `find_homography` with
