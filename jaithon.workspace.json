@@ -7,6 +7,7 @@
     "packages/jainum",
     "packages/jaiplot",
     "packages/jaisci",
-    "packages/jaitensor"
+    "packages/jaitensor",
+    "packages/jaitoml"
   ]
 }

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "jaitoml",
+  "version": "0.1.0",
+  "description": "TOML 1.0: tomllib's loads/load and tomli_w's dumps/dump",
+  "source": "src",
+  "dependencies": {}
+}
