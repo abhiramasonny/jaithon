@@ -69,9 +69,14 @@ reviewers of their own proposal, and several by reviewers of other proposals:
    `check/modsig.jai`'s `_join` builds its result one character at a time and is
    73% of a probe reviewers ran. ~110 lines, one reseed, no format change.
 
-5. **Structural intern keys.** `universe.jai:_intern_key` builds a `list[str]`
-   and f-string-formats every argument to make a dictionary key. A structural
-   hash with a collision bucket replaces it, behind a switch.
+5. ~~**Structural intern keys.**~~ **Dropped, measured.**
+   `universe.jai:_intern_key` does build a `list[str]` and f-string-format every
+   argument to make a dictionary key, and the proposal was right about the code.
+   It is **0.20% of the compiler's interpreted work**, ranked 86th, with
+   `intern` itself at 0.27%. A structural hash with a collision bucket is real
+   work for less than half a percent. This is the fourth proposal claim to fail
+   the same way, and the discipline the rest of this file is built on applies to
+   this file too.
 
 6. **Two text gates**, in the house style: `_field_kind_code`'s integer literals
    in `emitter.jai` must equal the `FieldKind` enum in `object.h`, and the six
@@ -107,7 +112,11 @@ Each step lands green, on its own, and is worth having if 3.4 stops there.
        speedup -- kept for shape; see JAITHON_JIT_ARENA_WINDOW)
     5. jaiChunkCfg + tests/vm/test_chunk_cfg.c + the gate
     6. the two wire-constant gates                          DONE
-    7. structural intern keys, behind a switch
+    7. DROPPED -- structural intern keys measured at 0.20%, ranked 86th
+    7'. the three hottest bodies instead, which the fixed attribution dump
+        made legible for the first time: jaithon.ast.node.init (6.2%),
+        jaithon.compile.lexer._push (6.1%), jaithon.compile.lexer.init (5.6%)
+        -- 18% of the compiler between them, each with a NAMED refusal
     8. only then: a total meet over SlotKind, with the lattice laws
        (commutativity, associativity, absorption) checked exhaustively by a
        gate rather than argued in a comment
