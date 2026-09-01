@@ -161,7 +161,20 @@ static void onTick(int signum) {
     if (jaiInterrupted == 0) jaiInterrupted = 2;
 }
 
+uint32_t jaiJitThresholdOverride;
+
+/* Read once, at the same moment the sampler is armed, so nothing has compiled
+ * yet when it takes effect. See jaiJitThreshold in jit.h for why this is a
+ * testing switch and not a tuning knob. */
+static void jaiJitReadThresholdOverride(void) {
+    const char *v = getenv("JAITHON_JIT_THRESHOLD");
+    if (v == NULL || v[0] == '\0') return;
+    long n = strtol(v, NULL, 10);
+    if (n > 0 && n < 100000) jaiJitThresholdOverride = (uint32_t)n;
+}
+
 void jaiJitStartSampling(void) {
+    jaiJitReadThresholdOverride();
     static bool started;
     if (started || !jaiJitEnabled()) return;
     started = true;

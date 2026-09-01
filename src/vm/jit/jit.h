@@ -14,7 +14,25 @@
 #define JAI_JIT_THRESHOLD 64
 #define JAI_JIT_TRACE_THRESHOLD 8
 
+/* Non-zero replaces both thresholds, from JAITHON_JIT_THRESHOLD.
+ *
+ * It exists for TESTING, not tuning. Most programs never call anything 64
+ * times, so most of the corpus never reaches the compiled tier at all: 40 of
+ * the 61 programs in tests/golden compile nothing, which means a differential
+ * against JAITHON_NO_JIT=1 over them compares the interpreter with itself.
+ * That is how three silent JIT bugs shipped -- one of them made
+ * `std.fmt.green()` return uncoloured text from call 65 onward, invisible to
+ * every test because no test called it 65 times.
+ *
+ * Setting it to 1 makes every body compile on first call, so the whole suite
+ * becomes a JIT test. Results must be UNCHANGED: a lower threshold hands the
+ * tier a half-formed inline cache (JAI_IC_OBS_BUDGET no longer settles first),
+ * which costs prediction quality, and every prediction is guarded. A
+ * difference under this switch is a miscompile, which is the point. */
+extern uint32_t jaiJitThresholdOverride;
+
 static inline uint32_t jaiJitThreshold(const ObjFunction *fn) {
+    if (jaiJitThresholdOverride != 0) return jaiJitThresholdOverride;
     if (fn != NULL && (fn->flags & FN_TRACE) != 0) return JAI_JIT_TRACE_THRESHOLD;
     return JAI_JIT_THRESHOLD;
 }
