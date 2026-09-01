@@ -1122,6 +1122,13 @@ bool retObjTypeOn(void);
 
 /* Defined in jit_call.c. */
 
+/* Defined in jit_body_cmp.c. */
+bool emitCompare(Emit *e, uint8_t op, int *offp);
+bool emitIsTest(Emit *e, uint8_t op, int *offp);
+bool emitJumpIfCmpFalse(Emit *e, const uint8_t *code, int *offp);
+bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
+                         int *offp);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
