@@ -164,6 +164,109 @@ not the last thing on the list, it is the thing the list was pointing at.
 Measured ceiling on a body that does compile once its chain is clear:
 58.5M -> 0.76M instructions, 77x.
 
+## 3.4, measured: what would make it drastically better
+
+Researched 2026-09-01 with the repo's own instruments, after the four
+architecture proposals died on falsified measurements. The question was not
+"what does rustc do" but "where do the compiler's 568M interpreted instructions
+actually go". The answer is not an IR.
+
+### The numbers
+
+`check --no-cache --stats lib/jaithon` (1.12 MB of source, 31.7k lines):
+
+    568.7M interpreted instructions     485 per source byte
+     14.1M allocations                   12 per source byte
+     24.9M calls
+    171 KB/s wall, best of three         (CPython's compiler: tens of MB/s)
+
+Where it goes, by module (`JAI_JIT_ATTRIB=1`, exact, sums to the total):
+
+    33.4%  jaithon.compile.parse
+    23.0%  jaithon.compile.lexer          lex + parse = 56%
+    20.3%  jaithon.compile.check
+    10.8%  jaithon.ast
+     4.4%  jaithon.compile.resolve
+     3.7%  jaithon.compile.token
+     2.9%  jaithon.compile.emit
+
+**The checker is a fifth of it. Lexing and parsing are more than half.** Every
+design proposal so far has aimed at the checker or the JIT.
+
+### The shapes, and what they cost
+
+The hot code is written in the slow shape of four data representations. Each
+was priced with a pair of probes that compute the same answer
+(`tests/bench/shapes/`, `./jaithon run --stats`):
+
+| what | slow shape | fast shape | instructions | allocations |
+|---|---|---|---|---|
+| lexer scan | `[c for c in source]`, a `list[str]` of 1-char objects | `source.bytes()`, a `list[int]` | 32.7M -> 1.6M, **20x** | 674k -> 37k, **18x** |
+| enum -> value table (`_compare_op` and 90 `if kind == TokenKind.X` chains) | `match` chain | `dict[K, V]` | 21.6M -> 9.1M, 2.4x | -- |
+| same | `match` chain | `list` indexed by ordinal | 21.6M -> 0.8M, **27x** | -- |
+| AST node fields (`Node.fields: dict[str, any]`) | dict per node | `list[any]` slots behind the same accessors | 11.2M -> 0.47M, **24x** | -- |
+| same | dict per node | one class per kind, real fields | 11.2M -> 0.14M, **82x** | 401k -> 201k, 2x |
+| one token | `Token` + `Span` + substring | `Token(kind, start, end)`, lazy text | ~flat | 219k -> 117k, **1.9x** |
+
+The lexer's 20x is the JIT, not the allocation: with `JAITHON_NO_JIT=1` both
+shapes cost ~10M. The `list[int]` loop compiles silently; the `list[str]` loop
+refuses at the comprehension -- "an iterator kind with no loop-head arm", the
+same refusal that is `lexer.init`'s 5.6% today. **The tier already arms the
+fast shapes.** The front end simply never uses them.
+
+The real lexer, measured on 334 KB of synthetic source: 106,827 tokens at
+**194 instructions and 3.5 allocations per token**.
+
+### The four changes, in order
+
+All four are in the seeded front end (one reseed each; the emitter is not
+touched, so no fixpoint dance). None changes the language, the bytecode, the
+`.jaic` format, or the on-disk AST (`ast_encode.jai` reaches `.fields` at two
+sites, both through `fields_of`).
+
+1. **Lexer over bytes.** `lexer.jai` and its twin in `repl.jai` (which
+   duplicates the `chars`/`offsets` scheme) scan `source.bytes()`; character
+   comparisons become integer comparisons; tokens keep byte offsets and
+   slice text lazily. API unchanged: `tokenize() -> list[Token]`, 8 call
+   sites. Covers 23% + 3.7% of the run and the 5.6% comprehension refusal.
+2. **Ordinal tables.** A 5-line builtin exposing the enum tag the VM already
+   holds (`vm.c` pushes `AS_ENUM_VAL(v)->tag` for `OP_ENUM_TAG`); then
+   `_compare_op`, `_multiplicative_op`, `_additive_op`, `_assign_op` and the
+   91 `if kind == TokenKind.X` chains in `parse/` become indexed lists.
+   Covers ~6.4% directly and a large slice of `parse`'s 33%.
+3. **Slot-array Node.** `Node.fields` becomes a `list[any]` positioned by a
+   per-kind field index derived from `_RECORDS`; the seven accessors
+   (`get`/`set`/`has`/`child`/`require`/`text`/`children`) keep their names so
+   the 363 `.child(` sites and everything else do not change; the two encoder
+   lines index by position. `init` stops walking the schema and calling
+   `_default_field` per field -- the defaults become one prebuilt list per
+   kind, copied. Covers `node.init` 6.2% + `_default_field` 3.2% + the 470
+   "dict holds more than one kind" JIT refusals that are all this dict.
+   Later, per-kind classes generated from `_RECORDS` get the remaining 3.4x,
+   but that touches every builder and is not the first step.
+4. **Flat tokens.** `Token(kind, start, end, flags)`, `span` and `text`
+   computed on demand. Halves token allocation.
+
+### What to expect, and what is projection
+
+Derived from the attribution, not measured: 1 + 2 + 3 + 4 remove or shrink
+about 45% of today's interpreted work outright, and cut allocation by roughly
+half (GC is 22% of wall). That is the floor: ~1.8x on `check`. The larger
+claim -- that once the lexer and parser run on integers and slot arrays the
+existing JIT compiles most of the remaining 33% in `parse` the way it compiled
+the probe loops -- is a projection, and the whole point of doing these in
+order is that each one is measured before the next is started. A fair target
+is 1 MB/s from 171 KB/s. Anyone claiming more than that before step 2 lands is
+repeating the mistake the four proposals made.
+
+### What this says about the earlier plan
+
+Item 8, the total meet over `SlotKind`, was the end of the refusal chain for
+`_default_field`. Step 3 deletes `_default_field`'s mixed return instead of
+teaching the tier to compile it. That is the pattern: **change the data so the
+tier it already has applies**, before building tier machinery to chase data
+that was never in a compilable shape.
+
 ## The method, which is the durable part
 
 Every number above is an A/B **in one binary**, with the two forms interleaved
