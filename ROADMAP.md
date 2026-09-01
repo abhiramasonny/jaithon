@@ -117,9 +117,52 @@ Each step lands green, on its own, and is worth having if 3.4 stops there.
         made legible for the first time: jaithon.ast.node.init (6.2%),
         jaithon.compile.lexer._push (6.1%), jaithon.compile.lexer.init (5.6%)
         -- 18% of the compiler between them, each with a NAMED refusal
+    7''. NOT MERGED -- the pair-over-list-of-tuples OSR head arm. Built,
+        correct, switch-gated, loses no compiled body, and measured at ZERO on
+        two independent A/Bs. Three adversarial reviews: one found no defect,
+        one priced an unmentioned cost (compile attempts 445 -> 1035 on
+        lib/jaithon), and one found a REGRESSION -- a pair loop whose components
+        are often null now compiles and then bails at the entry guard once per
+        null element, 3.50x slower than HEAD. The arm samples one element and
+        pins both component tags with no null-density check, where the
+        list-BIND head refuses past 1 in 64. Held until that check exists AND
+        the chain below it is cleared, because until then it buys nothing.
     8. only then: a total meet over SlotKind, with the lattice laws
        (commutativity, associativity, absorption) checked exhaustively by a
        gate rather than argued in a comment
+
+## Where the chain actually leads
+
+The scoping pass for the loop-head arms is the most useful negative result since
+the design phase, and it reorders what is left.
+
+**The refusal ranking does not survive contact with the work.** "A pair loop over
+something other than a live dict view" is the largest refusal in the compiler by
+count -- and only about **10 of the 106** pair-loop sites in `lib/jaithon` are
+the shape it names. The other 96 are `.enumerate()`, which returns a user
+iterator (`lib/std/core.jai:75`) and hits the same site wearing the same
+message. Ranking by that string credited one shape with another's events. Same
+lesson as counting events instead of distinct sites, one level further in: the
+refusal STRING is not the refusal.
+
+**Both headline refusals are chains, and link 2 is the same in both.**
+
+* `jaithon.ast.node.init` (6.18%) is blocked at its pair loop -- but a probe of
+  the identical body over a DICT, where the head arm already exists, still
+  declines, at the callee. The real blocker is
+  `jaithon.ast.schema._default_field` (3.17%), which never compiles:
+  **"OP_RETURN: a body returning both int and list"**.
+* `jaithon.compile.lexer.init` (5.61%) needs a string-iteration arm that does
+  not exist -- and would still be worth nothing, because its accumulator is a
+  comprehension target sitting on the interpreter's stack BELOW the OSR entry,
+  which the OSR model cannot see. That is an entry-contract change, not an arm.
+
+`_default_field` returns `-1`, `[]`, `Span.none()`, `false`, `0`, `0.0`. No
+single `SlotKind` covers int-or-list, and no widening rule in this tier can
+invent one. **The chain ends at the lattice**, which is item 8 -- so item 8 is
+not the last thing on the list, it is the thing the list was pointing at.
+Measured ceiling on a body that does compile once its chain is clear:
+58.5M -> 0.76M instructions, 77x.
 
 ## The method, which is the durable part
 
