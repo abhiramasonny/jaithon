@@ -48,6 +48,9 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 CHUNK_C = ROOT / "src/vm/bytecode/chunk.c"
+# Every translation unit of the tier, not one file: the opcode walk was split
+# across jit_body*.c and jit_global.c, and this gate reported five arms
+# missing that had simply moved.
 JIT_DIR = ROOT / "src/vm/jit"
 BASELINE = ROOT / "tests/vm/jit_unarmed.baseline"
 
@@ -82,7 +85,7 @@ def declared_opcodes():
 
 def armed_opcodes():
     armed = set()
-    for src in sorted(JIT_DIR.glob("jit*.c")):
+    for src in sorted(JIT_DIR.glob("*.c")):
         armed |= set(re.findall(r"case\s+(OP_[A-Z0-9_]+)\s*:", src.read_text()))
     return armed
 
