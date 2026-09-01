@@ -5,11 +5,16 @@ off with `JAITHON_NO_JIT=1` and the interpreter runs every program exactly as
 it would have. That is the first thing to know about it, and the reason the
 boundary contract below is written the way it is.
 
-`jit.h` is the whole surface the rest of the VM sees. `jit.c` holds the entry
-point, the SIGPROF sampler and two stencil compilers; `jit_func.c` holds both
-real tiers; `jit_loop.c` holds a shape-matched compiler for one exact loop;
-`jit_arena.c` and `jit_arm64.{c,h}` are executable memory and the instruction
-encoders.
+`jit.h` is the whole surface the rest of the VM sees; `jit_internal.h` is the
+tier's own shared state, and nothing outside this directory includes it.
+`jit.c` holds the entry point, the SIGPROF sampler and two stencil compilers.
+The rest is one concern per file: `jit_compile.c` drives a whole-function
+compile, `jit_body.c` walks the opcodes with the per-family arms beside it in
+`jit_body_*.c`, `jit_call*.c` emit calls, `jit_osr.c` is on-stack replacement,
+`jit_global.c` resolves globals and module members, `jit_runtime.c` holds the
+C thunks compiled code calls out to, `jit_loop.c` is a shape-matched compiler
+for one exact loop, and `jit_arena.c` and `jit_arm64.{c,h}` are executable
+memory and the instruction encoders.
 
 **This document names functions, not files or lines.** A function name survives
 a file being split or moved and a line number does not, and this directory gets
@@ -202,8 +207,7 @@ matches any one-instruction `OP_RETURN_NULL` body, and its caller in
 replaces the value with `frame->slots[0]`, the receiver, which is what makes
 `Point(1, 2)` an expression. The kind of the body -- "returns
 null" -- was read off the opcode; what the instruction actually produces
-depends on the function it is in. *The fix is to refuse initializers in
-`compileReturnNull`.*
+depends on the function it is in. *Fixed: `compileReturnNull` refuses an initializer.*
 
 **2. A SIGSEGV under `JAITHON_JIT_DEOPT_STRESS`.** A local past the arity starts
 as a bare zero in its **register** home, and a register carries no tag. The
@@ -211,18 +215,17 @@ deopt stub rebuilt every tag from the compile-time `localKind` and wrote an
 unconditional `VAL_OBJ` for object kinds, manufacturing `{VAL_OBJ, obj = NULL}`.
 `jaiJitEnterOsr`'s slot scan then dereferenced it, because `IS_INSTANCE` is
 `IS_OBJ(v) && AS_OBJ(v)->type == OBJ_INSTANCE` and the tag-only half passed.
-*The fix is to take `emitTagFor`'s payload-dependent `csel` for every `VAL_OBJ`
-kind, not only for `SLOT_MAYBE_INST`.*
+*Fixed: the stub takes `emitTagFor`'s payload-dependent `csel` for every
+`VAL_OBJ` kind, not only for `SLOT_MAYBE_INST`.*
 
 **3. `m ?? 100` yielded 0 for a nullable local.** The OSR tier accepts the
 `dynamic` widening -- the kind becomes a speculation when two paths disagree --
 but never implemented its READ side. `localIn`'s `if (e->osr)` branch returns
 before reaching the tag-check-and-deopt block the function tier uses, so an OSR
 dynamic local was read as a bare payload with no tag check at all, and the
-operand-stack entry was then stamped with the walk's last-written kind. *The fix
-is a shared `localGuardDynamic` called from both tiers.*
+operand-stack entry was then stamped with the walk's last-written kind. *Fixed: a shared `localGuardDynamic`, called from both tiers.*
 
-Note that bug 3 was **correct under `JAI_JIT_THRESHOLD=1` and wrong under
+Note that bug 3 was **correct under `JAITHON_JIT_THRESHOLD=1` and wrong under
 `JAITHON_JIT_TICK_US=50`**. The two tiers are complements; a suspected
 miscompile has to be tried under both.
 
@@ -360,9 +363,11 @@ that matters. Work it in this order.
 
 2. **Ask which tier.** They are complements and a bug in one is routinely
    invisible in the other:
-   * `JAI_JIT_THRESHOLD` -- it is a plain `#define` in `jit.h`, not an env
-     var. Set it to 1 and rebuild, and the whole-function tier compiles
-     everything on its first call.
+   * `JAITHON_JIT_THRESHOLD=1` -- the whole-function tier compiles every body
+     on its first call instead of its 64th. It overrides the `JAI_JIT_THRESHOLD`
+     default in `jit.h`, and it is a TESTING switch: results must be UNCHANGED
+     under it, because a lower threshold only hands the tier a half-settled
+     inline cache and every prediction is guarded. A difference is a miscompile.
    * `JAITHON_JIT_TICK_US=50` -- the fastest legal sampler rate, so the OSR
      tier reaches loops that a short run would never make hot.
 
