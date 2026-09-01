@@ -712,3 +712,227 @@ bool jaiChunkStackDepths(const ObjFunction *fn, int *out) {
     char err[8];
     return verifyChunk(fn, err, sizeof err, out);
 }
+
+/* ------------------------------------------------------------------ */
+/* The control-flow graph                                              */
+/* ------------------------------------------------------------------ */
+
+/* A SEPARATE leader scan, not a refactor of pass 4. Pass 4 fuses the depth
+ * fixpoint with the edge enumeration, and its rounds are ordered the way they
+ * are for reasons its own comments record -- dynamic handlers before imprecise
+ * seeds, exactly one imprecise seed per round -- so nothing unverified is ever
+ * compiled. Reusing its loop to also emit a graph would put a second consumer
+ * inside the only pass in the tree that must not be touched casually. What the
+ * two DO share are the three facts that could drift: jaiOpBranchOperandAt,
+ * jaiOpFallsThrough, and OP_CLOSURE's variable operand run. */
+
+static int instructionWidth(const Chunk *chunk, int offset) {
+    uint8_t op = chunk->code[offset];
+    int operands = jaiOpOperandSize((OpCode)op);
+    if (op == OP_CLOSURE) {
+        uint32_t k = jaiReadU24(chunk->code + offset + 1);
+        operands = 3 + 3 * (int)AS_FUNCTION(chunk->constants.data[k])->upvalueCount;
+    }
+    return 1 + operands;
+}
+
+/* The code address the instruction at `offset` names, or -1. Wider than
+ * opBranchIsEdge on purpose: OP_PUSH_HANDLER and OP_PUSH_FINALLY only REGISTER
+ * their target, so pass 4 refuses to flow a depth along that edge and seeds it
+ * in a later round instead -- but control does arrive there, and a graph that
+ * dropped the edge would leave every handler body an unreachable island. */
+static int branchTargetAt(const Chunk *chunk, int offset, int width) {
+    int at = jaiOpBranchOperandAt(chunk->code[offset]);
+    if (at < 0) return -1;
+    return (int)((long)offset + width + jaiReadI16(chunk->code + offset + 1 + at));
+}
+
+static void addSuccessor(JaiBlock *block, uint32_t to) {
+    for (uint8_t i = 0; i < block->nsucc; i++) {
+        if (block->succ[i] == to) return;
+    }
+    block->succ[block->nsucc++] = to;
+}
+
+JaiChunkCfg *jaiChunkCfg(const ObjFunction *fn) {
+    if (!jaiVerifyChunk(fn, NULL, 0)) return NULL;
+
+    const Chunk *chunk = &fn->chunk;
+    int n = chunk->count;
+
+    /* Leaders: offset 0, every code address named, the offset after every
+     * instruction that names one or does not fall through, every
+     * exception-table handler, every default thunk. */
+    uint8_t *leader = JAI_ALLOC_ZEROED(uint8_t, n);
+    leader[0] = 1;
+    for (int offset = 0; offset < n;) {
+        int width = instructionWidth(chunk, offset);
+        int next = offset + width;
+        int target = branchTargetAt(chunk, offset, width);
+        if (target >= 0) {
+            leader[target] = 1;
+            if (next < n) leader[next] = 1;
+        } else if (!jaiOpFallsThrough(chunk->code[offset]) && next < n) {
+            leader[next] = 1;
+        }
+        offset = next;
+    }
+    for (int e = 0; e < (int)fn->exceptionCount; e++) {
+        leader[fn->exceptions[e].handler] = 1;
+    }
+    /* defaultCount with no defaultOffsets is what a truncated image looks like;
+     * pass 3 skips those entries rather than rejecting them, so this skips the
+     * same ones rather than reading the null. */
+    if (fn->defaultOffsets != NULL) {
+        for (int d = 0; d < (int)fn->defaultCount; d++) {
+            leader[fn->defaultOffsets[d]] = 1;
+        }
+    }
+
+    uint32_t blockCount = 0;
+    for (int offset = 0; offset < n; offset++) blockCount += leader[offset];
+
+    JaiChunkCfg *cfg = JAI_ALLOC(JaiChunkCfg, 1);
+    cfg->blockCount = blockCount;
+    cfg->blocks = JAI_ALLOC(JaiBlock, blockCount);
+    cfg->preds = NULL;
+    cfg->predCount = 0;
+    cfg->rpo = JAI_ALLOC(uint32_t, blockCount);
+    cfg->rpoCapacity = blockCount;
+    cfg->rpoCount = 0;
+    cfg->blockAt = JAI_ALLOC(uint32_t, n);
+    cfg->codeCount = (uint32_t)n;
+
+    uint32_t index = 0;
+    for (int offset = 0; offset < n; offset++) {
+        if (leader[offset]) {
+            if (index > 0) cfg->blocks[index - 1].end = (uint32_t)offset;
+            JaiBlock *block = &cfg->blocks[index++];
+            block->start = (uint32_t)offset;
+            block->end = (uint32_t)n;
+            block->succ[0] = block->succ[1] = 0;
+            block->nsucc = 0;
+            block->predFirst = 0;
+            block->predCount = 0;
+            block->rpoIndex = JAI_BLOCK_UNREACHED;
+        }
+        cfg->blockAt[offset] = index - 1;
+    }
+
+    /* The terminator is whatever instruction the block ends on, which is not
+     * always a branch: a block also ends because the NEXT offset is a leader. */
+    uint32_t *terminator = JAI_ALLOC(uint32_t, blockCount);
+    for (int offset = 0; offset < n;) {
+        terminator[cfg->blockAt[offset]] = (uint32_t)offset;
+        offset += instructionWidth(chunk, offset);
+    }
+
+    for (uint32_t b = 0; b < blockCount; b++) {
+        int offset = (int)terminator[b];
+        int width = instructionWidth(chunk, offset);
+        int next = offset + width;
+        if (jaiOpFallsThrough(chunk->code[offset]) && next < n) {
+            addSuccessor(&cfg->blocks[b], cfg->blockAt[next]);
+        }
+        int target = branchTargetAt(chunk, offset, width);
+        if (target >= 0) addSuccessor(&cfg->blocks[b], cfg->blockAt[target]);
+    }
+
+    uint32_t edges = 0;
+    for (uint32_t b = 0; b < blockCount; b++) edges += cfg->blocks[b].nsucc;
+    cfg->predCount = edges;
+    cfg->preds = JAI_ALLOC(uint32_t, edges);
+    for (uint32_t b = 0; b < blockCount; b++) {
+        for (uint8_t i = 0; i < cfg->blocks[b].nsucc; i++) {
+            cfg->blocks[cfg->blocks[b].succ[i]].predCount++;
+        }
+    }
+    uint32_t at = 0;
+    for (uint32_t b = 0; b < blockCount; b++) {
+        cfg->blocks[b].predFirst = at;
+        at += cfg->blocks[b].predCount;
+        cfg->blocks[b].predCount = 0;
+    }
+    for (uint32_t b = 0; b < blockCount; b++) {
+        for (uint8_t i = 0; i < cfg->blocks[b].nsucc; i++) {
+            JaiBlock *to = &cfg->blocks[cfg->blocks[b].succ[i]];
+            cfg->preds[to->predFirst + to->predCount++] = b;
+        }
+    }
+
+    /* Entries, in the order the header promises. A handler and a default thunk
+     * are entered by the unwinder and by the call sequence respectively, so
+     * neither has an in-edge anywhere in the code; a single-entry search would
+     * report most of a `try` body as unreachable. */
+    uint32_t entryCap = 1 + (uint32_t)fn->exceptionCount + (uint32_t)fn->defaultCount;
+    uint32_t *entry = JAI_ALLOC(uint32_t, entryCap);
+    uint32_t entryCount = 0;
+    entry[entryCount++] = 0;
+    for (int e = 0; e < (int)fn->exceptionCount; e++) {
+        entry[entryCount++] = cfg->blockAt[fn->exceptions[e].handler];
+    }
+    if (fn->defaultOffsets != NULL) {
+        for (int d = 0; d < (int)fn->defaultCount; d++) {
+            entry[entryCount++] = cfg->blockAt[fn->defaultOffsets[d]];
+        }
+    }
+
+    uint32_t *stack = JAI_ALLOC(uint32_t, blockCount);
+    uint8_t *cursor = JAI_ALLOC(uint8_t, blockCount);
+    uint8_t *seen = JAI_ALLOC_ZEROED(uint8_t, blockCount);
+    uint32_t *postorder = JAI_ALLOC(uint32_t, blockCount);
+    uint32_t postCount = 0;
+
+    /* Roots are taken LAST first, so that block 0 finishes last and therefore
+     * heads the reverse postorder. Root order does not affect which edges come
+     * out retreating -- a cross edge into an already-finished tree still runs
+     * forward in the order -- it only decides which entry's region is printed
+     * first, and the function's own entry reads better there. */
+    for (uint32_t e = entryCount; e-- > 0;) {
+        uint32_t root = entry[e];
+        if (seen[root]) continue;
+        seen[root] = 1;
+        cursor[root] = 0;
+        uint32_t top = 0;
+        stack[top] = root;
+        for (;;) {
+            uint32_t b = stack[top];
+            if (cursor[b] < cfg->blocks[b].nsucc) {
+                uint32_t to = cfg->blocks[b].succ[cursor[b]++];
+                if (!seen[to]) {
+                    seen[to] = 1;
+                    cursor[to] = 0;
+                    stack[++top] = to;
+                }
+                continue;
+            }
+            postorder[postCount++] = b;
+            if (top == 0) break;
+            top--;
+        }
+    }
+    for (uint32_t i = 0; i < postCount; i++) {
+        uint32_t b = postorder[postCount - 1 - i];
+        cfg->rpo[i] = b;
+        cfg->blocks[b].rpoIndex = i;
+    }
+    cfg->rpoCount = postCount;
+
+    JAI_FREE_ARRAY(uint32_t, postorder, blockCount);
+    JAI_FREE_ARRAY(uint8_t, seen, blockCount);
+    JAI_FREE_ARRAY(uint8_t, cursor, blockCount);
+    JAI_FREE_ARRAY(uint32_t, stack, blockCount);
+    JAI_FREE_ARRAY(uint32_t, entry, entryCap);
+    JAI_FREE_ARRAY(uint32_t, terminator, blockCount);
+    JAI_FREE_ARRAY(uint8_t, leader, n);
+    return cfg;
+}
+
+void jaiChunkCfgFree(JaiChunkCfg *cfg) {
+    if (cfg == NULL) return;
+    JAI_FREE_ARRAY(JaiBlock, cfg->blocks, cfg->blockCount);
+    JAI_FREE_ARRAY(uint32_t, cfg->preds, cfg->predCount);
+    JAI_FREE_ARRAY(uint32_t, cfg->rpo, cfg->rpoCapacity);
+    JAI_FREE_ARRAY(uint32_t, cfg->blockAt, cfg->codeCount);
+    JAI_FREE(JaiChunkCfg, cfg);
+}

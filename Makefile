@@ -358,7 +358,7 @@ ifneq ($(BUILD_GOAL),)
                              || rm -rf $(BUILD))
 endif
 
-.PHONY: all debug release test verify-test bench jaitensor jaicv jainum jaiframe exports-check import-check install uninstall \
+.PHONY: all debug release test verify-test chunk-cfg-test bench jaitensor jaicv jainum jaiframe exports-check import-check install uninstall \
         clean distclean fmt fmt-check fmt-roundtrip check help
 
 # `all` must be the default goal: the recursive release and debug targets below
@@ -417,7 +417,8 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check layer-check kind-tag-check switch-doc-check seed-closure-check jaic-wire-check field-kind-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check layer-check kind-tag-check switch-doc-check seed-closure-check jaic-wire-check field-kind-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/chunk_cfg $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+	@$(BUILD)/chunk_cfg
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1

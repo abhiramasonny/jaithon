@@ -18,6 +18,15 @@ $(BUILD)/verify_chunk: $(VERIFY_OBJS) tests/vm/verify_chunk.c | $(CC_STAMP)
 verify-test: $(BUILD)/verify_chunk
 	@$(BUILD)/verify_chunk
 
+# The chunk CFG, over every function the tree can compile. C rather than .jai
+# for the same reason as its neighbour above: JaiChunkCfg reaches no program's
+# output at all, and the corpus is the test -- a pass with no consumer can only
+# be wrong quietly. Run by `make chunk-cfg-test` (mk/gates.mk).
+$(BUILD)/chunk_cfg: $(VERIFY_OBJS) tests/vm/chunk_cfg.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/chunk_cfg.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/chunk_cfg.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
 # The two CRC32 implementations must be one function. Every .jaic carries a CRC
 # written by the table path, so a divergence rejects every cached image in the
 # tree -- correct output, 100x the load time, and no error anywhere.

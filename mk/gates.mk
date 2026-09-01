@@ -153,3 +153,16 @@ jaic-wire-check:
 .PHONY: field-kind-check
 field-kind-check:
 	@python3 scripts/gate/field_kind_check.py
+
+# jaiChunkCfg is consumed by nothing -- which is why it was kept, and also why
+# it needs a gate: a graph no code reads cannot be wrong loudly. This compiles
+# every .jai under lib/, tests/ and packages/ and checks the blocks of every
+# function object in every constant pool -- tiling, instruction boundaries,
+# successors and predecessors agreeing, a reverse postorder whose retreating
+# edges all lie on a cycle -- and then cross-checks the lot against
+# jaiChunkStackDepths, the verifier's own walk, which is the one pass here that
+# is already trusted. The binary is built in mk/unit.mk beside the other C unit
+# tests, since it links the same objects they do.
+.PHONY: chunk-cfg-test
+chunk-cfg-test: $(BUILD)/chunk_cfg
+	@$(BUILD)/chunk_cfg
