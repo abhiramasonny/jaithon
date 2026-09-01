@@ -22,7 +22,7 @@ import std.math
 from jaicv.core.types import CV_32F, CV_MAKETYPE
 from jaicv.core.mat import Mat
 from jaicv.dnn.graph import run_graph
-from jaicv.dnn.onnx import free_onnx_weights, read_net_from_onnx, read_net_from_onnx_as_net, read_net_from_onnx_bytes, read_onnx_engine
+from jaicv.dnn.onnx import free_onnx_weights, read_net_from_onnx, read_net_from_onnx_as_net, read_net_from_onnx_bytes, read_onnx_engine, read_onnx_model
 from jaitensor import Tensor
 from std.test import assert_contains, assert_eq, assert_throws, assert_true
 
@@ -196,6 +196,30 @@ fn test_concat_matches_torch() -> void { check("onnx_concat.onnx", 1e-6) }
 #: node rather than an initializer. Exact, since neither operator does
 #: arithmetic.
 fn test_shuffle_matches_torch() -> void { check("onnx_shuffle.onnx", 1e-6) }
+
+#: The declared shapes, which `read_net_from_onnx` drops on the floor.
+#:
+#: A caller that has to size its input before it can feed the graph -- letterbox
+#: to the right square, decode the right number of rows -- needs these, and the
+#: alternative is hardcoding one model's numbers and silently working with only
+#: that model. `examples/yolo_detect` reads its input size and class count this
+#: way.
+fn test_a_model_carries_the_shapes_it_declared() -> void {
+    let item = case_for("onnx_mlp.onnx")
+    let model = read_onnx_model(item.path())
+    defer { free_onnx_weights(model.graph) }
+
+    assert_true(model.graph.inputs.len() > 0, "the model declares an input")
+    assert_true(model.graph.outputs.len() > 0, "the model declares an output")
+
+    let declared = model.shapes.get(model.graph.inputs[0], [])
+    assert_true(declared.len() > 0, "the input shape should have been kept")
+    for dimension in declared {
+        assert_true(dimension != 0, "no declared dimension is zero")
+    }
+    #: The graph still runs, so keeping the shapes has not changed the reading.
+    check("onnx_mlp.onnx", 1e-6)
+}
 
 #: Every shape a `Constant` node is written in, and what folding them does.
 fn test_constants_become_weights() -> void {
