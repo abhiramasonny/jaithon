@@ -1134,6 +1134,7 @@ typedef enum { JIT_ARM_REFUSED = 0, JIT_ARM_OK = 1, JIT_ARM_UNARMED = 2 }
 /* Defined in jit_body.c. */
 bool fpWorthLoading(const Emit *e, const uint8_t *code, int next, int stop);
 bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop);
+bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape);
 
 /* Defined in jit_body_cmp.c. */
 bool emitCompare(Emit *e, uint8_t op, int *offp);
@@ -1161,6 +1162,11 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp);
 bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop);
 bool emitSetIndex(Emit *e, int *offp);
 bool emitGetSlice(Emit *e, const uint8_t *code, int *offp);
+
+/* Defined in jit_body_call.c. */
+bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp);
+bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
+                  int count);
 
 #endif /* arm64 */
 
