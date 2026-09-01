@@ -573,8 +573,11 @@ CONFIGS = [
     ("split", {"JAITHON_JIT_SPLIT_STRESS": "1"}, [], False),
     ("trace", {}, [], True),
     ("trace_tick", {"JAITHON_JIT_TICK_US": "50"}, [], True),
+    # On by default: it is the only configuration that has found a crash here.
+    # A compiled body's roots are only wrong while a collection is running, and
+    # a 600-call program never allocates enough to schedule one on its own.
+    ("gc", {}, ["--gc-stress=64"], False),
 ]
-GC_CONFIG = ("gc", {}, ["--gc-stress=64"], False)
 
 
 def traced(source):
@@ -693,7 +696,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="first seed")
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--keep", action="store_true")
-    ap.add_argument("--gc", action="store_true", help="add a --gc-stress config")
+    ap.add_argument("--no-gc", action="store_true",
+                    help="drop the --gc-stress configuration")
     ap.add_argument("--compile-rate", type=int, default=0, metavar="N",
                     help="generate N programs, report what fraction compiled, run none")
     args = ap.parse_args()
@@ -703,7 +707,7 @@ def main():
         return 2
 
     outdir = tempfile.mkdtemp(prefix="cffuzz-")
-    configs = CONFIGS + ([GC_CONFIG] if args.gc else [])
+    configs = [c for c in CONFIGS if not (args.no_gc and c[0] == "gc")]
 
     if args.compile_rate:
         tally = {"full": 0, "partial": 0, "declined": 0, "rejected": 0}
