@@ -101,9 +101,6 @@ static bool compileAccessor(ObjFunction *fn) {
         /* ret                        */
         0xd65f03c0u,
     };
-#else
-    return false;   /* no stencil for this architecture yet */
-#endif
 
     uint8_t *entry = jaiCodeArenaWrite(&sArena, code, sizeof code);
     if (entry == NULL) return false;
@@ -111,6 +108,14 @@ static bool compileAccessor(ObjFunction *fn) {
     fn->jitCode = entry;
     fn->jitKind = 1;   /* accessor: takes the slot base */
     return true;
+#else
+    /* No stencil for this architecture yet. The tail above has to sit INSIDE
+     * the guard rather than after it: `code` is only declared in the arm64
+     * branch, so an `#else` that merely returns still leaves the tail
+     * referencing a name that does not exist, and the file will not compile. */
+    (void)slot;
+    return false;
+#endif
 }
 
 typedef int (*JaiCompiledFn)(void);

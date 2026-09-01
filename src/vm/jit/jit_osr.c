@@ -1366,4 +1366,9 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
 
 #else
 
+/* 0 is "declined", so the interpreter runs the loop itself. */
+int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
+    (void)closure; (void)top; (void)resumeAt; return 0;
+}
+
 #endif

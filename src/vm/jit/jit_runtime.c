@@ -61,21 +61,6 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
 
     for (int64_t i = 0; i < gDeopt.nlocals; i++) {
         if (i < 64 && (((uint64_t)gDeopt.skipLocals >> i) & 1u) != 0) continue;
-        if (getenv("JAI_DIAG_NULLOBJ") &&
-            gDeopt.locals[i].type == VAL_OBJ && gDeopt.locals[i].as.obj == NULL) {
-            fprintf(stderr,
-                "[diag] applyDeopt WRITES {VAL_OBJ,NULL} fn=%s ip=%lld base=%lld "
-                "nlocals=%lld local=%lld -> frameslot=%lld skipLocals=0x%llx\n",
-                fn->name ? fn->name->chars : "<anon>", (long long)gDeopt.ip,
-                (long long)gDeopt.base, (long long)gDeopt.nlocals, (long long)i,
-                (long long)(gDeopt.base + i),
-                (unsigned long long)gDeopt.skipLocals);
-        }
-        if (getenv("JAI_DIAG_SANITISE") &&
-            gDeopt.locals[i].type == VAL_OBJ && gDeopt.locals[i].as.obj == NULL) {
-            slotBase[gDeopt.base + i] = NULL_VAL;
-            continue;
-        }
         slotBase[gDeopt.base + i] = gDeopt.locals[i];
     }
     /* The operand stack sits above the frame's window, which bindCallArgs has
@@ -423,5 +408,13 @@ int jitCallOut(JitCallDesc *d) {
 }
 
 #else
+
+/* Nothing compiles here, so there is never a record to resume from and never a
+ * compiled frame to mark. */
+bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
+    (void)closure; (void)slotBase; return false;
+}
+void jaiJitMarkFrames(void) {
+}
 
 #endif
