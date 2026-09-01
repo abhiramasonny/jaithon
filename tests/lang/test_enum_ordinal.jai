@@ -10,7 +10,7 @@ enum Shadow {
     A,
     B,
 
-    fn ordinal(self) -> int { return 99 }
+    pub fn ordinal(self) -> int { return 99 }
 }
 
 fn main() -> void {
