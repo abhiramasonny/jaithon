@@ -1,7 +1,12 @@
-class N { pub var kind: int
+class N {
+    pub var kind: int
     pub var slots: list[any]
-    pub fn init(self, kind: int, a: any, b: any) { self.kind = kind
-        self.slots = [a, b, 0, false] } }
+
+    pub fn init(self, kind: int, a: any, b: any) {
+        self.kind = kind
+        self.slots = [a, b, 0, false]
+    }
+}
 let LEFT = 0
 let RIGHT = 1
 var total = 0
