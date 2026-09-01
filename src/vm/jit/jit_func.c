@@ -2437,9 +2437,6 @@ static uint32_t exitTargetFor(Emit *e, uint32_t target) {
     return FIXUP_EXIT - e->exitCount++;
 }
 
-static void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
-                          int depthOverride);
-
 static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
@@ -2457,6 +2454,25 @@ static void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
     e->fixups[e->fixupCount].depth        = (int)stackSignature(e);
     e->fixupCount++;
     emit(e, conditional ? jaiA64BCond(cond, 0) : jaiA64B(0));
+}
+
+/* A conditional branch whose target is reached with a different operand stack
+ * than the branch leaves from -- the exhausted arm of a for-loop, where the
+ * interpreter drops the iterator. */
+static void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
+                          int depthOverride) {
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+    settleAll(e);   /* see branchTo: a join agrees about where every value is */
+    if (e->osr && targetOffset < UINT32_MAX - 64u &&
+        (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
+        targetOffset = exitTargetFor(e, targetOffset);
+    }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = targetOffset;
+    e->fixups[e->fixupCount].conditional  = true;
+    e->fixups[e->fixupCount].depth        = depthOverride;
+    e->fixupCount++;
+    emit(e, jaiA64BCond(cond, 0));
 }
 
 /* A guard failed: not a bail (unsound once the body has written anything, and the guards that matter
@@ -17393,22 +17409,3 @@ bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out) {
 }
 
 #endif
-
-/* A conditional branch whose target is reached with a different operand stack
- * than the branch leaves from -- the exhausted arm of a for-loop, where the
- * interpreter drops the iterator. */
-static void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
-                          int depthOverride) {
-    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
-    settleAll(e);   /* see branchTo: a join agrees about where every value is */
-    if (e->osr && targetOffset < UINT32_MAX - 64u &&
-        (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
-        targetOffset = exitTargetFor(e, targetOffset);
-    }
-    e->fixups[e->fixupCount].instIndex    = (int)e->count;
-    e->fixups[e->fixupCount].targetOffset = targetOffset;
-    e->fixups[e->fixupCount].conditional  = true;
-    e->fixups[e->fixupCount].depth        = depthOverride;
-    e->fixupCount++;
-    emit(e, jaiA64BCond(cond, 0));
-}
