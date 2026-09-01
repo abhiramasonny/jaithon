@@ -1134,7 +1134,27 @@ typedef enum { JIT_ARM_REFUSED = 0, JIT_ARM_OK = 1, JIT_ARM_UNARMED = 2 }
 /* Defined in jit_body.c. */
 bool fpWorthLoading(const Emit *e, const uint8_t *code, int next, int stop);
 bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop);
+
+/* Defined in jit_body_return.c. */
 bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape);
+bool emitReturn(Emit *e, int *offp);
+bool emitReturnNull(Emit *e, ObjFunction *fn, int *offp);
+bool emitPopReturnNull(Emit *e, ObjFunction *fn, int *offp);
+
+/* Defined in jit_body_build.c. */
+bool emitBuildList(Emit *e, const uint8_t *code, int *offp);
+JitArmResult emitBuildDictSet(Emit *e, const uint8_t *code, int *offp);
+JitArmResult emitBuildTuple(Emit *e, const uint8_t *code, int *offp);
+JitArmResult emitElemKind(Emit *e, const uint8_t *code, int *offp);
+bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp);
+
+/* Defined in jit_body_local.c. */
+bool emitGetLocal(Emit *e, const uint8_t *code, int *offp, int stop);
+bool emitGetLocal2(Emit *e, const uint8_t *code, int *offp, int stop);
+bool emitSetLocal(Emit *e, const uint8_t *code, int *offp);
+bool emitBind(Emit *e, const uint8_t *code, int *offp);
+bool emitGetUpvalue(Emit *e, ObjFunction *fn, ObjClosure *closure,
+                    const uint8_t *code, int *offp);
 
 /* Defined in jit_body_cmp.c. */
 bool emitCompare(Emit *e, uint8_t op, int *offp);
@@ -1142,6 +1162,7 @@ bool emitIsTest(Emit *e, uint8_t op, int *offp);
 bool emitJumpIfCmpFalse(Emit *e, const uint8_t *code, int *offp);
 bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
                          int *offp);
+JitArmResult emitMembership(Emit *e, const uint8_t *code, int *offp);
 
 /* Defined in jit_body_field.c. */
 bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp);
@@ -1149,6 +1170,7 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
                                int *offp, int stop);
 bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                   int stop);
+bool emitSetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp);
 
 /* Defined in jit_body_iter.c. */
 bool emitGetIter(Emit *e, int *offp);
@@ -1157,6 +1179,7 @@ bool emitForRangeBind(Emit *e, const uint8_t *code, int *offp);
 bool emitGetIterItems(Emit *e, const uint8_t *code, int *offp, int stop);
 bool emitForIterBind(Emit *e, const uint8_t *code, int *offp);
 bool emitForIterPair(Emit *e, const uint8_t *code, int *offp);
+bool emitBuildRange(Emit *e, const uint8_t *code, int *offp, int count);
 
 /* Defined in jit_body_index.c. */
 bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop);
@@ -1181,6 +1204,9 @@ bool emitNegate(Emit *e, int *offp);
 bool emitPow(Emit *e, int *offp);
 bool emitMod(Emit *e, ObjFunction *fn, int prevOff, int *offp);
 bool emitFloorDiv(Emit *e, ObjFunction *fn, int prevOff, int *offp);
+JitArmResult emitNot(Emit *e, int *offp);
+JitArmResult emitBitNot(Emit *e, int *offp);
+JitArmResult emitUnaryPlus(Emit *e, int *offp);
 
 /* Defined in jit_body_fused.c. */
 bool emitAddLocals(Emit *e, const uint8_t *code, int *offp);

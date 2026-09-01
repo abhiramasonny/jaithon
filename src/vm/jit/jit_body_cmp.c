@@ -1,4 +1,5 @@
-/* jit_body_cmp.c -- the comparison arms of the opcode walk. */
+/* jit_body_cmp.c -- the comparison and membership arms of the opcode walk. */
+#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
@@ -646,6 +647,54 @@ bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
     } while (0);
     *offp = off;
     return true;
+}
+
+JitArmResult emitMembership(Emit *e, const uint8_t *code, int *offp) {
+    int off = *offp;
+    do {
+        /* `x in c`. No arm existed, so a membership test ENDED THE WALK:
+         * `if k in seen` is the shape of every dedup loop in the corpus and
+         * everything after it ran interpreted.
+         *
+         * The containment itself is not made faster -- it is the same
+         * jaiContainsOp the interpreter runs, called out to. What the arm
+         * buys is the body around it, which is the whole point of a row
+         * over a call that is cheap next to its loop.
+         *
+         * `not in` is the same call with the sense flipped, in its own
+         * entry point rather than an argc flag -- a wider descriptor would
+         * name a stack entry past the operands. */
+        if (!jitMembership() || !e->callsOut || e->depth < 2) {
+            goto unarmedOpcode;
+        }
+        if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
+                            code[off] == OP_IN ? (void *)&jitContains
+                                               : (void *)&jitNotContains)) {
+            return false;
+        }
+        for (unsigned i = 0; i < 2; i++) {
+            unsigned r;
+            if (!popValue(e, &r, NULL)) return false;
+        }
+        if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
+        emit(e, jaiA64LdrByte(pushReg(e) - 1, 31,
+                              e->descOffset +
+                                  (unsigned)offsetof(JitCallDesc, result) +
+                                  8));
+        /* Containment is not pure: a class can define __contains__, so the
+         * call may run Jaithon code that writes. Leaving this unset marked
+         * every body holding an `in` jitFuncNoWrite, which lets a direct
+         * caller finish the callee by RE-RUNNING it from the start on a
+         * bail -- and re-running the writes with it. */
+        e->wroteHeap = true;
+        off += 1;
+        break;
+    } while (0);
+    *offp = off;
+    return JIT_ARM_OK;
+unarmedOpcode:
+    *offp = off;
+    return JIT_ARM_UNARMED;
 }
 
 #endif /* __aarch64__ || __arm64__ */

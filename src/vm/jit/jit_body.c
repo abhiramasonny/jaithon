@@ -43,31 +43,6 @@ static void reconcileAfterUncond(Emit *e, uint32_t off) {
     e->depth = (unsigned)d;
 }
 
-/* `build` in binary_trees returns `null` on one path and `Node(..)` on another -- an instance merged
- * with a maybe-instance becomes a maybe-instance (shape survives only if both sides agree). Written once before and reverted when it made binary_trees 11x slower -- not this merge's fault: at the time a self-call rooted nothing and emitRootFill's operand-stack-to-register mapping was wrong, and `build` was the first body to hold a fresh allocation across an allocating self-call. Both bugs are now fixed. */
-bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
-    if (!e->sawReturn) {
-        e->sawReturn = true; e->returnKind = k; e->returnShape = shape;
-        return true;
-    }
-    if (e->returnKind == k) {
-        if (e->returnShape != shape) e->returnShape = 0;
-        return true;
-    }
-    bool nullable = (e->returnKind == SLOT_INST && k == SLOT_MAYBE_INST) ||
-                    (e->returnKind == SLOT_MAYBE_INST && k == SLOT_INST);
-    /* Named, because bare this was the whole of what a census said about
-     * OP_RETURN: which two kinds a body cannot agree on is the entire question,
-     * and an instance meeting a nullable instance is already merged above. */
-    if (!nullable) {
-        return subWhy(e, "a body returning both %s and %s",
-                      slotKindName(e->returnKind), slotKindName(k));
-    }
-    if (e->returnShape != shape) e->returnShape = 0;
-    e->returnKind = SLOT_MAYBE_INST;
-    return true;
-}
-
 /* Opcodes that pull a float operand straight out of the FP bank; every other opcode sees the model
  * materialised as before. Adding an opcode here without also teaching it fpOperand is a MISCOMPILE, not a decline -- the whole risk of this design, and why the list stays short. */
 static bool fpFastOp(uint8_t op) {
@@ -673,59 +648,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         switch (op) {
-        case OP_GET_LOCAL: {
-            unsigned slot = jaiReadU16(code + off + 1);
-            /* Both refusals used to be silent, so the census said only
-             * "OP_GET_LOCAL" for two unrelated causes -- one a window the OSR
-             * form does not cover, the other a slot whose kind is not known
-             * yet. They want different fixes; they should not share a line. */
-            if (!localInRange(e, slot)) {
-                e->whyNot = "a local outside the compiled window";
-                return false;
-            }
-            if (e->localKind[slot] == SLOT_OPAQUE) {
-                e->whyNot = "a local of no known kind";
-                return false;
-            }
-            if (slot == 0) e->usesSlot0 = true;
-            if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
-                            e->localClass[slot],
-                            seenLocal(e, slot),
-                            (int)slot)) {
-                return false;
-            }
-            /* The seed of the index shape: this entry IS this local, offset
-             * zero. See Emit::idxKnown. */
-            if (e->localKind[slot] == SLOT_INT && slot <= UINT8_MAX) {
-                unsigned at = e->valueDepth - 1;
-                e->idxKnown |= 1u << at;
-                e->idxBase[at] = (uint8_t)slot;
-                e->idxOff[at]  = 0;
-            }
-            if (e->localKind[slot] == SLOT_FLOAT && !e->dynamicLocal[slot] &&
-                fpWorthLoading(e, code, off + 3, stop)) {
-                unsigned idx = e->valueDepth - 1;
-                if (e->slotFpReg[slot] != 0) {
-                    fpBorrowLocal(e, idx, e->slotFpReg[slot]);
-                } else {
-                    localInFp(e, slot, fpRegAt(e, idx));
-                    fpClaim(e, idx);
-                }
-            } else {
-                unsigned home = localHomeX(e, slot);
-                if (home != 0) {
-                    /* The copy this used to always emit is the whole cost of reading a local (six of them in `fib`) --
-                     * borrowing defers it; if nothing consumes the value before an instruction that can't read a borrow, the settle there emits exactly the same mov, so this never costs more. */
-                    xBorrowLocal(e, e->valueDepth - 1, home);
-                } else {
-                    unsigned dst = pushReg(e) - 1;
-                    unsigned src = localIn(e, slot, dst);
-                    if (src != dst) emit(e, jaiA64MovX(dst, src));
-                }
-            }
-            off += 3;
+        case OP_GET_LOCAL:
+            if (!emitGetLocal(e, code, &off, stop)) return false;
             break;
-        }
 
         case OP_INT: {
             int16_t k = jaiReadI16(code + off + 1);
@@ -758,32 +683,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
-        case OP_SET_LOCAL: {
-            /* Assigns without popping: the value stays as the statement's
-             * result, which is what the interpreter does. */
-            unsigned slot = jaiReadU16(code + off + 1);
-            if (!localInRange(e, slot)) return false;
-            if (slot == 0) e->usesSlot0 = true;
-            if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;
-            /* A local keeps one kind for the whole function. Two kinds would
-             * mean the reads of it cannot be compiled to one instruction, and
-             * the join check works on the operand stack, not on locals. */
-            if (!adoptLocalKind(e, slot, e->stack[e->depth - 1],
-                                e->stackShape[e->depth - 1],
-                                e->stackClass[e->depth - 1])) {
-                e->whyNot = kindClash(e, slot);
-                return false;
-            }
-            if (!e->fpOff && !e->dynamicLocal[slot] &&
-                e->stack[e->depth - 1] == SLOT_FLOAT &&
-                (e->fpLive & (1u << (e->valueDepth - 1)))) {
-                localOutFp(e, slot, fpHeldIn(e, e->valueDepth - 1));
-            } else {
-                localOut(e, slot, xHeldIn(e, e->valueDepth - 1));
-            }
-            off += 3;
+        case OP_SET_LOCAL:
+            if (!emitSetLocal(e, code, &off)) return false;
             break;
-        }
 
         case OP_ADD_LOCALS:
             if (!emitAddLocals(e, code, &off)) return false;
@@ -811,95 +713,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
          * interpreted: 270ms to 510ms. A new opcode in ordinary code is a JIT
          * admission question before it is anything else. */
         case OP_ELEM_KIND: {
-            uint8_t packed = code[off + 1];
-            if (e->depth == 0) return false;
-            /* The STATIC kind, not the sampled value: the measuring pass runs
-             * with no sample, so keying on stackSeen declined every time and
-             * cost the whole function. OP_BUILD_LIST pushes SLOT_LIST, which is
-             * exactly what the emitter puts this opcode after. */
-            if (e->stack[e->depth - 1] != SLOT_LIST) {
-                /* The interpreter stamps a dict's two nibbles as well, and
-                 * does NOTHING for any other container -- "an unstamped
-                 * container is simply unguarded". Both of those are arms.
-                 *
-                 * They became reachable the day the dict and set literals got
-                 * arms of their own: before that the walk stopped AT the
-                 * literal, so this opcode was never reached with a non-list on
-                 * top. `var d: dict[str, int] = {}` in a hot body then
-                 * declined the WHOLE function, which is strictly worse than
-                 * the partial walk it replaced. */
-                uint8_t built = e->stackObjType[e->depth - 1];
-                if (built == (uint8_t)(OBJ_SET + 1) ||
-                    built == (uint8_t)(OBJ_TUPLE + 1)) {
-                    off += 2;
-                    break;
-                }
-                if (built != (uint8_t)(OBJ_DICT + 1)) {
-                    goto unarmedOpcode;
-                }
-                unsigned dr = valueXReg(e, e->valueDepth - 1);
-                /* The prediction came from the build instruction just below,
-                 * but a guard costs two instructions and does not depend on
-                 * the emitter keeping them adjacent. */
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, dr,
-                                   (unsigned)offsetof(Obj, type)));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
-                branchOnDeoptInstStart(e, JAI_A64_NE);
-                emitConst64(e, JIT_SCRATCH_A, (int64_t)((packed >> 4) & 0xFu));
-                emit(e, jaiA64StrByte(JIT_SCRATCH_A, dr,
-                                      (unsigned)offsetof(ObjDict, keyKind)));
-                emitConst64(e, JIT_SCRATCH_A, (int64_t)(packed & 0xFu));
-                emit(e, jaiA64StrByte(JIT_SCRATCH_A, dr,
-                                      (unsigned)offsetof(ObjDict, valKind)));
-                e->wroteHeap = true;
-                off += 2;
-                break;
-            }
-            unsigned r = valueXReg(e, e->valueDepth - 1);
-            /* The arm was already computing this byte and throwing it away.
-             * Keeping it is what lets a subscript of this list choose a load
-             * when no sample of it can exist. */
-            e->stackElemDecl[e->depth - 1] = (uint8_t)((packed & 0xFu) + 1u);
-            emitConst64(e, JIT_SCRATCH_A, (int64_t)(packed & 0xFu));
-            emit(e, jaiA64StrByte(JIT_SCRATCH_A, r,
-                                  (unsigned)offsetof(ObjList, elemKind)));
-            /* And the storage, on the same terms jaiListSpecialise takes: an
-             * empty list with nothing reserved, which is what a `[]` literal
-             * is. Six instructions rather than a call, and no allocation --
-             * that is the whole reason the interpreter's half refuses a
-             * non-empty list too. Without this the two tiers build the same
-             * literal at different widths and a pinned loop form is denied
-             * entry for half the lists it meets; see jaiListSpecialise. */
-            uint8_t kStg = listAltFor(
-                (packed & 0xFu) == FIELD_KIND_INT   ? SLOT_INT
-              : (packed & 0xFu) == FIELD_KIND_FLOAT ? SLOT_FLOAT
-              : (packed & 0xFu) == FIELD_KIND_BOOL  ? SLOT_BOOL
-                                                    : SLOT_OPAQUE);
-            if (kStg != LIST_STORE_BOXED && jaiListUnboxOn()) {
-                /* JIT_SCRATCH_A only: this arm has always used one scratch,
-                 * and e->scratchRoom is what says how many the body actually
-                 * reserved -- reaching for a second clobbered a live value
-                 * register and miscompiled the self-hosted emitter. */
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
-                                   (unsigned)offsetof(ObjList, count)));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
-                int kA = (int)e->count;
-                emit(e, jaiA64BCond(JAI_A64_NE, 0));
-                emit(e, jaiA64LdrX(JIT_SCRATCH_A, r,
-                                   (unsigned)offsetof(ObjList, items)));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
-                int kB = (int)e->count;
-                emit(e, jaiA64BCond(JAI_A64_NE, 0));
-                emitConst64(e, JIT_SCRATCH_A, (int64_t)kStg);
-                emit(e, jaiA64StrByte(JIT_SCRATCH_A, r,
-                                      (unsigned)offsetof(ObjList, stg)));
-                e->code[kA] = jaiA64BCond(JAI_A64_NE,
-                                          (int32_t)((int)e->count - kA));
-                e->code[kB] = jaiA64BCond(JAI_A64_NE,
-                                          (int32_t)((int)e->count - kB));
-            }
-            e->wroteHeap = true;
-            off += 2;
+            JitArmResult r = emitElemKind(e, code, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
@@ -927,39 +743,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             if (!emitSubBind(e, code, &off)) return false;
             break;
 
-        case OP_BIND: {
-            unsigned slot = jaiReadU16(code + off + 1);
-            if (!localInRange(e, slot)) return false;
-            if (slot == 0) e->usesSlot0 = true;
-            if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;
-            if (!adoptLocalKindSeen(e, slot, e->stack[e->depth - 1],
-                                    e->stackShape[e->depth - 1],
-                                    e->stackClass[e->depth - 1],
-                                    e->stackSeen[e->depth - 1])) {
-                e->whyNot = kindClash(e, slot);
-                return false;
-            }
-            if (e->stackElemDecl[e->depth - 1] != 0) {
-                e->localElemDecl[slot] = e->stackElemDecl[e->depth - 1];
-            }
-            e->localObjType[slot] = e->stackObjType[e->depth - 1];
-            if (!e->fpOff && !e->dynamicLocal[slot] &&
-                e->stack[e->depth - 1] == SLOT_FLOAT &&
-                (e->fpLive & (1u << (e->valueDepth - 1)))) {
-                unsigned idx = e->valueDepth - 1;
-                unsigned held = fpHeldIn(e, idx);
-                unsigned r2; SlotKind k2;
-                if (!popValueRaw(e, &r2, &k2)) return false;
-                localOutFp(e, slot, held);
-                off += 3;
-                break;
-            }
-            unsigned r;
-            if (!popValue(e, &r, NULL)) return false;
-            localOut(e, slot, r);
-            off += 3;
+        case OP_BIND:
+            if (!emitBind(e, code, &off)) return false;
             break;
-        }
 
         case OP_INC_LOCAL:
             if (!emitIncLocal(e, code, &off)) return false;
@@ -1104,50 +890,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             if (!emitTypeGuard(e, fn, code, &off)) return false;
             break;
 
-        case OP_FORMAT: {
-            /* Largest single refusal reason across the benchmark census (ninety) -- every f-string is one, and
-             * dict_ops, word_freq and string_build all build their keys with one. */
-            unsigned parts = code[off + 1];
-            if (parts == 0 || parts > JIT_MAX_ARGS_OUT) {
-                e->whyNot = "an f-string with more parts than the descriptor holds";
-                return false;
-            }
-            if (e->depth < parts) return false;
-            /* `str` bound in the module means every part goes through it
-             * instead, which is a call this does not make. */
-            {
-                ObjModule *fmod = closure->fn->module;
-                Value bound;
-                ObjString *sname = jaiStringIntern("str", 3);
-                if (fmod == NULL || sname == NULL ||
-                    jaiTableGetInterned(&fmod->globals, sname, &bound)) {
-                    e->whyNot = "the module binds its own str";
-                    return false;
-                }
-            }
-            if (!emitDescriptor(e, NULL_VAL, e->depth - parts, parts,
-                                (void *)&jitFormat)) {
-                return false;
-            }
-            for (unsigned i = 0; i < parts; i++) {
-                unsigned drop;
-                if (!popValue(e, &drop, NULL)) return false;
-            }
-            if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
-            /* jitFormat always builds a string, and there is no Value to carry
-             * as a sample, so the expectation is recorded instead: without it
-             * `f"{a}-{b}".len()` declined the loop around it at the very next
-             * instruction ("an invoke on an object with nothing to look at"). */
-            e->stackObjType[e->depth - 1] = (uint8_t)(OBJ_STRING + 1);
-            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                               e->descOffset +
-                                   (unsigned)offsetof(JitCallDesc, result) + 8));
-            e->wroteHeap = true;
-            /* count u8, litmask u24, name u24, cache u16 -- nine after the
-             * opcode. */
-            off += 10;
+        case OP_FORMAT:
+            if (!emitFormat(e, closure, code, &off)) return false;
             break;
-        }
 
         case OP_JUMP: {
             int16_t jump = jaiReadI16(code + off + 1);
@@ -1194,498 +939,75 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
-        case OP_GET_LOCAL2: {
-            unsigned a = jaiReadU16(code + off + 1);
-            unsigned b = jaiReadU16(code + off + 3);
-            /* The second local may guard (if dynamic), and a guard can't be reached with a borrow live -- the
-             * deopt stub writes float entries out of fpRegAt, where a borrowed one isn't. So the FIRST local takes a copy instead of a borrow whenever the second is going to guard: `dt * b.vx` in nbody's second loop is exactly this shape (`dt` has a home, `b` is dynamic). */
-            bool guardFollows = b <= JIT_MAX_SLOTS && e->dynamicLocal[b];
-            for (unsigned k = 0; k < 2; k++) {
-                unsigned slot = k == 0 ? a : b;
-                /* Named, for the reason given at OP_GET_LOCAL. */
-                if (!localInRange(e, slot)) {
-                    e->whyNot = "a local outside the compiled window";
-                    return false;
-                }
-                if (e->localKind[slot] == SLOT_OPAQUE) {
-                    e->whyNot = "a local of no known kind";
-                    return false;
-                }
-                if (slot == 0) e->usesSlot0 = true;
-                if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
-                                e->localClass[slot],
-                                seenLocal(e, slot),
-                                (int)slot)) {
-                    return false;
-                }
-                /* Same seed as OP_GET_LOCAL, and this is the arm that matters:
-                 * the emitter fuses `xs[j]` into GET_LOCAL2, so every subscript
-                 * in a stencil arrives here and nowhere else. */
-                if (e->localKind[slot] == SLOT_INT && slot <= UINT8_MAX) {
-                    unsigned at = e->valueDepth - 1;
-                    e->idxKnown |= 1u << at;
-                    e->idxBase[at] = (uint8_t)slot;
-                    e->idxOff[at]  = 0;
-                }
-                if (e->localKind[slot] == SLOT_FLOAT &&
-                    !e->dynamicLocal[slot] &&
-                    fpWorthLoading(e, code, off + 5, stop)) {
-                    unsigned idx = e->valueDepth - 1;
-                    if (e->slotFpReg[slot] != 0 && !(k == 0 && guardFollows)) {
-                        fpBorrowLocal(e, idx, e->slotFpReg[slot]);
-                    } else {
-                        localInFp(e, slot, fpRegAt(e, idx));
-                        fpClaim(e, idx);
-                    }
-                } else {
-                    unsigned home = localHomeX(e, slot);
-                    if (home != 0) {            /* see OP_GET_LOCAL */
-                        xBorrowLocal(e, e->valueDepth - 1, home);
-                    } else {
-                        unsigned dst = pushReg(e) - 1;
-                        unsigned src = localIn(e, slot, dst);
-                        if (src != dst) emit(e, jaiA64MovX(dst, src));
-                    }
-                }
-            }
-            off += 5;
+        case OP_GET_LOCAL2:
+            if (!emitGetLocal2(e, code, &off, stop)) return false;
             break;
-        }
 
-        case OP_SET_FIELD: {
-            uint32_t nameIdx = jaiReadU24(code + off + 1);
-            /* Receiver then value, both dropped. The receiver's class comes from its STACK entry, not guessed
-             * from the locals: two instance locals of different classes would make any guess a silently wrong field offset. */
-            if (e->depth < 2) return false;
-            ObjClass *klass = e->stackClass[e->depth - 2];
-            int recvLocal = e->stackLocal[e->depth - 2];
-
-            unsigned rv, rr;
-            SlotKind kv, kr;
-            /* A float already in the FP bank is stored from there (`str d`, not popValue's `fmov x,d` + `str x`)
-             * -- captured before the pop, since popping is what clears the bit and renames the index. */
-            bool vIsFp = e->depth >= 1 && e->valueDepth >= 1 &&
-                         e->stack[e->depth - 1] == SLOT_FLOAT &&
-                         (e->fpLive & (1u << (e->valueDepth - 1))) != 0;
-            unsigned dv = vIsFp ? fpHeldIn(e, e->valueDepth - 1) : 0u;
-            if (vIsFp) {
-                if (!popValueRaw(e, &rv, &kv)) return false;
-            } else if (!popValue(e, &rv, &kv)) {
-                return false;
-            }
-            if (!popValue(e, &rr, &kr)) return false;
-            if (kr != SLOT_INST) return false;
-            /* An object goes in as readily as a number. The collector is a plain mark-sweep with no write
-             * barrier and nothing moves, so the only question is reachability: the receiver is rooted (it
-             * is a live SLOT_INST here), and after the store the value hangs off it, while before the store
-             * it was rooted in its own right by emitRootFill. What is refused is a kind with no payload
-             * register to store (class/function/native/self) and SLOT_ITER, whose index lives in memory. */
-            if (kv != SLOT_INT && kv != SLOT_FLOAT && kv != SLOT_BOOL &&
-                kv != SLOT_OBJ && kv != SLOT_LIST && kv != SLOT_INST &&
-                kv != SLOT_MAYBE_INST) {
-                e->whyNot = "storing a field kind this tier cannot write";
-                return false;
-            }
-            if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
-            Value nameVal = fn->chunk.constants.data[nameIdx];
-            if (!IS_STRING(nameVal)) return false;
-
-            if (klass == NULL) return false;
-            const FieldInfo *info = jaiClassFieldInfo(klass, AS_STRING(nameVal));
-            if (info == NULL || info->isStatic) return false;
-
-            unsigned base = (unsigned)offsetof(ObjInstance, fields) +
-                            (unsigned)info->slot * (unsigned)sizeof(Value);
-            /* Not a constant tag any more: a maybe-instance's is null-or-object,
-             * read off the payload, which is exactly what emitTagFor does. */
-            emitTagFor(e, kv, rv, JIT_SCRATCH_A, JIT_SCRATCH_B);
-            emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
-            if (vIsFp) emit(e, jaiA64StrD(dv, rr, base + 8));
-            else       emit(e, jaiA64StrX(rv, rr, base + 8));
-            /* Only a kind a later read can replay EXACTLY is remembered; the rest merely retire what was
-             * known of this field (local -1), because the read side would otherwise take SLOT_INST with no
-             * class behind it -- a shape every field offset it then resolved would be resolved against. */
-            bool replayable = kv == SLOT_INT || kv == SLOT_FLOAT ||
-                              kv == SLOT_BOOL || kv == SLOT_OBJ;
-            recordFieldStore(e, replayable ? recvLocal : -1, info->slot, kv);
-            e->wroteHeap = true;
-            off += 6;
+        case OP_SET_FIELD:
+            if (!emitSetField(e, fn, code, &off)) return false;
             break;
-        }
 
-        case OP_RETURN_NULL: {
-            /* An OSR form's x0 is the resume bytecode offset (see jaiJitEnterOsr's `*resumeAt = at`), but this
-             * return sequence is the function tier's and leaves the VALUE in x0 -- a `return` inside a compiled loop once handed the interpreter an int/pointer as an instruction offset instead, miscompiling `for i in 0..n { if .. { return x } }` (14/20 wrong in released builds, 10/10 under --gc-stress). */
-            if (e->osr) {
-                e->whyNot = "a return inside an OSR loop";
-                return false;
-            }
-            if ((fn->flags & FN_INIT) == 0) {
-                /* A function with nothing to return. No register carries the
-                 * answer; the entry point builds a null from the kind alone. */
-                if (e->sawReturn && e->returnKind != SLOT_NULL) return false;
-                e->sawReturn  = true;
-                e->returnKind = SLOT_NULL;
-                emit(e, jaiA64MovzX(0, 0, 0));
-                emitEpilogue(e, 0);
-                off += 1;
-                break;
-            }
-            /* An initializer yields the object it initialised, which is what
-             * makes `Point(1, 2)` an expression. */
-            if (!localInRange(e, 0) || e->localKind[0] != SLOT_INST) return false;
-            e->usesSlot0 = true;
-            if (e->sawReturn && e->returnKind != SLOT_INST) return false;
-            e->sawReturn  = true;
-            e->returnKind = SLOT_INST;
-            e->returnShape = e->localShape[0];
-            {
-                unsigned src = localIn(e, 0, 0);
-                if (src != 0) emit(e, jaiA64MovX(0, src));
-            }
-            emitEpilogue(e, 0);
-            off += 1;
+        case OP_RETURN_NULL:
+            if (!emitReturnNull(e, fn, &off)) return false;
             break;
-        }
 
-        case OP_POP_RETURN_NULL: {
-            /* POP's half: forget a deferred/borrowed entry rather than settle
-             * it, same as plain OP_POP -- nothing reads a value being thrown
-             * away. */
-            unsigned r;
-            if (e->depth > 0 && holdsRegister(e->stack[e->depth - 1]) &&
-                e->valueDepth > 0) {
-                unsigned idx = e->valueDepth - 1;
-                e->kPend   &= ~(1u << idx);
-                e->xBorrow &= ~(1u << idx);
-            }
-            if (!popValue(e, &r, NULL)) return false;
-
-            /* RETURN_NULL's half, unchanged. */
-            if (e->osr) {
-                e->whyNot = "a return inside an OSR loop";
-                return false;
-            }
-            if ((fn->flags & FN_INIT) == 0) {
-                if (e->sawReturn && e->returnKind != SLOT_NULL) return false;
-                e->sawReturn  = true;
-                e->returnKind = SLOT_NULL;
-                emit(e, jaiA64MovzX(0, 0, 0));
-                emitEpilogue(e, 0);
-                off += 1;
-                break;
-            }
-            if (!localInRange(e, 0) || e->localKind[0] != SLOT_INST) return false;
-            e->usesSlot0 = true;
-            if (e->sawReturn && e->returnKind != SLOT_INST) return false;
-            e->sawReturn  = true;
-            e->returnKind = SLOT_INST;
-            e->returnShape = e->localShape[0];
-            {
-                unsigned src = localIn(e, 0, 0);
-                if (src != 0) emit(e, jaiA64MovX(0, src));
-            }
-            emitEpilogue(e, 0);
-            off += 1;
+        case OP_POP_RETURN_NULL:
+            if (!emitPopReturnNull(e, fn, &off)) return false;
             break;
-        }
 
-        case OP_GET_UPVALUE: {
-            unsigned index = code[off + 1];
-            if (index >= (unsigned)fn->upvalueCount) return false;
-            /* Whose closure. An inlined body's is in the register the call
-             * site guarded, not in the caller's own closure register: the
-             * caller may have no upvalues at all and still be inlining a body
-             * that has them. */
-            unsigned creg;
-            if (e->inlining) {
-                if (e->inlClosureReg < 0) return false;
-                creg = (unsigned)e->inlClosureReg;
-            } else {
-                if (!e->usesUpvalues) return false; /* decided before this pass */
-                creg = closureReg(e);
-            }
-
-            /* closure->upvalues[index]->location, then the Value there. The
-             * upvalue may still be open, pointing into the VM stack, so the
-             * location is followed rather than assumed closed. */
-            emit(e, jaiA64LdrX(JIT_SCRATCH_A, creg,
-                               (unsigned)offsetof(ObjClosure, upvalues)));
-            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A, index * 8u));
-            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
-                               (unsigned)offsetof(ObjUpvalue, location)));
-            emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-
-            /* An upvalue's type is whatever the capture put there, so it is
-             * read once here and checked on every entry into the loop. */
-            Value seen = NULL_VAL;
-            ObjClosure *cl = closure;
-            if (index < (unsigned)cl->upvalueCount && cl->upvalues[index] != NULL) {
-                seen = *cl->upvalues[index]->location;
-            }
-            SlotKind kind;
-            unsigned tag;
-            uint32_t seenShape = 0;
-            ObjClass *seenClass = NULL;
-            if (IS_INT(seen))        { kind = SLOT_INT;   tag = VAL_INT; }
-            else if (IS_FLOAT(seen)) { kind = SLOT_FLOAT; tag = VAL_FLOAT; }
-            else if (IS_BOOL(seen))  { kind = SLOT_BOOL;  tag = VAL_BOOL; }
-            else if (IS_LIST(seen))  { kind = SLOT_LIST;  tag = VAL_OBJ; }
-            else if (rawObjValue(seen)) { kind = SLOT_OBJ; tag = VAL_OBJ; }
-            else if (IS_INSTANCE(seen) && AS_INSTANCE(seen)->klass != NULL) {
-                /* Same reasoning as every other raw-object read site in this
-                 * tier: nothing about an upvalue makes its capture special,
-                 * it is read the same way a global or a field is. A closure
-                 * over a str/list/dict/instance never compiled before this. */
-                kind = SLOT_INST; tag = VAL_OBJ;
-                seenClass = AS_INSTANCE(seen)->klass;
-                seenShape = seenClass->shapeId;
-            } else return false;
-
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, tag));
-            branchOnDeopt(e, JAI_A64_NE);
-            if (kind == SLOT_LIST) {
-                /* "an object" is not "a list": same contract as every other
-                 * SLOT_LIST arm in this tier. JIT_SCRATCH_A holds the
-                 * upvalue's location and must survive to the load below. */
-                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_A, 8));
-                emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
-                                   (unsigned)offsetof(Obj, type)));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, OBJ_LIST));
-                branchOnDeopt(e, JAI_A64_NE);
-            } else if (kind == SLOT_INST) {
-                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_A, 8));
-                emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_D,
-                                   (unsigned)offsetof(Obj, type)));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, OBJ_INSTANCE));
-                branchOnDeopt(e, JAI_A64_NE);
-                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
-                                   (unsigned)offsetof(ObjInstance, klass)));
-                emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
-                                   (unsigned)offsetof(ObjClass, shapeId)));
-                emitConst64(e, JIT_SCRATCH_B, (int64_t)seenShape);
-                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_B));
-                branchOnDeopt(e, JAI_A64_NE);
-            }
-            if (!pushValue3(e, kind, seenShape, seenClass, seen, -1)) return false;
-            if (kind == SLOT_BOOL) {
-                emit(e, jaiA64LdrByte(pushReg(e) - 1, JIT_SCRATCH_A, 8));
-            } else {
-                emit(e, jaiA64LdrX(pushReg(e) - 1, JIT_SCRATCH_A, 8));
-            }
-            off += 2;
+        case OP_GET_UPVALUE:
+            if (!emitGetUpvalue(e, fn, closure, code, &off)) return false;
             break;
-        }
 
         case OP_GET_FIELD:
             if (!emitGetField(e, fn, code, &off, stop)) return false;
             break;
 
-        case OP_BUILD_LIST: {
-            unsigned n = jaiReadU16(code + off + 1);
-            if (n > JIT_MAX_ARGS_OUT) return false;
-            if (!e->callsOut) return false;
-            if (e->depth < n) return false;
-            Value elemSeen = NULL_VAL;
-            if (!buildListExemplar(e, e->depth - n, n, &elemSeen)) {
-                elemSeen = NULL_VAL;
-            }
-            if (!emitDescriptor(e, NULL_VAL, e->depth - n, n,
-                                (void *)&jitBuildList)) {
-                return false;
-            }
-            for (unsigned i = 0; i < n; i++) {
-                unsigned r;
-                if (!popValue(e, &r, NULL)) return false;
-            }
-            if (!pushValue(e, SLOT_LIST, 0, NULL)) return false;
-            /* Computed BEFORE the pops above, since it reads the entries they
-             * remove. See buildListExemplar for why the list itself cannot
-             * answer this. */
-            e->stackElem[e->depth - 1] = elemSeen;
-            /* The same exemplar as a KIND, which survives a bind into a local
-             * where the Value does not -- there is nowhere to root a Value per
-             * local, and a byte needs no rooting.
-             *
-             * A prediction, not a fact, unlike the OP_ELEM_KIND route: an
-             * undeclared literal gets boxed storage, so a later append may put
-             * anything in it. That is safe on the same terms as stackElem
-             * itself -- a boxed element is tag-checked at every read, so a
-             * changed kind deoptimises. `min_area_rect` builds
-             * `[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]` with no declared type and then
-             * subscripts it, which is the case that needed this. */
-            e->stackElemDecl[e->depth - 1] =
-                IS_INT(elemSeen)   ? (uint8_t)(FIELD_KIND_INT   + 1)
-              : IS_FLOAT(elemSeen) ? (uint8_t)(FIELD_KIND_FLOAT + 1)
-              : IS_BOOL(elemSeen)  ? (uint8_t)(FIELD_KIND_BOOL  + 1)
-                                   : (uint8_t)0;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                               e->descOffset +
-                                   (unsigned)offsetof(JitCallDesc, result) + 8));
-            e->wroteHeap = true;
-            off += 3;
+        case OP_BUILD_LIST:
+            if (!emitBuildList(e, code, &off)) return false;
             break;
-        }
 
         case OP_IN:
         case OP_NOT_IN: {
-            /* `x in c`. No arm existed, so a membership test ENDED THE WALK:
-             * `if k in seen` is the shape of every dedup loop in the corpus and
-             * everything after it ran interpreted.
-             *
-             * The containment itself is not made faster -- it is the same
-             * jaiContainsOp the interpreter runs, called out to. What the arm
-             * buys is the body around it, which is the whole point of a row
-             * over a call that is cheap next to its loop.
-             *
-             * `not in` is the same call with the sense flipped, in its own
-             * entry point rather than an argc flag -- a wider descriptor would
-             * name a stack entry past the operands. */
-            if (!jitMembership() || !e->callsOut || e->depth < 2) {
-                goto unarmedOpcode;
-            }
-            if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
-                                code[off] == OP_IN ? (void *)&jitContains
-                                                   : (void *)&jitNotContains)) {
-                return false;
-            }
-            for (unsigned i = 0; i < 2; i++) {
-                unsigned r;
-                if (!popValue(e, &r, NULL)) return false;
-            }
-            if (!pushValue(e, SLOT_BOOL, 0, NULL)) return false;
-            emit(e, jaiA64LdrByte(pushReg(e) - 1, 31,
-                                  e->descOffset +
-                                      (unsigned)offsetof(JitCallDesc, result) +
-                                      8));
-            /* Containment is not pure: a class can define __contains__, so the
-             * call may run Jaithon code that writes. Leaving this unset marked
-             * every body holding an `in` jitFuncNoWrite, which lets a direct
-             * caller finish the callee by RE-RUNNING it from the start on a
-             * bail -- and re-running the writes with it. */
-            e->wroteHeap = true;
-            off += 1;
+            JitArmResult r = emitMembership(e, code, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
         case OP_BUILD_DICT:
         case OP_BUILD_SET: {
-            /* The remaining container literals, on the OP_BUILD_LIST template.
-             *
-             * Both were top of the partial-walk census over the self-hosted
-             * parser: `_node(kind, span, fields: dict = {})` builds a dict for
-             * every AST node, and the walk stopped there sixteen times in one
-             * file. */
-            bool isDict = code[off] == OP_BUILD_DICT;
-            unsigned n = jaiReadU16(code + off + 1);
-            unsigned operands = isDict ? n * 2u : n;
-            if (!jitTuple() || operands > JIT_MAX_ARGS_OUT || !e->callsOut ||
-                e->depth < operands) {
-                goto unarmedOpcode;
-            }
-            if (!emitDescriptor(e, NULL_VAL, e->depth - operands, operands,
-                                isDict ? (void *)&jitBuildDict
-                                       : (void *)&jitBuildSet)) {
-                return false;
-            }
-            for (unsigned i = 0; i < operands; i++) {
-                unsigned r;
-                if (!popValue(e, &r, NULL)) return false;
-            }
-            if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
-            /* SLOT_OBJ does not say which container this is, and OP_ELEM_KIND
-             * comes straight after a literal and has to know. */
-            e->stackObjType[e->depth - 1] =
-                (uint8_t)((isDict ? OBJ_DICT : OBJ_SET) + 1);
-            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                               e->descOffset +
-                                   (unsigned)offsetof(JitCallDesc, result) + 8));
-            e->wroteHeap = true;
-            off += 3;
+            JitArmResult r = emitBuildDictSet(e, code, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
         case OP_BUILD_TUPLE: {
-            /* Same shape as OP_BUILD_LIST above, and simpler: jaiTupleNew
-             * copies the operands itself and cannot throw. No exemplar is
-             * kept -- a tuple has no element arm to feed, so the entry is a
-             * plain SLOT_OBJ.
-             *
-             * Worth an arm only because there was none: a tuple build ENDED
-             * THE WALK, and `let p = (x, y)` in a loop body is common enough
-             * that the whole body after it ran interpreted. */
-            unsigned n = jaiReadU16(code + off + 1);
-            if (!jitTuple() || n > JIT_MAX_ARGS_OUT || !e->callsOut ||
-                e->depth < n) {
-                goto unarmedOpcode;
-            }
-            if (!emitDescriptor(e, NULL_VAL, e->depth - n, n,
-                                (void *)&jitBuildTuple)) {
-                return false;
-            }
-            for (unsigned i = 0; i < n; i++) {
-                unsigned r;
-                if (!popValue(e, &r, NULL)) return false;
-            }
-            if (!pushValue(e, SLOT_OBJ, 0, NULL)) return false;
-            e->stackObjType[e->depth - 1] = (uint8_t)(OBJ_TUPLE + 1);
-            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                               e->descOffset +
-                                   (unsigned)offsetof(JitCallDesc, result) + 8));
-            e->wroteHeap = true;
-            off += 3;
+            JitArmResult r = emitBuildTuple(e, code, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
         case OP_NOT: {
-            /* `not x`. The interpreter REQUIREs a bool here, and SLOT_BOOL's
-             * contract is "0 or 1 in a register", so the flip is an xor with
-             * one and there is nothing to guard. Anything else is not a
-             * narrowing this tier declines to do -- it is a program the
-             * interpreter would throw on, and it reaches the throw by the
-             * unarmed path.
-             *
-             * No arm existed, so `not` ENDED THE WALK the way OP_NEG did:
-             * `if not a` in a loop was 23,252,579 interpreted instructions. */
-            if (!jitNegate() || e->depth < 1 ||
-                e->stack[e->depth - 1] != SLOT_BOOL) {
-                goto unarmedOpcode;
-            }
-            {
-                unsigned nr = pushReg(e) - 1;
-                emitConst64(e, JIT_SCRATCH_A, 1);
-                emit(e, jaiA64EorX(nr, nr, JIT_SCRATCH_A));
-            }
-            off += 1;
+            JitArmResult r = emitNot(e, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
         case OP_BNOT: {
-            /* `~x` is `x ^ -1`, and the model has already proved the int. */
-            if (!jitNegate() || e->depth < 1 ||
-                e->stack[e->depth - 1] != SLOT_INT) {
-                goto unarmedOpcode;
-            }
-            {
-                unsigned nr = pushReg(e) - 1;
-                emitConst64(e, JIT_SCRATCH_A, -1);
-                emit(e, jaiA64EorX(nr, nr, JIT_SCRATCH_A));
-            }
-            off += 1;
+            JitArmResult r = emitBitNot(e, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
         case OP_POS: {
-            /* Unary `+` on a number is the identity -- the interpreter checks
-             * the type and does nothing else. The model has already proved it,
-             * so this emits nothing at all; the point is only that the walk
-             * does not stop here. */
-            if (!jitNegate() || e->depth < 1 ||
-                (e->stack[e->depth - 1] != SLOT_INT &&
-                 e->stack[e->depth - 1] != SLOT_FLOAT)) {
-                goto unarmedOpcode;
-            }
-            off += 1;
+            JitArmResult r = emitUnaryPlus(e, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
@@ -1743,31 +1065,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
-        case OP_BUILD_RANGE: {
-            /* Deferred: the range is only worth building alongside its
-             * iterator, which the next instruction asks for. */
-            if (e->depth < 2) return false;
-            if (e->stack[e->depth - 1] != SLOT_INT) return false;
-            if (e->stack[e->depth - 2] != SLOT_INT) return false;
-            /* OP_BUILD_RANGE carries one operand byte, so the next opcode is
-             * two along. */
-            if (off + 2 >= count || code[off + 2] != OP_GET_ITER) {
-                e->whyNot = "a range that is not immediately iterated";
-                return false;
-            }
-            e->rangeInclusive = code[off + 1] != 0;
-            e->pendingRange = true;
-            e->rangeBuildIp = (uint32_t)off;
-            /* Both ends hold registers, so the low end is the entry one below
-             * the top in the value bank as well as on the stack. */
-            {
-                unsigned lo = e->valueDepth - 2;
-                e->rangeStartKnown = (e->kKnown & (1u << lo)) != 0;
-                e->rangeStartVal   = e->rangeStartKnown ? e->kKnownVal[lo] : 0;
-            }
-            off += 2;
+        case OP_BUILD_RANGE:
+            if (!emitBuildRange(e, code, &off, count)) return false;
             break;
-        }
 
         case OP_GET_ITER:
             if (!emitGetIter(e, &off)) return false;
@@ -1821,28 +1121,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             if (!emitTailCall(e, fn, code, &off, count)) return false;
             break;
 
-        case OP_RETURN: {
-            /* Same OSR resume-offset hazard as OP_RETURN_NULL -- see there. */
-            if (e->osr) {
-                e->whyNot = "a return inside an OSR loop";
-                return false;
-            }
-            uint32_t rsh = e->depth > 0 ? e->stackShape[e->depth - 1] : 0;
-            unsigned r;
-            SlotKind k;
-            if (e->depth == 0) return subWhy(e, "a return with an empty stack");
-            if (!popValue(e, &r, &k)) {
-                return subWhy(e, "returning a %s, which holds no register",
-                              slotKindName(e->stack[e->depth - 1]));
-            }
-            /* One return kind per function: the entry point rebuilds a Value
-             * from it, and it cannot rebuild two. */
-            if (!mergeReturnKind(e, k, rsh)) return false;
-            emit(e, jaiA64MovX(0, r));
-            emitEpilogue(e, 0);
-            off += 1;
+        case OP_RETURN:
+            if (!emitReturn(e, &off)) return false;
             break;
-        }
 
         default:
         unarmedOpcode:
