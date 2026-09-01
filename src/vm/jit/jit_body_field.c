@@ -1,4 +1,4 @@
-/* jit_body_field.c -- the field-read and type-guard arms of the opcode walk. */
+/* jit_body_field.c -- the field read/write and type-guard arms of the opcode walk. */
 #include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
@@ -930,6 +930,72 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                 emit(e, jaiA64LdrX(pushReg(e) - 1, rr, fbase + 8));
             }
         }
+        off += 6;
+        break;
+    } while (0);
+    *offp = off;
+    return true;
+}
+
+bool emitSetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
+    int off = *offp;
+    do {
+        uint32_t nameIdx = jaiReadU24(code + off + 1);
+        /* Receiver then value, both dropped. The receiver's class comes from its STACK entry, not guessed
+         * from the locals: two instance locals of different classes would make any guess a silently wrong field offset. */
+        if (e->depth < 2) return false;
+        ObjClass *klass = e->stackClass[e->depth - 2];
+        int recvLocal = e->stackLocal[e->depth - 2];
+
+        unsigned rv, rr;
+        SlotKind kv, kr;
+        /* A float already in the FP bank is stored from there (`str d`, not popValue's `fmov x,d` + `str x`)
+         * -- captured before the pop, since popping is what clears the bit and renames the index. */
+        bool vIsFp = e->depth >= 1 && e->valueDepth >= 1 &&
+                     e->stack[e->depth - 1] == SLOT_FLOAT &&
+                     (e->fpLive & (1u << (e->valueDepth - 1))) != 0;
+        unsigned dv = vIsFp ? fpHeldIn(e, e->valueDepth - 1) : 0u;
+        if (vIsFp) {
+            if (!popValueRaw(e, &rv, &kv)) return false;
+        } else if (!popValue(e, &rv, &kv)) {
+            return false;
+        }
+        if (!popValue(e, &rr, &kr)) return false;
+        if (kr != SLOT_INST) return false;
+        /* An object goes in as readily as a number. The collector is a plain mark-sweep with no write
+         * barrier and nothing moves, so the only question is reachability: the receiver is rooted (it
+         * is a live SLOT_INST here), and after the store the value hangs off it, while before the store
+         * it was rooted in its own right by emitRootFill. What is refused is a kind with no payload
+         * register to store (class/function/native/self) and SLOT_ITER, whose index lives in memory. */
+        if (kv != SLOT_INT && kv != SLOT_FLOAT && kv != SLOT_BOOL &&
+            kv != SLOT_OBJ && kv != SLOT_LIST && kv != SLOT_INST &&
+            kv != SLOT_MAYBE_INST) {
+            e->whyNot = "storing a field kind this tier cannot write";
+            return false;
+        }
+        if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
+        Value nameVal = fn->chunk.constants.data[nameIdx];
+        if (!IS_STRING(nameVal)) return false;
+
+        if (klass == NULL) return false;
+        const FieldInfo *info = jaiClassFieldInfo(klass, AS_STRING(nameVal));
+        if (info == NULL || info->isStatic) return false;
+
+        unsigned base = (unsigned)offsetof(ObjInstance, fields) +
+                        (unsigned)info->slot * (unsigned)sizeof(Value);
+        /* Not a constant tag any more: a maybe-instance's is null-or-object,
+         * read off the payload, which is exactly what emitTagFor does. */
+        emitTagFor(e, kv, rv, JIT_SCRATCH_A, JIT_SCRATCH_B);
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
+        if (vIsFp) emit(e, jaiA64StrD(dv, rr, base + 8));
+        else       emit(e, jaiA64StrX(rv, rr, base + 8));
+        /* Only a kind a later read can replay EXACTLY is remembered; the rest merely retire what was
+         * known of this field (local -1), because the read side would otherwise take SLOT_INST with no
+         * class behind it -- a shape every field offset it then resolved would be resolved against. */
+        bool replayable = kv == SLOT_INT || kv == SLOT_FLOAT ||
+                          kv == SLOT_BOOL || kv == SLOT_OBJ;
+        recordFieldStore(e, replayable ? recvLocal : -1, info->slot, kv);
+        e->wroteHeap = true;
         off += 6;
         break;
     } while (0);

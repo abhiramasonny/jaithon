@@ -1149,6 +1149,7 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
                                int *offp, int stop);
 bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                   int stop);
+bool emitSetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp);
 
 /* Defined in jit_body_iter.c. */
 bool emitGetIter(Emit *e, int *offp);
