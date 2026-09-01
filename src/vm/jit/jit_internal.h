@@ -1134,7 +1134,12 @@ typedef enum { JIT_ARM_REFUSED = 0, JIT_ARM_OK = 1, JIT_ARM_UNARMED = 2 }
 /* Defined in jit_body.c. */
 bool fpWorthLoading(const Emit *e, const uint8_t *code, int next, int stop);
 bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop);
+
+/* Defined in jit_body_return.c. */
 bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape);
+bool emitReturn(Emit *e, int *offp);
+bool emitReturnNull(Emit *e, ObjFunction *fn, int *offp);
+bool emitPopReturnNull(Emit *e, ObjFunction *fn, int *offp);
 
 /* Defined in jit_body_build.c. */
 bool emitBuildList(Emit *e, const uint8_t *code, int *offp);
