@@ -170,6 +170,17 @@ for src in "$ROOT"/tests/golden/*.jai; do
     # in src/vm/jit/jit.h.
     run_golden "$name (jit-first-call)" "$src" "$expected" "" \
         JAITHON_JIT_THRESHOLD=1
+    # Opt-in, via `#: jit-cold-compile: yes` in the golden's own header, because
+    # --no-cache costs a full stdlib recompile per run and 61 of them is a
+    # minute of gate for nothing. A golden asks for it when what it checks
+    # depends on the COMPILER having run in-process: the tier's fallback paths
+    # (compileReturnNull, compileAccessor) are only reached once the shared code
+    # arena is full, and a warm cache never fills it. That is the difference
+    # between catching an empty initializer that returns null and not.
+    if sed -n 's/^#: *jit-cold-compile: *\(yes\).*/\1/p' "$src" | head -1 | grep -q yes; then
+        run_golden "$name (cold-compile, jit-first-call)" "$src" "$expected" \
+            "--no-cache" JAITHON_JIT_THRESHOLD=1
+    fi
     for level in -O0 -O1 -O3; do
         run_golden "$name ($level)" "$src" "$expected" "$level"
     done
