@@ -48,6 +48,7 @@ jaithon/compile/check/universe.jai
 jaithon/compile/diag.jai
 jaithon/compile/emit.jai
 jaithon/compile/emit/chunk.jai
+jaithon/compile/emit/emitter.jai
 jaithon/compile/emit/opcode.jai
 jaithon/compile/emit/spec.jai
 jaithon/compile/jaic.jai

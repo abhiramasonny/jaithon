@@ -1,0 +1,2398 @@
+#: The emitter itself: the walk that lowers a resolved tree into a chunk.
+from jaithon.ast import CompKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKind
+from jaithon.ast import Visibility
+from jaithon.ast import is_statement
+from jaithon.compile.diag import DiagnosticBag
+from jaithon.compile.symbol import Resolution, SemaCode, Symbol, SymbolKind
+from jaithon.compile.emit.opcode import FMT_MAX_PARTS, Op
+from jaithon.compile.emit.spec import CATCH_ALL, Const, ConstTag, ExceptionEntry
+from jaithon.compile.emit.spec import FN_ASYNC, FN_GENERATOR, FN_GETTER
+from jaithon.compile.emit.spec import FN_GPU_KERNEL, FN_KWREST, FN_METHOD
+from jaithon.compile.emit.spec import FN_SETTER, FN_STATIC, FN_TRACE, FN_VARIADIC
+from jaithon.compile.emit.spec import SPEC_CLASS, SPEC_ENUM, SPEC_TRAIT
+from jaithon.compile.emit.chunk import Chunk, FuncProto
+
+class LoopFrame {
+    pub let label: str?
+    pub let continue_target: int
+    #: Lowest slot to close when an iteration ends, or -1. See `_close_iteration`.
+    pub let capture_base: int
+    #: Operand-stack depth `continue` and `break` unwind to. A `for` leaves its
+    #: iterator pushed across the body, so `continue` keeps it and `break` drops it.
+    pub let continue_depth: int
+    pub let break_depth: int
+    pub var breaks: list[int]
+
+    pub fn init(
+        self,
+        label: str?,
+        continue_target: int,
+        capture_base: int,
+        continue_depth: int,
+        break_depth: int
+    ) {
+        self.label = label
+        self.continue_target = continue_target
+        self.capture_base = capture_base
+        self.continue_depth = continue_depth
+        self.break_depth = break_depth
+        self.breaks = []
+    }
+}
+
+class FnCtx {
+    pub let proto: FuncProto
+    pub var loops: list[LoopFrame]
+    #: Lowest capture base of the blocks open around the cursor, or -1.
+    #: `return` leaves all of them at once and closes at this.
+    pub var close_base: int
+    #: Watermark, not a stack: the lowest base of any block or loop *opened*
+    #: since it was last reset. `_try` resets it around the guarded region,
+    #: since an exception skips every block close inside that region.
+    pub var deep_close_base: int
+    #: Next free temporary slot, handed out above the resolver's peak. A
+    #: temporary lives in the frame window, not on the operand stack, so a
+    #: pattern test can fail without unwinding partially destructured values.
+    pub var next_temp: int
+    #: High-water mark of `next_temp`; the frame reserves this many slots
+    #: before the operand stack starts.
+    pub var max_slot: int
+    #: The `finally` blocks open around the cursor, innermost last. An explicit
+    #: `return`, `break` or `continue` leaving them inlines a copy of each; the
+    #: exception path uses the exception table instead.
+    pub var finallys: list[Node]
+    #: Number of loop frames open when each `finally` was entered, so that a
+    #: `break` knows which of them it is leaving.
+    pub var finally_loop_depth: list[int]
+    #: Above zero inside a `try`, `catch`, `finally` or deferred block. A
+    #: `return` there may not reuse the frame: see `_can_tail_call`.
+    pub var protect_depth: int
+    #: True once this frame has registered a `defer`. Set where PUSH_DEFER is
+    #: emitted, so a `return` above the `defer` sees false, exactly as the VM
+    #: would find no defer registered yet.
+    pub var has_defer: bool
+
+    pub fn init(self, proto: FuncProto, local_count: int) {
+        self.proto = proto
+        self.loops = []
+        self.close_base = -1
+        self.deep_close_base = -1
+        self.next_temp = if local_count < 1 { 1 } else { local_count }
+        self.max_slot = self.next_temp
+        self.finallys = []
+        self.finally_loop_depth = []
+        self.protect_depth = 0
+        self.has_defer = false
+    }
+}
+
+#: Lower a resolved program to a `FuncProto` for the module body.
+#:
+#: Run `jaithon.compile.resolve` first: the emitter reads the symbols, slots and
+#: capture lists that pass left behind and looks nothing up itself.
+pub class Emitter {
+    #: The resolver's output: symbols by node identity, and function scopes.
+    pub let resolution: Resolution
+    #: Where a construct the instruction set cannot express is reported.
+    pub let bag: DiagnosticBag
+    #: When true `assert` compiles to nothing, as `--release` requires.
+    pub let strip_asserts: bool
+    #: The `--O` level handed to `optimize`: 0 disables passes 3-7 (spec §8).
+    pub let opt_level: int
+    #: The optimiser run over every function this emitter finishes; see
+    #: `_no_optimize` for why it is a parameter.
+    pub let optimize: fn(FuncProto, int) -> void
+
+    #: The file's source text, so an assert can bake in its condition. Null
+    #: falls back to the bare `"assertion failed"`, as the C does.
+    pub var source: str?
+    #: Enum declarations this file imported, by the name they are bound to here.
+    #: An enum pattern needs the variant's tag, which is the declaration's
+    #: variant order and for an imported enum lives in another file. The C reads
+    #: it out of the checker's registry (`jaiTypeDeclFind` in
+    #: `src/codegen/codegen_pattern.c`); here the checker hands the enums over.
+    pub var imported_enums: dict[str, Node]
+    var stack: list[FnCtx]
+    var enums: dict[str, Node]
+    #: The METHOD names of each class whose body is being lowered, innermost
+    #: last. `_call` needs it to tell `self.m()` -- a real method -- from
+    #: `self.f()`, a field that happens to hold a callable; see the tail-call
+    #: note there. Methods only: a getter's `self.g()` calls what the getter
+    #: RETURNS, and an inherited method is not in this class's own list, so
+    #: both keep the old shape rather than being answered wrongly.
+    var class_methods: list[list[str]]
+
+    #: Create an emitter over `resolution`, reporting into `bag`.
+    pub fn init(
+        self,
+        resolution: Resolution,
+        bag: DiagnosticBag,
+        strip_asserts: bool = false,
+        opt_level: int = 2,
+        optimize: fn(FuncProto, int) -> void = _no_optimize
+    ) {
+        self.resolution = resolution
+        self.bag = bag
+        self.strip_asserts = strip_asserts
+        self.opt_level = opt_level
+        self.optimize = optimize
+        self.source = null
+        self.imported_enums = {}
+        self.stack = []
+        self.enums = {}
+        self.class_methods = []
+    }
+
+    #: Lower `program` and return the module body's function record.
+    pub fn compile_program(self, program: Node, module_name: str? = null) -> FuncProto {
+        let proto = FuncProto(module_name ?? "__main__", 0, 0)
+        for name in self.imported_enums.keys() { self.enums[name] = self.imported_enums[name] }
+        self._index_enums(program.child_list("stmts"))
+        self.stack.push(FnCtx(proto, self.resolution.slot_count(program)))
+        let stmts = program.child_list("stmts")
+        for statement in stmts {
+            if statement.kind == NodeKind.FnDecl { self._stmt(statement) }
+        }
+        for statement in stmts {
+            if statement.kind != NodeKind.FnDecl { self._stmt(statement) }
+        }
+        self._run_defers(program.span)
+        self._op(Op.ReturnNull, program.span)
+        self._finish()
+        return proto
+    }
+
+    fn _finish(self) -> void {
+        let ctx = self._ctx()
+        ctx.proto.max_slots = ctx.max_slot + ctx.proto.chunk.max_depth
+        self.optimize(ctx.proto, self.opt_level)
+        self.stack.pop()
+    }
+
+    fn _index_enums(self, stmts: list[Node]) -> void {
+        for node in stmts {
+            if node.kind == NodeKind.EnumDecl {
+                self.enums[node.text("name")] = node
+            } elif node.kind == NodeKind.Block {
+                self._index_enums(node.child_list("stmts"))
+            }
+        }
+    }
+
+    fn _chunk(self) -> Chunk { return self.stack[self.stack.len() - 1].proto.chunk }
+
+    fn _ctx(self) -> FnCtx { return self.stack[self.stack.len() - 1] }
+
+    fn _op(self, op: Op, span: Span) -> int {
+        return self._chunk().write_op(op, span)
+    }
+
+    fn _op_u8(self, op: Op, value: int, span: Span) -> void {
+        self._chunk().write_op(op, span)
+        self._chunk().write_byte(value)
+    }
+
+    fn _op_u16(self, op: Op, value: int, span: Span) -> void {
+        self._chunk().write_op(op, span)
+        self._chunk().write_u16(value)
+    }
+
+    fn _op_k(self, op: Op, index: int, span: Span) -> void {
+        self._chunk().write_op(op, span)
+        self._chunk().write_u24(index)
+    }
+
+    fn _op_cached(self, op: Op, index: int, span: Span) -> void {
+        self._chunk().write_op(op, span)
+        self._chunk().write_u24(index)
+        self._chunk().write_u16(self._chunk().add_cache())
+    }
+
+    fn _string(self, text: str) -> int {
+        return self._chunk().add_constant(Const(ConstTag.Str, text))
+    }
+
+    fn _depth(self) -> int { return self._chunk().depth }
+
+    fn _adjust(self, delta: int) -> void { self._chunk().adjust(delta) }
+
+    fn _set_depth(self, value: int) -> void { self._chunk().set_depth(value) }
+
+    fn _pop_n(self, count: int, span: Span) -> void {
+        var left = count
+        while left > 0 {
+            if left == 1 {
+                self._op(Op.Pop, span)
+                return
+            }
+            let step = if left > 255 { 255 } else { left }
+            self._op_u8(Op.PopN, step, span)
+            self._adjust(-step)
+            left -= step
+        }
+    }
+
+    fn _alloc_temp(self) -> int {
+        let ctx = self._ctx()
+        let slot = ctx.next_temp
+        ctx.next_temp += 1
+        if ctx.next_temp > ctx.max_slot { ctx.max_slot = ctx.next_temp }
+        return slot
+    }
+
+    fn _free_temps(self, count: int) -> void {
+        let ctx = self._ctx()
+        ctx.next_temp -= count
+        if ctx.next_temp < 0 { ctx.next_temp = 0 }
+    }
+
+    fn _get_local(self, slot: int, span: Span) -> void {
+        self._op_u16(Op.GetLocal, if slot < 0 { 0 } else { slot }, span)
+    }
+
+    fn _emit_int(self, value: int, span: Span) -> void {
+        if value >= -32768 and value <= 32767 {
+            self._chunk().write_op(Op.Int, span)
+            self._chunk().write_i16(value)
+            return
+        }
+        self._op_k(Op.Const, self._chunk().add_constant(Const(ConstTag.Int, value)), span)
+    }
+
+    fn _bind_local(self, slot: int, span: Span) -> void {
+        self._op_u16(Op.Bind, if slot < 0 { 0 } else { slot }, span)
+    }
+
+    fn _emit_jump(self, op: Op, span: Span) -> int {
+        self._chunk().write_op(op, span)
+        let operand = self._chunk().here()
+        self._chunk().write_u16(0)
+        return operand
+    }
+
+    fn _patch(self, operand: int) -> void {
+        self._patch_from(operand, operand + 2)
+    }
+
+    fn _patch_from(self, operand: int, base: int) -> void {
+        self._chunk().patch_i16(operand, self._chunk().here() - base)
+    }
+
+    fn _patch_all(self, operands: list[int]) -> void {
+        for operand in operands { self._patch(operand) }
+    }
+
+    fn _loop_back(self, target: int, span: Span) -> void {
+        self._chunk().write_op(Op.Loop, span)
+        let operand = self._chunk().here()
+        self._chunk().write_i16(target - (operand + 2))
+    }
+
+    fn _unsupported(self, span: Span, what: str) -> void {
+        self.bag.error(
+            SemaCode.E0902_INTERNAL_ERROR,
+            span,
+            f"the self-hosted back end cannot lower {what}"
+        )
+    }
+
+    fn _load_name(self, node: Node, name: str) -> void {
+        self._load_symbol(self.resolution.symbol_of(node), name, node.span)
+    }
+
+    fn _load_symbol(self, symbol: Symbol?, name: str, span: Span) -> void {
+        if symbol == null {
+            self._op_cached(Op.GetGlobal, self._string(name), span)
+            return
+        }
+        if symbol.is_slotted() {
+            self._get_local(symbol.slot, span)
+        } elif symbol.kind == SymbolKind.Upvalue {
+            self._op_u8(Op.GetUpvalue, if symbol.slot < 0 { 0 } else { symbol.slot }, span)
+        } elif symbol.kind == SymbolKind.Field {
+            self._op_u16(Op.GetLocal, 0, span)
+            self._op_cached(Op.GetField, self._string(symbol.name), span)
+        } else {
+            self._op_cached(Op.GetGlobal, self._string(symbol.name), span)
+        }
+    }
+
+    fn _store_symbol(self, symbol: Symbol?, name: str, span: Span, declaring: bool) -> void {
+        if symbol == null or _symbol_is_global_like(symbol) {
+            let bound = if symbol == null { name } else { symbol.name }
+            if declaring {
+                self._op_k(Op.DefGlobal, self._string(bound), span)
+            } else {
+                self._op_cached(Op.SetGlobal, self._string(bound), span)
+                self._op(Op.Pop, span)
+            }
+            return
+        }
+        if symbol.is_slotted() {
+            self._bind_local(symbol.slot, span)
+        } elif symbol.kind == SymbolKind.Upvalue {
+            self._op_u8(Op.SetUpvalue, if symbol.slot < 0 { 0 } else { symbol.slot }, span)
+            self._op(Op.Pop, span)
+        } else {
+            self._op_u16(Op.GetLocal, 0, span)
+            self._op(Op.Swap, span)
+            self._op_cached(Op.SetField, self._string(symbol.name), span)
+        }
+    }
+
+    fn _bind_pattern(self, pattern: Node?, span: Span) -> void {
+        if pattern == null {
+            self._op(Op.Pop, span)
+            return
+        }
+        let kind = pattern.kind
+        if kind == NodeKind.PatWildcard {
+            self._op(Op.Pop, span)
+        } elif kind == NodeKind.PatBind {
+            let symbol = self.resolution.symbol_of(pattern)
+            if symbol == null or symbol.kind == SymbolKind.Global {
+                let name = if symbol == null { pattern.text("name") } else { symbol.name }
+                self._op_k(Op.DefGlobal, self._string(name), span)
+            } elif symbol.kind == SymbolKind.Upvalue {
+                self._op_u8(Op.SetUpvalue, symbol.slot, span)
+                self._op(Op.Pop, span)
+            } else {
+                self._op_u16(Op.Bind, symbol.slot, span)
+            }
+        } elif kind == NodeKind.PatTuple or kind == NodeKind.PatList {
+            let elements = pattern.child_list("elems")
+            let rest = pattern.number("restIndex")
+            self._chunk().write_op(Op.Unpack, span)
+            self._chunk().write_byte(elements.len())
+            self._chunk().write_byte(if rest < 0 { 255 } else { rest })
+            self._adjust(elements.len() - 1)
+            for element in elements { self._bind_pattern(element, span) }
+        } else {
+            self._unsupported(pattern.span, "this pattern in a binding position")
+            self._op(Op.Pop, span)
+        }
+    }
+
+    fn _each_expr(self, nodes: list[Node]) -> void {
+        for node in nodes { self._expr(node) }
+    }
+
+    fn _expr(self, node: Node?) -> void {
+        if node == null {
+            self._op(Op.Null, Span.none())
+            return
+        }
+        let span = node.span
+        match node.kind {
+            NodeKind.IntLit => { self._emit_int(node.number("intLit"), span) }
+            NodeKind.FloatLit => {
+                self._op_k(
+                    Op.Const,
+                    self._chunk().add_constant(Const(ConstTag.Float, node.get("floatLit"))),
+                    span
+                )
+            }
+            NodeKind.StrLit => { self._op_k(Op.Const, self._string(node.text("chars")), span) }
+            NodeKind.BoolLit => {
+                self._op(if node.flag("boolLit") { Op.True } else { Op.False }, span)
+            }
+            NodeKind.NullLit => { self._op(Op.Null, span) }
+            NodeKind.FString => { self._fstring(node) }
+            NodeKind.Ident => { self._load_name(node, node.text("name")) }
+            NodeKind.Self | NodeKind.Super => {
+                let captured = self.resolution.symbol_of(node)
+                if captured == null {
+                    self._op_u16(Op.GetLocal, 0, span)
+                } else {
+                    self._load_symbol(captured, "self", span)
+                }
+            }
+            NodeKind.ListLit => { self._sequence_literal(node, Op.BuildList) }
+            NodeKind.SetLit => { self._sequence_literal(node, Op.BuildSet) }
+            NodeKind.TupleLit => { self._sequence_literal(node, Op.BuildTuple) }
+            NodeKind.DictLit => {
+                let keys = node.child_list("keys")
+                let values = node.child_list("values")
+                for (index, key) in keys.enumerate() {
+                    self._expr(key)
+                    self._expr(values[index])
+                }
+                self._op_u16(Op.BuildDict, keys.len(), span)
+                self._adjust(-2 * keys.len() + 1)
+            }
+            NodeKind.Unary => {
+                self._expr(node.child("operand"))
+                self._op(_unary_op(node.op()), span)
+            }
+            NodeKind.Binary => {
+                self._expr(node.child("left"))
+                self._expr(node.child("right"))
+                self._op(_binary_op(node.op()), span)
+            }
+            NodeKind.Logical => { self._logical(node) }
+            NodeKind.CompareChain => { self._chain(node) }
+            NodeKind.Ternary | NodeKind.IfExpr => {
+                self._expr(node.child("cond"))
+                let otherwise = self._emit_jump(Op.JumpIfFalse, span)
+                let base = self._depth()
+                self._branch_value(_then_of(node), span)
+                let done = self._emit_jump(Op.Jump, span)
+                self._set_depth(base)
+                self._patch(otherwise)
+                self._branch_value(_else_of(node), span)
+                self._set_depth(base + 1)
+                self._patch(done)
+            }
+            NodeKind.Coalesce => {
+                self._expr(node.child("left"))
+                let absent = self._emit_jump(Op.JumpIfNull, span)
+                let done = self._emit_jump(Op.Jump, span)
+                let base = self._depth() - 1
+                self._set_depth(base + 1)
+                self._patch(absent)
+                self._op(Op.Pop, span)
+                self._expr(node.child("right"))
+                self._set_depth(base + 1)
+                self._patch(done)
+            }
+            NodeKind.Call => { self._call(node) }
+            NodeKind.Index => {
+                self._expr(node.child("object"))
+                if not self.resolution.is_type_args(node) {
+                    self._expr(node.child("index"))
+                    self._op(Op.GetIndex, span)
+                }
+            }
+            NodeKind.Slice => {
+                self._expr(node.child("object"))
+                let before = self._depth()
+                self._op_u8(Op.GetSlice, self._slice_parts(node), span)
+                self._set_depth(before)  # object out, one slice in
+            }
+            NodeKind.Member => {
+                let object = node.require("object")
+                if object.kind == NodeKind.Super {
+                    self._op_u16(Op.GetLocal, 0, span)
+                    self._op_k(Op.GetSuper, self._string(node.text("name")), span)
+                } else {
+                    self._expr(object)
+                    self._op_cached(Op.GetField, self._string(node.text("name")), span)
+                }
+            }
+            NodeKind.OptMember => {
+                self._expr(node.child("object"))
+                let absent = self._emit_jump(Op.JumpIfNull, span)
+                self._op_cached(Op.GetField, self._string(node.text("name")), span)
+                self._patch(absent)
+            }
+            NodeKind.Lambda | NodeKind.AnonFn => { self._closure(node, null, 0) }
+            NodeKind.Comprehension => { self._comprehension(node) }
+            NodeKind.Range => {
+                self._expr(node.child("start"))
+                self._expr(node.child("stop"))
+                self._op_u8(Op.BuildRange, if node.flag("inclusive") { 1 } else { 0 }, span)
+            }
+            NodeKind.MatchExpr => { self._match(node, true) }
+            NodeKind.Cast => {
+                self._expr(node.child("operand"))
+                if node.flag("widen") {
+                    self._op(Op.ToFloat, span)
+                } else {
+                    let target = node.type_field("target")
+                    self._op_k(Op.TypeGuard, self._type_guard_const(target), span)
+                }
+            }
+            NodeKind.ThrowExpr => {
+                self._expr(node.child("operand"))
+                self._op(Op.Throw, span)
+            }
+            NodeKind.Block => { self._block_expr(node) }
+            NodeKind.Yield => {
+                self._unsupported(span, "`yield`: the instruction set has no generators")
+                self._op(Op.Null, span)
+            }
+            NodeKind.Await => {
+                self._unsupported(span, "`await`: the instruction set has no coroutines")
+                self._op(Op.Null, span)
+            }
+            _ => {
+                self._unsupported(span, f"{node.kind} in expression position")
+                self._op(Op.Null, span)
+            }
+        }
+    }
+
+    fn _fstring(self, node: Node) -> void {
+        let span = node.span
+        let parts = node.child_list("parts")
+        if parts.len() == 0 {
+            self._op_k(Op.Const, self._string(""), span)
+            return
+        }
+        if parts.len() == 1 and parts[0].kind == NodeKind.StrLit {
+            self._expr(parts[0])
+            return
+        }
+
+        if parts.len() <= FMT_MAX_PARTS {
+            var litmask = 0
+            for (index, part) in parts.enumerate() {
+                if part.kind == NodeKind.StrLit { litmask = litmask | 1 << index }
+                self._expr(part)
+            }
+            self._chunk().write_op(Op.Format, span)
+            self._chunk().write_byte(parts.len())
+            self._chunk().write_u24(litmask)
+            self._chunk().write_u24(self._string("str"))
+            self._chunk().write_u16(self._chunk().add_cache())
+            self._adjust(-parts.len() + 1)
+            return
+        }
+
+        self._op_k(Op.Const, self._string(""), span)
+        for part in parts { self._fstring_part(part) }
+        self._op_u16(Op.BuildList, parts.len(), span)
+        self._adjust(-parts.len() + 1)
+        self._invoke_name("join", 1, span)
+    }
+
+    fn _fstring_part(self, part: Node) -> void {
+        if part.kind == NodeKind.StrLit {
+            self._expr(part)
+            return
+        }
+        self._op_cached(Op.GetGlobal, self._string("str"), part.span)
+        self._expr(part)
+        self._op_u8(Op.Call, 1, part.span)
+        self._adjust(-1)
+    }
+
+    fn _logical(self, node: Node) -> void {
+        self._expr(node.child("left"))
+        var keep = Op.JumpIfTrueKeep
+        if node.op() == OpKind.And { keep = Op.JumpIfFalseKeep }
+        let short_circuit = self._emit_jump(keep, node.span)
+        self._op(Op.Pop, node.span)
+        self._expr(node.child("right"))
+        self._patch(short_circuit)
+    }
+
+    fn _chain(self, node: Node) -> void {
+        let span = node.span
+        let operands = node.child_list("operands")
+        let ops: list[OpKind] = node.get("ops")
+        if ops.len() == 0 {
+            self._expr(operands[0])
+            return
+        }
+
+        let temp = if ops.len() > 1 { self._alloc_temp() } else { -1 }
+        var short_circuit: list[int] = []
+        let base = self._depth()
+
+        self._expr(operands[0])
+        for (index, op) in ops.enumerate() {
+            self._expr(operands[index + 1])
+            if index + 1 < ops.len() {
+                self._op_u16(Op.SetLocal, temp, span)  # peeks: keeps the operand
+            }
+            self._op(_binary_op(op), span)
+            if index + 1 < ops.len() {
+                short_circuit.push(self._emit_jump(Op.JumpIfFalseKeep, span))
+                self._op(Op.Pop, span)
+                self._get_local(temp, span)
+            }
+        }
+
+        self._set_depth(base + 1)
+        self._patch_all(short_circuit)
+        if temp >= 0 { self._free_temps(1) }
+    }
+
+    fn _sequence_literal(self, node: Node, build: Op) -> void {
+        let items = node.child_list("items")
+        self._each_expr(items)
+        self._op_u16(build, items.len(), node.span)
+        self._adjust(-items.len() + 1)
+    }
+
+    fn _slice_parts(self, node: Node) -> int {
+        var flags = 0
+        if node.child("start") != null {
+            self._expr(node.child("start"))
+            flags = flags | 1
+        }
+        if node.child("stop") != null {
+            self._expr(node.child("stop"))
+            flags = flags | 2
+        }
+        if node.child("step") != null {
+            self._expr(node.child("step"))
+            flags = flags | 4
+        }
+        return flags
+    }
+
+    fn _call(self, node: Node, tail: bool = false) -> void {
+        let span = node.span
+        let callee = node.require("callee")
+        var keywords: list[str] = []
+        var positional: list[Node] = []
+        var spread: Node? = null
+
+        for argument in node.records("args") {
+            let value: Node = argument["value"]
+            if argument["isSpread"] {
+                spread = value
+            } elif argument["name"] != null {
+                keywords.push(argument["name"])
+            } else {
+                positional.push(value)
+            }
+        }
+
+        if callee.kind == NodeKind.Super {
+            self._super_call(node, "init", positional, span)
+            return
+        }
+        if callee.kind == NodeKind.Member and callee.require("object").kind == NodeKind.Super {
+            self._super_call(node, callee.text("name"), positional, span)
+            return
+        }
+
+        #: `return self.m(x)` is an INVOKE, not a tail call.
+        #:
+        #: `Op.TailCall` reuses the caller's frame only when the callee passes
+        #: `IS_CLOSURE`, and `self.m` puts a BOUND METHOD in the callee slot --
+        #: an ObjBound is not a closure, so the test fails and the call is
+        #: handed straight back to the ordinary path. Checked, not assumed: a
+        #: class whose method tail-calls itself two million times still dies at
+        #: 1024 frames, exactly as it does with this change. So for a genuine
+        #: method the tail form bought nothing and cost the compiled tier the
+        #: whole enclosing body -- `self._at` lowers as a FIELD read, the
+        #: function tier's `jaiClassFieldInfo` does not find a method there, and
+        #: the body declines at `OP_GET_FIELD_LOCAL`. The invoke shape compiles
+        #: through the direct-method path that already existed.
+        #:
+        #: Measured old against new, alternating, best of 30 timed runs each,
+        #: under scripts/gpu_lock.sh: a method-per-iteration probe 1369ms ->
+        #: 413ms (3.3x); tests/bench/json_parse, which has two `return
+        #: self.method()` sites, 955ms -> 709ms (1.35x); a cold `check` of
+        #: parser.jai, where the front end's own `_peek`/`_at` are the inner
+        #: loop, 881ms -> 842ms (4.5%).
+        #:
+        #: NARROW ON PURPOSE, and narrower than `self.` alone. A member of
+        #: anything else may be a module function or a static, and a member of
+        #: `self` may be a callable FIELD -- `lib/std/iter/mod.jai:712`,
+        #: `lib/std/core.jai:578` and `lib/jaithon/compile/check/ctx.jai:551`
+        #: all hold one. Those ARE plain closures and DO reuse the frame today,
+        #: so turning them into invokes would both give up real tail calls and
+        #: silently change which callee a subclass field shadows. Requiring the
+        #: name to be a method of the enclosing class costs nothing that exists
+        #: -- an inherited method simply keeps the old shape -- and keeps the
+        #: whole measured win, because every site that pays for it is a genuine
+        #: method.
+        #:
+        #: Ruled out as the alternative: fusing the field read and the call
+        #: inside the JIT instead. It needs the model to hold a receiver where
+        #: the interpreter's stack holds a bound method, and every guard between
+        #: the two writes that model out to a deopt record, so the record would
+        #: have to rematerialise an ObjBound from a stub that allocates.
+        var self_method = false
+        if callee.kind == NodeKind.Member and callee.require("object").kind == NodeKind.Self {
+            if self.class_methods.len() > 0 {
+                let own = self.class_methods[self.class_methods.len() - 1]
+                self_method = callee.text("name") in own
+            }
+        }
+        if callee.kind == NodeKind.Member and
+            keywords.len() == 0 and
+            spread == null and
+            (not tail or self_method) {
+            self._expr(callee.require("object"))
+            self._each_expr(positional)
+            self._invoke_name(callee.text("name"), positional.len(), span)
+            return
+        }
+
+        var opt_skip = -1
+        var is_tail = tail
+        if callee.kind == NodeKind.OptMember {
+            self._expr(callee.require("object"))
+            opt_skip = self._emit_jump(Op.JumpIfNull, span)
+            self._op_cached(Op.GetField, self._string(callee.text("name")), span)
+            is_tail = false
+        } else {
+            self._expr(callee)
+        }
+
+        self._each_expr(positional)
+        if spread != null {
+            self._expr(spread)
+            self._op_u8(Op.CallSpread, positional.len() + 1, span)
+            self._adjust(-(positional.len() + 1))
+            if opt_skip >= 0 { self._patch(opt_skip) }
+            return
+        }
+        if keywords.len() > 0 {
+            var names: list[Const] = []
+            for name in keywords { names.push(Const(ConstTag.Str, name)) }
+            var keyword_count = 0
+            for argument in node.records("args") {
+                if argument["name"] != null {
+                    self._expr(argument["value"])
+                    keyword_count += 1
+                }
+            }
+            self._chunk().write_op(Op.CallKw, span)
+            self._chunk().write_byte(positional.len())
+            self._chunk().write_u24(self._chunk().add_constant(Const(ConstTag.Tuple, names)))
+            self._adjust(-(positional.len() + keyword_count))
+            if opt_skip >= 0 { self._patch(opt_skip) }
+            return
+        }
+        self._op_u8(if is_tail { Op.TailCall } else { Op.Call }, positional.len(), span)
+        self._adjust(-positional.len())
+        if opt_skip >= 0 { self._patch(opt_skip) }
+    }
+
+    fn _super_call(self, node: Node, method: str, positional: list[Node], span: Span) -> void {
+        self._op_u16(Op.GetLocal, 0, span)
+        self._each_expr(positional)
+        self._chunk().write_op(Op.SuperInvoke, span)
+        self._chunk().write_u24(self._string(method))
+        self._chunk().write_byte(positional.len())
+        self._adjust(-positional.len())
+    }
+
+    fn _invoke_name(self, name: str, argc: int, span: Span) -> void {
+        let index = self._string(name)
+        let cache = self._chunk().add_cache()
+        self._chunk().write_op(Op.Invoke, span)
+        self._chunk().write_u24(index)
+        self._chunk().write_byte(argc)
+        self._chunk().write_u16(cache)
+        self._adjust(-argc)
+    }
+
+    fn _block_expr(self, node: Node) -> void {
+        let close_at = self.resolution.capture_base_of(node)
+        let saved = self._enter_close_scope(close_at)
+        self._block_expr_contents(node)
+        self._close_scope(close_at, node.span)
+        self._ctx().close_base = saved
+    }
+
+    fn _block_expr_contents(self, node: Node) -> void {
+        let stmts = node.child_list("stmts")
+        if stmts.len() == 0 {
+            self._op(Op.Null, node.span)
+            return
+        }
+        var index = 0
+        while index < stmts.len() - 1 {
+            self._stmt(stmts[index])
+            index += 1
+        }
+        let last = stmts[stmts.len() - 1]
+        if last.kind == NodeKind.ExprStmt {
+            self._expr(last.child("expr"))
+            return
+        }
+        if last.kind == NodeKind.Match or
+            last.kind == NodeKind.If and last.child("elseBranch") != null {
+            self._branch_value(last, last.span)
+            return
+        }
+        self._stmt(last)
+        self._op(Op.Null, node.span)
+    }
+
+    fn _branch_value(self, branch: Node?, span: Span) -> void {
+        if branch == null {
+            self._op(Op.Null, span)
+            return
+        }
+        if branch.kind == NodeKind.Block {
+            self._block_expr(branch)
+            return
+        }
+        if branch.kind == NodeKind.Match {
+            self._match(branch, true)
+            return
+        }
+        if branch.kind == NodeKind.If {
+            let base = self._depth()
+            self._expr(branch.child("cond"))
+            let otherwise = self._emit_jump(Op.JumpIfFalse, span)
+            self._branch_value(branch.child("thenBranch"), span)
+            let done = self._emit_jump(Op.Jump, span)
+            self._set_depth(base)
+            self._patch(otherwise)
+            self._branch_value(branch.child("elseBranch"), span)
+            self._set_depth(base + 1)
+            self._patch(done)
+            return
+        }
+        self._expr(branch)
+    }
+
+    fn _comprehension(self, node: Node) -> void {
+        let span = node.span
+        let clauses = node.records("clauses")
+        let kind: CompKind = node.get("compKind")
+        if kind == CompKind.Generator {
+            self._unsupported(span, "a generator expression: it needs a coroutine")
+        }
+        if kind == CompKind.Dict {
+            self._op_u16(Op.BuildDict, 0, span)
+        } elif kind == CompKind.Set {
+            self._op_u16(Op.BuildSet, 0, span)
+        } else {
+            self._op_u16(Op.BuildList, 0, span)
+        }
+        self._adjust(1)
+        let container_depth = self._depth() - 1
+
+        var starts: list[int] = []
+        var exits: list[int] = []
+        var before_iter: list[int] = []
+        var skips: list[list[int]] = []
+        var is_range: list[bool] = []
+        var range_temps: list[int] = []
+        for clause in clauses {
+            before_iter.push(self._depth())
+            let iterable: Node = clause["iterable"]
+            let pattern: Node = clause["pattern"]
+            if iterable.kind == NodeKind.Range and self._range_bind_slot(pattern, false) >= 0 {
+                is_range.push(true)
+                let wildcard = pattern.kind == NodeKind.PatWildcard
+                let counter = self._alloc_temp()
+                let end = self._alloc_temp()
+                let slot = self._range_bind_slot(pattern, wildcard)
+                self._expr(iterable.child("start"))
+                self._expr(iterable.child("stop"))
+                self._chunk().write_op(Op.IterRange, span)
+                self._chunk().write_byte(if iterable.flag("inclusive") { 1 } else { 0 })
+                self._chunk().write_u16(counter)
+                self._chunk().write_u16(end)
+                starts.push(self._chunk().here())
+                self._chunk().write_op(Op.ForRangeBind, span)
+                exits.push(self._chunk().here())
+                self._chunk().write_u16(0)
+                self._chunk().write_u16(slot)
+                self._chunk().write_u16(counter)
+                self._chunk().write_u16(end)
+                range_temps.push(if wildcard { 3 } else { 2 })
+            } else {
+                is_range.push(false)
+                range_temps.push(0)
+                if _is_items_call(iterable) {
+                    self._items_iterable(iterable, span)
+                } else {
+                    self._expr(iterable)
+                    self._op(Op.GetIter, span)
+                }
+                starts.push(self._chunk().here())
+                exits.push(self._emit_jump(Op.ForIter, span))
+                self._adjust(1)
+                self._bind_pattern(pattern, span)
+            }
+            var failures: list[int] = []
+            let conditions: list[Node] = clause["conditions"]
+            for condition in conditions {
+                self._expr(condition)
+                failures.push(self._emit_jump(Op.JumpIfFalse, span))
+            }
+            skips.push(failures)
+        }
+
+        if kind == CompKind.Dict {
+            self._expr(node.child("keyExpr"))
+            self._expr(node.child("element"))
+            self._op_u16(Op.DictInsert, self._depth() - 1 - container_depth, span)
+        } elif kind == CompKind.Set {
+            self._expr(node.child("element"))
+            self._op_u16(Op.SetAdd, self._depth() - 1 - container_depth, span)
+        } else {
+            self._expr(node.child("element"))
+            self._op_u16(Op.ListAppend, self._depth() - 1 - container_depth, span)
+        }
+
+        var index = clauses.len() - 1
+        while index >= 0 {
+            self._patch_all(skips[index])
+            self._loop_back(starts[index], span)
+            self._set_depth(before_iter[index])
+            if is_range[index] {
+                self._patch_from(exits[index], exits[index] + 8)
+                self._free_temps(range_temps[index])
+            } else {
+                self._patch(exits[index])
+            }
+            index -= 1
+        }
+    }
+
+    fn _closure(self, node: Node, name: str?, extra_flags: int) -> int {
+        let index = self._function_constant(node, name, extra_flags)
+        self._emit_closure(node, index)
+        return index
+    }
+
+    fn _emit_closure(self, node: Node, index: int) -> void {
+        self._op_k(Op.Closure, index, node.span)
+        let scope = self.resolution.scope_of(node)
+        if scope == null { return }
+        for upvalue in scope.upvalues {
+            var how = if upvalue.is_local { 1 } else { 0 }
+            if upvalue.by_value { how = how | 2 }
+            self._chunk().write_byte(how)
+            self._chunk().write_u16(upvalue.index)
+        }
+    }
+
+    fn _function_constant(
+        self,
+        node: Node,
+        name: str?,
+        extra_flags: int,
+        init_fields: list[any]? = null
+    ) -> int {
+        let scope = self.resolution.scope_of(node)
+        var arity = 0
+        var flags = extra_flags
+        if node.flag("isStatic") { flags = flags | FN_STATIC }
+        if node.flag("isGenerator") { flags = flags | FN_GENERATOR }
+        if node.flag("isAsync") { flags = flags | FN_ASYNC }
+        if node.has("decorators") {
+            let decorators = node.get("decorators")
+            if decorators is not null {
+                for decorator in decorators {
+                    if decorator == "trace" { flags = flags | FN_TRACE }
+                    if decorator == "gpu_kernel" or decorator == "mps_graph" {
+                        flags = flags | FN_GPU_KERNEL
+                    }
+                }
+            }
+        }
+
+        var names: list[str] = []
+        var defaults: list[Node] = []
+        for param in node.records("params") {
+            if param["name"] == "self" { continue }
+            names.push(param["name"])
+            if param["isVariadic"] {
+                flags = flags | FN_VARIADIC
+            } elif param["isKwRest"] {
+                flags = flags | FN_KWREST
+            } else {
+                arity += 1
+                if param["defaultValue"] != null { defaults.push(param["defaultValue"]) }
+            }
+        }
+
+        let proto = FuncProto((name ?? node.opt_text("name")) ?? "<anonymous>", arity, flags)
+        proto.upvalue_count = if scope == null { 0 } else { scope.upvalues.len() }
+        proto.param_names = names
+
+        var locals = self.resolution.slot_count(node)
+        if locals < node.records("params").len() + 1 {
+            locals = node.records("params").len() + 1
+        }
+        self.stack.push(FnCtx(proto, locals))
+
+        self._default_thunks(proto, defaults, node)
+        if init_fields != null { self._field_defaults(init_fields) }
+
+        let body = node.child("body")
+        if body == null {
+            self._op(Op.ReturnNull, node.span)
+        } elif node.flag("isExprBody") or body.kind != NodeKind.Block {
+            self._expr(body)
+            self._run_defers(node.span)
+            self._op(Op.Return, node.span)
+        } else {
+            self._stmt(body)
+            self._run_defers(node.span)
+            self._op(Op.ReturnNull, node.span)
+        }
+
+        self._finish()
+        return self._chunk().add_constant(Const(ConstTag.Func, proto))
+    }
+
+    fn _default_thunks(self, proto: FuncProto, defaults: list[Node], node: Node) -> void {
+        if defaults.len() == 0 { return }
+        let to_body = self._emit_jump(Op.Jump, node.span)
+        for default_value in defaults {
+            proto.default_offsets.push(self._chunk().here())
+            let depth = self._depth()
+            self._expr(default_value)
+            self._op(Op.Return, default_value.span)
+            self._set_depth(depth)
+        }
+        self._patch(to_body)
+    }
+
+    fn _field_defaults(self, fields: list[any]) -> void {
+        for field in fields {
+            if field["defaultValue"] == null or field["isStatic"] { continue }
+            let field_span: Span = field["span"]
+            self._op_u16(Op.GetLocal, 0, field_span)
+            self._expr(field["defaultValue"])
+            self._op_cached(Op.SetField, self._string(field["name"]), field_span)
+        }
+    }
+
+    fn _class_spec(
+        self,
+        kind: int,
+        name: str,
+        super_name: str?,
+        is_abstract: bool,
+        required: list[Const],
+        variants: list[Const]
+    ) -> int {
+        var items: list[Const] = [Const(ConstTag.Int, kind), Const(ConstTag.Str, name), if super_name == null {
+            Const(ConstTag.Null, null)
+        } else {
+            Const(ConstTag.Str, super_name)
+        }, Const(ConstTag.Bool, is_abstract), Const(ConstTag.Tuple, required), Const(ConstTag.Tuple, variants)]
+        return self._chunk().add_constant(Const(ConstTag.Tuple, items))
+    }
+
+    fn _class_decl(self, node: Node) -> void {
+        let span = node.span
+        let name = node.text("name")
+        let superclass = node.type_field("superclass")
+        let super_name = superclass?.name
+
+        if super_name != null {
+            self._op_cached(Op.GetGlobal, self._string(super_name), span)
+        }
+        self._op_k(
+            Op.Class,
+            self._class_spec(SPEC_CLASS, name, super_name, node.flag("isAbstract"), [], []),
+            span
+        )
+        if super_name != null {
+            self._op(Op.Inherit, span)
+            self._op(Op.SwapPop, span)
+        }
+
+        for trait_type in node.type_list("traits") {
+            self._op_k(Op.ImplTrait, self._string(trait_type.name ?? ""), span)
+        }
+
+        var type_params: list[str] = []
+        for generic in node.records("generics") {
+            let generic_name = generic["name"]
+            if generic_name != null { type_params.push(generic_name) }
+        }
+
+        let fields = node.records("fields")
+        for field in fields {
+            var bits = _visibility_code(field["visibility"]) & 0x3
+            if field["isStatic"] { bits = bits | 4 }
+            if field["isLet"] { bits = bits | 8 }
+            bits = bits | (_field_kind_code(field["type"], type_params) & 0xF) << 4
+            self._chunk().write_op(Op.FieldDef, field["span"])
+            self._chunk().write_u24(self._string(field["name"]))
+            self._chunk().write_byte(bits)
+        }
+
+        for field in fields {
+            if not field["isStatic"] or field["defaultValue"] == null { continue }
+            let field_span: Span = field["span"]
+            self._op(Op.Dup, field_span)
+            self._expr(field["defaultValue"])
+            self._op_cached(Op.SetField, self._string(field["name"]), field_span)
+        }
+
+        var init: Node? = null
+        for method in node.child_list("methods") {
+            if method.opt_text("name") == "init" {
+                init = method
+                break
+            }
+        }
+        var needs_init = init == null
+        if needs_init {
+            needs_init = false
+            for field in fields {
+                if field["defaultValue"] != null and not field["isStatic"] {
+                    needs_init = true
+                    break
+                }
+            }
+        }
+
+        var own_methods: list[str] = []
+        for method in node.child_list("methods") {
+            let method_name = method.opt_text("name")
+            if method_name != null { own_methods.push(method_name) }
+        }
+        self.class_methods.push(own_methods)
+        for method in node.child_list("methods") {
+            let own = if method is init { fields } else { null }
+            self._method(method, FN_METHOD, own)
+        }
+        for getter in node.child_list("getters") {
+            self._method(getter, FN_METHOD | FN_GETTER, null)
+        }
+        for setter in node.child_list("setters") {
+            self._method(setter, FN_METHOD | FN_SETTER, null)
+        }
+        self.class_methods.pop()
+
+        if needs_init {
+            let synthetic = Node(NodeKind.FnDecl, {"name": "init"}, span)
+            let index = self._function_constant(synthetic, "init", FN_METHOD, fields)
+            self._op_k(Op.Closure, index, span)
+            self._chunk().write_op(Op.Method, span)
+            self._chunk().write_u24(self._string("init"))
+            self._chunk().write_byte(FN_METHOD)
+            self._chunk().write_byte(_visibility_code(Visibility.Public))
+        }
+
+        self._define(node, name, span)
+    }
+
+    fn _method(self, method: Node, flags: int, init_fields: list[any]?) -> void {
+        let span = method.span
+        var combined = flags
+        if method.flag("isStatic") { combined = combined | FN_STATIC }
+        if method.flag("isGenerator") { combined = combined | FN_GENERATOR }
+        if method.flag("isAsync") { combined = combined | FN_ASYNC }
+        let name = method.text("name")
+        let index = self._function_constant(method, name, combined, init_fields)
+        self._emit_closure(method, index)
+        self._chunk().write_op(Op.Method, span)
+        self._chunk().write_u24(self._string(name))
+        self._chunk().write_byte(combined & 0xFF)
+        self._chunk().write_byte(_visibility_code(method.visibility()))
+    }
+
+    fn _enum_decl(self, node: Node) -> void {
+        let span = node.span
+        let name = node.text("name")
+        self.enums[name] = node
+
+        var variants: list[Const] = []
+        for variant in node.records("variants") {
+            variants.push(Const(ConstTag.Str, variant["name"]))
+            var field_names: list[Const] = []
+            for param in variant["params"] {
+                field_names.push(Const(ConstTag.Str, param["name"] ?? ""))
+            }
+            variants.push(Const(ConstTag.Tuple, field_names))
+        }
+        self._op_k(Op.Class, self._class_spec(SPEC_ENUM, name, null, false, [], variants), span)
+        for method in node.child_list("methods") { self._method(method, FN_METHOD, null) }
+        self._define(node, name, span)
+    }
+
+    fn _trait_decl(self, node: Node) -> void {
+        let span = node.span
+        let name = node.text("name")
+
+        var required: list[Const] = []
+        for method in node.child_list("methods") {
+            if method.child("body") != null { continue }
+            required.push(Const(ConstTag.Str, method.opt_text("name") ?? ""))
+            required.push(Const(ConstTag.Int, method.records("params").len()))
+        }
+        self._op_k(Op.Class, self._class_spec(SPEC_TRAIT, name, null, false, required, []), span)
+        for super_trait in node.type_list("supers") {
+            self._op_k(Op.ImplTrait, self._string(super_trait.name ?? ""), span)
+        }
+        for method in node.child_list("methods") {
+            if method.child("body") == null { continue }  # defaults only
+            self._method(method, FN_METHOD, null)
+        }
+        self._define(node, name, span)
+    }
+
+    fn _define(self, node: Node, name: str?, span: Span) -> void {
+        let symbol = self.resolution.symbol_of(node)
+        self._store_symbol(symbol, name ?? "_", span, true)
+        if symbol != null and symbol.visibility == Visibility.Public {
+            self._op_k(Op.Export, self._string(symbol.name), span)
+        }
+    }
+
+    fn _stmt(self, node: Node?) -> void {
+        if node == null { return }
+        let span = node.span
+        match node.kind {
+            NodeKind.ExprStmt => {
+                self._expr(node.child("expr"))
+                self._op(Op.Pop, span)
+            }
+            NodeKind.VarDecl => {
+                self._expr(node.child("init"))
+                let pattern = node.child("pattern")
+                if pattern != null and pattern.kind == NodeKind.PatBind {
+                    let packed = _container_kind_code(node.type_field("declaredType"))
+                    if packed != 0 {
+                        self._chunk().write_op(Op.ElemKind, span)
+                        self._chunk().write_byte(packed)
+                    }
+                }
+                self._bind_pattern(pattern, span)
+                let symbol = self.resolution.symbol_of(node)
+                if symbol != null and
+                    symbol.visibility == Visibility.Public and
+                    pattern != null and
+                    pattern.kind == NodeKind.PatBind {
+                    self._op_k(Op.Export, self._string(symbol.name), span)
+                }
+            }
+            NodeKind.Assign => { self._assign(node) }
+            NodeKind.Block => {
+                let close_at = self.resolution.capture_base_of(node)
+                let saved = self._enter_close_scope(close_at)
+                for statement in node.child_list("stmts") { self._stmt(statement) }
+                self._close_scope(close_at, span)
+                self._ctx().close_base = saved
+            }
+            NodeKind.If => {
+                let base = self._depth()
+                self._expr(node.child("cond"))
+                let otherwise = self._emit_jump(Op.JumpIfFalse, span)
+                self._stmt(node.child("thenBranch"))
+                if node.child("elseBranch") == null {
+                    self._set_depth(base)
+                    self._patch(otherwise)
+                } else {
+                    let done = self._emit_jump(Op.Jump, span)
+                    self._set_depth(base)
+                    self._patch(otherwise)
+                    self._stmt(node.child("elseBranch"))
+                    self._set_depth(base)
+                    self._patch(done)
+                }
+            }
+            NodeKind.While => {
+                let base = self._depth()
+                let start = self._chunk().here()
+                self._expr(node.child("cond"))
+                let exit = self._emit_jump(Op.JumpIfFalse, span)
+                self._body_of_loop(node, start, base, base)
+                self._loop_back(start, span)
+                self._set_depth(base)
+                self._patch(exit)
+                self._close_loop()
+            }
+            NodeKind.Loop => {
+                let base = self._depth()
+                let start = self._chunk().here()
+                self._body_of_loop(node, start, base, base)
+                self._loop_back(start, span)
+                self._close_loop()
+            }
+            NodeKind.For => { self._for(node) }
+            NodeKind.Match => { self._match(node, false) }
+            NodeKind.Break | NodeKind.Continue => { self._jump(node) }
+            NodeKind.Return => {
+                let value = node.child("value")
+                if value == null {
+                    self._close_scope(self._return_close_base(), span)
+                    self._finally_chain_for_return()
+                    self._run_defers(span)
+                    self._op(Op.ReturnNull, span)
+                } elif self._can_tail_call(value) {
+                    self._call(value, true)
+                    self._op(Op.Return, span)
+                } else {
+                    self._expr(value)
+                    self._close_scope(self._return_close_base(), span)
+                    self._finally_chain_for_return()
+                    self._run_defers(span)
+                    self._op(Op.Return, span)
+                }
+            }
+            NodeKind.Throw => {
+                self._expr(node.child("value"))
+                self._op(Op.Throw, span)
+            }
+            NodeKind.Try => { self._try(node) }
+            NodeKind.Defer => {
+                let parent = self._ctx()
+                let proto = FuncProto("defer", 0, 0)
+                proto.upvalue_count = parent.proto.upvalue_count
+                self.stack.push(FnCtx(proto, parent.next_temp))
+                self._ctx().max_slot = parent.max_slot
+                self._ctx().protect_depth = 1
+                self._stmt(node.child("body"))
+                self._op(Op.ReturnNull, span)
+                parent.proto.chunk.raise_max_depth(proto.chunk.max_depth)
+                self._finish()
+                self._op_k(Op.PushDefer, self._chunk().add_constant(Const(ConstTag.Func, proto)), span)
+                parent.has_defer = true
+            }
+            NodeKind.Assert => {
+                if self.strip_asserts { return }
+                self._expr(node.child("cond"))
+                let ok = self._emit_jump(Op.JumpIfTrue, span)
+                self._op_k(Op.AssertFail, self._string(_assert_message(node, self.source)), span)
+                self._patch(ok)
+            }
+            NodeKind.FnDecl => {
+                self._closure(node, node.opt_text("name"), 0)
+                self._define(node, node.opt_text("name"), span)
+            }
+            NodeKind.ClassDecl => { self._class_decl(node) }
+            NodeKind.EnumDecl => { self._enum_decl(node) }
+            NodeKind.TraitDecl => { self._trait_decl(node) }
+            NodeKind.Import => {
+                self._op_k(Op.Import, self._string(node.text("path")), span)
+                self._define(node, _last_segment(node.opt_text("alias") ?? node.text("path")), span)
+            }
+            NodeKind.FromImport => { self._from_import(node) }
+            NodeKind.Export => {
+                let names: list[str?] = node.get("names")
+                for name in names {
+                    if name != null { self._op_k(Op.Export, self._string(name), span) }
+                }
+            }
+            # Aliases erase at use sites (spec §2.3), but `from M import Alias`
+            # resolves against M's globals/exports at run time, so a public
+            # alias still needs a binding here or import fails with E0802.
+            NodeKind.TypeDecl => {
+                if node.visibility() == Visibility.Public {
+                    let index = self._string(node.text("name"))
+                    self._op(Op.Null, span)
+                    self._op_k(Op.DefGlobal, index, span)
+                    self._op_k(Op.Export, index, span)
+                }
+            }
+            NodeKind.ModuleDecl => { }
+            _ => {
+                self._expr(node)
+                self._op(Op.Pop, span)
+            }
+        }
+    }
+
+    fn _assign(self, node: Node) -> void {
+        let span = node.span
+        let target = node.require("target")
+        let value = node.child("value")
+        let compound = node.flag("isCompound")
+
+        if target.kind == NodeKind.Ident {
+            if compound {
+                self._load_name(target, target.text("name"))
+                self._expr(value)
+                self._op(_binary_op(node.op()), span)
+            } else {
+                self._expr(value)
+            }
+            self._store_symbol(self.resolution.symbol_of(target), target.text("name"), span, false)
+        } elif target.kind == NodeKind.Member {
+            let field = self._string(target.text("name"))
+            self._expr(target.child("object"))
+            if compound {
+                self._op(Op.Dup, span)
+                self._op_cached(Op.GetField, field, span)
+                self._expr(value)
+                self._op(_binary_op(node.op()), span)
+            } else {
+                self._expr(value)
+            }
+            self._op_cached(Op.SetField, field, span)
+        } elif target.kind == NodeKind.Index {
+            self._expr(target.child("object"))
+            self._expr(target.child("index"))
+            if compound {
+                self._op(Op.Dup2, span)
+                self._op(Op.GetIndex, span)
+                self._expr(value)
+                self._op(_binary_op(node.op()), span)
+            } else {
+                self._expr(value)
+            }
+            self._op(Op.SetIndex, span)
+        } elif target.kind == NodeKind.Slice {
+            self._expr(target.child("object"))
+            let before = self._depth()
+            let flags = self._slice_parts(target)
+            self._expr(value)
+            self._op_u8(Op.SetSlice, flags, span)
+            self._set_depth(before - 1)  # object, bounds and value all go
+        } else {
+            self._expr(value)
+            self._bind_pattern(target, span)
+        }
+    }
+
+    fn _body_of_loop(
+        self,
+        node: Node,
+        continue_target: int,
+        continue_depth: int,
+        break_depth: int
+    ) -> void {
+        let base = self.resolution.capture_base_of(node)
+        self._enter_loop(node.opt_text("label"), continue_target, base, continue_depth, break_depth)
+        self._loop_body(node.child("body"))
+        self._close_iteration(base, node.span)
+    }
+
+    fn _enter_loop(
+        self,
+        label: str?,
+        continue_target: int,
+        base: int,
+        continue_depth: int,
+        break_depth: int
+    ) -> void {
+        let ctx = self._ctx()
+        ctx.loops.push(LoopFrame(label, continue_target, base, continue_depth, break_depth))
+        if base >= 0 and (ctx.deep_close_base < 0 or base < ctx.deep_close_base) {
+            ctx.deep_close_base = base
+        }
+    }
+
+    fn _loop_body(self, body: Node?) -> void {
+        if body == null { return }
+        if body.kind != NodeKind.Block {
+            self._stmt(body)
+            return
+        }
+        for statement in body.child_list("stmts") { self._stmt(statement) }
+    }
+
+    fn _close_loop(self) -> void {
+        let frame = self._ctx().loops.pop()
+        self._set_depth(frame.break_depth)
+        self._patch_all(frame.breaks)
+    }
+
+    fn _close_scope(self, base: int, span: Span) -> void {
+        if base < 0 { return }
+        self._op_u16(Op.CloseUpvalue, base, span)
+    }
+
+    fn _close_iteration(self, base: int, span: Span) -> void {
+        self._close_scope(base, span)
+    }
+
+    fn _enter_close_scope(self, base: int) -> int {
+        let ctx = self._ctx()
+        let saved = ctx.close_base
+        if base >= 0 {
+            if ctx.close_base < 0 or base < ctx.close_base { ctx.close_base = base }
+            if ctx.deep_close_base < 0 or base < ctx.deep_close_base {
+                ctx.deep_close_base = base
+            }
+        }
+        return saved
+    }
+
+    fn _return_close_base(self) -> int {
+        var base = self._ctx().close_base
+        let loops = self._close_base_through(0)
+        if loops >= 0 and (base < 0 or loops < base) { base = loops }
+        return base
+    }
+
+    fn _finally_chain_for_loop(self, index: int) -> void {
+        let ctx = self._ctx()
+        var position = ctx.finallys.len() - 1
+        while position >= 0 and ctx.finally_loop_depth[position] > index + 1 {
+            self._stmt(ctx.finallys[position])
+            position -= 1
+        }
+    }
+
+    fn _can_tail_call(self, value: Node) -> bool {
+        if value.kind != NodeKind.Call { return false }
+        let ctx = self._ctx()
+        if ctx.protect_depth > 0 or ctx.has_defer { return false }
+        if ctx.proto.flags & FN_GENERATOR != 0 { return false }
+        if ctx.finallys.len() > 0 { return false }
+
+        let callee = value.child("callee")
+        if callee == null { return false }
+        if callee.kind == NodeKind.Super { return false }
+        if callee.kind == NodeKind.Member and callee.require("object").kind == NodeKind.Super {
+            return false
+        }
+        for argument in value.records("args") {
+            if argument["isSpread"] { return false }
+            if argument["name"] != null { return false }
+        }
+        return true
+    }
+
+    fn _run_defers(self, span: Span) -> void {
+        if self._ctx().has_defer { self._op(Op.RunDefers, span) }
+    }
+
+    fn _finally_chain_for_return(self) -> void {
+        let ctx = self._ctx()
+        var position = ctx.finallys.len() - 1
+        while position >= 0 {
+            self._stmt(ctx.finallys[position])
+            position -= 1
+        }
+    }
+
+    fn _close_base_through(self, target: int) -> int {
+        let loops = self._ctx().loops
+        var base = -1
+        var index = loops.len() - 1
+        while index >= target {
+            let candidate = loops[index].capture_base
+            if candidate >= 0 and (base < 0 or candidate < base) { base = candidate }
+            index -= 1
+        }
+        return base
+    }
+
+    #: `X.items()` as a loop iterable: take the lazy path when X turns out to
+    #: be a dict, and otherwise fall through to the ordinary call so a user
+    #: class's own `items()` still runs. The branch is the opcode's, because
+    #: this file cannot know X's type — see `_is_items_call`.
+    fn _items_iterable(self, iterable: Node?, span: Span) -> void {
+        self._expr(_items_receiver(iterable))
+        let skip = self._emit_jump(Op.GetIterItems, span)
+        self._invoke_name("items", 0, span)
+        self._op(Op.GetIter, span)
+        self._patch(skip)
+    }
+
+    #: The frame slot `for <pattern> in <range>` binds each value into, or -1
+    #: when the pattern is not one `OP_FOR_RANGE_BIND` can carry.
+    #:
+    #: It carries a slot number and nothing else, so a global, an upvalue and a
+    #: destructuring pattern all fall back to the general loop — a range never
+    #: yields anything unpackable anyway, so the tuple case is an error program
+    #: either way and belongs on the path that reports it.
+    #:
+    #: A wildcard has no symbol and needs a destination nothing will read, so it
+    #: takes a temporary — but only when `allocate` says this call is the one
+    #: about to emit the loop, not the one deciding whether to.
+    fn _range_bind_slot(self, pattern: Node?, allocate: bool) -> int {
+        if pattern == null { return -1 }
+        if pattern.kind == NodeKind.PatWildcard {
+            return if allocate { self._alloc_temp() } else { 0 }
+        }
+        if pattern.kind != NodeKind.PatBind { return -1 }
+        let symbol = self.resolution.symbol_of(pattern)
+        if symbol == null or not symbol.is_slotted() { return -1 }
+        return symbol.slot
+    }
+
+    #: `for x in a..b` with no ObjRange and no ObjIter: two int temporaries hold
+    #: the counter and the end, and nothing is pushed at all.
+    #:
+    #: The saving is per loop ENTRY, which is why it is worth an opcode pair: an
+    #: allocation census found the two objects a range loop's header builds were
+    #: 99.95% of everything `tests/bench/nbody` allocated and 98.5% of
+    #: `matrix_mul`'s. Measured at ~15.7ns per entry on an M2 Max, two thirds of
+    #: it the allocation itself and a third the collections it forces.
+    #:
+    #: Emitted here rather than fused from bytecode — unlike `FOR_ITER_PAIR`,
+    #: which is a peephole rule — because the loop stops occupying an operand
+    #: stack slot, and `break` unwinds to a depth only this function knows.
+    #:
+    #: Answers false, having emitted nothing, for a loop that is not this shape:
+    #: the range must be written out at the loop (one reaching it through a
+    #: variable already built its object, so there is nothing left to save) and
+    #: it must bind to a single frame slot.
+    fn _for_range(self, node: Node, iterable: Node?) -> bool {
+        if iterable == null or iterable.kind != NodeKind.Range { return false }
+        let pattern = node.child("pattern")
+        if self._range_bind_slot(pattern, false) < 0 { return false }
+        let span = node.span
+        let base = self._depth()
+        let wildcard = pattern != null and pattern.kind == NodeKind.PatWildcard
+        let counter = self._alloc_temp()
+        let end = self._alloc_temp()
+        let slot = self._range_bind_slot(pattern, wildcard)
+        self._expr(iterable.child("start"))
+        self._expr(iterable.child("stop"))
+        self._chunk().write_op(Op.IterRange, span)
+        self._chunk().write_byte(if iterable.flag("inclusive") { 1 } else { 0 })
+        self._chunk().write_u16(counter)
+        self._chunk().write_u16(end)
+
+        let start = self._chunk().here()
+        self._chunk().write_op(Op.ForRangeBind, span)
+        let exit = self._chunk().here()
+        self._chunk().write_u16(0)
+        self._chunk().write_u16(slot)
+        self._chunk().write_u16(counter)
+        self._chunk().write_u16(end)
+
+        let capture_base = self.resolution.capture_base_of(node)
+        self._enter_loop(node.opt_text("label"), start, capture_base, base, base)
+        self._loop_body(node.child("body"))
+        self._close_iteration(capture_base, span)
+        self._loop_back(start, span)
+        self._set_depth(base)
+        # The displacement is measured from the end of the instruction, which is
+        # six bytes past its own operand rather than the usual zero.
+        self._patch_from(exit, exit + 8)
+        self._close_loop()
+        self._free_temps(if wildcard { 3 } else { 2 })
+        return true
+    }
+
+    fn _for(self, node: Node) -> void {
+        let span = node.span
+        let base = self._depth()
+        let iterable = node.child("iterable")
+        if self._for_range(node, iterable) { return }
+        if _is_items_call(iterable) {
+            self._items_iterable(iterable, span)
+        } else {
+            self._expr(iterable)
+            self._op(Op.GetIter, span)
+        }
+        let start = self._chunk().here()
+        let exit = self._emit_jump(Op.ForIter, span)
+        self._adjust(1)
+        let capture_base = self.resolution.capture_base_of(node)
+        self._enter_loop(node.opt_text("label"), start, capture_base, base + 1, base)
+        self._bind_pattern(node.child("pattern"), span)
+        self._loop_body(node.child("body"))
+        self._close_iteration(capture_base, span)
+        self._loop_back(start, span)
+        self._set_depth(base)
+        self._patch(exit)
+        self._close_loop()
+    }
+
+    fn _jump(self, node: Node) -> void {
+        let loops = self._ctx().loops
+        let label = node.opt_text("label")
+        var index = loops.len() - 1
+        if label != null {
+            while index >= 0 and loops[index].label != label { index -= 1 }
+        }
+        if index < 0 {
+            self._unsupported(node.span, f"`break`/`continue` to `{label}`")
+            return
+        }
+        let frame = loops[index]
+        self._finally_chain_for_loop(index)
+        let saved = self._depth()
+        var want = frame.continue_depth
+        if node.kind == NodeKind.Break { want = frame.break_depth }
+        self._pop_n(saved - want, node.span)
+        self._close_iteration(self._close_base_through(index), node.span)
+        if node.kind == NodeKind.Break {
+            frame.breaks.push(self._emit_jump(Op.Jump, node.span))
+        } else {
+            self._loop_back(frame.continue_target, node.span)
+        }
+        self._set_depth(saved)
+    }
+
+    fn _push_handler(self, type_const: int, span: Span) -> int {
+        self._chunk().write_op(Op.PushHandler, span)
+        let operand = self._chunk().here()
+        self._chunk().write_u16(0)
+        self._chunk().write_u24(type_const)
+        return operand
+    }
+
+    fn _type_guard_const(self, caught: TypeExpr?) -> int {
+        if caught is not null and caught.kind == TypeKind.Union {
+            var names: list[Const] = []
+            for member in caught.args {
+                names.push(Const(ConstTag.Str, member.name ?? "any"))
+            }
+            return self._chunk().add_constant(Const(ConstTag.Tuple, names))
+        }
+        return self._string(caught?.name ?? "any")
+    }
+
+    fn _try(self, node: Node) -> void {
+        let span = node.span
+        let ctx = self._ctx()
+        let finally_block = node.child("finallyBlock")
+        let catches = node.records("catches")
+        let base = self._depth()
+
+        let dynamic = catches.len() > 0 and (base > 0 or finally_block != null)
+
+        var finally_entry = -1
+        if finally_block != null {
+            finally_entry = self._emit_jump(Op.PushFinally, span)
+            ctx.finallys.push(finally_block)
+            ctx.finally_loop_depth.push(ctx.loops.len())
+        }
+        var dispatch_entry = -1
+        if dynamic { dispatch_entry = self._push_handler(self._string("any"), span) }
+
+        let saved_deep = ctx.deep_close_base
+        ctx.deep_close_base = -1
+
+        let guarded_start = self._chunk().here()
+        ctx.protect_depth += 1
+        self._stmt(node.child("body"))
+        ctx.protect_depth -= 1
+        if dynamic { self._op(Op.PopHandler, span) }
+        let guarded_end = self._chunk().here()
+        let body_deep = ctx.deep_close_base
+
+        var done: list[int] = [self._emit_jump(Op.Jump, span)]
+
+        if dynamic {
+            self._patch_from(dispatch_entry, dispatch_entry + 5)
+            self._close_scope(body_deep, span)
+            self._catch_dispatch(catches, base, done, span)
+        } else {
+            for handler in catches {
+                let handler_span: Span = handler["span"]
+                let entry = self._chunk().here()
+                self._set_depth(base)
+                self._close_scope(body_deep, handler_span)
+
+                let types: list[TypeExpr] = handler["types"]
+                if types.len() == 0 {
+                    self._chunk().exceptions.push(
+                        ExceptionEntry(guarded_start, guarded_end, entry, CATCH_ALL)
+                    )
+                } else {
+                    for caught in types {
+                        self._chunk().exceptions.push(
+                            ExceptionEntry(
+                                guarded_start,
+                                guarded_end,
+                                entry,
+                                self._type_guard_const(caught)
+                            )
+                        )
+                    }
+                }
+                self._catch_body(handler, handler_span)
+                done.push(self._emit_jump(Op.Jump, handler_span))
+            }
+        }
+
+        let catches_end = self._chunk().here()
+
+        if finally_block != null {
+            ctx.finallys.pop()
+            ctx.finally_loop_depth.pop()
+
+            self._set_depth(base)
+            self._patch_all(done)
+            self._patch(finally_entry)
+
+            self._chunk().exceptions.push(
+                ExceptionEntry(guarded_start, catches_end, self._chunk().here(), CATCH_ALL)
+            )
+            self._close_scope(ctx.deep_close_base, span)
+
+            ctx.protect_depth += 1
+            self._stmt(finally_block)
+            ctx.protect_depth -= 1
+            self._op(Op.EndFinally, span)
+        } else {
+            self._set_depth(base)
+            self._patch_all(done)
+        }
+
+        if saved_deep >= 0 and (ctx.deep_close_base < 0 or saved_deep < ctx.deep_close_base) {
+            ctx.deep_close_base = saved_deep
+        }
+        self._set_depth(base)
+    }
+
+    fn _catch_dispatch(self, catches: list[any], base: int, done: list[int], span: Span) -> void {
+        var entries: list[list[int]] = []
+        self._set_depth(base)
+        for handler in catches {
+            let handler_span: Span = handler["span"]
+            var hits: list[int] = []
+            let types: list[TypeExpr] = handler["types"]
+            if types.len() == 0 {
+                hits.push(self._emit_jump(Op.Jump, handler_span))
+            } else {
+                for caught in types {
+                    self._op_k(Op.MatchExc, self._type_guard_const(caught), handler_span)
+                    hits.push(self._emit_jump(Op.JumpIfTrue, handler_span))
+                }
+            }
+            entries.push(hits)
+        }
+        self._op(Op.Reraise, span)
+
+        for (index, handler) in catches.enumerate() {
+            let handler_span: Span = handler["span"]
+            self._set_depth(base)
+            self._patch_all(entries[index])
+            self._catch_body(handler, handler_span)
+            done.push(self._emit_jump(Op.Jump, handler_span))
+        }
+    }
+
+    fn _catch_body(self, handler: any, handler_span: Span) -> void {
+        self._op(Op.GetExc, handler_span)
+        let symbol = self.resolution.symbol_of(handler)
+        if symbol != null or handler["name"] != null {
+            self._store_symbol(symbol, handler["name"] ?? "_", handler_span, symbol == null)
+        } else {
+            self._op(Op.Pop, handler_span)
+        }
+        let ctx = self._ctx()
+        ctx.protect_depth += 1
+        self._stmt(handler["body"])
+        ctx.protect_depth -= 1
+    }
+
+    fn _from_import(self, node: Node) -> void {
+        let span = node.span
+        self._op_k(Op.Import, self._string(node.text("path")), span)
+        if node.flag("isWildcard") {
+            self._op(Op.Pop, span)
+            self._unsupported(span, "`import *`: the loader needs an explicit name list")
+            return
+        }
+        for item in node.records("items") {
+            let item_span: Span = item["span"]
+            self._op_k(Op.ImportFrom, self._string(item["name"]), item_span)
+            let bound: str = item["alias"] ?? item["name"]
+            self._op_k(Op.DefGlobal, self._string(bound), item_span)
+        }
+        self._op(Op.Pop, span)
+    }
+
+    fn _match(self, node: Node, as_expression: bool) -> void {
+        let span = node.span
+        let base = self._depth()
+
+        self._expr(node.child("subject"))
+        let subject = self._alloc_temp()
+        self._bind_local(subject, span)
+
+        var done: list[int] = []
+        for arm in node.records("arms") {
+            let arm_span: Span = arm["span"]
+            var misses: list[int] = []
+            var guard_miss: list[int] = []
+
+            self._set_depth(base)
+            self._pattern_in_slot(arm["pattern"], subject, misses)
+
+            if arm["guard"] != null {
+                let guard: Node = arm["guard"]
+                self._expr(guard)
+                guard_miss.push(self._emit_jump(Op.JumpIfFalse, guard.span))
+            }
+
+            let body: Node? = arm["body"]
+            if as_expression {
+                if body != null and body.kind == NodeKind.Block {
+                    self._block_expr(body)
+                } else {
+                    self._expr(body)
+                }
+            } elif body != null {
+                if body.kind == NodeKind.Block or is_statement(body.kind) {
+                    self._stmt(body)
+                } else {
+                    self._expr(body)
+                    self._op(Op.Pop, arm_span)
+                }
+            }
+            done.push(self._emit_jump(Op.Jump, arm_span))
+
+            # A pattern miss arrives with the failed candidate still pushed.
+            self._set_depth(base + 1)
+            self._patch_all(misses)
+            self._op(Op.Pop, arm_span)
+            self._set_depth(base)
+            self._patch_all(guard_miss)
+        }
+
+        self._set_depth(base)
+        if as_expression {
+            # The checker proves exhaustiveness; this covers `any` subjects and
+            # keeps the join depth honest.
+            self._op_k(Op.AssertFail, self._string("no match arm matched"), span)
+            self._op(Op.Null, span)
+        }
+
+        self._set_depth(base + (if as_expression { 1 } else { 0 }))
+        self._patch_all(done)
+        self._free_temps(1)
+    }
+
+    fn _pattern_in_slot(self, pattern: Node?, slot: int, misses: list[int]) -> void {
+        if pattern == null { return }
+        let span = pattern.span
+        let kind = pattern.kind
+
+        if kind == NodeKind.PatWildcard {
+            return
+        } elif kind == NodeKind.PatBind {
+            let declared = pattern.type_field("type")
+            if declared != null {
+                self._get_local(slot, span)
+                self._chunk().write_op(Op.MatchTypePop, span)
+                self._chunk().write_u24(self._string(declared.name ?? "any"))
+                misses.push(self._reserve_jump())
+            }
+            let symbol = self.resolution.symbol_of(pattern)
+            if symbol == null and pattern.opt_text("name") == null { return }
+            self._get_local(slot, span)
+            self._store_symbol(symbol, pattern.opt_text("name") ?? "_", span, symbol == null)
+        } elif kind == NodeKind.PatLiteral {
+            # The success path always pops the subject copy right here -- see
+            # spec/BYTECODE.md's `MATCH_CONST_POP` entry -- so it is emitted
+            # fused rather than as MatchConst followed by a separate Pop.
+            self._get_local(slot, span)
+            self._chunk().write_op(Op.MatchConstPop, span)
+            self._chunk().write_u24(self._literal_constant(pattern.child("value")))
+            misses.push(self._reserve_jump())
+        } elif kind == NodeKind.PatRange {
+            self._get_local(slot, span)
+            self._chunk().write_op(Op.MatchRangePop, span)
+            self._chunk().write_u24(self._literal_constant(pattern.child("lo")))
+            self._chunk().write_u24(self._literal_constant(pattern.child("hi")))
+            self._chunk().write_byte(if pattern.flag("inclusive") { 1 } else { 0 })
+            misses.push(self._reserve_jump())
+        } elif kind == NodeKind.PatOr {
+            self._test_or(pattern, slot, misses)
+        } elif kind == NodeKind.PatTuple or kind == NodeKind.PatList {
+            self._test_sequence(pattern, slot, misses)
+        } elif kind == NodeKind.PatEnum {
+            self._test_enum(pattern, slot, misses)
+        } elif kind == NodeKind.PatClass {
+            self._test_class(pattern, slot, misses)
+        } else {
+            self._unsupported(span, f"the pattern {kind}")
+        }
+    }
+
+    fn _sub_pattern(self, sub: Node?, misses: list[int], span: Span) -> void {
+        if sub == null or sub.kind == NodeKind.PatWildcard {
+            self._op(Op.Pop, span)
+            return
+        }
+        if sub.kind == NodeKind.PatBind and sub.type_field("type") == null {
+            self._bind_pattern(sub, span)
+            return
+        }
+        let temp = self._alloc_temp()
+        self._bind_local(temp, span)
+        self._pattern_in_slot(sub, temp, misses)
+        self._free_temps(1)
+    }
+
+    fn _reserve_jump(self) -> int {
+        let operand = self._chunk().here()
+        self._chunk().write_u16(0)
+        return operand
+    }
+
+    fn _literal_constant(self, node: Node?) -> int {
+        if node == null { return self._chunk().add_constant(Const(ConstTag.Null, null)) }
+        match node.kind {
+            NodeKind.IntLit => {
+                return self._chunk().add_constant(Const(ConstTag.Int, node.number("intLit")))
+            }
+            NodeKind.FloatLit => {
+                return self._chunk().add_constant(Const(ConstTag.Float, node.get("floatLit")))
+            }
+            NodeKind.StrLit => { return self._string(node.text("chars")) }
+            NodeKind.BoolLit => {
+                return self._chunk().add_constant(Const(ConstTag.Bool, node.flag("boolLit")))
+            }
+            NodeKind.NullLit => { return self._chunk().add_constant(Const(ConstTag.Null, null)) }
+            _ => {
+                self._unsupported(node.span, "a non-literal pattern constant")
+                return self._chunk().add_constant(Const(ConstTag.Null, null))
+            }
+        }
+    }
+
+    fn _test_or(self, pattern: Node, slot: int, misses: list[int]) -> void {
+        let alternatives = pattern.child_list("elems")
+        if alternatives.len() == 0 { return }
+        var matched: list[int] = []
+        let base = self._depth()
+
+        for (index, alternative) in alternatives.enumerate() {
+            if index == alternatives.len() - 1 {
+                self._pattern_in_slot(alternative, slot, misses)
+                break
+            }
+            var local: list[int] = []
+            self._pattern_in_slot(alternative, slot, local)
+            matched.push(self._emit_jump(Op.Jump, pattern.span))
+            self._set_depth(base + 1)  # the failing candidate is still pushed
+            self._patch_all(local)
+            self._op(Op.Pop, pattern.span)
+        }
+
+        self._set_depth(base)
+        self._patch_all(matched)
+    }
+
+    fn _test_sequence(self, pattern: Node, slot: int, misses: list[int]) -> void {
+        let span = pattern.span
+        let elements = pattern.child_list("elems")
+        let rest = pattern.number("restIndex")
+        let count = elements.len()
+        let has_rest = rest >= 0
+        let fixed = if has_rest { count - 1 } else { count }
+        let tail = if has_rest { count - rest - 1 } else { 0 }
+
+        self._get_local(slot, span)
+        self._chunk().write_op(Op.MatchSeqPop, span)
+        self._chunk().write_byte(if fixed > 255 { 255 } else { fixed })
+        self._chunk().write_byte(if has_rest { 1 } else { 0 })
+        misses.push(self._reserve_jump())
+
+        for (index, element) in elements.enumerate() {
+            if has_rest and index == rest {
+                self._get_local(slot, span)
+                self._emit_int(rest, span)
+                var flags = 1
+                var pushed = 1
+                if tail > 0 {
+                    self._emit_int(-tail, span)
+                    flags = flags | 2
+                    pushed += 1
+                }
+                self._op_u8(Op.GetSlice, flags, span)
+                self._adjust(-pushed)
+            } else {
+                let offset = if has_rest and index > rest { index - count } else { index }
+                self._get_local(slot, span)
+                self._emit_int(offset, span)
+                self._op(Op.GetIndex, span)
+            }
+            self._sub_pattern(element, misses, span)
+        }
+    }
+
+    fn _test_enum(self, pattern: Node, slot: int, misses: list[int]) -> void {
+        let span = pattern.span
+        let owner = pattern.opt_text("typeName")
+        let variant = pattern.opt_text("variantName")
+        let tag = self._variant_tag(pattern)
+
+        self._get_local(slot, span)
+        self._chunk().write_op(Op.MatchTypePop, span)
+        if tag < 0 {
+            self._chunk().write_u24(self._string(f"{owner ?? "?"}.{variant ?? "?"}"))
+        } else {
+            self._chunk().write_u24(self._string(owner ?? "any"))
+        }
+        misses.push(self._reserve_jump())
+
+        if tag >= 0 {
+            self._get_local(slot, span)
+            self._op(Op.EnumTag, span)
+            self._op(Op.SwapPop, span)
+            self._chunk().write_op(Op.MatchConstPop, span)
+            self._chunk().write_u24(self._chunk().add_constant(Const(ConstTag.Int, tag)))
+            misses.push(self._reserve_jump())
+        }
+
+        for (index, element) in pattern.child_list("subPatterns").enumerate() {
+            self._get_local(slot, span)
+            self._op_u8(Op.EnumField, index, span)
+            self._op(Op.SwapPop, span)
+            self._sub_pattern(element, misses, span)
+        }
+    }
+
+    fn _test_class(self, pattern: Node, slot: int, misses: list[int]) -> void {
+        let span = pattern.span
+        let sub_patterns = pattern.child_list("subPatterns")
+
+        self._get_local(slot, span)
+        self._chunk().write_op(Op.MatchTypePop, span)
+        self._chunk().write_u24(self._string(pattern.opt_text("typeName") ?? "any"))
+        misses.push(self._reserve_jump())
+        if sub_patterns.len() == 0 { return }
+
+        var names: list[Const] = []
+        for index in range(sub_patterns.len()) {
+            names.push(Const(ConstTag.Str, _field_name(pattern, index)))
+        }
+        self._get_local(slot, span)
+        self._chunk().write_op(Op.MatchFields, span)
+        self._chunk().write_u24(self._chunk().add_constant(Const(ConstTag.Tuple, names)))
+        misses.push(self._reserve_jump())
+        self._adjust(sub_patterns.len())
+
+        var temps: list[int] = []
+        for _index in range(sub_patterns.len()) { temps.push(0) }
+        var index = sub_patterns.len() - 1
+        while index >= 0 {
+            temps[index] = self._alloc_temp()
+            self._bind_local(temps[index], span)
+            index -= 1
+        }
+        self._op(Op.Pop, span)
+
+        for (position, element) in sub_patterns.enumerate() {
+            self._pattern_in_slot(element, temps[position], misses)
+        }
+        self._free_temps(sub_patterns.len())
+    }
+
+    fn _variant_tag(self, pattern: Node) -> int {
+        let name = pattern.opt_text("variantName")
+        let owner = pattern.opt_text("typeName")
+        if name == null or owner == null { return -1 }
+        let decl = self.enums.get(owner, null)
+        if decl == null { return -1 }
+        for (tag, variant) in decl.records("variants").enumerate() {
+            if variant["name"] == name { return tag }
+        }
+        return -1
+    }
+}
+
+fn _symbol_is_global_like(symbol: Symbol) -> bool {
+    let kind = symbol.kind
+    return not (kind == SymbolKind.Local or kind == SymbolKind.Param or kind == SymbolKind.Upvalue or kind == SymbolKind.Field)
+}
+
+fn _visibility_code(visibility: Visibility) -> int {
+    if visibility == Visibility.Public { return 2 }
+    if visibility == Visibility.Protected { return 1 }
+    return 0
+}
+
+#: The declared kind of a field, for bits 4-7 of `OP_FIELD_DEF`'s info byte.
+#: Mirrors `FieldKind` in `src/vm/object/object.h`; 0 is `any`.
+#:
+#: A HINT, not a guarantee, and the VM guards on it rather than trusting it. So
+#: the safe direction is downward: anything this cannot name exactly comes out
+#: `any`, which claims nothing. A wrong claim is a false `TypeError` on correct
+#: code, which is far worse than a missed one.
+#:
+#: `T?` is `any` because a nullable holds `null`, and a bare type parameter is
+#: `any` because its type is not known here. `list[T]` is still `list`: the
+#: container is known even when its element is not.
+fn _field_kind_code(declared: TypeExpr?, type_params: list[str]) -> int {
+    if declared == null { return 0 }
+    let t: TypeExpr = declared
+
+    if t.kind == TypeKind.Name {
+        let n = t.name ?? ""
+        if type_params.contains(n) { return 0 }
+        if n == "int" { return 1 }
+        if n == "float" { return 2 }
+        if n == "bool" { return 3 }
+        if n == "str" { return 4 }
+        if n == "list" { return 5 }
+        if n == "dict" { return 6 }
+        if n == "any" { return 0 }
+        #: A user type name -- a class, an enum, a trait, or an alias for one.
+        #: Everything the language can put behind such a name is a heap object,
+        #: which is all code 8 claims. It is a hint for the compiled tier, which
+        #: guards it; the run-time check accepts everything for it, because
+        #: tightening a check that has always passed would reject code that
+        #: works today.
+        #:
+        #: A TYPE PARAMETER is excluded above and must stay excluded: `T` can be
+        #: an int.
+        return 8
+    }
+
+    if t.kind == TypeKind.Generic {
+        let n = t.name ?? ""
+        if n == "list" { return 5 }
+        if n == "dict" { return 6 }
+        return 0
+    }
+
+    return 0
+}
+
+#: The packed `OP_ELEM_KIND` byte for a declared container type, or 0 when the
+#: type is not a container or its element type cannot be named.
+#:
+#: Low nibble is the element (or dict value) kind, high nibble the dict key
+#: kind, both `FieldKind` codes. Zero means "promise nothing", which is what an
+#: untyped container carries and what makes the guard one compare on the common
+#: path.
+fn _container_kind_code(declared: TypeExpr?) -> int {
+    if declared == null { return 0 }
+    let t: TypeExpr = declared
+    if t.kind != TypeKind.Generic { return 0 }
+
+    let name = t.name ?? ""
+    if name == "list" {
+        if t.args.len() != 1 { return 0 }
+        return _field_kind_code(t.args[0], []) & 0xF
+    }
+    if name == "dict" {
+        if t.args.len() != 2 { return 0 }
+        let key = _field_kind_code(t.args[0], []) & 0xF
+        let value = _field_kind_code(t.args[1], []) & 0xF
+        return key << 4 | value
+    }
+    return 0
+}
+
+#: Emit the iterable of a `for` loop, leaving an iterator on the stack.
+#:
+#: `for … in X.items()` gets `OP_GET_ITER_ITEMS` applied to X rather than a call
+#: to `items()` followed by `OP_GET_ITER`. On a dict that iterates the table
+#: lazily instead of building the whole list of pairs first — `jaiDictItems`
+#: allocates an N-element list of N fresh 2-tuples per call and keeps all N
+#: alive at once, so every collection during the loop marks the lot.
+#:
+#: Matched on SHAPE only, because this file has no checker types. The opcode
+#: decides at run time what the receiver actually is, so a user class defining
+#: its own `items()` still gets that method called and behaves exactly as
+#: before.
+fn _is_items_call(iterable: Node?) -> bool {
+    if iterable == null { return false }
+    let node: Node = iterable
+    if node.kind != NodeKind.Call { return false }
+    if node.records("args").len() != 0 { return false }
+    let callee = node.child("callee")
+    if callee == null { return false }
+    let target: Node = callee
+    if target.kind != NodeKind.Member { return false }
+    if target.opt_text("name") != "items" { return false }
+    let receiver = target.child("object")
+    if receiver == null { return false }
+    let recv: Node = receiver
+    return recv.kind != NodeKind.Super
+}
+
+#: The receiver of an `X.items()` call matched by `_is_items_call`.
+fn _items_receiver(iterable: Node?) -> Node? {
+    if iterable == null { return null }
+    let node: Node = iterable
+    return node.child("callee")?.child("object")
+}
+
+fn _then_of(node: Node) -> Node? {
+    if node.kind == NodeKind.Ternary { return node.child("thenExpr") }
+    return node.child("thenBranch")
+}
+
+fn _else_of(node: Node) -> Node? {
+    if node.kind == NodeKind.Ternary { return node.child("elseExpr") }
+    return node.child("elseBranch")
+}
+
+fn _field_name(pattern: Node, index: int) -> str {
+    let names: list[str?] = pattern.get("fieldNames")
+    if index >= names.len() { return f"{index}" }
+    return names[index] ?? f"{index}"
+}
+
+fn _last_segment(path: str?) -> str? {
+    if path == null { return null }
+    let parts = path.split(".")
+    return parts[parts.len() - 1]
+}
+
+#: 256-byte buffer minus 32 reserved for prefix and terminator (`assertMessage`,
+#: src/codegen/codegen_stmt.c).
+const _ASSERT_TEXT_MAX: int = 224
+
+fn _assert_message(node: Node, source: str?) -> str {
+    let message = node.child("message")
+    if message != null and message.kind == NodeKind.StrLit { return message.text("chars") }
+
+    let cond = node.child("cond")
+    if source != null and cond != null and cond.span.is_known() {
+        let raw = __prim__.str_encode(source)
+        let start = cond.span.start
+        var stop = cond.span.end
+        if stop > start and stop <= raw.len() {
+            if stop - start > _ASSERT_TEXT_MAX { stop = start + _ASSERT_TEXT_MAX }
+            var taken: list[int] = []
+            var at = start
+            while at < stop {
+                taken.push(raw[at])
+                at += 1
+            }
+            return f"assertion failed: {_decoded(taken)}"
+        }
+    }
+    return "assertion failed"
+}
+
+fn _decoded(raw: list[int]) -> str {
+    var length = raw.len()
+    while length > 0 {
+        try {
+            return __prim__.str_decode(__prim__.bytes_new(raw[:length]))
+        } catch _invalid: ValueError {
+            length -= 1
+        }
+    }
+    return ""
+}
+
+fn _unary_op(op: OpKind) -> Op {
+    if op == OpKind.Neg { return Op.Neg }
+    if op == OpKind.Pos { return Op.Pos }
+    if op == OpKind.Not { return Op.Not }
+    return Op.BNot
+}
+
+fn _binary_op(op: OpKind) -> Op {
+    if op == OpKind.Add { return Op.Add }
+    if op == OpKind.Sub { return Op.Sub }
+    if op == OpKind.Mul { return Op.Mul }
+    if op == OpKind.Div { return Op.Div }
+    if op == OpKind.FloorDiv { return Op.FloorDiv }
+    if op == OpKind.Mod { return Op.Mod }
+    if op == OpKind.Pow { return Op.Pow }
+    if op == OpKind.AddWrap { return Op.AddWrap }
+    if op == OpKind.SubWrap { return Op.SubWrap }
+    if op == OpKind.MulWrap { return Op.MulWrap }
+    if op == OpKind.Band { return Op.BAnd }
+    if op == OpKind.Bor { return Op.BOr }
+    if op == OpKind.Bxor { return Op.BXor }
+    if op == OpKind.Shl { return Op.Shl }
+    if op == OpKind.Shr { return Op.Shr }
+    if op == OpKind.Eq { return Op.Eq }
+    if op == OpKind.Ne { return Op.Ne }
+    if op == OpKind.Lt { return Op.Lt }
+    if op == OpKind.Le { return Op.Le }
+    if op == OpKind.Gt { return Op.Gt }
+    if op == OpKind.Ge { return Op.Ge }
+    if op == OpKind.Is { return Op.Is }
+    if op == OpKind.IsNot { return Op.IsNot }
+    if op == OpKind.In { return Op.In }
+    if op == OpKind.NotIn { return Op.NotIn }
+    return Op.Add
+}
+
+#: Lower a resolved program and return the module body's function record.
+#:
+#: The record comes back even when a diagnostic was reported, so a caller can
+#: disassemble what was produced while reporting what was not.
+pub fn emit(
+    program: Node,
+    resolution: Resolution,
+    bag: DiagnosticBag,
+    strip_asserts: bool = false,
+    module_name: str? = null,
+    opt_level: int = 2,
+    optimize: fn(FuncProto, int) -> void = _no_optimize,
+    source: str? = null,
+    imported_enums: dict[str, Node] = {}
+) -> FuncProto {
+    let emitter = Emitter(resolution, bag, strip_asserts, opt_level, optimize)
+    emitter.source = source
+    emitter.imported_enums = imported_enums
+    return emitter.compile_program(program, module_name)
+}
+
+fn _no_optimize(proto: FuncProto, level: int) -> void { }
