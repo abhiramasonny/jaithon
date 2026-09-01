@@ -1144,6 +1144,14 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
 bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                   int stop);
 
+/* Defined in jit_body_iter.c. */
+bool emitGetIter(Emit *e, int *offp);
+bool emitIterRange(Emit *e, const uint8_t *code, int *offp);
+bool emitForRangeBind(Emit *e, const uint8_t *code, int *offp);
+bool emitGetIterItems(Emit *e, const uint8_t *code, int *offp, int stop);
+bool emitForIterBind(Emit *e, const uint8_t *code, int *offp);
+bool emitForIterPair(Emit *e, const uint8_t *code, int *offp);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
