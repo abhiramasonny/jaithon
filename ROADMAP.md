@@ -259,6 +259,16 @@ order is that each one is measured before the next is started. A fair target
 is 1 MB/s from 171 KB/s. Anyone claiming more than that before step 2 lands is
 repeating the mistake the four proposals made.
 
+### Landed so far (2026-09-01)
+
+* `ordinal()` on every enum value -- the 5-line builtin step 2 needed, plus
+  the checker rule, the surface gate's thirteenth receiver kind, and a spec
+  paragraph. A method the enum declares with that name still wins.
+* The four parser operator tables as ordinal-indexed lists: 37.3M -> 11.7M
+  instructions with a shared lookup helper, then inlined. Whole run
+  568.7M -> 525.8M before inlining. The 91 `if kind == TokenKind.X` chains in
+  `parse/` are the same fix and are next.
+
 ### What this says about the earlier plan
 
 Item 8, the total meet over `SlotKind`, was the end of the refusal chain for
