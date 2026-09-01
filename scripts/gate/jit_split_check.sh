@@ -13,8 +13,14 @@ RUNS=${SPLIT_CHECK_RUNS:-3}
 # what this gate is for is whether compiled code computes the same ANSWERS, and
 # those are the fields after it. Only that one field is blanked; the loss and
 # the checksum beside it are floats too and are compared exactly.
+# tests/bench/jaicv/pipeline.jai also prints `#  ceiling <ratio>x`, which is one
+# wall clock divided by another and so never repeats -- it made this gate fail
+# on every run regardless of what the tier did.
 strip_timings() {
-    awk -F'\t' 'BEGIN { OFS = "\t" } $1 == "jtb" && NF > 2 { $3 = "TIME" } { print }'
+    awk -F'\t' 'BEGIN { OFS = "\t" }
+         /^#[[:space:]]*ceiling / { print "#  ceiling TIME"; next }
+         $1 == "jtb" && NF > 2 { $3 = "TIME" }
+         { print }'
 }
 
 fail=0
