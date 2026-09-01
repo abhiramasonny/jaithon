@@ -403,7 +403,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check jit-fusion-check branch-table-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check linkage-check jit-fusion-check branch-table-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -474,6 +474,17 @@ opcode-check:
 .PHONY: exports-check
 exports-check:
 	@python3 scripts/exports_reachable_check.py
+
+# Splitting a file is when linkage gets widened: every helper the two halves
+# shared has to lose `static`, and nothing narrows it again. Nothing catches
+# that -- the compiler can only warn about `static`, and a function nothing
+# calls links fine. This reads `nm` over the object tree, which is the only
+# witness that survives a function whose ADDRESS is taken rather than called,
+# so the JIT's runtime thunks are not mistaken for dead. The one gate that is
+# not pure text: it needs the objects, hence the prerequisite.
+.PHONY: linkage-check
+linkage-check: $(OBJS)
+	@python3 scripts/gate/dead_code_check.py --build $(BUILD)
 
 # sum(jaiOpCounts) == vm.instructionCount, which is the only evidence that no
 # dispatch path skips the census. VM_NEXT_HINT skipped it and loop_sum's

@@ -1,0 +1,52 @@
+# Non-static functions in src/ that nothing outside their own .c
+# reaches, and prototypes nothing defines. `file-local` wants
+# `static`; `dead` wants deleting. Checked by
+# scripts/gate/dead_code_check.py, which explains what this is for.
+# The path is for a reader; only the verdict and the name are checked.
+# Regenerate with: scripts/gate/dead_code_check.py --write
+
+dead       jaiSeedCount                boot/seed.c
+file-local jaiCliDispatch              src/cli/main.c
+file-local jaiDiagCodeIsWarning        src/common/diag.c
+dead       jaiNameDistance             src/common/diag.c
+dead       jaiNameIsCloser             src/common/diag.c
+file-local jaiSourceLineText           src/common/diag.c
+dead       jaiSpanJoin                 src/common/diag.c
+file-local jaiArenaAlloc               src/common/memory.c
+dead       jaiArenaAllocZeroed         src/common/memory.c
+dead       jaiArenaFree                src/common/memory.c
+dead       jaiArenaInit                src/common/memory.c
+dead       jaiArenaMemdup              src/common/memory.c
+dead       jaiArenaReset               src/common/memory.c
+dead       jaiBufWriteI16              src/common/memory.c
+dead       jaiBufWriteU24              src/common/memory.c
+dead       jaiGpuDownload              src/native/apple/gpu_buffer.m
+dead       jaiProcessRun               src/native/posix/process.c
+dead       jaiStatPath                 src/native/posix/process.c
+dead       jaiParallelFor              src/native/posix/thread.c
+file-local jaiMethodTablesInit         src/runtime/builtins/builtins.c
+file-local jaiFormatValue              src/runtime/builtins/text/builtins_format.c
+file-local jaiFrontEndCall0            src/runtime/modules/frontend.c
+file-local jaiFrontEndField            src/runtime/modules/frontend.c
+dead       jaiResolveModulePathQuiet   src/runtime/modules/module_path.c
+dead       jaiChunkAddConstant         src/vm/bytecode/chunk.c
+file-local jaiChunkWrite               src/vm/bytecode/chunk.c
+dead       jaiChunkWriteI16            src/vm/bytecode/chunk.c
+file-local jaiChunkWriteU16            src/vm/bytecode/chunk.c
+dead       jaiChunkWriteU24            src/vm/bytecode/chunk.c
+dead       jaiCacheClear               src/vm/bytecode/serialize.c
+dead       jaiCacheLoad                src/vm/bytecode/serialize.c
+file-local jaiGCMarkArray              src/vm/gc.c
+file-local emitGlobalsGuard            src/vm/jit/jit_global.c
+file-local emitVersionBump             src/vm/jit/jit_global.c
+file-local globalClass                 src/vm/jit/jit_global.c
+file-local globalFunction              src/vm/jit/jit_global.c
+file-local globalIsSelf                src/vm/jit/jit_global.c
+file-local globalNamespace             src/vm/jit/jit_global.c
+file-local globalSlot                  src/vm/jit/jit_global.c
+file-local jaiStringChar               src/vm/object/object_string.c
+dead       jaiTableReserve             src/vm/table.c
+dead       jaiTraceOpCount             src/vm/trace/trace.c
+file-local enumMember                  src/vm/vm_class.c
+file-local jaiVMPrintStack             src/vm/vm_lifecycle.c
+file-local jaiVMResetStack             src/vm/vm_lifecycle.c
