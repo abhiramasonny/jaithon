@@ -185,6 +185,14 @@ def run_target(path):
     return proc.stdout, proc.stderr, proc.returncode
 
 
+def bare(label):
+    """The function's own name. The tier labels every diagnostic
+    `module.function` (jitFnLabel) so `init` is not five different rows in
+    a report; a `jit-compiles:` marker names the function as written in its
+    file, so the module prefix is dropped before comparing."""
+    return label.rsplit(".", 1)[-1]
+
+
 def collect_reached(stderr):
     """name -> set of arities seen compiled; name -> reached via osr."""
     compiled = {}
@@ -192,11 +200,11 @@ def collect_reached(stderr):
     for line in stderr.splitlines():
         m = COMPILED_RE.match(line)
         if m:
-            compiled.setdefault(m.group(1), set()).add(int(m.group(2)))
+            compiled.setdefault(bare(m.group(1)), set()).add(int(m.group(2)))
             continue
         m = OSR_RE.match(line)
         if m:
-            osr.add(m.group(1))
+            osr.add(bare(m.group(1)))
     return compiled, osr
 
 
