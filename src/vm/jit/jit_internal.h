@@ -1115,6 +1115,9 @@ bool emitCallOut(Emit *e, unsigned argc);
 void emitListElemStore(Emit *e, uint8_t stg, unsigned vtag,
                               unsigned rVal);
 
+/* Defined in jit_global.c. */
+bool retObjTypeOn(void);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
