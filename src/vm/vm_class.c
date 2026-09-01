@@ -307,6 +307,9 @@ bool getPropertyInto(Value receiver, ObjString *name, Value *out,
             *out = OBJ_VAL(jaiBoundNew(receiver, *out));
             return true;
         }
+        /* After the enum's own members, so a user method of the same name
+         * wins: the builtin table is what every enum value has by default. */
+        if (jaiBuiltinMethod(receiver, name, out)) return true;
         if (!raise) return false;
         return jaiThrow(vm.cAttributeError, "'%s' has no member '%.*s'",
                         jaiTypeNameStatic(receiver), (int)name->length, name->chars);

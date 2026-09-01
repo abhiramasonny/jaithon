@@ -77,6 +77,7 @@ RECEIVERS = {
     "iter": "[0].iter()",
     "file": '__prim__.io_open("/dev/null", "r")',
     "module": "probe_empty_module",
+    "enumval": "ProbeEnum.A",
 }
 
 # Implemented, callable, and named by no k*MethodNames[] array, so absent from
@@ -159,6 +160,8 @@ def ask_runtime(wanted):
     """
     lines = [
         "import probe_empty_module",
+        "",
+        "enum ProbeEnum { A, B }",
         "",
         "fn present(receiver: any, name: str) -> bool {",
         "    try {",

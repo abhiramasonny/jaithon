@@ -41,7 +41,7 @@ from jaithon.compile.check.substitute import mentions_generic_param, substitute
 from jaithon.compile.check.suggest import SUGGEST_NO_MATCH, closer, suggest_member
 from jaithon.compile.check.ty import MemberInfo, Type, TypeDecl
 from jaithon.compile.check.union import optional_of
-from jaithon.compile.check.universe import dict_of, list_of, set_of, tuple_of
+from jaithon.compile.check.universe import dict_of, fn_of, list_of, set_of, tuple_of
 from jaithon.compile.symbol import Symbol, SymbolKind
 
 #: A value does not fit the slot it is going into.
@@ -735,6 +735,12 @@ fn _lookup_member(
     }
 
     if inherits_opaquely(decl) { return (u.t_any, null) }
+    if decl.ty is not null and
+        decl.ty.kind == TyKind.Enum and
+        name == "ordinal" and
+        not static_access {
+        return (fn_of(u, [], u.t_int), null)
+    }
 
     let got = render(decl.ty)
     let d = c.error(E0410_UNKNOWN_MEMBER, site.span, f"`{got}` has no member `{name}`")

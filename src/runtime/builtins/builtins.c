@@ -422,6 +422,7 @@ static inline MethodLookup lookupFor(Value receiver) {
         case OBJ_FILE:   return jaiFileMethod;
         case OBJ_MODULE: return jaiModuleMethod;
         case OBJ_ITER:   return jaiIterMethod;
+        case OBJ_ENUM_VAL: return jaiEnumValMethod;
         default:         return NULL;
     }
 }
@@ -473,6 +474,9 @@ bool jaiBuiltinMethod(Value receiver, ObjString *name, Value *out) {
                     break;
                 case OBJ_ITER:
                     if (jaiIterMethod(receiver, name, out)) return true;
+                    break;
+                case OBJ_ENUM_VAL:
+                    if (jaiEnumValMethod(receiver, name, out)) return true;
                     break;
                 default:
                     break;
@@ -568,6 +572,9 @@ static const char *const kModuleMethodNames[] = {
 static const char *const kIterMethodNames[] = {
     "collect", "drop", "iter", "next", "take",
 };
+static const char *const kEnumValMethodNames[] = {
+    "ordinal",
+};
 
 #define NAME_TABLE(table)                                                      \
     do {                                                                       \
@@ -595,6 +602,7 @@ static const char *const *candidatesFor(Value receiver, int *count) {
     case OBJ_FILE:   NAME_TABLE(kFileMethodNames);
     case OBJ_MODULE: NAME_TABLE(kModuleMethodNames);
     case OBJ_ITER:   NAME_TABLE(kIterMethodNames);
+    case OBJ_ENUM_VAL: NAME_TABLE(kEnumValMethodNames);
     default:         return NULL;
     }
 }

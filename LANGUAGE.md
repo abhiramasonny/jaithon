@@ -397,6 +397,18 @@ fn eval(e: Expr) -> float {
 }
 ```
 
+Every enum value answers `ordinal()`, the variant's position in its
+declaration counted from zero. It is what makes a table indexed by variant
+possible where a `match` chain would compare one variant at a time:
+
+```jai
+enum Op { Add, Sub, Mul }
+let symbol = ["+", "-", "*"]
+symbol[Op.Mul.ordinal()]        # "*"
+```
+
+A method the enum declares with the same name takes precedence.
+
 ## Errors
 
 `throw` raises, `try` and `catch` handle. A handler catches subclasses too.

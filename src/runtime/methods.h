@@ -16,6 +16,7 @@ bool jaiFloatMethod(Value receiver, ObjString *name, Value *out);
 bool jaiFileMethod(Value receiver, ObjString *name, Value *out);
 bool jaiModuleMethod(Value receiver, ObjString *name, Value *out);
 bool jaiIterMethod(Value receiver, ObjString *name, Value *out);
+bool jaiEnumValMethod(Value receiver, ObjString *name, Value *out);
 
 bool jaiValueFormatMethod(Value receiver, ObjString *name, Value *out);
 
