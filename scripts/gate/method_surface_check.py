@@ -33,7 +33,9 @@ but every name it reports is then asked of a live `jaithon`, through
 and raises AttributeError exactly when that call would. It answers presence
 without calling anything, so `file.close` and `list.clear` are safe to probe.
 An earlier audit that trusted the regex alone reported 102 names; the empirical
-pass cut it to 46.
+pass cut it to 46. Because one side is read from source and the other from a
+binary, run it through `make method-surface-check` rather than by hand: a stale
+./jaithon answers for the builtins.c you have not rebuilt yet.
 
 What this does NOT check, because there is nothing to check: `jaithon check`
 never consults either table. `[1,2,3].totally_fake_method_xyz()` exits 0 and
