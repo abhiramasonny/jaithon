@@ -61,6 +61,17 @@ jaithon/compile/opt/fuse.jai
 jaithon/compile/opt/hoist.jai
 jaithon/compile/opt/mod.jai
 jaithon/compile/opt/peephole.jai
+jaithon/compile/parse/decl.jai
+jaithon/compile/parse/expr.jai
+jaithon/compile/parse/node_build.jai
+jaithon/compile/parse/pattern.jai
+jaithon/compile/parse/predicate.jai
+jaithon/compile/parse/primary.jai
+jaithon/compile/parse/state.jai
+jaithon/compile/parse/stmt.jai
+jaithon/compile/parse/token_class.jai
+jaithon/compile/parse/type_expr.jai
+jaithon/compile/parse/wire.jai
 jaithon/compile/parser.jai
 jaithon/compile/repl.jai
 jaithon/compile/resolve.jai
