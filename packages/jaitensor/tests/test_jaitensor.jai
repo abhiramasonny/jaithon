@@ -1,16 +1,8 @@
-#: GPU tensor operations, generic datasets, optimizers, and model lifecycle.
+#: The tensor surface: construction, the elementwise and shape operations, and views.
 import jaitensor as jt
-import std.gpu as gpu
 import std.math
-import std.os
-from jaitensor import Dataset
-from jaitensor.gemm import default_plan, plan_from_text
-from jaitensor.ops import dense_static_forward, matmul_backend
-from jaitensor.tensor import GradNode, Tensor
-from std.io import Path, read_file
-from std.random import Random
+from jaitensor.tensor import Tensor
 from std.test import assert_eq, assert_near, assert_throws, assert_true
-from std.trace import is_traced
 
 fn assert_values_near(actual: list[float], expected: list[float], tolerance: float = 1e-5) -> void {
     assert_eq(actual.len(), expected.len())
