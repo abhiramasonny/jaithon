@@ -1552,54 +1552,23 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_NOT: {
-            /* `not x`. The interpreter REQUIREs a bool here, and SLOT_BOOL's
-             * contract is "0 or 1 in a register", so the flip is an xor with
-             * one and there is nothing to guard. Anything else is not a
-             * narrowing this tier declines to do -- it is a program the
-             * interpreter would throw on, and it reaches the throw by the
-             * unarmed path.
-             *
-             * No arm existed, so `not` ENDED THE WALK the way OP_NEG did:
-             * `if not a` in a loop was 23,252,579 interpreted instructions. */
-            if (!jitNegate() || e->depth < 1 ||
-                e->stack[e->depth - 1] != SLOT_BOOL) {
-                goto unarmedOpcode;
-            }
-            {
-                unsigned nr = pushReg(e) - 1;
-                emitConst64(e, JIT_SCRATCH_A, 1);
-                emit(e, jaiA64EorX(nr, nr, JIT_SCRATCH_A));
-            }
-            off += 1;
+            JitArmResult r = emitNot(e, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
         case OP_BNOT: {
-            /* `~x` is `x ^ -1`, and the model has already proved the int. */
-            if (!jitNegate() || e->depth < 1 ||
-                e->stack[e->depth - 1] != SLOT_INT) {
-                goto unarmedOpcode;
-            }
-            {
-                unsigned nr = pushReg(e) - 1;
-                emitConst64(e, JIT_SCRATCH_A, -1);
-                emit(e, jaiA64EorX(nr, nr, JIT_SCRATCH_A));
-            }
-            off += 1;
+            JitArmResult r = emitBitNot(e, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 
         case OP_POS: {
-            /* Unary `+` on a number is the identity -- the interpreter checks
-             * the type and does nothing else. The model has already proved it,
-             * so this emits nothing at all; the point is only that the walk
-             * does not stop here. */
-            if (!jitNegate() || e->depth < 1 ||
-                (e->stack[e->depth - 1] != SLOT_INT &&
-                 e->stack[e->depth - 1] != SLOT_FLOAT)) {
-                goto unarmedOpcode;
-            }
-            off += 1;
+            JitArmResult r = emitUnaryPlus(e, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
             break;
         }
 

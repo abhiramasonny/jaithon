@@ -1183,6 +1183,9 @@ bool emitNegate(Emit *e, int *offp);
 bool emitPow(Emit *e, int *offp);
 bool emitMod(Emit *e, ObjFunction *fn, int prevOff, int *offp);
 bool emitFloorDiv(Emit *e, ObjFunction *fn, int prevOff, int *offp);
+JitArmResult emitNot(Emit *e, int *offp);
+JitArmResult emitBitNot(Emit *e, int *offp);
+JitArmResult emitUnaryPlus(Emit *e, int *offp);
 
 /* Defined in jit_body_fused.c. */
 bool emitAddLocals(Emit *e, const uint8_t *code, int *offp);
