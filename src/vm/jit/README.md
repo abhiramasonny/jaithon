@@ -302,6 +302,178 @@ Nothing deferred or borrowed may reach a record: `deoptRecordAt` and
 
 ---
 
+## The polymorphic inline cache, and the one shape that reaches it
+
+`emitInvokePic1` is the most intricate arm in this directory and by some
+distance the hardest to arrive at. A fuzzing census sampled 100 generated
+programs and **not one** of them emitted a `[jit] pic N-way` line under
+`JAI_JIT_WHY=1`; hand-written attempts at the obvious shapes missed it too.
+This section is what it actually takes, written down so nobody has to
+reconstruct it from the code a third time.
+
+### The gate is one NULL
+
+`emitInvoke` reaches the arm from exactly one place: the `OP_INVOKE` branch
+where the receiver entry is `SLOT_INST` **and its `Emit::stackClass` is NULL**
+-- an instance whose class the walk has not pinned. Everything else about the
+site is downstream of that one condition.
+
+And this tier has exactly one producer of an unpinned `SLOT_INST`:
+`emitForIterBind`'s **loop-head** arm, under `Emit::elemMixed`. Every other
+route to a `SLOT_INST` carries a class and guards it.
+
+| where a `SLOT_INST` comes from | what pins the class |
+| --- | --- |
+| a parameter (`seedLocals`) | the live argument's own class |
+| any other local (`adoptLocalKindSeen`) | the class of the first value bound -- and **both widenings keep one**: `nullable` by construction, `dynamic` by taking the last adopted class |
+| a list element (`exemplarKind`, `OP_GET_INDEX`) | the sampled element's class, plus a `shapeId` deopt guard |
+| a *nested* `for x in xs` (`emitForIterBind`'s ordinary arm) | the same, off the iterator's sample |
+| a field (`OP_GET_FIELD*`) | `SLOT_MAYBE_INST` of the field's class, narrowed to `SLOT_INST` by the null compare at the head of `emitInvoke` |
+| a global (`globalKind`) | the live global's class |
+| a call's result (`observedReturnKind`, and the module and static arms) | refused outright unless `jaiClassForShape` resolves the recorded shape |
+
+`elemMixed` is not computed by the walk. `jaiJitEnterOsr` computes it, for a
+loop head whose iterator is `ITER_LIST`: it scans up to 1024 elements from
+index 0 and sets the flag if any is an instance of a class other than the
+sampled element's. The head arm then discards the shape and class it would
+have pinned, clears `localTyped` for the loop variable, and the slot becomes
+"an instance, of no class in particular". Nothing else here does that.
+
+**The arm is therefore OSR-only, and loop-head-only.** The whole-function tier
+cannot reach it at all, and neither can a list loop sitting *inside* an OSR
+body -- that one takes the ordinary arm and pins.
+
+### The shape
+
+    for op in ops { ... op.method(args) ... }
+
+with all of the following true at once:
+
+* `ops` is a **list holding instances of two or more classes**, mixed within
+  its first 1024 elements. One class is not enough; `elemMixed` stays false and
+  the head pins. A trait is not required and neither is a declared element
+  type -- `var ops = [A(1), B(2)]` is enough. Nulls are allowed but not dense:
+  past one in 64 `jaiJitEnterOsr` declines the head outright.
+* **that `for` is the loop the OSR tier entered at**, i.e. a `SIGPROF` tick
+  landed on its own back edge and made it `osrTop`. Nesting it inside another
+  loop is fine and is what `tests/bench/poly_dispatch` does -- the inner head
+  is hot enough to collect its own tick and its own form. What does not work is
+  the enclosing loop being the entry and this one being walked inside it.
+* the method **returns `int`, `float` or `bool`**, and every way of the site's
+  cache agrees. `siteInvokeResultKind` merges the per-way `resultKind` bytes;
+  a result carrying a class shape is refused by the arm ("an unpinned receiver
+  returning something with a shape") and a *disagreement* between two classes
+  merges to `JAI_FB_MIXED`, which takes the whole body down one step earlier
+  with "an unpinned receiver's result kind".
+* **the callees are already compiled when the head compiles.** Each way needs
+  `ObjFunction::jitFunc`, so every implementation must have passed
+  `JAI_JIT_THRESHOLD` before the tick that compiles the loop lands. This is the
+  one condition that is about *timing* rather than about the program, and it is
+  why one configuration below never sees the arm at all.
+* the rest is `jitPic1Admissible`, per way: a public method (`InlineCache::payload`
+  is 0 -- a non-public one is cached with the byte set so the interpreter can
+  re-run `methodPermitted`, which emitted code cannot), a closure rather than a
+  bound native, the callee in the caller's own module at the module version the
+  callee compiled against, matching arity and parameter kinds, and the callee's
+  own slot 0 specialised to exactly the class this way's shape names.
+* no float local is live across the call: `emitInvokePic1` refuses on
+  `Emit::fpLive` after `fpReleaseAll` ("an unpinned receiver with a value in
+  the float bank").
+
+The site's cache state is *not* a constraint worth worrying about. `IC_MONO`,
+`IC_POLY` and `IC_MEGA` are all admitted, and `JAI_IC_OBS_BUDGET` closing
+early is fine too: one usable way is enough, and every miss simply falls
+through to the descriptor the site would have emitted anyway.
+
+### Where it is reached, and under which switches
+
+`tests/bench/poly_dispatch` prints `pic 8-way (of 8 recorded, state 2) at 97`
+from `osr main at 87` -- offset 87 is the `OP_FOR_ITER_BIND` of
+`for op in ops`, iter kind 2, and 97 is the `op.apply(acc)` inside it.
+`tests/lang/test_jit_poly_receiver.jai` reaches it too, as `pic 2-way (of 4
+recorded)` in `drive`, but only under `jaithon test` -- the file has no `main`,
+so running it directly compiles the module and stops.
+
+The smallest thing that reaches it is about a dozen lines: two classes with a
+`pub fn f(self, x: int) -> int`, a list holding both, and a `for` over that
+list inside an outer repeat loop. Measured over the differential fuzzer's six
+configurations:
+
+| configuration | reaches the arm |
+| --- | --- |
+| default | yes |
+| `JAITHON_JIT_DEOPT_STRESS=1` | yes |
+| `JAITHON_JIT_SPLIT_STRESS=1` | yes |
+| `JAITHON_JIT_THRESHOLD=1` | yes -- the half-formed cache is not an obstacle |
+| `JAITHON_JIT_TICK_US=50` | **no** |
+| `JAITHON_NO_JIT=1` | n/a |
+
+`JAITHON_JIT_TICK_US=50` missing it is the ordering condition above, and it is
+worth stating plainly because that switch is otherwise the one that drives this
+tier hardest: at 50us the tick lands on the list head before the methods in the
+list have been called 64 times, so no way has a `jitFunc`, the arm answers "no
+way of this site's cache is usable", and the form that gets cached for the rest
+of the run has no cache in it. The fastest sampler is the configuration least
+able to reach the polymorphic call arm.
+
+### Why the obvious candidates do not
+
+All four were tried and all four fail for reasons that are worth knowing.
+
+* **A local swapped between two classes** -- `var v: Op = A(1)` (or `: any`),
+  then `v = A(..)` on one branch and `v = B(..)` on the other. The checker
+  requires the annotation, and then `adoptLocalKindSeen` sees two `SLOT_INST`
+  of different shapes, asks for the `dynamic` widening, and the retried compile
+  pins the slot to *one* of them. What follows is not a polymorphic site but a
+  loop that barely runs: the compile refuses once with "local 2 was given two
+  kinds, instance and instance", and the form that does compile then fails its
+  own entry guard on every other iteration -- 996,332 `osr main stopped: a slot
+  pinned to a class now holds a different one` in a two-million-iteration probe.
+  Class polymorphism through a local is not something this tier models.
+* **`ops[j].method()`** instead of `for op in ops`. `OP_GET_INDEX` predicts
+  from one live element through `exemplarKind` and guards the `shapeId`, so the
+  receiver is pinned to whichever class element 0 happened to be, and every
+  other class deoptimises. `[jit] direct method A.apply`, never a pic.
+* **A trait-typed `list[Op]` walked in a nested loop** *when the outer loop is
+  the OSR entry*. The inner `OP_FOR_ITER_BIND` then takes `emitForIterBind`'s
+  ordinary arm, which samples the element and pins -- and since the sample
+  disagrees with the slot on the next class, it refuses with
+  "OP_FOR_ITER_BIND: loop variable in local 4 has kind instance, not instance".
+  The same source *does* reach the arm once the inner loop collects its own
+  tick and becomes an `osrTop` of its own, which is the only difference between
+  reaching this arm and not.
+* **A monomorphic list.** `elemMixed` stays false and the head pins, exactly as
+  intended: a one-class list should get the direct call, not a cache.
+
+### One gap, recorded rather than fixed
+
+`jitPic1Admissible` says it "mirrors every decision `emitDirectCall` makes
+before it commits to emitting". It does not mirror `jitReturnKnown`. A way
+whose callee compiled but whose walk never reached an `OP_RETURN` passes
+`jitPic1Admissible`, and `emitDirectCall` then refuses it -- after the shape
+compare is already in the instruction stream, so the arm has nowhere to fall
+back to and sets `e->failed`. The whole loop declines rather than the one way
+being dropped.
+
+It is a decline, not a wrong answer, but it is not a free one: the loop stops
+compiling **at all**, where without the arm it compiled fine. Reproduced with a
+three-class list whose second class computed `x *% self.k` -- `apply walked
+only to OP_MUL_WRAP`, so that callee has a `jitFunc` and no `jitReturnKnown`.
+A/B'd inside one binary, which is what `JAITHON_JIT_PIC` is for, ten runs each:
+
+    JAITHON_JIT_PIC=1   4-8 x "osr probe0 stopped: a direct callee whose
+                        walk never reached a return", and the loop never
+                        compiles
+    JAITHON_JIT_PIC=0   0 x, and the loop compiles at 235 instructions
+
+Removing the one wrapping multiply turns the same program into
+`pic 3-way (of 3 recorded, state 2)` and 447 instructions. The fix, if it is
+worth making, is one line in `jitPic1Admissible`: drop a way whose
+`jitReturnKnown` is false, the same way it already drops one whose module
+version has moved.
+
+---
+
 ## Environment switches
 
 Every switch is read once through a cached accessor, except `JAI_JIT_WHY` and
