@@ -1,0 +1,45 @@
+# Every place in src/vm/jit/ that maps a compile-time SlotKind onto a Value tag.
+#
+# A tag reconstructed from a compile-time kind is a lie whenever the RUN-TIME
+# VALUE decides. The payload decides null-ness; a `dynamic` slot's kind is a
+# speculation; a register home carries no tag at all. Two confirmed miscompiles
+# were that one sentence -- a deopt stub that wrote VAL_OBJ over a bare zero and
+# handed the interpreter {VAL_OBJ, obj = NULL}, and an OSR dynamic local read
+# with no tag check at all.
+#
+# So every line here is a site somebody had to justify, and the `why` column
+# records which justification it has:
+#
+#   guard    the tag is only the EXPECTED operand of a compare that deopts on
+#            mismatch -- a wrong guess costs a deopt, never a wrong answer
+#   refuses  no fall-through: a kind the ladder does not list is refused at
+#            compile time
+#   payload  every kind whose tag the payload decides is routed out of the
+#            ladder first, to emitTagFor's csel
+#   sampled  the object arms carry an observed Value, not a manufactured tag
+#
+# `--write` refreshes the kinds and tags and carries the `why` forward; a new
+# site arrives as UNJUSTIFIED, which fails until a human replaces it with one of
+# the four words above. A `#N` suffix on a target only separates two ladders in
+# one function that assign to the same name, numbered in source order.
+#
+# Regenerate: python3 scripts/gate/kind_tag_check.py --write
+# Enforced by that script, whose docstring says what it does and does not cover.
+#
+# function | target | why | kinds | tags
+buildListExemplar | switch e->stack[idx] | sampled | SLOT_BOOL,SLOT_FLOAT,SLOT_INST,SLOT_INT,SLOT_LIST,SLOT_OBJ | BOOL_VAL,FLOAT_VAL,INT_VAL
+compileBody | e->selfSlow[si].tag | guard | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_NULL | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ
+compileBody | stag | guard | SLOT_BOOL,SLOT_FLOAT,SLOT_INT | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_OBJ
+compileBody | tag | guard | SLOT_BOOL,SLOT_FLOAT,SLOT_INT | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_OBJ
+compileBody | vtag | refuses | SLOT_BOOL,SLOT_FLOAT,SLOT_INST,SLOT_INT,SLOT_LIST,SLOT_OBJ | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_OBJ
+compileBody | wantTag | guard | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_NULL | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ
+compileFuncOnce | tag#1 | payload | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_NULL,SLOT_OPAQUE | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ
+compileFuncOnce | tag#2 | payload | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_NULL | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ
+compileOsrOnce | lt | payload | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_OPAQUE | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ
+compileOsrOnce | tag | payload | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_NULL | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ
+emitCallOutResult | wantTag | guard | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_NULL | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ
+emitDirectCall | e->selfSlow[si].tag | guard | SLOT_BOOL,SLOT_FLOAT,SLOT_INT | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_OBJ
+emitListStore | vtag | refuses | SLOT_BOOL,SLOT_FLOAT,SLOT_INST,SLOT_INT,SLOT_LIST,SLOT_OBJ | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_OBJ
+emitTagFor | tag | payload | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_NULL,SLOT_OPAQUE | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ
+jitResultOut | switch fn->jitReturnKind | payload | SLOT_BOOL,SLOT_FLOAT,SLOT_INST,SLOT_INT,SLOT_LIST,SLOT_NULL,SLOT_OBJ | BOOL_VAL,FLOAT_VAL,INT_VAL,NULL_VAL,OBJ_VAL
+localTagFor | return | guard | SLOT_BOOL,SLOT_FLOAT,SLOT_INT,SLOT_NULL,SLOT_OPAQUE | VAL_BOOL,VAL_FLOAT,VAL_INT,VAL_NULL,VAL_OBJ

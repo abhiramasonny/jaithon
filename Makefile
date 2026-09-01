@@ -414,7 +414,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check layer-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check layer-check kind-tag-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -545,6 +545,18 @@ linetable-check:
 .PHONY: jit-fusion-check
 jit-fusion-check:
 	@python3 scripts/gate/jit_fusion_check.py
+
+# A tag reconstructed from a compile-time SlotKind is a lie whenever the RUN-TIME
+# VALUE decides -- the payload decides null-ness, a dynamic slot's kind is a
+# speculation, and a register home carries no tag at all. Two confirmed
+# miscompiles were exactly that: a deopt stub that wrote VAL_OBJ over a bare zero
+# and handed the interpreter {VAL_OBJ, obj = NULL}, and an OSR dynamic local read
+# with no tag check. This pins every SlotKind-to-tag site in src/vm/jit so a new
+# one has to be justified, and fails outright on SLOT_MAYBE_INST mapped to a
+# constant. Pure text, so it costs nothing to run on every `make test`.
+.PHONY: kind-tag-check
+kind-tag-check:
+	@python3 scripts/gate/kind_tag_check.py
 
 # Where a branch keeps its displacement is written down twice, in verify.c and
 # in opt/chunk.jai, and neither consults the other. A missing entry makes the
