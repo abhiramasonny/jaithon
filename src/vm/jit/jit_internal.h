@@ -1120,6 +1120,8 @@ bool retObjTypeOn(void);
 
 /* Defined in jit_frame.c. */
 
+/* Defined in jit_call.c. */
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
