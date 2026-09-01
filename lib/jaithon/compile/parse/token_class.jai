@@ -30,12 +30,6 @@ fn _table(pairs: list[tuple[TokenKind, OpKind]]) -> list[OpKind?] {
     return table
 }
 
-fn _lookup(table: list[OpKind?], kind: TokenKind) -> OpKind? {
-    let index = kind.ordinal()
-    if index >= table.len() { return null }
-    return table[index]
-}
-
 let _MULTIPLICATIVE_OP: list[OpKind?] = _table(
     [
         (TokenKind.Star, OpKind.Mul),
@@ -86,17 +80,25 @@ let _ASSIGN_OP: list[OpKind?] = _table(
 )
 
 pub fn _multiplicative_op(kind: TokenKind) -> OpKind? {
-    return _lookup(_MULTIPLICATIVE_OP, kind)
+    let index = kind.ordinal()
+    if index >= _MULTIPLICATIVE_OP.len() { return null }
+    return _MULTIPLICATIVE_OP[index]
 }
 
 pub fn _additive_op(kind: TokenKind) -> OpKind? {
-    return _lookup(_ADDITIVE_OP, kind)
+    let index = kind.ordinal()
+    if index >= _ADDITIVE_OP.len() { return null }
+    return _ADDITIVE_OP[index]
 }
 
 pub fn _compare_op(kind: TokenKind) -> OpKind? {
-    return _lookup(_COMPARE_OP, kind)
+    let index = kind.ordinal()
+    if index >= _COMPARE_OP.len() { return null }
+    return _COMPARE_OP[index]
 }
 
 pub fn _assign_op(kind: TokenKind) -> OpKind? {
-    return _lookup(_ASSIGN_OP, kind)
+    let index = kind.ordinal()
+    if index >= _ASSIGN_OP.len() { return null }
+    return _ASSIGN_OP[index]
 }
