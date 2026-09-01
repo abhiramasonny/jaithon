@@ -149,10 +149,18 @@ def reduce(prog, oracle, original, repeat=2):
         #     declaration AND its digest term; if anything still names the
         #     container the candidate fails to compile in every configuration,
         #     which reads as agreement and puts it back.
+        #     Read with a default, because which flags a Probe carries is the
+        #     generator's business and not this file's. Five of these six were
+        #     lost from progen.py in a merge (4fe6c839) while this loop kept
+        #     them, and a bare getattr made `reduce` raise AttributeError on
+        #     its first probe -- so for as long as that stood, EVERY hit was
+        #     reported at full size and `--shrink` could not run at all. A
+        #     shrinker that quietly skips a knob the generator no longer has
+        #     is doing its job; one that dies is not.
         for probe_idx in range(len(prog.probes)):
             for flag in ("use_empty", "use_mixed", "use_tuple", "use_set",
                          "use_nested", "use_dict"):
-                if not getattr(prog.probes[probe_idx], flag):
+                if not getattr(prog.probes[probe_idx], flag, False):
                     continue
 
                 def build(c, pi=probe_idx, fl=flag):
