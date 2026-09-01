@@ -101,11 +101,25 @@ CMPS = ["==", "!=", "<", "<=", ">", ">="]
 class Node:
     """One statement, possibly with nested blocks.
 
-    `parts` interleaves literal lines at this node's own indent with lists of
-    child Nodes one level deeper, which is enough for if/elif/else and for any
-    loop. The shrinker deletes whole Nodes, so anything that must survive a
-    deletion -- a loop's counter increment above all -- belongs in a literal
-    line here rather than in a child.
+    `parts` interleaves literal lines at this node's own indent with lists one
+    level deeper, which is enough for if/elif/else and for any loop. A list may
+    hold Nodes or plain strings, and the difference is the whole safety story:
+    THE SHRINKER DELETES NODES AND NEVER STRINGS, so anything a reduction must
+    not be able to remove goes in as a string.
+
+    A loop's counter increment is the case that matters. Written as a child
+    Node it is deletable, and deleting it turns
+
+        while w < 40 {
+            w = w + 1          <- gone
+            ...
+        }
+
+    into a program that never terminates -- which the runner then sees as a
+    timeout under some configurations and not others, reads as a divergence,
+    and adopts. That happened: a shrink ran twenty-five minutes on an infinite
+    loop it had just created. As a string the line is part of the loop and no
+    reduction can separate them.
     """
 
     __slots__ = ("parts",)
@@ -123,7 +137,10 @@ class Node:
                 out.append(pad + part)
             else:
                 for kid in part:
-                    kid.render(out, depth + 1)
+                    if isinstance(kid, str):
+                        out.append(pad + "    " + kid)
+                    else:
+                        kid.render(out, depth + 1)
 
 
 def line(text):
@@ -666,11 +683,11 @@ class Gen:
         body = self.block(r.randint(1, 3), depth + 1)
         self.loop_depth -= 1
         self.ints.remove(var)
-        # The increment leads the body and is a literal line of this Node, so
+        # The increment leads the body and is a plain string, not a Node, so
         # neither a generated `continue` nor a shrink step can strand the loop.
         return Node(f"var {var} = 0",
                     f"while {var} < {trips} {{",
-                    [line(f"{var} = {var} + 1")] + body,
+                    [f"{var} = {var} + 1"] + body,
                     "}")
 
     def st_loop(self, depth):
@@ -682,10 +699,13 @@ class Gen:
         body = self.block(r.randint(1, 2), depth + 1)
         self.loop_depth -= 1
         self.ints.remove(var)
+        # Both the increment and the break that consumes it are strings: this
+        # loop has no other exit, so a reduction that took either would not
+        # terminate.
         return Node(f"var {var} = 0",
                     "loop {",
-                    [line(f"{var} = {var} + 1"),
-                     line(f"if {var} > {trips} {{ break }}")] + body,
+                    [f"{var} = {var} + 1",
+                     f"if {var} > {trips} {{ break }}"] + body,
                     "}")
 
     def st_for_list(self, depth):

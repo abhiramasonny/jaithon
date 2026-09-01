@@ -40,8 +40,15 @@ import sys
 
 
 def walk(nodes):
-    """Every Node in pre-order, parents before children."""
+    """Every deletable Node in pre-order, parents before children.
+
+    A plain string in a block is a line the generator marked as not removable
+    -- a loop's counter increment, the break that consumes it -- so it is never
+    offered as a candidate. See Node in progen.py for why that matters.
+    """
     for node in nodes:
+        if isinstance(node, str):
+            continue
         yield node
         for part in node.parts:
             if isinstance(part, list):
@@ -51,6 +58,8 @@ def walk(nodes):
 def remove(nodes, target):
     """Delete `target` wherever it sits in the tree. Identity, not equality."""
     for i, node in enumerate(nodes):
+        if isinstance(node, str):
+            continue
         if node is target:
             del nodes[i]
             return True

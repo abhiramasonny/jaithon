@@ -217,12 +217,25 @@ def check_seed(seed, warm, modes, timeout, keep, strict=False):
             shutil.rmtree(workdir, ignore_errors=True)
 
 
-def make_oracle(warm, modes, timeout, strict=False):
-    """A callable the shrinker uses: source text in, disagreeing modes out."""
+def make_oracle(warm, modes, timeout, strict=False, reject_timeouts=False):
+    """A callable the shrinker uses: source text in, disagreeing modes out.
+
+    `reject_timeouts` makes a candidate where anything timed out count as "no
+    disagreement", so the shrinker puts it back. A reduction can legitimately
+    make a program much SLOWER -- delete the early `return` from a loop and the
+    loop now runs every iteration -- and a program that is merely slow is
+    indistinguishable here from one that hangs. Without this the shrinker
+    adopts the slow candidate, every later candidate inherits it, and the run
+    dissolves into 120-second timeouts. The cost is that a hit which is ONLY a
+    hang cannot be reduced; it is reported at full size instead, which is the
+    right way round.
+    """
     def oracle(source):
         workdir = tempfile.mkdtemp(prefix="jitshrink-")
         try:
             results = run_all(source, workdir, modes, timeout, strict)
+            if reject_timeouts and any(r.timedout for r in results.values()):
+                return ()
             return disagreeing(results)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -231,9 +244,16 @@ def make_oracle(warm, modes, timeout, strict=False):
 
 def do_shrink(seed, warm, modes, timeout, strict=False, repeat=2):
     import shrink
+    import time
     prog = progen.generate(seed, warm)
-    oracle = make_oracle(warm, modes, timeout, strict)
-    off = oracle(prog.render())
+    # Time the original, then hold every candidate to a small multiple of it.
+    # A reduction should not be slower than what it reduces, and the default
+    # 120s is far too generous to notice when one is.
+    started = time.time()
+    check = make_oracle(warm, modes, timeout, strict)
+    off = check(prog.render())
+    budget = max(10, min(timeout, int((time.time() - started) * 4) + 5))
+    oracle = make_oracle(warm, modes, budget, strict, reject_timeouts=True)
     if not off:
         print(f"seed {seed} does not reproduce -- nothing to shrink.")
         print("Note the tier is sampler-driven, so an OSR-only hit can be "
