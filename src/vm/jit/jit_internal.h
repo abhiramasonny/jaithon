@@ -1152,6 +1152,11 @@ bool emitGetIterItems(Emit *e, const uint8_t *code, int *offp, int stop);
 bool emitForIterBind(Emit *e, const uint8_t *code, int *offp);
 bool emitForIterPair(Emit *e, const uint8_t *code, int *offp);
 
+/* Defined in jit_body_index.c. */
+bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop);
+bool emitSetIndex(Emit *e, int *offp);
+bool emitGetSlice(Emit *e, const uint8_t *code, int *offp);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
