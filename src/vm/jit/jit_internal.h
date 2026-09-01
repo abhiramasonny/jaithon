@@ -1167,6 +1167,9 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp);
 bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp);
 bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                   int count);
+JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
+                        const uint8_t *code, int *offp, int count,
+                        bool *afterUncondp);
 
 #endif /* arm64 */
 
