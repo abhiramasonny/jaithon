@@ -23,12 +23,12 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VERIFY_C = ROOT / "src/vm/bytecode/verify.c"
 OPT_JAI = ROOT / "lib/jaithon/compile/opt/chunk.jai"
-EMIT_JAI = ROOT / "lib/jaithon/compile/emit.jai"
+OPCODE_JAI = ROOT / "lib/jaithon/compile/emit/opcode.jai"
 
 
 def op_name_by_enum():
-    """`Op.ForIterBind` -> `OP_FOR_ITER_BIND`, from emit.jai's own _OPS table."""
-    text = EMIT_JAI.read_text()
+    """`Op.ForIterBind` -> `OP_FOR_ITER_BIND`, from opcode.jai's own _OPS table."""
+    text = OPCODE_JAI.read_text()
     pairs = re.findall(r'OpSpec\(\s*Op\.(\w+)\s*,\s*"(OP_[A-Z0-9_]+)"', text)
     return {enum: name for enum, name in pairs}
 
@@ -85,7 +85,7 @@ def main():
     problems = []
 
     if not names:
-        problems.append("emit.jai: _OPS parsed as empty -- regex is stale")
+        problems.append("opcode.jai: _OPS parsed as empty -- regex is stale")
     if not c:
         problems.append("verify.c: jaiOpBranchOperandAt parsed as empty -- regex is stale")
     if not jai:
