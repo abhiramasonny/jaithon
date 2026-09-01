@@ -864,7 +864,12 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             if (e.deopt[k].fpLive & (1u << valueSeen)) {
                 emit(&e, jaiA64FmovXD(reg0, fpRegAt(&e, valueSeen)));
             }
-            if (kind == SLOT_MAYBE_INST) {
+            /* Both nullable kinds, not just the instance one. The ladder
+             * below hands anything it does not name an unconditional VAL_OBJ,
+             * and for a kind whose payload may be zero that writes
+             * {VAL_OBJ, obj = NULL} into the frame for the collector to
+             * trace -- the same shape that made an OSR entry segfault. */
+            if (kind == SLOT_MAYBE_INST || kind == SLOT_MAYBE_OBJ) {
                 emitTagFor(&e, kind, reg0, JIT_SCRATCH_B, JIT_SCRATCH_C);
                 emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
                 emit(&e, jaiA64StrX(reg0, JIT_SCRATCH_A, at + 8));

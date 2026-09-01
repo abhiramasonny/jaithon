@@ -1005,6 +1005,7 @@ bool jitModuleNativeCalls(void);
 extern bool gNullableFbUsed;
 extern bool gNoNullableFb;
 bool jitNullableFbOn(void);
+bool jitMaybeObjStackOn(void);
 bool jitMaybeObjOn(void);
 bool jitMatchArm(void);
 bool modelAgreesWithChunk(const Emit *e, uint32_t off);

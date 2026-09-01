@@ -220,6 +220,19 @@ bool jitNullableFbOn(void) {
     return cached != 0;
 }
 
+/* Whether SLOT_MAYBE_OBJ may reach the OPERAND STACK, as opposed to only
+ * being a return kind. Default OFF: every site that reads a stack entry's kind
+ * has to be shown to exclude it or to handle it, and until that audit is done
+ * the refusal in pushValue3 is what makes the kind safe. */
+bool jitMaybeObjStackOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_MAYBE_OBJ_STACK");
+        cached = (v != NULL && strcmp(v, "1") == 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 bool jitMaybeObjOn(void) {
     static int cached = -1;
     if (cached < 0) {

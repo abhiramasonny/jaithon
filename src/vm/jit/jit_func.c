@@ -979,7 +979,7 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
      * instance once it has compared against null -- is then unreachable for it
      * by construction, rather than by ninety separate arguments. Enforced here
      * so a future producer gets a refusal and not a miscompile. */
-    if (kind == SLOT_MAYBE_OBJ) {
+    if (kind == SLOT_MAYBE_OBJ && !jitMaybeObjStackOn()) {
         e->whyNot = "an object-or-null on the operand stack";
         return false;
     }

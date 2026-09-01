@@ -62,8 +62,13 @@ bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
         if (!holdsRegister(k)) continue;
         unsigned reg = valueBankReg(e, seen);
         seen++;
+        /* SLOT_MAYBE_OBJ belongs here for the reason the others do and one
+         * more: an allow-list that SKIPS a live pointer leaves it unrooted
+         * across the call, which is not a refusal but a collected object.
+         * Its null case costs nothing -- emitTagFor writes VAL_NULL for a
+         * zero payload, and a null root is inert. */
         if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
-            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
+            k != SLOT_ITER && k != SLOT_MAYBE_INST && k != SLOT_MAYBE_OBJ) {
             continue;
         }
         if (nroots >= jitRootLimit()) {
@@ -139,7 +144,7 @@ bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
         }
         if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL &&
             k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
-            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
+            k != SLOT_ITER && k != SLOT_MAYBE_INST && k != SLOT_MAYBE_OBJ) {
             e->whyNot = "an argument kind this call cannot pass";
             return false;
         }
