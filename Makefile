@@ -75,6 +75,12 @@ JAICV_GC_STRESS_EVERY ?= 50000
 # Loop repetitions before `make kind-fuzz` changes a kind. Must exceed the
 # tier's hotness threshold or nothing under test ever compiles.
 KIND_FUZZ_WARM ?= 3000
+# `make jit-fuzz`: how many random programs, and how many calls each generated
+# function gets before the program ends. FUZZ_WARM must clear JAI_JIT_THRESHOLD
+# (64, and not settable from the environment) with room to spare, or the tier
+# under test never compiles and every program passes on no coverage at all.
+FUZZ_COUNT ?= 400
+FUZZ_WARM  ?= 1500
 EXTRA_LDFLAGS ?=
 
 # zlib inflates the seed's images. boot/seed.bin holds them deflated, one
@@ -611,6 +617,35 @@ jit-split-check:
 kind-fuzz: $(TARGET)
 	@python3 tests/fuzz/kind_mutation.py --warm $(KIND_FUZZ_WARM)
 	@python3 tests/fuzz/iter_mutation.py --warm $(KIND_FUZZ_WARM)
+
+# The differential fuzzer: RANDOM whole programs rather than a fixed matrix.
+#
+# kind-fuzz above enumerates two known bug shapes exhaustively. This asks the
+# complementary question -- what shape has nobody thought of -- by generating
+# programs from a grammar biased at what the tier compiles, then running each
+# one under five configurations of the tier and diffing. The oracle needs no
+# expected output: jit.h calls the tier "an accelerator that may always
+# decline", so declining is always legal and answering differently never is.
+#
+# Deliberately OUT of `test`, for the reason roadmap.md §7 gives at length: the
+# OSR tier is sampler-driven and not deterministic, so a hit that depends on
+# where a SIGPROF landed can appear and vanish between runs. That is exactly
+# the flaky-gate problem, and tying it to every `make test` would buy the
+# project a gate nobody trusts. Run it deliberately, like jit-declines-check.
+#
+# Teeth, on the tree it was written against: the first 400 seeds turned up
+# three programs the tier gets wrong, two of them SEGFAULTS -- seed 236 (in
+# JAITHON_JIT_TICK_US=50, 25 runs of 25) and seed 352 (in the default
+# configuration), plus seed 232, which prints a different number. None of the
+# 3,258 tests in `make test` covers any of them.
+#
+# 400 programs x 5 configurations at warm=1500 measured 257s wall on twelve
+# cores. A hit prints the seed; reduce it to something reportable with
+#     python3 tests/fuzz/differential.py --shrink SEED
+.PHONY: jit-fuzz
+jit-fuzz: $(TARGET)
+	@python3 tests/fuzz/differential.py --count $(FUZZ_COUNT) \
+	    --warm $(FUZZ_WARM)
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.
