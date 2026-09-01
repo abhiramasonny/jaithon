@@ -1,11 +1,8 @@
 /* jit_body_build.c -- the arms that build an object: the list, dict, set and
  * tuple literals, the f-string, and the element stamp that follows a literal. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "runtime/runtime.h"
-#include "vm/vm.h"
 
 #include <stddef.h>
 #include <stdint.h>

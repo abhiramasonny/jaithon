@@ -1,10 +1,8 @@
 /* jit_body_local.c -- the arms that read and write a named slot: locals, their
  * binding, and the upvalues a closure captured them into. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/vm.h"
 
 #include <stddef.h>
 #include <stdint.h>

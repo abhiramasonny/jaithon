@@ -1,10 +1,8 @@
 /* jit_body_return.c -- the three ways a compiled body leaves, and the rule that
  * merges what they each said it returns. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/vm.h"
 
 #include <stddef.h>
 #include <stdint.h>
