@@ -4,7 +4,7 @@
 The compiled tier is an accelerator that may always decline (src/vm/jit/jit.h),
 so for ANY program every configuration of it has to print the same thing as the
 interpreter. That makes a random program a test case on its own, with no
-expected output to write down: differential.py runs one program five ways and
+expected output to write down: differential.py runs one program six ways and
 diffs. This file is the half that invents the programs.
 
 What a generated program looks like, and why it is shaped that way:
@@ -62,13 +62,17 @@ Two invariants keep every generated program legal and terminating, since a
 program that dies the same way five times proves nothing:
 
   - `xs` never empties (pops are guarded), so `xs[k % xs.len()]` cannot raise,
-    and never passes 64 elements (pushes are capped), so no nest of loops can
-    make one probe call take minutes -- a program the runner cannot finish in
-    its timeout is reported as a divergence, and seed 300 was exactly that;
-    `d["k"]` is only ever read for a key seeded into the literal;
+    and never passes 64 elements (pushes are capped); `d["k"]` is only ever
+    read for a key seeded into the literal;
   - every loop carries its own counter increment as the FIRST statement of its
     body, outside anything the generator or the shrinker can delete, so no
-    body and no `continue` can stop it terminating.
+    body and no `continue` can stop it terminating;
+  - trip counts multiply, so they are drawn against TRIP_BUDGET, an iteration
+    allowance one probe CALL may spend and nested loops share out. A program
+    the runner cannot finish inside its timeout is reported as a divergence,
+    and the two hits in a 3,000-program run were both only that: seed 300 grew
+    xs to 25,200 elements, seed 1111 nested two 200-trip ranges. 66s and 69s
+    respectively, now 1.3s and 1.1s, and neither was ever a miscompile.
 
 Integer expressions combine with the wrapping operators `+% -% *%` so an edge
 literal can never raise; the checked `+ - *` arms are still covered, on
@@ -89,6 +93,9 @@ import random
 import sys
 
 WARM_DEFAULT = 1500
+
+# Loop iterations one probe CALL may run, shared out between nested loops.
+TRIP_BUDGET = 2000
 
 # Combined with `+% -% *%` only, so any of these is safe to reach.
 EDGE_INTS = [
@@ -325,6 +332,14 @@ class Gen:
         self.helpers = {}               # name -> (arity, return kind)
         self.uid = 0
         self.loop_depth = 0
+        # Iterations still affordable at this point in the probe, per CALL.
+        # Trip counts multiply, and the probe is called `warm` times on top of
+        # that, so an unbudgeted `for .. 0..200` inside another one is 60
+        # million iterations and a program that takes a minute. A minute under
+        # the runner's parallel load is a timeout, and the runner reads a
+        # timeout as a divergence -- seeds 300 and 1111 were both exactly that
+        # and neither was a miscompile. 2000 x 1500 calls is a second or so.
+        self.trip_budget = TRIP_BUDGET
         # `xs`, `d` and `text` are locals of `probe`. A helper body is
         # generated with the same expression machinery but must not reach
         # them, so every atom that names one is gated on this.
@@ -901,6 +916,23 @@ class Gen:
 
     # -- statements -----------------------------------------------------
 
+    def trips(self, options):
+        """A trip count this loop can still afford. Never empty: the smallest
+        option is taken when even that is over budget."""
+        ok = [t for t in options if t <= self.trip_budget]
+        return self.rng.choice(ok) if ok else min(options)
+
+    def enter_loop(self, trips):
+        """Charge `trips` to the budget for the body about to be generated."""
+        saved = self.trip_budget
+        self.loop_depth += 1
+        self.trip_budget = max(2, self.trip_budget // max(1, trips))
+        return saved
+
+    def leave_loop(self, saved):
+        self.loop_depth -= 1
+        self.trip_budget = saved
+
     def block(self, count, depth):
         """A list of Nodes. May legally be empty -- Jaithon accepts `if c {}`.
 
@@ -993,24 +1025,24 @@ class Gen:
     def st_for_range(self, depth):
         r = self.rng
         var = self.fresh("i")
-        hi = r.choice([3, 5, 8, 16, 32, 64, 200])
+        hi = self.trips([3, 5, 8, 16, 32, 64, 200])
         lo = r.choice([0, 0, 0, 1, -3])
         rng = f"{lo}..{hi}" if r.random() < 0.7 else f"{lo}..={hi}"
         self.ints.append(var)
-        self.loop_depth += 1
+        saved = self.enter_loop(hi - lo)
         body = self.block(r.randint(1, 3), depth + 1)
-        self.loop_depth -= 1
+        self.leave_loop(saved)
         self.ints.remove(var)
         return Node(f"for {var} in {rng} {{", body, "}")
 
     def st_while(self, depth):
         r = self.rng
         var = self.fresh("w")
-        trips = r.choice([3, 6, 12, 40, 100])
+        trips = self.trips([3, 6, 12, 40, 100])
         self.ints.append(var)
-        self.loop_depth += 1
+        saved = self.enter_loop(trips)
         body = self.block(r.randint(1, 3), depth + 1)
-        self.loop_depth -= 1
+        self.leave_loop(saved)
         self.ints.remove(var)
         # The increment leads the body and is a plain string, not a Node, so
         # neither a generated `continue` nor a shrink step can strand the loop.
@@ -1022,11 +1054,11 @@ class Gen:
     def st_loop(self, depth):
         r = self.rng
         var = self.fresh("l")
-        trips = r.choice([2, 5, 10, 30])
+        trips = self.trips([2, 5, 10, 30])
         self.ints.append(var)
-        self.loop_depth += 1
+        saved = self.enter_loop(trips)
         body = self.block(r.randint(1, 2), depth + 1)
-        self.loop_depth -= 1
+        self.leave_loop(saved)
         self.ints.remove(var)
         # Both the increment and the break that consumes it are strings: this
         # loop has no other exit, so a reduction that took either would not
@@ -1041,11 +1073,12 @@ class Gen:
         r = self.rng
         var = self.fresh("e")
         self.ints.append(var)
-        self.loop_depth += 1
+        # xs is capped at 64 by st_list_ops, so that is its worst case.
+        saved = self.enter_loop(64)
         self.iterating.add("xs")
         body = self.block(r.randint(1, 2), depth + 1)
         self.iterating.discard("xs")
-        self.loop_depth -= 1
+        self.leave_loop(saved)
         self.ints.remove(var)
         if r.random() < 0.3:
             idx = self.fresh("p")
@@ -1058,11 +1091,11 @@ class Gen:
         val = self.fresh("dv")
         self.ints.append(val)
         self.strs.append(key)
-        self.loop_depth += 1
+        saved = self.enter_loop(4)
         self.iterating.add("d")
         body = self.block(r.randint(1, 2), depth + 1)
         self.iterating.discard("d")
-        self.loop_depth -= 1
+        self.leave_loop(saved)
         self.ints.remove(val)
         self.strs.remove(key)
         return Node(f"for ({key}, {val}) in d.items() {{", body, "}")
@@ -1332,9 +1365,9 @@ class Gen:
                           for _ in range(r.randint(2, 3)))
         e = self.fresh("q")
         self.insts.append((e, None))
-        self.loop_depth += 1
+        saved = self.enter_loop(3)
         body = self.block(r.randint(0, 2), depth + 1)
-        self.loop_depth -= 1
+        self.leave_loop(saved)
         self.insts = [p for p in self.insts if p[0] != e]
         return Node(f"var {var} = [{elems}]",
                     f"for {e} in {var} {{",
@@ -1359,11 +1392,11 @@ class Gen:
         # constructions per call, so the top of the range is kept
         # modest -- a program nobody can wait for is a program the
         # runner times out and misreads as a divergence.
-        trips = r.choice([4, 8, 16])
+        trips = self.trips([4, 8, 16])
         self.ints.append(idx)
-        self.loop_depth += 1
+        saved = self.enter_loop(trips)
         body = self.block(r.randint(0, 1), depth + 1)
-        self.loop_depth -= 1
+        self.leave_loop(saved)
         self.ints.remove(idx)
         # Both lines are strings: the swap and the call it feeds are the whole
         # point of this statement and a reduction may not separate them.
@@ -1466,14 +1499,15 @@ class Gen:
         inner = self.fresh("c")
         label = f"'L{self.uid}"
         self.ints += [outer, inner]
-        self.loop_depth += 1
+        hi_out, hi_in = r.randint(2, 8), r.randint(2, 8)
+        saved = self.enter_loop(hi_out * hi_in)
         body = self.block(1, depth + 1)
-        self.loop_depth -= 1
+        self.leave_loop(saved)
         self.ints.remove(outer)
         self.ints.remove(inner)
         kw = r.choice(["break", "continue"])
-        return Node(f"{label}: for {outer} in 0..{r.randint(2, 8)} {{",
-                    [Node(f"for {inner} in 0..{r.randint(2, 8)} {{",
+        return Node(f"{label}: for {outer} in 0..{hi_out} {{",
+                    [Node(f"for {inner} in 0..{hi_in} {{",
                           body + [line(f"if {outer} *% {inner} > "
                                        f"{r.randint(1, 20)} {{ {kw} {label} }}")],
                           "}")],
@@ -1519,6 +1553,7 @@ class Gen:
             self.iterating = set()
             self.containers = True
             self.loop_depth = 0
+            self.trip_budget = TRIP_BUDGET
             probe.body = [self.stmt(0) for _ in range(r.randint(1, 4))]
             self.prog.probes.append(probe)
         if r.random() < 0.12:
