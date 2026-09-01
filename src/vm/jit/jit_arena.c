@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #if defined(__APPLE__)
 #  include <libkern/OSCacheControl.h>
@@ -34,18 +35,56 @@ uint8_t *jaiCodeArenaWrite(JaiCodeArena *arena, const void *bytes,
     return at;
 }
 
+/* Whether unseal/seal and the instruction-cache invalidation are limited to
+ * the range that changed. Off restores the whole-mapping flip and the
+ * invalidate-everything-written-so-far behaviour.
+ *
+ * MEASURED, and it is not a speedup: five interleaved pairs on
+ * `check --no-cache lib/jaithon` disagreed in sign. Kept anyway, for two
+ * reasons that are about shape rather than this workload -- the invalidation
+ * becomes O(bytes written) instead of O(all code emitted so far), which is the
+ * difference between linear and quadratic across a long run, and a window that
+ * seals exactly what it unsealed cannot leave the back catalogue
+ * unexecutable. The switch exists so the first claim stays checkable. */
+static bool arenaWindowOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ARENA_WINDOW");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static size_t pageFloor(size_t n) {
+    long page = sysconf(_SC_PAGESIZE);
+    size_t p = (page > 0) ? (size_t)page : 4096u;
+    return n & ~(p - 1u);
+}
+
 bool jaiCodeArenaSeal(JaiCodeArena *arena) {
     if (arena->sealed) return true;
-    if (mprotect(arena->code, arena->capacity, PROT_READ | PROT_EXEC) != 0) {
+    size_t from = arenaWindowOn() ? arena->windowFrom : 0;
+    if (from > arena->capacity) from = 0;
+    if (mprotect(arena->code + from, arena->capacity - from,
+                 PROT_READ | PROT_EXEC) != 0) {
         return false;
     }
     /* Not optional on arm64: the data and instruction caches are not coherent,
-     * so without this the CPU can fetch whatever was in the line before. */
+     * so without this the CPU can fetch whatever was in the line before. Only
+     * the range actually written since the last seal needs it -- everything
+     * below was invalidated when IT was sealed, and the arena never rewrites
+     * it. */
+    size_t dirty = (arenaWindowOn() && arena->dirtyFrom <= arena->used)
+                       ? arena->dirtyFrom : 0;
+    size_t length = arena->used - dirty;
+    if (length > 0) {
 #if defined(__APPLE__)
-    sys_icache_invalidate(arena->code, arena->used);
+        sys_icache_invalidate(arena->code + dirty, length);
 #elif defined(__GNUC__)
-    __builtin___clear_cache((char *)arena->code, (char *)arena->code + arena->used);
+        __builtin___clear_cache((char *)arena->code + dirty,
+                                (char *)arena->code + arena->used);
 #endif
+    }
     arena->sealed = true;
     return true;
 }
@@ -55,9 +94,17 @@ bool jaiCodeArenaSeal(JaiCodeArena *arena) {
  * every later compile found `sealed` and declined. */
 bool jaiCodeArenaUnseal(JaiCodeArena *arena) {
     if (!arena->sealed) return true;
-    if (mprotect(arena->code, arena->capacity, PROT_READ | PROT_WRITE) != 0) {
+    /* From the page `used` lands in, not from the base. The tail of the last
+     * body shares that page and loses its execute bit for the duration, which
+     * is sound because nothing compiled runs between an unseal and its seal --
+     * the window is inside one compile, and a compile calls no compiled code. */
+    size_t from = arenaWindowOn() ? pageFloor(arena->used) : 0;
+    if (mprotect(arena->code + from, arena->capacity - from,
+                 PROT_READ | PROT_WRITE) != 0) {
         return false;
     }
+    arena->windowFrom = from;
+    arena->dirtyFrom  = arena->used;
     arena->sealed = false;
     return true;
 }

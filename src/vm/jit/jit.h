@@ -147,6 +147,19 @@ typedef struct {
     uint8_t *code;      /* base of the mapping */
     size_t   capacity;
     size_t   used;
+    /* The arena is append-only, so everything below `windowFrom` is finished
+     * code that never changes again. Unsealing flips only [windowFrom,
+     * capacity) and sealing flips exactly that range back, instead of the
+     * whole mapping -- which matters because the mapping is now four
+     * mebibytes and the flip happens on every single compile.
+     *
+     * `dirtyFrom` is the same idea for the instruction cache: arm64's I and D
+     * caches are not coherent, so written code must be invalidated, but only
+     * the bytes actually written. Invalidating [code, used) on every seal made
+     * that O(total code emitted so far) per compile -- quadratic across a run,
+     * and paid 400+ times on `check lib/std` alone. */
+    size_t   windowFrom;
+    size_t   dirtyFrom;
     bool     sealed;    /* true once flipped to RX; writing after this is a bug */
 } JaiCodeArena;
 

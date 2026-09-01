@@ -406,6 +406,7 @@ this table complete in both directions.
 | switch | default | what it does |
 | --- | --- | --- |
 | `JAITHON_JIT_ARENA_MB` | 4 | Capacity of **both** code arenas, in mebibytes, clamped to 1..64. At the old default of 1 the tier declined **70 distinct bodies** on `check lib/jaithon` with "the code arena is full" -- more than any missing opcode arm -- and 4 takes that to zero, 301 compiled bodies to 369, and interpreted instructions down 13%. |
+| `JAITHON_JIT_ARENA_WINDOW` | on | Limit unseal/seal and the instruction-cache invalidation to the range that changed. Off flips the whole mapping on every compile and invalidates everything written so far. **Not a measured speedup** -- five interleaved pairs on `check lib/jaithon` disagreed in sign, so on this workload the mprotect and the invalidate are not hot. It is kept for the shape: the invalidation is O(bytes written) rather than O(all code emitted so far), and the window cannot leave the back catalogue unexecutable. |
 | `JAITHON_JIT_ROOT_LIMIT` | `JIT_MAX_ROOTS` | Roots one call descriptor may carry. |
 | `JAITHON_JIT_SHAPE_LIMIT` | `JAI_OSR_SHAPES` | Shapes one site may pin. |
 
