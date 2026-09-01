@@ -656,7 +656,7 @@ static unsigned valueBankBase(const Emit *e) {
 /* How many entries the operand stack may hold. The scratch bank is a fixed
  * nine; the callee-saved one is whatever the locals and the reserved registers
  * left behind. */
-static unsigned valueBankRoom(const Emit *e) {
+unsigned valueBankRoom(const Emit *e) {
     if (e->scratchValues) return e->scratchRoom;
     unsigned taken = regBase(e) + (e->usesUpvalues ? 1u : 0u);
     unsigned saved = taken < JIT_MAX_SAVED ? JIT_MAX_SAVED - taken : 0u;

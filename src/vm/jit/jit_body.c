@@ -534,15 +534,21 @@ bool compileBody(Emit *e, ObjClosure *closure) {
          * asked while a proof is actually live, which is the two or three
          * instructions between `s[i]` and whatever consumes it, or the single
          * instruction between OP_NULL and OP_IS. */
+        /* popSkipTarget is the other half of the same question: the `match`
+         * arms retarget a miss edge one instruction past where the bytecode
+         * sends it, so this offset can be reached by something the chunk scan
+         * cannot see. See matchMissResume. */
         if (anyStackProof(e) &&
-            offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
+            (offsetIsBranchTarget(&fn->chunk, (uint32_t)off) ||
+             popSkipTarget(e, (uint32_t)off))) {
             clearStackProofs(e);
         }
         /* A field-kind memo is good along the same one edge, and goes for the
          * same reason -- see forgetFieldKinds. `fn` is whichever body is being
          * walked, so an inlined one is measured against its own chunk. */
         if (e->knownCount != 0 &&
-            offsetIsBranchTarget(&fn->chunk, (uint32_t)off)) {
+            (offsetIsBranchTarget(&fn->chunk, (uint32_t)off) ||
+             popSkipTarget(e, (uint32_t)off))) {
             forgetFieldKinds(e);
         }
         /* Settles any deferred entry BEFORE the offset map records the instruction start, so a branch landing
@@ -889,6 +895,37 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_TYPE_GUARD:
             if (!emitTypeGuard(e, fn, code, &off)) return false;
             break;
+
+        /* The four opcodes an enum-variant `match` is made of. Arming any ONE
+         * of them buys exactly nothing -- the next link of the chain is two
+         * instructions later -- so they land together. See jit_body_match.c. */
+        case OP_MATCH_TYPE_POP: {
+            JitArmResult r = emitMatchTypePop(e, closure, code, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
+            break;
+        }
+
+        case OP_ENUM_TAG: {
+            JitArmResult r = emitEnumTag(e, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
+            break;
+        }
+
+        case OP_SWAP_POP: {
+            JitArmResult r = emitSwapPop(e, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
+            break;
+        }
+
+        case OP_MATCH_CONST_POP: {
+            JitArmResult r = emitMatchConstPop(e, fn, code, &off, &afterUncond);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
+            break;
+        }
 
         case OP_FORMAT:
             if (!emitFormat(e, closure, code, &off)) return false;

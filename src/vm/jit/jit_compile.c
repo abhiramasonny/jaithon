@@ -349,6 +349,16 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
                             needNull, true)) {
             return true;
         }
+        /* And the same bargain for the enum-`match` arms: a body that compiled
+         * a prefix before they existed has to compile it still. See
+         * gMatchUsed. */
+        if (gMatchUsed && !gNoMatchArm) {
+            gNoMatchArm = true;
+            bool ok = compileFuncOnce(closure, slotBase, dynamic, need,
+                                      nullable, needNull, false);
+            gNoMatchArm = false;
+            if (ok) return true;
+        }
         bool grew = false;
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             if (need[i] && !dynamic[i]) { dynamic[i] = true; grew = true; }
@@ -369,6 +379,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             bool noInline) {
     ObjFunction *fn = closure->fn;
     gInlineFailed = false;
+    gMatchUsed    = false;
 
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] considering %s\n",

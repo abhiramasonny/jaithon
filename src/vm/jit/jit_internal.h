@@ -66,6 +66,11 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
  * rather than of the whole body. Past this the body answers yes everywhere,
  * which is the same answer it gave before the range existed. */
 #define JIT_MAX_CLOBBER 24u
+/* Distinct offsets the `match` arms may branch to across a discarded OP_POP
+ * (see matchMissResume). One per alternative of one `match`, and `_is_operator`
+ * in the lexer -- the largest in the tree -- has 40. Past this the arm refuses,
+ * which costs coverage and never an unrecorded join. */
+#define JIT_MAX_POPSKIP 128u
 /* Repeated from the register plan below, which cannot be declared this early:
  * x0..x8, the bank a call-free body's operand stack uses. */
 #define JIT_SCRATCH_BANK_COUNT 9u
@@ -274,6 +279,13 @@ typedef struct {
      * fixup pass can name the cause and not just the symptom. */
     uint8_t   unarmedOp;
     uint32_t  unarmedAt;
+    /* Offsets this walk branched to across an OP_POP it never emitted; see
+     * matchMissResume. Nothing in the BYTECODE branches there, so every test in
+     * the walk that asks "can something else reach this offset" by scanning the
+     * chunk has to be told about them separately -- the ones that scan the
+     * fixup list instead already see them. */
+    uint32_t  popSkip[JIT_MAX_POPSKIP];
+    unsigned  popSkipCount;
     uint8_t   stackObjType[JIT_MAX_STACK];
     /* An exemplar of what THIS list entry's elements are, for a list the body
      * built itself and so has no live sample of. `OP_BUILD_LIST` knows the kind
@@ -928,6 +940,7 @@ Value seenLocal(Emit *e, unsigned slot);
 void noteScratchClobber(Emit *e);
 unsigned valueXReg(const Emit *e, unsigned idx);
 unsigned pushReg(const Emit *e);
+unsigned valueBankRoom(const Emit *e);
 unsigned fpHeldIn(const Emit *e, unsigned idx);
 void fpSyncOne(Emit *e, unsigned idx);
 void fpReleaseHome(Emit *e, unsigned reg);
@@ -972,6 +985,7 @@ void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
 bool jitModuleCalls(void);
 bool jitClassCalls(void);
 bool jitModuleNativeCalls(void);
+bool jitMatchArm(void);
 bool modelAgreesWithChunk(const Emit *e, uint32_t off);
 bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
                           unsigned *out);
@@ -1164,6 +1178,17 @@ bool emitJumpIfCmpFalse(Emit *e, const uint8_t *code, int *offp);
 bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
                          int *offp);
 JitArmResult emitMembership(Emit *e, const uint8_t *code, int *offp);
+
+/* Defined in jit_body_match.c. */
+extern bool gMatchUsed;
+extern bool gNoMatchArm;
+bool popSkipTarget(const Emit *e, uint32_t at);
+JitArmResult emitMatchTypePop(Emit *e, ObjClosure *closure,
+                              const uint8_t *code, int *offp);
+JitArmResult emitEnumTag(Emit *e, int *offp);
+JitArmResult emitSwapPop(Emit *e, int *offp);
+JitArmResult emitMatchConstPop(Emit *e, ObjFunction *fn, const uint8_t *code,
+                               int *offp, bool *afterUncondp);
 
 /* Defined in jit_body_field.c. */
 bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp);

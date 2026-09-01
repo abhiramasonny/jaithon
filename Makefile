@@ -81,6 +81,9 @@ KIND_FUZZ_WARM ?= 3000
 # under test never compiles and every program passes on no coverage at all.
 FUZZ_COUNT ?= 400
 FUZZ_WARM  ?= 1500
+# How many generated `match` bodies `make match-fuzz` runs through its six
+# configurations. Four to a program, so this is fifty programs at the default.
+MATCH_FUZZ_COUNT ?= 200
 EXTRA_LDFLAGS ?=
 
 # zlib inflates the seed's images. boot/seed.bin holds them deflated, one
@@ -709,6 +712,14 @@ kind-fuzz: $(TARGET)
 jit-fuzz: $(TARGET)
 	@python3 tests/fuzz/differential.py --count $(FUZZ_COUNT) \
 	    --warm $(FUZZ_WARM)
+
+# The enum-`match` differential: random enums, random match bodies over them,
+# every subject the checker lets through, six configurations, diffed. Out of
+# `make test` for the same reason kind-fuzz is -- minutes of subprocesses. Its
+# own header says how its teeth were established.
+.PHONY: match-fuzz
+match-fuzz: $(TARGET)
+	@python3 tests/fuzz/match_differential.py --count $(MATCH_FUZZ_COUNT)
 
 # The chunk verifier is C-only: it has to be fed malformed bytecode, which no
 # .jai source can express. Everything but the CLI entry point links in.

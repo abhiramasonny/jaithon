@@ -178,6 +178,26 @@ bool jitModuleCalls(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_MATCH=0 puts the four enum-`match` opcodes back on the unarmed
+ * path, so what arming them is worth can be read off ONE binary. It has to be
+ * one binary: alternating two invalidates __jaicache__ and every sample then
+ * pays a stdlib recompile larger than the effect.
+ *
+ * Off is the exact pre-arm behaviour and not an approximation of it -- each arm
+ * declines the way it declines any shape it cannot speak, into emitUnarmedDeopt
+ * at its own offset.
+ *
+ * Default ON. Read once: a body compiled with the arms and one compiled without
+ * must not coexist in a run. */
+bool jitMatchArm(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_MATCH");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* JAITHON_JIT_CLASS_CALLS=0 turns off the static-member call arm at OP_INVOKE,
  * for the same reason jitModuleCalls exists: the two shapes have to be
  * comparable inside ONE binary. Alternating two builds is not an A/B here --

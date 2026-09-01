@@ -331,6 +331,12 @@ uint32_t jaiA64StrByte(unsigned rt, unsigned rn, unsigned offset) {
     return 0x39000000u | ((offset & 0xfffu) << 10) | (rn << 5) | rt;
 }
 
+/* LDRH Wt, [Xn, #imm12] -- the halfword load, whose immediate is SCALED by two
+ * where jaiA64LdrByte's is not. */
+uint32_t jaiA64LdrHalf(unsigned rd, unsigned rn, unsigned offset) {
+    return 0x79400000u | (((offset >> 1) & 0xfffu) << 10) | (rn << 5) | rd;
+}
+
 uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm) {
     return 0x8a000000u | (rm << 16) | (rn << 5) | rd;
 }

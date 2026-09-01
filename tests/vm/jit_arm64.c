@@ -670,6 +670,18 @@ int main(void) {
     { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
                              jaiA64OrrX(0, 1, 2), jaiA64Ret() };
       check("orr", runWith(w, 4, cell), 0xf0 | 0x3c); }
+    /* ldrh. Two things can go wrong and neither shows on a small value: the
+     * immediate is SCALED by two where ldrb's is not, and the load must stop at
+     * sixteen bits or the neighbouring halfword rides along. 0xdeadbeef has
+     * both halves distinct, so a missing shift reads the wrong one and a
+     * too-wide load reads both. */
+    { const uint32_t w[] = { jaiA64MovzX(1, 0xbeef, 0),
+                             jaiA64MovkX(1, 0xdead, 1),
+                             jaiA64StrX(1, 0, 40),
+                             jaiA64LdrHalf(0, 0, 40), jaiA64Ret() };
+      check("ldrh", runWith(w, 5, cell), 0xbeef); }
+    { const uint32_t w[] = { jaiA64LdrHalf(0, 0, 42), jaiA64Ret() };
+      check("ldrh offset", runWith(w, 2, cell), 0xdead); }
 
     /* and-with-a-run-of-ones, which is floor-mod by a power of two. The
      * negative case is the one that matters: `x %% 8` is 5 for x = -3, and the
