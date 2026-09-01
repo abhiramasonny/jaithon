@@ -1,7 +1,10 @@
 #: The compiled tier does not enforce the interpreter's frame limit, so this
 #: prints 1100 with the JIT on and RuntimeError without it. All six compiled
-#: configurations disagree with the reference. Possibly by design; recorded
-#: here because the fuzzer's oracle cannot tell that from a miscompile.
+#: configurations disagree with the reference. DELIBERATE, and now written
+#: down: see "The one divergence that is deliberate" in
+#: src/vm/jit/README.md. Kept as the record of it, not as a bug -- and as
+#: the reason a generated program must not recurse past JAI_FRAMES_MAX,
+#: since the oracle cannot tell a designed divergence from a miscompile.
 #:
 #:   ./jaithon run tests/fuzz/found/recursion_depth_limit.jai            # 1100
 #:   JAITHON_NO_JIT=1 ./jaithon run tests/fuzz/found/recursion_depth_limit.jai

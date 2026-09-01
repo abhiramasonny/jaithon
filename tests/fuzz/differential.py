@@ -24,16 +24,19 @@ The configurations, and what each is for:
                                          and every OSR exit is taken
     split     JAITHON_JIT_SPLIT_STRESS=1 the split operand bank in every body
                                          that can take one
-    first     JAITHON_JIT_THRESHOLD=1    every body compiles on its FIRST call
-                                         instead of its 64th
+    thresh    JAITHON_JIT_THRESHOLD=1    every body compiles on its FIRST call
 
-`tick` and `first` drive DIFFERENT TIERS and neither subsumes the other:
-`first` lowers the entry counter, which is the whole-function tier, while
-`tick` raises the sampler rate, which is the OSR loop tier. The nullable-local
-miscompile fixed on 2026-09-01 was CORRECT under `first` and WRONG under
-`tick`, which is what settled the question of running both.
+`thresh` and `tick` are complements, not substitutes. They drive different
+tiers -- `thresh` the whole-function one, `tick` the OSR loop one -- and a bug
+in either is invisible from the other: the last hit found here was correct
+under JAITHON_JIT_THRESHOLD=1 and wrong under JAITHON_JIT_TICK_US=50. `thresh`
+also hands the tier a half-formed inline cache, since JAI_IC_OBS_BUDGET no
+longer settles before the body compiles, which is exactly the state a
+polymorphic call site is least likely to survive. Measured over 20 programs it
+runs in 3.69s against 19.12s for the other five together, so it adds about a
+fifth to the run, which is worth it.
 
-`--gc` adds a sixth, `--gc-stress=N`, which is worth running occasionally but
+`--gc` adds a seventh, `--gc-stress=N`, which is worth running occasionally but
 is slow: a collection between almost every allocation.
 
 A crash under one configuration and not another is the loudest possible hit and
@@ -71,7 +74,7 @@ MODES = [
     ("tick", {"JAITHON_JIT_TICK_US": "50"}, []),
     ("deopt", {"JAITHON_JIT_DEOPT_STRESS": "1"}, []),
     ("split", {"JAITHON_JIT_SPLIT_STRESS": "1"}, []),
-    ("first", {"JAITHON_JIT_THRESHOLD": "1"}, []),
+    ("thresh", {"JAITHON_JIT_THRESHOLD": "1"}, []),
 ]
 
 GC_MODE = ("gc", {}, ["--gc-stress=64"])

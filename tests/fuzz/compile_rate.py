@@ -1,39 +1,21 @@
 #!/usr/bin/env python3
-"""How much of what progen.py generates actually reaches the compiled tier.
+"""Reports what fraction of generated probes actually reach the compiled tier.
 
-The failure mode this exists to catch: a generator that emits programs the
-tier REFUSES leaves differential.py comparing the interpreter with itself,
-so every seed passes and nothing was tested. `JAI_JIT_WHY=1` names every
-compile and every refusal, and this counts them.
+A generator that emits programs the tier refuses is a generator that compares
+the interpreter with itself, so the oracle in differential.py proves nothing.
+`JAI_JIT_WHY=1` names every attempt and every refusal; this counts them.
 
-A function counts as compiled when a run prints either
+"Compiled" is not the whole story, so this also counts how far the walk got:
+the tier stops at the first opcode it does not model and interprets the rest,
+and a probe reported as compiled can be compiled for three instructions.
+Measured over 80 programs, 94 of 110 cuts land before 85% of the body, the
+median at 68%, and 82 of those 94 are OP_MUL_WRAP or OP_ADD_WRAP -- opcodes
+src/vm/jit has no handler for at all, and which progen.py chose deliberately
+so an edge literal could not raise. That is a generator decision, so it is a
+generator decision to revisit.
 
-    [jit] compiled NAME arity=1 ...     the call-count whole-function tier
-    [jit] osr NAME at N: M instructions the sampler-driven loop tier
-
-and the refusal text is tallied for everything else, most common first --
-which is the list to work down when the rate is low. Probes and container
-helpers are counted separately because they fail for different reasons: a
-probe declines on whatever its random body happens to contain, a container
-helper on what the tier can do with the container it was handed.
-
-    python3 tests/fuzz/compile_rate.py --count 80
-    python3 tests/fuzz/compile_rate.py --count 80 --warm 400
-
-Three findings came straight out of running this, each worth more than any
-single grammar rule that was added, and all three are self-inflicted harness
-problems rather than anything about the programs:
-
-  - a container BUILT in the body that reads it has no live sample, so the
-    dict index, the list element kind and the set length all decline. Passed
-    in as a parameter the same work compiles: 1 of 72 against clean;
-  - `sfold(str(x))` refuses the whole enclosing body on `OP_TYPE_GUARD: a
-    str guard on a object`, and `sfold(f"{x}")` compiles. Same text;
-  - a container helper that is generated but never CALLED is never hot, so
-    it is never even considered -- 201 generated, 0 called, 0 compiled.
-
-The self-hosted compiler and the test front end are loaded by every run and
-are themselves hot, so their `[jit]` lines are filtered out by name.
+    python3 tests/fuzz/compile_rate.py --count 40
+    python3 tests/fuzz/compile_rate.py --count 40 --warm 400 --reasons 20
 """
 
 import argparse
@@ -41,7 +23,6 @@ import collections
 import concurrent.futures
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,99 +34,96 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 JAITHON = os.environ.get("JAITHON", os.path.join(ROOT, "jaithon"))
 
 COMPILED = re.compile(r"^\[jit\] compiled (\S+)\s")
-OSR = re.compile(r"^\[jit\] osr (\S+) at \d+: \d+ instructions")
-STOPPED = re.compile(r"^\[jit\] (\S+) (?:stopped[^:]*|walked only to \S+ at \d+)"
-                     r"(?:: (.*))?$")
-# The container helpers progen names cd/cs/ct/cn/cm plus a counter. They carry
-# the shape under test with the container arriving as a PARAMETER, which is the
-# only way most of it reaches the whole-function tier, so they are counted
-# separately rather than folded into the probe number.
-HELPER = re.compile(r"^c[dstnm]\d+$")
+OSR = re.compile(r"^\[jit\] osr (\S+) at \d+:")
+STOPPED = re.compile(r"^\[jit\] (\S+) stopped \(measuring\): (.*)$")
+WALKED = re.compile(r"^\[jit\] (\S+) walked only to (\S+) at \d+ --")
 
 
-def measure(seed, warm, timeout):
-    """Run one generated program with JAI_JIT_WHY=1.
+def probe_names(source):
+    return re.findall(r"^fn (probe\d+)\(", source, re.MULTILINE)
 
-    Returns (probes present, probes compiled, helpers present, helpers
-    compiled, [refusal texts]).
-    """
-    workdir = tempfile.mkdtemp(prefix=f"jitrate-{seed}-")
-    empty = (set(), set(), set(), set())
-    try:
-        prog = progen.generate(seed, warm)
-        source = prog.render()
-        path = os.path.join(workdir, "case.jai")
+
+def one(seed, warm, timeout):
+    source = progen.generate(seed, warm).render()
+    names = probe_names(source)
+    with tempfile.TemporaryDirectory(prefix=f"jitrate-{seed}-") as work:
+        path = os.path.join(work, "case.jai")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(source)
         env = dict(os.environ)
-        env["JAITHON_PATH"] = os.path.join(ROOT, "lib")
         env["JAI_JIT_WHY"] = "1"
+        env["JAITHON_PATH"] = os.path.join(ROOT, "lib")
         try:
             done = subprocess.run([JAITHON, "run", path], capture_output=True,
                                   env=env, timeout=timeout)
         except subprocess.TimeoutExpired:
-            return empty + (["<timeout>"],)
-        text = done.stderr.decode("utf-8", "replace")
-        if done.returncode not in (0, 1):
-            return empty + ([f"<exit {done.returncode}>"],)
-        probes = {p.name for p in prog.probes}
-        helpers = {m.group(1) for m in
-                   re.finditer(r"^fn (c[dstnm]\d+)\(", source, re.M)}
-        wanted = probes | helpers
-        hit, why = set(), []
-        for ln in text.splitlines():
-            m = COMPILED.match(ln) or OSR.match(ln)
-            if m and m.group(1) in wanted:
-                hit.add(m.group(1))
-                continue
-            m = STOPPED.match(ln)
-            if m and m.group(1) in wanted:
-                why.append(m.group(2) or "walked only part of the body")
-        return (probes, hit & probes, helpers, hit & helpers, why)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+            return seed, names, set(), set(), [], {}
+        err = done.stderr.decode("utf-8", "replace")
+    fn, osr, why, cut = set(), set(), [], {}
+    for ln in err.splitlines():
+        m = COMPILED.match(ln)
+        if m and m.group(1) in names:
+            fn.add(m.group(1))
+        m = OSR.match(ln)
+        if m and m.group(1) in names:
+            osr.add(m.group(1))
+        m = STOPPED.match(ln)
+        if m and m.group(1) in names:
+            why.append(m.group(2))
+        m = WALKED.match(ln)
+        if m and m.group(1) in names:
+            why.append("walked only to " + m.group(2))
+            # A compiled body is not a compiled BODY: the walk stops at the
+            # first opcode this tier does not model and everything after it is
+            # interpreted, so "compiled" alone overstates what the oracle
+            # actually covers. Which opcode did the cutting is the actionable
+            # part -- if it is one the generator chose, the generator can stop.
+            cut.setdefault(m.group(1), m.group(2))
+    return seed, names, fn, osr, why, cut
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--count", type=int, default=60)
+    ap.add_argument("--count", type=int, default=40)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--warm", type=int, default=progen.WARM_DEFAULT)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--timeout", type=int, default=180)
-    ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--reasons", type=int, default=12)
     args = ap.parse_args()
 
-    if not os.access(JAITHON, os.X_OK):
-        print(f"error: {JAITHON} not built. Run 'make' first.", file=sys.stderr)
-        return 2
-
-    seeds = list(range(args.start, args.start + args.count))
-    probes = compiled = helpers = hcompiled = 0
-    programs = hot_programs = 0
+    seeds = range(args.start, args.start + args.count)
+    total = compiled_fn = compiled_any = 0
+    progs_any = 0
     reasons = collections.Counter()
+    cuts = collections.Counter()
+    truncated = 0
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        for pnames, phit, hnames, hhit, why in pool.map(
-                lambda s: measure(s, args.warm, args.timeout), seeds):
-            probes += len(pnames)
-            compiled += len(phit)
-            helpers += len(hnames)
-            hcompiled += len(hhit)
-            programs += 1
-            if phit or hhit:
-                hot_programs += 1
-            reasons.update(w[:100] for w in why)
+        for seed, names, fn, osr, why, cut in pool.map(
+                lambda s: one(s, args.warm, args.timeout), seeds):
+            total += len(names)
+            compiled_fn += len(fn)
+            compiled_any += len(fn | osr)
+            progs_any += 1 if (fn | osr) else 0
+            reasons.update(why)
+            for name in fn | osr:
+                if name in cut:
+                    truncated += 1
+                    cuts[cut[name]] += 1
 
-    def rate(a, b):
-        return f"{a}/{b} ({100.0 * a / b:.1f}%)" if b else f"{a}/0"
-
-    print(f"probes            {rate(compiled, probes)} reached a compiled tier")
-    print(f"container helpers {rate(hcompiled, helpers)}")
-    print(f"programs          {rate(hot_programs, programs)} had at least one")
-    if reasons:
-        print("\nwhy the rest declined:")
-        for text, n in reasons.most_common(args.top):
-            print(f"  {n:5d}  {text}")
+    pct = lambda a, b: f"{a}/{b} = {100.0 * a / max(1, b):.1f}%"
+    print(f"{args.count} programs, warm={args.warm}")
+    print(f"  probes reaching ANY compiled tier   {pct(compiled_any, total)}")
+    print(f"  probes reaching the function tier   {pct(compiled_fn, total)}")
+    print(f"  programs with >=1 compiled probe    {pct(progs_any, args.count)}")
+    print(f"  of those, walk cut short before the end     "
+          f"{pct(truncated, compiled_any)}")
+    print("\nwhat cut a compiled probe's walk short:")
+    for op, n in cuts.most_common(6):
+        print(f"  {n:5d}  {op}")
+    print("\ntop refusals inside a probe:")
+    for reason, n in reasons.most_common(args.reasons):
+        print(f"  {n:5d}  {reason[:100]}")
     return 0
 
 

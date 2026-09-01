@@ -128,6 +128,29 @@ innermost frame that sees it, and the value handed back to the compiled caller.
 
 ---
 
+## The one divergence that is deliberate
+
+Everything else here exists to make the tier unobservable. Recursion depth is
+the exception, and it is worth knowing before a differential run reports it as
+a miscompile.
+
+The interpreter counts frames and raises `RuntimeError` past `JAI_FRAMES_MAX`
+(1024). A compiled frame is a native frame, not a `vm.frames` entry, so that
+count does not apply to it; the tier bails on the real thread stack instead,
+derived from the thread's own bounds in `stackLimit`. So `deep(1100)` raises
+interpreted and returns compiled, and compiled recursion raises only in the
+tens of thousands.
+
+It fails cleanly either way -- the deep case still raises `RuntimeError`, it
+just raises later -- and the compiled limit is the more accurate one, since it
+measures the stack that actually exists rather than a fixed count chosen for
+the interpreter's frame size. Enforcing parity would mean counting frames on
+every compiled call, on the hot path, to make a rarely-observed threshold
+match. It is not worth that, so it is written down instead.
+
+`tests/fuzz/found/recursion_depth_limit.jai` is the reproducer, kept as a
+record of a divergence rather than as a bug.
+
 ## SlotKind, and the one invariant
 
 `SlotKind` is what the tier believes about a value. Every local, every operand
