@@ -417,7 +417,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check layer-check kind-tag-check switch-doc-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check layer-check kind-tag-check switch-doc-check seed-closure-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -569,6 +569,16 @@ kind-tag-check:
 .PHONY: switch-doc-check
 switch-doc-check:
 	@python3 scripts/gate/switch_doc_check.py
+
+# A seeded module whose import is not itself seeded makes the tree unable to
+# compile AT ALL -- and since `make reseed` needs a working compiler to build
+# the next seed, it cannot rebuild its way out: boot/ has to be restored by hand
+# and every __jaicache__ wiped. `seed-check` catches it, but only by building a
+# whole seed and watching the compiler abort. This is text, so it runs first and
+# costs nothing.
+.PHONY: seed-closure-check
+seed-closure-check:
+	@python3 scripts/gate/seed_closure_check.py
 
 # Where a branch keeps its displacement is written down twice, in verify.c and
 # in opt/chunk.jai, and neither consults the other. A missing entry makes the
