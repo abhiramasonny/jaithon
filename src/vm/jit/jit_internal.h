@@ -1122,12 +1122,27 @@ bool retObjTypeOn(void);
 
 /* Defined in jit_call.c. */
 
+/* An arm's three outcomes. REFUSED is zero and OK is one so that an arm body's
+ * own `return false` and `return subWhy(...)` still mean "declined". */
+typedef enum { JIT_ARM_REFUSED = 0, JIT_ARM_OK = 1, JIT_ARM_UNARMED = 2 }
+    JitArmResult;
+
+/* Defined in jit_body.c. */
+bool fpWorthLoading(const Emit *e, const uint8_t *code, int next, int stop);
+
 /* Defined in jit_body_cmp.c. */
 bool emitCompare(Emit *e, uint8_t op, int *offp);
 bool emitIsTest(Emit *e, uint8_t op, int *offp);
 bool emitJumpIfCmpFalse(Emit *e, const uint8_t *code, int *offp);
 bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
                          int *offp);
+
+/* Defined in jit_body_field.c. */
+bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp);
+JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
+                               int *offp, int stop);
+bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
+                  int stop);
 
 #endif /* arm64 */
 
