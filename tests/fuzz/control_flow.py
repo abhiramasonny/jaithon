@@ -147,6 +147,13 @@ fn main() -> int {{
         print(attempt(m, out))
         print(out)
     }}
+    for _r in 0..{warm} {{ w = attempt(0, sink) }}
+    print(w)
+    for m in 0..{modes} {{
+        var out: list = []
+        print(attempt(m, out))
+        print(out)
+    }}
     return 0
 }}
 """
