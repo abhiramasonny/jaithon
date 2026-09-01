@@ -781,12 +781,13 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
              * the home is bit-exact either way, so it only has to come back   \
              * through an X register to be tagged. */                          \
             unsigned rp = lx;                                                  \
-            if (lf != 0 && (lk == SLOT_MAYBE_INST || lt != VAL_FLOAT)) {       \
+            if (lf != 0 && (lk == SLOT_MAYBE_INST ||                           \
+                            lk == SLOT_MAYBE_OBJ || lt != VAL_FLOAT)) {        \
                 rp = JIT_SCRATCH_B;                                            \
                 emit(&e, jaiA64FmovXD(rp, lf));                                \
                 lf = 0;                                                        \
             }                                                                  \
-            if (lk == SLOT_MAYBE_INST) {                                       \
+            if (lk == SLOT_MAYBE_INST || lk == SLOT_MAYBE_OBJ) {               \
                 emitTagFor(&e, lk, rp, JIT_SCRATCH_D, JIT_SCRATCH_C);          \
                 emit(&e, jaiA64StrW(JIT_SCRATCH_D, JIT_SLOTS_REG, li * 16u));  \
                 emit(&e, jaiA64StrX(rp, JIT_SLOTS_REG, li * 16u + 8u));        \
@@ -902,7 +903,12 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             if (e.deopt[k].fpLive & (1u << valueSeen)) {
                 emit(&e, jaiA64FmovXD(reg0, fpRegAt(&e, valueSeen)));
             }
-            if (kind == SLOT_MAYBE_INST) {
+            /* Both nullable kinds. The function tier's twin of this ladder
+             * (jit_compile.c) already reads both; this one named only the
+             * instance, which is how a fix lands in one tier and not the
+             * other -- and the tiers are complements, so a bug that survives
+             * in one is a bug that ships. */
+            if (kind == SLOT_MAYBE_INST || kind == SLOT_MAYBE_OBJ) {
                 emitTagFor(&e, kind, reg0, JIT_SCRATCH_B, JIT_SCRATCH_C);
                 emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
                 emit(&e, jaiA64StrX(reg0, JIT_SCRATCH_A, at + 8));
@@ -1312,6 +1318,19 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         SlotKind want = (SlotKind)(form->kinds[i] & 0x0Fu);
         if (want == SLOT_MAYBE_INST) {
             if (!IS_NULL(v) && !IS_INSTANCE(v))
+                return osrNoSlot(fn, top, i, want, v);
+            continue;
+        }
+        /* The same check without the class. `default` used to admit this kind
+         * on the premise that an unnamed slot is never read, which is false
+         * here: the prologue loads every slot with a register home eight bytes
+         * wide. A slot compiled as object-or-null and entered holding an int
+         * would put that int in the home, `== null` would compare it against
+         * zero and call 7 non-null, and the first tag written off that payload
+         * says VAL_OBJ for a pointer of 7. Exactly what the SLOT_OBJ arm below
+         * records having been fixed once for the neighbouring kind. */
+        if (want == SLOT_MAYBE_OBJ) {
+            if (!IS_NULL(v) && !IS_OBJ(v))
                 return osrNoSlot(fn, top, i, want, v);
             continue;
         }

@@ -205,7 +205,8 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
      * is the contract, exactly as it is for every other kind at this arm. */
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
         rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
-        rk != SLOT_OBJ && rk != SLOT_NULL) {
+        rk != SLOT_OBJ && rk != SLOT_NULL &&
+        !(rk == SLOT_MAYBE_OBJ && jitMaybeObjStackOn())) {
         return subWhy(e, "a direct callee returning %s", slotKindName(rk));
     }
     if ((rk == SLOT_INST || rk == SLOT_MAYBE_INST) &&

@@ -107,6 +107,15 @@ static bool seedLocals(Emit *e, Value *slotBase) {
  * instruction chosen from that kind. */
 bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
                                uint32_t shape, ObjClass *klass, Value seen) {
+    /* SLOT_MAYBE_OBJ may cross the operand stack but may not become a LOCAL's
+     * kind. A local's tag is written by localTagFor, a ladder of constants,
+     * and a constant tag is the one thing a nullable kind cannot have -- a
+     * zero payload would be materialised as VAL_OBJ for the collector to
+     * trace. Every other consumer of a nullable kind reaches emitTagFor's
+     * csel; this one cannot, so the kind stops here. */
+    if (kind == SLOT_MAYBE_OBJ) {
+        return subWhy(e, "binding an object-or-null to a local");
+    }
     if (!IS_NULL(seen)) e->localSeen[slot] = seen;
     if (!e->localTyped[slot]) {
         /* A slot an earlier attempt asked to be widened takes the wider kind

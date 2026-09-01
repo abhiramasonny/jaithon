@@ -153,7 +153,8 @@ bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
     }
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
         rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
-        rk != SLOT_OBJ && rk != SLOT_NULL) {
+        rk != SLOT_OBJ && rk != SLOT_NULL &&
+        !(rk == SLOT_MAYBE_OBJ && jitMaybeObjStackOn())) {
         return subWhy(e, "a callee returning %s", slotKindName(rk));
     }
 

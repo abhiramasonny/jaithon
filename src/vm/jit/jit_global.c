@@ -520,14 +520,21 @@ bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
             *shape = cfn->obsReturnShape;
             return true;
         }
-        /* Deliberately nothing for the other object types. SLOT_MAYBE_OBJ is
-         * legal as a RETURN kind but not on an operand stack, so handing one
-         * back here does not compile a caller -- it only moves the refusal
-         * from "observed returns disagree" to "a method returning
-         * object-or-null", 97 of them on lib/std. Widening the callers to
-         * accept it means auditing every site that reads a stack entry's
-         * kind, which is its own change. */
-        return false;
+        /* The other object types only help once SLOT_MAYBE_OBJ may reach an
+         * operand stack: without that, handing one back does not compile a
+         * caller, it only moves the refusal from "observed returns disagree"
+         * to "a method returning object-or-null". */
+        if (!jitMaybeObjStackOn()) return false;
+        SlotKind base;
+        unsigned btag;
+        uint8_t btype = 0;
+        if (!feedbackSlotKind((uint8_t)(JAI_FB_OBJ + (unsigned)ot), &base,
+                              &btag, &btype)) {
+            return false;
+        }
+        if (objType != NULL) *objType = btype;
+        *k = SLOT_MAYBE_OBJ;
+        return true;
     }
     if (fb == JAI_FB_OBJ + (unsigned)OBJ_INSTANCE) {
         if (cfn->obsReturnShape == 0) return false;

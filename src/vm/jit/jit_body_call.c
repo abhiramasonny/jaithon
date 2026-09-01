@@ -888,7 +888,8 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             } else if (rkind != SLOT_INT && rkind != SLOT_FLOAT &&
                        rkind != SLOT_BOOL && rkind != SLOT_INST &&
                        rkind != SLOT_MAYBE_INST && rkind != SLOT_LIST &&
-                       rkind != SLOT_OBJ && rkind != SLOT_NULL) {
+                       rkind != SLOT_OBJ && rkind != SLOT_NULL &&
+                       !(rkind == SLOT_MAYBE_OBJ && jitMaybeObjStackOn())) {
                 haveKind = false;
                 mwhy = "a method returning %s";
             }

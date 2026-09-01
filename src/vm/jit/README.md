@@ -271,9 +271,34 @@ refuse the object form; wherever it only loads, passes, stores or roots, the
 two are interchangeable. It is what `-> OpKind?` returns -- an enum member on
 one edge and null on the other, a pair no other kind covers. Today it is
 produced only by `mergeReturnKind`, `pushValue3` refuses it, and
-`jitMaybeObjStackOn` (`JAITHON_JIT_MAYBE_OBJ_STACK=1`) is the switch that would
-let it onto the operand stack once every site that reads an entry's kind has
-been shown to exclude or handle it.
+`jitMaybeObjStackOn` (`JAITHON_JIT_MAYBE_OBJ_STACK=1`) lets it onto the operand
+stack, which is worth ~352 refusals on `check lib/std` and measured +6 compiled
+bodies. It is **off by default** pending a measurement on a quiet machine.
+
+An audit of all 234 sites in `src/vm/jit/` that branch on a stack entry's kind
+found 14 that would miscompile with it on. Every one is fixed, and the shape of
+the finding is worth keeping: **nine of the fourteen were the same defect**. The
+two deopt stubs had diverged -- the function tier's ladder
+(`jit_compile.c`) already read both nullable kinds, the OSR tier's read only
+`SLOT_MAYBE_INST` -- so every producer of a deopt record (`emitUnarmedDeopt`,
+`branchOnDeopt`, `branchOnDeoptInstStart`, `deoptRecordAt`, three arms of
+`emitDirectCall`, `emitMaybeInstResult`, `emitCompare`) was reported separately
+while being one missing arm. Ranking the reports by count would have pointed at
+eight innocent files. The genuinely distinct ones were:
+
+* `adoptLocalKindSeen` -- a stack entry's kind becomes a LOCAL's kind, and a
+  local's tag comes from `localTagFor`, a ladder of constants. A nullable kind
+  cannot have a constant tag, so this one refuses rather than widens.
+* the OSR entry guard's `default: break` -- its premise, "opaque: never read",
+  is false for this kind, since the prologue loads every register-homed slot
+  eight bytes wide. A form compiled for object-or-null and re-entered holding
+  an int would call `7` non-null. The neighbouring `SLOT_OBJ` arm records
+  having been fixed for exactly this once before.
+* the OSR local write-back, whose csel escape named only the instance kind.
+
+The tiers are complements, and the lesson is the one the bug list at the end of
+this file already teaches twice: **a fix applied to one tier's copy of a ladder
+is not applied.** Grep the twin.
 
 ### What the interpreter records about a return
 
