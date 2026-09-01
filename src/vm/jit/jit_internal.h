@@ -854,6 +854,42 @@ int jitGetIndexDict(JitCallDesc *d);
 int jitSetIndexDict(JitCallDesc *d);
 int jitCallOut(JitCallDesc *d);
 
+/* Defined in jit_osr.c. */
+int instructionLength(const Chunk *c, int off);
+/* Filled by loopDepthTable, which lives with the OSR entry below. */
+const uint8_t *loopDepthFor(const Chunk *c, unsigned *count);
+
+/* Defined in jit_func.c. */
+const char *slotKindName(SlotKind k);
+void emit(Emit *e, uint32_t word);
+unsigned osrReserved(const Emit *e);
+void emitTagFor(Emit *e, SlotKind kind, unsigned payloadReg,
+                       unsigned tagReg, unsigned spare);
+uint8_t localStgOf(const Emit *e, unsigned slot);
+unsigned valueBankReg(const Emit *e, unsigned idx);
+unsigned fpRegAt(const Emit *e, unsigned idx);
+void emitConst64(Emit *e, unsigned rd, int64_t value);
+void emitSaveRestore(Emit *e, bool save);
+void emitFrameEnter(Emit *e);
+void emitFpSaveRestore(Emit *e, bool save);
+void emitEpilogue(Emit *e, unsigned bailed);
+bool jitSplitStress(void);
+bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi);
+void planHoists(Emit *e, ObjFunction *fn);
+const char *declineReason(Emit *e);
+unsigned jitShapeLimit(void);
+const char *unarmedDetail(const ObjFunction *fn, uint8_t op,
+                                 uint32_t at);
+void emitSelfSlowStubs(Emit *e, ObjClosure *closure);
+void emitGrowStubs(Emit *e);
+bool compileBody(Emit *e, ObjClosure *closure);
+void jitFree(int *map, int *depths, int *chunkDepth, int count);
+int *chunkDepthTable(const ObjFunction *fn);
+void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
+                              const bool *skip, unsigned *strandedOut);
+uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
+                          unsigned count);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
