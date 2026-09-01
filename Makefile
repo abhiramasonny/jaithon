@@ -228,8 +228,8 @@ DEPS := $(OBJS:.o=.d) $(BUILD)/verify_chunk.d
 # So key the cache on the compiler's own sources as well. Any edit to a .c, .h
 # or .m under src/ changes the fingerprint and invalidates every cached image.
 # The generated header is rewritten only when the value actually changes, so an
-# unrelated rebuild does not cascade: serialize.c is the only translation unit
-# that includes it.
+# unrelated rebuild does not cascade: the serialize*.c files are the only
+# translation units that include it.
 # boot/seed.c is excluded on purpose. ALL_SRCS feeds SRC_FINGERPRINT, which
 # becomes JAI_BUILD_ID, which every .jaic records and demands back. The seed is
 # generated data rather than compiler logic -- it changes what the compiler
@@ -273,7 +273,10 @@ DEPS := $(OBJS:.o=.d) $(BUILD)/verify_chunk.d
 # changed the fingerprint, which changed the id stamped into the next seed's
 # images. That loop cannot converge and a fixpoint over it never holds.
 ALL_SRCS := src/vm/bytecode/chunk.h src/vm/bytecode/serialize.h \
-            src/vm/bytecode/serialize.c src/vm/object/object.h src/vm/value.h
+            src/vm/bytecode/serialize_internal.h \
+            src/vm/bytecode/serialize.c src/vm/bytecode/serialize_read.c \
+            src/vm/bytecode/serialize_write.c \
+            src/vm/object/object.h src/vm/value.h
 SRC_FINGERPRINT := $(shell cat $(ALL_SRCS) 2>/dev/null | shasum -a 256 | cut -c1-8)
 # At BUILD_ROOT, not $(BUILD): the fingerprint does not depend on build type,
 # and BASE_CFLAGS is expanded before $(BUILD) is narrowed to debug/release.
@@ -293,6 +296,8 @@ $(BUILD_ID_H): $(BUILD_ID_H).check
 	@:
 
 $(BUILD)/src/vm/bytecode/serialize.o: $(BUILD_ID_H)
+$(BUILD)/src/vm/bytecode/serialize_read.o: $(BUILD_ID_H)
+$(BUILD)/src/vm/bytecode/serialize_write.o: $(BUILD_ID_H)
 
 # --- rebuild stamps ---------------------------------------------------------
 #
