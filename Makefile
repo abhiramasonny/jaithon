@@ -633,14 +633,17 @@ kind-fuzz: $(TARGET)
 # the flaky-gate problem, and tying it to every `make test` would buy the
 # project a gate nobody trusts. Run it deliberately, like jit-declines-check.
 #
-# Teeth, on the tree it was written against: the first 400 seeds turned up
-# three programs the tier gets wrong, two of them SEGFAULTS -- seed 236 (in
-# JAITHON_JIT_TICK_US=50, 25 runs of 25) and seed 352 (in the default
-# configuration), plus seed 232, which prints a different number. None of the
-# 3,258 tests in `make test` covers any of them.
+# Teeth, on the tree it was written against (2c3807cc, no local edits): seeds
+# 0..999 turned up 10 programs the tier gets wrong. Seven SEGFAULT, and every
+# one of the seven faults at the same instruction -- the `case SLOT_INST` kind
+# check in jaiJitEnterOsr, which reaches AS_OBJ(v)->type through a slot holding
+# an object TAG over a null pointer. Three print a different number; the
+# smallest of those (seed 232) reduces to a nullable local read through `??`
+# on the first iteration after its `if` stops firing. None of the 3,258 tests
+# in `make test` covers any of it.
 #
 # 400 programs x 5 configurations at warm=1500 measured 257s wall on twelve
-# cores. A hit prints the seed; reduce it to something reportable with
+# cores; 600 more measured 507s on ten. A hit prints the seed; reduce it with
 #     python3 tests/fuzz/differential.py --shrink SEED
 .PHONY: jit-fuzz
 jit-fuzz: $(TARGET)
