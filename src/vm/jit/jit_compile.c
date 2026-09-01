@@ -183,9 +183,9 @@ bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
     return adoptLocalKindSeen(e, slot, kind, shape, klass, NULL_VAL);
 }
 
-void jitFree(int *map, int *depths, int *chunkDepth, int count) {
+void jitFree(int *map, int64_t *depths, int *chunkDepth, int count) {
     JAI_FREE_ARRAY(int, map, count);
-    JAI_FREE_ARRAY(int, depths, count);
+    JAI_FREE_ARRAY(int64_t, depths, count);
     JAI_FREE_ARRAY(int, chunkDepth, count);
 }
 
@@ -405,7 +405,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (arena == NULL) return false;
 
     int *map = JAI_ALLOC(int, fn->chunk.count + 1);
-    int *depths = JAI_ALLOC(int, fn->chunk.count + 1);
+    int64_t *depths = JAI_ALLOC(int64_t, fn->chunk.count + 1);
     int *chunkDepth = chunkDepthTable(fn);
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
 

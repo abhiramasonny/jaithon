@@ -1138,15 +1138,32 @@ void dropCalleeEntry(Emit *e) {
 /* Depth and the kind of every entry, in one word. Registers are assigned from
  * the depth and instructions are chosen from the kinds, so a join reached with
  * either one different is a join this tier cannot compile. */
-uint32_t stackSignatureAt(const Emit *e, unsigned depth) {
-    uint32_t sig = depth & 0xfu;
-    for (unsigned i = 0; i < depth && i < 9; i++) {
-        sig |= ((uint32_t)e->stack[i] & 3u) << (4 + 2 * i);
+int64_t stackSignatureAt(const Emit *e, unsigned depth) {
+    unsigned mode = jitJoinMode();
+    if (mode == 0) {
+        int64_t sig = (int64_t)(depth & 0xfu);
+        for (unsigned i = 0; i < depth && i < 9; i++) {
+            sig |= (int64_t)((uint32_t)e->stack[i] & 3u) << (4 + 2 * i);
+        }
+        return sig;
+    }
+    /* depth 5 bits, valueDepth 5 bits, then the WHOLE kind of each of the
+     * first thirteen entries in 4 bits each -- 62 bits, and positive. */
+    int64_t sig = (int64_t)(depth & 0x1fu);
+    if (mode >= 2) {
+        unsigned seen = 0;
+        for (unsigned i = 0; i < depth; i++) {
+            if (holdsRegister(e->stack[i])) seen++;
+        }
+        sig |= (int64_t)(seen & 0x1fu) << 5;
+    }
+    for (unsigned i = 0; i < depth && i < 13; i++) {
+        sig |= (int64_t)((uint32_t)e->stack[i] & 0xfu) << (10 + 4 * i);
     }
     return sig;
 }
 
-uint32_t stackSignature(const Emit *e) {
+int64_t stackSignature(const Emit *e) {
     return stackSignatureAt(e, e->depth);
 }
 

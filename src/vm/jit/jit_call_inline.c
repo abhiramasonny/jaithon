@@ -160,9 +160,11 @@ bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     /* The callee's own offset map, so its offsets cannot land in the
      * caller's. Nothing reads it back -- there are no branches -- but
      * compileBody writes one entry per instruction either way. */
-    int cmap[129], cdepths[129];
+    int cmap[129];
+    int64_t cdepths[129];
     for (int i = 0; i <= cfn->chunk.count; i++) { cmap[i] = -1; cdepths[i] = -1; }
-    int *savedMap = e->offsetToInst, *savedDepths = e->offsetToDepth;
+    int *savedMap = e->offsetToInst;
+    int64_t *savedDepths = e->offsetToDepth;
     unsigned savedCarry = e->fpCarryCount;
     uint32_t savedCurOffset = e->curOffset;
     unsigned savedInstDepth = e->instDepth;

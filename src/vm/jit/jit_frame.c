@@ -127,7 +127,7 @@ void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = targetOffset;
     e->fixups[e->fixupCount].conditional  = conditional;
-    e->fixups[e->fixupCount].depth        = (int)stackSignature(e);
+    e->fixups[e->fixupCount].depth        = stackSignature(e);
     e->fixupCount++;
     emit(e, conditional ? jaiA64BCond(cond, 0) : jaiA64B(0));
 }
@@ -136,7 +136,7 @@ void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
  * than the branch leaves from -- the exhausted arm of a for-loop, where the
  * interpreter drops the iterator. */
 void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
-                          int depthOverride) {
+                          int64_t depthOverride) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     settleAll(e);   /* see branchTo: a join agrees about where every value is */
     if (e->osr && targetOffset < UINT32_MAX - 64u &&
@@ -189,6 +189,22 @@ bool jitModuleCalls(void) {
  *
  * Default ON. Read once: a body compiled with the arms and one compiled without
  * must not coexist in a run. */
+/* How precisely a join compares two operand stacks. 0 restores the 2-bit
+ * hash; 1 compares the whole kind of the first thirteen entries; 2 also
+ * compares valueDepth. A/B in one binary. */
+unsigned jitJoinMode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_JOIN");
+        cached = 1;
+        if (v != NULL) {
+            if (strcmp(v, "0") == 0) cached = 0;
+            else if (strcmp(v, "2") == 0) cached = 2;
+        }
+    }
+    return (unsigned)cached;
+}
+
 bool jitMatchArm(void) {
     static int cached = -1;
     if (cached < 0) {

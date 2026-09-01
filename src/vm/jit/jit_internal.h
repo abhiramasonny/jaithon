@@ -236,7 +236,7 @@ typedef struct {
     int      instIndex;
     uint32_t targetOffset; /* bytecode offset, or FIXUP_BAIL / FIXUP_ENTRY */
     bool     conditional;
-    int      depth;
+    int64_t  depth;
 } Fixup;
 
 typedef struct {
@@ -376,7 +376,7 @@ typedef struct {
     unsigned  fixupCount;
 
     int      *offsetToInst;
-    int      *offsetToDepth;
+    int64_t  *offsetToDepth;
     /* What the BYTECODE says the operand stack is at each offset, from
      * jaiChunkStackDepths -- an oracle this file did not write, checked against
      * every deopt record. NULL only when the chunk would not verify, which is
@@ -895,7 +895,7 @@ const char *unarmedDetail(const ObjFunction *fn, uint8_t op,
 void emitSelfSlowStubs(Emit *e, ObjClosure *closure);
 void emitGrowStubs(Emit *e);
 bool compileBody(Emit *e, ObjClosure *closure);
-void jitFree(int *map, int *depths, int *chunkDepth, int count);
+void jitFree(int *map, int64_t *depths, int *chunkDepth, int count);
 int *chunkDepthTable(const ObjFunction *fn);
 void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
                               const bool *skip, unsigned *strandedOut);
@@ -976,12 +976,13 @@ bool anyStackProof(const Emit *e);
 bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind);
 bool popValue(Emit *e, unsigned *reg, SlotKind *kind);
 void dropCalleeEntry(Emit *e);
-uint32_t stackSignatureAt(const Emit *e, unsigned depth);
-uint32_t stackSignature(const Emit *e);
+int64_t stackSignatureAt(const Emit *e, unsigned depth);
+int64_t stackSignature(const Emit *e);
+unsigned jitJoinMode(void);
 void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond);
 void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
-                          int depthOverride);
+                          int64_t depthOverride);
 bool jitModuleCalls(void);
 bool jitClassCalls(void);
 bool jitModuleNativeCalls(void);

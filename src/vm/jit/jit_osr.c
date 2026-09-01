@@ -300,7 +300,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     if (arena == NULL) return false;
 
     int *map = JAI_ALLOC(int, fn->chunk.count + 1);
-    int *depths = JAI_ALLOC(int, fn->chunk.count + 1);
+    int64_t *depths = JAI_ALLOC(int64_t, fn->chunk.count + 1);
     int *chunkDepth = chunkDepthTable(fn);
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
 

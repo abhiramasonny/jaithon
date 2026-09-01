@@ -25,11 +25,12 @@
 static int reconcileDepth(const Emit *e, uint32_t off) {
     for (unsigned i = 0; i < e->fixupCount; i++) {
         if (e->fixups[i].targetOffset != off) continue;
-        int want = e->fixups[i].depth;
+        int64_t want = e->fixups[i].depth;
         if (want < 0) continue;
-        unsigned d = (unsigned)want & 0xfu;
+        unsigned d = jitJoinMode() == 0 ? (unsigned)want & 0xfu
+                                        : (unsigned)want & 0x1fu;
         if (d > e->depth) continue;
-        if ((int)stackSignatureAt(e, d) != want) continue;
+        if (stackSignatureAt(e, d) != want) continue;
         if (e->depth - d > e->valueDepth) continue;
         return (int)d;
     }
@@ -593,7 +594,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
          * the loop head, not on the loads that were hoisted out of it. */
         emitHoistsAt(e, (uint32_t)off);
         e->offsetToInst[off]  = (int)e->count;
-        e->offsetToDepth[off] = (int)stackSignature(e);
+        e->offsetToDepth[off] = stackSignature(e);
         e->lastOp = op;
         e->whySub[0] = '\0';
         /* A borrow ends here unless the instruction is one of the few it is
