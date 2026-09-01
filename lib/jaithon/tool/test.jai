@@ -384,8 +384,15 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
         if found.len() == 0 { continue }
         let complaints = noise.get(path) ?? ""
         if complaints.len() > 0 { print_err(complaints.rstrip()) }
-        if options.verbose { print(bold(module_name_of(path))) }
-        print(_file_line(path, found))
+        #: Same shape as the sequential runner: per-test lines when verbose,
+        #: the one-line summary when not. Printing the summary either way made
+        #: a parallel run unparseable to anything reading for `  pass  `.
+        if options.verbose {
+            print(bold(module_name_of(path)))
+            for result in found { print("  " + result.to_str()) }
+        } else {
+            print(_file_line(path, found))
+        }
         results.extend(found)
     }
     return results
