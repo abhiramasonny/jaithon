@@ -119,7 +119,29 @@ CMPS = ["==", "!=", "<", "<=", ">", ">="]
 # branch and a different one on the next is the polymorphic-inline-cache path
 # (src/vm/jit/jit_call_pic.c), and a cache keyed on a compile-time kind is a
 # lie exactly there.
-CLASS_METHODS = ["kind", "geta", "twice", "bump"]
+CLASS_METHODS = ["kind", "geta", "twice", "bump", "step"]
+
+# `step` is the one method written for the polymorphic inline cache, and every
+# line of it is a constraint out of src/vm/jit/README.md rather than a taste:
+#
+#   - it is `pub`, because a way whose InlineCache::payload is set is dropped;
+#   - it returns `int`, because the arm admits only a result that carries no
+#     class shape;
+#   - its body is CHECKED arithmetic bounded by `%`, because the compiled tier
+#     walks no wrapping operator at all -- a callee whose walk stops at a `+%`
+#     never records a return kind, and the arm drops that way too;
+#   - and the `%` is what makes the checked arithmetic safe, so no generated
+#     program can raise on overflow reaching it.
+#
+# Both operands land in (-STEP_MOD, STEP_MOD) before they are added, so the sum
+# provably cannot overflow whatever the field holds.
+STEP_MOD = 1000003
+
+
+def step_method(term):
+    """`step`'s source, given the per-class term it folds in."""
+    return (f"    pub fn step(self, x: int) -> int {{"
+            f" return (x % {STEP_MOD} + {term}) % {STEP_MOD} }}")
 
 # What is known about a receiver whose class is NOT known statically -- an
 # `any` that two branches filled differently. Only the shared contract.
@@ -331,6 +353,10 @@ class Gen:
         self.classes = {}               # name -> dict describing its API
         self.helpers = {}               # name -> (arity, return kind)
         self.uid = 0
+        # How many mixed-class dispatch loops the grammar happened to draw.
+        # Counted because a program with none reaches jit_call_pic.c nowhere;
+        # see build().
+        self.dispatch_loops = 0
         self.loop_depth = 0
         # Iterations still affordable at this point in the probe, per CALL.
         # Trip counts multiply, and the probe is called `warm` times on top of
@@ -459,10 +485,18 @@ class Gen:
         # atom reaches every expression in the program, so one chain here
         # refused a quarter of all probes. st_class_use emits the chain
         # instead, where a refusal costs one statement.
-        name = r.choice(api["int_methods"])
-        if name == "bump":
-            return f"{var}.bump({self.int_expr(0)})"
-        return f"{var}.{name}()"
+        return self.method_atom(var, r.choice(api["int_methods"]))
+
+    def method_atom(self, var, meth):
+        """`var.meth(...)` with the arity that method actually has.
+
+        Two of the shared five take an int and three do not, and three call
+        sites need to know. One place, so adding a sixth is one edit and not
+        a hunt for the site that still thinks every method is nullary.
+        """
+        if meth in ("bump", "step"):
+            return f"{var}.{meth}({self.int_expr(0)})"
+        return f"{var}.{meth}()"
 
     def float_expr(self, depth=2):
         r = self.rng
@@ -635,6 +669,7 @@ class Gen:
             f" return self.geta() +% self.geta() }}\n"
             f"    pub fn bump(self, k: int) -> int {{"
             f" return self.kind() +% k }}\n"
+            f"{step_method(str(tag))}\n"
             f"}}",
             f"{name}()")
         return name
@@ -670,7 +705,8 @@ class Gen:
                 "    pub fn bump(self, k: int) -> int {",
                 "        self.a = self.a +% k",
                 "        return self.geta()",
-                "    }"]
+                "    }",
+                step_method(f"self.a % {STEP_MOD}")]
         if ops:
             src += [f"    pub fn __add__(self, o: {name}) -> int {{"
                     " return self.a +% o.a }",
@@ -723,6 +759,11 @@ class Gen:
                        " return super.geta() *% 2 +% self.c }")
         # style 2 inherits geta untouched, so one call site can see two classes
         # sharing a single method implementation.
+        # `step` is overridden on two styles of three, so a base and its
+        # subclass in one list are sometimes two ways of the site and sometimes
+        # one -- both are cases the arm has to get right.
+        if style != 2:
+            src.append(step_method(f"self.c % {STEP_MOD}"))
         src.append("}")
         parent = self.classes[base]
         self.add_class(name, "\n".join(src), f"{name}(ARG, ARG2)",
@@ -752,6 +793,7 @@ class Gen:
             f"        self.a = self.a -% k\n"
             f"        return self.geta()\n"
             f"    }}\n"
+            f"{step_method(f'self.a % {STEP_MOD}')}\n"
             f"}}",
             f"{name}(ARG)", fields=["a"])
         return name
@@ -790,6 +832,7 @@ class Gen:
             f"        self.a = self.a +% k\n"
             f"        return self.a +% self.inner.kind()\n"
             f"    }}\n"
+            f"{step_method(f'self.a % {STEP_MOD}')}\n"
             f"}}",
             f"{name}(INST)", fields=["a"], inst_field="inner",
             inst_type=held)
@@ -830,6 +873,7 @@ class Gen:
             f"        }}\n"
             f"        return t\n"
             f"    }}\n"
+            f"{step_method(f'self.a % {STEP_MOD}')}\n"
             f"}}",
             f"{name}(ARG)", fields=["a"], walk=True,
             int_methods=CLASS_METHODS + ["walk"])
@@ -969,7 +1013,10 @@ class Gen:
             (self.st_base_typed, 8),
             (self.st_inst_null, 8),
             (self.st_inst_swap, 10),
-            (self.st_inst_list, 6),
+            # Weighted with st_poly and st_inst_swap rather than below them:
+            # this is the only statement here that reaches jit_call_pic.c at
+            # all, and at weight 6 it appeared in 35 of 100 programs.
+            (self.st_inst_list, 9),
             (self.st_inst_field, 4),
             (self.st_inst_mix, 4),
             (self.st_static_call, 4),
@@ -1211,9 +1258,7 @@ class Gen:
         parts.append([line("acc = acc -% 424242")])
         parts.append("}")
         meth = r.choice(api["int_methods"])
-        call = (f"{var}.bump({self.int_expr(0)})" if meth == "bump"
-                else f"{var}.{meth}()")
-        parts.append(f"acc = acc +% {call}")
+        parts.append(f"acc = acc +% {self.method_atom(var, meth)}")
         if api["fields"] and r.random() < 0.6:
             fld = r.choice(api["fields"])
             parts.append(f"{var}.{fld} = {var}.{fld} +% {self.int_expr(0)}")
@@ -1257,9 +1302,7 @@ class Gen:
                       [line(f"{var} = {self.ctor_of(names[2])}")]]
         parts.append("}")
         meth = r.choice(CLASS_METHODS)
-        parts.append("acc = acc +% " +
-                     (f"{var}.bump({self.int_expr(0)})" if meth == "bump"
-                      else f"{var}.{meth}()"))
+        parts.append(f"acc = acc +% {self.method_atom(var, meth)}")
         if r.random() < 0.5:
             parts.append(f"acc = acc ^ {var}.kind()")
         self.insts.append((var, None))
@@ -1354,24 +1397,56 @@ class Gen:
     def st_inst_list(self, depth):
         """A list of mixed classes walked by one loop.
 
-        One call site, a new receiver class every trip, inside the OSR tier.
+        One call site, a new receiver class every trip, inside the OSR tier --
+        and the ONLY shape in this file that reaches the polymorphic inline
+        cache. `emitInvokePic1` wants a receiver that is SLOT_INST with no
+        class pinned, and src/vm/jit/README.md enumerates the single producer
+        of one: the head of a list loop the OSR tier entered at, over a list
+        holding more than one class. Four things here are therefore load-
+        bearing rather than taste, and the census in that section is what says
+        so -- the earlier form of this statement reached the arm 0 times in 100
+        programs:
+
+          - TWO DISTINCT classes at least, sampled without replacement. Drawing
+            each element from one pool independently left a real fraction of
+            lists monomorphic, and a monomorphic list pins the head by design.
+          - SIX elements or more. The head has to collect a SIGPROF tick of its
+            own to become an osrTop; a two-trip loop rides its caller's instead
+            and takes emitForIterBind's ordinary arm, which pins.
+          - `step` and not `kind`/`geta`, because `step` is the one method
+            whose body is checked arithmetic. A callee whose walk stops at a
+            wrapping operator records no return kind and the arm drops that
+            way.
+          - the call FIRST in the body, and its own line. The tier walks no
+            wrapping operator, so the `acc +% ...` fold below stops the loop's
+            walk where it stands -- which is fine after the invoke and fatal
+            before it.
         """
         r = self.rng
         names = self.constructible()
-        if not names:
-            return self.st_int(depth)
+        if len(names) < 2:
+            return self.st_class_use(depth)
+        picked = r.sample(names, 2)
+        if len(names) > 2 and r.random() < 0.5:
+            picked.append(r.choice([n for n in names if n not in picked]))
+        # Drawn against the budget like any other trip count: a nine-element
+        # list inside a 200-trip range is 1,800 iterations of a probe CALL.
+        nelem = self.trips([6, 7, 8, 9])
+        order = [picked[i % len(picked)] for i in range(nelem)]
+        r.shuffle(order)
         var = self.fresh("ol")
-        elems = ", ".join(self.ctor_of(r.choice(names))
-                          for _ in range(r.randint(2, 3)))
+        elems = ", ".join(self.ctor_of(n) for n in order)
         e = self.fresh("q")
         self.insts.append((e, None))
-        saved = self.enter_loop(3)
-        body = self.block(r.randint(0, 2), depth + 1)
+        saved = self.enter_loop(nelem)
+        body = self.block(r.randint(0, 1), depth + 1)
         self.leave_loop(saved)
         self.insts = [p for p in self.insts if p[0] != e]
+        self.dispatch_loops += 1
         return Node(f"var {var} = [{elems}]",
                     f"for {e} in {var} {{",
-                    [f"acc = acc +% {e}.kind() +% {e}.geta()"] + body,
+                    [f"acc = {e}.step(acc)",
+                     f"acc = acc +% {e}.kind() +% {e}.geta()"] + body,
                     "}")
 
     def st_inst_swap(self, depth):
@@ -1556,6 +1631,16 @@ class Gen:
             self.trip_budget = TRIP_BUDGET
             probe.body = [self.stmt(0) for _ in range(r.randint(1, 4))]
             self.prog.probes.append(probe)
+        # The polymorphic inline cache is the most intricate arm in
+        # src/vm/jit and the weighted grammar alone left three programs in
+        # five with no site that reaches it at all -- a program is 2-5 probes
+        # of 1-4 statements, so a weight-9 statement is simply absent more
+        # often than not. One is appended when none was drawn, outside the
+        # grammar for the same reason st_late_raise is: some shapes are worth
+        # having in EVERY program rather than in a third of them. The scope
+        # state still belongs to the last probe, which is the one that gets it.
+        if self.dispatch_loops == 0:
+            self.prog.probes[-1].body.append(self.st_inst_list(0))
         if r.random() < 0.12:
             self.prog.probes[0].body.append(self.st_late_raise(0))
         return self.prog
