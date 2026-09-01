@@ -17,13 +17,13 @@
 # stdlib's own startup varies by a few hundred thousand instructions, which is
 # enough to make a probe that never compiles look as if it does.
 #
-# Why probes rather than the decline census (scripts/jit_declines.sh): a census
+# Why probes rather than the decline census (scripts/dev/jit_declines.sh): a census
 # ranks by frequency and is not hotness-correct. It put 168 `dict.get` refusals
 # at the top, every one in a setup path that runs once per process.
 
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT" || exit 1
 JAITHON="${JAITHON:-./jaithon}"
 probes="$ROOT/docs/probes"

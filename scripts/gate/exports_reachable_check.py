@@ -14,7 +14,7 @@ import pathlib
 import re
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 PACKAGES = ("jaicv", "jaitensor")
 
 DEFINITION = re.compile(r"^pub fn ([a-z_][a-z_0-9]*)", re.MULTILINE)

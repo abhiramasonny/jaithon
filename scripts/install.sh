@@ -15,7 +15,7 @@ if [[ ! -x ./jaithon ]]; then
     make -s
 fi
 
-python3 scripts/check_packages.py
+python3 scripts/gate/check_packages.py
 
 echo "==> installing to $PREFIX"
 

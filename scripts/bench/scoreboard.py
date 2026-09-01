@@ -7,8 +7,8 @@ at", and answering it meant reading three tables and doing the filtering by
 eye, which is how a row sits below parity for a month without anyone noticing.
 
 Usage:
-    python3 scripts/scoreboard.py lang.log cv.log tensor.log
-    python3 scripts/scoreboard.py --all logs/*.log
+    python3 scripts/bench/scoreboard.py lang.log cv.log tensor.log
+    python3 scripts/bench/scoreboard.py --all logs/*.log
 
 Each argument is the raw stdout of a `make bench` run; the suite each one came
 from is worked out from its contents rather than from its filename.

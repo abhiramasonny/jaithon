@@ -60,8 +60,8 @@ tick (see the warm-up loops added alongside the markers), not from making
 OSR itself deterministic -- it is not, and no amount of iterating changes
 that.
 
-    python3 scripts/jit_compile_check.py             # auto-discovered files
-    python3 scripts/jit_compile_check.py FILE...      # just these
+    python3 scripts/gate/jit_compile_check.py             # auto-discovered files
+    python3 scripts/gate/jit_compile_check.py FILE...      # just these
 
 Exit status is non-zero if any marker rotted or any named function failed
 to reach a compiled form.
@@ -72,7 +72,7 @@ import re
 import subprocess
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 JAITHON = os.environ.get("JAITHON", os.path.join(ROOT, "jaithon"))
 JAITHON_PATH = os.environ.get("JAITHON_PATH", os.path.join(ROOT, "lib"))
 
@@ -166,7 +166,7 @@ def run_target(path):
     CPU time that its own hot loops soak up most of the sampler's ticks --
     measured: on a fresh cache one_call_sum/nested in
     test_jit_dict_items_iter.jai missed OSR entirely, 2/2 runs, and passed
-    every time once warm. scripts/jit_declines.sh hits the same thing
+    every time once warm. scripts/dev/jit_declines.sh hits the same thing
     ("warm every cache first, or the front end's own compilation
     dominates") and fixes it the same way.
     """

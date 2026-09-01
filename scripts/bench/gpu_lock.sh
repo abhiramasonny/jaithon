@@ -7,8 +7,8 @@
 # quiet, and individual rows moved by a factor of three. Wrap anything you
 # intend to believe:
 #
-#   ./scripts/gpu_lock.sh make bench jaicv
-#   ./scripts/gpu_lock.sh ./jaithon probe.jai
+#   ./scripts/bench/gpu_lock.sh make bench jaicv
+#   ./scripts/bench/gpu_lock.sh ./jaithon probe.jai
 #
 # mkdir is the mutex because macOS has no flock(1). The lock carries the pid
 # that took it, so a lock left behind by a killed process is reclaimed rather

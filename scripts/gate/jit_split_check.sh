@@ -2,7 +2,7 @@
 # Check for split-operand-bank differential bugs in JIT compilation.
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export JAITHON_PATH="$ROOT/lib"
 export BENCH_LEVEL="${BENCH_LEVEL:-easy}"
 JAITHON="${JAITHON:-$ROOT/jaithon}"

@@ -3,7 +3,7 @@
 # encoded.
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export JAITHON_PATH="$ROOT/lib"
 export JAI_DISASM_SPANS=1
 JAITHON="${JAITHON:-$ROOT/jaithon}"
@@ -54,7 +54,7 @@ check)
     fi
     echo "linetable golden MISMATCH -- a span now resolves differently:"
     diff -u "$GOLDEN" "$tmp" | grep '^[-+][^-+]' | head -20
-    echo "(re-run with: scripts/linetable_golden.sh dump <file> on both sides)"
+    echo "(re-run with: scripts/gate/linetable_golden.sh dump <file> on both sides)"
     exit 1
     ;;
 dump)

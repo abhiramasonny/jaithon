@@ -5,9 +5,9 @@ interesting part of it is never the totals -- it is which single row went the
 wrong way. Reading two tables side by side by eye misses that; this does not.
 
 Usage:
-    python3 scripts/bench_delta.py before.log after.log
-    python3 scripts/bench_delta.py --save baseline.json after.log
-    python3 scripts/bench_delta.py baseline.json after.log
+    python3 scripts/bench/bench_delta.py before.log after.log
+    python3 scripts/bench/bench_delta.py --save baseline.json after.log
+    python3 scripts/bench/bench_delta.py baseline.json after.log
 
 Either argument may be a saved baseline (JSON) or the raw stdout of
 `make bench`. Rows present in one run and not the other are reported rather

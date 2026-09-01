@@ -11,7 +11,7 @@ import pathlib
 import re
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 
 C_ROW = re.compile(r"X\(\s*(OP_[A-Z0-9_]+)\s*,\s*([A-Z_]+|-?\d+)\s*,"
                    r"\s*([A-Z_]+|[-+]?\d+)\s*\)")

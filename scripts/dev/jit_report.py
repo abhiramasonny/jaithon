@@ -26,9 +26,9 @@ is here because ranking by the obvious alternative was measured and was wrong:
     the line "OP_GET_LOCAL" and wanted different fixes.
 
 Usage:
-    scripts/jit_report.py run  tests/bench/fib_recursive/fib.jai
-    scripts/jit_report.py check lib/jaithon/compile/parser.jai
-    scripts/jit_report.py -- ./jaithon test tests/lang
+    scripts/dev/jit_report.py run  tests/bench/fib_recursive/fib.jai
+    scripts/dev/jit_report.py check lib/jaithon/compile/parser.jai
+    scripts/dev/jit_report.py -- ./jaithon test tests/lang
 
 Exit status is the program's own, so this can wrap a command in a script.
 """
@@ -42,7 +42,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 
 BOLD = "\033[1m" if sys.stdout.isatty() else ""
 DIM = "\033[2m" if sys.stdout.isatty() else ""

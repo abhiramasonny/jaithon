@@ -192,7 +192,7 @@ else
   LDFLAGS    += -flto
 endif
 
-# boot/seed.c is generated (scripts/gen_seed.py, `make reseed`) and holds the
+# boot/seed.c is generated (scripts/dev/gen_seed.py, `make reseed`) and holds the
 # .jaic images the self-hosted front end needs before it can compile anything.
 # A wildcard rather than a literal so a tree without a seed still builds -- that
 # build simply needs a working front end on disk to start.
@@ -412,7 +412,7 @@ test: package-check opcode-check exports-check jit-fusion-check branch-table-che
 	@$(BUILD)/field_natives
 	@$(BUILD)/invoke_result_kind
 	@./scripts/run_tests.sh
-	@./scripts/bench_smoke.sh
+	@./scripts/bench/bench_smoke.sh
 	@$(MAKE) --no-print-directory fmt-roundtrip
 	@$(MAKE) --no-print-directory gc-stress-test
 
@@ -464,7 +464,7 @@ gc-stress-test: $(TARGET)
 # undocumented. Pure text, so it costs nothing to run on every `make test`.
 .PHONY: opcode-check
 opcode-check:
-	@python3 scripts/opcode_table_check.py
+	@python3 scripts/gate/opcode_table_check.py
 
 # jaicv's recorded cases cover what OpenCV was asked to record, so an export
 # nobody recorded is an export nobody ran -- that is how `find_homography` with
@@ -473,7 +473,7 @@ opcode-check:
 # same rule. Pure text, so it costs nothing to run on every `make test`.
 .PHONY: exports-check
 exports-check:
-	@python3 scripts/exports_reachable_check.py
+	@python3 scripts/gate/exports_reachable_check.py
 
 # sum(jaiOpCounts) == vm.instructionCount, which is the only evidence that no
 # dispatch path skips the census. VM_NEXT_HINT skipped it and loop_sum's
@@ -482,16 +482,16 @@ exports-check:
 # second full build with -DJAI_OPCODE_STATS.
 .PHONY: opstats-check
 opstats-check:
-	@./scripts/opstats_check.sh
+	@./scripts/gate/opstats_check.sh
 
 # Every instruction offset of every function in lib, tests and examples must
 # resolve to the same source span it did before. The line table's encoding has
 # no differential oracle behind it (spec/BYTECODE.md §11), so this golden is the
 # oracle. Re-capture only when a corpus SOURCE changed:
-#   scripts/linetable_golden.sh capture
+#   scripts/gate/linetable_golden.sh capture
 .PHONY: linetable-check
 linetable-check:
-	@./scripts/linetable_golden.sh check
+	@./scripts/gate/linetable_golden.sh check
 
 # No opcode may NEWLY lack an arm in the function JIT. An unarmed opcode now
 # deoptimises at its own offset rather than declining the whole function, so it
@@ -504,7 +504,7 @@ linetable-check:
 # on it costs.
 .PHONY: jit-fusion-check
 jit-fusion-check:
-	@python3 scripts/jit_fusion_check.py
+	@python3 scripts/gate/jit_fusion_check.py
 
 # Where a branch keeps its displacement is written down twice, in verify.c and
 # in opt/chunk.jai, and neither consults the other. A missing entry makes the
@@ -512,7 +512,7 @@ jit-fusion-check:
 # stops, with no diagnostic. Pure text, so it runs on every `make test`.
 .PHONY: branch-table-check
 branch-table-check:
-	@python3 scripts/branch_table_check.py
+	@python3 scripts/gate/branch_table_check.py
 
 # What the tier covers, one ordinary idiom at a time. Each probe in docs/probes/
 # is a single hot loop; the script runs it with the tier on and with
@@ -526,7 +526,7 @@ branch-table-check:
 # docs/research/PLAN-nullable-scalars.md) that would fail a gate for ever.
 .PHONY: jit-coverage
 jit-coverage: $(TARGET)
-	@./scripts/jit_coverage.sh
+	@./scripts/dev/jit_coverage.sh
 
 # The JIT's decline census, collapsed to distinct reasons and compared against a
 # recorded baseline. A NEW reason means the tier stopped compiling something it
@@ -535,7 +535,7 @@ jit-coverage: $(TARGET)
 # Runs the benchmark suite twice (warm, then measure), so it is not in `test`.
 .PHONY: jit-declines-check
 jit-declines-check:
-	@./scripts/jit_declines.sh check
+	@./scripts/dev/jit_declines.sh check
 
 # A `test_jit_*` case can pass with its own fix reverted: `jaithon test` never
 # makes the body it means to exercise hot enough to compile, so the test only
@@ -546,7 +546,7 @@ jit-declines-check:
 # are real -- but nothing enforced it, and an edit that drops a loop below
 # JAI_JIT_THRESHOLD hollows the gate with no signal.
 #
-# scripts/jit_compile_check.py closes that hole with a declaration next to the
+# scripts/gate/jit_compile_check.py closes that hole with a declaration next to the
 # test rather than a separate list that drifts: a `# jit-compiles: name, ...`
 # line naming the helpers (never the `test_*` wrappers) the file claims reach
 # the compiled tier. It fails if a name is not a real top-level `fn` in that
@@ -570,7 +570,7 @@ jit-declines-check:
 #     the same way jit-declines-check and kind-fuzz are.
 .PHONY: jit-compile-check
 jit-compile-check: $(TARGET)
-	@python3 scripts/jit_compile_check.py
+	@python3 scripts/gate/jit_compile_check.py
 
 # The split operand bank makes the operand stack two runs of registers instead
 # of one, and a site that adds an index to a base can then land one past the end
@@ -581,7 +581,7 @@ jit-compile-check: $(TARGET)
 # benchmark suite four times over.
 .PHONY: jit-split-check
 jit-split-check:
-	@./scripts/jit_split_check.sh
+	@./scripts/gate/jit_split_check.sh
 
 # The kind-mutation fuzzer: 144 generated programs, each warming a loop until it
 # compiles and then putting a different kind where the tier sampled one, run
@@ -708,7 +708,7 @@ jit-test: $(BUILD)/jit_arena $(BUILD)/jit_arm64
 #: under a load average of 4.5 and 3.10x on the same commit with the machine
 #: quiet, with individual rows moving by a factor of three.
 bench: $(TARGET)
-	@LEVEL="$(LEVEL)" ./scripts/gpu_lock.sh ./scripts/run_bench.sh $(filter jaitensor jaicv jainum jaiframe,$(MAKECMDGOALS))
+	@LEVEL="$(LEVEL)" ./scripts/bench/gpu_lock.sh ./scripts/bench/run_bench.sh $(filter jaitensor jaicv jainum jaiframe,$(MAKECMDGOALS))
 
 jaitensor:
 	@:
@@ -738,7 +738,7 @@ reseed: $(TARGET)
 # disabling it leaves nothing that can compile anything. seed_touch.jai boots on
 # the previous seed and compiles the next one's sources explicitly, which is the
 # same guarantee by a route that does not need a second compiler.
-	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/seed_touch.jai >/dev/null 2>&1 || true
+	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/gate/seed_touch.jai >/dev/null 2>&1 || true
 # STALE COMMENT, KEPT AS A WARNING -- do not follow it. It argued for
 # `lib/jaithon` rather than `lib`, and the invocation below has said `lib` for
 # some time. The comment describes the OLD seed_touch, which populated the cache
@@ -749,7 +749,7 @@ reseed: $(TARGET)
 # Narrowing to `lib/jaithon` now would WEDGE THE BOOTSTRAP. The compiler imports
 # std modules while it is itself loading -- `std.json` among them -- inside the
 # window where the compiler does not yet exist, so std has to be seeded too.
-# scripts/seed_touch.jai's SEED_ROOT carries that reasoning in full.
+# scripts/gate/seed_touch.jai's SEED_ROOT carries that reasoning in full.
 #
 # The walk is blanket rather than a dependency closure. Workspace packages live
 # outside lib, so they no longer enter the seed. Narrowing this to
@@ -760,7 +760,7 @@ reseed: $(TARGET)
 # whatever it imports, so collecting the whole tree embeds a set that varies run
 # to run. Measured, 44 modules and then 47 across two reseeds of an unchanged
 # tree. What is embedded has to be exactly what the step above set out to build.
-	@python3 scripts/gen_seed.py lib boot/seed.c --manifest boot/seed.manifest lib
+	@python3 scripts/dev/gen_seed.py lib boot/seed.c --manifest boot/seed.manifest lib
 	@$(MAKE) --no-print-directory
 # The rebuild above embeds the new seed, which changes JAI_BUILD_ID, which
 # invalidates every .jaic just written -- so reseeding used to hand back a tree
@@ -769,7 +769,7 @@ reseed: $(TARGET)
 # happens per allocation, and compiling std from source under it takes eight
 # minutes (measured, twice). Warming here costs a second and removes the cliff.
 	@echo "  SEED    warming __jaicache__"
-	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) --front=jai run scripts/seed_touch.jai >/dev/null 2>&1 || true
+	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) --front=jai run scripts/gate/seed_touch.jai >/dev/null 2>&1 || true
 	@$(MAKE) --no-print-directory fixpoint-check
 	@$(MAKE) --no-print-directory seed-check
 
@@ -779,7 +779,7 @@ reseed: $(TARGET)
 #: from "the seed was never needed".
 .PHONY: seed-check
 seed-check: $(TARGET)
-	@scripts/seed_check.sh
+	@scripts/gate/seed_check.sh
 
 #: Compile each source twice with the self-hosted front end and compare. With
 #: the differential oracle retired this is the gate that says the front end is
@@ -787,16 +787,16 @@ seed-check: $(TARGET)
 #: satisfy `stage1.jaic == stage2.jaic`.
 .PHONY: fixpoint-check
 fixpoint-check: $(TARGET)
-	@scripts/fixpoint_check.sh $(if $(PATHS),$(PATHS),lib/std)
+	@scripts/gate/fixpoint_check.sh $(if $(PATHS),$(PATHS),lib/std)
 
 .PHONY: package-check workspace-sync
 #: The members list is derived from the manifests that are present, so that a
 #: new package does not need every author to edit the same shared line.
 workspace-sync:
-	@python3 scripts/sync_workspace.py
+	@python3 scripts/dev/sync_workspace.py
 
 package-check: workspace-sync
-	@python3 scripts/check_packages.py
+	@python3 scripts/gate/check_packages.py
 
 #: A prerequisite of `test` since 2026-08-24. It was a target nobody ran, and
 #: it was red: twenty-three private-access errors in one jaiframe file, plus —
@@ -832,11 +832,11 @@ fmt-check: $(TARGET)
 # is here: they are programs no gate ran, and one of them was broken.
 .PHONY: bench-smoke
 bench-smoke: $(TARGET)
-	@./scripts/bench_smoke.sh
+	@./scripts/bench/bench_smoke.sh
 
 .PHONY: fmt-roundtrip
 fmt-roundtrip: $(TARGET)
-	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/fmt_roundtrip.jai
+	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/gate/fmt_roundtrip.jai
 
 install: package-check $(TARGET)
 	@install -d $(DESTDIR)$(PREFIX)/bin

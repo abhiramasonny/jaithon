@@ -2,7 +2,7 @@
 # Reseed after a change to the compiler's own sources.
 set -eu
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 [ -x ./jaithon ] || { echo "build jaithon first" >&2; exit 2; }
@@ -48,5 +48,5 @@ find lib -name '__jaicache__' -type d -exec rm -rf {} + 2>/dev/null || true
 JAITHON_PATH="$stage0/lib" JAITHON_NO_DEFAULT_PATH=1 \
     ./jaithon run "$stage0/build_all.jai" "$ROOT/lib"
 
-python3 scripts/gen_seed.py lib boot/seed.c lib
+python3 scripts/dev/gen_seed.py lib boot/seed.c lib
 echo "stage0: seed rebuilt from the working tree; rebuild to pick it up"

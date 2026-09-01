@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 def main() -> int:
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     members = sorted(
         f"packages/{child.name}"
         for child in (root / "packages").iterdir()

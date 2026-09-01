@@ -46,7 +46,7 @@ import pathlib
 import re
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 CHUNK_C = ROOT / "src/vm/bytecode/chunk.c"
 JIT_C = ROOT / "src/vm/jit/jit_func.c"
 BASELINE = ROOT / "tests/vm/jit_unarmed.baseline"

@@ -20,7 +20,7 @@ import pathlib
 import re
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 VERIFY_C = ROOT / "src/vm/bytecode/verify.c"
 OPT_JAI = ROOT / "lib/jaithon/compile/opt/chunk.jai"
 EMIT_JAI = ROOT / "lib/jaithon/compile/emit.jai"

@@ -2,7 +2,7 @@
 """Render every shipped raster from assets/logo/jaithon.svg.
 
     DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib \
-      uv run --with cairosvg --with pillow python scripts/render_logo.py
+      uv run --with cairosvg --with pillow python scripts/dev/render_logo.py
 
 The glyph fills only part of the SVG's 1000x1000 viewBox, so rendering the
 canvas as-is leaves lopsided padding and wastes pixels at icon sizes. Measure
@@ -19,7 +19,7 @@ from pathlib import Path
 import cairosvg
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 SVG = ROOT / "assets/logo/jaithon.svg"
 OUT = ROOT / "assets/logo"
 

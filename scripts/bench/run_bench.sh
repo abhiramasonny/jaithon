@@ -3,7 +3,7 @@
 
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_ROOT="${BUILD_ROOT:-build}"
 JAITHON="$ROOT/jaithon"
 SUITE="${1:-}"

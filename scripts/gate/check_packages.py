@@ -168,7 +168,7 @@ def dependency_order(packages: dict[str, Package]) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     workspace_path = Path(argv[1]).resolve() if len(argv) > 1 else root / "jaithon.workspace.json"
     if len(argv) > 2:
         print(f"usage: {Path(argv[0]).name} [WORKSPACE]", file=sys.stderr)
