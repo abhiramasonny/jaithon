@@ -71,6 +71,12 @@ static bool jitPic1Admissible(Emit *e, ObjFunction *caller, ObjFunction *cfn,
             return false;
         }
     }
+    /* emitDirectCall refuses a callee whose walk never reached a return, and
+     * this has to refuse it too: by the time that arm says no, the shape
+     * compare for this way is already in the instruction stream, so the
+     * refusal sets e->failed and the WHOLE LOOP declines rather than this one
+     * way being dropped. Asking here costs the way and keeps the loop. */
+    if (!cfn->jitReturnKnown && jitReturnKnownOn()) return false;
     /* A callee that writes is finished in the interpreter from a selfSlow
      * record, and this arm takes one of its own -- the same budget a pinned
      * direct call draws from. */

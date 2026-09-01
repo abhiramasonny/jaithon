@@ -1068,6 +1068,7 @@ bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
 void emitMaybeInstResult(Emit *e, unsigned dst, unsigned rat,
                                 uint32_t rshape, uint32_t deoptIp);
 bool jitAnyGuard(void);
+bool jitReturnKnownOn(void);
 bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
                            unsigned argc, uint32_t callOff, uint32_t after,
