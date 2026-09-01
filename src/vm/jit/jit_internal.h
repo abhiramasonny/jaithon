@@ -909,6 +909,208 @@ void reportChain(const Emit *proto, Emit *first, ObjClosure *closure,
                         ObjFunction *fn);
 bool jitCollectClashes(void);
 
+/* Defined in jit_body.c. */
+
+/* Defined in jit_func.c. */
+bool elemDeclOn(void);
+bool holdsRegister(SlotKind k);
+unsigned localIn(Emit *e, unsigned slot, unsigned scratch);
+unsigned localDest(const Emit *e, unsigned slot);
+void forgetFieldKinds(Emit *e);
+void noteIndexSpan(Emit *e, int slot, bool shaped, int32_t off,
+                          uint8_t base);
+void noteSlotIndexed(Emit *e, int slot);
+void localOut(Emit *e, unsigned slot, unsigned src);
+void localInFp(Emit *e, unsigned slot, unsigned dst);
+void localOutFp(Emit *e, unsigned slot, unsigned src);
+bool localInRange(Emit *e, unsigned slot);
+Value seenLocal(Emit *e, unsigned slot);
+void noteScratchClobber(Emit *e);
+unsigned valueXReg(const Emit *e, unsigned idx);
+unsigned pushReg(const Emit *e);
+unsigned fpHeldIn(const Emit *e, unsigned idx);
+void fpSyncOne(Emit *e, unsigned idx);
+void fpReleaseHome(Emit *e, unsigned reg);
+void fpReleaseAll(Emit *e);
+void fpSyncAll(Emit *e);
+unsigned fpOperand(Emit *e, unsigned idx);
+void fpClaim(Emit *e, unsigned idx);
+void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg);
+unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank);
+unsigned fpBindLookahead(Emit *e, const uint8_t *code, int next,
+                                int stop, const ObjFunction *fn,
+                                uint32_t *bindOffOut);
+bool anyDeferred(const Emit *e);
+void settleAll(Emit *e);
+/* d register holding entry `idx`, loaded from X if that's where it still lives. Leaves fpLive
+ * untouched -- the two copies now agree, and marking the X copy stale when it isn't would cost a needless sync. */
+unsigned xHeldIn(Emit *e, unsigned idx);
+unsigned localHomeX(const Emit *e, unsigned slot);
+void xBorrowLocal(Emit *e, unsigned idx, unsigned reg);
+void kPendLocal(Emit *e, unsigned idx, int64_t k);
+bool pendingImm12(const Emit *e, unsigned idx, int64_t *out);
+void emitCmpImm(Emit *e, unsigned rn, int64_t k);
+void emitAddSubImm(Emit *e, unsigned rd, unsigned rn, int64_t k,
+                          bool subtract);
+bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
+                       Value seen, int fromLocal);
+bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass);
+SlotKind knownFieldKind(const Emit *e, int local, uint16_t field);
+void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind);
+bool pushSelf(Emit *e);
+void clearStackProofs(Emit *e);
+bool anyStackProof(const Emit *e);
+bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind);
+bool popValue(Emit *e, unsigned *reg, SlotKind *kind);
+void dropCalleeEntry(Emit *e);
+uint32_t stackSignatureAt(const Emit *e, unsigned depth);
+uint32_t stackSignature(const Emit *e);
+void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
+                     unsigned cond);
+void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
+                          int depthOverride);
+bool jitModuleCalls(void);
+bool jitClassCalls(void);
+bool jitModuleNativeCalls(void);
+bool modelAgreesWithChunk(const Emit *e, uint32_t off);
+bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
+                          unsigned *out);
+void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
+                            bool lastFromDesc);
+void branchOnDeopt(Emit *e, unsigned cond);
+void branchOnDeoptInstStart(Emit *e, unsigned cond);
+void nanToDeopt(Emit *e);
+bool isOrdering(uint8_t op);
+bool stringOperand(const Emit *e, unsigned at);
+bool oneBytePair(const Emit *e, unsigned a, unsigned b);
+void emitOneByteString(Emit *e, unsigned at, unsigned reg, unsigned dst);
+bool jitStrCmpOn(void);
+bool jitStrCmpEqOn(void);
+bool preferLeafEquality(const Emit *e, unsigned da, unsigned db);
+void emitStringOrder(Emit *e);
+void emitListBoxedGuard(Emit *e, unsigned rList, unsigned scratch);
+uint8_t listAltFor(SlotKind vk);
+ListAccess listAccessFor(Emit *e, unsigned rList, int slot,
+                                SlotKind vk, unsigned scratch);
+int listDispatchBegin(Emit *e, const ListAccess *a, unsigned rList,
+                             unsigned scratch);
+int listDispatchElse(Emit *e, int skip);
+void listDispatchEnd(Emit *e, int join);
+unsigned listStgShift(uint8_t stg);
+SlotKind listStgKind(uint8_t stg);
+void emitElemStoreAt(Emit *e, uint8_t stg, unsigned rItems,
+                            unsigned rIdx, unsigned vtag, unsigned rVal);
+void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
+                           unsigned rCount);
+int hoistFor(const Emit *e, int slot);
+bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
+                                int32_t *offOut, uint8_t *baseOut);
+void emitHoistsAt(Emit *e, uint32_t off);
+void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
+                                unsigned rOut, bool countW);
+void branchOnOverflow(Emit *e, unsigned which, unsigned cond);
+unsigned ovfDest(const Emit *e, unsigned home);
+bool raiseExitAllowed(Emit *e, const char *what);
+bool negatedCondition(uint8_t cmp, unsigned *out);
+ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx);
+bool firstLiveEntry(const JaiTable *t, Value *key, Value *value);
+ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
+                                   Value *out);
+ObjNative *globalNative(ObjClosure *closure, uint32_t nameIdx,
+                               Value *out);
+ObjModule *globalNamespace(ObjClosure *closure, uint32_t nameIdx);
+bool globalIsSelf(ObjClosure *closure, uint32_t nameIdx);
+JaiEntry *globalSlot(Emit *e, ObjClosure *closure, uint32_t nameIdx,
+                            Value *out);
+void emitGlobalsGuard(Emit *e);
+bool jitStaticFieldEnabled(void);
+JaiEntry *staticFieldSlot(Emit *e, ObjClass *klass, ObjString *name);
+JaiEntry *moduleMemberSlot(Emit *e, ObjModule *m, ObjString *name);
+void emitModuleGuard(Emit *e);
+bool listProbeOn(void);
+bool moduleFieldOn(void);
+void emitStaticsGuard(Emit *e);
+void emitVersionBump(Emit *e, ObjModule *m);
+const char *jaiFeedbackName(uint8_t fb);
+bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag,
+                             uint8_t *objType);
+bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
+                          int slot);
+bool siteInvokeResultKind(const Chunk *chunk, uint16_t cacheIdx,
+                                 SlotKind *k, unsigned *tag);
+bool rawObjValue(Value v);
+bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
+                               uint32_t *shape, uint8_t *objType);
+bool globalKind(Value v, SlotKind *k, uint32_t *shape, ObjClass **kls);
+bool declaredScalarFieldKind(uint32_t typeId, SlotKind *k, unsigned *tag);
+bool jitDeclaredFieldKindEnabled(void);
+bool isClassCallee(const Emit *e, unsigned argc);
+bool subWhy(Emit *e, const char *fmt, ...);
+const char *kindClash(Emit *e, unsigned slot);
+bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut);
+bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
+                                 unsigned nargs, void *helper, bool ownStatus,
+                                 int calleeReg);
+bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
+                           unsigned nargs, void *helper);
+bool concatOperands(const Emit *e, Value *sample);
+bool emitStringConcat(Emit *e, Value sample);
+bool nullLiteralPair(const Emit *e, uint8_t op, SlotKind ka, SlotKind kb);
+DiscardKind discardedAfter(const uint8_t *code, int at, int count);
+bool emitFusedReturnNull(Emit *e, ObjFunction *fn);
+bool jitStrIter(void);
+bool pushLocalAsValue(Emit *e, unsigned slot);
+bool jitConcatLocals(void);
+bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,
+                          unsigned ridx, unsigned argc, uint32_t afterIp);
+bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
+                                unsigned firstIdx, unsigned argc);
+void emitMaybeInstResult(Emit *e, unsigned dst, unsigned rat,
+                                uint32_t rshape, uint32_t deoptIp);
+bool jitAnyGuard(void);
+bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
+                           Value calleeVal, int calleeReg, unsigned cidx,
+                           unsigned argc, uint32_t callOff, uint32_t after,
+                           bool method);
+bool jitPicEnabled(void);
+bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
+                           unsigned argc, uint32_t callOff, uint32_t after,
+                           int siteCache, bool havePrediction, SlotKind rkind,
+                           int *toEnd);
+bool offsetIsBranchTarget(const Chunk *c, uint32_t off);
+bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
+                              int64_t *out);
+void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
+                           bool signKnown, int64_t divisor, uint32_t fixup);
+bool powerOfTwoShift(int64_t k, unsigned *shift);
+bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
+                             unsigned argc, uint32_t callOff, int calleeReg);
+bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
+                           uint32_t callOff, uint32_t after);
+bool emitModuleCall(Emit *e, ObjModule *m, Value calleeVal,
+                           unsigned ridx, unsigned argc, uint32_t after);
+bool primInvokePairFits(const Emit *e, const Chunk *chunk, uint32_t off);
+bool emitModuleNativeCall(Emit *e, ObjModule *m, Value calleeVal,
+                                 unsigned ridx, unsigned argc, uint32_t after);
+bool emitClassCall(Emit *e, ObjClass *klass, JaiEntry *slot,
+                          Value calleeVal, unsigned ridx, unsigned argc,
+                          uint32_t after);
+bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
+                         unsigned argc, int callOff);
+bool exemplarKind(Value elem, SlotKind *kind, unsigned *tag,
+                         ObjClass **cls, uint32_t *shape);
+bool buildListExemplar(const Emit *e, unsigned first, unsigned n,
+                              Value *out);
+bool dictUniformValue(ObjDict *dict, Value *out);
+bool jitSoftField(void);
+bool jitMembership(void);
+bool jitTuple(void);
+bool jitNegate(void);
+bool jitListResult(void);
+int emitNativeResultCall(Emit *e, Value cv, const char *nm,
+                                unsigned argc, uint32_t afterIp);
+bool emitCallOut(Emit *e, unsigned argc);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
