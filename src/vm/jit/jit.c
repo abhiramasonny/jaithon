@@ -39,6 +39,26 @@ static bool arenaReady(void) {
  * leaving the stack exactly as OP_RETURN would. */
 static bool compileReturnNull(ObjFunction *fn) {
     if (fn->chunk.count != 1 || fn->chunk.code[0] != OP_RETURN_NULL) return false;
+    /* An initializer's OP_RETURN_NULL does NOT return null: the interpreter's
+     * opReturn replaces the value with `frame->slots[0]`, which is what makes
+     * `Point(1, 2)` an expression. This fast path has no such step -- its
+     * caller writes NULL_VAL over slotBase[0] -- so matching an EMPTY
+     * initializer here compiles `fn init(self) {}` into `return null`.
+     *
+     * `LinearScale` in packages/jaiplot has exactly that body. Its first call
+     * ran interpreted (the call that compiles a body does not use it), so
+     * `Axes.init`'s `self.x_scale = LinearScale()` was correct and
+     * `self.y_scale = LinearScale()` on the next line stored null -- and the
+     * failure surfaced hundreds of frames away, as `'null' object has no
+     * method 'accepts'` inside _fallback. The test that catches it is
+     * tests/lang/test_jit_empty_init_returns_self.jai.
+     *
+     * The condition mirrors opReturn's own, including the name check: a
+     * default thunk borrows its function record and does not carry the flag. */
+    if ((fn->flags & FN_INIT) != 0 ||
+        (fn->name != NULL && fn->name == vm.strInit)) {
+        return false;
+    }
     if (!arenaReady() || sArena.sealed) return false;
 
 #if defined(__aarch64__) || defined(__arm64__)
