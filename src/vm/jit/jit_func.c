@@ -155,8 +155,100 @@ unsigned localTagFor(const Emit *e, unsigned slot) {
                             : VAL_OBJ;
 }
 
+/* The read side of the dynamic-local contract stated at localTagInFrame: a
+ * slot two paths disagreed about carries a run-time tag, and the kind this
+ * read was compiled for is a speculation until that tag confirms it. Both
+ * tiers guard; only the address of the frame home differs, so it is passed
+ * in rather than recomputed here. */
+static void localGuardDynamic(Emit *e, unsigned slot, unsigned scratch,
+                              unsigned base, unsigned off) {
+    /* Every exit below is a deopt, and a deopt record describes each stack entry
+     * by its own register -- so nothing may still be a pending constant or a
+     * borrow of a local's, and settling is what makes the guard legal at all.
+     * What settling must not do is park an entry in the register the tag load
+     * below is about to clobber; that one case keeps the older answer and hands
+     * the body back, which is what every guard did here before it settled. */
+    for (unsigned i = 0; i < 32u; i++) {
+        if (((e->kPend | e->xBorrow) & (1u << i)) == 0) continue;
+        if (valueXReg(e, i) != scratch) continue;
+        e->whyNot = "a deferred value is in the register a local's guard needs";
+        e->failed = true;
+        return;
+    }
+    settleAll(e);
+    /* Into `scratch`, not JIT_SCRATCH_A, since the caller may already be holding an operand there: this
+     * exact mistake once loaded the tag over the constant on a dynamic slot, so `for j in i + 1..n` silently ran from i+2 and every nested loop was one iteration short. */
+    emit(e, jaiA64LdrW(scratch, base, off));
+    emit(e, jaiA64SubsXImm(31, scratch, localTagFor(e, slot)));
+    branchOnDeopt(e, JAI_A64_NE);
+
+    /* VAL_OBJ is shared by SLOT_LIST, SLOT_OBJ and SLOT_INST alike (see
+     * localTagFor), so the tag check above cannot tell a list from a dict
+     * a sibling write left in this slot -- confirmed the same way
+     * OP_GET_INDEX's own SLOT_LIST arm does, once, before a consumer
+     * trusts it with no check of its own. Chained through `scratch`
+     * alone (no second register): the payload is reloaded fresh into it,
+     * then `Obj.type` is loaded from that address back into the same
+     * register -- valid on this encoder elsewhere (e.g. the
+     * OP_GET_INDEX/OP_SET_INDEX list arms chain JIT_SCRATCH_C the same
+     * way), and it never needs the pointer again afterward, since the
+     * unconditional reload below re-reads it from the frame regardless. */
+    if (e->localKind[slot] == SLOT_LIST) {
+        emit(e, jaiA64LdrX(scratch, base, off + 8));
+        emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, scratch, OBJ_LIST));
+        branchOnDeopt(e, JAI_A64_NE);
+    } else if (e->localKind[slot] == SLOT_INST ||
+               e->localKind[slot] == SLOT_MAYBE_INST) {
+        /* Same hazard, for a slot that took two different classes: a tag
+         * of VAL_OBJ says "an instance", not "an instance of THIS class",
+         * so the object type and its class shape are both confirmed here
+         * before a consumer reads a field at an offset only this class
+         * has. JIT_SCRATCH_D is free at every call site that can carry an
+         * instance-kinded dynamic local through this helper (audited:
+         * OP_GET_LOCAL, OP_GET_LOCAL2, OP_GET_FIELD_LOCAL's two reads of
+         * its receiver, the init-returns-self arms of
+         * OP_RETURN_NULL/OP_POP_RETURN_NULL, emitRootFill's root loop --
+         * every other site names a scalar kind and cannot reach here).
+         * `scratch` keeps the instance pointer as the base throughout --
+         * loading FROM it doesn't clobber it -- until it is chained into
+         * the class pointer and then the shapeId, since nothing after
+         * this needs the original pointer back (the unconditional reload
+         * below restores it for the return regardless).
+         *
+         * SLOT_MAYBE_INST shares the arm rather than going unchecked: it
+         * is a kind a dynamic slot really does take, both from the
+         * nullable-parameter seed and from any OP_BIND of a nullable
+         * instance field, and its tag is the same VAL_OBJ, so without
+         * this a `Bird` left in the slot by a sibling write was read at
+         * `Dog`'s field offsets. What it does NOT share is the pointer
+         * being known non-null. A null cannot be chased and cannot be
+         * jumped over either -- every branch this file emits leaves the
+         * block for a stub -- so it deopts, and the interpreter finishes
+         * the instruction. That costs one deopt on a value the tier could
+         * in principle have carried, which is the price of not letting a
+         * guard load off address zero. (The prologue's own tag write is
+         * payload-dependent for the same reason, so a null argument is
+         * usually already stopped by the tag check above.) */
+        emit(e, jaiA64LdrX(scratch, base, off + 8));
+        if (e->localKind[slot] == SLOT_MAYBE_INST) {
+            emit(e, jaiA64SubsXImm(31, scratch, 0));
+            branchOnDeopt(e, JAI_A64_EQ);
+        }
+        emit(e, jaiA64LdrW(JIT_SCRATCH_D, scratch, (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
+        branchOnDeopt(e, JAI_A64_NE);
+        emit(e, jaiA64LdrX(scratch, scratch, (unsigned)offsetof(ObjInstance, klass)));
+        emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(ObjClass, shapeId)));
+        emitConst64(e, JIT_SCRATCH_D, (int64_t)e->localShape[slot]);
+        emit(e, jaiA64SubsXReg(31, scratch, JIT_SCRATCH_D));
+        branchOnDeopt(e, JAI_A64_NE);
+    }
+}
+
 /* Register mode: the local's own register, `scratch` unused. Memory mode: loaded into `scratch`.
- * Only the payload moves -- a local's kind is fixed for the whole function, so the tag is never restored. */
+ * Only the payload moves -- a fixed-kind local's tag is rebuildable from the kind, so it is never
+ * restored. A dynamic local's kind is a speculation instead, so both tiers guard before the load. */
 unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
     if (e->osr) {
         /* An X home answers with no instruction at all, an FP home costs the
@@ -168,6 +260,11 @@ unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
         if (e->slotFpReg[slot] != 0) {
             emit(e, jaiA64FmovXD(scratch, e->slotFpReg[slot]));
             return scratch;
+        }
+        /* The interpreter's own Value slot is the frame home here, so the tag
+         * to check is the one already sitting beside the payload. */
+        if (e->dynamicLocal[slot]) {
+            localGuardDynamic(e, slot, scratch, JIT_SLOTS_REG, slot * 16u);
         }
         /* One byte for a bool. The slot is the interpreter's, and BOOL_VAL is a
          * `strb`, so the seven bytes above it are whatever the slot held
@@ -187,77 +284,7 @@ unsigned localIn(Emit *e, unsigned slot, unsigned scratch) {
         return scratch;
     }
     if (e->dynamicLocal[slot]) {
-        /* Two paths reached here disagreeing about this slot, so what it holds
-         * is a runtime fact: check it against what this read was compiled for
-         * and hand the instruction back otherwise. */
-        /* Into `scratch`, not JIT_SCRATCH_A, since the caller may already be holding an operand there: this
-         * exact mistake once loaded the tag over the constant on a dynamic slot, so `for j in i + 1..n` silently ran from i+2 and every nested loop was one iteration short. */
-        emit(e, jaiA64LdrW(scratch, 31, localFrameOff(e, slot)));
-        emit(e, jaiA64SubsXImm(31, scratch, localTagFor(e, slot)));
-        branchOnDeopt(e, JAI_A64_NE);
-
-        /* VAL_OBJ is shared by SLOT_LIST, SLOT_OBJ and SLOT_INST alike (see
-         * localTagFor), so the tag check above cannot tell a list from a dict
-         * a sibling write left in this slot -- confirmed the same way
-         * OP_GET_INDEX's own SLOT_LIST arm does, once, before a consumer
-         * trusts it with no check of its own. Chained through `scratch`
-         * alone (no second register): the payload is reloaded fresh into it,
-         * then `Obj.type` is loaded from that address back into the same
-         * register -- valid on this encoder elsewhere (e.g. the
-         * OP_GET_INDEX/OP_SET_INDEX list arms chain JIT_SCRATCH_C the same
-         * way), and it never needs the pointer again afterward, since the
-         * unconditional reload below re-reads it from the frame regardless. */
-        if (e->localKind[slot] == SLOT_LIST) {
-            emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
-            emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(Obj, type)));
-            emit(e, jaiA64SubsXImm(31, scratch, OBJ_LIST));
-            branchOnDeopt(e, JAI_A64_NE);
-        } else if (e->localKind[slot] == SLOT_INST ||
-                   e->localKind[slot] == SLOT_MAYBE_INST) {
-            /* Same hazard, for a slot that took two different classes: a tag
-             * of VAL_OBJ says "an instance", not "an instance of THIS class",
-             * so the object type and its class shape are both confirmed here
-             * before a consumer reads a field at an offset only this class
-             * has. JIT_SCRATCH_D is free at every call site that can carry an
-             * instance-kinded dynamic local through this helper (audited:
-             * OP_GET_LOCAL, OP_GET_LOCAL2, OP_GET_FIELD_LOCAL's two reads of
-             * its receiver, the init-returns-self arms of
-             * OP_RETURN_NULL/OP_POP_RETURN_NULL, emitRootFill's root loop --
-             * every other site names a scalar kind and cannot reach here).
-             * `scratch` keeps the instance pointer as the base throughout --
-             * loading FROM it doesn't clobber it -- until it is chained into
-             * the class pointer and then the shapeId, since nothing after
-             * this needs the original pointer back (the unconditional reload
-             * below restores it for the return regardless).
-             *
-             * SLOT_MAYBE_INST shares the arm rather than going unchecked: it
-             * is a kind a dynamic slot really does take, both from the
-             * nullable-parameter seed and from any OP_BIND of a nullable
-             * instance field, and its tag is the same VAL_OBJ, so without
-             * this a `Bird` left in the slot by a sibling write was read at
-             * `Dog`'s field offsets. What it does NOT share is the pointer
-             * being known non-null. A null cannot be chased and cannot be
-             * jumped over either -- every branch this file emits leaves the
-             * block for a stub -- so it deopts, and the interpreter finishes
-             * the instruction. That costs one deopt on a value the tier could
-             * in principle have carried, which is the price of not letting a
-             * guard load off address zero. (The prologue's own tag write is
-             * payload-dependent for the same reason, so a null argument is
-             * usually already stopped by the tag check above.) */
-            emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
-            if (e->localKind[slot] == SLOT_MAYBE_INST) {
-                emit(e, jaiA64SubsXImm(31, scratch, 0));
-                branchOnDeopt(e, JAI_A64_EQ);
-            }
-            emit(e, jaiA64LdrW(JIT_SCRATCH_D, scratch, (unsigned)offsetof(Obj, type)));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
-            branchOnDeopt(e, JAI_A64_NE);
-            emit(e, jaiA64LdrX(scratch, scratch, (unsigned)offsetof(ObjInstance, klass)));
-            emit(e, jaiA64LdrW(scratch, scratch, (unsigned)offsetof(ObjClass, shapeId)));
-            emitConst64(e, JIT_SCRATCH_D, (int64_t)e->localShape[slot]);
-            emit(e, jaiA64SubsXReg(31, scratch, JIT_SCRATCH_D));
-            branchOnDeopt(e, JAI_A64_NE);
-        }
+        localGuardDynamic(e, slot, scratch, 31, localFrameOff(e, slot));
     }
     emit(e, jaiA64LdrX(scratch, 31, localFrameOff(e, slot) + 8));
     return scratch;
