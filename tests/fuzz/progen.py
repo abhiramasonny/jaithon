@@ -62,6 +62,17 @@ shapes that have broken it before:
     is the census that says so
   - a nullable instance conditionally assigned, and an `any` that is an int on
     one path and an object on the other
+  - a TERNARY whose two edges carry different KINDS, which is the only shape
+    that reaches the join check. It is here because a corpus was blind to it:
+    200 generated programs and 159 checked-in files all passed while a body
+    returning `1.5` on one edge and a string on the other compiled to a
+    SIGSEGV, since the join packed two bits of a fifteen-value SlotKind and
+    four pairs collided. Nothing drew two kinds out of one expression, so
+    nothing ever reached the check. With the old signature restored
+    (`JAITHON_JIT_JOIN=0`) it was 0 of 200; it is now 3 of 60. Note the shape
+    has to be a ternary and it has to be in the PROBE: two `return`s are
+    mergeReturnKind's path, not the join's, and a helper only reaches the
+    join if it happens to get hot
   - lists, dicts, strings, indexing, recursion, match, lambdas
 
 Two invariants keep every generated program legal and terminating, since a
@@ -201,6 +212,22 @@ class Node:
                         out.append(pad + "    " + kid)
                     else:
                         kid.render(out, depth + 1)
+
+
+#: Return-value pairs whose SlotKinds differ. Written as source text because
+#: what matters is the kind the tier infers, not the Python value.
+MIX_RETURN_PAIRS = [
+    ("1.5", '"s"'),          # SLOT_FLOAT vs SLOT_OBJ -- the pair that collided
+    ("true", "null"),        # SLOT_BOOL vs SLOT_MAYBE_INST -- its sibling
+    ("7", '"t"'),
+    ("2.25", "null"),
+    ("[1, 2]", "9"),
+    ('"u"', "null"),
+    ("0.5", "3"),
+    ("false", '"v"'),
+    ("[3]", "null"),
+    ("1.0", "true"),
+]
 
 
 def line(text):
@@ -964,6 +991,89 @@ class Gen:
                 f"}}")
             self.helpers[name] = (4, "int")
 
+
+        # A function whose two RETURN edges carry different KINDS. This is the
+        # one shape a whole corpus can be blind to: 200 generated programs and
+        # 159 checked-in files all passed while a body returning `1.5` on one
+        # edge and a string on the other compiled to a segfault, because the
+        # join check packed only two bits of a fifteen-value SlotKind and four
+        # pairs collided. Nothing here drew two different kinds out of one
+        # function, so nothing ever reached the check.
+        #
+        # The pairs are chosen to span the tag classes rather than to be
+        # exotic: a raw double against a heap pointer, a one-byte bool against
+        # a pointer-or-zero, a defined zero against an object. Instances are
+        # deliberately NOT printed -- their rendering is not stable enough to
+        # diff -- so the object edges are strings and lists.
+        for _ in range(r.randint(1, 2)):
+            name = self.fresh("mix")
+            a, b = r.choice(MIX_RETURN_PAIRS)
+            third = r.random() < 0.4
+            c = r.choice([e for (x, y) in MIX_RETURN_PAIRS
+                          for e in (x, y) if e not in (a, b)]) if third else None
+            form = r.random()
+            if form < 0.45:
+                # A TERNARY, which is the shape that actually reaches the join
+                # check: both edges land in ONE stack slot and the walk carries
+                # on from there. The if-return form below never does -- each
+                # edge leaves by its own OP_RETURN, so mergeReturnKind sees it
+                # and the join check never runs. Sixty programs of the
+                # if-return form alone found nothing with the two-bit hash
+                # restored; the ternary finds it in the first few.
+                body = [f"fn {name}(k: int) -> any {{",
+                        f"    return k % 3 == 0 ? {a} : {b}",
+                        "}"]
+            elif form < 0.75:
+                # The joined value used before it leaves, so the disagreement
+                # has to survive a store and a load rather than going straight
+                # out through x0.
+                body = [f"fn {name}(k: int) -> any {{",
+                        f"    let v = k % 3 == 0 ? {a} : {b}",
+                        "    if k < 0 { return null }",
+                        "    return v",
+                        "}"]
+            else:
+                # Two OP_RETURNs, which is mergeReturnKind's own path -- the
+                # one SLOT_MAYBE_OBJ widens.
+                body = [f"fn {name}(k: int) -> any {{",
+                        f"    if k % 3 == 0 {{ return {a} }}"]
+                if c is not None:
+                    body.append(f"    if k % 3 == 1 {{ return {c} }}")
+                body.append(f"    return {b}")
+                body.append("}")
+            self.prog.helpers.append("\n".join(body))
+            self.mixers.append(name)
+
+    def st_mix_join(self, depth):
+        """A ternary whose two edges carry different kinds, in the PROBE body.
+
+        The helper form reaches the join too, but only if that helper happens
+        to get hot; the probe is called `warm` times by construction, so this
+        one is always in compiled code. Both halves matter -- the value is
+        printed AND compared against null, since a join that survives to a use
+        is a different path from one that goes straight out through x0.
+        """
+        r = self.rng
+        a, b = r.choice(MIX_RETURN_PAIRS)
+        var = self.fresh("j")
+        cond = r.choice([f"n % {r.randint(2, 5)} == 0", self.bool_expr()])
+        out = [f"let {var} = {cond} ? {a} : {b}",
+               f"print({var})"]
+        if r.random() < 0.5:
+            out.append(f"if {var} == null {{ acc = acc +% 1 }}")
+        return Node(*out)
+
+    def st_mix_return(self, depth):
+        """Print what a kind-disagreeing function returned.
+
+        Printed rather than consumed: the value has no single type, so there is
+        nothing to do with it arithmetically, and stdout is what the runner
+        diffs anyway. The modulus keeps every edge reachable.
+        """
+        r = self.rng
+        name = r.choice(self.mixers)
+        return Node(f"print({name}(n % {r.randint(3, 12)}))")
+
     # -- statements -----------------------------------------------------
 
     def trips(self, options):
@@ -1031,6 +1141,9 @@ class Gen:
             # not worth putting in every probe.
             (self.st_operator, 2),
         ]
+        kinds.append((self.st_mix_join, 8))
+        if self.mixers:
+            kinds.append((self.st_mix_return, 7))
         if self.use_dict:
             kinds.append((self.st_dict_ops, 5))
             kinds.append((self.st_for_dict, 4))
@@ -1617,6 +1730,7 @@ class Gen:
 
     def build(self):
         r = self.rng
+        self.mixers = []
         self.gen_classes()
         self.gen_helpers()
         for k in range(r.randint(2, 5)):
