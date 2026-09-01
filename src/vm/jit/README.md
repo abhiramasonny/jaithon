@@ -486,6 +486,12 @@ fuzzer runs. Same binary, same seeds, generator before and after:
       thresh           0/100    50/100       thresh           0/100    55/100
       any              0/100    76/100       any              0/100    83/100
 
+The "after" column is sampler-driven and so is not exactly repeatable: the same
+100 seeds re-run gave 38/27/52/51/50 and 80 for `any`. The zeroes are not like
+that. Every "before" cell was 0 in every run, which is the point -- a number
+that moves by a few programs between runs and a number that is structurally
+unreachable do not need the same precision to tell apart.
+
 The old statement already emitted "a list of mixed classes walked by one loop"
 and still scored zero, which is the part worth remembering: the shape was
 right and three details were wrong. Its list was two or three elements drawn
