@@ -109,3 +109,16 @@ jaithon/compile/resolve/resolver.jai
 jaithon/compile/resolve/scope.jai
 jaithon/compile/resolve/walk.jai
 jaithon/compile/resolve/wire.jai
+jaithon/compile/emit/assert_text.jai
+jaithon/compile/emit/decl.jai
+jaithon/compile/emit/exception.jai
+jaithon/compile/emit/expr.jai
+jaithon/compile/emit/field_kind.jai
+jaithon/compile/emit/function.jai
+jaithon/compile/emit/iteration.jai
+jaithon/compile/emit/operator.jai
+jaithon/compile/emit/pattern.jai
+jaithon/compile/emit/shape.jai
+jaithon/compile/emit/state.jai
+jaithon/compile/emit/stmt.jai
+jaithon/compile/emit/wire.jai

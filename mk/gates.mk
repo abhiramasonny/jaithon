@@ -135,3 +135,21 @@ branch-table-check:
 .PHONY: method-surface-check
 method-surface-check: $(TARGET)
 	@JAITHON=$(CURDIR)/$(TARGET) python3 scripts/gate/method_surface_check.py
+
+# The .jaic wire format is described twice, in two languages, by two readers of
+# the same files. A version bumped on one side only makes every cached image the
+# other side wrote silently accepted or silently rejected -- and __jaicache__ is
+# consulted before anything else, so the symptom is a stale image running, or a
+# full recompile blamed on a cold cache.
+.PHONY: jaic-wire-check
+jaic-wire-check:
+	@python3 scripts/gate/jaic_wire_check.py
+
+# The emitter picks FieldKind codes with bare integer literals -- `return 5` --
+# and nothing in the source connects them to the enum they are numerals of.
+# Inserting a member in the middle of FieldKind changes what every previously
+# written .jaic means without touching the emitter, and the compiled tier then
+# guards for the wrong thing.
+.PHONY: field-kind-check
+field-kind-check:
+	@python3 scripts/gate/field_kind_check.py

@@ -59,8 +59,13 @@ reviewers of their own proposal, and several by reviewers of other proposals:
    Adopted *because* it has no consumer: it is the one piece of every IR
    proposal that cannot miscompile anything.
 
-4. **Fix the attribution dump, then `_join`.** The dump prints `fn->name`, so
-   rows are ambiguous; `fn->qualifiedName` is already on `ObjFunction`. Then
+4. **Fix the attribution dump, then `_join`.** *(landed)* The dump printed
+   `fn->name`, so rows were ambiguous -- and `qualifiedName` does NOT fix it,
+   because `serialize_read.c` sets it equal to `name` for anything from a cached
+   image, which is nearly everything. The DEFINING MODULE does, and one
+   `jitFnLabel` helper now qualifies all 41 diagnostic sites, so
+   `JAI_JIT_WHY` and the attribution dump agree and `jit_report.py` can join
+   them again. Then
    `check/modsig.jai`'s `_join` builds its result one character at a time and is
    73% of a probe reviewers ran. ~110 lines, one reseed, no format change.
 
@@ -95,12 +100,13 @@ reviewers of their own proposal, and several by reviewers of other proposals:
 
 Each step lands green, on its own, and is worth having if 3.4 stops there.
 
-    1. arena capacity, both arenas, one tunable            DONE
-    2. attribution dump prints qualifiedName + file:line
-    3. _join stops building a string one character at a time
-    4. range-limited unseal/seal, with its two-stencil test
+    1. arena capacity, both arenas, one tunable            DONE  -13%
+    2. the attribution dump names a function unambiguously  DONE
+    3. _join stops building a string one character at a time DONE
+    4. range-limited unseal/seal, with its two-stencil test DONE  (not a
+       speedup -- kept for shape; see JAITHON_JIT_ARENA_WINDOW)
     5. jaiChunkCfg + tests/vm/test_chunk_cfg.c + the gate
-    6. the two wire-constant gates
+    6. the two wire-constant gates                          DONE
     7. structural intern keys, behind a switch
     8. only then: a total meet over SlotKind, with the lattice laws
        (commutativity, associativity, absorption) checked exhaustively by a
