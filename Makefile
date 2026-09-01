@@ -408,7 +408,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check layer-check import-check jit-fusion-check branch-table-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check layer-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -536,6 +536,20 @@ jit-fusion-check:
 .PHONY: branch-table-check
 branch-table-check:
 	@python3 scripts/gate/branch_table_check.py
+
+# The builtin method surface is written down twice -- k*MethodNames[] in
+# builtins.c, which dir() answers from, and twelve dispatch tables in four C
+# shapes, which a real call resolves through -- and they drifted to 46 names
+# once. An advertised name the runtime will not bind raises AttributeError at
+# the user's run time, because `jaithon check` types every method call on a
+# builtin as `any` and rejects nothing. tests/stdlib/test_method_tables.jai
+# hand-copies six of the twelve lists into Jaithon, so it cannot see a name
+# added to builtins.c after it was written; this reads builtins.c itself and
+# then asks the built binary about every name -- hence the $(TARGET)
+# prerequisite, which the pure-text gates above do not need.
+.PHONY: method-surface-check
+method-surface-check: $(TARGET)
+	@JAITHON=$(CURDIR)/$(TARGET) python3 scripts/gate/method_surface_check.py
 
 # What the tier covers, one ordinary idiom at a time. Each probe in docs/probes/
 # is a single hot loop; the script runs it with the tier on and with
