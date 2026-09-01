@@ -50,13 +50,22 @@ shapes that have broken it before:
   - loops of every form, which is the only way into the OSR tier
   - an early `return` out of a loop, which OSR handles separately
   - field reads and writes, methods, `self.m()` calls, and overrides
+  - a variable holding one class on one branch and another on the next, which
+    is the inline cache's own path; every generated class answers kind(),
+    geta(), twice() and bump(k) precisely so that any two of them are legal at
+    the same call site and only the run-time value says which arrived
+  - a nullable instance conditionally assigned, and an `any` that is an int on
+    one path and an object on the other
   - lists, dicts, strings, indexing, recursion, match, lambdas
 
 Two invariants keep every generated program legal and terminating, since a
 program that dies the same way five times proves nothing:
 
   - `xs` never empties (pops are guarded), so `xs[k % xs.len()]` cannot raise,
-    and `d["k"]` is only ever read for a key seeded into the literal;
+    and never passes 64 elements (pushes are capped), so no nest of loops can
+    make one probe call take minutes -- a program the runner cannot finish in
+    its timeout is reported as a divergence, and seed 300 was exactly that;
+    `d["k"]` is only ever read for a key seeded into the literal;
   - every loop carries its own counter increment as the FIRST statement of its
     body, outside anything the generator or the shrinker can delete, so no
     body and no `continue` can stop it terminating.
@@ -96,6 +105,22 @@ FLOAT_LITS = ["0.0", "1.0", "0.5", "2.0", "-1.5", "3.25", "1e10", "-0.125",
 STR_LITS = ['""', '"a"', '"bc"', '"xyz"', '"jai"', '"0"', '"-"', '" "']
 
 CMPS = ["==", "!=", "<", "<=", ">", ">="]
+
+# EVERY generated class answers all four, so any two of them are legal at the
+# same call site whatever the run-time value turns out to be. That uniformity
+# is the whole point of the class family: a variable holding one class on one
+# branch and a different one on the next is the polymorphic-inline-cache path
+# (src/vm/jit/jit_call_pic.c), and a cache keyed on a compile-time kind is a
+# lie exactly there.
+CLASS_METHODS = ["kind", "geta", "twice", "bump"]
+
+# What is known about a receiver whose class is NOT known statically -- an
+# `any` that two branches filled differently. Only the shared contract.
+COMMON_API = {"ctor": None, "int_methods": list(CLASS_METHODS), "fields": [],
+              "float_field": False, "opt_int": None, "inst_field": None,
+              "ops": False, "static": None, "maybe": False, "me": False,
+              "mix": False, "walk": False, "base": None, "subs": [],
+              "inst_type": None}
 
 
 class Node:
@@ -145,6 +170,22 @@ class Node:
 
 def line(text):
     return Node(text)
+
+
+def int_lit(v):
+    """Source for an integer constant.
+
+    `-9223372036854775808` is not a literal the front end takes in every
+    position: the magnitude is read first, and 9223372036854775808 does not
+    fit, so `x - -9223372036854775808` is rejected outright (E0005) while
+    `-9223372036854775808 - x` is fine. A program that fails to compile fails
+    the same way under all six configurations, so it is not a false positive
+    -- it is worse, a seed that tests nothing. The most negative int is
+    therefore written as the expression that reaches it.
+    """
+    if v == -9223372036854775808:
+        return "(-9223372036854775807 -% 1)"
+    return str(v)
 
 
 class Probe:
@@ -339,8 +380,8 @@ class Gen:
     def int_atom(self):
         r = self.rng
         options = [
-            lambda: str(r.choice(SMALL_INTS)),
-            lambda: str(r.choice(EDGE_INTS)),
+            lambda: int_lit(r.choice(SMALL_INTS)),
+            lambda: int_lit(r.choice(EDGE_INTS)),
             lambda: r.choice(self.ints),
         ]
         # `n` is the only thing that differs between one call and the next, so
@@ -374,6 +415,11 @@ class Gen:
             if not self.containers:
                 return r.choice(self.ints)
             return f"{name}(xs)"
+        if kind == "inst":
+            names = self.constructible()
+            if not names:
+                return r.choice(self.ints)
+            return f"{name}({self.ctor_of(r.choice(names))}, {self.int_expr(0)})"
         if kind == "rec":
             # Every argument is bounded to 0..11 by a positive modulus, so the
             # depth is bounded too -- an int_expr straight in blows the stack.
@@ -384,7 +430,20 @@ class Gen:
     def method_call(self):
         r = self.rng
         var, cls = r.choice(self.insts)
-        api = self.classes[cls]
+        api = self.api_of(cls)
+        if api["maybe"] and r.random() < 0.2:
+            return (f"({var}.maybe({self.int_expr(0)}) ?? "
+                    f"{r.choice(SMALL_INTS)})")
+        if api["opt_int"] and r.random() < 0.2:
+            return f"({var}.{api['opt_int']} ?? {r.choice(SMALL_INTS)})"
+        if api["fields"] and r.random() < 0.25:
+            return f"{var}.{r.choice(api['fields'])}"
+        # Deliberately NOT `o.me().geta()`. A call on a call's result has no
+        # receiver kind for the tier to read -- SLOT_INT is the zero of
+        # SlotKind, so the census calls it "a receiver of kind int" -- and this
+        # atom reaches every expression in the program, so one chain here
+        # refused a quarter of all probes. st_class_use emits the chain
+        # instead, where a refusal costs one statement.
         name = r.choice(api["int_methods"])
         if name == "bump":
             return f"{var}.bump({self.int_expr(0)})"
@@ -401,7 +460,7 @@ class Gen:
                 options.append(lambda: r.choice(self.floats))
             if self.insts:
                 cands = [v for v, c in self.insts
-                         if self.classes[c]["float_field"]]
+                         if self.api_of(c)["float_field"]]
                 if cands:
                     options.append(lambda: f"{r.choice(cands)}.b")
             return r.choice(options)()
@@ -463,62 +522,303 @@ class Gen:
 
     # -- declarations ---------------------------------------------------
 
+    def add_class(self, name, src, ctor, **api):
+        """Record one class and what may legally be written about it.
+
+        Everything the generator needs to keep a program legal lives here:
+        which fields exist (a write to an absent one is a checker error), which
+        of the optional members were rolled, and which class is whose base.
+        """
+        self.prog.classes.append(src)
+        info = dict(COMMON_API)
+        info["ctor"] = ctor
+        info["int_methods"] = list(CLASS_METHODS)
+        info["subs"] = []
+        info.update(api)
+        self.classes[name] = info
+        return info
+
+    def api_of(self, cls):
+        """The API of a receiver, or the shared contract when None."""
+        return self.classes[cls] if cls is not None else COMMON_API
+
+    def constructible(self):
+        return sorted(self.classes)
+
+    def plain_classes(self):
+        """Classes whose constructor needs no instance -- what a holder holds.
+
+        Kept separate so a holder can never be asked to hold a holder, which
+        would recurse without bound in ctor_of.
+        """
+        return [n for n, a in sorted(self.classes.items())
+                if "INST" not in a["ctor"]]
+
+    def holdable_by(self, cls):
+        """What may legally be stored in `cls`'s instance field.
+
+        A field write is checked at run time (LANGUAGE.md), so a declared
+        `Box` field takes a Box or any subclass of one and nothing else.
+        """
+        want = self.classes[cls]["inst_type"]
+        if want is None:
+            return self.plain_classes()
+        return [want] + list(self.classes[want]["subs"])
+
+    def ctor_of(self, name):
+        """A construction expression, every placeholder filled in.
+
+        ARG2 before ARG: the other order rewrites the `ARG` inside `ARG2`.
+        """
+        ctor = self.classes[name]["ctor"]
+        if "INST" in ctor:
+            held = self.holdable_by(name)
+            inner = self.ctor_of(self.rng.choice(held)) if held else "0"
+            ctor = ctor.replace("INST", inner)
+        return ctor.replace("ARG2", self.int_expr(0)).replace(
+            "ARG", self.int_expr(0))
+
     def gen_classes(self):
         r = self.rng
-        # An empty initialiser that must still evaluate to the new object.
-        # A one-instruction OP_RETURN_NULL body once made this return null.
-        if r.random() < 0.75:
-            name = self.fresh("Empty")
-            tag = r.randint(1, 99)
-            self.prog.classes.append(
-                f"class {name} {{\n"
-                f"    fn init(self) {{}}\n"
-                f"    pub fn tag(self) -> int {{ return {tag} }}\n"
-                f"}}")
-            self.classes[name] = {"ctor": f"{name}()", "float_field": False,
-                                  "int_methods": ["tag"], "fields": []}
+        if r.random() < 0.7:
+            self.gen_empty()
+        base = self.gen_box() if r.random() < 0.9 else None
+        if base is not None:
+            # At least one, so a base-typed variable always exists: a variable
+            # declared `any` gives the whole-function tier no kind for its
+            # receiver at all (SLOT_INT is the zero of SlotKind, which is why
+            # the census reads "a receiver of kind int"), and that tier then
+            # declines the body. A variable typed as the BASE is polymorphic
+            # in the way that matters and still compiles.
+            for _ in range(r.choice([1, 1, 2, 2])):
+                self.gen_sub(base)
+        if r.random() < 0.7:
+            # Inheritance is not what makes a receiver interchangeable. A cache
+            # keyed on shape has to cope with two classes that share nothing
+            # but their method names.
+            self.gen_peer()
+        if self.classes and r.random() < 0.5:
+            self.gen_holder()
+        if r.random() < 0.4:
+            self.gen_node()
 
-        if r.random() < 0.85:
-            name = self.fresh("Box")
-            lit = r.choice(FLOAT_LITS)
-            self.prog.classes.append(
-                f"class {name} {{\n"
-                f"    pub var a: int\n"
-                f"    pub var b: float\n"
-                f"    pub var s: str\n"
-                f"    fn init(self, a: int) {{\n"
-                f"        self.a = a\n"
-                f"        self.b = {lit}\n"
-                f'        self.s = "{name.lower()}"\n'
-                f"    }}\n"
-                f"    pub fn geta(self) -> int {{ return self.a }}\n"
-                f"    pub fn bump(self, k: int) -> int {{\n"
-                f"        self.a = self.a +% k\n"
-                f"        return self.geta()\n"
-                f"    }}\n"
-                f"    pub fn twice(self) -> int {{"
-                f" return self.geta() +% self.geta() }}\n"
-                f"}}")
-            self.classes[name] = {"ctor": f"{name}(ARG)", "float_field": True,
-                                  "int_methods": ["geta", "bump", "twice"],
-                                  "fields": ["a"]}
-            # An override reached through the parent's own `self.geta()`.
-            if r.random() < 0.6:
-                sub = self.fresh("Sub")
-                self.prog.classes.append(
-                    f"class {sub} extends {name} {{\n"
-                    f"    pub var c: int\n"
-                    f"    fn init(self, a: int, c: int) {{\n"
-                    f"        super(a)\n"
-                    f"        self.c = c\n"
-                    f"    }}\n"
-                    f"    pub fn geta(self) -> int {{"
-                    f" return self.a +% self.c }}\n"
-                    f"}}")
-                self.classes[sub] = {"ctor": f"{sub}(ARG, ARG2)",
-                                     "float_field": True,
-                                     "int_methods": ["geta", "bump", "twice"],
-                                     "fields": ["a", "c"]}
+    def gen_empty(self):
+        """An empty initialiser that must still evaluate to the new object.
+
+        A one-instruction OP_RETURN_NULL body once made this return null.
+        """
+        r = self.rng
+        name = self.fresh("Empty")
+        tag = r.randint(1, 99)
+        self.add_class(
+            name,
+            f"class {name} {{\n"
+            f"    fn init(self) {{}}\n"
+            f"    pub fn kind(self) -> int {{ return {tag} }}\n"
+            f"    pub fn geta(self) -> int {{ return {tag} *% 3 }}\n"
+            f"    pub fn twice(self) -> int {{"
+            f" return self.geta() +% self.geta() }}\n"
+            f"    pub fn bump(self, k: int) -> int {{"
+            f" return self.kind() +% k }}\n"
+            f"}}",
+            f"{name}()")
+        return name
+
+    def gen_box(self):
+        """The field-storing class, with the optional members rolled per run."""
+        r = self.rng
+        name = self.fresh("Box")
+        lit = r.choice(FLOAT_LITS)
+        tag = r.randint(1, 99)
+        ops = r.random() < 0.45
+        static = r.random() < 0.4
+        maybe = r.random() < 0.45
+        me = r.random() < 0.35
+        opt = r.random() < 0.45
+        src = [f"class {name} {{",
+               "    pub var a: int",
+               "    pub var b: float",
+               "    pub var s: str"]
+        if opt:
+            src.append("    pub var o: int?")
+        src += ["    fn init(self, a: int) {",
+                "        self.a = a",
+                f"        self.b = {lit}",
+                f'        self.s = "{name.lower()}"']
+        if opt:
+            src.append("        self.o = null")
+        src += ["    }",
+                "    pub fn geta(self) -> int { return self.a }",
+                f"    pub fn kind(self) -> int {{ return {tag} }}",
+                "    pub fn twice(self) -> int {"
+                " return self.geta() +% self.geta() }",
+                "    pub fn bump(self, k: int) -> int {",
+                "        self.a = self.a +% k",
+                "        return self.geta()",
+                "    }"]
+        if ops:
+            src += [f"    pub fn __add__(self, o: {name}) -> int {{"
+                    " return self.a +% o.a }",
+                    f"    pub fn __eq__(self, o: {name}) -> bool {{"
+                    " return self.a == o.a }",
+                    '    pub fn __str__(self) -> str'
+                    ' { return f"<{self.a}>" }']
+        if static:
+            src.append(f"    pub static fn make(k: int) -> {name} {{"
+                       f" return {name}(k % 1000) }}")
+        if maybe:
+            src += ["    pub fn maybe(self, k: int) -> int? {",
+                    f"        if k % {r.randint(2, 5)} == 0 {{ return null }}",
+                    "        return self.a +% k",
+                    "    }"]
+        # A return whose KIND only the run-time value decides: an instance on
+        # one path and an int on the other, out of one signature.
+        src += ["    pub fn mix(self, k: int) -> any {",
+                f"        if k % {r.randint(2, 4)} == 0 {{ return self }}",
+                "        return self.a +% k",
+                "    }"]
+        if me:
+            src.append(f"    pub fn me(self) -> {name} {{ return self }}")
+        src.append("}")
+        self.add_class(name, "\n".join(src), f"{name}(ARG)",
+                       fields=["a"], float_field=True,
+                       opt_int="o" if opt else None, ops=ops,
+                       static="make" if static else None, maybe=maybe,
+                       me=me, mix=True)
+        return name
+
+    def gen_sub(self, base):
+        """A subclass whose override is reached through the base's own self."""
+        r = self.rng
+        name = self.fresh("Sub")
+        tag = r.randint(1, 99)
+        style = r.randrange(3)
+        src = [f"class {name} extends {base} {{",
+               "    pub var c: int",
+               "    fn init(self, a: int, c: int) {",
+               "        super(a)",
+               "        self.c = c",
+               "    }",
+               f"    pub fn kind(self) -> int {{ return {tag} }}"]
+        if style == 0:
+            src.append("    pub fn geta(self) -> int {"
+                       " return self.a +% self.c }")
+        elif style == 1:
+            src.append("    pub fn geta(self) -> int {"
+                       " return super.geta() *% 2 +% self.c }")
+        # style 2 inherits geta untouched, so one call site can see two classes
+        # sharing a single method implementation.
+        src.append("}")
+        parent = self.classes[base]
+        self.add_class(name, "\n".join(src), f"{name}(ARG, ARG2)",
+                       fields=["a", "c"], float_field=True, base=base,
+                       opt_int=parent["opt_int"], ops=parent["ops"],
+                       maybe=parent["maybe"], me=parent["me"],
+                       mix=parent["mix"])
+        parent["subs"].append(name)
+        return name
+
+    def gen_peer(self):
+        """Same method names, no relation. The duck-typed half of the cache."""
+        r = self.rng
+        name = self.fresh("Peer")
+        tag = r.randint(1, 99)
+        mult = r.randint(2, 9)
+        self.add_class(
+            name,
+            f"class {name} {{\n"
+            f"    pub var a: int\n"
+            f"    fn init(self, a: int) {{ self.a = a }}\n"
+            f"    pub fn kind(self) -> int {{ return {tag} }}\n"
+            f"    pub fn geta(self) -> int {{ return self.a *% {mult} }}\n"
+            f"    pub fn twice(self) -> int {{"
+            f" return self.geta() +% self.geta() }}\n"
+            f"    pub fn bump(self, k: int) -> int {{\n"
+            f"        self.a = self.a -% k\n"
+            f"        return self.geta()\n"
+            f"    }}\n"
+            f"}}",
+            f"{name}(ARG)", fields=["a"])
+        return name
+
+    def gen_holder(self):
+        """A class whose field is an instance, so a call goes through a FIELD.
+
+        `geta` forwards to whatever is in the field -- a polymorphic call
+        inside a method. The field is declared as a class where one exists
+        rather than always `any`: an `any` field has no declared kind for the
+        tier to read a receiver off, so it refuses the whole enclosing body,
+        and a base class is polymorphic enough (every subclass fits it).
+        """
+        r = self.rng
+        name = self.fresh("Hold")
+        tag = r.randint(1, 99)
+        holdable = [n for n in self.plain_classes()
+                    if self.classes[n]["base"] is None]
+        held = r.choice(holdable) if holdable and r.random() < 0.7 else None
+        decl = held if held else "any"
+        self.add_class(
+            name,
+            f"class {name} {{\n"
+            f"    pub var inner: {decl}\n"
+            f"    pub var a: int\n"
+            f"    fn init(self, inner: {decl}) {{\n"
+            f"        self.inner = inner\n"
+            f"        self.a = {r.randint(0, 99)}\n"
+            f"    }}\n"
+            f"    pub fn kind(self) -> int {{ return {tag} }}\n"
+            f"    pub fn geta(self) -> int {{"
+            f" return self.a +% self.inner.geta() }}\n"
+            f"    pub fn twice(self) -> int {{"
+            f" return self.geta() +% self.geta() }}\n"
+            f"    pub fn bump(self, k: int) -> int {{\n"
+            f"        self.a = self.a +% k\n"
+            f"        return self.a +% self.inner.kind()\n"
+            f"    }}\n"
+            f"}}",
+            f"{name}(INST)", fields=["a"], inst_field="inner",
+            inst_type=held)
+        return name
+
+    def gen_node(self):
+        """A nullable instance FIELD, walked to a literal bound."""
+        r = self.rng
+        name = self.fresh("Node")
+        tag = r.randint(1, 99)
+        cap = r.randint(2, 8)
+        self.add_class(
+            name,
+            f"class {name} {{\n"
+            f"    pub var a: int\n"
+            f"    pub var next: {name}?\n"
+            f"    fn init(self, a: int) {{\n"
+            f"        self.a = a\n"
+            f"        self.next = null\n"
+            f"    }}\n"
+            f"    pub fn kind(self) -> int {{ return {tag} }}\n"
+            f"    pub fn geta(self) -> int {{ return self.a }}\n"
+            f"    pub fn twice(self) -> int {{"
+            f" return self.geta() +% self.geta() }}\n"
+            f"    pub fn bump(self, k: int) -> int {{\n"
+            f"        self.a = self.a +% k\n"
+            f"        return self.geta()\n"
+            f"    }}\n"
+            f"    pub fn walk(self) -> int {{\n"
+            f"        var t = 0\n"
+            f"        var cur: {name}? = self\n"
+            f"        var g = 0\n"
+            f"        while g < {cap} {{\n"
+            f"            g = g + 1\n"
+            f"            if cur == null {{ break }}\n"
+            f"            t = t *% 31 +% (cur?.a ?? 0)\n"
+            f"            cur = cur?.next\n"
+            f"        }}\n"
+            f"        return t\n"
+            f"    }}\n"
+            f"}}",
+            f"{name}(ARG)", fields=["a"], walk=True,
+            int_methods=CLASS_METHODS + ["walk"])
+        return name
 
     def gen_helpers(self):
         r = self.rng
@@ -576,6 +876,19 @@ class Gen:
                 f"}}")
             self.helpers[name] = (1, "list")
 
+        # An instance crossing a call boundary. The callee's parameter is
+        # specialised on whatever class arrived first, and every later call
+        # site hands it a different one.
+        if self.classes and r.random() < 0.6:
+            name = self.fresh("oh")
+            guard = r.choice(["k % 2 == 0", "k < 0", "k > 40"])
+            self.prog.helpers.append(
+                f"fn {name}(o: any, k: int) -> int {{\n"
+                f"    if {guard} {{ return o.kind() }}\n"
+                f"    return o.geta() +% (o.kind() *% (k % 8))\n"
+                f"}}")
+            self.helpers[name] = (2, "inst")
+
         # JIT_MAX_ARITY is 4; a 4-argument function is the widest the
         # whole-function tier will take.
         if r.random() < 0.4:
@@ -618,6 +931,20 @@ class Gen:
             (self.st_try, 4),
             (self.st_labelled, 4),
             (self.st_optional, 4),
+            # The class family. A run-time value decides the receiver's class
+            # in every one of these, which is the shape that keeps breaking.
+            (self.st_poly, 9),
+            (self.st_base_typed, 8),
+            (self.st_inst_null, 8),
+            (self.st_inst_swap, 10),
+            (self.st_inst_list, 6),
+            (self.st_inst_field, 4),
+            (self.st_inst_mix, 4),
+            (self.st_static_call, 4),
+            # An overloaded `+` is an OP_ADD the tier declines outright, so
+            # this one is weighted like `**` and a dict: worth generating,
+            # not worth putting in every probe.
+            (self.st_operator, 2),
         ]
         if self.use_dict:
             kinds.append((self.st_dict_ops, 5))
@@ -630,7 +957,9 @@ class Gen:
             kinds = [(k, w) for k, w in kinds
                      if k in (self.st_int, self.st_float, self.st_str,
                               self.st_list_ops, self.st_dict_ops,
-                              self.st_class_use, self.st_cond_local)]
+                              self.st_class_use, self.st_cond_local,
+                              self.st_inst_null, self.st_static_call,
+                              self.st_inst_field)]
         picks = [k for k, w in kinds for _ in range(w)]
         return r.choice(picks)(depth)
 
@@ -773,16 +1102,12 @@ class Gen:
                         [line("acc = acc -% 1")],
                         "}")
         name = r.choice(cls)
-        ctor = self.classes[name]["ctor"].replace(
-            "ARG2", self.int_expr(0)).replace("ARG", self.int_expr(0))
         return Node(f"var {var}: any = null",
                     f"if {cond} {{",
-                    [line(f"{var} = {ctor}")],
+                    [line(f"{var} = {self.ctor_of(name)}")],
                     "}",
                     f"if {var} != null {{",
-                    [line(f"acc = acc +% {var}.geta()"
-                          if "geta" in self.classes[name]["int_methods"]
-                          else f"acc = acc +% {var}.tag()")],
+                    [line(f"acc = acc +% {var}.geta()")],
                     "}")
 
     def st_early_return(self, depth):
@@ -802,7 +1127,15 @@ class Gen:
             return line("acc = acc +% lfold(xs)")
         pick = r.randrange(6)
         if pick == 0:
-            return line(f"xs.push({self.int_expr(1)})")
+            # Capped exactly as `text` is, and for the same reason. Uncapped,
+            # a push nested two loops deep grew xs by 25,200 elements per call
+            # -- `insert(0, ..)` is linear and every probe ends in lfold(xs)
+            # -- and seed 300 took 66s under the interpreter and 120s+ under
+            # the runner's parallel load. The runner reads that timeout as a
+            # divergence, which is the one false positive this fuzzer must
+            # never produce.
+            return Node("if xs.len() < 64 {",
+                        [line(f"xs.push({self.int_expr(1)})")], "}")
         if pick == 1:
             # Guarded: xs must never empty, or `k % xs.len()` divides by zero.
             return Node("if xs.len() > 1 {", [line("xs.pop()")], "}")
@@ -810,7 +1143,8 @@ class Gen:
             return line(f"xs[{r.randint(0, 30)} % xs.len()] = "
                         f"{self.int_expr(1)}")
         if pick == 3:
-            return line(f"xs.insert(0, {self.int_expr(1)})")
+            return Node("if xs.len() < 64 {",
+                        [line(f"xs.insert(0, {self.int_expr(1)})")], "}")
         if pick == 4:
             return line("acc = acc +% xs[-1] +% xs[0]")
         return line("acc = acc +% lfold(xs)")
@@ -838,9 +1172,7 @@ class Gen:
         name = r.choice(names)
         api = self.classes[name]
         var = self.fresh("o")
-        ctor = api["ctor"].replace("ARG2", self.int_expr(0)).replace(
-            "ARG", self.int_expr(0))
-        parts = [f"let {var} = {ctor}"]
+        parts = [f"let {var} = {self.ctor_of(name)}"]
         # The empty-init shape: the constructor must evaluate to the object.
         parts.append(f"if {var} == null {{")
         parts.append([line("acc = acc -% 424242")])
@@ -855,8 +1187,241 @@ class Gen:
             parts.append(f"acc = acc ^ {var}.{fld}")
         if api["float_field"] and r.random() < 0.4:
             parts.append(f"f = f + {var}.b")
+        if api["me"] and r.random() < 0.4:
+            # A call on a call's RESULT, which is what a returned instance is
+            # for. Confined to this statement on purpose -- see method_call.
+            parts.append(f"acc = acc +% {var}.me().geta()")
+        if api["opt_int"] and r.random() < 0.5:
+            # A FIELD that is null on one path and an int on the other.
+            fld = api["opt_int"]
+            parts.append(f"if {self.bool_expr()} {{")
+            parts.append([line(f"{var}.{fld} = {self.int_expr(0)}")])
+            parts.append("}")
+            parts.append(f"acc = acc +% ({var}.{fld} ?? "
+                         f"{r.choice(SMALL_INTS)})")
         # Stays visible to later siblings; block() drops it at the brace.
         self.insts.append((var, name))
+        return Node(*parts)
+
+    def st_poly(self, depth):
+        """One variable, a different class down each branch.
+
+        The receiver's class is settled by the run-time value and by nothing
+        else, so a call site that reconstructed it from a compile-time kind is
+        wrong here. This is the inline cache's own path.
+        """
+        r = self.rng
+        names = self.constructible()
+        if len(names) < 2:
+            return self.st_class_use(depth)
+        r.shuffle(names)
+        var = self.fresh("v")
+        parts = [f"var {var}: any = {self.ctor_of(names[0])}",
+                 f"if {self.bool_expr()} {{",
+                 [line(f"{var} = {self.ctor_of(names[1])}")]]
+        if len(names) > 2 and r.random() < 0.45:
+            parts += [f"}} elif {self.bool_expr()} {{",
+                      [line(f"{var} = {self.ctor_of(names[2])}")]]
+        parts.append("}")
+        meth = r.choice(CLASS_METHODS)
+        parts.append("acc = acc +% " +
+                     (f"{var}.bump({self.int_expr(0)})" if meth == "bump"
+                      else f"{var}.{meth}()"))
+        if r.random() < 0.5:
+            parts.append(f"acc = acc ^ {var}.kind()")
+        self.insts.append((var, None))
+        return Node(*parts)
+
+    def st_base_typed(self, depth):
+        """An override reached through a variable typed as the BASE."""
+        r = self.rng
+        bases = [n for n, a in sorted(self.classes.items()) if a["subs"]]
+        if not bases:
+            return self.st_poly(depth)
+        base = r.choice(bases)
+        subs = self.classes[base]["subs"]
+        var = self.fresh("bv")
+        parts = [f"var {var}: {base} = {self.ctor_of(base)}",
+                 f"if {self.bool_expr()} {{",
+                 [line(f"{var} = {self.ctor_of(subs[0])}")]]
+        if len(subs) > 1:
+            parts += [f"}} elif {self.bool_expr()} {{",
+                      [line(f"{var} = {self.ctor_of(subs[1])}")]]
+        parts.append("}")
+        parts.append(f"acc = acc +% {var}.geta() +% {var}.kind()")
+        if r.random() < 0.5:
+            parts.append(f"acc = acc -% {var}.twice()")
+        self.insts.append((var, base))
+        return Node(*parts)
+
+    def st_inst_null(self, depth):
+        """A nullable instance that only a run-time branch fills in.
+
+        Exactly the kind whose tag the tier reconstructs, and the third style
+        goes further: the slot holds an int on one path and an object on the
+        other, and an f-string reads whichever arrived.
+        """
+        r = self.rng
+        names = self.constructible()
+        if not names:
+            return self.st_int(depth)
+        cls = r.choice(names)
+        var = self.fresh("p")
+        style = r.randrange(3)
+        if style == 0:
+            return Node(f"var {var}: {cls}? = null",
+                        f"if {self.bool_expr()} {{",
+                        [line(f"{var} = {self.ctor_of(cls)}")],
+                        "}",
+                        f"if {var} != null {{",
+                        [line(f"acc = acc +% {var}.geta()")],
+                        "}",
+                        f"acc = acc +% ({var}?.kind() ?? "
+                        f"{r.choice(SMALL_INTS)})")
+        if style == 1:
+            return Node(f"var {var}: {cls}? = {self.ctor_of(cls)}",
+                        f"if {self.bool_expr()} {{",
+                        [line(f"{var} = null")],
+                        "}",
+                        f"acc = acc +% ({var}?.twice() ?? "
+                        f"{r.choice(SMALL_INTS)})",
+                        f"if {var} == null {{",
+                        [line("acc = acc -% 3")],
+                        "}")
+        return Node(f"var {var}: any = {self.int_expr(0)}",
+                    f"if {self.bool_expr()} {{",
+                    [line(f"{var} = {self.ctor_of(cls)}")],
+                    "}",
+                    "if text.len() < 200 {",
+                    [line(f'text = text + f"{{{var}}}"')],
+                    "}")
+
+    def st_inst_field(self, depth):
+        """A method call that goes through a FIELD rather than a local."""
+        r = self.rng
+        holders = [n for n, a in sorted(self.classes.items())
+                   if a["inst_field"]]
+        if not holders:
+            return self.st_class_use(depth)
+        cls = r.choice(holders)
+        fld = self.classes[cls]["inst_field"]
+        var = self.fresh("hd")
+        parts = [f"let {var} = {self.ctor_of(cls)}",
+                 f"acc = acc +% {var}.{fld}.geta()",
+                 f"acc = acc ^ {var}.{fld}.kind()"]
+        held = self.holdable_by(cls)
+        if held and r.random() < 0.6:
+            # The field's class changes under the same read site.
+            parts.append(f"{var}.{fld} = {self.ctor_of(r.choice(held))}")
+            parts.append(f"acc = acc +% {var}.{fld}.twice()")
+        parts.append(f"acc = acc +% {var}.geta()")
+        self.insts.append((var, cls))
+        return Node(*parts)
+
+    def st_inst_list(self, depth):
+        """A list of mixed classes walked by one loop.
+
+        One call site, a new receiver class every trip, inside the OSR tier.
+        """
+        r = self.rng
+        names = self.constructible()
+        if not names:
+            return self.st_int(depth)
+        var = self.fresh("ol")
+        elems = ", ".join(self.ctor_of(r.choice(names))
+                          for _ in range(r.randint(2, 3)))
+        e = self.fresh("q")
+        self.insts.append((e, None))
+        self.loop_depth += 1
+        body = self.block(r.randint(0, 2), depth + 1)
+        self.loop_depth -= 1
+        self.insts = [p for p in self.insts if p[0] != e]
+        return Node(f"var {var} = [{elems}]",
+                    f"for {e} in {var} {{",
+                    [f"acc = acc +% {e}.kind() +% {e}.geta()"] + body,
+                    "}")
+
+    def st_inst_swap(self, depth):
+        """A receiver whose class changes on every trip of a loop.
+
+        The variable survives the back-edge, so whatever the first trip made
+        the site speculate on is wrong by the second.
+        """
+        r = self.rng
+        names = self.constructible()
+        if len(names) < 2:
+            return self.st_poly(depth)
+        r.shuffle(names)
+        a, b = names[0], names[1]
+        var = self.fresh("sw")
+        idx = self.fresh("t")
+        # Nested inside a 200-trip range this is 200 x trips
+        # constructions per call, so the top of the range is kept
+        # modest -- a program nobody can wait for is a program the
+        # runner times out and misreads as a divergence.
+        trips = r.choice([4, 8, 16])
+        self.ints.append(idx)
+        self.loop_depth += 1
+        body = self.block(r.randint(0, 1), depth + 1)
+        self.loop_depth -= 1
+        self.ints.remove(idx)
+        # Both lines are strings: the swap and the call it feeds are the whole
+        # point of this statement and a reduction may not separate them.
+        return Node(f"var {var}: any = {self.ctor_of(a)}",
+                    f"for {idx} in 0..{trips} {{",
+                    [f"if {idx} % 2 == 0 {{ {var} = {self.ctor_of(b)} }}"
+                     f" else {{ {var} = {self.ctor_of(a)} }}",
+                     f"acc = acc +% {var}.kind()"] + body,
+                    "}",
+                    f"acc = acc +% {var}.geta()")
+
+    def st_inst_mix(self, depth):
+        """A method whose RETURN kind only the argument decides."""
+        r = self.rng
+        mixers = [n for n, a in sorted(self.classes.items()) if a["mix"]]
+        if not mixers:
+            return self.st_class_use(depth)
+        cls = r.choice(mixers)
+        var = self.fresh("mx")
+        parts = [f"let {var} = {self.ctor_of(cls)}",
+                 "if text.len() < 200 {",
+                 [line(f'text = text + f"{{{var}.mix({self.int_expr(0)})}}"')],
+                 "}"]
+        if self.classes[cls]["maybe"]:
+            parts.append(f"acc = acc +% ({var}.maybe({self.int_expr(0)}) ?? "
+                         f"{r.choice(SMALL_INTS)})")
+        self.insts.append((var, cls))
+        return Node(*parts)
+
+    def st_static_call(self, depth):
+        """A static factory: a call on the CLASS, not on an instance."""
+        r = self.rng
+        cands = [n for n, a in sorted(self.classes.items()) if a["static"]]
+        if not cands:
+            return self.st_class_use(depth)
+        cls = r.choice(cands)
+        name = self.classes[cls]["static"]
+        return line(f"acc = acc +% {cls}.{name}({self.int_expr(0)}).geta()")
+
+    def st_operator(self, depth):
+        """`+`, `==` and an f-string routed through a class's own methods."""
+        r = self.rng
+        cands = [n for n, a in sorted(self.classes.items()) if a["ops"]]
+        if not cands:
+            return self.st_class_use(depth)
+        cls = r.choice(cands)
+        x, y = self.fresh("x"), self.fresh("y")
+        parts = [f"let {x} = {self.ctor_of(cls)}",
+                 f"let {y} = {self.ctor_of(cls)}",
+                 f"acc = acc +% ({x} + {y})",
+                 f"if {x} == {y} {{",
+                 [line(f"acc = acc -% {r.randint(1, 999)}")],
+                 "}"]
+        if r.random() < 0.5:
+            parts += ["if text.len() < 200 {",
+                      [line(f'text = text + f"{{{x}}}"')],
+                      "}"]
+        self.insts.append((x, cls))
         return Node(*parts)
 
     def st_match(self, depth):
