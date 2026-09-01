@@ -52,6 +52,7 @@ from .linalg.qr import _accumulate_reflectors, _column_reflector, _householder_q
 from .linalg.qr import _reflect_across, _reflect_from, _row_reflector, _upper_triangle
 from .linalg.reduction import RED_COUNT, RED_MAX_ABS, RED_MIN_ABS, RED_SUM_ABS, RED_SUM_POW, RED_SUM_SQ
 from .linalg.reduction import _kept_shape, _move_axes_last, _reduce_axes
+from .linalg.rotate import _givens, _order_ascending, _rotate_columns, _rotate_rows, _swap_columns
 
 export { BLOCKED_FROM, BLOCKED_PANEL, FLOAT32_EPS, blocked_panel }
 
@@ -147,56 +148,6 @@ pub fn norm(a: NDArray, ord: any = null, axis: any = null, keepdims: bool = fals
         return _extreme_matrix_norm(a, p, r, c, kept)
     }
     throw ValueError(f"norm does not know the matrix order {ord}")
-}
-
-#: `(c, s, r)` with `c a + s b = r` and `c b - s a = 0`.
-fn _givens(a: float, b: float) -> (float, float, float) {
-    if b == 0.0 { return (1.0, 0.0, a) }
-    if a == 0.0 { return (0.0, 1.0, b) }
-    let r = math.hypot(a, b)
-    return (a / r, b / r, r)
-}
-
-#: Mix columns `p` and `q`: this is `A <- A G`, and `rows` of zero is the
-#: no-op the value-only paths pass to skip accumulating a basis they will not
-#: return.
-fn _rotate_columns(
-    a: list[float],
-    rows: int,
-    cols: int,
-    p: int,
-    q: int,
-    c: float,
-    s: float
-) -> void {
-    for row in 0..rows {
-        let base = row * cols
-        let x = a[base + p]
-        let y = a[base + q]
-        a[base + p] = c * x + s * y
-        a[base + q] = c * y - s * x
-    }
-}
-
-#: Mix rows `p` and `q` the same way, which is `A <- G^T A`.
-fn _rotate_rows(a: list[float], cols: int, p: int, q: int, c: float, s: float) -> void {
-    let top = p * cols
-    let bottom = q * cols
-    for column in 0..cols {
-        let x = a[top + column]
-        let y = a[bottom + column]
-        a[top + column] = c * x + s * y
-        a[bottom + column] = c * y - s * x
-    }
-}
-
-fn _swap_columns(a: list[float], rows: int, cols: int, p: int, q: int) -> void {
-    for row in 0..rows {
-        let base = row * cols
-        let held = a[base + p]
-        a[base + p] = a[base + q]
-        a[base + q] = held
-    }
 }
 
 #: Householder bidiagonalization: `d` and `e` are the diagonal and the
@@ -462,21 +413,6 @@ fn _svd_host(
     _svd_finish(d, u, v, urows, ucols, vrows, n)
     if not vectors { return ([], d, []) }
     return (u, d, _transpose_host(v, n, n))
-}
-
-#: Put eigenvalues in ascending order, carrying their vectors with them.
-fn _order_ascending(values: list[float], basis: list[float], n: int, rows: int) -> void {
-    for index in 0..n {
-        var best = index
-        for other in index + 1..n {
-            if values[other] < values[best] { best = other }
-        }
-        if best == index { continue }
-        let held = values[index]
-        values[index] = values[best]
-        values[best] = held
-        _swap_columns(basis, rows, n, index, best)
-    }
 }
 
 #: The weight sitting off the diagonal, against the weight on it.
