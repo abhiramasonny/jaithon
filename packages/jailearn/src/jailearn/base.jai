@@ -39,6 +39,7 @@ from .base.reduce import copy_into, log_sum_exp_rows, masked_column_mean, row_ar
 from .base.reduce import row_argmin, row_extreme, row_topk, sort_columns
 from .base.distance import GRAM_LINEAR, GRAM_POLY, GRAM_RBF, GRAM_SIGMOID, gram
 from .base.distance import pairwise_sqdist
+from .base.classes import bincount, class_sums, class_sumsq, scatter_add_rows
 
 export { cached_kernel }
 export { Params, check_fitted, check_matrix, check_pair, check_width, param_bool }
@@ -49,6 +50,7 @@ export { argsort_columns, column_min_max, column_moments, column_quantiles }
 export { log_sum_exp_rows, masked_column_mean, row_argmax, row_argmin, row_extreme }
 export { row_topk, sort_columns }
 export { GRAM_LINEAR, GRAM_POLY, GRAM_RBF, GRAM_SIGMOID, gram, pairwise_sqdist }
+export { bincount, class_sums, class_sumsq, scatter_add_rows }
 
 #: How `model_selection` measures a fitted estimator: higher is better, always.
 #: It takes one of these rather than importing `metrics`, so a search can run
@@ -184,53 +186,6 @@ pub fn default_score(estimator: Estimator, x: Tensor, y: Tensor) -> float {
     column.free()
     if spread <= 0.0 { return 0.0 }
     return 1.0 - unexplained / spread
-}
-
-fn class_moment(values: Tensor, labels: Tensor, width: int, classes: int, power: int) -> Tensor {
-    if classes <= 0 { throw ValueError(f"classes must be positive, got {classes}") }
-    let out = Tensor(if power == 0 { [classes] } else { [classes, width] })
-    base_kernel("base_class_moment").dispatch_async(
-        [values.buffer(), labels.buffer(), out.buffer()],
-        classes * width * 256,
-        [labels.size, width, classes, power],
-        group_size: 256
-    )
-    return out
-}
-
-#: How many samples carry each code `0..classes-1`, as `[classes]`.
-pub fn bincount(labels: Tensor, classes: int) -> Tensor {
-    return class_moment(labels, labels, 1, classes, 0)
-}
-
-#: The column totals of each class, `[classes, n_features]`.
-pub fn class_sums(x: Tensor, labels: Tensor, classes: int) -> Tensor {
-    check_pair(x, labels)
-    return class_moment(x, labels, x.shape[1], classes, 1)
-}
-
-#: The column totals of each class's squares, `[classes, n_features]`.
-pub fn class_sumsq(x: Tensor, labels: Tensor, classes: int) -> Tensor {
-    check_pair(x, labels)
-    return class_moment(x, labels, x.shape[1], classes, 2)
-}
-
-#: Each row of `source` added into the row of the result its index names. The
-#: order the additions land in is not fixed, so the last bits of a total vary
-#: between runs on the same data.
-pub fn scatter_add_rows(source: Tensor, indices: Tensor, rows: int) -> Tensor {
-    check_matrix(source, "source")
-    if indices.size != source.shape[0] {
-        throw ValueError(f"{indices.size} indices for {source.shape[0]} rows")
-    }
-    if rows <= 0 { throw ValueError(f"destination rows must be positive, got {rows}") }
-    let out = Tensor.zeros([rows, source.shape[1]])
-    base_kernel("base_scatter_add_rows").dispatch_async(
-        [source.buffer(), indices.buffer(), out.buffer()],
-        source.size,
-        [source.size, source.shape[1], rows]
-    )
-    return out
 }
 
 #: `x[i][j] * scale[j] + offset[j]`, which is every scaler's apply step.
