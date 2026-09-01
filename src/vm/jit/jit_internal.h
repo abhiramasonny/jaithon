@@ -890,6 +890,25 @@ void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
 uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
                           unsigned count);
 
+/* Defined in jit_func.c. */
+extern bool gInlineFailed;
+
+/* Defined in jit_compile.c. */
+bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
+                               uint32_t shape, ObjClass *klass, Value seen);
+bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
+                           uint32_t shape, ObjClass *klass);
+
+/* Defined in jit_func.c. */
+unsigned localFrameOff(const Emit *e, unsigned slot);
+bool localTagInFrame(const Emit *e, unsigned slot);
+unsigned localTagFor(const Emit *e, unsigned slot);
+unsigned closureReg(const Emit *e);
+bool jitChainOn(void);
+void reportChain(const Emit *proto, Emit *first, ObjClosure *closure,
+                        ObjFunction *fn);
+bool jitCollectClashes(void);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
