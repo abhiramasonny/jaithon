@@ -24,7 +24,7 @@
 #  define JAI_HAVE_GETENTROPY 1
 #endif
 
-#include "runtime/builtins/builtins_math.h"
+#include "runtime/builtins/numeric/builtins_math.h"
 #include "vm/gc.h"
 
 /* ------------------------------------------------------------------ */

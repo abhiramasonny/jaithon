@@ -5,7 +5,7 @@
 #include <math.h>
 #include <stdlib.h>
 
-#include "runtime/builtins/builtins_core.h"
+#include "runtime/builtins/lang/builtins_core.h"
 
 #include "vm/gc.h"
 

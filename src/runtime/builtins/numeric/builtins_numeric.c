@@ -3,7 +3,7 @@
 
 #include <math.h>
 
-#include "runtime/builtins/builtins_math.h"
+#include "runtime/builtins/numeric/builtins_math.h"
 
 /* |v| as an unsigned magnitude. Negating through uint64_t is the only way to
  * express |INT64_MIN|, which has no int64_t representation. */

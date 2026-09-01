@@ -6,7 +6,7 @@
 
 #include <math.h>
 
-#include "runtime/builtins/builtins_math.h"
+#include "runtime/builtins/numeric/builtins_math.h"
 
 /* ------------------------------------------------------------------ */
 /* Shared helpers                                                       */

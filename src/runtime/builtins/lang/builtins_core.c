@@ -3,7 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 
-#include "runtime/builtins/builtins_core.h"
+#include "runtime/builtins/lang/builtins_core.h"
 #include "runtime/builtins/collections/builtins_seq.h"
 #include "runtime/methods.h"
 #include "runtime/runtime.h"

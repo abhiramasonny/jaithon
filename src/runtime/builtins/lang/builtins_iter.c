@@ -1,7 +1,7 @@
 /* builtins_iter.c — the builtins that walk an iterable: min, max, sum,
  * sorted, reversed, enumerate, zip, map, filter, any and all. */
 
-#include "runtime/builtins/builtins_core.h"
+#include "runtime/builtins/lang/builtins_core.h"
 
 #include "vm/gc.h"
 
