@@ -31,6 +31,8 @@ gate/fixpoint_check.sh       compile each source twice, diff the images byte for
                          byte (make fixpoint-check)
 dev/gen_seed.py             generate boot/seed.c from the compiler's .jaic images
                          (make reseed)
+import_names_check.py   resolve every import in lib/ and packages/ and fail on
+                         a name the target does not export (make import-check)
 install.sh              build jaithon and install it to a prefix (see
                          README.md; run directly, no make target)
 gate/jit_compile_check.py    confirm test_jit_* tests actually reach compiled/OSR
