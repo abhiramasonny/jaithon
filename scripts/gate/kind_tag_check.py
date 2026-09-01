@@ -98,9 +98,15 @@ KIND = re.compile(r"\bSLOT_[A-Z_]+\b")
 FNDEF = re.compile(r"^[A-Za-z_].*[A-Za-z0-9_]\s*\(")
 NAME = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
-#: The kind whose tag the PAYLOAD decides. A ladder may route it elsewhere or
-#: refuse it; it may never map it to a constant.
-NULLABLE_KIND = "SLOT_MAYBE_INST"
+#: The kinds whose tag the PAYLOAD decides. A ladder may route one elsewhere or
+#: refuse it; it may never map one to a constant.
+#:
+#: This was a single name until SLOT_MAYBE_OBJ arrived, and a single name is
+#: how the gate silently stops guarding: a second nullable kind that nothing
+#: here mentions is exactly the hazard the file exists for, wearing a name the
+#: check does not know. Any future kind that can hold a pointer OR a zero in
+#: one register belongs on this list on the same commit that introduces it.
+NULLABLE_KINDS = ("SLOT_MAYBE_INST", "SLOT_MAYBE_OBJ")
 
 JUSTIFICATIONS = ("guard", "refuses", "payload", "sampled")
 
@@ -327,14 +333,15 @@ def main(argv):
     # constant tag is the miscompile, whatever else the site does.
     for site in sites:
         text = site["text"]
-        if re.search(NULLABLE_KIND + r"\s*[?:]", text) or \
-           re.search(r"case\s+" + NULLABLE_KIND + r"\s*:", text):
-            problems.append(
-                f"{site['where']}: {site['function']} maps {NULLABLE_KIND} to a "
-                f"constant tag. That kind is a pointer OR a zero in one "
-                f"register and only the payload says which -- route it to "
-                f"emitTagFor's csel, or refuse it. No manifest line excuses "
-                f"this one.")
+        for kind in NULLABLE_KINDS:
+            if re.search(kind + r"\s*[?:]", text) or \
+               re.search(r"case\s+" + kind + r"\s*:", text):
+                problems.append(
+                    f"{site['where']}: {site['function']} maps {kind} to a "
+                    f"constant tag. That kind is a pointer OR a zero in one "
+                    f"register and only the payload says which -- route it to "
+                    f"emitTagFor's csel, or refuse it. No manifest line "
+                    f"excuses this one.")
 
     found = {key(s): s for s in sites}
     for site in sites:

@@ -492,12 +492,43 @@ bool rawObjValue(Value v) {
  * "an object with no sample and no known type" even though the record said
  * plainly that it was a list. That refusal was 18.4% of the interpreted work
  * on the self-hosted compiler, the largest by a factor of seven. */
+/* Same bargain the enum-`match` arms struck: believing the band lets a walk
+ * past a refusal it used to stop at, and what it reaches there can decline the
+ * WHOLE body where a prefix used to compile. Measured: 339 bodies compiled
+ * before, 321 after -- eighteen lost. The retry in compileFunc puts them back.
+ * See gMatchUsed. */
+bool gNullableFbUsed;
+bool gNoNullableFb;
+
 bool observedReturnKind(const ObjFunction *cfn, SlotKind *k,
                                uint32_t *shape, uint8_t *objType) {
     uint8_t fb = cfn->obsReturnKind;
     *shape = 0;
     if (objType != NULL) *objType = 0;
-    if (fb == 1u + (unsigned)VAL_NULL) { *k = SLOT_NULL; return true; }
+    if (fb == JAI_FB_NULL) { *k = SLOT_NULL; return true; }
+    /* "null and one object type", the band jaiFeedbackMerge records instead of
+     * collapsing to MIXED. An instance becomes the kind the tier has spoken all
+     * along; anything else it can hold at all becomes the weaker
+     * SLOT_MAYBE_OBJ. Both take their tag off the payload, so neither needs a
+     * representation this tier does not already emit. */
+    if (jaiFeedbackIsNullable(fb) && !gNoNullableFb && jitNullableFbOn()) {
+        gNullableFbUsed = true;
+        ObjType ot = (ObjType)(fb - JAI_FB_NULLABLE);
+        if (ot == OBJ_INSTANCE) {
+            if (cfn->obsReturnShape == 0) return false;
+            *k = SLOT_MAYBE_INST;
+            *shape = cfn->obsReturnShape;
+            return true;
+        }
+        /* Deliberately nothing for the other object types. SLOT_MAYBE_OBJ is
+         * legal as a RETURN kind but not on an operand stack, so handing one
+         * back here does not compile a caller -- it only moves the refusal
+         * from "observed returns disagree" to "a method returning
+         * object-or-null", 97 of them on lib/std. Widening the callers to
+         * accept it means auditing every site that reads a stack entry's
+         * kind, which is its own change. */
+        return false;
+    }
     if (fb == JAI_FB_OBJ + (unsigned)OBJ_INSTANCE) {
         if (cfn->obsReturnShape == 0) return false;
         *k = SLOT_INST;

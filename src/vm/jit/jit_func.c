@@ -34,6 +34,7 @@ const char *slotKindName(SlotKind k) {
     case SLOT_FLOAT:      return "float";
     case SLOT_INST:       return "instance";
     case SLOT_MAYBE_INST: return "instance-or-null";
+    case SLOT_MAYBE_OBJ:  return "object-or-null";
     case SLOT_SELF:       return "self";
     case SLOT_OPAQUE:     return "opaque";
     case SLOT_CLOSURE:    return "closure";
@@ -126,10 +127,10 @@ static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
 }
 
 
-/* Every kind but SLOT_MAYBE_INST has a tag fixed at compile time; that one reads it off the payload (null vs non-null). */
+/* Every kind but the two nullable ones has a tag fixed at compile time; those read it off the payload (null vs non-null). */
 void emitTagFor(Emit *e, SlotKind kind, unsigned payloadReg,
                        unsigned tagReg, unsigned spare) {
-    if (kind != SLOT_MAYBE_INST) {
+    if (kind != SLOT_MAYBE_INST && kind != SLOT_MAYBE_OBJ) {
         unsigned tag = kind == SLOT_INT    ? VAL_INT
                      : kind == SLOT_FLOAT  ? VAL_FLOAT
                      : kind == SLOT_BOOL   ? VAL_BOOL
@@ -969,6 +970,17 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
                        Value seen, int fromLocal) {
     if (e->depth >= JIT_MAX_STACK) {
         e->whyNot = "the operand stack is deeper than the model allows";
+        return false;
+    }
+    /* SLOT_MAYBE_OBJ lives only between a merge of two returns and the entry
+     * point that rebuilds a Value from it. Keeping it off the operand stack is
+     * what makes it a small change: every site that reads an entry's kind --
+     * the field reads, the invokes, the arm that treats SLOT_MAYBE_INST as an
+     * instance once it has compared against null -- is then unreachable for it
+     * by construction, rather than by ninety separate arguments. Enforced here
+     * so a future producer gets a refusal and not a miscompile. */
+    if (kind == SLOT_MAYBE_OBJ) {
+        e->whyNot = "an object-or-null on the operand stack";
         return false;
     }
     if (!e->measuring && inlineOwnBank(e) &&

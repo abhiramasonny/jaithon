@@ -2138,8 +2138,19 @@ static JaiRunResult runLoop(int baseFrameCount) {
                  * resolve, which is exactly the callee this record is for. */
                 jaiClassRememberShape(AS_INSTANCE(retval)->klass);
             }
-            if (fn->obsReturnKind == JAI_FB_NONE) fn->obsReturnShape = shape;
-            else if (fn->obsReturnShape != shape) fn->obsReturnShape = 0;
+            /* A null says nothing about the shape, and must not be allowed
+             * to answer for one: the old rule zeroed the shape the moment a
+             * nullable-instance function returned its null, so the very case
+             * the nullable band exists to record arrived with no class and was
+             * refused anyway. The first NON-null return sets it; later ones
+             * confirm it or zero it, and that zero stays sticky because
+             * `firstReal` can never come back true afterwards. */
+            if (!IS_NULL(retval)) {
+                uint8_t prevfb = fn->obsReturnKind;
+                bool firstReal = prevfb == JAI_FB_NONE || prevfb == JAI_FB_NULL;
+                if (firstReal) fn->obsReturnShape = shape;
+                else if (fn->obsReturnShape != shape) fn->obsReturnShape = 0;
+            }
             fn->obsReturnKind = jaiFeedbackMerge(fn->obsReturnKind,
                                                  jaiFeedbackKind(retval));
         }

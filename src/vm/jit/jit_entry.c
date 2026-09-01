@@ -119,7 +119,8 @@ static inline JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
         return JAI_JIT_DECLINED;
     }
 
-    if ((SlotKind)fn->jitReturnKind == SLOT_MAYBE_INST) {
+    if ((SlotKind)fn->jitReturnKind == SLOT_MAYBE_INST ||
+        (SlotKind)fn->jitReturnKind == SLOT_MAYBE_OBJ) {
         slotBase[0] = r.value == 0 ? NULL_VAL
                                    : OBJ_VAL((Obj *)(uintptr_t)r.value);
         vm.stackTop = slotBase + 1;
@@ -402,6 +403,7 @@ void jaiPrepareFn1(Value callee, JaiPreparedFn1 *prepared) {
     switch ((SlotKind)fn->jitReturnKind) {
     case SLOT_INT: case SLOT_FLOAT: case SLOT_INST: case SLOT_LIST:
     case SLOT_OBJ: case SLOT_BOOL: case SLOT_NULL: case SLOT_MAYBE_INST:
+    case SLOT_MAYBE_OBJ:
         break;
     default:
         return;

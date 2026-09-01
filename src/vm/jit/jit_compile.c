@@ -374,6 +374,14 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
             gNoMatchArm = false;
             if (ok) return true;
         }
+        /* And again for the nullable return-feedback band. */
+        if (gNullableFbUsed && !gNoNullableFb) {
+            gNoNullableFb = true;
+            bool ok = compileFuncOnce(closure, slotBase, dynamic, need,
+                                      nullable, needNull, false);
+            gNoNullableFb = false;
+            if (ok) return true;
+        }
         bool grew = false;
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             if (need[i] && !dynamic[i]) { dynamic[i] = true; grew = true; }
@@ -393,8 +401,9 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *nullable, bool *needNullable,
                             bool noInline) {
     ObjFunction *fn = closure->fn;
-    gInlineFailed = false;
-    gMatchUsed    = false;
+    gInlineFailed   = false;
+    gMatchUsed      = false;
+    gNullableFbUsed = false;
 
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] considering %s\n",

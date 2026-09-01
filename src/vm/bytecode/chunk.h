@@ -413,6 +413,13 @@ typedef enum { IC_EMPTY = 0, IC_MONO, IC_POLY, IC_MEGA } ICState;
  * one than a lucky guess. */
 #define JAI_FB_NONE   0u
 #define JAI_FB_OBJ    32u
+/* A third band: "null, and also exactly one object type", the disagreement the
+ * single byte used to throw away. Measured on `check lib/std`, 42 of the 50
+ * first disagreements are null meeting an instance and 4 are null meeting a
+ * string; only 4 are two unrelated kinds. Collapsing all of them to MIXED cost
+ * 433 refusals across 121 bodies, because a nullable instance is a kind the
+ * tier has spoken since SLOT_MAYBE_INST existed. */
+#define JAI_FB_NULLABLE 128u
 #define JAI_FB_MIXED  255u
 
 /* How many INVOKEs one site observes before it stops recording.
@@ -437,10 +444,41 @@ JAI_INLINE uint8_t jaiFeedbackKind(Value v) {
                      : (uint8_t)(1u + (unsigned)jaiValueType(v));
 }
 
+#define JAI_FB_NULL   (1u + (unsigned)VAL_NULL)
+
+JAI_INLINE bool jaiFeedbackIsObj(uint8_t fb) {
+    return fb >= JAI_FB_OBJ && fb < JAI_FB_OBJ + (unsigned)OBJ_TYPE_COUNT;
+}
+
+JAI_INLINE bool jaiFeedbackIsNullable(uint8_t fb) {
+    return fb >= JAI_FB_NULLABLE &&
+           fb < JAI_FB_NULLABLE + (unsigned)OBJ_TYPE_COUNT;
+}
+
 JAI_INLINE uint8_t jaiFeedbackMerge(uint8_t prev, uint8_t seen) {
     if (prev == JAI_FB_NONE) return seen;
-    return prev == seen ? prev : (uint8_t)JAI_FB_MIXED;
+    if (prev == seen) return prev;
+    if (prev == JAI_FB_NULL && jaiFeedbackIsObj(seen)) {
+        return (uint8_t)(JAI_FB_NULLABLE + (seen - JAI_FB_OBJ));
+    }
+    if (seen == JAI_FB_NULL && jaiFeedbackIsObj(prev)) {
+        return (uint8_t)(JAI_FB_NULLABLE + (prev - JAI_FB_OBJ));
+    }
+    if (jaiFeedbackIsNullable(prev) &&
+        (seen == JAI_FB_NULL ||
+         seen == (uint8_t)(JAI_FB_OBJ + (prev - JAI_FB_NULLABLE)))) {
+        return prev;
+    }
+    return (uint8_t)JAI_FB_MIXED;
 }
+
+/* Every decoder rejects an unknown byte rather than indexing on it, so a reader
+ * that has not been taught the nullable band treats it as MIXED -- which is
+ * what it meant before. That only holds while the band stays clear of both the
+ * object band and MIXED itself. */
+_Static_assert(JAI_FB_NULLABLE >= JAI_FB_OBJ + (unsigned)OBJ_TYPE_COUNT &&
+               JAI_FB_NULLABLE + (unsigned)OBJ_TYPE_COUNT <= JAI_FB_MIXED,
+               "the nullable feedback band must not overlap the object band or MIXED");
 
 typedef struct {
     uint8_t  state;

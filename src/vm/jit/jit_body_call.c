@@ -859,18 +859,38 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             } else {
                 haveKind = observedReturnKind(mfn, &rkind, &rshape, NULL);
             }
-            if (haveKind &&
-                (rkind == SLOT_INST || rkind == SLOT_MAYBE_INST) &&
-                (rshape == 0 || !jaiClassForShape(rshape, &rrcls) ||
-                 rrcls == NULL)) {
+            /* Three different refusals used to share one string, and the
+             * kind it printed was this variable's INITIALISER whenever the
+             * first of them fired -- reading as "a method returning null" for
+             * a method whose return kind was simply never recorded. Which one
+             * it is decides what would fix it, so they are kept apart. */
+            const char *mwhy = NULL;
+            if (!haveKind) {
+                /* Split because the two want opposite fixes: nothing recorded
+                 * at all means the method has not returned while the
+                 * interpreter watched (a mutually-recursive pair never can),
+                 * while a recorded-but-unusable one means the feedback saw
+                 * more than one kind and no widening covers them. */
+                mwhy = mfn->obsReturnKind == JAI_FB_NONE
+                     ? "a method that has not returned yet"
+                     : mfn->obsReturnKind == JAI_FB_MIXED
+                     ? "a method whose observed returns disagree"
+                     : jaiFeedbackIsNullable(mfn->obsReturnKind)
+                     ? "a method returning a nullable object, which only "
+                       "reaches the stack as an instance"
+                     : "a method returning an object kind the tier does not model";
+            } else if ((rkind == SLOT_INST || rkind == SLOT_MAYBE_INST) &&
+                       (rshape == 0 || !jaiClassForShape(rshape, &rrcls) ||
+                        rrcls == NULL)) {
                 haveKind = false;
                 rrcls = NULL;
-            }
-            if (haveKind && rkind != SLOT_INT && rkind != SLOT_FLOAT &&
-                rkind != SLOT_BOOL && rkind != SLOT_INST &&
-                rkind != SLOT_MAYBE_INST && rkind != SLOT_LIST &&
-                rkind != SLOT_OBJ && rkind != SLOT_NULL) {
+                mwhy = "a method whose return class is not on record";
+            } else if (rkind != SLOT_INT && rkind != SLOT_FLOAT &&
+                       rkind != SLOT_BOOL && rkind != SLOT_INST &&
+                       rkind != SLOT_MAYBE_INST && rkind != SLOT_LIST &&
+                       rkind != SLOT_OBJ && rkind != SLOT_NULL) {
                 haveKind = false;
+                mwhy = "a method returning %s";
             }
             /* A result the very next instruction pops needs no kind at all -- which is every `-> void`
              * method called as a statement, and the reason a parser's `self.skip()` used to decline the
@@ -878,8 +898,7 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             DiscardKind mdisc = discardedAfter(code, off + 7, count);
             bool mdiscarded = mdisc != DISCARD_NO;
             if (!haveKind && !mdiscarded) {
-                e->whyNot = "callee's return kind not usable";
-                return false;
+                return subWhy(e, mwhy, slotKindName(rkind));
             }
 
             /* Straight to the method's compiled entry since the receiver's class is fixed here (SLOT_INST

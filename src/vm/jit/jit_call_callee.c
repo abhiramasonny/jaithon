@@ -148,12 +148,13 @@ bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         e->whyNot = "callee's return class not on record";
         return false;
     }
-    if (!haveKind ||
-        (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
-         rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
-         rk != SLOT_OBJ && rk != SLOT_NULL)) {
-        e->whyNot = "callee's return kind not usable";
-        return false;
+    if (!haveKind) {
+        return subWhy(e, "a callee whose return kind is not on record");
+    }
+    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
+        rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
+        rk != SLOT_OBJ && rk != SLOT_NULL) {
+        return subWhy(e, "a callee returning %s", slotKindName(rk));
     }
 
     if (!emitDescriptor(e, cv, e->depth - argc, argc, (void *)&jitCallOut)) {

@@ -205,6 +205,30 @@ unsigned jitJoinMode(void) {
     return (unsigned)cached;
 }
 
+/* Whether a body may return SLOT_MAYBE_OBJ. Off restores the refusal
+ * "a body returning both object and instance-or-null". A/B in one binary. */
+/* Whether the tier believes the nullable feedback band. Off, a nullable record
+ * is read as MIXED, which is exactly what it was before the band existed --
+ * the merge still records it, only this read declines to use it. A/B in one
+ * binary, and no cost on the recording path. */
+bool jitNullableFbOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_NULLABLE_FB");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+bool jitMaybeObjOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_MAYBE_OBJ");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool jitMatchArm(void) {
     static int cached = -1;
     if (cached < 0) {

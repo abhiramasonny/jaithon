@@ -23,6 +23,29 @@ bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
     }
     bool nullable = (e->returnKind == SLOT_INST && k == SLOT_MAYBE_INST) ||
                     (e->returnKind == SLOT_MAYBE_INST && k == SLOT_INST);
+    /* `-> OpKind?` returns an enum member on one edge and null on the other:
+     * SLOT_OBJ meeting SLOT_MAYBE_INST, which nothing above merges. Neither
+     * side's promise survives -- the object is not an instance of the
+     * nullable side's shape, and the nullable side is not non-null -- so the
+     * join is the weaker SLOT_MAYBE_OBJ, whose tag emitTagFor already reads
+     * off the payload the same way. Shape is dropped with it. */
+    bool widerNullable =
+        jitMaybeObjOn() &&
+        ((e->returnKind == SLOT_OBJ &&
+          (k == SLOT_MAYBE_INST || k == SLOT_NULL || k == SLOT_MAYBE_OBJ)) ||
+         (k == SLOT_OBJ &&
+          (e->returnKind == SLOT_MAYBE_INST || e->returnKind == SLOT_NULL ||
+           e->returnKind == SLOT_MAYBE_OBJ)) ||
+         (e->returnKind == SLOT_MAYBE_OBJ &&
+          (k == SLOT_INST || k == SLOT_MAYBE_INST || k == SLOT_NULL)) ||
+         (k == SLOT_MAYBE_OBJ &&
+          (e->returnKind == SLOT_INST || e->returnKind == SLOT_MAYBE_INST ||
+           e->returnKind == SLOT_NULL)));
+    if (widerNullable) {
+        e->returnShape = 0;
+        e->returnKind = SLOT_MAYBE_OBJ;
+        return true;
+    }
     /* Named, because bare this was the whole of what a census said about
      * OP_RETURN: which two kinds a body cannot agree on is the entire question,
      * and an instance meeting a nullable instance is already merged above. */

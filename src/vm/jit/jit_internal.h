@@ -170,8 +170,24 @@ typedef enum {
     SLOT_NULL,    /* What `-> void` returns: a defined zero in a register (droppable, or written out by a deopt) whose
                    * tag is VAL_NULL rather than the VAL_OBJ every other kind chain in this file falls through to. */
     SLOT_OBJ,     /* Heap object of a type this tier doesn't model, held raw: may only be read, passed, stored and rooted. */
-    SLOT_LIST     /* ObjList *, raw -- safe for the same reason an instance is: nothing moves, and a call spills it as a root first. */
+    SLOT_LIST,    /* ObjList *, raw -- safe for the same reason an instance is: nothing moves, and a call spills it as a root first. */
+    /* Some heap object or null, class unknown: SLOT_OBJ's permissions (read,
+ * pass, store, root) minus the promise that it is non-null, and without
+ * SLOT_MAYBE_INST's promise that the non-null case is an instance of one
+ * shape. What `-> OpKind?` returns. Produced ONLY by mergeReturnKind and
+ * consumed only where a return kind is; pushValue refuses it, so none of the
+ * ninety-odd sites that treat SLOT_MAYBE_INST as instance-like can see it. */
+    SLOT_MAYBE_OBJ
 } SlotKind;
+
+/* stackSignatureAt packs a whole SlotKind into four bits per operand-stack
+ * entry, and that packing is what makes a join with two disagreeing kinds a
+ * refusal rather than a miscompile. It used to pack two bits, four kind pairs
+ * collided, and a body returning `1.5` on one edge and a string on the other
+ * compiled and segfaulted (tests/golden/jit_join_kind_collision.jai). A
+ * sixteenth kind is the last one that fits. */
+_Static_assert(SLOT_MAYBE_OBJ <= 15,
+               "a SlotKind must fit the four bits stackSignatureAt packs it into");
 
 
 /* Floats live in X registers, visiting d0/d1 only for the arithmetic itself -- simpler-but-correct beats
@@ -986,6 +1002,10 @@ void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
 bool jitModuleCalls(void);
 bool jitClassCalls(void);
 bool jitModuleNativeCalls(void);
+extern bool gNullableFbUsed;
+extern bool gNoNullableFb;
+bool jitNullableFbOn(void);
+bool jitMaybeObjOn(void);
 bool jitMatchArm(void);
 bool modelAgreesWithChunk(const Emit *e, uint32_t off);
 bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,

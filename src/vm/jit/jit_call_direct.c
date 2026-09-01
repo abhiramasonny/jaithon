@@ -206,8 +206,7 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&
         rk != SLOT_INST && rk != SLOT_MAYBE_INST && rk != SLOT_LIST &&
         rk != SLOT_OBJ && rk != SLOT_NULL) {
-        e->whyNot = "callee's return kind not usable";
-        return false;
+        return subWhy(e, "a direct callee returning %s", slotKindName(rk));
     }
     if ((rk == SLOT_INST || rk == SLOT_MAYBE_INST) &&
         (cfn->jitReturnShape == 0 ||
