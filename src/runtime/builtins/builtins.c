@@ -633,7 +633,7 @@ ObjList *jaiBuiltinMethodNames(Value receiver) {
 /* The k*MethodNames[] tables above and the k*Methods[] dispatch tables
  * scattered across src/runtime/builtins/ (four incompatible shapes: the
  * JaiSeqMethod/JAI_METHOD tables the collections sources share, the bare
- * JaiStrMethodEntry literals str and bytes use, builtins_math.c's file-local
+ * JaiStrMethodEntry literals str and bytes use, builtins_numeric.c's file-local
  * MethodEntry/METHOD_ENTRY for int and float, and the FILE_METHOD/
  * MODULE_METHOD strcmp chains for file and module) are two hand-maintained
  * lists of the same 12 receiver kinds' methods, kept in sync by nobody. They
