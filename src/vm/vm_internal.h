@@ -235,9 +235,6 @@ JAI_INLINE void recordInvokeResult(InlineCache *ic, unsigned way, Value result) 
                                            jaiFeedbackKind(result));
 }
 
-/* Arm the record for a call about to be made from `resumeIp` in the current
- * frame. Spends one of the site's observations whether or not the return is
- * ever seen, so a site whose callee always throws still stops paying. */
 JAI_INLINE void armInvokeResult(InlineCache *ic, unsigned way,
                                 const uint8_t *resumeIp) {
     ic->obsBudget--;
@@ -247,15 +244,6 @@ JAI_INLINE void armInvokeResult(InlineCache *ic, unsigned way,
     sResultSite.way      = (uint8_t)way;
 }
 
-/* Fixed arity, fully applied — every call in a hot loop. Nothing the slow path
- * does applies: the arity checks cannot fire, there is no variadic tail to
- * pack, no default to evaluate and no keyword-rest dict to make, so all that is
- * left is clearing the frame's window.
- *
- * Inline because this runs 49.8M times in one `check lib/std` and the work it
- * does is a branch and ~3.6 stores. As one function with the slow path it was
- * too big for clang to inline and showed up in the profile as its own symbol,
- * paying call overhead per call to do almost nothing. */
 static inline bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     int arity = (int)fn->arity;
@@ -264,8 +252,6 @@ static inline bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) 
                    (fn->flags & (FN_VARIADIC | FN_KWREST)) == 0)) {
         int window = (int)fn->maxSlots > 1 + arity ? (int)fn->maxSlots : 1 + arity;
         if (!ensureRoom(slotBase, window + JAI_FRAME_SLACK)) return false;
-        /* The collector scans the whole window as soon as stackTop is above
-         * it, so no slot may be left holding whatever the last frame did. */
         for (int i = 1 + argc; i < window; i++) slotBase[i] = NULL_VAL;
         vm.stackTop = slotBase + window;
         return true;
@@ -273,18 +259,6 @@ static inline bool bindCallArgs(ObjClosure *closure, int argc, Value *slotBase) 
     return bindCallArgsSlow(closure, argc, slotBase);
 }
 
-/* `a == b` when both are strings: the one object case jaiValuesEqual cannot be
- * reached without a call.
- *
- * Every `==` whose operands are not both ints goes out of line through
- * jaiValuesEqual, wrapped in SAVE_STATE/LOAD_STATE because in general it can
- * dispatch to a user `__eq__` and therefore re-enter the interpreter. Two
- * strings can do none of that: jaiValuesEqual's OBJ_STRING arm is exactly
- * jaiStringEquals, which is already inline, allocates nothing and cannot
- * throw. Comparing a scanned character against a literal is the single
- * hottest comparison shape there is -- `text[at] == " "` was 17% of
- * tests/bench/word_freq's scan by sample -- and it was paying a call and eight
- * memory operations to reach a pointer compare. */
 JAI_INLINE bool valuesEqualFast(Value a, Value b, bool *equal) {
     if (JAI_UNLIKELY(!IS_OBJ(a) || !IS_OBJ(b))) return false;
     Obj *ao = AS_OBJ(a), *bo = AS_OBJ(b);
@@ -294,21 +268,6 @@ JAI_INLINE bool valuesEqualFast(Value a, Value b, bool *equal) {
     return true;
 }
 
-/* The part of `c[i]` that can neither allocate, call, nor throw, so the
- * interpreter can answer it without saving and restoring its state.
- *
- * indexGet below is a real call behind SAVE_STATE/LOAD_STATE -- two stores and
- * six loads, one of them a three-deep chase to the constant pool -- and for a
- * string it reaches the general slice machinery (scalar count, sliceCount,
- * step and ASCII analysis) to produce one character. That is what a scanner
- * does per byte: tests/bench/word_freq runs this 956,166 times and gets no
- * help from the JIT, and every lexer written in this language has the same
- * shape.
- *
- * Anything this declines -- a non-int index, out of range, a non-ASCII string,
- * a character not yet in the shared one-byte table, any other container --
- * falls through to indexGet unchanged, so the error messages and the slow
- * paths stay in exactly one place. */
 JAI_INLINE bool indexGetFast(Value container, Value index, Value *out) {
     if (JAI_UNLIKELY(!IS_OBJ(container) || !IS_INT(index))) return false;
 
@@ -325,15 +284,11 @@ JAI_INLINE bool indexGetFast(Value container, Value index, Value *out) {
 
     if (o->type == OBJ_STRING) {
         ObjString *s = (ObjString *)o;
-        /* Indexing is by scalar. `scalars` is UINT32_MAX until something asks,
-         * so the first index of any string goes the slow way and fills it in;
-         * after that this is the ASCII test, one byte per scalar. */
         if (JAI_UNLIKELY(s->scalars != s->length)) return false;
         int at;
         if (JAI_UNLIKELY(!jaiNormalizeIndex(raw, (int)s->length, &at))) return false;
         const unsigned char c = (unsigned char)s->chars[at];
         if (JAI_UNLIKELY(c >= 128)) return false;
-        /* Every slot is filled by jaiVMInit, so there is no null to test. */
         *out = OBJ_VAL(jaiAsciiCharTable()[c]);
         return true;
     }
@@ -349,18 +304,6 @@ JAI_INLINE bool indexGetFast(Value container, Value index, Value *out) {
     return false;
 }
 
-/* One step of the three iterator kinds that can neither allocate, call, nor
- * throw: a range computes an int, and a list or a tuple reads a slot it has
- * already bounds-checked. Those three are what `for i in 0..n` and
- * `for x in xs` are in every interpreted loop in the language.
- *
- * Worth taking apart from jaiIterNext because of what the general path costs
- * around it rather than in it: SAVE_STATE, a cross-translation-unit call, and
- * LOAD_STATE's six reloads, one of them a three-deep chase through
- * frame->closure->fn->chunk to the constant pool. None of that buys anything
- * when the step cannot move the frame array or the value stack. A list whose
- * version moved, and every other kind, still goes the long way -- that is what
- * ITER_STEP_SLOW is for, and the fast path has written nothing by then. */
 typedef enum { ITER_STEP_DONE, ITER_STEP_VALUE, ITER_STEP_SLOW } IterStep;
 
 JAI_INLINE IterStep iterStepFast(ObjIter *it, Value *out) {
@@ -389,7 +332,6 @@ JAI_INLINE IterStep iterStepFast(ObjIter *it, Value *out) {
 
         case ITER_LIST: {
             ObjList *const list = AS_LIST(it->source);
-            /* A mutated list is an error jaiIterNext raises; leave it there. */
             if (JAI_UNLIKELY(list->version != it->version))
                 return ITER_STEP_SLOW;
             if (index >= it->limit) return ITER_STEP_DONE;
@@ -411,21 +353,6 @@ JAI_INLINE IterStep iterStepFast(ObjIter *it, Value *out) {
     }
 }
 
-/* The same step for a loop that binds a PAIR, `for (a, b) in …`. Two things
- * are different and both are the point of OP_FOR_ITER_PAIR.
- *
- * A dict-items iterator is served here rather than declared slow: it is the
- * one built-in kind whose item does not exist until jaiIterNext builds it, and
- * building it is pure cost when the very next instruction takes it apart
- * again. Walking the table writes key and value straight out. Nothing here
- * allocates, calls or throws, so no SAVE_STATE is owed -- jaiTableNext only
- * scans the order array.
- *
- * Every other kind produces its item the ordinary way and the item is split in
- * place, so a list of pairs or a user iterator costs exactly what it did.
- * PAIR_STEP_BAD is separate from PAIR_STEP_SLOW because the step has already
- * advanced by then: retrying it on the slow path would skip an entry before
- * raising. The caller raises from `*a` instead. */
 typedef enum {
     PAIR_STEP_DONE, PAIR_STEP_VALUE, PAIR_STEP_BAD, PAIR_STEP_SLOW
 } PairStep;
@@ -450,8 +377,6 @@ JAI_INLINE bool pairSplit(Value item, Value *a, Value *b) {
 
 JAI_INLINE PairStep iterStepPairFast(ObjIter *it, Value *a, Value *b) {
     if (it->kind == ITER_DICT_ITEMS) {
-        /* A dict that changed under the loop must raise, and jaiIterNext is
-         * where that message lives; hand it over untouched and unadvanced. */
         JaiTable *const table = &AS_DICT(it->source)->table;
         if (JAI_UNLIKELY(table->version != it->version)) return PAIR_STEP_SLOW;
 

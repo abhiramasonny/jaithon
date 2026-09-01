@@ -17,12 +17,6 @@ static bool accessPermitted(const ObjClass *owner, Visibility vis) {
     CallFrame *frame = topFrame();
     if (frame == NULL || owner == NULL) return false;
 
-    /* fn->owner (the declaring class, spec §7.1) is checked first and is
-     * exact; slot 0 -- the instance, or for a `static fn` the class itself --
-     * is only a fallback for a lambda with no owner. A tail-called static
-     * factory compiles to GET_FIELD+TAIL_CALL, leaving the function itself in
-     * slot 0, so relying on slot 0 alone locked every static factory out of
-     * its own fields. */
     ObjClass *selfClass = NULL;
     if (frame->closure != NULL && frame->closure->fn != NULL)
         selfClass = frame->closure->fn->owner;
