@@ -1121,6 +1121,7 @@ bool jitSoftField(void);
 bool jitMembership(void);
 bool jitTuple(void);
 bool jitNegate(void);
+bool jitWrapArith(void);
 bool jitListResult(void);
 int emitNativeResultCall(Emit *e, Value cv, const char *nm,
                                 unsigned argc, uint32_t afterIp);
@@ -1232,6 +1233,7 @@ bool emitMod(Emit *e, ObjFunction *fn, int prevOff, int *offp);
 bool emitFloorDiv(Emit *e, ObjFunction *fn, int prevOff, int *offp);
 JitArmResult emitNot(Emit *e, int *offp);
 JitArmResult emitBitNot(Emit *e, int *offp);
+JitArmResult emitWrapArith(Emit *e, uint8_t op, int *offp);
 JitArmResult emitUnaryPlus(Emit *e, int *offp);
 
 /* Defined in jit_body_fused.c. */

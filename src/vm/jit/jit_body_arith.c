@@ -540,4 +540,51 @@ unarmedOpcode:
     return JIT_ARM_UNARMED;
 }
 
+/* `add`/`sub`/`mul`, and nothing else. These are the checked arms with the
+ * overflow guard deleted rather than relaxed: the interpreter defines them as
+ * `(int64_t)((uint64_t)x OP (uint64_t)y)`, which is the low 64 bits every one
+ * of these instructions already writes. OP_MUL's `smulh` goes with the guard it
+ * fed -- it only ever supplied the high half to compare against -- so nothing
+ * is left that could observe the difference, and there is no strength-reduced
+ * or immediate form of the checked arms to mirror: `*` has none, and the
+ * peephole fuses only the checked operators (opt/fuse.jai), so no
+ * OP_*_WRAP_INT_CONST exists.
+ *
+ * Both operands must be SLOT_INT. `+% -% *%` wrap a 64-bit integer and nothing
+ * else: the interpreter raises TypeError for a float on either side and looks
+ * for __add__/__sub__/__mul__ on anything that is not a number, so every other
+ * shape belongs to it. Answered from the model BEFORE the pops, so the refusal
+ * hands emitUnarmedDeopt the state as of this instruction's start.
+ *
+ * No ovfDest, because there is no guard to resume at: the result may go
+ * straight to its home even inside a `try`. */
+JitArmResult emitWrapArith(Emit *e, uint8_t op, int *offp) {
+    int off = *offp;
+    do {
+        if (!jitWrapArith() || e->depth < 2 ||
+            e->stack[e->depth - 1] != SLOT_INT ||
+            e->stack[e->depth - 2] != SLOT_INT) {
+            goto unarmedOpcode;
+        }
+        {
+            unsigned rbw, raw;
+            SlotKind kbw, kaw;
+            if (!popValue(e, &rbw, &kbw)) { *offp = off; return JIT_ARM_REFUSED; }
+            if (!popValue(e, &raw, &kaw)) { *offp = off; return JIT_ARM_REFUSED; }
+            if (!pushValue(e, SLOT_INT, 0, NULL)) { *offp = off; return JIT_ARM_REFUSED; }
+            unsigned rdw = pushReg(e) - 1;
+            emit(e, op == OP_ADD_WRAP ? jaiA64AddX(rdw, raw, rbw)
+                 : op == OP_SUB_WRAP  ? jaiA64SubX(rdw, raw, rbw)
+                                      : jaiA64MulX(rdw, raw, rbw));
+        }
+        off += 1;
+        break;
+    } while (0);
+    *offp = off;
+    return JIT_ARM_OK;
+unarmedOpcode:
+    *offp = off;
+    return JIT_ARM_UNARMED;
+}
+
 #endif /* __aarch64__ || __arm64__ */

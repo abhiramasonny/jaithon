@@ -89,6 +89,12 @@ uint32_t jaiA64Ret(void) {
     return 0xd65f03c0u;
 }
 
+/* sub Xd, Xn, Xm -- SUBS with the S bit (29) clear, so the difference lands in
+ * rd and NZCV is left alone. The wrapping `-%` has no overflow to test. */
+uint32_t jaiA64SubX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0xcb000000u | (rm << 16) | (rn << 5) | rd;
+}
+
 uint32_t jaiA64SubsXReg(unsigned rd, unsigned rn, unsigned rm) {
     return 0xeb000000u | (rm << 16) | (rn << 5) | rd;
 }

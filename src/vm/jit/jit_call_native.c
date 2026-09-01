@@ -99,6 +99,21 @@ bool jitTuple(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_WRAP=0 sends `+% -% *%` back to the unarmed path, so the arms can
+ * be A/B'd inside ONE binary -- alternating two builds cannot be trusted here,
+ * since each switch invalidates __jaicache__ and the cache state alone decides
+ * which loops the sampler gets hot enough to enter. Off, the walk stops at the
+ * opcode exactly as it did before the arms existed, which is what makes the
+ * "off" side a real control rather than a whole-body decline. */
+bool jitWrapArith(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_WRAP");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool jitNegate(void) {
     static int cached = -1;
     if (cached < 0) {

@@ -52,6 +52,8 @@ uint32_t jaiA64LsrX(unsigned rd, unsigned rn, unsigned shift);
 uint32_t jaiA64AddX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64AddXLsl(unsigned rd, unsigned rn, unsigned rm, unsigned shift);
 /* subs Xd, Xn, Xm -- result AND flags; V set on signed overflow */
+/* sub Xd, Xn, Xm -- the flagless twin of jaiA64SubsXReg, for `-%` */
+uint32_t jaiA64SubX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64SubsXReg(unsigned rd, unsigned rn, unsigned rm);
 /* subs Xd, Xn, Wm, uxtw -- Xm's low 32 bits, zero-extended; rd = 31 is `cmp` */
 uint32_t jaiA64SubsXUxtw(unsigned rd, unsigned rn, unsigned rm);

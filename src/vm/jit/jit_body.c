@@ -1027,6 +1027,15 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
+        case OP_ADD_WRAP:
+        case OP_SUB_WRAP:
+        case OP_MUL_WRAP: {
+            JitArmResult r = emitWrapArith(e, op, &off);
+            if (r == JIT_ARM_REFUSED) return false;
+            if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
+            break;
+        }
+
         case OP_NOT: {
             JitArmResult r = emitNot(e, &off);
             if (r == JIT_ARM_REFUSED) return false;
