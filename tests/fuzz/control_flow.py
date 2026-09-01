@@ -342,11 +342,14 @@ class Gen:
         r = self.rng
         pad = "    " * ind
         k = self.n()
-        pool = ["try_catch", "try_catch", "try_finally", "throw_prop"]
+        pool = ["try_catch", "try_catch", "try_finally", "throw_prop",
+                "try_return"]
+        if in_for:
+            pool += ["try_break"]
         if "match" in self.features:
             pool += ["match", "match"]
         if "defer" in self.features:
-            pool += ["defer"]
+            pool += ["defer", "defer_in_try"]
         pick = r.choice(pool)
 
         if pick == "try_catch":
@@ -372,6 +375,38 @@ class Gen:
                      '{}    text = text + "y"'.format(pad),
                      pad + "} finally {",
                      "{}    acc = acc + {}".format(pad, r.randint(1, 5)),
+                     pad + "}"])
+        if pick == "try_break":
+            # Leaving a try block sideways: the handler is never entered, but
+            # the tier still has to unwind whatever the try pushed.
+            word = r.choice(("break", "continue"))
+            if labels and r.random() < 0.4:
+                word += " '" + r.choice(labels)
+            return ([pad + "try {",
+                     "{}    acc = acc + {}".format(pad, r.randint(1, 9)),
+                     "{}    if {} and {} {{ {} }}".format(
+                         pad, self.warmed(), self.cond(loopvars), word),
+                     '{}    if mode >= {} {{ throw ValueError("b{}") }}'.format(
+                         pad, r.randint(1, NMODES - 1), k),
+                     pad + "} catch _e: ValueError {",
+                     "{}    acc = acc + {}".format(pad, r.randint(10, 40)),
+                     pad + "}"])
+        if pick == "try_return":
+            return ([pad + "try {",
+                     "{}    acc = acc + {}".format(pad, r.randint(1, 9)),
+                     '{}    if {} and {} {{ return f"T{}/{{acc}}/{{slot}}" }}'.format(
+                         pad, self.warmed(), self.cond(loopvars), k),
+                     pad + "} finally {",
+                     "{}    acc = acc + {}".format(pad, r.randint(1, 5)),
+                     pad + "}"])
+        if pick == "defer_in_try":
+            return ([pad + "try {",
+                     "{}    defer {{ out.push({}) }}".format(pad, r.randint(1, 99)),
+                     "{}    acc = acc + {}".format(pad, r.randint(1, 9)),
+                     '{}    if mode >= {} {{ throw ValueError("d{}") }}'.format(
+                         pad, r.randint(1, NMODES - 1), k),
+                     pad + "} catch _e: ValueError {",
+                     "{}    acc = acc + {}".format(pad, r.randint(10, 40)),
                      pad + "}"])
         if pick == "throw_prop":
             # Never for mode 0: main warms with mode 0, and a body that raises
@@ -485,14 +520,28 @@ def program(seed):
 # ---------------------------------------------------------------------------
 # The oracle. The compiled tier may always decline, so all of these must agree
 # with the interpreter, byte for byte, on stdout+stderr and on exit status.
+#
+# `trace` runs a copy of the program with @trace on the hot body. There is no
+# env var for the function tier's threshold in this tree, and TICK_US only
+# drives the OSR loop tier, so this is what reaches the FUNCTION tier early:
+# @trace compiles after 8 calls instead of 64 and fills inline caches from a
+# smaller observation budget, which is a different set of kind predictions to
+# violate. The decorator does not change what a program prints, so the plain
+# interpreter run is still the oracle for it.
 CONFIGS = [
-    ("interp", {"JAITHON_NO_JIT": "1"}, []),
-    ("jit", {}, []),
-    ("tick", {"JAITHON_JIT_TICK_US": "50"}, []),
-    ("deopt", {"JAITHON_JIT_DEOPT_STRESS": "1"}, []),
-    ("split", {"JAITHON_JIT_SPLIT_STRESS": "1"}, []),
+    ("interp", {"JAITHON_NO_JIT": "1"}, [], False),
+    ("jit", {}, [], False),
+    ("tick", {"JAITHON_JIT_TICK_US": "50"}, [], False),
+    ("deopt", {"JAITHON_JIT_DEOPT_STRESS": "1"}, [], False),
+    ("split", {"JAITHON_JIT_SPLIT_STRESS": "1"}, [], False),
+    ("trace", {}, [], True),
+    ("trace_tick", {"JAITHON_JIT_TICK_US": "50"}, [], True),
 ]
-GC_CONFIG = ("gc", {}, ["--gc-stress=64"])
+GC_CONFIG = ("gc", {}, ["--gc-stress=64"], False)
+
+
+def traced(source):
+    return source.replace("fn {}(".format(PROBE), "@trace\nfn {}(".format(PROBE), 1)
 
 
 def run(path, env_extra, flags, timeout, why=False):
@@ -656,20 +705,25 @@ def main():
     ran = rejected = 0
     failures = []
     for seed in range(args.seed, args.seed + args.count):
+        source = program(seed)
         path = os.path.join(outdir, "s{}.jai".format(seed))
+        tpath = os.path.join(outdir, "t{}.jai".format(seed))
         with open(path, "w") as f:
-            f.write(program(seed))
+            f.write(source)
+        with open(tpath, "w") as f:
+            f.write(traced(source))
 
         results = {}
-        for name, env_extra, flags in configs:
-            results[name] = run(path, env_extra, flags, args.timeout)
+        for name, env_extra, flags, want_trace in configs:
+            results[name] = run(tpath if want_trace else path,
+                                env_extra, flags, args.timeout)
 
         oracle, ocode = results["interp"]
         if "error[" in oracle or oracle == "<timeout>":
             rejected += 1
             continue
         ran += 1
-        bad = {n: results[n] for n, _, _ in configs
+        bad = {n: results[n] for n, _, _, _ in configs
                if n != "interp" and results[n] != (oracle, ocode)}
         if bad:
             failures.append((seed, path, (oracle, ocode), bad))
