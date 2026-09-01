@@ -1069,31 +1069,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
         }
 
-        case OP_BUILD_RANGE: {
-            /* Deferred: the range is only worth building alongside its
-             * iterator, which the next instruction asks for. */
-            if (e->depth < 2) return false;
-            if (e->stack[e->depth - 1] != SLOT_INT) return false;
-            if (e->stack[e->depth - 2] != SLOT_INT) return false;
-            /* OP_BUILD_RANGE carries one operand byte, so the next opcode is
-             * two along. */
-            if (off + 2 >= count || code[off + 2] != OP_GET_ITER) {
-                e->whyNot = "a range that is not immediately iterated";
-                return false;
-            }
-            e->rangeInclusive = code[off + 1] != 0;
-            e->pendingRange = true;
-            e->rangeBuildIp = (uint32_t)off;
-            /* Both ends hold registers, so the low end is the entry one below
-             * the top in the value bank as well as on the stack. */
-            {
-                unsigned lo = e->valueDepth - 2;
-                e->rangeStartKnown = (e->kKnown & (1u << lo)) != 0;
-                e->rangeStartVal   = e->rangeStartKnown ? e->kKnownVal[lo] : 0;
-            }
-            off += 2;
+        case OP_BUILD_RANGE:
+            if (!emitBuildRange(e, code, &off, count)) return false;
             break;
-        }
 
         case OP_GET_ITER:
             if (!emitGetIter(e, &off)) return false;

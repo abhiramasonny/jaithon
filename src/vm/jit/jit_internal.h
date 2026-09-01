@@ -1179,6 +1179,7 @@ bool emitForRangeBind(Emit *e, const uint8_t *code, int *offp);
 bool emitGetIterItems(Emit *e, const uint8_t *code, int *offp, int stop);
 bool emitForIterBind(Emit *e, const uint8_t *code, int *offp);
 bool emitForIterPair(Emit *e, const uint8_t *code, int *offp);
+bool emitBuildRange(Emit *e, const uint8_t *code, int *offp, int count);
 
 /* Defined in jit_body_index.c. */
 bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop);
