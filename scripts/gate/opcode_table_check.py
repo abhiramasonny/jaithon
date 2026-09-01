@@ -2,7 +2,7 @@
 """Fail when the three opcode tables disagree.
 
 `JAI_OPCODES(X)` in src/vm/bytecode/chunk.c is the wire format: its order is
-the on-disk encoding. `_OPS` in lib/jaithon/compile/emit.jai is a
+the on-disk encoding. `_OPS` in lib/jaithon/compile/emit/opcode.jai is a
 hand-transcribed copy of it, and spec/BYTECODE.md is normative documentation
 for both. Nothing checked that the three agreed until this script, and the
 survey that motivated it found four opcodes shipped and undocumented.
@@ -39,7 +39,7 @@ def c_table():
 
 
 def jai_table():
-    text = (ROOT / "lib/jaithon/compile/emit.jai").read_text()
+    text = (ROOT / "lib/jaithon/compile/emit/opcode.jai").read_text()
     return [(n, norm(o), norm(e)) for n, o, e in JAI_ROW.findall(text)]
 
 
@@ -55,14 +55,14 @@ def main():
     if not c:
         problems.append("chunk.c: JAI_OPCODES parsed as empty -- regex is stale")
     if not jai:
-        problems.append("emit.jai: _OPS parsed as empty -- regex is stale")
+        problems.append("opcode.jai: _OPS parsed as empty -- regex is stale")
 
     if len(c) != len(jai):
-        problems.append(f"row count: chunk.c has {len(c)}, emit.jai has {len(jai)}")
+        problems.append(f"row count: chunk.c has {len(c)}, opcode.jai has {len(jai)}")
 
     for i, (a, b) in enumerate(zip(c, jai)):
         if a != b:
-            problems.append(f"row {i}: chunk.c {a} != emit.jai {b}")
+            problems.append(f"row {i}: chunk.c {a} != opcode.jai {b}")
 
     for name, _, _ in c:
         if name[3:] not in spec:

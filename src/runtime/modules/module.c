@@ -1182,7 +1182,7 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
      * otherwise for long enough that it was quoted back as authority.
      *
      * The real reason is that EMIT REPORTS DIAGNOSTICS THE CHECKER DOES NOT.
-     * There are nine `_unsupported()` sites in lib/jaithon/compile/emit.jai
+     * There are nine `_unsupported()` sites in lib/jaithon/compile/emit/emitter.jai
      * for shapes the checker deliberately accepts and the instruction set
      * cannot express -- `yield` and `await` (no generators), a generator
      * expression (needs a coroutine), `from m import *` (the loader needs an
