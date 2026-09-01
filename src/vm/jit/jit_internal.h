@@ -1136,6 +1136,13 @@ bool fpWorthLoading(const Emit *e, const uint8_t *code, int next, int stop);
 bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop);
 bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape);
 
+/* Defined in jit_body_build.c. */
+bool emitBuildList(Emit *e, const uint8_t *code, int *offp);
+JitArmResult emitBuildDictSet(Emit *e, const uint8_t *code, int *offp);
+JitArmResult emitBuildTuple(Emit *e, const uint8_t *code, int *offp);
+JitArmResult emitElemKind(Emit *e, const uint8_t *code, int *offp);
+bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp);
+
 /* Defined in jit_body_local.c. */
 bool emitGetLocal(Emit *e, const uint8_t *code, int *offp, int stop);
 bool emitGetLocal2(Emit *e, const uint8_t *code, int *offp, int stop);
