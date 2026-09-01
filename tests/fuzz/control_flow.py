@@ -662,11 +662,10 @@ def loop_end_offset(path, timeout):
 def compile_state(path, timeout):
     """Did the hot body reach the compiled tier, and did its LOOP compile whole?
 
-    The OSR line is the precise signal: "osr cfprobe at N: M instructions" with
-    no matching "walked only" means the loop the shapes live in ran entirely in
-    the compiled tier. A walk truncated after the loop -- at OP_RUN_DEFERS, at
-    the tail `??`, at the call that drains the closures -- still compiled every
-    iteration, so it is not the same thing as a truncated loop."""
+    A walk truncated AFTER the hot loop -- at OP_RUN_DEFERS, at the tail `??`,
+    at the call that drains the closures -- still compiled every iteration, so
+    it is not the same thing as a walk cut inside the loop. The two are told
+    apart by comparing the offset the tier names against loop_end_offset."""
     text, _ = run(path, {"JAITHON_JIT_TICK_US": "50"}, [], timeout, why=True)
     reached = False
     cuts = []
