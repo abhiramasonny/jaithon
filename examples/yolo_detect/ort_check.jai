@@ -21,13 +21,13 @@ from .detector import open_model
 let SIDE = 640
 
 fn main() -> int {
-    let graph = open_model(env("YOLO_MODEL"))
-    if graph is null { return 1 }
+    let model = open_model(env("YOLO_MODEL"))
+    if model is null { return 1 }
     var values: list[float] = []
     for index in 0..3 * SIDE * SIDE { values.push(float(index * 37 % 251) / 251.0) }
     let input = Tensor([1, 3, SIDE, SIDE], values)
-    let outputs = run_best(graph, {graph.inputs[0]: input})
-    let out = outputs[graph.outputs[0]]
+    let outputs = run_best(model.graph, {model.graph.inputs[0]: input})
+    let out = outputs[model.graph.outputs[0]]
     let flat = out.download()
     var total = 0.0
     var peak = 0.0

@@ -526,7 +526,7 @@ fn declared_shape(fields: list[Field]) -> list[int] {
 
 #: A model, once read: the graph, and the shapes its inputs and outputs were
 #: declared with, which the graph itself has no room for.
-class Model {
+pub class Model {
     pub let graph: Graph
     pub let shapes: dict[str, list[int]]
 
@@ -955,6 +955,18 @@ pub fn read_net_from_onnx_bytes(data: bytes) -> Graph { return import_model(data
 #: model can be turned away before a forward pass rather than during one.
 pub fn read_net_from_onnx(path: str) -> Graph {
     return read_net_from_onnx_bytes(io.read_bytes(path))
+}
+
+#: The model in an ONNX file: the graph, and the shapes it declared for its
+#: inputs and outputs.
+#:
+#: `read_net_from_onnx` throws the shapes away, which is fine until a caller
+#: has to know them before it can feed the graph anything -- a detector cannot
+#: letterbox to the network's input size without being told what that is, and
+#: hardcoding it is how a reader ends up only ever working with one model. A
+#: dimension the file left symbolic reads as `-1`.
+pub fn read_onnx_model(path: str) -> Model {
+    return import_model(io.read_bytes(path))
 }
 
 #: A network behind `Runnable`, so an ONNX file can stand where OpenCV's

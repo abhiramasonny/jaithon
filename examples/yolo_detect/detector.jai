@@ -18,15 +18,45 @@ from jaitensor import Tensor
 from jaicv import Mat, Point, Rect, Scalar, Size
 from jaicv.dnn.graph import run_graph
 from jaicv.dnn.plan import run_best
-from jaicv.dnn.onnx import read_net_from_onnx
+from jaicv.dnn.onnx import read_onnx_model
 from jaicv.dnn.graph import Graph
 from std.io import Path
 
 from .coco import COCO_NAMES
 
+#: What a YOLOv8n export happens to use. Only a fallback: the geometry below
+#: is read from the model, and these are what a file that declares no shapes
+#: is assumed to be.
 pub let INPUT = 640
+pub let ROWS = 84
 pub let SCORE_THRESHOLD = 0.25
 pub let NMS_THRESHOLD = 0.45
+
+#: A loaded model and the three numbers the decoding depends on.
+#:
+#: All three used to be constants, which meant the example worked with exactly
+#: one file. They are not properties of YOLO, they are properties of an export:
+#: `input` is whatever `imgsz` the model was exported at (640 for the usual
+#: ones, 1280 for the `-p6` variants), and `rows` is four box coordinates plus
+#: one score per class, so a model trained on something other than COCO's 80
+#: has a different one. ONNX declares all of it, and the reader already parsed
+#: it -- see `read_onnx_model`.
+pub class Detector {
+    pub var graph: Graph
+    pub var input: int
+    pub var rows: int
+
+    pub fn init(self, graph: Graph, input: int, rows: int) {
+        self.graph = graph
+        self.input = input
+        self.rows = rows
+    }
+
+    #: Rows past the four box coordinates.
+    pub fn classes(self) -> int {
+        return self.rows - 4
+    }
+}
 
 #: A detection in the coordinates of the ORIGINAL image, not the letterboxed
 #: one the network saw.
@@ -56,21 +86,21 @@ pub class Detection {
 #: Squashing to 640x640 instead would work and detect slightly worse: the
 #: network was trained on letterboxed images, so a stretched one is off its
 #: training distribution.
-pub fn letterbox(image: Mat) -> tuple[Mat, float, int, int] {
-    let scale = min(float(INPUT) / float(image.cols), float(INPUT) / float(image.rows))
+pub fn letterbox(image: Mat, input: int = INPUT) -> tuple[Mat, float, int, int] {
+    let scale = min(float(input) / float(image.cols), float(input) / float(image.rows))
     let width = max(1, int(float(image.cols) * scale))
     let height = max(1, int(float(image.rows) * scale))
     let resized = cv.resize(image, Size(width, height))
-    let left = (INPUT - width) // 2
-    let top = (INPUT - height) // 2
+    let left = (input - width) // 2
+    let top = (input - height) // 2
     #: 114 grey is what Ultralytics pads with, and the network has seen it in
     #: training; black would be a colour it reads as content.
     let padded = cv.copy_make_border(
         resized,
         top,
-        INPUT - height - top,
+        input - height - top,
         left,
-        INPUT - width - left,
+        input - width - left,
         cv.BORDER_CONSTANT,
         Scalar(114.0, 114.0, 114.0)
     )
@@ -91,13 +121,17 @@ pub fn decode(
     pad_x: int,
     pad_y: int,
     width: int,
-    height: int
+    height: int,
+    rows: int = ROWS
 ) -> list[Detection] {
-    let rows = 84
     let cells = output.size // rows
+    let score_rows = rows - 4
     #: Rows four onward are the class scores, and they are contiguous, so the
     #: view costs nothing.
-    let per_class = jt.Tensor([80, cells], storage: output.buffer().view(4 * cells, 80 * cells))
+    let per_class = jt.Tensor(
+        [score_rows, cells],
+        storage: output.buffer().view(4 * cells, score_rows * cells)
+    )
     #: Down the columns, and both answers at once. Reducing along the rows
     #: instead would want the classes on the last axis, and transposing to put
     #: them there is a whole pass over the scores; asking for the best and
@@ -262,6 +296,7 @@ pub class Pending {
     pub let pad_y: int
     pub let width: int
     pub let height: int
+    pub let rows: int
 
     pub fn init(
         self,
@@ -270,7 +305,8 @@ pub class Pending {
         pad_x: int,
         pad_y: int,
         width: int,
-        height: int
+        height: int,
+        rows: int
     ) {
         self.output = output
         self.scale = scale
@@ -278,6 +314,7 @@ pub class Pending {
         self.pad_y = pad_y
         self.width = width
         self.height = height
+        self.rows = rows
     }
 }
 
@@ -287,29 +324,37 @@ pub class Pending {
 #: and the result is not read until `finish_detect`. A loop that has processor
 #: work of its own -- drawing the frame before this one, writing it out -- can
 #: do it in between and pay the slower of the two rather than their sum.
-pub fn start_detect(graph: Graph, image: Mat) -> Pending {
-    let (padded, scale, pad_x, pad_y) = letterbox(image)
+pub fn start_detect(model: Detector, image: Mat) -> Pending {
+    let (padded, scale, pad_x, pad_y) = letterbox(image, model.input)
     #: `blob_from_image` does the BGR-to-RGB swap and the 1/255 scaling the
     #: network expects, and lays the result out as N x C x H x W.
     let blob = cv.blob_from_image(
         padded,
         1.0 / 255.0,
-        Size(INPUT, INPUT),
+        Size(model.input, model.input),
         Scalar(0.0, 0.0, 0.0),
         true
     )
     #: The blob is already on the device, so the tensor shares its storage
     #: rather than making a round trip through the host to say so.
-    let input = cv.blob_to_tensor(blob, 3, Size(INPUT, INPUT))
+    let input = cv.blob_to_tensor(blob, 3, Size(model.input, model.input))
     #: `run_best` interprets the first frame and compiles the model after,
     #: which for a run of more than one frame is most of the speed.
-    let outputs = run_best(graph, {graph.inputs[0]: input})
+    let outputs = run_best(model.graph, {model.graph.inputs[0]: input})
     #: Committed here so the GPU starts on it now rather than whenever the
     #: caller next happens to touch the device. Nothing waits: a flush hands
     #: the queue over and returns, which is the whole point of coming back for
     #: the answer later.
     gpu.flush()
-    return Pending(outputs[graph.outputs[0]], scale, pad_x, pad_y, image.cols, image.rows)
+    return Pending(
+        outputs[model.graph.outputs[0]],
+        scale,
+        pad_x,
+        pad_y,
+        image.cols,
+        image.rows,
+        model.rows
+    )
 }
 
 #: Read what `start_detect` queued. This is where the wait happens.
@@ -320,7 +365,8 @@ pub fn finish_detect(pending: Pending) -> list[Detection] {
         pending.pad_x,
         pending.pad_y,
         pending.width,
-        pending.height
+        pending.height,
+        pending.rows
     )
 }
 
@@ -330,12 +376,41 @@ pub fn finish_detect(pending: Pending) -> list[Detection] {
 #:
 #: This waits for the network before returning. A loop that has other work to
 #: do meanwhile should use `start_detect` and `finish_detect` instead.
-pub fn detect_frame(graph: Graph, image: Mat) -> list[Detection] {
-    return finish_detect(start_detect(graph, image))
+pub fn detect_frame(model: Detector, image: Mat) -> list[Detection] {
+    return finish_detect(start_detect(model, image))
 }
 
-#: The model, from `YOLO_MODEL` or from beside this file.
-pub fn open_model(override: str?) -> Graph? {
+#: The square side an `[N, C, H, W]` input declares, or null when the file
+#: leaves it symbolic (a dynamic-axis export) or is not square.
+fn declared_input(shape: list[int]) -> int? {
+    if shape.len() != 4 { return null }
+    let height = shape[2]
+    let width = shape[3]
+    if height <= 0 or width <= 0 or height != width { return null }
+    return width
+}
+
+#: The row count an `[N, rows, cells]` output declares. Rows are the four box
+#: coordinates plus one score per class, so anything at or below four is not a
+#: detection head and is refused rather than decoded into nonsense.
+fn declared_rows(shape: list[int]) -> int? {
+    if shape.len() != 3 { return null }
+    let rows = shape[1]
+    let cells = shape[2]
+    if rows <= 4 or cells <= 0 { return null }
+    return rows
+}
+
+#: The model, from `YOLO_MODEL` or from beside this file, with its geometry.
+#:
+#: The two numbers come out of the file rather than out of this source, which
+#: is what lets any YOLOv8-shaped export work: n/s/m/l/x all declare 640x640
+#: and 84 rows, the `-p6` variants declare 1280, and a model fine-tuned on a
+#: different class set declares its own row count. A file that declares
+#: neither -- an export with dynamic axes -- falls back to the YOLOv8n numbers
+#: and says so, because guessing quietly is how a wrong box ends up looking
+#: like a bad model.
+pub fn open_model(override: str?) -> Detector? {
     let path = if override is not null {
         Path(override)
     } else {
@@ -346,5 +421,20 @@ pub fn open_model(override: str?) -> Graph? {
         print("run examples/yolo_detect/fetch_model.sh, or set YOLO_MODEL to one")
         return null
     }
-    return read_net_from_onnx(path.to_str())
+    let model = read_onnx_model(path.to_str())
+    let graph = model.graph
+    if graph.inputs.len() == 0 or graph.outputs.len() == 0 {
+        print(f"{path.to_str()} declares no input or no output")
+        return null
+    }
+
+    let in_shape = model.shapes.get(graph.inputs[0]) ?? []
+    let out_shape = model.shapes.get(graph.outputs[0]) ?? []
+    let input = declared_input(in_shape)
+    let rows = declared_rows(out_shape)
+    if input is null or rows is null {
+        print(f"{path.to_str()} declares {in_shape} in and {out_shape} out")
+        print(f"assuming a YOLOv8 export at {INPUT} with {ROWS} rows")
+    }
+    return Detector(graph, input ?? INPUT, rows ?? ROWS)
 }

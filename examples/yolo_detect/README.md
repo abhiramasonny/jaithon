@@ -14,6 +14,41 @@ That exports `yolov8n.onnx` (~12 MB) next to the script, using a throwaway `uv`
 environment. The weights are not committed: they are Ultralytics' to
 distribute, and YOLOv8 is AGPL-3.0 — worth reading before you build on it.
 
+## Bigger models
+
+`fetch_model.sh` takes a model name, and the detector reads the geometry out of
+the ONNX file rather than assuming it, so nothing here needs changing to run a
+different one:
+
+```bash
+examples/yolo_detect/fetch_model.sh yolov8s      # 43 MB
+examples/yolo_detect/fetch_model.sh yolov8x      # ~260 MB
+examples/yolo_detect/fetch_model.sh yolov8x6     # exported at 1280, not 640
+```
+
+```bash
+YOLO_MODEL=examples/yolo_detect/yolov8s.onnx \
+    jaithon run examples/yolo_detect/detect.jai photo.jpg out.png
+```
+
+Two numbers come out of the file: the input size the model was exported at, and
+the number of output rows, which is four box coordinates plus one score per
+class. That covers the whole YOLOv8 family, the `-p6` variants at 1280, the
+`yolo11` models, and anything fine-tuned on a class set other than COCO's 80 —
+a model with different classes will report `class 0`, `class 1` and so on,
+since the names in `coco.jai` no longer describe it.
+
+Measured on `bus.jpg`, same code path, only `YOLO_MODEL` different:
+
+| model | load | inference | best person |
+| --- | --- | --- | --- |
+| yolov8n 640 | 1.8 s | 217 ms | 0.891 |
+| yolov8s 640 | 6.1 s | 246 ms | 0.915 |
+| yolov8n 1280 | 1.9 s | 312 ms | 0.809 |
+
+A file exported with dynamic axes declares no shape at all; the detector says
+so and falls back to 640 and 80 classes rather than guessing quietly.
+
 ## Run
 
 ```bash

@@ -37,14 +37,14 @@ fn main() -> int {
     print(f"{source}: {image.cols}x{image.rows}")
 
     var clock = Instant.now()
-    let graph = open_model(env("YOLO_MODEL"))
-    if graph is null { return 1 }
+    let model = open_model(env("YOLO_MODEL"))
+    if model is null { return 1 }
     print(
-        f"model: {graph.nodes.len()} nodes, {graph.initializers.len()} weights, loaded in {clock.elapsed().to_seconds() * 1000.0:.0f}ms"
+        f"model: {model.graph.nodes.len()} nodes, {model.graph.initializers.len()} weights, {model.input}px, {model.classes()} classes, loaded in {clock.elapsed().to_seconds() * 1000.0:.0f}ms"
     )
 
     clock = Instant.now()
-    let found = detect_frame(graph, image)
+    let found = detect_frame(model, image)
     print(f"inference {clock.elapsed().to_seconds() * 1000.0:.0f}ms, {found.len()} detections")
     for hit in found {
         print(

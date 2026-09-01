@@ -142,9 +142,11 @@ fn main() -> int {
         return 2
     }
 
-    let graph = open_model(env("YOLO_MODEL"))
-    if graph is null { return 1 }
-    print(f"model: {graph.nodes.len()} nodes, {graph.initializers.len()} weights")
+    let model = open_model(env("YOLO_MODEL"))
+    if model is null { return 1 }
+    print(
+        f"model: {model.graph.nodes.len()} nodes, {model.graph.initializers.len()} weights, {model.input}px, {model.classes()} classes"
+    )
 
     #: `VideoCapture` takes a path as readily as a device index, so a
     #: recorded clip runs the identical loop -- which is how this gets tested
@@ -221,7 +223,7 @@ fn main() -> int {
         var pending: Pending? = null
         var clock = Instant.now()
         if frames % options.every == 0 {
-            pending = start_detect(graph, frame)
+            pending = start_detect(model, frame)
             net_ms = clock.elapsed().to_seconds() * 1000.0
         }
 

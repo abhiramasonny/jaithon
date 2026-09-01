@@ -223,6 +223,7 @@ from .dnn.blob import net_from, nms_boxes, nms_boxes_batched, Net, Runnable
 from .dnn.graph import run_graph, Attr, Graph, GraphNode
 from .dnn.onnx import read_net_from_onnx, read_net_from_onnx_as_net
 from .dnn.onnx import read_net_from_onnx_bytes, read_onnx_engine
+from .dnn.onnx import Model, read_onnx_model
 from .dnn.caffe import read_net_from_caffe, read_net_from_caffe_bytes
 from .dnn.tensorflow import read_net_from_tensorflow, read_net_from_tensorflow_bytes
 from .dnn.torch import read_torch_state_dict, read_torch_state_dict_bytes, TorchTensor
@@ -446,6 +447,7 @@ export { net_from, nms_boxes, nms_boxes_batched, Net, Runnable }
 export { run_graph, Attr, Graph, GraphNode }
 export { read_net_from_onnx, read_net_from_onnx_as_net, read_net_from_onnx_bytes }
 export { read_onnx_engine, read_net_from_caffe, read_net_from_caffe_bytes }
+export { Model, read_onnx_model }
 export { read_net_from_tensorflow, read_net_from_tensorflow_bytes }
 export { read_torch_state_dict, read_torch_state_dict_bytes, TorchTensor }
 
