@@ -1446,3 +1446,61 @@ fn month_of_name(name: str, whole: str) -> int {
     }
     throw ValueError(f"{repr(whole)} anchors to no month this calendar has")
 }
+
+#: A `Datetime` column from ISO 8601 text, missing entries staying missing.
+#:
+#: This is the host loop the module header names, and it is a loop over the
+#: distinct spellings rather than the rows: a column of a million daily stamps
+#: holds a few thousand of them, and every repeat after the first is a
+#: dictionary hit instead of a parse. The lanes still reach the device in the
+#: one upload `Column.from_ints` makes.
+#:
+#: What a date looks like is `std.time.DateTime.from_iso` — the date alone, a
+#: `T` or a space before the clock, an optional fraction, and `Z` or a UTC
+#: offset — which is the spelling `io.jai` writes a `Datetime` back out in, so
+#: a file this package wrote reads in as the timestamps it held. Text that is
+#: not a timestamp raises `ParseError`, a `ValueError`, rather than becoming a
+#: null: nothing infers `Datetime`, so a caller is here because it named the
+#: dtype, and data that does not honour the name is worth hearing about.
+#:
+#: ```
+#: let stamps = to_datetime(["2024-01-01", null, "2024-01-01T06:30:00Z"])
+#: defer { stamps.free() }
+#: stamps.to_ints()      # [1704067200000, 0, 1704090600000]
+#: stamps.null_mask()    # [false, true, false]
+#: ```
+pub fn to_datetime(texts: list[str?]) -> Column {
+    var stamps: list[int] = []
+    var nulls: list[bool] = []
+    var parsed: dict[str, int] = {}
+    for text in texts {
+        if text is null {
+            stamps.push(0)
+            nulls.push(true)
+            continue
+        }
+        let spelling = text ?? ""
+        if parsed.has(spelling) {
+            stamps.push(parsed[spelling])
+        } else {
+            let stamp = millis_of(spelling)
+            parsed[spelling] = stamp
+            stamps.push(stamp)
+        }
+        nulls.push(false)
+    }
+    return Column.from_ints(stamps, nulls, Dtype.Datetime)
+}
+
+#: What `DateTime` counts its fraction in, against the millisecond this stores.
+const NANOS_PER_MILLI = 1000000
+
+#: The millisecond count one ISO 8601 timestamp names.
+#:
+#: `DateTime` has already normalised the fraction into `[0, 1e9)` against a
+#: floored second, so this is exactly the inverse of the split `io.jai`'s
+#: `iso_stamp` makes and a moment before the epoch survives the round trip.
+fn millis_of(text: str) -> int {
+    let moment = DateTime.from_iso(text)
+    return moment.to_unix() * MILLIS_PER_SECOND + moment.nanosecond // NANOS_PER_MILLI
+}

@@ -39,6 +39,7 @@ from std.time import DateTime
 from .column import Column, DataFrame, Dtype, Index, Series, Value
 from .column import f32_bits, wide_unpack
 from .construct import column_from_values, infer_dtype
+from .timeseries import to_datetime
 
 #: The strings a reader treats as a missing cell when `keep_default_na` is on.
 #:
@@ -604,11 +605,8 @@ fn refusal(name: str, field: str, dtype: Dtype) -> ValueError {
 #: A `Datetime` column from field text.
 #:
 #: Every rule about what a date looks like belongs to `timeseries.jai`, so the
-#: fields go there whole rather than being picked apart here. The import is
-#: local because the calendar is the only thing this reader borrows from that
-#: module and a `read_csv` without `parse_dates` has no use for it.
+#: fields go there whole rather than being picked apart here.
 fn datetime_column(name: str, fields: list[str], words: dict[str, bool]) -> Column {
-    from .timeseries import to_datetime
     var texts: list[str?] = []
     for field in fields { texts.push(if words.get(field, false) { null } else { field }) }
     return to_datetime(texts)
