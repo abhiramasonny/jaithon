@@ -5,7 +5,7 @@
  * including itself. The images are deflated one per module and
  * inflated on first use, so a program pays for what it imports.
  *
- * 80 modules, 842581 bytes of images, 448768 bytes packed.
+ * 86 modules, 848772 bytes of images, 453771 bytes packed.
  * Regenerate with `make reseed`.
  */
 
@@ -84,28 +84,34 @@ static const SeedSource kSources[] = {
     {"jaithon/compile/parse/wire.jai", 326243, 726, 1134},
     {"jaithon/compile/parser.jai", 326969, 221, 306},
     {"jaithon/compile/repl.jai", 327190, 3863, 6486},
-    {"jaithon/compile/resolve.jai", 331053, 21112, 39893},
-    {"jaithon/compile/symbol.jai", 352165, 3717, 6448},
-    {"jaithon/compile/token.jai", 355882, 7209, 15680},
-    {"std/json.jai", 363091, 13802, 25646},
-    {"std/math.jai", 376893, 9516, 20028},
-    {"std/str.jai", 386409, 12606, 23249},
-    {"jaithon/compile/jaic/bits.jai", 399015, 1971, 3054},
-    {"jaithon/compile/jaic/code.jai", 400986, 1228, 1977},
-    {"jaithon/compile/jaic/disassemble.jai", 402214, 3535, 5801},
-    {"jaithon/compile/jaic/format.jai", 405749, 794, 1162},
-    {"jaithon/compile/jaic/linetable.jai", 406543, 1167, 1843},
-    {"jaithon/compile/jaic/model.jai", 407710, 1114, 1745},
-    {"jaithon/compile/jaic/read.jai", 408824, 5772, 10190},
-    {"jaithon/compile/jaic/stream.jai", 414596, 2176, 3886},
-    {"jaithon/compile/jaic/write.jai", 416772, 4785, 7921},
-    {"jaithon/compile/check/stmt/codes.jai", 421557, 648, 966},
-    {"jaithon/compile/check/stmt/fields.jai", 422205, 645, 915},
-    {"jaithon/compile/check/stmt/flow.jai", 422850, 4401, 7734},
-    {"jaithon/compile/check/stmt/function.jai", 427251, 4355, 7093},
-    {"jaithon/compile/check/stmt/matching.jai", 431606, 5039, 8390},
-    {"jaithon/compile/check/stmt/pattern.jai", 436645, 5829, 9747},
-    {"jaithon/compile/check/stmt/store.jai", 442474, 6294, 10557},
+    {"jaithon/compile/resolve.jai", 331053, 229, 348},
+    {"jaithon/compile/symbol.jai", 331282, 3717, 6448},
+    {"jaithon/compile/token.jai", 334999, 7209, 15680},
+    {"std/json.jai", 342208, 13802, 25646},
+    {"std/math.jai", 356010, 9516, 20028},
+    {"std/str.jai", 365526, 12606, 23249},
+    {"jaithon/compile/jaic/bits.jai", 378132, 1971, 3054},
+    {"jaithon/compile/jaic/code.jai", 380103, 1228, 1977},
+    {"jaithon/compile/jaic/disassemble.jai", 381331, 3535, 5801},
+    {"jaithon/compile/jaic/format.jai", 384866, 794, 1162},
+    {"jaithon/compile/jaic/linetable.jai", 385660, 1167, 1843},
+    {"jaithon/compile/jaic/model.jai", 386827, 1114, 1745},
+    {"jaithon/compile/jaic/read.jai", 387941, 5772, 10190},
+    {"jaithon/compile/jaic/stream.jai", 393713, 2176, 3886},
+    {"jaithon/compile/jaic/write.jai", 395889, 4785, 7921},
+    {"jaithon/compile/check/stmt/codes.jai", 400674, 648, 966},
+    {"jaithon/compile/check/stmt/fields.jai", 401322, 645, 915},
+    {"jaithon/compile/check/stmt/flow.jai", 401967, 4401, 7734},
+    {"jaithon/compile/check/stmt/function.jai", 406368, 4355, 7093},
+    {"jaithon/compile/check/stmt/matching.jai", 410723, 5039, 8390},
+    {"jaithon/compile/check/stmt/pattern.jai", 415762, 5829, 9747},
+    {"jaithon/compile/check/stmt/store.jai", 421591, 6294, 10557},
+    {"jaithon/compile/resolve/decl.jai", 427885, 7666, 13555},
+    {"jaithon/compile/resolve/predicate.jai", 435551, 1050, 1630},
+    {"jaithon/compile/resolve/resolver.jai", 436601, 8599, 14898},
+    {"jaithon/compile/resolve/scope.jai", 445200, 810, 1282},
+    {"jaithon/compile/resolve/walk.jai", 446010, 7241, 13588},
+    {"jaithon/compile/resolve/wire.jai", 453251, 520, 783},
 };
 
 #define JAI_SEED_N (sizeof kSources / sizeof kSources[0])

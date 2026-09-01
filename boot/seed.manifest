@@ -103,3 +103,9 @@ jaithon/compile/check/stmt/function.jai
 jaithon/compile/check/stmt/matching.jai
 jaithon/compile/check/stmt/pattern.jai
 jaithon/compile/check/stmt/store.jai
+jaithon/compile/resolve/decl.jai
+jaithon/compile/resolve/predicate.jai
+jaithon/compile/resolve/resolver.jai
+jaithon/compile/resolve/scope.jai
+jaithon/compile/resolve/walk.jai
+jaithon/compile/resolve/wire.jai
