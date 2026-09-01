@@ -417,7 +417,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check layer-check kind-tag-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check layer-check kind-tag-check switch-doc-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -560,6 +560,15 @@ jit-fusion-check:
 .PHONY: kind-tag-check
 kind-tag-check:
 	@python3 scripts/gate/kind_tag_check.py
+
+# A switch is how this tier gets measured -- an A/B in one binary, interleaved,
+# is the only number it accepts -- so fifty of them accumulated, and with no
+# index the only way to find one was to grep. This checks both directions:
+# every getenv in src/vm/jit has a row in that README, and every row still has
+# a getenv. Pure text, so it runs on every `make test`.
+.PHONY: switch-doc-check
+switch-doc-check:
+	@python3 scripts/gate/switch_doc_check.py
 
 # Where a branch keeps its displacement is written down twice, in verify.c and
 # in opt/chunk.jai, and neither consults the other. A missing entry makes the

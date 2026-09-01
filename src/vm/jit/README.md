@@ -237,6 +237,7 @@ the tier emits is chosen from it.
 | `SLOT_BOOL` | 0 or 1 -- **one byte**, because `BOOL_VAL` writes only the union's `bool` member |
 | `SLOT_INST` | `ObjInstance *`, of one pinned class |
 | `SLOT_MAYBE_INST` | that same pointer **or a zero** |
+| `SLOT_MAYBE_OBJ` | some heap object **or a zero**, with no class at all -- `SLOT_OBJ`'s permissions minus the promise of being non-null |
 | `SLOT_LIST` | `ObjList *` |
 | `SLOT_OBJ` | some heap object this tier does not model: load, pass, store, root, nothing else |
 | `SLOT_ITER` | an `ObjIter` this body built; its index stays in memory |
@@ -256,10 +257,148 @@ object" is never enough:
 `localIn`, `emitCallOutResult` and the invoke arms all follow a `VAL_OBJ` check
 with an `Obj.type` check and, for an instance, a `shapeId` check.
 
-And `SLOT_MAYBE_INST` has **no compile-time tag at all**. The same register is
-a pointer or a zero and only the payload says which. `emitTagFor` is the one
-place that gets it right: a `subs`/`csel` off the payload rather than a `movz`
-of a constant.
+And the two nullable kinds -- `SLOT_MAYBE_INST` and `SLOT_MAYBE_OBJ` -- have
+**no compile-time tag at all**. The same register is a pointer or a zero and
+only the payload says which. `emitTagFor` is the one place that gets it right:
+a `subs`/`csel` off the payload rather than a `movz` of a constant.
+`scripts/gate/kind_tag_check.py` exists to keep that true, and it names both
+kinds: a second nullable kind the gate has not been taught is exactly the
+hazard it was written for, wearing a name it does not know.
+
+`SLOT_MAYBE_OBJ` is `SLOT_MAYBE_INST` with the class dropped, and that is the
+whole of the difference: wherever a site consults a shape or a class, it must
+refuse the object form; wherever it only loads, passes, stores or roots, the
+two are interchangeable. It is what `-> OpKind?` returns -- an enum member on
+one edge and null on the other, a pair no other kind covers. Today it is
+produced only by `mergeReturnKind`, `pushValue3` refuses it, and
+`jitMaybeObjStackOn` (`JAITHON_JIT_MAYBE_OBJ_STACK=1`) is the switch that would
+let it onto the operand stack once every site that reads an entry's kind has
+been shown to exclude or handle it.
+
+### What the interpreter records about a return
+
+A caller compiling before its callee has none of the callee's own answers, so
+it reads what the interpreter watched the callee return: `ObjFunction::
+obsReturnKind`, one byte, merged by `jaiFeedbackMerge` in `bytecode/chunk.h`.
+
+That byte used to collapse **every** disagreement to `JAI_FB_MIXED`, and mixed
+is unusable, so 433 refusals on `check lib/std` across 121 bodies came down to
+"the callee returned two things". Measured, 42 of the 50 first disagreements
+were *null meeting an instance* and 4 were *null meeting a string*: only 4 were
+two unrelated kinds. A nullable instance is a kind this tier has spoken since
+`SLOT_MAYBE_INST` existed -- the byte was throwing away the one fact that
+would have compiled the caller.
+
+So there is a third band, `JAI_FB_NULLABLE + ObjType`: "null, and also exactly
+one object type". Two properties keep it safe:
+
+* Every decoder **rejects an unknown byte** rather than indexing on it, so a
+  reader that predates the band treats it as mixed -- which is what it meant.
+  A `_Static_assert` keeps the band clear of both the object band and `MIXED`.
+* A null return must no longer clear `obsReturnShape`. The old rule zeroed the
+  shape the moment a nullable-instance function returned its null, so the very
+  case the band exists to record arrived with no class and was refused anyway.
+  The first *non-null* return sets the shape; later ones confirm or zero it,
+  and that zero stays sticky.
+
+Believing the band lets a walk past a refusal it used to stop at, and what it
+reaches there can decline the **whole** body where a prefix used to compile --
+the same bargain the enum-`match` arms struck. `compileFunc` therefore retries
+with `gNoNullableFb` set, exactly as it does for `gMatchUsed`.
+
+
+## Every switch this tier reads
+
+Fifty-odd environment variables reach `src/vm/jit/`, and until this table
+existed the only way to find one was to grep. They are here because **a change
+with no switch is a change with no number you can trust**: an A/B in one binary,
+interleaved, is the only measurement this tier accepts, and that needs the two
+forms to coexist in one build.
+
+Unless a row says otherwise, the value `0` turns the switch off and anything
+else (including unset) leaves it on. `scripts/gate/switch_doc_check.py` keeps
+this table complete in both directions.
+
+### Which tier runs, and when
+
+| switch | default | what it does |
+| --- | --- | --- |
+| `JAITHON_NO_JIT` | on | Set to anything but `0` to run everything interpreted. The baseline every correctness question is settled against. |
+| `JAITHON_JIT_THRESHOLD` | 64 | Calls before the **function tier** looks at a body. `1` compiles on the first call -- the way to make the function tier deterministic. |
+| `JAITHON_JIT_TICK_US` | 1000 | `SIGPROF` period for the **OSR tier**, clamped to 50..100000. `50` is the aggressive setting; it changes a *race*, so it can miss arms a slower tick reaches. |
+| `JAITHON_JIT_TICK_ARM` | on | Whether the first tick arms a body, rather than waiting for a second. |
+| `JAITHON_JIT_OSR_FORMS` | `JAI_OSR_MAX` | Cap on compiled forms per OSR loop. |
+| `JAITHON_JIT_OSR_SLOTS` | `JAI_OSR_SLOTS` | Cap on slots an OSR entry will reconstruct. |
+| `JAITHON_JIT_RECOMPILE` | on | Recompile a body once, when the cold callee its walk stopped at finally compiles. Worth 7.3% on `lib/std`; see the recompile section. |
+
+### Stress, for finding bugs the default configuration hides
+
+| switch | default | what it does |
+| --- | --- | --- |
+| `JAITHON_JIT_DEOPT_STRESS` | off | Take every deopt exit that *can* be taken. Set to anything but `0`. |
+| `JAITHON_JIT_SPLIT_STRESS` | off | Split compiled bodies at every opportunity. |
+| `JAITHON_MEGA_STRESS` | off | (`vm_cache.c`) Force inline caches megamorphic. |
+
+### Arms, each an A/B of one feature
+
+| switch | default | what it does |
+| --- | --- | --- |
+| `JAITHON_JIT_MATCH` | on | The four enum-`match` opcodes. Off restores the pre-arm prefix compile. |
+| `JAITHON_JIT_WRAP` | on | The wrapping operators `+% -% *%`. |
+| `JAITHON_JIT_JOIN` | 1 | How exactly a join compares two operand stacks. `0` restores the 2-bit kind hash that **miscompiled** (see the golden `jit_join_kind_collision`); `1` compares the whole kind; `2` also compares `valueDepth`. |
+| `JAITHON_JIT_NULLABLE_FB` | on | Believe the nullable return-feedback band. Off reads it as mixed, which is what it meant before the band existed. |
+| `JAITHON_JIT_MAYBE_OBJ` | on | Let `mergeReturnKind` widen object-meets-null to `SLOT_MAYBE_OBJ`. |
+| `JAITHON_JIT_MAYBE_OBJ_STACK` | **off** | Let `SLOT_MAYBE_OBJ` reach the operand stack. Off until every site that reads an entry's kind is shown to exclude or handle it; `1` turns it on. |
+| `JAITHON_JIT_PIC` | on | The polymorphic inline-cache arm at an invoke. |
+| `JAITHON_JIT_CLASS_CALLS` | on | Direct calls to a class constructor. |
+| `JAITHON_JIT_MODULE_CALLS` | on | Calls through a module member. |
+| `JAITHON_JIT_MODULE_NATIVE` | on | Native calls through a module member. |
+| `JAITHON_JIT_MODULE_FIELD` | on | Reading a module member as a field. |
+| `JAITHON_JIT_STATIC_FIELD` | on | Reading a class's `statics` table. |
+| `JAITHON_JIT_SOFT_FIELD` | on | Refuse a field arm softly rather than declining the body. |
+| `JAITHON_JIT_FIELD_DECL_KIND` | on | Trust a field's declared type as its kind. |
+| `JAITHON_JIT_ELEM_DECL` | on | Trust a list's declared element type. |
+| `JAITHON_JIT_LIST_PROBE` | on | Read an element kind off a live list. |
+| `JAITHON_JIT_LIST_RESULT` | on | List-returning native results. |
+| `JAITHON_JIT_LIST_SCALAR` | on | Scalar-returning list natives. |
+| `JAITHON_JIT_RET_LIST` | on | Let a per-callee record earn `SLOT_LIST` rather than `SLOT_OBJ`. |
+| `JAITHON_JIT_RET_OBJTYPE` | on | Record the object type a callee returns. |
+| `JAITHON_JIT_RETURN_KNOWN` | on | Require a direct callee's walk to have reached a return. |
+| `JAITHON_JIT_ANY_GUARD` | on | Guard an `any`-typed value rather than refusing it. |
+| `JAITHON_JIT_CONCAT_LOCALS` | on | String concatenation into locals. |
+| `JAITHON_JIT_STRCMP` | on | String ordering comparisons. |
+| `JAITHON_JIT_STRCMP_EQ` | on | String equality. |
+| `JAITHON_JIT_STR_ITER` | on | Iterating a string. |
+| `JAITHON_JIT_OBJ_EQ` | on | Object identity comparison. |
+| `JAITHON_JIT_NULL_PAIR` | on | The null-compare pair fusion. |
+| `JAITHON_JIT_FUSED_DISCARD` | on | Fuse a call whose result is discarded. |
+| `JAITHON_JIT_MEMBERSHIP` | on | `in` against a container. |
+| `JAITHON_JIT_NEGATE` | on | Arithmetic negation. |
+| `JAITHON_JIT_TUPLE` | on | Tuple construction and unpacking. |
+
+### Limits
+
+| switch | default | what it does |
+| --- | --- | --- |
+| `JAITHON_JIT_ROOT_LIMIT` | `JIT_MAX_ROOTS` | Roots one call descriptor may carry. |
+| `JAITHON_JIT_SHAPE_LIMIT` | `JAI_OSR_SHAPES` | Shapes one site may pin. |
+
+### Diagnostics -- output only, no effect on generated code
+
+| switch | what it prints |
+| --- | --- |
+| `JAI_JIT_WHY` | Every body considered, compiled, or refused, **with the named reason**. The first thing to run. |
+| `JAI_JIT_CHAIN` | The refusal chain for a body -- but only when `compileBody` returns false, so a body that compiled a PARTIAL prefix prints nothing. |
+| `JAI_JIT_RECON` | Deopt reconstructions, one line each. A body entered and abandoned every call shows up here and nowhere else. |
+| `JAI_JIT_TRACE` | A body going hot. |
+| `JAI_JIT_DUMP` | Disassembly of the named function (exact name match). |
+| `JAITHON_JIT_COLLECT_CLASHES` | Kind clashes gathered during a walk. |
+
+`JAI_JIT_ATTRIB=1` with `--stats` gives exact per-function attribution of
+interpreted work (`sum(attrib) == vm.instructionCount`);
+`scripts/dev/jit_report.py` drives it. Rank refusals by **distinct sites**, not
+events -- the two orderings are nearly opposite.
+
 
 ### Widening
 
