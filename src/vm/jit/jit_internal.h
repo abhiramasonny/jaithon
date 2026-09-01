@@ -1182,6 +1182,18 @@ bool emitPow(Emit *e, int *offp);
 bool emitMod(Emit *e, ObjFunction *fn, int prevOff, int *offp);
 bool emitFloorDiv(Emit *e, ObjFunction *fn, int prevOff, int *offp);
 
+/* Defined in jit_body_fused.c. */
+bool emitAddLocals(Emit *e, const uint8_t *code, int *offp);
+bool emitAddBind(Emit *e, const uint8_t *code, int *offp);
+bool emitCmpLocalConstLt(Emit *e, const uint8_t *code, int *offp);
+bool emitAddIntConst(Emit *e, const uint8_t *code, int *offp);
+bool emitSubIntConst(Emit *e, const uint8_t *code, int *offp);
+bool emitMulIntConst(Emit *e, const uint8_t *code, int *offp);
+bool emitMulBind(Emit *e, const uint8_t *code, int *offp);
+bool emitSubBind(Emit *e, const uint8_t *code, int *offp);
+bool emitIncLocal(Emit *e, const uint8_t *code, int *offp);
+bool emitModIntConst(Emit *e, const uint8_t *code, int *offp);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
