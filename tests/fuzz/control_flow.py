@@ -43,7 +43,8 @@ ERRORS = ("ValueError", "TypeError", "IndexError", "KeyError", "RuntimeError")
 # tier outright (OP_CALL) and `match` stops the walk dead, so sprinkling them
 # everywhere would leave every program half interpreted and the oracle
 # comparing the interpreter with itself.
-FEATURES = ("closure", "recurse", "unwind", "match", "defer", "late", "nullable")
+FEATURES = ("closure", "recurse", "unwind", "match", "defer", "late",
+            "nullable", "retkind")
 
 HELPERS = {
     "rsum": """
@@ -88,6 +89,16 @@ fn drain(fs: list) -> int {
     var t = 0
     for h in fs { t = t + h() }
     return t
+}
+""",
+    # A callee whose RETURN kind is decided by a branch, not by an argument.
+    # The unreachable first `return` is load-bearing: a one-expression body is
+    # inlined outright, and then there is no call left to predict a kind for.
+    "branchy": """
+fn branchy(n: int, mode: int) -> any {
+    if n > 1000000000 { return "never" }
+    if mode >= 3 { return "s" }
+    return n
 }
 """,
     "make_adder": """
@@ -219,7 +230,7 @@ class Gen:
         else:
             pool = ["acc", "acc", "text", "slot_set", "slot_use", "slot_use",
                     "branch_local", "index", "div"]
-            pool += [f for f in ("closure", "recurse", "unwind")
+            pool += [f for f in ("closure", "recurse", "unwind", "retkind")
                      if f in self.features]
             if "nullable" in self.features:
                 pool += ["null_set", "null_use"]
@@ -282,6 +293,11 @@ class Gen:
             name = self.closure()
             return ["{}cap = {}".format(pad, self.iexpr(loopvars)),
                     "{}acc = acc + {}".format(pad, name)]
+        if pick == "retkind":
+            self.helpers.add("branchy")
+            return ["{}let b{}: any = branchy({}, mode)".format(
+                        pad, k, self.ivar(loopvars)),
+                    '{}text = text + f"{{b{}}}"'.format(pad, k)]
         if pick == "recurse":
             which = r.choice(("rsum", "rping"))
             self.helpers.add(which)
@@ -343,7 +359,7 @@ class Gen:
         pad = "    " * ind
         k = self.n()
         pool = ["try_catch", "try_catch", "try_finally", "throw_prop",
-                "try_return"]
+                "try_return", "slot_via_catch"]
         if in_for:
             pool += ["try_break"]
         if "match" in self.features:
@@ -376,6 +392,20 @@ class Gen:
                      pad + "} finally {",
                      "{}    acc = acc + {}".format(pad, r.randint(1, 5)),
                      pad + "}"])
+        if pick == "slot_via_catch":
+            # The handler is the only writer of the other kind, and mode 0
+            # never enters it: the tier specialises `slot` to int off a warm-up
+            # that never took the exception edge.
+            return ([pad + "try {",
+                     "{}    slot = {}".format(pad, self.iexpr(loopvars)),
+                     '{}    if mode >= {} {{ throw ValueError("s{}") }}'.format(
+                         pad, r.randint(1, NMODES - 1), k),
+                     pad + "} catch _e: ValueError {",
+                     "{}    slot = {}".format(pad, r.choice(
+                         ('"c{}"'.format(k), "null", "Node({})".format(r.randint(1, 9)),
+                          "[{}]".format(r.randint(1, 9)), "{}.5".format(r.randint(1, 9))))),
+                     pad + "}",
+                     '{}text = text + f"{{slot}}|"'.format(pad)])
         if pick == "try_break":
             # Leaving a try block sideways: the handler is never entered, but
             # the tier still has to unwind whatever the try pushed.
