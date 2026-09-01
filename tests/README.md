@@ -15,7 +15,7 @@ stdlib    tests/stdlib      layer 3, same as tests/lang: unit tests run via
                              `jaithon test`; standard-library coverage only
 checker   tests/checker     layer 3, same as tests/stdlib: unit tests for the
                              self-hosted compiler's checker/optimiser internals
-                             (jaithon.compile.check / opt.chunk), split out of
+                             (jaithon.compile.check.* / opt.*), split out of
                              tests/stdlib since they don't test std.* at all
 errors    tests/errors      layer 4: each .jai is compiled with `jaithon
                              check` and must produce the diagnostic named in
