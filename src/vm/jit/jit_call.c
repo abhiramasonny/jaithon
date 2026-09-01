@@ -1,5 +1,5 @@
-/* jit_call.c -- call emission: descriptors, direct calls, the monomorphic invoke
- * cache, inlining, and the native-call arms. */
+/* jit_call.c -- the constructor call, string concatenation, the one-load field
+ * read, and the small predicates the call arms ask before emitting. */
 #include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
