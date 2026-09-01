@@ -24,23 +24,23 @@
 #: jl.to_values(mean)    # [2.0, 3.0]
 #: ```
 import jaitensor as jt
-import std.math
 from jaitensor import Tensor
-from .base.kernels import base_kernel, cached_kernel
+from .base.kernels import cached_kernel
 from .base.params import Params, check_fitted, check_matrix, check_pair, check_width
 from .base.params import param_bool, param_float, param_int, param_str, params_of
 from .base.params import require_target
 from .base.data import column, hstack, index_tensor, matrix, select_columns, take_rows
 from .base.data import to_rows, to_values, vector
 from .base.reduce import argsort_columns, column_min_max, column_moments, column_quantiles
-from .base.reduce import copy_into, log_sum_exp_rows, masked_column_mean, row_argmax
-from .base.reduce import row_argmin, row_extreme, row_topk, sort_columns
+from .base.reduce import log_sum_exp_rows, masked_column_mean, row_argmax, row_argmin
+from .base.reduce import row_extreme, row_topk, sort_columns
 from .base.distance import GRAM_LINEAR, GRAM_POLY, GRAM_RBF, GRAM_SIGMOID, gram
 from .base.distance import pairwise_sqdist
 from .base.classes import bincount, class_sums, class_sumsq, scatter_add_rows
 from .base.elementwise import affine_columns, count_equal, nan_mask, sum_to_host
 from .base.random import kmeanspp_seed, random_normal, random_uniform, rng_for
 from .base.labels import LabelIndex, MAX_CLASSES, distinct_values
+from .base.solve import cholesky_factor, cholesky_solve, diagonal, triangular_solve
 
 export { cached_kernel }
 export { Params, check_fitted, check_matrix, check_pair, check_width, param_bool }
@@ -55,6 +55,7 @@ export { bincount, class_sums, class_sumsq, scatter_add_rows }
 export { affine_columns, count_equal, nan_mask }
 export { kmeanspp_seed, random_normal, random_uniform, rng_for }
 export { LabelIndex, MAX_CLASSES, distinct_values }
+export { cholesky_factor, cholesky_solve, diagonal, triangular_solve }
 
 #: How `model_selection` measures a fitted estimator: higher is better, always.
 #: It takes one of these rather than importing `metrics`, so a search can run
@@ -190,79 +191,4 @@ pub fn default_score(estimator: Estimator, x: Tensor, y: Tensor) -> float {
     column.free()
     if spread <= 0.0 { return 0.0 }
     return 1.0 - unexplained / spread
-}
-
-#: The lower-triangular `L` with `L LT = a`.
-#:
-#: For the normal equations and for a full-covariance Gaussian, both square in
-#: the features or the components and never in the samples. Column by column,
-#: two dispatches each because there is no barrier across a grid; a matrix that
-#: is not positive definite is caught when the diagonal comes back with a NaN.
-pub fn cholesky_factor(a: Tensor) -> Tensor {
-    let order = square_order(a)
-    let l = Tensor.zeros([order, order])
-    let step = base_kernel("base_chol_step")
-    for column in 0..order {
-        step.dispatch_async([a.buffer(), l.buffer()], 1, [order, column, 0])
-        let below = order - column - 1
-        if below > 0 { step.dispatch_async([a.buffer(), l.buffer()], below, [order, column, 1]) }
-    }
-    let pivots = diagonal(l)
-    let values = pivots.download()
-    pivots.free()
-    for (index, value) in values.enumerate() {
-        if math.is_nan(value) or value <= 0.0 {
-            l.free()
-            throw ValueError(f"the matrix is not positive definite; pivot {index} is {value}")
-        }
-    }
-    return l
-}
-
-#: Solve `L x = b`, or `LT x = b` when `transposed`. `b` may be `[order]` or
-#: `[order, n_rhs]`, and the answer keeps its shape.
-pub fn triangular_solve(l: Tensor, b: Tensor, transposed: bool = false) -> Tensor {
-    let order = square_order(l)
-    if b.rank() < 1 or b.rank() > 2 {
-        throw ValueError(f"b must be a vector or a matrix, got {b.shape}")
-    }
-    if b.shape[0] != order {
-        throw ValueError(f"b has {b.shape[0]} rows against an order-{order} factor")
-    }
-    let rhs = if b.rank() == 1 { 1 } else { b.shape[1] }
-    let x = Tensor(b.shape)
-    copy_into(b, x, b.size)
-    let solve = base_kernel("base_tri_row")
-    let upper = if transposed { 1 } else { 0 }
-    for step in 0..order {
-        let row = if transposed { order - 1 - step } else { step }
-        solve.dispatch_async([l.buffer(), x.buffer()], rhs, [order, rhs, row, upper])
-    }
-    return x
-}
-
-#: Solve `a x = b` for a symmetric positive definite `a`.
-pub fn cholesky_solve(a: Tensor, b: Tensor) -> Tensor {
-    let l = cholesky_factor(a)
-    let forward = triangular_solve(l, b, false)
-    let x = triangular_solve(l, forward, true)
-    l.free()
-    forward.free()
-    return x
-}
-
-#: The diagonal of a square matrix, as `[order]`.
-pub fn diagonal(m: Tensor) -> Tensor {
-    let order = square_order(m)
-    let out = Tensor([order])
-    copy_into(m, out, order, stride: order + 1)
-    return out
-}
-
-fn square_order(m: Tensor) -> int {
-    if m.rank() != 2 or m.shape[0] != m.shape[1] {
-        throw ValueError(f"expected a square matrix, got {m.shape}")
-    }
-    if m.shape[0] == 0 { throw ValueError("the matrix is empty") }
-    return m.shape[0]
 }
