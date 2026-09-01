@@ -142,6 +142,26 @@ def reduce(prog, oracle, original, repeat=2):
                 else:
                     break
 
+        # 2b. Container declarations. A probe's `d`, `ys`, `st`, `tp`, `ms`,
+        #     `ez` and `ed` are written by Probe.decls rather than by a Node,
+        #     so no statement deletion can reach them and a reproducer keeps
+        #     five containers it no longer touches. Clearing the flag drops the
+        #     declaration AND its digest term; if anything still names the
+        #     container the candidate fails to compile in every configuration,
+        #     which reads as agreement and puts it back.
+        for probe_idx in range(len(prog.probes)):
+            for flag in ("use_empty", "use_mixed", "use_tuple", "use_set",
+                         "use_nested", "use_dict"):
+                if not getattr(prog.probes[probe_idx], flag):
+                    continue
+
+                def build(c, pi=probe_idx, fl=flag):
+                    setattr(c.probes[pi], fl, False)
+                    return True
+                got = attempt(build)
+                if got is not None:
+                    prog, changed = got, True
+
         # 3. Helpers, then classes. A statement still naming one of them makes
         #    the candidate fail to compile everywhere, which reads as agreement.
         for idx in range(len(prog.helpers) - 1, -1, -1):
