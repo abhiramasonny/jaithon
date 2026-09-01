@@ -424,6 +424,19 @@ interpreted work (`sum(attrib) == vm.instructionCount`);
 `scripts/dev/jit_report.py` drives it. Rank refusals by **distinct sites**, not
 events -- the two orderings are nearly opposite.
 
+`scripts/dev/ab.py <SWITCH>` runs the A/B, and measures the noise floor first,
+because the floor is usually wider than the change. Six identical runs of
+`check --no-cache lib/std` spread **3.36%**, monotonically -- drift, not noise,
+so averaging launders it instead of cancelling it. `--pin` sets
+`JAITHON_JIT_THRESHOLD=1` and `JAITHON_JIT_TICK_US=100000`, which takes the same
+six runs to **0.017%** by removing the sampler's race.
+
+Pinning is not free: nothing stays cold in that regime, so it cannot see a
+change to what a caller does when its callee has no compiled form. On
+`JAITHON_JIT_NULLABLE_FB` it returns exactly 0.00% with a 0.000% floor -- not
+"no effect" but "wrong instrument", and the script says so rather than reporting
+a win.
+
 
 ### Widening
 
