@@ -165,6 +165,11 @@ void jaiCodeArenaFree(JaiCodeArena *arena);
  * reachable for the life of the process. */
 JaiCodeArena *jaiJitArena(void);
 
+/* "module.function", for every diagnostic the tier prints. The bare name is
+ * ambiguous -- `check lib/std` has three hot functions called `init` -- and
+ * qualifiedName does not help, because a cached image stores none. */
+const char *jitFnLabel(const ObjFunction *fn);
+
 /* The capacity both arenas are built at, JAITHON_JIT_ARENA_MB or one mebibyte. */
 size_t jaiCodeArenaDefaultCapacity(void);
 

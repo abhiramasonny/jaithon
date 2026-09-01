@@ -10,6 +10,34 @@
 #include <string.h>
 #include "vm/jit/jit_internal.h"
 
+/* "module.function", for every diagnostic this tier prints.
+ *
+ * The bare name is ambiguous in exactly the way that makes a report unusable:
+ * `check lib/std` has three hot functions called `init` and two called `_node`,
+ * and a reader deciding what to optimise cannot tell them apart. ObjFunction
+ * carries a qualifiedName, but it does NOT help -- serialize_read.c sets it
+ * equal to `name` for anything that came from a cached image ("stores no
+ * qualified name"), which is nearly everything. The defining module is on the
+ * function either way.
+ *
+ * A small ring of buffers rather than one, because a single fprintf may label
+ * two functions (a caller and the callee it stopped at) and one buffer would
+ * make both of them the second name. */
+const char *jitFnLabel(const ObjFunction *fn) {
+    enum { WAYS = 4, WIDTH = 160 };
+    static char ring[WAYS][WIDTH];
+    static unsigned next;
+    char *out = ring[next++ % WAYS];
+    const char *base = (fn != NULL && fn->name != NULL) ? fn->name->chars
+                                                        : "<anon>";
+    if (fn != NULL && fn->module != NULL && fn->module->name != NULL) {
+        snprintf(out, WIDTH, "%s.%s", fn->module->name->chars, base);
+    } else {
+        snprintf(out, WIDTH, "%s", base);
+    }
+    return out;
+}
+
 #if (defined(__aarch64__) || defined(__arm64__))
 
 /* JAI_JIT_CHAIN=1: print the whole chain of refusals a body would hit, not just
@@ -41,7 +69,7 @@ void reportChain(const Emit *proto, Emit *first, ObjClosure *closure,
     static Emit probe;
     uint32_t skips[JIT_MAX_CHAIN];
     unsigned n = 0;
-    const char *name = fn->name != NULL ? fn->name->chars : "<anon>";
+    const char *name = jitFnLabel(fn);
 
     fprintf(stderr, "[jit] chain %s:\n", name);
     /* Link 1 is a fact. Everything below it is a PROBE, and the probe is not

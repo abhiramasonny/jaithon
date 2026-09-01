@@ -303,7 +303,7 @@ bool jaiJitSample(ObjClosure *closure, uint32_t offset) {
         fn->tickCount++;
         if (fn->tickCount == JAI_JIT_HOT_TICKS && getenv("JAI_JIT_TRACE")) {
             fprintf(stderr, "[jit] hot: %s at offset %u\n",
-                    fn->name ? fn->name->chars : "<anon>", offset);
+                    jitFnLabel(fn), offset);
         }
         if (fn->tickCount < JAI_JIT_HOT_TICKS) return true;
         if (!jaiJitArmOnFirstTick()) return true;

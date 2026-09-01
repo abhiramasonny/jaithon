@@ -350,8 +350,23 @@ void jaiVMPrintStats(FILE *out) {
         for (unsigned i = 0; i < n; i++) {
             ObjFunction *fn = vm.attributed[i];
             if (fn->interpCount == 0) continue;
-            fprintf(out, "attrib %-40s %12" PRIu64 "  %6.2f%%\n",
-                    fn->name != NULL ? fn->name->chars : "<anon>",
+            /* Qualified by the DEFINING MODULE, not by fn->qualifiedName.
+             * The dump is read to decide what to optimise, and `init`
+             * appearing three times with three different totals is not a
+             * reading anyone can act on -- but qualifiedName does not fix it:
+             * serialize_read.c sets it equal to `name` for every function that
+             * came from a cached image ("§5 stores no qualified name"), which
+             * is almost all of them. The module is on the function either way. */
+            char label[160];
+            const char *base = fn->name != NULL ? fn->name->chars : "<anon>";
+            if (fn->module != NULL && fn->module->name != NULL) {
+                snprintf(label, sizeof label, "%s.%s",
+                         fn->module->name->chars, base);
+            } else {
+                snprintf(label, sizeof label, "%s", base);
+            }
+            fprintf(out, "attrib %-52s %12" PRIu64 "  %6.2f%%\n",
+                    label,
                     fn->interpCount,
                     vm.instructionCount > 0
                         ? 100.0 * (double)fn->interpCount

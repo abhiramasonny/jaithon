@@ -152,7 +152,7 @@ const uint8_t *loopDepthFor(const Chunk *c, unsigned *count) {
 static int osrNo(ObjFunction *fn, uint32_t top, const char *why) {
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] osr %s at %u stopped: %s\n",
-                fn->name ? fn->name->chars : "<anon>", top, why);
+                jitFnLabel(fn), top, why);
     }
     return 0;
 }
@@ -166,7 +166,7 @@ static int osrNoSlot(ObjFunction *fn, uint32_t top, unsigned slot,
         fprintf(stderr,
                 "[jit] osr %s at %u stopped: slot %u holds %s, but the form "
                 "was compiled for %s\n",
-                fn->name ? fn->name->chars : "<anon>", top, slot,
+                jitFnLabel(fn), top, slot,
                 jaiTypeNameStatic(held), slotKindName(want));
     }
     return 0;
@@ -703,7 +703,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 "[jit] osr %s at %u registers: %u reserved, %u stack "
                 "(%u incl. inlined), %u deep at a call, %u x-locals, "
                 "%u fp-locals, %u stranded, bank %s, of %u; %s\n",
-                fn->name ? fn->name->chars : "<anon>", top,
+                jitFnLabel(fn), top,
                 osrReserved(&e), probeMaxValue, probeMaxValueAll,
                 probeClobberDepth, e.xLocals, e.fpLocals, probeStranded,
                 e.scratchValues ? "x0"
@@ -725,7 +725,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         }
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] osr %s at %u stopped: %s\n",
-                    fn->name ? fn->name->chars : "<anon>", top,
+                    jitFnLabel(fn), top,
                     declineReason(&e));
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
@@ -965,7 +965,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             if (target < 0 && getenv("JAI_JIT_WHY")) {
                 fprintf(stderr, "[jit] %s stopped: a branch to %u, which is "
                                 "not an instruction this compiled\n",
-                        fn->name ? fn->name->chars : "<anon>", f->targetOffset);
+                        jitFnLabel(fn), f->targetOffset);
             }
             if (target < 0 ||
                 (f->depth >= 0 && depths[f->targetOffset] != f->depth)) {
@@ -1029,7 +1029,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             if (getenv("JAI_JIT_WHY")) {
                 fprintf(stderr, "[jit] osr %s at %u stopped: more than %u "
                         "instance slots to pin\n",
-                        fn->name ? fn->name->chars : "<anon>", top,
+                        jitFnLabel(fn), top,
                         jitShapeLimit());
             }
             return false;
@@ -1044,7 +1044,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     fn->jitOsrModuleVersion = fn->module != NULL ? fn->module->version : 0;
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] osr %s at %u: %u instructions iter=%u\n",
-                fn->name ? fn->name->chars : "<anon>", top, e.count,
+                jitFnLabel(fn), top, e.count,
                 (unsigned)iterKind);
         /* Same reason as the function tier's line: a loop that walked two
          * instructions and interpreted the other forty reported success. */
@@ -1052,7 +1052,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             fprintf(stderr,
                     "[jit] osr %s at %u walked only to %s%s at %u -- the rest of "
                     "the loop is interpreted\n",
-                    fn->name ? fn->name->chars : "<anon>", top,
+                    jitFnLabel(fn), top,
                     jaiOpName((OpCode)e.unarmedOp),
                     unarmedDetail(fn, e.unarmedOp, e.unarmedAt), e.unarmedAt);
         }

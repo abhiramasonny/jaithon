@@ -1180,7 +1180,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             if (!emitUnarmedDeopt(e, &fn->chunk, &off, stop)) {
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s declined at %s\n",
-                            fn->name ? fn->name->chars : "<anon>",
+                            jitFnLabel(fn),
                             jaiOpName((OpCode)op));
                 }
                 return false;

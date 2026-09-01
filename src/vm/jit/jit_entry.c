@@ -206,7 +206,7 @@ static JAI_NOINLINE void jitRecompileBlocked(ObjClosure *closure,
         fn->jitFuncModuleVersion = fn->module->version;
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] recompiled %s: `%s` has compiled since\n",
-                    fn->name ? fn->name->chars : "<anon>",
+                    jitFnLabel(fn),
                     blocker->name ? blocker->name->chars : "<anon>");
         }
         /* One retry per (caller, callee) PAIR. The fresh walk has recorded
@@ -241,7 +241,7 @@ static JAI_NOINLINE void jitRecompileBlocked(ObjClosure *closure,
     memcpy(fn->jitParamShape, oldShape, sizeof oldShape);
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] recompile of %s failed -- old form restored\n",
-                fn->name ? fn->name->chars : "<anon>");
+                jitFnLabel(fn));
     }
 }
 

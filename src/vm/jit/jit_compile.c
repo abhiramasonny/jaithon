@@ -233,7 +233,7 @@ static bool eligible(ObjFunction *fn) {
     if (why != NULL) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s ineligible: %s (arity=%d maxSlots=%d)\n",
-                    fn->name ? fn->name->chars : "<anon>", why, (int)fn->arity,
+                    jitFnLabel(fn), why, (int)fn->arity,
                     (int)fn->maxSlots);
         }
         return false;
@@ -416,7 +416,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
 
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] considering %s\n",
-                fn->name ? fn->name->chars : "<anon>");
+                jitFnLabel(fn));
     }
 
     JaiCodeArena *arena = jaiJitArena();
@@ -471,7 +471,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (!seedLocals(&body, slotBase)) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
-                    fn->name ? fn->name->chars : "<anon>",
+                    jitFnLabel(fn),
                     body.whyNot ? body.whyNot : "its arguments");
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
@@ -504,10 +504,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 fprintf(stderr,
                         "[jit] %s asked to retry (measuring): a local wants a "
                         "wider kind\n",
-                        fn->name ? fn->name->chars : "<anon>");
+                        jitFnLabel(fn));
             } else {
                 fprintf(stderr, "[jit] %s stopped (measuring): %s\n",
-                        fn->name ? fn->name->chars : "<anon>",
+                        jitFnLabel(fn),
                         declineReason(&body));
             }
         }
@@ -524,7 +524,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (body.usesSlot0 && body.hasSelfCall) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: a body that both recurses and reads slot 0\n",
-                    fn->name ? fn->name->chars : "<anon>");
+                    jitFnLabel(fn));
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
@@ -569,7 +569,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (e.whyNot != NULL) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s (%u locals, %u stack)\n",
-                    fn->name ? fn->name->chars : "<anon>", e.whyNot, e.locals,
+                    jitFnLabel(fn), e.whyNot, e.locals,
                     body.maxValue);
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
@@ -599,7 +599,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (e.frameBytes > 4095u) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: frame of %u bytes\n",
-                    fn->name ? fn->name->chars : "<anon>", e.frameBytes);
+                    jitFnLabel(fn), e.frameBytes);
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
@@ -694,7 +694,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (!seedLocals(&e, slotBase)) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: its locals could not be seeded on the real pass\n",
-                    fn->name ? fn->name->chars : "<anon>");
+                    jitFnLabel(fn));
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
@@ -703,7 +703,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * print "an unsupported operand form", which is how math.sqrt's own body
      * managed to stop on a named refusal and report nothing. */
     if (!compileBody(&e, closure) && getenv("JAI_JIT_WHY")) {
-        fprintf(stderr, "[jit] %s stopped: %s\n", fn->name ? fn->name->chars : "<anon>",
+        fprintf(stderr, "[jit] %s stopped: %s\n", jitFnLabel(fn),
                 declineReason(&e));
     }
     if (e.failed || e.whyNot != NULL)
@@ -711,7 +711,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (e.failed) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
-                    fn->name ? fn->name->chars : "<anon>",
+                    jitFnLabel(fn),
                     e.whyNot ? e.whyNot : "the emitter ran out of room");
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
@@ -935,7 +935,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (limit == 0) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: no stack bound available\n",
-                    fn->name ? fn->name->chars : "<anon>");
+                    jitFnLabel(fn));
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
@@ -946,7 +946,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (e.failed) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
-                    fn->name ? fn->name->chars : "<anon>",
+                    jitFnLabel(fn),
                     e.whyNot ? e.whyNot : "the emitter ran out of room");
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
@@ -971,7 +971,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: a stub it branches to "
                                     "was never emitted\n",
-                            fn->name ? fn->name->chars : "<anon>");
+                            jitFnLabel(fn));
                 }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
@@ -983,7 +983,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: a self-call block was "
                                     "never emitted\n",
-                            fn->name ? fn->name->chars : "<anon>");
+                            jitFnLabel(fn));
                 }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
@@ -995,7 +995,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: a stub it branches to "
                                     "was never emitted\n",
-                            fn->name ? fn->name->chars : "<anon>");
+                            jitFnLabel(fn));
                 }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
@@ -1007,7 +1007,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: a list-growth block was "
                                     "never emitted\n",
-                            fn->name ? fn->name->chars : "<anon>");
+                            jitFnLabel(fn));
                 }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
@@ -1019,7 +1019,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: a stub it branches to "
                                     "was never emitted\n",
-                            fn->name ? fn->name->chars : "<anon>");
+                            jitFnLabel(fn));
                 }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
@@ -1030,7 +1030,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             if (f->targetOffset > (uint32_t)fn->chunk.count) {
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: a branch target past the end of the chunk\n",
-                            fn->name ? fn->name->chars : "<anon>");
+                            jitFnLabel(fn));
                 }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
@@ -1042,7 +1042,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                         fprintf(stderr, "[jit] %s stopped: %s at %u ended the "
                                 "walk, so the branch to offset %u (%s) has "
                                 "nowhere to land\n",
-                                fn->name ? fn->name->chars : "<anon>",
+                                jitFnLabel(fn),
                                 jaiOpName((OpCode)e.unarmedOp), e.unarmedAt,
                                 f->targetOffset,
                                 f->targetOffset < (uint32_t)fn->chunk.count
@@ -1051,7 +1051,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                     } else {
                         fprintf(stderr, "[jit] %s stopped: a branch to offset "
                                 "%u, which this walk never emitted (%s)\n",
-                                fn->name ? fn->name->chars : "<anon>",
+                                jitFnLabel(fn),
                                 f->targetOffset,
                                 f->targetOffset < (uint32_t)fn->chunk.count
                                     ? jaiOpName((OpCode)fn->chunk.code[f->targetOffset])
@@ -1067,7 +1067,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 if (getenv("JAI_JIT_WHY")) {
                     fprintf(stderr, "[jit] %s stopped: offset %u is reached "
                                     "with two different operand stacks\n",
-                            fn->name ? fn->name->chars : "<anon>",
+                            jitFnLabel(fn),
                             f->targetOffset);
                 }
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
@@ -1141,20 +1141,20 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         e.whyNot = "the code arena is full";
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
-                    fn->name ? fn->name->chars : "<anon>", e.whyNot);
+                    jitFnLabel(fn), e.whyNot);
         }
         return false;
     }
 
     if (e.whyNot != NULL && getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s stopped: %s\n",
-                fn->name ? fn->name->chars : "<anon>", e.whyNot);
+                jitFnLabel(fn), e.whyNot);
     }
     if (e.assumedIntReturn && e.returnKind != SLOT_INT) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: a self-call had to guess the "
                             "return kind and guessed wrong\n",
-                    fn->name ? fn->name->chars : "<anon>");
+                    jitFnLabel(fn));
         }
         /* A self-call before the first return had to guess, and guessed
          * wrong. */
@@ -1191,7 +1191,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         fprintf(stderr,
                 "[jit] compiled %s  arity=%u locals=%u insts=%u saved=%u "
                 "spill=%d xloc=%u fploc=%u fix=%u deopt=%u maxval=%u base=%u\n",
-                fn->name ? fn->name->chars : "<anon>", e.arity, e.locals,
+                jitFnLabel(fn), e.arity, e.locals,
                 e.count, e.savedCount, (int)e.spilled, e.xLocals, e.fpLocals,
                 e.fixupCount, e.deoptCount, body.maxValue, e.base);
         /* A partial compile used to be entirely silent: emitUnarmedDeopt
@@ -1207,7 +1207,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             fprintf(stderr,
                     "[jit] %s walked only to %s%s at %u -- the rest of the body "
                     "is interpreted\n",
-                    fn->name ? fn->name->chars : "<anon>",
+                    jitFnLabel(fn),
                     jaiOpName((OpCode)e.unarmedOp),
                     unarmedDetail(fn, e.unarmedOp, e.unarmedAt), e.unarmedAt);
         }

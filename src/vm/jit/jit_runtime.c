@@ -69,7 +69,7 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     frame->ip = fn->chunk.code + gDeopt.ip;
     if (jitReconTrace()) {
         fprintf(stderr, "[deopt] %s ip=%lld base=%lld nlocals=%lld nstack=%lld\n",
-                fn->name ? fn->name->chars : "<anon>", (long long)gDeopt.ip,
+                jitFnLabel(fn), (long long)gDeopt.ip,
                 (long long)gDeopt.base, (long long)gDeopt.nlocals,
                 (long long)gDeopt.nstack);
     }
