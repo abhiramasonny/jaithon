@@ -405,6 +405,7 @@ this table complete in both directions.
 
 | switch | default | what it does |
 | --- | --- | --- |
+| `JAITHON_JIT_ARENA_MB` | 4 | Capacity of **both** code arenas, in mebibytes, clamped to 1..64. At the old default of 1 the tier declined **70 distinct bodies** on `check lib/jaithon` with "the code arena is full" -- more than any missing opcode arm -- and 4 takes that to zero, 301 compiled bodies to 369, and interpreted instructions down 13%. |
 | `JAITHON_JIT_ROOT_LIMIT` | `JIT_MAX_ROOTS` | Roots one call descriptor may carry. |
 | `JAITHON_JIT_SHAPE_LIMIT` | `JAI_OSR_SHAPES` | Shapes one site may pin. |
 

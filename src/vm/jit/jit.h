@@ -165,4 +165,7 @@ void jaiCodeArenaFree(JaiCodeArena *arena);
  * reachable for the life of the process. */
 JaiCodeArena *jaiJitArena(void);
 
+/* The capacity both arenas are built at, JAITHON_JIT_ARENA_MB or one mebibyte. */
+size_t jaiCodeArenaDefaultCapacity(void);
+
 #endif /* JAI_VM_JIT_H */

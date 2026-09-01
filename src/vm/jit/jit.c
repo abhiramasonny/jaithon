@@ -27,7 +27,7 @@ static bool sArenaReady;
 
 static bool arenaReady(void) {
     if (!sArenaReady) {
-        if (!jaiCodeArenaInit(&sArena, 1u << 20)) return false;
+        if (!jaiCodeArenaInit(&sArena, jaiCodeArenaDefaultCapacity())) return false;
         sArenaReady = true;
     }
     return true;

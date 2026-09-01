@@ -1,5 +1,6 @@
 #include "vm/jit/jit.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 
@@ -67,12 +68,45 @@ void jaiCodeArenaFree(JaiCodeArena *arena) {
 }
 
 
+/* Four mebibytes, and the previous one was a guess that cost more than anything
+ * else the tier refuses for.
+ *
+ * On `check --no-cache lib/jaithon` -- the compiler's own source -- a 1 MB
+ * arena declined SEVENTY distinct bodies with "the code arena is full", making
+ * it the single largest refusal cause in the tier, ahead of every missing
+ * opcode arm. At 4 MB that count is ZERO and 301 compiled bodies become 369.
+ * Measured with scripts/dev/ab.py: -13.3%..-12.5% interpreted instructions
+ * across three interleaved pairs against a 4.75% noise floor.
+ *
+ * It went unmeasured because there are TWO arenas of one mebibyte -- this one,
+ * which the function and OSR tiers write into, and a second in jit.c for the
+ * fallback forms -- and sizing only one measures nothing. A first sweep resized
+ * jit.c's and concluded capacity was irrelevant. They share this now so an A/B
+ * moves both.
+ *
+ * The mapping is lazy, so the cost of the headroom is address space rather than
+ * resident pages. Clamped: under a mebibyte is not worth testing, over 64 is a
+ * mapping large enough to be its own problem. */
+size_t jaiCodeArenaDefaultCapacity(void) {
+    static size_t cached;
+    if (cached == 0) {
+        unsigned mb = 4u;
+        const char *v = getenv("JAITHON_JIT_ARENA_MB");
+        if (v != NULL) {
+            long n = strtol(v, NULL, 10);
+            if (n >= 1 && n <= 64) mb = (unsigned)n;
+        }
+        cached = (size_t)mb << 20;
+    }
+    return cached;
+}
+
 JaiCodeArena *jaiJitArena(void) {
     static JaiCodeArena arena;
     static bool tried;
     if (!tried) {
         tried = true;
-        if (!jaiCodeArenaInit(&arena, 1u << 20)) return NULL;
+        if (!jaiCodeArenaInit(&arena, jaiCodeArenaDefaultCapacity())) return NULL;
     }
     return arena.code != NULL ? &arena : NULL;
 }
