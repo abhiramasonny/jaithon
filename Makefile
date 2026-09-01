@@ -344,7 +344,7 @@ ifneq ($(BUILD_GOAL),)
                              || rm -rf $(BUILD))
 endif
 
-.PHONY: all debug release test verify-test bench jaitensor jaicv jainum jaiframe exports-check install uninstall \
+.PHONY: all debug release test verify-test bench jaitensor jaicv jainum jaiframe exports-check import-check install uninstall \
         clean distclean fmt fmt-check fmt-roundtrip check help
 
 # `all` must be the default goal: the recursive release and debug targets below
@@ -403,7 +403,7 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check jit-fusion-check branch-table-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check import-check jit-fusion-check branch-table-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
 	@$(BUILD)/linetable_ltv1
@@ -474,6 +474,16 @@ opcode-check:
 .PHONY: exports-check
 exports-check:
 	@python3 scripts/exports_reachable_check.py
+
+# The other half of that: not "does anyone call this export" but "does the name
+# this import asks for exist at all". Modules resolve at run time, so a wrong
+# name is an ImportError on the line that first runs, and `check` only reports
+# a name the module never declares -- it never asks whether the module EXPORTS
+# it, so `from jainum import gpu` type-checks clean and raises at run time.
+# Pure text, and it needs no built compiler, so it runs before `check` does.
+.PHONY: import-check
+import-check:
+	@python3 scripts/import_names_check.py
 
 # sum(jaiOpCounts) == vm.instructionCount, which is the only evidence that no
 # dispatch path skips the census. VM_NEXT_HINT skipped it and loop_sum's
