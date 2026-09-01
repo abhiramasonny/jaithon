@@ -24,7 +24,6 @@
 #include "vm/gc.h"
 #include "vm/object/object.h"
 #include "vm/table.h"
-#include "common/diag.h"
 #include "runtime/runtime.h"
 
 VM vm;

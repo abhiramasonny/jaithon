@@ -1,7 +1,6 @@
 /* cli_compile.c — shared step to compile a source path into an ObjFunction. */
 #include "cli/cli_internal.h"
 
-#include "runtime/modules/frontend.h"
 #include "vm/bytecode/serialize.h"
 
 bool gSelfHosted;

@@ -10,7 +10,6 @@
 
 #include "vm/bytecode/chunk.h"
 #include "vm/object/object.h"
-#include "vm/vm.h"
 
 /* Keep in sync with chunk.h. */
 int jaiOpBranchOperandAt(uint8_t op) {

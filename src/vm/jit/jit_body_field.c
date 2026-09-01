@@ -1,10 +1,7 @@
 /* jit_body_field.c -- the field-read and type-guard arms of the opcode walk. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "runtime/runtime.h"
-#include "vm/vm.h"
 
 #include <stddef.h>
 #include <stdint.h>

@@ -1,11 +1,9 @@
 /* jit_body_call.c -- the call and invoke arms of the opcode walk. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
 #include "vm/gc.h"
 #include "runtime/runtime.h"
-#include "vm/bytecode/verify.h"
 #include "vm/vm.h"
 
 #include <stddef.h>

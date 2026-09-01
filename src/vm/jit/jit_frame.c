@@ -1,16 +1,11 @@
 /* jit_frame.c -- constants, prologue and epilogue, branches and their fixups, the
  * deopt sites, and the one-byte string ordering arm. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 /* For jaiJitFieldReadFor: which builtins are one load from their receiver. */
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
 /* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
-#include "runtime/runtime.h"
 /* For jaiOpBranchOperandAt: says which opcodes carry a branch target. */
-#include "vm/bytecode/verify.h"
-#include "vm/vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

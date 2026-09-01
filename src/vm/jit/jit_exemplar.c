@@ -1,13 +1,7 @@
 /* jit_exemplar.c -- predicting what a container holds from one live element,
  * for the arms that specialise on an element kind the model cannot see. */
-#include "vm/jit/jit.h"
 
-#include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
-#include "runtime/runtime.h"
-#include "vm/bytecode/verify.h"
-#include "vm/vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

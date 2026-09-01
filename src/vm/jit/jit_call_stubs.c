@@ -4,9 +4,6 @@
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
-#include "runtime/runtime.h"
-#include "vm/vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

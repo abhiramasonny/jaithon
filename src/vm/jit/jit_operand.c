@@ -1,13 +1,9 @@
 /* jit_operand.c -- reading a literal back out of the instruction stream, and
  * the strength reductions that only apply once one has been read. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
-#include "runtime/runtime.h"
 #include "vm/bytecode/verify.h"
-#include "vm/vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

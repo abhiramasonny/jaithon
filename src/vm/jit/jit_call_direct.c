@@ -1,12 +1,8 @@
 /* jit_call_direct.c -- branching straight to a compiled callee's entry: the
  * argument-kind match that makes it sound, and reading its result back. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
-#include "runtime/runtime.h"
-#include "vm/bytecode/verify.h"
 #include "vm/vm.h"
 
 #include <stdio.h>

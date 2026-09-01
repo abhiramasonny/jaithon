@@ -1,12 +1,8 @@
 /* jit_call_desc.c -- the call descriptor: rooting the live values a call out
  * could collect, and building the descriptor a helper reads its arguments from. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
-#include "runtime/runtime.h"
-#include "vm/vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

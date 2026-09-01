@@ -1,15 +1,10 @@
 /* jit_func.c -- whole-function JIT tier: compiles self-recursive, integer-only bodies to native arm64, bailing to the interpreter on overflow, deep recursion, or an unsupported shape. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 /* For jaiJitFieldReadFor: which builtins are one load from their receiver. */
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
 /* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
-#include "runtime/runtime.h"
 /* For jaiOpBranchOperandAt: says which opcodes carry a branch target. */
-#include "vm/bytecode/verify.h"
-#include "vm/vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

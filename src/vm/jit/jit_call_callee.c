@@ -1,12 +1,8 @@
 /* jit_call_callee.c -- one emitter per kind of callee a descriptor call can
  * reach: a global function, a module member, a module native, a class. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
-#include "runtime/runtime.h"
-#include "vm/bytecode/verify.h"
 #include "vm/vm.h"
 
 #include <stdio.h>

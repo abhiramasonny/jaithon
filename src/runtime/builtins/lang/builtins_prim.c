@@ -4,7 +4,6 @@
 #include <stdlib.h>
 
 #include "runtime/builtins/builtins.h"
-#include "runtime/methods.h"
 #include "runtime/runtime.h"
 
 #include "vm/gc.h"

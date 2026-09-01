@@ -14,7 +14,6 @@
 
 #include "vm/gc.h"
 #include "vm/table.h"
-#include "vm/vm.h"
 
 /* ------------------------------------------------------------------ */
 /* Modules                                                              */

@@ -1,13 +1,8 @@
 /* jit_call_native.c -- calls to a builtin whose result kind is known before the
  * call is made, and the one-binary A/B switches that sit alongside them. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
-#include "runtime/runtime.h"
-#include "vm/bytecode/verify.h"
-#include "vm/vm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

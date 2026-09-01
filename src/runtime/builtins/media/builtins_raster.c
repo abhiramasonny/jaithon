@@ -24,7 +24,6 @@
 #include "runtime/runtime.h"
 
 #include "native/native.h"
-#include "vm/gc.h"
 
 #define JAI_XY_SHIFT 16
 #define JAI_XY_ONE   (1 << JAI_XY_SHIFT)

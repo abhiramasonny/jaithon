@@ -1,12 +1,8 @@
 /* jit_call_inline.c -- inlining a callee's body at the call site, for the two
  * shapes the tier admits: a global function and a one-expression method. */
-#include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
 #include "vm/jit/jit_field_read.h"
-#include "vm/gc.h"
-#include "runtime/runtime.h"
-#include "vm/bytecode/verify.h"
 #include "vm/vm.h"
 
 #include <stdio.h>

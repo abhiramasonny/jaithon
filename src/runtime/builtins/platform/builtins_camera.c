@@ -4,7 +4,6 @@
  * choosing a layout for every caller; handing over what the device produced
  * lets the image type expand it in one pass. */
 
-#include "runtime/builtins/builtins.h"
 #include "runtime/runtime.h"
 #include "native/native.h"
 #include "vm/gc.h"
