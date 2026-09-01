@@ -80,6 +80,32 @@ def edges():
     return found
 
 
+def internal_leaks():
+    """A *_internal.h included from outside the directory that owns it.
+
+    The pair is the tier boundary: jit.h is what the rest of the VM may see,
+    jit_internal.h is the shared state jit_*.c pass around. Seven directories
+    use the convention and all seven keep it; this is what stops the eighth
+    reader from being the one that quietly does not.
+
+    A subdirectory of the owner counts as inside it: src/cli/commands/ is part
+    of the CLI and reads src/cli/cli_internal.h.
+    """
+    owner = {p.name: p.parent.relative_to(ROOT).as_posix()
+             for p in ROOT.joinpath("src").rglob("*_internal.h")}
+    leaks = []
+    for path in sorted(ROOT.joinpath("src").rglob("*")):
+        if path.suffix not in (".c", ".h", ".m"):
+            continue
+        here = path.parent.relative_to(ROOT).as_posix()
+        for m in re.finditer(r'#\s*include\s+"([^"]+)"', path.read_text(errors="ignore")):
+            name = m.group(1).rsplit("/", 1)[-1]
+            own = owner.get(name)
+            if own is not None and here != own and not here.startswith(own + "/"):
+                leaks.append((path.relative_to(ROOT).as_posix(), m.group(1), own))
+    return leaks
+
+
 def read_manifest():
     if not MANIFEST.exists():
         return None
@@ -118,18 +144,23 @@ def main():
         print(f"FAIL: no {MANIFEST.relative_to(ROOT)}; run with --write", file=sys.stderr)
         return 1
 
+    leaks = internal_leaks()
+    for where, inc, own in leaks:
+        print(f"internal header crossing a directory: {where} includes {inc}\n"
+              f"    only {own}/ may include it", file=sys.stderr)
+
     added = sorted(set(found) - declared)
     gone = sorted(declared - set(found))
     for src, dst in added:
         print(f"undeclared edge: {src} -> {dst}\n    {found[(src, dst)]}", file=sys.stderr)
     for src, dst in gone:
         print(f"declared edge no longer exists: {src} -> {dst}", file=sys.stderr)
-    if added or gone:
-        print(f"\n{len(added)} new, {len(gone)} stale. If the change is intended, re-run "
+    if added or gone or leaks:
+        print(f"\n{len(added)} new, {len(gone)} stale, {len(leaks)} internal leaks. If the change is intended, re-run "
               f"with --write and commit the manifest.", file=sys.stderr)
         return 1
 
-    print(f"layers ok, {len(found)} declared edges")
+    print(f"layers ok, {len(found)} declared edges, no internal header crossings")
     return 0
 
 
