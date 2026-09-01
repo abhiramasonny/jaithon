@@ -575,6 +575,28 @@ struct ObjFunction {
      * answered by re-executing the whole call, and that is only sound when the
      * abandoned attempt left nothing behind. */
     bool        jitFuncNoWrite;
+    /* The global function whose lack of a compiled form truncated this body's
+     * walk, or NULL. A partial compile SUCCEEDS -- emitUnarmedDeopt interprets
+     * from the unarmed opcode onward rather than declining -- so jitAttempts
+     * and jitRefused never see it, and the truncated form is kept FOREVER even
+     * once the named callee compiles a moment later. Nothing else here
+     * re-examines a body that succeeded.
+     *
+     * jaiJitEnterFunc retries the compile when this callee has since compiled,
+     * at most JAI_JIT_RECOMPILES times per body and never twice on the same
+     * pair, and sets it back to NULL once the budget is spent -- so the entry
+     * path's check is one load that stops costing anything after the retry.
+     *
+     * MARKED in blackenFunction. The value is a global of `module`, which is
+     * marked here already, so while the binding stands this pins nothing that
+     * was not pinned before; a REBOUND global is the case it exists for, where
+     * the old function can be collected and this would otherwise dangle.
+     *
+     * Costs this struct 16 bytes, 408 -> 424; see osrForms below for why that
+     * is a number worth writing down here. */
+    struct ObjFunction *jitBlockedOn;
+    /* Retries spent, against JAI_JIT_RECOMPILES. */
+    uint8_t     jitRecompiles;
     /* On-stack replacement: a compiled loop entered from the interpreter, with
      * the interpreter's own slots as its locals. This is what reaches a loop
      * in a function that runs once -- `main`, mostly. */

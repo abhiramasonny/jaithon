@@ -236,7 +236,7 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             unsigned rCallee = rCallee0;   /* guarded above */
 
             /* Straight to the callee's compiled entry, not through jaiCallValue/an interpreter frame -- same
-             * convention a self-call and jaiJitEnterFunc use. Callee must live in this module since the caller's module-version guard stands in for the callee's own entry check. The baked jitFunc address can't go stale: the arena is never freed and jitFunc is written once; only the ObjFunction identity needs guarding (done above). */
+             * convention a self-call and jaiJitEnterFunc use. Callee must live in this module since the caller's module-version guard stands in for the callee's own entry check. The baked jitFunc address can't go stale: the arena is never freed, so the words this branches to stay exactly what they were. jitFunc is NOT written once -- a body blocked on a cold callee is recompiled when that callee compiles (ObjFunction::jitBlockedOn) -- but the address and every field read beside it here are taken in the same instant and baked as immediates, so this site keeps calling the form it was told about rather than reading a newer one's metadata. Only the ObjFunction identity needs guarding (done above). */
             unsigned calleeArgs = (unsigned)cfn->jitArgCount;
             bool wantsClosure = calleeArgs == argc + 1u;
             if (cfn->module != fn->module || cfn->jitArgBase != 1u ||

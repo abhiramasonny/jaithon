@@ -46,6 +46,10 @@ A compile that fails is retried at most five times (`fn->jitAttempts`), then
 measured, not guessed: `jaiJitEnter`'s comment records that raising the cap to
 40 compiles seven more bodies in one workload and costs 20% wall.
 
+A compile that *partially* succeeds is a different thing and has its own,
+smaller budget -- see "A partial body is recompiled once its callee compiles"
+below.
+
 `jit.c` also holds two toy stencil compilers, `compileReturnNull` and
 `compileAccessor`, tried only after `jaiJitCompileFunc` declines. They exist as
 the smallest proof that generated code can be entered and returned from.
@@ -83,6 +87,75 @@ guard failing on one loop says nothing about the others in the same body.
 and a `for i in 0..n` head over the same body -- and emits a hand-written loop
 with a multiply-shift reciprocal for the constant divisor. It is not a general
 compiler and is tried first only because it is cheap.
+
+---
+
+## A partial body is recompiled once its callee compiles
+
+`emitUnarmedDeopt` lets a walk stop at an opcode this tier cannot speak and
+interpret the rest, rather than giving the whole body up. That partial compile
+**succeeds**. Nothing above notices: `jitAttempts` counts declines and never
+sees one, `jitRefused` is not set, and the body keeps its truncated form for
+the life of the process.
+
+Which is fine when the walk stopped at something permanent, and an accident
+when it stopped at `OP_GET_GLOBAL` on a callee that had simply not compiled
+*yet*. The caller crossed its own entry count first, the global read found no
+`jitFunc`, the walk stopped -- and the callee compiled seconds later with
+nothing to re-examine the caller. `_is_ident_start`, whose whole body is a
+call to `_is_alpha`, compiled to a single deopt and stayed that way for
+13.3 million interpreted instructions of `check --no-cache lib/std`.
+
+So `compileFuncOnce` records **which** callee stopped it, in
+`ObjFunction::jitBlockedOn`, recovered from `(fn, e.unarmedAt)` exactly as
+`unarmedDetail` recovers the name it prints. `jaiJitEnterFunc` then checks that
+one pointer on entry, and when the named callee has a `jitFunc` it did not have
+before, calls `jitRecompileBlocked`.
+
+Four things make that not the 20%-slower mistake in disguise.
+
+* **The trigger is specific.** It fires only when *the callee this body's walk
+  actually named* has compiled since -- not on "everything that failed". On
+  `check --no-cache lib/std` it fires 20 times in a run, across 20 distinct
+  bodies, and 13 of them go on to compile further. On `check lib/jaithon`, 17
+  times across 16 bodies.
+* **The bound is per (caller, callee) pair**, `JAI_JIT_RECOMPILES` of them.
+  Per-*body* was measured and is too tight: `_scan_token` needs two, on
+  `_is_ident_start` and then on `_is_digit`, and capping at one loses a third
+  of the win on `lib/jaithon`. The retry that produced a form blocked on the
+  same callee again clears the field rather than asking twice, and the count is
+  the backstop against a longer cycle. Once the budget is spent the field is
+  NULL, so the entry path's check goes back to costing nothing -- the same
+  lesson `jitRefused` records two paragraphs up.
+* **The old form is restored when the retry fails**, which it does 5 times in
+  20. Without that those bodies fall from partly-compiled to fully interpreted,
+  which is worse than what they had. It is cheap because a failed compile
+  writes nothing to the `ObjFunction`: every `fn->jit*` store in
+  `compileFuncOnce` is in its success tail.
+* **Acceptance is not gated on "walked further".** That was built and measured
+  and it is worse -- 308.35M interpreted instructions against 300.22M for
+  accept-anything. A bytecode offset is not a quality proxy: `_scan_token`'s
+  new stop offset is *lower* and its own interpreted work falls from 6,990,397
+  to 2,527.
+
+Worth 7.1% of the interpreted instructions of `check --no-cache lib/std` and
+7.5% of `check --no-cache lib/jaithon`, A/B'd in one binary on
+`JAITHON_JIT_RECOMPILE`. It is not only a compiler-shaped win: `sort_merge`,
+whose `sort` stops at `OP_GET_GLOBAL` on `merge`, goes from 14.2M interpreted
+instructions to 0.25M on one retry, and 0.33s to 0.27s.
+
+**This is the one thing in the tier that writes `jitFunc` twice.** A baked
+direct call is still sound -- the arena is never freed, so the words the old
+entry points at do not move, and `emitDirectCall` reads the address and every
+field beside it in the same instant and bakes all of them as immediates, so a
+site keeps calling the form it was told about rather than pairing old code with
+newer metadata. `jaiCallPreparedFn1` already re-validated on `fn->jitFunc !=
+p->entry` and its comment already named a recompile as the case.
+
+`jitBlockedOn` is marked in `blackenFunction`. It is a global of the function's
+own module, which is marked there already, so while the binding stands this
+pins nothing new; a *rebound* global is what it is there for, where the old
+function becomes collectable and the field would dangle.
 
 ---
 
@@ -608,6 +681,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_TUPLE` | `jitTuple` | building and unpacking tuples. |
 | `JAITHON_JIT_NEGATE` | `jitNegate` | `OP_NEG`. |
 | `JAITHON_JIT_COLLECT_CLASHES` | `jitCollectClashes` | collecting every clashing local in one measuring pass instead of one retry per clash. |
+| `JAITHON_JIT_RECOMPILE` | `jitRecompileOn` (jit_compile.c) | recording the callee that truncated a body's walk, and so the whole recompile above. Gated where the record is WRITTEN, not where it is read, so the off side really does nothing. |
 | `JAITHON_JIT_ROOT_LIMIT` | `jitRootLimit` | numeric, 1..`JIT_MAX_ROOTS`; `=10` puts the root cap back where it was when it shared the register budget. |
 | `JAITHON_JIT_SHAPE_LIMIT` | `jitShapeLimit` | numeric, 1..`JAI_OSR_SHAPES`; the OSR instance-shape cap. |
 | `JAITHON_JIT_OSR_FORMS` | `osrFormCap` | numeric, 1..`JAI_OSR_MAX`; compiled loops one body may keep. |

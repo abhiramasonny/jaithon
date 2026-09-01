@@ -113,6 +113,9 @@ static inline JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
          * the interpreter is enough -- it raises the error with a traceback. Refused permanently so a bailing body isn't re-entered every call only to bail again. */
         fn->jitRefused = true;
         fn->jitFunc = NULL;
+        /* Nothing will look at this body again, so the blocked-on callee is
+         * held for a retry that cannot happen. */
+        fn->jitBlockedOn = NULL;
         return JAI_JIT_DECLINED;
     }
 
@@ -150,9 +153,116 @@ static inline JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
     return JAI_JIT_DONE;
 }
 
+/* The callee this body's walk stopped at has a compiled form now. Compile the
+ * body again, from nothing: the retried compile shares no state with the
+ * truncated one -- jaiJitCompileFunc reseeds the model from this call's live
+ * arguments exactly as the first compile did -- so the form it produces is
+ * correct on its own terms or it is not produced.
+ *
+ * Out of line and called only from behind a NULL test, because this sits on the
+ * path of every interpreted call into every compiled body.
+ *
+ * The old form is put back whenever the retry does not succeed, and that is not
+ * a nicety: five of twenty retries on `check lib/std` fail outright, and
+ * without the restore those bodies fall from partly-compiled to entirely
+ * interpreted -- strictly worse than the truncated form they had. It is cheap
+ * because a failed compile writes NOTHING to the function: every fn->jit* store
+ * in compileFuncOnce is in its success tail, past the last `return false`, so
+ * the only field to undo is the jitFunc pointer this cleared itself. The rest
+ * is saved and restored anyway, so that stays true of whatever the tail writes
+ * next.
+ *
+ * Guarantees fn->jitFunc is not NULL on return. */
+static JAI_NOINLINE void jitRecompileBlocked(ObjClosure *closure,
+                                             ObjFunction *fn, Value *slotBase) {
+    ObjFunction *blocker = fn->jitBlockedOn;
+    /* Still cold. Ask again next call -- that is the whole point, the callee
+     * has not reached its own threshold yet. */
+    if (blocker->jitFunc == NULL) return;
+
+    uint8_t *old       = fn->jitFunc;
+    uint8_t  oldArgC   = fn->jitArgCount;
+    uint8_t  oldArgB   = fn->jitArgBase;
+    uint8_t  oldRet    = fn->jitReturnKind;
+    bool     oldRetK   = fn->jitReturnKnown;
+    uint32_t oldRetS   = fn->jitReturnShape;
+    bool     oldNoWr   = fn->jitFuncNoWrite;
+    uint32_t oldVer    = fn->jitFuncModuleVersion;
+    uint8_t  oldKind[8];
+    uint32_t oldShape[8];
+    memcpy(oldKind,  fn->jitParamKind,  sizeof oldKind);
+    memcpy(oldShape, fn->jitParamShape, sizeof oldShape);
+
+    /* jitFunc NULL for the duration, which is also what stops anything
+     * reentering this body's compiled form while it has none; jitBlockedOn is
+     * deliberately LEFT SET, because it is the only thing marking `blocker`
+     * for a collector that may run inside the compile. The success tail
+     * overwrites it with whatever stops the new walk, after the last
+     * allocation, so the comparison below still reads the old value here. */
+    fn->jitRecompiles++;
+    fn->jitFunc = NULL;
+    if (jaiJitCompileFunc(closure, slotBase)) {
+        fn->jitFuncModuleVersion = fn->module->version;
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] recompiled %s: `%s` has compiled since\n",
+                    fn->name ? fn->name->chars : "<anon>",
+                    blocker->name ? blocker->name->chars : "<anon>");
+        }
+        /* One retry per (caller, callee) PAIR. The fresh walk has recorded
+         * whatever stops it NOW, which is usually a different callee and is
+         * where the second retry's win comes from; the same callee again is
+         * not a new pair and asking twice would be a loop.
+         *
+         * Deliberately NOT gated on the new form having walked further. That
+         * was built and measured and it is worse -- 308.35M against 300.22M --
+         * because a bytecode offset is not a quality proxy: `_scan_token`'s
+         * new stop offset is LOWER and its interpreted work falls from
+         * 6,990,397 to 2,527. */
+        if (fn->jitBlockedOn == blocker ||
+            fn->jitRecompiles >= JAI_JIT_RECOMPILES) {
+            fn->jitBlockedOn = NULL;
+        }
+        return;
+    }
+
+    /* A compile that failed on this callee fails again on it, so the pair is
+     * spent whether or not it produced anything. */
+    fn->jitBlockedOn         = NULL;
+    fn->jitFunc              = old;
+    fn->jitArgCount          = oldArgC;
+    fn->jitArgBase           = oldArgB;
+    fn->jitReturnKind        = oldRet;
+    fn->jitReturnKnown       = oldRetK;
+    fn->jitReturnShape       = oldRetS;
+    fn->jitFuncNoWrite       = oldNoWr;
+    fn->jitFuncModuleVersion = oldVer;
+    memcpy(fn->jitParamKind,  oldKind,  sizeof oldKind);
+    memcpy(fn->jitParamShape, oldShape, sizeof oldShape);
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] recompile of %s failed -- old form restored\n",
+                fn->name ? fn->name->chars : "<anon>");
+    }
+}
+
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
+
+    /* One load, and NULL for every body that compiled whole -- and for every
+     * body at all once JAITHON_JIT_RECOMPILE=0 stops it being recorded. Both
+     * the version test and the budget live inside the cold branch so this
+     * stays the only thing the common path pays. */
+    if (JAI_UNLIKELY(fn->jitBlockedOn != NULL)) {
+        if (fn->module == NULL ||
+            fn->module->version != fn->jitFuncModuleVersion) {
+            /* This form is retired; rebuilding it is a different mechanism's
+             * job and this one has no business holding the callee alive for a
+             * retry that will never happen. */
+            fn->jitBlockedOn = NULL;
+            return JAI_JIT_DECLINED;
+        }
+        jitRecompileBlocked(closure, fn, slotBase);
+    }
 
     /* Compiled code reads the global naming this function exactly once, at compile time, then calls it
      * directly. Rebinding the name must invalidate that; the module's version counter moves on every global mutation, so one comparison covers it -- conservative (any global write in the module retires the form), which is the safe direction. */

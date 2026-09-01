@@ -40,7 +40,6 @@ file-local jaiGCMarkArray              src/vm/gc.c
 file-local emitGlobalsGuard            src/vm/jit/jit_global.c
 file-local emitVersionBump             src/vm/jit/jit_global.c
 file-local globalClass                 src/vm/jit/jit_global.c
-file-local globalFunction              src/vm/jit/jit_global.c
 file-local globalIsSelf                src/vm/jit/jit_global.c
 file-local globalNamespace             src/vm/jit/jit_global.c
 file-local globalSlot                  src/vm/jit/jit_global.c

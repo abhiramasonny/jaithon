@@ -262,6 +262,12 @@ static void blackenFunction(ObjFunction *fn) {
     jaiGCMark((Obj *)fn->qualifiedName);
     jaiGCMark((Obj *)fn->module);
     jaiGCMark((Obj *)fn->owner);
+    /* The callee whose uncompiled state truncated this body's walk; the tier
+     * dereferences it to ask whether it has compiled yet. It is a global of
+     * `module`, marked just above, so while that binding stands this pins
+     * nothing new -- a REBOUND global is the case it is here for, where the old
+     * function is collectable and the field would otherwise dangle. */
+    jaiGCMark((Obj *)fn->jitBlockedOn);
     markStrings(fn->paramNames, (int)fn->paramCount);
     markChunk(&fn->chunk);
 }

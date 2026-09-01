@@ -31,6 +31,27 @@
  * difference under this switch is a miscompile, which is the point. */
 extern uint32_t jaiJitThresholdOverride;
 
+/* How many times a body may be recompiled because the callee its walk stopped
+ * at has since compiled. See ObjFunction::jitBlockedOn.
+ *
+ * This is NOT the budget the comment in jaiJitEnter warns about, and the
+ * difference is worth stating because the two look identical from a distance.
+ * That one is jitAttempts, and it counts DECLINES: raising it from 5 to 40 spent
+ * thirty-five more compiles each on bodies that fail for reasons which do not
+ * resolve, and cost 20% wall. This one counts retries of bodies that SUCCEEDED
+ * -- partially -- and only ever fires when the specific named callee that
+ * truncated the walk has a compiled form it did not have before. Measured on
+ * `check --no-cache lib/std`: it fires 20 times in a run, across 20 distinct
+ * bodies, and 13 of those compile further.
+ *
+ * Two is what the workloads need. Every body on `check lib/std` retries exactly
+ * once; `_scan_token` on `check lib/jaithon` needs two, on two DIFFERENT
+ * callees, and capping at one there loses a third of the win. Nothing observed
+ * wants a third, and the cap is also the backstop that stops a cycle:
+ * jaiJitEnterFunc refuses an immediate repeat of the same pair, and at two
+ * retries a longer cycle cannot close. */
+#define JAI_JIT_RECOMPILES 2
+
 static inline uint32_t jaiJitThreshold(const ObjFunction *fn) {
     if (jaiJitThresholdOverride != 0) return jaiJitThresholdOverride;
     if (fn != NULL && (fn->flags & FN_TRACE) != 0) return JAI_JIT_TRACE_THRESHOLD;

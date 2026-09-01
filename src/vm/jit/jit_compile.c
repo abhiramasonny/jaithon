@@ -20,6 +20,21 @@
 
 #include <pthread.h>
 
+/* JAITHON_JIT_RECOMPILE=0 stops a partial body from recording the callee that
+ * truncated it, which is the whole mechanism: with nothing recorded,
+ * ObjFunction::jitBlockedOn is NULL for every body and jaiJitEnterFunc's check
+ * is the one load it always was. Gated here rather than on the entry path so
+ * the "off" side really does no work, and so the A/B is inside one binary --
+ * see the warning at the end of the README about the alternative. */
+static bool jitRecompileOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_RECOMPILE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Run-time state shared with compiled code                             */
 /* ------------------------------------------------------------------ */
@@ -1174,6 +1189,31 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                     unarmedDetail(fn, e.unarmedOp, e.unarmedAt), e.unarmedAt);
         }
     }
+
+    /* WHICH callee left this body truncated, so the entry path can look again
+     * once it compiles. Recorded here rather than at the refusal because a
+     * partial compile is a SUCCESS -- emitUnarmedDeopt keeps the prefix and
+     * interprets from the unarmed opcode onward -- so the refusal never
+     * reaches a decline path and no budget in this tier sees it.
+     *
+     * Recomputed from (fn, e.unarmedAt) exactly as unarmedDetail prints the
+     * name, so there is no new plumbing through the walk to keep in step. It
+     * is the LAST unarmed stop, not the first: emitUnarmedDeopt may fire more
+     * than once in one body, and this is the one the ceiling was measured on.
+     *
+     * Cleared on every successful compile, so a body that goes on to compile
+     * fully stops being asked about. */
+    fn->jitBlockedOn = NULL;
+    if (jitRecompileOn() && e.unarmedOp == OP_GET_GLOBAL &&
+        (size_t)e.unarmedAt + 4 <= (size_t)fn->chunk.count) {
+        Value gv;
+        ObjFunction *gfn =
+            globalFunction(closure, jaiReadU24(fn->chunk.code + e.unarmedAt + 1),
+                           &gv);
+        /* Not itself: a body still being compiled has no form to wait for. */
+        if (gfn != NULL && gfn != fn) fn->jitBlockedOn = gfn;
+    }
+
     fn->jitFunc = entry;
     return true;
 }
