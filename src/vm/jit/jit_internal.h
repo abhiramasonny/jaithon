@@ -1171,6 +1171,17 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                         const uint8_t *code, int *offp, int count,
                         bool *afterUncondp);
 
+/* Defined in jit_body_arith.c. */
+bool emitMul(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
+             int stop);
+bool emitBitOp(Emit *e, ObjFunction *fn, uint8_t op, int prevOff, int *offp);
+bool emitAddSubDiv(Emit *e, ObjFunction *fn, uint8_t op, const uint8_t *code,
+                   int *offp, int stop);
+bool emitNegate(Emit *e, int *offp);
+bool emitPow(Emit *e, int *offp);
+bool emitMod(Emit *e, ObjFunction *fn, int prevOff, int *offp);
+bool emitFloorDiv(Emit *e, ObjFunction *fn, int prevOff, int *offp);
+
 #endif /* arm64 */
 
 #endif /* JAI_VM_JIT_INTERNAL_H */
