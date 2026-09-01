@@ -48,7 +48,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 CHUNK_C = ROOT / "src/vm/bytecode/chunk.c"
-JIT_C = ROOT / "src/vm/jit/jit_func.c"
+JIT_DIR = ROOT / "src/vm/jit"
 BASELINE = ROOT / "tests/vm/jit_unarmed.baseline"
 
 # Opcodes the PEEPHOLE synthesises. Listed explicitly rather than inferred:
@@ -81,7 +81,10 @@ def declared_opcodes():
 
 
 def armed_opcodes():
-    return set(re.findall(r"case\s+(OP_[A-Z0-9_]+)\s*:", JIT_C.read_text()))
+    armed = set()
+    for src in sorted(JIT_DIR.glob("jit*.c")):
+        armed |= set(re.findall(r"case\s+(OP_[A-Z0-9_]+)\s*:", src.read_text()))
+    return armed
 
 
 def main():
@@ -93,7 +96,7 @@ def main():
     if not declared:
         problems.append("chunk.c: JAI_OPCODES parsed as empty -- regex is stale")
     if not armed:
-        problems.append("jit_func.c: no `case OP_...:` found -- regex is stale")
+        problems.append("src/vm/jit: no `case OP_...:` found -- regex is stale")
 
     for name in FUSED:
         if name not in declared:
@@ -102,7 +105,7 @@ def main():
         elif name not in armed:
             problems.append(
                 f"{name} is FUSED and has no `case {name}:` in "
-                f"src/vm/jit/jit_func.c -- every function the peephole puts it "
+                f"src/vm/jit -- every function the peephole puts it "
                 f"in will decline WHOLE. A fused opcode has no baseline "
                 f"exemption; write the arm.")
 
@@ -119,7 +122,7 @@ def main():
             continue          # already reported above, with a sharper message
         if name not in baseline:
             problems.append(
-                f"{name} has no arm in src/vm/jit/jit_func.c and is not in "
+                f"{name} has no arm in src/vm/jit and is not in "
                 f"{BASELINE.relative_to(ROOT)} -- every function containing it "
                 f"will decline WHOLE. Write the arm, or add it to the baseline "
                 f"and say why in the commit.")

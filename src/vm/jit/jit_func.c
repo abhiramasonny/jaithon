@@ -1128,7 +1128,6 @@ uint32_t stackSignature(const Emit *e) {
     return stackSignatureAt(e, e->depth);
 }
 
-
 #else
 
 #endif
