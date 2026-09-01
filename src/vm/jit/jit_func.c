@@ -15583,7 +15583,28 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * binaries with identical dynamic instruction counts. The cost is at most
      * 28 wasted bytes per compiled body in a 1 MB arena. */
     uint8_t *entry = arenaEmit(arena, e.code, e.count);
-    if (entry == NULL) return false;
+    if (entry == NULL) {
+        /* The one silent decline a body could reach AFTER `[jit] considering`:
+         * everything upstream names its reason, so a full arena looked exactly
+         * like a walk that stopped for no reason at all. It is also the only
+         * decline that says nothing about the body -- a one-instruction
+         * `fn init(self) {}` reaches it the same as a thousand-instruction
+         * loop, and which one you get depends only on how much code the
+         * process has already compiled.
+         *
+         * Worth naming twice over, because the decline is not the end of it:
+         * jaiJitEnter falls through to compileReturnNull and compileAccessor,
+         * which write into a DIFFERENT arena and so still succeed. A full
+         * arena therefore does not stop compiling, it silently changes which
+         * tier compiles -- and that is what exposed compileReturnNull
+         * returning null from an initializer (see jit.c). */
+        e.whyNot = "the code arena is full";
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: %s\n",
+                    fn->name ? fn->name->chars : "<anon>", e.whyNot);
+        }
+        return false;
+    }
 
     if (e.whyNot != NULL && getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s stopped: %s\n",
@@ -16617,7 +16638,28 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     if (!jaiCodeArenaUnseal(arena)) return false;
     /* Same 32-alignment as the function tier above, for the same two reasons. */
     uint8_t *entry = arenaEmit(arena, e.code, e.count);
-    if (entry == NULL) return false;
+    if (entry == NULL) {
+        /* The one silent decline a body could reach AFTER `[jit] considering`:
+         * everything upstream names its reason, so a full arena looked exactly
+         * like a walk that stopped for no reason at all. It is also the only
+         * decline that says nothing about the body -- a one-instruction
+         * `fn init(self) {}` reaches it the same as a thousand-instruction
+         * loop, and which one you get depends only on how much code the
+         * process has already compiled.
+         *
+         * Worth naming twice over, because the decline is not the end of it:
+         * jaiJitEnter falls through to compileReturnNull and compileAccessor,
+         * which write into a DIFFERENT arena and so still succeed. A full
+         * arena therefore does not stop compiling, it silently changes which
+         * tier compiles -- and that is what exposed compileReturnNull
+         * returning null from an initializer (see jit.c). */
+        e.whyNot = "the code arena is full";
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: %s\n",
+                    fn->name ? fn->name->chars : "<anon>", e.whyNot);
+        }
+        return false;
+    }
 
     if (fn->osrCount >= osrFormCap()) return false;
     /* First form this function has ever recorded: fewer than 2% of functions
