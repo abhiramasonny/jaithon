@@ -447,7 +447,13 @@ typedef struct {
     /* `for i in a..b` compiled as a counted loop: the iterator object stays on the interpreter's stack
      * untouched, only its index rides in a register, and every exit writes it back. */
     bool      hasIter;
-    uint8_t   iterKind;   /* 1 a unit-step range, 2 a list, 3 a dict-items view */
+    /* 1 a unit-step range, 2 a list, 3 a dict-items view, 4 a list of 2-tuples
+     * at a pair head. 3 and 4 share a prologue and reserve the same single
+     * register, because both read the index out of the ObjIter every iteration
+     * and write it straight back -- they differ only in where emitForIterPair
+     * finds the pair, and so in what elemSample holds: the DICT itself for 3,
+     * the sampled TUPLE ELEMENT for 4. */
+    uint8_t   iterKind;
     Value     elemSample;
     /* The sampled element's class is one of several the list holds, so the
      * loop variable is an instance of no particular class. Set by the driver,
@@ -1047,6 +1053,8 @@ bool jitMaybeObjOn(void);
 bool jitMatchArm(void);
 bool jitDynamicReturn(void);
 bool jitStaticMethodOn(void);
+
+bool jitPairListOn(void);
 bool modelAgreesWithChunk(const Emit *e, uint32_t off);
 bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
                           unsigned *out);

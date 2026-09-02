@@ -437,6 +437,7 @@ this table complete in both directions.
 | `JAITHON_JIT_STATIC_METHOD` | on | `Klass.static_fn` read as a value at `OP_GET_FIELD` -- what `return Klass.f()` compiles to -- as a `SLOT_FUNC` entry behind the static-call guards. |
 | `JAITHON_JIT_COLD_RETRY` | on | A decline on a callee that has not returned yet does not spend one of the five attempts, up to `JAI_JIT_COLD_RETRIES` times. Off charges it like any other decline. |
 | `JAITHON_JIT_MAYBE_OBJ_STACK` | **off** | Let `SLOT_MAYBE_OBJ` reach the operand stack. Off until every site that reads an entry's kind is shown to exclude or handle it; `1` turns it on. |
+| `JAITHON_JIT_PAIR_LIST` | on | Let a pair loop over a **list of 2-tuples** be an OSR loop head (iterKind 4), not only a dict-items view. The step is not new -- it is `emitForIterPair`'s non-dict tail, which the function tier already reaches; only `jaiJitEnterOsr`'s head gate refused it. Off restores that gate. |
 | `JAITHON_JIT_PIC` | on | The polymorphic inline-cache arm at an invoke. |
 | `JAITHON_JIT_CLASS_CALLS` | on | Direct calls to a class constructor. |
 | `JAITHON_JIT_MODULE_CALLS` | on | Calls through a module member. |
@@ -856,6 +857,109 @@ can draw: eight runs give `pic 3-way` eight times with all three checked, and
 with one of the three wrapping give `pic 1-way` twice, nothing six times, and
 the decline in all eight. A site does not lose the wrapping way. It loses the
 arm, and the loop around it.
+
+---
+
+## The pair head over a list of 2-tuples, and why it measured nothing
+
+`JAITHON_JIT_PAIR_LIST` (iterKind 4) is the cheapest kind of arm there is: a
+**tier-complement gap**. `emitForIterPair`'s non-dict tail was already a
+complete inline step for `for (a, b) in xs` over a list of 2-tuples, guarded
+and deopt-safe, and the whole-function tier already reached it. Only
+`jaiJitEnterOsr`'s head gate refused the same shape, so one source line
+compiled when its body went hot by CALL COUNT and declined when it went hot by
+SAMPLING. Closing it is 3 accepted `iterKind == 4` arms (the prologue,
+`OSR_SYNC_ITER`, `osrReserved`), a `pairIsDict` that asks the iterKind at a
+head instead of the operand-stack shape, and the gate itself. No new step, no
+new register, no new prologue -- kind 4 shares kind 3's, because both read the
+index out of the `ObjIter` every iteration rather than hoisting it, so there is
+nothing to write back at an exit.
+
+It works, and on `check --no-cache lib/jaithon` **it is worth nothing**, and
+the reason is the one this file already teaches twice.
+
+* **Ranked by refusal count it looked like the largest thing in the tier**:
+  "a pair loop over something other than a live dict view", ~1400 events.
+  Ranked by WORK it is not, and the gap between those two orderings is the
+  whole result. The gate now names the iterator kind it saw, per "name every
+  JIT refusal" -- and the naming is what settles which shape the count was
+  about. On `check --no-cache lib/jaithon` the answer is: **all of it is this
+  shape**. 1451 events over 25 distinct sites, every one a list, and not one
+  `.enumerate()` -- the `Iterator[tuple[int, T]]` sites, which are the majority
+  of the compiler's pair loops in SOURCE, never become an `osrTop` here, so
+  they never reach this gate at all. That is worth knowing precisely because a
+  reasonable reading of the source says the opposite; a source-site census and
+  a refusal census answer different questions.
+* **The site that carries the work is chained.** `jaithon.ast.node.init` is
+  6.18% of the run and its `for (name, tag) in fields_of(kind)` at 73 is the
+  largest single pair loop in it. With the arm on, that head clears link 1 and
+  stops at link 2: `OP_GET_GLOBAL: _default_field is not a compiled global
+  function` -- and `jaithon.ast.schema._default_field`, itself 3.17% of the
+  run, never compiles ("a body returning both int and list"). The dict arm was
+  the oracle for this before the list arm was built: the same body run over a
+  DICT, where the head arm already existed, declined at exactly that global.
+
+So the arm lands green and behind a switch, and the honest number is **no
+measurable effect** -- 10 interleaved pairs inside a 3.95% noise floor on a
+loaded machine, with only two bodies in the whole workload reaching it
+(`check.expr._check_args`, 0.67% of interpreted work, and
+`check.kinds._build_ordinals`, 0.00%). On an isolated probe of the shape it
+is worth **5.3x** (4,437,264 interpreted instructions to 833,173), which is
+what the arm is actually worth and what it will be worth here once
+`_default_field` compiles.
+
+### The regression the first build shipped, and the density scan
+
+The first build of this arm was held out of the tree by a review that priced
+a shape none of the measurements above contained: a pair loop over a
+`list[tuple[str, int?]]`. The head samples ONE element and pins BOTH
+component tags from it; the step's component guard is a tag compare; so a
+null where the sample had an int is a guard failure, and because the loop is
+re-entered on the very next element the failure is paid **once per null**,
+not once. With nulls at 1 in 3 that ran **3.50x slower than never
+compiling** -- the same bail-per-element trap the list-BIND head had already
+hit and answered, and the arm had simply not borrowed the answer.
+
+It now does. `jaiJitEnterOsr` scans the same capped prefix (up to 1024
+elements) over the tuple COMPONENTS, counting nulls and components of another
+tag than the sample's (the guard cannot tell those two apart, so neither does
+the scan), and refuses past **1 in 64** -- by density, not presence, for the
+reason the list-BIND head's table gives: one null in a thousand is faster
+pinned than interpreted, and refusing on presence throws that away. A sample
+whose own component is null is refused at the head by name rather than four
+compile attempts later in `emitForIterPair`. The refusals are
+`a pair loop whose tuple components are too often null` /
+`... too often change kind` / `... whose sampled tuple holds a null component`.
+
+The probe: a 4M-iteration `for (name, v) in ps` over 4000 `(str, int?)`
+tuples, `if v is null { nulls += 1 } else { acc += v + name.len() }`, whole
+process, best of 5 interleaved, switch OFF (HEAD's gate) against ON, load ~5:
+
+                  wall OFF   wall ON   interpreted OFF   interpreted ON
+    nulls 1 in 3    0.191s    0.191s       42,768,674      42,768,674
+    nulls 1 in 1000 0.215s    0.042s       48,083,345         274,505
+    no nulls        0.216s    0.032s       48,079,341         140,344
+
+The 1-in-3 row is the fix: identical to HEAD to the instruction, because the
+head refuses and the interpreter runs the loop exactly as it did before (the
+pre-scan build read 0.37s on the same row). The other two rows are what the
+arm was always worth on the shape -- 5.1x and 6.8x -- and the 1-in-1000 row
+carries its ~4 guard failures per pass at no visible cost.
+
+Nothing else moved. On `check --no-cache lib/jaithon` the function tier
+compiles 429 bodies (401 distinct) with the switch off and on; the OSR tier
+compiles 43 forms off and 48 on, the five being the pair heads this arm
+admits; no body is lost. OSR compile attempts (`[jit] osr ... stopped` plus
+forms, under `JAI_JIT_WHY`) go 27,156 to 28,335 -- the 1,454 `a pair loop
+over a list` refusals become 625 `already past its last element` re-entries
+and 5 forms; none of the three density refusals fires on the compiler at all.
+`scripts/dev/ab.py JAITHON_JIT_PAIR_LIST --workload "check --no-cache --stats
+lib/jaithon"`: floor 3.33% over 6 runs, pairs +0.10% / -3.33% / +3.40%,
+**inside the floor**, which is the expected result -- the chain through
+`_default_field` above is unchanged, so the workload still has nothing for
+the arm to accelerate. That is not a reason to hold it: the arm is correct,
+switch-gated, loses nothing, and the shape it was priced against now costs
+exactly what HEAD costs.
 
 ---
 

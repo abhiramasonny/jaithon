@@ -294,6 +294,24 @@ bool jitDynamicReturn(void) {
     return cached != 0;
 }
 
+/* The pair-over-a-list-of-2-tuples LOOP HEAD, iterKind 4.
+ *
+ * A tier-complement gap rather than a new step. emitForIterPair's non-dict
+ * tail already steps `for (a, b) in xs` over a list of 2-tuples inline, and
+ * the whole-function tier reaches it through the shape OP_GET_ITER leaves on
+ * the operand stack. Only jaiJitEnterOsr's head gate refused that shape, on
+ * the grounds that a head has no arm -- which was true of the GATE, not of the
+ * step. This switch admits it there. Off restores the gate that took only a
+ * live dict view. */
+bool jitPairListOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_PAIR_LIST");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* JAITHON_JIT_CLASS_CALLS=0 turns off the static-member call arm at OP_INVOKE,
  * for the same reason jitModuleCalls exists: the two shapes have to be
  * comparable inside ONE binary. Alternating two builds is not an A/B here --

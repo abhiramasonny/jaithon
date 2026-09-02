@@ -74,7 +74,9 @@ void emit(Emit *e, uint32_t word) {
 unsigned osrReserved(const Emit *e) {
     if (!e->hasIter) return 1u;
     if (e->iterKind == 1) return 3u;
-    if (e->iterKind == 3) return 2u;   /* dict items: the ObjIter, nothing else */
+    /* A pair head -- dict items (3) or a list of 2-tuples (4) -- keeps the
+     * ObjIter and nothing else. */
+    if (e->iterKind == 3 || e->iterKind == 4) return 2u;
     return 5u;
 }
 

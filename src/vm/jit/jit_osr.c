@@ -646,10 +646,14 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             emit(&e, jaiA64LdrD(e.slotFpReg[i], JIT_SLOTS_REG, i * 16u + 8u));
         }
     }
-    if (hasIter && iterKind == 3) {
-        /* A dict-items head keeps only the pointer: its index, limit and
-         * version all live in the ObjIter and the step reads them there, so
-         * there is nothing to hoist here and nothing to write back at an exit. */
+    if (hasIter && (iterKind == 3 || iterKind == 4)) {
+        /* A pair head keeps only the pointer: its index, limit and version all
+         * live in the ObjIter and the step reads them there, so there is
+         * nothing to hoist here and nothing to write back at an exit. True of
+         * the list-of-tuples head as well as the dict one -- the step shared
+         * with the function tier reloads all three every iteration rather than
+         * hoisting them, which is exactly why iterKind 4 needs no prologue of
+         * its own. */
         emit(&e, jaiA64MovX(JIT_PAIR_ITER_REG, 1));
     } else if (hasIter) {
         /* x1 is the iterator on entry. A range head reads everything it wants
@@ -740,10 +744,10 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
  * interpreter carries on from stale values. */
 #define OSR_SYNC_ITER()                                                        \
     do {                                                                       \
-        /* iterKind 3 keeps nothing in a register but the pointer, and the step \
-         * has already stored the index it advanced -- so every way out of a    \
-         * dict-items loop finds the ObjIter already current. */                \
-        if (hasIter && iterKind != 3) {                                        \
+        /* A pair head (3 and 4) keeps nothing in a register but the pointer,  \
+         * and the step has already stored the index it advanced -- so every   \
+         * way out of one finds the ObjIter already current. */                \
+        if (hasIter && iterKind != 3 && iterKind != 4) {                       \
             /* A range head left the iterator in the frame rather than in a    \
              * register, so it comes back here. Every stub this expands into   \
              * is a way out of the loop, so the load is off the hot path and   \
@@ -1134,17 +1138,110 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         iter = AS_ITER(it);
         if (pairTop) {
             /* `for (k, v) in d.items()` at the top of the loop being entered.
-             * Only the lazy dict view: a pair loop over a LIST of tuples has no
-             * head arm, and letting it through here would enter a form compiled
-             * for a dict with an ObjList in the register. The sample is the
-             * dict itself -- the head arm reads the first live entry out of it
-             * for the component kinds, as the list head reads items[index]. */
-            if (iter->kind != ITER_DICT_ITEMS || !IS_DICT(iter->source)) {
+             * The sample is the dict itself -- the head arm reads the first
+             * live entry out of it for the component kinds, as the list head
+             * reads items[index]. */
+            if (iter->kind == ITER_DICT_ITEMS && IS_DICT(iter->source)) {
+                elemSample = iter->source;
+                iterKind = 3;
+            } else if (jitPairListOn() && iter->kind == ITER_LIST &&
+                       IS_LIST(iter->source)) {
+                /* `for (a, b) in fields_of(kind)` -- a list of 2-tuples.
+                 * emitForIterPair's non-dict tail is a complete inline step
+                 * for exactly this, and the whole-function tier already
+                 * reaches it; only this gate refused the head, so the two
+                 * tiers disagreed about a shape neither of them had to.
+                 *
+                 * The sample here is the ELEMENT, not the source container --
+                 * the opposite of kind 3, and the one thing about the two that
+                 * is not shared. Taken from the list at the iterator's own
+                 * index rather than from the loop variable's slot, for the
+                 * reason the list-bind head below records: the slot holds
+                 * whatever the previous iteration left there, which aims the
+                 * kind guard at the wrong type.
+                 *
+                 * Nothing is promised by this sample. The step guards the
+                 * iterator kind, the object type, the version, the bound, the
+                 * storage, the element tag, OBJ_TUPLE and the count of 2, and
+                 * then each component tag -- all of it before the index is
+                 * advanced or a local is written. */
+                ObjList *psrc = AS_LIST(iter->source);
+                int pat = (int)iter->index;
+                if (pat < 0 || pat >= psrc->count) {
+                    return osrNo(fn, top,
+                                 "a pair loop already past its last element");
+                }
+                Value pel = jaiListGet(psrc, pat);
+                if (!IS_TUPLE(pel) || AS_TUPLE(pel)->count != 2) {
+                    return osrNo(fn, top,
+                                 "a pair loop over a list of something other "
+                                 "than 2-tuples");
+                }
+                /* One sample pins BOTH component tags, and the step's
+                 * component guard is a tag compare -- so a null where the
+                 * sample had an int bails out of the compiled loop, and the
+                 * loop is re-entered on the next element, so the bail is paid
+                 * per null. The first build of this arm had no scan here and
+                 * a `list[tuple[str, int?]]` with nulls at 1 in 3 ran 3.50x
+                 * SLOWER than never compiling. Same question as the list-bind
+                 * head below, same answer: DENSITY, not presence, over the
+                 * same capped prefix, at the same 1-in-64 -- and the scan
+                 * counts a component of another kind alongside a null, since
+                 * the guard cannot tell the two apart. A sample whose own
+                 * component is null would be refused by emitForIterPair four
+                 * compile attempts later; refusing it here names it and
+                 * spends nothing. */
+                {
+                    const ObjTuple *st = AS_TUPLE(pel);
+                    if (IS_NULL(st->items[0]) || IS_NULL(st->items[1])) {
+                        return osrNo(fn, top,
+                                     "a pair loop whose sampled tuple holds "
+                                     "a null component");
+                    }
+                    int scan = psrc->count < 1024 ? psrc->count : 1024;
+                    int pnulls = 0, pother = 0;
+                    for (int i = 0; i < scan; i++) {
+                        Value v = jaiListGet(psrc, i);
+                        if (!IS_TUPLE(v) || AS_TUPLE(v)->count != 2) {
+                            pother++;
+                            continue;
+                        }
+                        for (unsigned c = 0; c < 2; c++) {
+                            Value w = AS_TUPLE(v)->items[c];
+                            if (IS_NULL(w)) pnulls++;
+                            else if (w.type != st->items[c].type) pother++;
+                        }
+                    }
+                    if (pnulls * 64 > scan) {
+                        return osrNo(fn, top,
+                                     "a pair loop whose tuple components are "
+                                     "too often null");
+                    }
+                    if (pother * 64 > scan) {
+                        return osrNo(fn, top,
+                                     "a pair loop whose tuple components too "
+                                     "often change kind");
+                    }
+                }
+                elemSample = pel;
+                elemStg = psrc->stg;
+                iterKind = 4;
+            } else {
+                /* Named, because one string used to cover at least three
+                 * shapes with very different costs -- a list of 2-tuples, a
+                 * user iterator such as `.enumerate()`, and everything else --
+                 * and ranking the refusal by its count then credited the
+                 * cheapest of them with the other two's sites. */
                 return osrNo(fn, top,
-                             "a pair loop over something other than a live dict view");
+                             iter->kind == ITER_LIST
+                                 ? "a pair loop over a list, with the list "
+                                   "pair head switched off"
+                             : (iter->kind == ITER_USER ||
+                                iter->kind == ITER_TRAIT)
+                                 ? "a pair loop over a user iterator"
+                                 : "a pair loop over something other than a "
+                                   "live dict view or a list of 2-tuples");
             }
-            elemSample = iter->source;
-            iterKind = 3;
         } else if (iter->kind == ITER_RANGE && IS_RANGE(iter->source)) {
             /* Unit steps only -- that is what makes the yielded value start
              * plus the index. The start need not be 0; it is loaded at entry. */

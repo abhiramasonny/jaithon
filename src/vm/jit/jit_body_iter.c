@@ -758,9 +758,11 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
         /* As the head of an OSR loop the iterator is not on the modelled
          * operand stack at all -- it arrives in a reserved register and
          * stays on the interpreter's stack, which is what lets an exit
-         * leave without unwinding anything. Only iterKind 3 gets here: a
-         * range or list head is an OP_FOR_ITER_BIND. */
-        bool pairHead = e->osr && e->hasIter && e->iterKind == 3 &&
+         * leave without unwinding anything. Only a PAIR head gets here --
+         * iterKind 3 (a dict-items view) or 4 (a list of 2-tuples); a range
+         * or a plain list head is an OP_FOR_ITER_BIND. */
+        bool pairHead = e->osr && e->hasIter &&
+                        (e->iterKind == 3 || e->iterKind == 4) &&
                         (uint32_t)off == e->osrTop;
         if (!pairHead &&
             (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER)) {
@@ -788,7 +790,14 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
          * the iterator was built (OP_GET_ITER / OP_GET_ITER_ITEMS carries
          * it forward), and the guards below are what make that a
          * specialisation rather than an assumption. */
-        bool pairIsDict = pairHead || e->stackShape[e->depth - 1] == 4;
+        /* At a head the container is settled by the iterKind the driver chose
+         * and there is no operand-stack entry to ask; away from a head it is
+         * settled by the shape OP_GET_ITER left. Kept as two questions rather
+         * than one OR, because a head's iterKind 4 is a LIST and would
+         * otherwise be read as the shape-4 dict it happens to share a digit
+         * with. */
+        bool pairIsDict = pairHead ? e->iterKind == 3
+                                   : e->stackShape[e->depth - 1] == 4;
         Value psample = pairHead ? e->elemSample : e->stackSeen[e->depth - 1];
         SlotKind pk[2];
         unsigned ptag[2];
