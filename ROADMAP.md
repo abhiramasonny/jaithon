@@ -269,6 +269,22 @@ repeating the mistake the four proposals made.
   568.7M -> 525.8M before inlining. The 91 `if kind == TokenKind.X` chains in
   `parse/` are the same fix and are next.
 
+### Held: the lazy `enumerate` iterator
+
+Built and measured (`JAITHON_LAZY_ENUMERATE`), NOT merged. It replaces the
+eager `list.enumerate()` -- a C native that builds N 2-tuples up front -- with
+a snapshot iterator the interpreter steps into two slots, plus arms in both
+tiers. On probes it is worth 15x interpreted instructions and turns 2,005,302
+allocations into 5,295. On `check lib/jaithon` it is **inside the noise floor**,
+and allocations fall only 5.1%, because the bodies it unblocks hit the next
+link of the same chain.
+
+Held for a concrete reason, not a doubt: it claims OSR `iterKind == 4`, and the
+pair-over-list-of-tuples head merged above already uses 4. The two must be
+renumbered against each other before either can carry the other -- a partial
+apply put both in one tree and it had to be reset. Its adversarial review never
+ran (the session hit its limit), so it has a builder's word and no refuter's.
+
 ### What this says about the earlier plan
 
 Item 8, the total meet over `SlotKind`, was the end of the refusal chain for
