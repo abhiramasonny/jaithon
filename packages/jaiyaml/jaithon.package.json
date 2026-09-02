@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "jaiyaml",
+  "version": "0.1.0",
+  "description": "YAML reading and writing with PyYAML's safe_load and safe_dump API over the YAML 1.2 core schema",
+  "source": "src",
+  "dependencies": {}
+}

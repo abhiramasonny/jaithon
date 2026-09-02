@@ -211,6 +211,7 @@ unit_args+=(
     "$ROOT/packages/jailearn/tests"
     "$ROOT/packages/jaisci/tests"
     "$ROOT/packages/jaitoml/tests"
+    "$ROOT/packages/jaiyaml/tests"
 )
 
 start=$(now_ms)

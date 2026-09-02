@@ -8,6 +8,7 @@
     "packages/jaiplot",
     "packages/jaisci",
     "packages/jaitensor",
-    "packages/jaitoml"
+    "packages/jaitoml",
+    "packages/jaiyaml"
   ]
 }
