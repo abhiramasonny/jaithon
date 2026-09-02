@@ -162,6 +162,19 @@ JaiJitOutcome jaiJitEnter(ObjClosure *closure, Value *slotBase) {
              * attempts cost 0.56s -> 0.67s, **20% slower**, reproduced in an
              * interleaved A/B. Retrying is not free and the bodies that fail
              * here mostly fail for reasons that do not resolve. */
+            /* One exception, and it is the transient case the paragraph
+             * above says is NOT what usually happens: the walk named a callee
+             * that has never returned while the interpreter watched. That is
+             * a matter of time -- `_default_field` reaches its `Span.none()`
+             * arm long after its five attempts are gone -- so it does not
+             * spend an attempt, up to JAI_JIT_COLD_RETRIES of them. Everything
+             * else is charged exactly as before. */
+            if (gJitColdDecline && jaiJitColdRetryOn() &&
+                fn->jitColdRetries < JAI_JIT_COLD_RETRIES) {
+                fn->jitColdRetries++;
+                fn->entryCount = 0;
+                return JAI_JIT_DECLINED;
+            }
             if (++fn->jitAttempts >= 5) fn->jitRefused = true;
             else fn->entryCount = 0;
             return JAI_JIT_DECLINED;

@@ -149,6 +149,16 @@ bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         return false;
     }
     if (!haveKind) {
+        /* Two states with opposite fixes, split the way OP_INVOKE splits
+         * them: a callee that has never returned is a matter of TIME -- the
+         * caller crossed its threshold first -- while one whose returns
+         * disagree is a matter of kind. `Span.none` in `_default_field` is
+         * the first: the `"span"` arm is reached long after the body's
+         * attempts are spent. */
+        if (cfn->obsReturnKind == JAI_FB_NONE) {
+            e->coldCallee = true;
+            return subWhy(e, "a callee that has not returned yet");
+        }
         return subWhy(e, "a callee whose return kind is not on record");
     }
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL &&

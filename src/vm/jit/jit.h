@@ -51,6 +51,17 @@ extern uint32_t jaiJitThresholdOverride;
  * jaiJitEnterFunc refuses an immediate repeat of the same pair, and at two
  * retries a longer cycle cannot close. */
 #define JAI_JIT_RECOMPILES 2
+/* Declines that name a callee which has NOT RETURNED YET are a matter of time,
+ * not of kind: the caller crossed its threshold first. Such a decline does not
+ * spend one of the five attempts; it resets the entry count and is looked at
+ * again sixty-four calls later, this many times at most. Each retry is one
+ * measuring pass that stops at the same call, so the cap prices the worst
+ * case -- a callee that never runs -- at sixteen short walks. */
+#define JAI_JIT_COLD_RETRIES 16
+/* Set by the compile when its LAST decline was of that shape; read by
+ * jaiJitEnter, which owns the attempt budget. */
+extern bool gJitColdDecline;
+bool jaiJitColdRetryOn(void);
 
 static inline uint32_t jaiJitThreshold(const ObjFunction *fn) {
     if (jaiJitThresholdOverride != 0) return jaiJitThresholdOverride;

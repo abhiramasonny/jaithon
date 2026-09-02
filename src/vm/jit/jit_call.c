@@ -270,13 +270,18 @@ bool emitFusedReturnNull(Emit *e, ObjFunction *fn) {
         return false;
     }
     if (e->sawReturn && e->returnKind != SLOT_NULL) {
-        e->whyNot = "two different return kinds";
-        return false;
+        /* One more return site for mergeReturnKind to join, so a body whose
+         * other edges return values still reaches SLOT_DYNAMIC. */
+        if (!jitDynamicReturn() || !mergeReturnKind(e, SLOT_NULL, 0)) {
+            e->whyNot = "two different return kinds";
+            return false;
+        }
+    } else {
+        e->sawReturn  = true;
+        e->returnKind = SLOT_NULL;
     }
-    e->sawReturn  = true;
-    e->returnKind = SLOT_NULL;
     emit(e, jaiA64MovzX(0, 0, 0));
-    emitEpilogue(e, 0);
+    emitReturnLeave(e, SLOT_NULL);
     return true;
 }
 

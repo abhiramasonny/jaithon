@@ -244,6 +244,7 @@ the tier emits is chosen from it.
 | `SLOT_NULL` | what `-> void` returns: a defined zero whose tag is `VAL_NULL` |
 | `SLOT_OPAQUE` | present in a register, but nothing may be done with it -- the body never reads this slot |
 | `SLOT_SELF`, `SLOT_CLASS`, `SLOT_FUNC`, `SLOT_NATIVE` | compile-time constants; `holdsRegister` says these four occupy no register at all |
+| `SLOT_DYNAMIC` | **a return kind only** -- the body's return sites disagree, and each one hands up its own Value tag beside the value. Never an operand-stack entry, never a local's kind, never in a deopt record or an OSR form; see below |
 
 Four kinds have a compile-time tag that is a **fact**: `SLOT_INT` is always
 `VAL_INT`, `SLOT_FLOAT` always `VAL_FLOAT`, `SLOT_BOOL` always `VAL_BOOL`,
@@ -299,6 +300,65 @@ eight innocent files. The genuinely distinct ones were:
 The tiers are complements, and the lesson is the one the bug list at the end of
 this file already teaches twice: **a fix applied to one tier's copy of a ladder
 is not applied.** Grep the twin.
+
+### A body whose returns disagree
+
+`jaithon.ast.schema._default_field` returns `-1`, `[]`, `Span.none()`,
+`false`, `0`, `0.0`, three enum members and `null`, and for a long time it
+was the callee that kept `jaithon.ast.node.init` -- the hottest body in the
+compiler -- interpreted, refused at every attempt with "OP_RETURN: a body
+returning both int and list". No `SlotKind` covers int-or-list, and no widening
+rule can invent one.
+
+It does not need one. The body returns exactly one thing per call and **every
+return site knows which**, so `mergeReturnKind` joins two kinds it cannot
+otherwise represent to `SLOT_DYNAMIC`, and each return site then leaves its own
+tag: `emitReturnLeave` runs `emitTagFor` on the payload in `x0` -- the `csel`
+off the payload for a nullable kind, a constant for the rest -- and shifts it
+into bits 8..15 of `x1`, above the verdict byte that has always been there
+(`JIT_RET_TAG_SHIFT`). `jitResultOut` masks the verdict, and for a
+`SLOT_DYNAMIC` body rebuilds the `Value` from that tag rather than from the
+kind. A float goes through as raw bits, so a NaN payload is not canonicalised
+on the way; a bool is read one byte wide, as everywhere.
+
+What keeps this small is that the kind is a **return kind only**:
+
+* It never reaches the operand stack -- `pushValue3` refuses it -- so it need
+  not fit the four bits `stackSignatureAt` packs a kind into, and the
+  `_Static_assert` beside the enum says exactly that: `SLOT_MAYBE_OBJ` is the
+  last kind that may be packed, and `SLOT_DYNAMIC` sits past the limit on the
+  strength of never being pushed.
+* It never becomes a local's kind (`adoptLocalKindSeen` refuses it), never
+  appears in a deopt record, and the OSR tier never sees it because a return
+  inside an OSR loop is refused before any merge.
+* **Every compiled caller refuses a callee that returns it.** No accept-list
+  was widened: a direct call, a self-call, an indirect call, a PIC way, a
+  module or static call all read `jitReturnKind` and decline `SLOT_DYNAMIC`
+  with its name. The tag bits therefore only ever reach C. A body that both
+  returns dynamic and calls itself is refused, since the self-call site reads
+  `x1` as a bare verdict.
+* The decision is made in the **measuring pass**: the real pass learns
+  `Emit::dynamicReturn` from it before its first return site is emitted,
+  because `x1`'s meaning has to be one thing for the whole body. A
+  disagreement the real pass meets that the measuring pass did not is
+  declined rather than patched after the fact.
+
+`OP_RETURN_NULL` used to refuse bare whenever an earlier return was not null;
+it is one more site for the merge now, so `-> any` bodies that end in a bare
+`return` join too. Off with `JAITHON_JIT_DYNAMIC_RETURN=0`, which restores the
+refusal exactly.
+
+Clearing that link exposed the next two in the same body. `return Span.none()`
+is `OP_GET_FIELD` + `OP_TAIL_CALL`, not the `OP_INVOKE` that `emitClassCall`
+speaks, so the static method read as a value now becomes a `SLOT_FUNC` entry
+behind `emitClassCall`'s three guards (`JAITHON_JIT_STATIC_METHOD`). And the
+callee it names has often **not returned yet** when the caller's attempts are
+spent -- a matter of time, not of kind. It is refused under that name, and a
+decline of that shape is not charged to the five-attempt budget: `jaiJitEnter`
+resets the entry count instead, up to `JAI_JIT_COLD_RETRIES` times
+(`JAITHON_JIT_COLD_RETRY`). The paragraph in `jaiJitEnter` that priced raising
+the cap to 40 at 20% wall still stands for every other decline; this one is
+sixteen measuring passes that each stop at the same call.
 
 ### What the interpreter records about a return
 
@@ -373,6 +433,9 @@ this table complete in both directions.
 | `JAITHON_JIT_JOIN` | 1 | How exactly a join compares two operand stacks. `0` restores the 2-bit kind hash that **miscompiled** (see the golden `jit_join_kind_collision`); `1` compares the whole kind; `2` also compares `valueDepth`. |
 | `JAITHON_JIT_NULLABLE_FB` | on | Believe the nullable return-feedback band. Off reads it as mixed, which is what it meant before the band existed. |
 | `JAITHON_JIT_MAYBE_OBJ` | on | Let `mergeReturnKind` widen object-meets-null to `SLOT_MAYBE_OBJ`. |
+| `JAITHON_JIT_DYNAMIC_RETURN` | on | Let `mergeReturnKind` join two kinds it cannot otherwise represent to `SLOT_DYNAMIC`, each return site carrying its own tag. Off restores the "a body returning both X and Y" refusal. |
+| `JAITHON_JIT_STATIC_METHOD` | on | `Klass.static_fn` read as a value at `OP_GET_FIELD` -- what `return Klass.f()` compiles to -- as a `SLOT_FUNC` entry behind the static-call guards. |
+| `JAITHON_JIT_COLD_RETRY` | on | A decline on a callee that has not returned yet does not spend one of the five attempts, up to `JAI_JIT_COLD_RETRIES` times. Off charges it like any other decline. |
 | `JAITHON_JIT_MAYBE_OBJ_STACK` | **off** | Let `SLOT_MAYBE_OBJ` reach the operand stack. Off until every site that reads an entry's kind is shown to exclude or handle it; `1` turns it on. |
 | `JAITHON_JIT_PIC` | on | The polymorphic inline-cache arm at an invoke. |
 | `JAITHON_JIT_CLASS_CALLS` | on | Direct calls to a class constructor. |
@@ -835,6 +898,9 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_TICK_ARM` | `jaiJitArmOnFirstTick` | `0` restores the old two-tick wait before a body is armed. |
 | `JAITHON_JIT_OBJ_EQ` | `jitObjEquality` | the call-out arm at the end of each equality chain. |
 | `JAITHON_JIT_ELEM_DECL` | `elemDeclOn` | using a list's *declared* element kind when there is no live list to sample -- a fact, not a guess, since the same byte pins `ObjList::stg` while the list is still empty. |
+| `JAITHON_JIT_DYNAMIC_RETURN` | `jitDynamicReturn` | the `SLOT_DYNAMIC` join in `mergeReturnKind`. |
+| `JAITHON_JIT_STATIC_METHOD` | `jitStaticMethodOn` | the static-method arm of `OP_GET_FIELD` on a `SLOT_CLASS` receiver. |
+| `JAITHON_JIT_COLD_RETRY` | `jaiJitColdRetryOn` | not charging a not-yet-returned-callee decline to the attempt budget (`jaiJitEnter`). |
 | `JAITHON_JIT_MODULE_CALLS` | `jitModuleCalls` | the module-member call arm at `OP_INVOKE`. |
 | `JAITHON_JIT_CLASS_CALLS` | `jitClassCalls` | the static-member call arm at `OP_INVOKE`. |
 | `JAITHON_JIT_MODULE_NATIVE` | `jitModuleNativeCalls` | both halves of the `__prim__.f64_sqrt` arm at once -- neither compiles anything useful alone. |

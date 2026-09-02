@@ -597,6 +597,9 @@ struct ObjFunction {
     struct ObjFunction *jitBlockedOn;
     /* Retries spent, against JAI_JIT_RECOMPILES. */
     uint8_t     jitRecompiles;
+    /* Uncharged attempts spent on a callee that had not returned yet, against
+     * JAI_JIT_COLD_RETRIES. Sits in the padding after the pointer above. */
+    uint8_t     jitColdRetries;
     /* On-stack replacement: a compiled loop entered from the interpreter, with
      * the interpreter's own slots as its locals. This is what reaches a loop
      * in a function that runs once -- `main`, mostly. */

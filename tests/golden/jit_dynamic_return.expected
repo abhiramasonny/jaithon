@@ -1,0 +1,27 @@
+0 Pt:0 null int:1 null
+1 Pt:1 null int:2 null
+2 Pt:2 null int:3 null
+198 Pt:198 null int:199 int:16
+199 Pt:199 null int:200 int:18
+bool/0 -> bool:true
+bool/1 -> bool:false
+false/0 -> bool:false
+false/1 -> bool:false
+float/0 -> float:0.5
+float/1 -> float:0.5
+inst/0 -> Pt:0
+inst/1 -> Pt:1
+int/0 -> int:-1
+int/1 -> int:-1
+list/0 -> list:0
+list/1 -> list:0
+nan/0 -> float:nan
+nan/1 -> float:nan
+negzero/0 -> float:-0.0
+negzero/1 -> float:-0.0
+none/0 -> null
+none/1 -> null
+str/0 -> str:s
+str/1 -> str:s
+zero/0 -> int:0
+zero/1 -> int:0

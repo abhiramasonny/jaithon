@@ -116,6 +116,9 @@ bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
     if (kind == SLOT_MAYBE_OBJ) {
         return subWhy(e, "binding an object-or-null to a local");
     }
+    if (kind == SLOT_DYNAMIC) {
+        return subWhy(e, "binding a dynamic return kind to a local");
+    }
     if (!IS_NULL(seen)) e->localSeen[slot] = seen;
     if (!e->localTyped[slot]) {
         /* A slot an earlier attempt asked to be widened takes the wider kind
@@ -405,6 +408,8 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     return false;
 }
 
+bool gJitColdDecline;
+
 static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *dynamic, bool *needDynamic,
                             const bool *nullable, bool *needNullable,
@@ -413,6 +418,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     gInlineFailed   = false;
     gMatchUsed      = false;
     gNullableFbUsed = false;
+    gJitColdDecline = false;
 
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] considering %s\n",
@@ -490,6 +496,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (!compileBody(&body, closure) || body.pendingRetry) {
         memcpy(needDynamic, body.needDynamic, sizeof body.needDynamic);
         memcpy(needNullable, body.needNullable, sizeof body.needNullable);
+        gJitColdDecline = body.coldCallee && !body.pendingRetry;
         if (getenv("JAI_JIT_WHY")) {
             /* A RETRY IS NOT A REFUSAL, and printing it as one cost a whole
              * session of analysis. This exit is `!compileBody(...) ||
@@ -530,6 +537,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         return false;
     }
     e.base         = body.usesSlot0 ? 0u : 1u;
+    /* The measuring pass has walked every return this pass will: if they
+     * disagreed there, every return site here carries its own tag in x1.
+     * Decided before the first site is emitted, because x1's meaning has to
+     * be one thing for the whole body. */
+    e.dynamicReturn = body.returnKind == SLOT_DYNAMIC;
     /* Only as far as the body reaches, never the whole window. */
     unsigned highest = body.maxSlotUsed;
     if (highest < fn->arity) highest = fn->arity;
@@ -706,8 +718,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         fprintf(stderr, "[jit] %s stopped: %s\n", jitFnLabel(fn),
                 declineReason(&e));
     }
-    if (e.failed || e.whyNot != NULL)
-        { jitFree(map, depths, chunkDepth, fn->chunk.count + 1); return false; }
+    if (e.failed || e.whyNot != NULL) {
+        gJitColdDecline = e.coldCallee && !e.failed;
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+        return false;
+    }
     if (e.failed) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
@@ -1149,6 +1164,25 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     if (e.whyNot != NULL && getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s stopped: %s\n",
                 jitFnLabel(fn), e.whyNot);
+    }
+    if (e.dynamicReturn) {
+        /* A self-call reads x1 as a bare verdict (`subs x1, #0`) and takes x0
+         * as the kind mergeReturnKind had settled on when the call was
+         * emitted. With a tag in x1 and a different kind on every edge, both
+         * of those are wrong, so a body that recurses stays interpreted. */
+        if (e.hasSelfCall || e.selfSlowCount > 0) {
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] %s stopped: a body returning dynamic "
+                                "that also calls itself\n",
+                        jitFnLabel(fn));
+            }
+            return false;
+        }
+        /* Every site this pass emitted carries its tag, and jitResultOut reads
+         * the tag rather than the kind -- so the kind the walk happened to
+         * settle on is not what the entry point should believe, even if this
+         * pass met fewer returns than the measuring one. */
+        if (e.sawReturn) { e.returnKind = SLOT_DYNAMIC; e.returnShape = 0; }
     }
     if (e.assumedIntReturn && e.returnKind != SLOT_INT) {
         if (getenv("JAI_JIT_WHY")) {

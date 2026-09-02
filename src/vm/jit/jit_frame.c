@@ -92,6 +92,13 @@ void emitFpSaveRestore(Emit *e, bool save) {
 
 void emitEpilogue(Emit *e, unsigned bailed) {
     emit(e, jaiA64MovzX(1, bailed, 0));
+    emitEpilogueKeepX1(e);
+}
+
+/* The epilogue with x1 already set by the caller: a SLOT_DYNAMIC return site
+ * has put the site's Value tag there (emitReturnLeave) and the verdict byte
+ * below it is zero. Nothing between here and `ret` touches x1. */
+void emitEpilogueKeepX1(Emit *e) {
     emitFpSaveRestore(e, false);
     emitSaveRestore(e, false);
     emitFrameLeave(e);
@@ -246,6 +253,42 @@ bool jitMatchArm(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_MATCH");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_DYNAMIC_RETURN=0 makes mergeReturnKind refuse two disagreeing
+ * return kinds the way it always did, instead of widening to SLOT_DYNAMIC.
+ * Default ON; read once, same reason as every switch above. */
+/* JAITHON_JIT_STATIC_METHOD=0 turns off OP_GET_FIELD's static-method arm --
+ * `Klass.static_fn` read as a value, which is what `return Klass.f()` and
+ * every other tail-called static compiles to. Default ON; read once. */
+bool jitStaticMethodOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_STATIC_METHOD");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_COLD_RETRY=0 charges a decline on a not-yet-returned callee to
+ * the five-attempt budget exactly as every other decline is. Default ON; read
+ * once. Named with the jai prefix because jaiJitEnter (jit.c) reads it. */
+bool jaiJitColdRetryOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_COLD_RETRY");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+bool jitDynamicReturn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DYNAMIC_RETURN");
         cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
     }
     return cached != 0;

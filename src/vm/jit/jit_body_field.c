@@ -544,6 +544,74 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
             }
             ObjString *sname = AS_STRING(sNameVal);
 
+            /* `Klass.static_fn` read as a VALUE. `return Span.none()` is
+             * OP_GET_FIELD + OP_TAIL_CALL, not the OP_INVOKE emitClassCall
+             * speaks, so the static that every `-> Span` default reaches
+             * stopped `_default_field` with "`none` is not a field of
+             * Span" once its returns had merged. The closure becomes a
+             * SLOT_FUNC entry exactly as OP_GET_GLOBAL makes one for a
+             * module function -- no register, the value baked -- behind
+             * emitClassCall's own three guards (the statics table has not
+             * rehashed, the tag, the pointer), so the call that follows
+             * takes emitGlobalCall's path with everything it checks. The
+             * same visibility rule as emitClassCall: a non-public static
+             * would skip the check the interpreter makes per call. */
+            Value smethod;
+            if (jitStaticMethodOn() &&
+                jaiTableGetInterned(&klass->statics, sname, &smethod) &&
+                IS_CLOSURE(smethod)) {
+                MethodInfo smi;
+                if (jaiClassRestrictedMethod(klass, sname, &smi)) {
+                    return subWhy(e, "`%s.%s` is not public",
+                                  klass->name ? klass->name->chars : "?",
+                                  sname->chars);
+                }
+                JaiEntry *mslot =
+                    jaiTableFindEntryInterned(&klass->statics, sname);
+                if (mslot == NULL) {
+                    return subWhy(e, "a static with no table entry");
+                }
+                settleAll(e);
+                /* emitClassCall's guard, not emitStaticsGuard: that one
+                 * reads the table staticFieldSlot pinned for this body, and
+                 * this arm pins nothing -- it compares the class's own
+                 * keyVersion against the value baked now, so a second
+                 * class's static in the same body is not a refusal here. */
+                emitConst64(e, JIT_SCRATCH_D,
+                            (int64_t)(uintptr_t)&klass->statics.keyVersion);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+                emitConst64(e, JIT_SCRATCH_B,
+                            (int64_t)(uint32_t)klass->statics.keyVersion);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+                emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)mslot);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(JaiEntry, value)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, VAL_OBJ));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                   (unsigned)offsetof(JaiEntry, value) + 8u));
+                emitConst64(e, JIT_SCRATCH_B,
+                            (int64_t)(uintptr_t)AS_OBJ(smethod));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+                if (e->failed) return false;
+                /* The class held no register; dropping it is the whole of
+                 * popping it, and the function entry holds none either. */
+                e->depth--;
+                if (e->depth >= JIT_MAX_STACK) return false;
+                e->stackShape[e->depth] = 0;
+                e->stackClass[e->depth] = (ObjClass *)(void *)AS_OBJ(smethod);
+                e->stackSeen[e->depth]  = smethod;
+                e->stackLocal[e->depth] = -1;
+                e->stackAscii[e->depth] = false;
+                e->stackNullLit[e->depth] = false;
+                e->stackUnit[e->depth]  = false;
+                e->stack[e->depth++]    = SLOT_FUNC;
+                off += 6;
+                break;
+            }
+
             const FieldInfo *sinfo = jaiClassFieldInfo(klass, sname);
             if (sinfo == NULL) {
                 return subWhy(e, "`%s` is not a field of %s", sname->chars,

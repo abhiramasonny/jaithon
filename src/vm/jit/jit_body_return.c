@@ -12,6 +12,33 @@
 
 /* `build` in binary_trees returns `null` on one path and `Node(..)` on another -- an instance merged
  * with a maybe-instance becomes a maybe-instance (shape survives only if both sides agree). Written once before and reverted when it made binary_trees 11x slower -- not this merge's fault: at the time a self-call rooted nothing and emitRootFill's operand-stack-to-register mapping was wrong, and `build` was the first body to hold a fresh allocation across an allocating self-call. Both bugs are now fixed. */
+/* The kinds a SLOT_DYNAMIC body may return from any one site: exactly those
+ * emitTagFor can tag off the register and jitResultOut can rebuild a Value
+ * from. SLOT_OPAQUE is the one register-holding kind kept out -- its payload
+ * is nothing in particular. SLOT_DYNAMIC itself is admitted so a third
+ * disagreeing site joins an already-dynamic body. */
+static bool dynamicReturnKind(SlotKind k) {
+    switch (k) {
+    case SLOT_INT: case SLOT_FLOAT: case SLOT_BOOL: case SLOT_NULL:
+    case SLOT_INST: case SLOT_MAYBE_INST: case SLOT_LIST: case SLOT_OBJ:
+    case SLOT_MAYBE_OBJ: case SLOT_DYNAMIC:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Leave the body with the value in x0. A SLOT_DYNAMIC body also says WHICH
+ * kind of value: emitTagFor reads the tag off the payload for the nullable
+ * kinds and names it for the rest, and it goes up in x1 above a zero verdict
+ * byte. Every other body leaves x1 as the bare verdict it always was. */
+void emitReturnLeave(Emit *e, SlotKind k) {
+    if (!e->dynamicReturn) { emitEpilogue(e, 0); return; }
+    emitTagFor(e, k, 0, JIT_SCRATCH_A, JIT_SCRATCH_B);
+    emit(e, jaiA64LslX(1, JIT_SCRATCH_A, JIT_RET_TAG_SHIFT));
+    emitEpilogueKeepX1(e);
+}
+
 bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
     if (!e->sawReturn) {
         e->sawReturn = true; e->returnKind = k; e->returnShape = shape;
@@ -19,6 +46,13 @@ bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
     }
     if (e->returnKind == k) {
         if (e->returnShape != shape) e->returnShape = 0;
+        return true;
+    }
+    if (e->returnKind == SLOT_DYNAMIC) {
+        if (!dynamicReturnKind(k)) {
+            return subWhy(e, "a body returning dynamic and also %s",
+                          slotKindName(k));
+        }
         return true;
     }
     bool nullable = (e->returnKind == SLOT_INST && k == SLOT_MAYBE_INST) ||
@@ -46,6 +80,33 @@ bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
         e->returnKind = SLOT_MAYBE_OBJ;
         return true;
     }
+    /* Two kinds nothing above can join -- `-1` on one edge and `[]` on
+     * another. The body still returns exactly one of them per call, and each
+     * site knows which: under JAITHON_JIT_DYNAMIC_RETURN the join is
+     * SLOT_DYNAMIC and every return site hands its own tag up in x1
+     * (emitReturnLeave), for jitResultOut to rebuild the Value from. Only
+     * kinds emitTagFor can tag and jitResultOut can rebuild are admitted; a
+     * self-call reads x1 as a bare verdict and x0 as one fixed kind, so a body
+     * that recurses is refused here rather than miscompiled. */
+    if (!nullable && jitDynamicReturn() && !e->osr &&
+        dynamicReturnKind(e->returnKind) && dynamicReturnKind(k)) {
+        if (e->hasSelfCall || e->selfSlowCount > 0) {
+            return subWhy(e, "a body returning both %s and %s that also "
+                             "calls itself",
+                          slotKindName(e->returnKind), slotKindName(k));
+        }
+        if (!e->measuring && !e->dynamicReturn) {
+            /* The real pass met a disagreement the measuring pass did not,
+             * so the sites already emitted carry no tag. Cannot be re-tagged
+             * after the fact; decline rather than guess. */
+            return subWhy(e, "a body returning both %s and %s, seen only "
+                             "in the second pass",
+                          slotKindName(e->returnKind), slotKindName(k));
+        }
+        e->returnShape = 0;
+        e->returnKind = SLOT_DYNAMIC;
+        return true;
+    }
     /* Named, because bare this was the whole of what a census said about
      * OP_RETURN: which two kinds a body cannot agree on is the entire question,
      * and an instance meeting a nullable instance is already merged above. */
@@ -55,6 +116,21 @@ bool mergeReturnKind(Emit *e, SlotKind k, uint32_t shape) {
     }
     if (e->returnShape != shape) e->returnShape = 0;
     e->returnKind = SLOT_MAYBE_INST;
+    return true;
+}
+
+/* OP_RETURN_NULL's half of the merge. It used to refuse bare, with no reason
+ * named, whenever any earlier return was not null; now it is one more site
+ * for mergeReturnKind to join -- which is what lets `-> any` bodies that end
+ * in a bare `return` reach SLOT_DYNAMIC. With the switch off the old check
+ * stands exactly as it was. */
+static bool mergeReturnNull(Emit *e) {
+    if (e->sawReturn && e->returnKind != SLOT_NULL) {
+        if (!jitDynamicReturn()) return false;
+        return mergeReturnKind(e, SLOT_NULL, 0);
+    }
+    e->sawReturn  = true;
+    e->returnKind = SLOT_NULL;
     return true;
 }
 
@@ -78,7 +154,7 @@ bool emitReturn(Emit *e, int *offp) {
          * from it, and it cannot rebuild two. */
         if (!mergeReturnKind(e, k, rsh)) return false;
         emit(e, jaiA64MovX(0, r));
-        emitEpilogue(e, 0);
+        emitReturnLeave(e, k);
         off += 1;
         break;
     } while (0);
@@ -98,11 +174,9 @@ bool emitReturnNull(Emit *e, ObjFunction *fn, int *offp) {
         if ((fn->flags & FN_INIT) == 0) {
             /* A function with nothing to return. No register carries the
              * answer; the entry point builds a null from the kind alone. */
-            if (e->sawReturn && e->returnKind != SLOT_NULL) return false;
-            e->sawReturn  = true;
-            e->returnKind = SLOT_NULL;
+            if (!mergeReturnNull(e)) return false;
             emit(e, jaiA64MovzX(0, 0, 0));
-            emitEpilogue(e, 0);
+            emitReturnLeave(e, SLOT_NULL);
             off += 1;
             break;
         }
@@ -118,7 +192,7 @@ bool emitReturnNull(Emit *e, ObjFunction *fn, int *offp) {
             unsigned src = localIn(e, 0, 0);
             if (src != 0) emit(e, jaiA64MovX(0, src));
         }
-        emitEpilogue(e, 0);
+        emitReturnLeave(e, SLOT_INST);
         off += 1;
         break;
     } while (0);
@@ -147,11 +221,9 @@ bool emitPopReturnNull(Emit *e, ObjFunction *fn, int *offp) {
             return false;
         }
         if ((fn->flags & FN_INIT) == 0) {
-            if (e->sawReturn && e->returnKind != SLOT_NULL) return false;
-            e->sawReturn  = true;
-            e->returnKind = SLOT_NULL;
+            if (!mergeReturnNull(e)) return false;
             emit(e, jaiA64MovzX(0, 0, 0));
-            emitEpilogue(e, 0);
+            emitReturnLeave(e, SLOT_NULL);
             off += 1;
             break;
         }
@@ -165,7 +237,7 @@ bool emitPopReturnNull(Emit *e, ObjFunction *fn, int *offp) {
             unsigned src = localIn(e, 0, 0);
             if (src != 0) emit(e, jaiA64MovX(0, src));
         }
-        emitEpilogue(e, 0);
+        emitReturnLeave(e, SLOT_INST);
         off += 1;
         break;
     } while (0);

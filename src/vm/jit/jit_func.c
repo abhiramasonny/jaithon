@@ -46,6 +46,7 @@ const char *slotKindName(SlotKind k) {
     case SLOT_NULL:       return "null";
     case SLOT_OBJ:        return "object";
     case SLOT_LIST:       return "list";
+    case SLOT_DYNAMIC:    return "dynamic";
     }
     return "an unnamed kind";
 }
@@ -981,6 +982,14 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
      * so a future producer gets a refusal and not a miscompile. */
     if (kind == SLOT_MAYBE_OBJ && !jitMaybeObjStackOn()) {
         e->whyNot = "an object-or-null on the operand stack";
+        return false;
+    }
+    /* SLOT_DYNAMIC is a return kind and nothing else. It does not fit the
+     * four bits a stack signature packs a kind into, no ladder in either tier
+     * has an arm for it, and its tag lives in x1 rather than anywhere a stack
+     * entry's does. Refused here so it can never be pushed by any producer. */
+    if (kind == SLOT_DYNAMIC) {
+        e->whyNot = "a dynamic return kind on the operand stack";
         return false;
     }
     if (!e->measuring && inlineOwnBank(e) &&

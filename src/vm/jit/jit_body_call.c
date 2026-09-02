@@ -340,6 +340,13 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
         /* Recorded, not rejected, here: the measuring pass always runs with slot 0 available, so testing the
          * base in THIS pass silently aborted every recursive function's compile (fib_recursive: 8.8ms back to 83ms). The decision belongs after the base is actually chosen. */
         e->hasSelfCall = true;
+        /* The site below reads x1 as a bare verdict and x0 as one settled
+         * kind; a SLOT_DYNAMIC body answers with neither. mergeReturnKind
+         * refuses the widening once this flag is set, and this refuses the
+         * call once the widening is decided, so the two can never coexist. */
+        if (e->dynamicReturn || e->returnKind == SLOT_DYNAMIC) {
+            return subWhy(e, "a self-call in a body returning dynamic");
+        }
         if (e->depth < argc + 1) return false;
         if (e->stack[e->depth - argc - 1] != SLOT_SELF) return false;
 
@@ -538,7 +545,7 @@ bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
         if (!popValue(e, &r, &k)) return false;
         if (!mergeReturnKind(e, k, tshape)) return false;
         emit(e, jaiA64MovX(0, r));
-        emitEpilogue(e, 0);
+        emitReturnLeave(e, k);
         off += 2;
         /* The compiler emits OP_RETURN after a tail call and the
          * interpreter never reaches it, because the tail call returned.
@@ -871,6 +878,7 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                  * interpreter watched (a mutually-recursive pair never can),
                  * while a recorded-but-unusable one means the feedback saw
                  * more than one kind and no widening covers them. */
+                if (mfn->obsReturnKind == JAI_FB_NONE) e->coldCallee = true;
                 mwhy = mfn->obsReturnKind == JAI_FB_NONE
                      ? "a method that has not returned yet"
                      : mfn->obsReturnKind == JAI_FB_MIXED

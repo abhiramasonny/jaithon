@@ -177,8 +177,23 @@ typedef enum {
  * shape. What `-> OpKind?` returns. Produced ONLY by mergeReturnKind and
  * consumed only where a return kind is; pushValue refuses it, so none of the
  * ninety-odd sites that treat SLOT_MAYBE_INST as instance-like can see it. */
-    SLOT_MAYBE_OBJ
+    SLOT_MAYBE_OBJ,
+    /* A RETURN KIND ONLY. A body whose return sites disagree -- `-1` on one
+     * edge, `[]` on another, `0.0` on a third -- returns whatever each site
+     * held, and says which by carrying that site's Value tag in bits 8..15 of
+     * JitResult::bailed (JIT_RET_TAG_SHIFT). jitResultOut rebuilds the Value
+     * from (tag, payload). It is never an operand-stack entry, never a
+     * local's kind, never in a deopt record or an OSR form: pushValue3 and
+     * adoptLocalKindSeen refuse it, and every compiled caller's accept-list
+     * refuses a callee that returns it, so the tag bits only ever reach C. */
+    SLOT_DYNAMIC
 } SlotKind;
+
+/* Where a SLOT_DYNAMIC body puts the return site's Value tag: bits 8..15 of
+ * JitResult::bailed. The verdict stays in the low byte, so every consumer of
+ * x1 that expects 0/1/2/4 keeps working unchanged -- a compiled caller never
+ * calls a SLOT_DYNAMIC body directly, and the C side masks. */
+#define JIT_RET_TAG_SHIFT 8u
 
 /* stackSignatureAt packs a whole SlotKind into four bits per operand-stack
  * entry, and that packing is what makes a join with two disagreeing kinds a
@@ -188,6 +203,15 @@ typedef enum {
  * sixteenth kind is the last one that fits. */
 _Static_assert(SLOT_MAYBE_OBJ <= 15,
                "a SlotKind must fit the four bits stackSignatureAt packs it into");
+/* SLOT_DYNAMIC is the seventeenth kind and does NOT fit those four bits. That
+ * is fine only because it never reaches the operand stack -- pushValue3
+ * refuses it -- so stackSignatureAt never packs it. The assert above pins the
+ * last kind that MAY be packed; this one pins the claim that nothing past it
+ * is a stack kind. A new kind that can be pushed goes BEFORE SLOT_MAYBE_OBJ
+ * and must fit. */
+_Static_assert(SLOT_DYNAMIC == SLOT_MAYBE_OBJ + 1 && SLOT_DYNAMIC == 16,
+               "SLOT_DYNAMIC is a return kind only: it is never packed into a "
+               "stack signature, so it alone may sit past the four-bit limit");
 
 
 /* Floats live in X registers, visiting d0/d1 only for the arithmetic itself -- simpler-but-correct beats
@@ -731,6 +755,17 @@ typedef struct {
     SlotKind  returnKind;
     uint32_t  returnShape;
     bool      sawReturn;
+    /* Set for the real pass when the measuring pass merged the return kinds
+     * to SLOT_DYNAMIC: every return site then leaves its own Value tag in
+     * x1 (emitReturnLeave) instead of the bare zero verdict. Decided before
+     * the first return is emitted, because a site cannot be re-tagged after
+     * the fact and the x1 convention must be one thing for the whole body. */
+    bool      dynamicReturn;
+    /* The walk declined on a callee that has never returned while the
+     * interpreter watched -- `obsReturnKind == JAI_FB_NONE` and no compiled
+     * form. jaiJitEnter does not charge such a decline to the attempt budget;
+     * see JAI_JIT_COLD_RETRIES. */
+    bool      coldCallee;
 
     bool      failed;
 
@@ -901,6 +936,8 @@ void emitSaveRestore(Emit *e, bool save);
 void emitFrameEnter(Emit *e);
 void emitFpSaveRestore(Emit *e, bool save);
 void emitEpilogue(Emit *e, unsigned bailed);
+void emitEpilogueKeepX1(Emit *e);
+void emitReturnLeave(Emit *e, SlotKind k);
 bool jitSplitStress(void);
 bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi);
 void planHoists(Emit *e, ObjFunction *fn);
@@ -1008,6 +1045,8 @@ bool jitNullableFbOn(void);
 bool jitMaybeObjStackOn(void);
 bool jitMaybeObjOn(void);
 bool jitMatchArm(void);
+bool jitDynamicReturn(void);
+bool jitStaticMethodOn(void);
 bool modelAgreesWithChunk(const Emit *e, uint32_t off);
 bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
                           unsigned *out);

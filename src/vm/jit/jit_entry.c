@@ -106,9 +106,13 @@ static inline bool jitArgIn(ObjClosure *closure, const Value *slotBase,
 
 static inline JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
                                          Value *slotBase) {
-    if (r.bailed == 2) return JAI_JIT_ERROR;
-    if (r.bailed == 4) return JAI_JIT_DEOPT;
-    if (r.bailed) {
+    /* The verdict is the low byte. A SLOT_DYNAMIC body's return site puts its
+     * Value tag in the byte above (JIT_RET_TAG_SHIFT); every other exit --
+     * bail, raise, deopt -- writes a bare 1, 2 or 4 with nothing above it. */
+    int64_t verdict = r.bailed & 0xff;
+    if (verdict == 2) return JAI_JIT_ERROR;
+    if (verdict == 4) return JAI_JIT_DEOPT;
+    if (verdict) {
         /* Overflow or a low stack: nothing was written (the body cannot write), so handing the call back to
          * the interpreter is enough -- it raises the error with a traceback. Refused permanently so a bailing body isn't re-entered every call only to bail again. */
         fn->jitRefused = true;
@@ -119,6 +123,44 @@ static inline JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
         return JAI_JIT_DECLINED;
     }
 
+    if ((SlotKind)fn->jitReturnKind == SLOT_DYNAMIC) {
+        /* The tag came from the return site -- emitTagFor, off the payload for
+         * a nullable kind -- so this is the one place the tier rebuilds a
+         * Value from a run-time tag rather than a compile-time kind. */
+        switch ((r.bailed >> JIT_RET_TAG_SHIFT) & 0xff) {
+        case VAL_INT:
+            slotBase[0] = INT_VAL(r.value);
+            break;
+        case VAL_FLOAT: {
+            /* Raw bits: never through a double conversion, which could
+             * canonicalise a NaN payload. */
+            double d;
+            memcpy(&d, &r.value, sizeof d);
+            slotBase[0] = FLOAT_VAL(d);
+            break;
+        }
+        case VAL_BOOL:
+            /* One byte: BOOL_VAL writes only the union's bool member and a
+             * bool register is trusted only that wide. */
+            slotBase[0] = BOOL_VAL((r.value & 0xff) != 0);
+            break;
+        case VAL_NULL:
+            slotBase[0] = NULL_VAL;
+            break;
+        case VAL_OBJ:
+            /* emitTagFor already answers VAL_NULL for a zero payload of a
+             * nullable kind, and the other object kinds are never zero; the
+             * test stays so that {VAL_OBJ, obj = NULL} -- the shipped bug
+             * shape -- cannot be built here under any future producer. */
+            slotBase[0] = r.value == 0 ? NULL_VAL
+                                       : OBJ_VAL((Obj *)(uintptr_t)r.value);
+            break;
+        default:
+            return JAI_JIT_DECLINED;
+        }
+        vm.stackTop = slotBase + 1;
+        return JAI_JIT_DONE;
+    }
     if ((SlotKind)fn->jitReturnKind == SLOT_MAYBE_INST ||
         (SlotKind)fn->jitReturnKind == SLOT_MAYBE_OBJ) {
         slotBase[0] = r.value == 0 ? NULL_VAL
