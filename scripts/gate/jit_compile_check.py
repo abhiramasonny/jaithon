@@ -78,8 +78,8 @@ JAITHON_PATH = os.environ.get("JAITHON_PATH", os.path.join(ROOT, "lib"))
 
 MARKER_RE = re.compile(r"^#\s*jit-compiles:\s*(.*)$")
 FN_RE = re.compile(r"^fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.MULTILINE)
-COMPILED_RE = re.compile(r"^\[jit\] compiled (\S+)\s+arity=(\d+)")
-OSR_RE = re.compile(r"^\[jit\] osr (\S+) at \d+:\s+\d+ instructions")
+COMPILED_RE = re.compile(r"^\[jit\] compiled (.+?)\s+arity=(\d+)")
+OSR_RE = re.compile(r"^\[jit\] osr (.+?) at \d+:\s+\d+ instructions")
 
 
 def default_targets():
