@@ -259,6 +259,41 @@ order is that each one is measured before the next is started. A fair target
 is 1 MB/s from 171 KB/s. Anyone claiming more than that before step 2 lands is
 repeating the mistake the four proposals made.
 
+### Correction: the parser's `TokenKind` chains are NOT the operator-table fix
+
+The note below said "the 91 `if kind == TokenKind.X` chains in `parse/` are the
+same fix and are next". They are not, and the difference is the same one that
+made the pair-loop refusal misleading: **a shape that looks alike is not alike.**
+
+The four operator tables mapped a kind to a VALUE, so a list indexed by
+`ordinal()` replaced the whole chain. The parser's chains DISPATCH -- each arm
+builds a different node and returns. There is nothing to put in a table.
+
+Worse, the chains are not what blocks those bodies. Ranked by the interpreted
+work of the bodies each refusal stops (`JAI_JIT_WHY` joined to
+`JAI_JIT_ATTRIB`, which is the ranking that matters -- see
+`rank-refusals-by-work-not-by-count`):
+
+    66.7M  a list loop already past its last element      (mostly OSR timer noise)
+    57.1M  a local of no known kind
+    54.4M  OP_INVOKE: a method that has not returned yet
+    50.9M  OP_GET_INDEX: the live dict is empty or holds more than one kind
+    40.8M  a pair loop already past its last element
+    36.8M  this loop head is out of compile attempts
+    34.0M  OP_FOR_ITER_PAIR: a pair's loop variables have kinds object and ...
+    34.0M  OP_CALL: a callee returning dynamic
+
+`_parse_primary` (4.6%) spends all five attempts on **"OP_GET_FIELD_LOCAL: no
+live receiver to read local 3's field off"**, and `_parse_unary` (2.0%) on
+**"OP_NE: a compare of a int with a object"**. Neither is a chain.
+
+Two entries there are worth naming. The 50.9M dict refusal **is `Node.fields`**
+-- step 3 below deletes it rather than teaching the tier to compile it. And
+"OP_CALL: a callee returning dynamic" (34.0M) is NEW, created by the dynamic
+return kind: callers deliberately refuse `SLOT_DYNAMIC` rather than widen an
+accept-list. That was the safe choice for landing it; teaching one caller shape
+to consume a tagged return is the obvious follow-up, and it is now measurable.
+
 ### Landed so far (2026-09-01)
 
 * `ordinal()` on every enum value -- the 5-line builtin step 2 needed, plus
