@@ -165,6 +165,15 @@ f8a2211d54cfbd1bd730833a9387b6c49dfc3b37f1e6ef5c2f2d650798b2918e  287  lib/std/c
 f8259208c93d9bb5caf4dbd3d1bbcb163ffd2d0e823ce8b67b9abc3c699068f8  767  lib/std/collections/mod.jai
 8c621e23afadb5c0a9c81de62f1e434d245e7bdc2700e599fb7a90884bb7b840  815  lib/std/collections/ring.jai
 31d90c42de0815fbf0a1739866d8e2e3126d56f8cafb1f4c806384155fcfc0c1  1310  lib/std/core.jai
+d852f1e0f61a4d7a3b1d1c5fc386ab23c7b64626f5e43a472fb7527dda563e98  37  lib/std/datetime.jai
+beca413eea3cf160b1dac95375536b472e48be21f4fa8ae45872e41d6722d2bc  482  lib/std/datetime/common.jai
+09215714cfb2b93dcebc8c78b07606026b97706454ee20905c218c8c52db3d7a  786  lib/std/datetime/dates.jai
+cd14cba32e75a66863255fabeae2b0842bef09a7f7918b72993a2e0ca9214089  436  lib/std/datetime/delta.jai
+28b0906d06758793e92567c9a4469b3cf001cdbb1a4eacaa04f6832e38dc9509  441  lib/std/datetime/fmt.jai
+8036bb759083169fa9bf8bc459fb42c1e1cdeb31086d4fd7321cfbe6ad80ad50  1262  lib/std/datetime/moment.jai
+ec982f43d17aaa205f57f835f86d64618e256923c340c3027bb0edc763f947c9  1217  lib/std/datetime/parse.jai
+76558c591cb25b295eb4b47ae1b9159a6d8354eaec31308d3615c80213db40b8  911  lib/std/datetime/times.jai
+c61ab257be024b63eb3a9379bcc3fb95b86a4b19794b216091e85a83172e9750  373  lib/std/datetime/tz.jai
 48cde7fc24c514563a38801170f07fd2d5f50411fc85e7a1f1d72b46a7a7a34d  391  lib/std/dict_ops.jai
 bb836ae5352662f8279b29debccbbbe0a35039dba925e8792a227492f9c7791f  20  lib/std/ds/graph.jai
 b41d63eab462477e4574e12b247b0dc06b2165f8bad784fad81d389c4c2bb4ae  2090  lib/std/ds/graph/adjacency.jai
@@ -194,6 +203,10 @@ e3536013d33dbfdb3d79df57994a3a3ad9ad78e342d1fdd1fe0bcd5d34a7a7bd  62  lib/std/gu
 dba71683d14915608f50b083be94334b2ab675bd3ec623f90c0821c2e06887bc  1016  lib/std/io/stream.jai
 7a392e8286d044a0b834f72946f9c127586fe75a5a104b98940a521bc1367ebc  247  lib/std/iter/generators.jai
 bdc0094bdde99ff09c6d38c7df378af7c24029a9f6d460f78902ed6483b6cf9f  2575  lib/std/iter/mod.jai
+58ba504e4f1372e34a5f67ab26c4cbccc5bf5f4814869585f12cd3ca8e0ba3fe  73  lib/std/itertools.jai
+dda20774541e31c9606e23cf796ad98ae20cb28496f4626ab89fd372e633494e  981  lib/std/itertools/adapters.jai
+bc2ab29bf2290a2f5785635bd7fff7e1aaa1b2cb937f48e506b279f29e57d2d0  363  lib/std/itertools/combinatoric.jai
+bba6e31ff9ddbb1995a82baae14d9b10bed6890fe93110aeb457c9df411242c9  147  lib/std/itertools/infinite.jai
 989b90221736341f827b0fb7506df26e93441c5e3af3ce6b65ec5fbe067d72db  2679  lib/std/json.jai
 de006454fa239944b233bcfb2ab410062a1623d8aac9c7f13ca05f3b2f7b2b47  1603  lib/std/list.jai
 58f61c0287833bf550fd45567391b608a334f3bc2647f6d116d0634d185e69ae  1943  lib/std/math.jai
@@ -224,6 +237,7 @@ c298afdde8b3f6d18d0c38f6657d71f184b89a56acab05b66cf109635ca7527d  171  tests/gol
 8d32eea637649cd8056b3ea665f02442b7de3c0d86273109e3867e04175b16f5  415  tests/golden/control_flow.jai
 2876239a0a12cec119f57144ccfd4437eedcec81a5a20f01fca0ff853caf66c2  39  tests/golden/cross_module/shapes.jai
 71df0a52d039d61e59010c0c6de59a89f4392868dd42486cdf98370b3db33ef7  378  tests/golden/emitter_bootstrap.jai
+e668cd82cd32b561b6331bac9c8e31f9a0d80eb7b72fc92a8e16f353962b7104  1122  tests/golden/enumerate_lazy.jai
 334c3b109117b3d96756adbf4f6ae285494170b9df2056d8b68e14bc1cf3cee4  281  tests/golden/errors_and_defer.jai
 cce2e45d6c5491cbc612a54bbbfe83f91075fc6beb586c35ed6c19a54db491b6  110  tests/golden/field_kind.jai
 22b074636d75f8469de856dc2ab686ce8f3c2a0b979fa394255c52aaa5544ec1  688  tests/golden/for_iter_pair.jai
@@ -260,6 +274,7 @@ f3d8ad5bf3c0d7e5b28714e90ebbee1c6f5d7ba1e6e4919eb92e00bb76c72d82  70  tests/gold
 0ac2118c408af7895ca15b767b63e871db8ccc7f7aefba78d1373759d3995997  289  tests/golden/jit_osr_bank.jai
 29024126f62f68f60143b62a636fd10d3504851828fa815c3c017c6daf8dd78b  73  tests/golden/jit_osr_dynamic_local.jai
 f71c8a4a927d5e5fa53f7ab7d0bf3db817920eee4893f508f199b58ffc4f50d1  277  tests/golden/jit_osr_locals.jai
+55eeecb49a249d220b960f0e5ca06721437a5747bb2427a19117c7495b989320  814  tests/golden/jit_osr_pair_and_enum.jai
 756808033a977862e5dfa42971982d4c819f87201e665fb8e0081cd443228619  311  tests/golden/jit_osr_pair_list.jai
 f7dc3d0051fad1d6d4f7eeda9f5a62457a4f00fc9781b02457cd11a50008c83e  117  tests/golden/jit_osr_range_bias.jai
 a3d73653a889dfe99f7549f856087692b8dc8a51e3e72d12d003737f30da4b2e  75  tests/golden/jit_osr_shape.jai
@@ -285,4 +300,4 @@ c99446f0a47d9ec65a760cb039c7a71e9b3a4e528b80c2e591cd93d0de2e3310  516  tests/gol
 f1942daa9ac333d8be760ceb2629af5de2b2eb506df1eea32e549bc2646df0f6  113  tests/golden/shadowing.jai
 fab4fc636bafe1f763c33f958e2fb658874df3a97e17405e101765edacd884ca  225  tests/golden/type_tests.jai
 e286562e8182f81293b8fa5a81fd887d852bf005743d2d0ab98a751d2e6820da  450  tests/golden/values_and_dispatch.jai
-# 287 files, 206349 instructions probed
+# 302 files, 215794 instructions probed

@@ -438,6 +438,7 @@ static void markInternedNames(void) {
         vm.strLen, vm.strGetItem, vm.strSetItem, vm.strContains, vm.strIter,
         vm.strNext, vm.strCall, vm.strAdd, vm.strSub, vm.strMul, vm.strDiv,
         vm.strMod, vm.strPow, vm.strNeg, vm.strMain, vm.strSelf, vm.strMessage,
+        vm.strItems, vm.strEnumerate,
     };
     markStrings(names, (int)(sizeof names / sizeof names[0]));
 }

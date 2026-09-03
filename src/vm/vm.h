@@ -63,6 +63,8 @@ typedef struct VM {
                 *strGetItem, *strSetItem, *strContains, *strIter, *strNext,
                 /* `items`, for OP_GET_ITER_ITEMS's non-dict fallback. */
                 *strItems,
+                /* `enumerate`, for OP_INVOKE's lazy list.enumerate() head. */
+                *strEnumerate,
                 *strCall, *strAdd, *strSub, *strMul, *strDiv, *strMod,
                 *strPow, *strNeg, *strMain, *strSelf, *strMessage;
 
@@ -291,5 +293,12 @@ void jaiPopRoots(int n);
 
 void jaiVMPrintStack(FILE *out);
 void jaiVMPrintStats(FILE *out);
+
+/* JAITHON_LAZY_ENUMERATE, read once. On (the default) `for (i, x) in
+ * xs.enumerate()` over a list walks an ITER_LIST_ENUM snapshot built at the
+ * OP_INVOKE instead of the N-tuple list `list.enumerate()` materialises, and
+ * both compiled tiers arm that head. `=0` restores the eager call everywhere,
+ * which is the A/B. Read by the interpreter and by src/vm/jit. */
+bool jaiLazyEnumerateOn(void);
 
 #endif /* JAI_VM_H */

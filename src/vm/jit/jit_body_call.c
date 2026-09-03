@@ -1340,6 +1340,66 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
         Value nameVal = fn->chunk.constants.data[nameIdx];
         if (!IS_STRING(nameVal)) return false;
 
+        /* `for (i, x) in xs.enumerate()`. OP_INVOKE (vm.c) swaps the eager
+         * native for an ITER_LIST_ENUM snapshot when the next instruction is
+         * the GET_ITER, and this is the same swap made on the same bytes, so
+         * the loop walks the same thing under either tier: the descriptor
+         * calls jitMakeEnumIter, the GET_ITER is skipped, and what is pushed
+         * is a SLOT_ITER of shape 5 carrying an element sample for the pair
+         * head to specialise on -- the head arm in emitForIterPair. That 5 is
+         * this tier's own SLOT_ITER shape numbering and is not the OSR
+         * iterKind, which is 5 for this head by coincidence: shape 4 here is
+         * the dict view, whose head is iterKind 3.
+         *
+         * Before this the site declined the whole body twice over: the
+         * result of `list.enumerate` is neither a field read nor discarded,
+         * and even predicted it reached OP_GET_ITER as an object with no
+         * element to look at. 96 of the 106 pair loops in lib/jaithon are
+         * this shape.
+         *
+         * The sample and its census come off the receiver's live list,
+         * exactly as the OSR list head takes them, including the
+         * null-density refusal: a form pinned to the sampled class bails once
+         * per null element, and past one in 64 that is slower than not
+         * compiling. A list holding several classes is refused too -- the
+         * head cannot widen a nested loop's variable the way the OSR entry
+         * can, and pinning one class of several deopts on every other. */
+        if (jaiLazyEnumerateOn() && argc == 0 &&
+            off + 8 < count && code[off + 7] == OP_GET_ITER &&
+            code[off + 8] == OP_FOR_ITER_PAIR &&
+            AS_STRING(nameVal) == vm.strEnumerate) {
+            Value probe = e->stackSeen[ridx];
+            Value sample = NULL_VAL;
+            if (IS_LIST(probe) && AS_LIST(probe)->count > 0) {
+                bool mixed = false;
+                if (!jitListHeadSample(AS_LIST(probe), 0, &sample, &mixed)) {
+                    return subWhy(e, "enumerating a list whose elements are "
+                                     "too often null");
+                }
+                if (mixed) {
+                    return subWhy(e, "enumerating a list holding instances "
+                                     "of several classes");
+                }
+            }
+            if (IS_NULL(sample)) sample = e->stackElem[ridx];
+            if (IS_NULL(sample)) {
+                return subWhy(e, "enumerating a list with nothing to look at");
+            }
+            if (!emitDescriptor(e, NULL_VAL, ridx, 1,
+                                (void *)&jitMakeEnumIter)) {
+                return false;
+            }
+            unsigned edrop;
+            if (!popValue(e, &edrop, NULL)) return false;
+            if (!pushValue3(e, SLOT_ITER, 5, NULL, sample, -1)) return false;
+            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            e->wroteHeap = true;
+            off += 8;              /* the invoke and the GET_ITER it absorbed */
+            break;
+        }
+
         /* Which method a name means depends on the receiver's type, not what it holds -- so for a list this
          * body built with no sample to look at, an empty probe list answers just as well. Rooted across the lookup since resolving allocates the bound wrapper; only the native is kept, and that outlives it. */
         Value probe = e->stackSeen[ridx];

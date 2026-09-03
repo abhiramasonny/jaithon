@@ -988,10 +988,18 @@ bool       jaiModuleIsExported(ObjModule *m, ObjString *name);
 /* ITER_USER drives spec §7.1's `__next__` dunder, which ends on StopIteration;
  * ITER_TRAIT drives std.core's `trait Iterator`, whose `next` ends by returning
  * null. Both are user objects, and a class may implement either. */
+/* ITER_LIST_ENUM is what `for (i, x) in xs.enumerate()` walks when
+ * JAITHON_LAZY_ENUMERATE is on: `source` is a private BOXED snapshot of the
+ * list, taken at the `INVOKE enumerate; GET_ITER` site, and the pair step
+ * yields (index, element) straight into the two slots with no tuple built.
+ * The eager `list.enumerate()` copied the elements too, one tuple each, so the
+ * loop sees exactly what it saw before under every mutation of `xs` -- which
+ * is why this is a snapshot and not a view, and why it needs no version.
+ * Appended, because the tier bakes these values into generated code. */
 typedef enum {
     ITER_LIST, ITER_TUPLE, ITER_STRING, ITER_BYTES, ITER_DICT_KEYS,
     ITER_DICT_ITEMS, ITER_SET, ITER_RANGE, ITER_USER, ITER_TRAIT,
-    ITER_GENERATOR
+    ITER_GENERATOR, ITER_LIST_ENUM
 } IterKind;
 
 struct ObjIter {
@@ -1004,6 +1012,10 @@ struct ObjIter {
 };
 
 ObjIter *jaiIterNew(IterKind kind, Value source);
+/* An ITER_LIST_ENUM over a fresh boxed copy of `src`'s elements. One
+ * allocation of N Values where `list.enumerate()` made N tuples and a list.
+ * `src` must be reachable by the caller's roots across the call. */
+ObjIter *jaiIterNewListEnum(ObjList *src);
 /* Advance. Returns false when exhausted (no exception). Sets *out otherwise.
  * Raises RuntimeError if the underlying container was mutated. */
 bool     jaiIterNext(ObjIter *it, Value *out);

@@ -735,6 +735,189 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
     return true;
 }
 
+bool jitListHeadSample(const ObjList *src, int at, Value *sample, bool *mixed) {
+    *sample = jaiListGet(src, at);
+    *mixed = false;
+    if (!IS_INSTANCE(*sample)) {
+        /* A non-instance sample still needs the NULL census, and skipping it
+         * was a real regression rather than a tidiness point: a head compiled
+         * for `int` off a `list[int?]` fails its tag compare on every null and
+         * bails, and on a 2M list with one null in three that is 3,333,335
+         * bails and 1.15x SLOWER than refusing -- worse than never compiling.
+         * The class half below cannot apply here, so only the count runs. */
+        int scan = src->count < 1024 ? src->count : 1024;
+        int nulls = 0;
+        for (int i = 0; i < scan; i++) {
+            if (IS_NULL(jaiListGet(src, i))) nulls++;
+        }
+        return nulls * 64 <= scan;
+    }
+    /* Whether the list holds one class or several. One sample cannot say,
+     * and getting it wrong is not merely a slower loop: a form compiled
+     * pinned to the sampled class fails its own entry guard on every later
+     * class, so the loop runs interpreted for the rest of the program with
+     * no second chance to notice. Capped because this runs per compile
+     * attempt and a list can be enormous; past the cap the pinned form is
+     * compiled as before and deoptimises if it was wrong, which is where
+     * this started. The scan does not stop at the first mismatch: the null
+     * count needs the whole prefix, and the cap is what bounds the cost. */
+    const ObjClass *first = AS_INSTANCE(*sample)->klass;
+    int scan = src->count < 1024 ? src->count : 1024;
+    int nulls = 0;
+    for (int i = 0; i < scan; i++) {
+        Value v = jaiListGet(src, i);
+        if (IS_NULL(v)) { nulls++; continue; }
+        if (!IS_INSTANCE(v)) continue;
+        if (AS_INSTANCE(v)->klass != first) *mixed = true;
+    }
+    return nulls * 64 <= scan;
+}
+
+/* `for (i, x) in xs.enumerate()` over the ITER_LIST_ENUM snapshot OP_INVOKE
+ * built: the index is the first component, read off the iterator, and the
+ * element the second, guarded exactly as OP_FOR_ITER_BIND's list arms guard
+ * theirs -- tag, then object type, then class where one is pinned -- with
+ * every guard BEFORE anything is written, so a deopt resumes at this very
+ * instruction. As the head of the OSR loop (iterKind 5) the list, index and
+ * limit ride in the reserved registers a list head uses; nested in a compiled
+ * function the index lives in the ObjIter, as it does for every other
+ * iterator the body built itself. No version guard either way: the snapshot
+ * is the iterator's own and nothing else can reach it. */
+static bool emitForIterPairEnum(Emit *e, unsigned pslotA, unsigned pslotB,
+                                int16_t pjump, int off, bool head) {
+    Value sample = head ? e->elemSample : e->stackSeen[e->depth - 1];
+    SlotKind ek;
+    unsigned etag;
+    uint32_t esh = 0;
+    ObjClass *ecl = NULL;
+    if (IS_INT(sample))        { ek = SLOT_INT;   etag = VAL_INT; }
+    else if (IS_FLOAT(sample)) { ek = SLOT_FLOAT; etag = VAL_FLOAT; }
+    else if (IS_BOOL(sample))  { ek = SLOT_BOOL;  etag = VAL_BOOL; }
+    else if (IS_LIST(sample))  { ek = SLOT_LIST;  etag = VAL_OBJ; }
+    else if (rawObjValue(sample)) { ek = SLOT_OBJ; etag = VAL_OBJ; }
+    else if (IS_INSTANCE(sample) && AS_INSTANCE(sample)->klass != NULL) {
+        ek = SLOT_INST; etag = VAL_OBJ;
+        ecl = AS_INSTANCE(sample)->klass;
+        esh = ecl->shapeId;
+    } else {
+        e->whyNot = "enumerating an element of a kind with no slot";
+        return false;
+    }
+    /* Several classes in the list: the element is an instance of no class
+     * in particular. Only the head may widen -- see the list head arm. */
+    if (ek == SLOT_INST && head && e->elemMixed) {
+        esh = 0;
+        ecl = NULL;
+        e->localTyped[pslotB] = false;
+    }
+    if (!adoptLocalKindSeen(e, pslotA, SLOT_INT, 0, NULL, INT_VAL(0)) ||
+        !adoptLocalKindSeen(e, pslotB, ek, esh, ecl, sample)) {
+        return subWhy(e, "an enumerate loop's variables (locals %u and %u) "
+                         "have kinds %s and %s", pslotA, pslotB,
+                      slotKindName(e->localKind[pslotA]),
+                      slotKindName(e->localKind[pslotB]));
+    }
+    uint32_t exit = (uint32_t)((int32_t)(off + 7) + pjump);
+
+    if (head) {
+        e->iterSlot = pslotB;
+        e->iterExit = exit;
+        emit(e, jaiA64SubsXReg(31, JIT_IDX_REG, JIT_LIM_REG));
+        branchTo(e, exit, true, JAI_A64_GE);
+        /* Boxed by construction (jaiIterNewListEnum), and jaiJitEnterOsr
+         * refused anything else at entry, so the stride is 16. */
+        emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_START_REG,
+                           (unsigned)offsetof(ObjList, items)));
+        emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_IDX_REG, 4));
+    } else {
+        unsigned rIter = pushReg(e) - 1;
+        int exitDepth = (int)stackSignatureAt(e, e->depth - 1);
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIter,
+                           (unsigned)offsetof(ObjIter, kind)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ITER_LIST_ENUM));
+        branchOnDeopt(e, JAI_A64_NE);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIter,
+                           (unsigned)offsetof(ObjIter, source) + 8));
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+        branchOnDeopt(e, JAI_A64_NE);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIter,
+                           (unsigned)offsetof(ObjIter, index)));
+        emit(e, jaiA64LdrX(JIT_SCRATCH_D, rIter,
+                           (unsigned)offsetof(ObjIter, limit)));
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
+        /* The exhausted arm drops the iterator, so the target is reached
+         * one entry shallower than this branch leaves from. */
+        branchToDepth(e, exit, JAI_A64_GE, exitDepth);
+        emitListBoxedGuard(e, JIT_SCRATCH_B, JIT_SCRATCH_A);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                           (unsigned)offsetof(ObjList, items)));
+        emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_B, JIT_SCRATCH_C, 4));
+        /* From here both forms hold the element's address in JIT_SCRATCH_C;
+         * the nested one keeps the index in the iterator and re-reads it
+         * once the guards are past. */
+    }
+
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, etag));
+    branchOnDeopt(e, JAI_A64_NE);
+    if (ek == SLOT_INST) {
+        /* VAL_OBJ is every heap object, so the type is checked before
+         * `klass` is read; the class only when one was pinned. */
+        emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+        branchOnDeopt(e, JAI_A64_NE);
+        if (esh != 0) {
+            emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                               (unsigned)offsetof(ObjInstance, klass)));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                               (unsigned)offsetof(ObjClass, shapeId)));
+            emitConst64(e, JIT_SCRATCH_A, (int64_t)esh);
+            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+            branchOnDeopt(e, JAI_A64_NE);
+        }
+    } else if (ek == SLOT_LIST) {
+        emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+        branchOnDeopt(e, JAI_A64_NE);
+    }
+
+    /* Past the last guard: from here nothing may fail. localOut spends
+     * JIT_SCRATCH_C and JIT_SCRATCH_D on a frame-resident slot's tag, so the
+     * element is loaded and bound first, off the address in C, and the index
+     * comes from a register localOut cannot touch: the reserved one at the
+     * head, and a fresh read of the iterator otherwise -- the advance below
+     * is the only heap write, and it goes before either bind. A bool is one
+     * byte (see OP_GET_INDEX); the rest of its payload word is stale. */
+    if (!head) {
+        unsigned rIter = pushReg(e) - 1;
+        emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIter,
+                           (unsigned)offsetof(ObjIter, index)));
+        emit(e, jaiA64AddXImm(JIT_SCRATCH_D, JIT_SCRATCH_B, 1));
+        emit(e, jaiA64StrX(JIT_SCRATCH_D, rIter,
+                           (unsigned)offsetof(ObjIter, index)));
+    }
+    if (ek == SLOT_BOOL) {
+        emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+    } else {
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+    }
+    localOut(e, pslotB, JIT_SCRATCH_A);
+    if (head) {
+        localOut(e, pslotA, JIT_IDX_REG);
+        emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
+    } else {
+        localOut(e, pslotA, JIT_SCRATCH_B);
+        e->wroteHeap = true;
+    }
+    return true;
+}
+
 bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
     int off = *offp;
     do {
@@ -759,16 +942,24 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
          * operand stack at all -- it arrives in a reserved register and
          * stays on the interpreter's stack, which is what lets an exit
          * leave without unwinding anything. Only a PAIR head gets here --
-         * iterKind 3 (a dict-items view) or 4 (a list of 2-tuples); a range
-         * or a plain list head is an OP_FOR_ITER_BIND. */
+         * iterKind 3 (a dict-items view), 4 (a list of 2-tuples) or 5 (an
+         * enumerate snapshot); a range or a plain list head is an
+         * OP_FOR_ITER_BIND. */
         bool pairHead = e->osr && e->hasIter &&
                         (e->iterKind == 3 || e->iterKind == 4) &&
                         (uint32_t)off == e->osrTop;
-        if (!pairHead &&
+        /* iterKind 5 is the enumerate head, and it is kept apart from 3 and 4
+         * rather than added to them: those two read the index out of the
+         * ObjIter every iteration, while this one is a list head whose list,
+         * index and limit ride in the reserved registers the prologue filled.
+         * Everything below the arm belongs to the other two. */
+        bool enumHead = e->osr && e->hasIter && e->iterKind == 5 &&
+                        (uint32_t)off == e->osrTop;
+        if (!pairHead && !enumHead &&
             (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER)) {
             return false;
         }
-        if (!pairHead && e->stackShape[e->depth - 1] == 0) {
+        if (!pairHead && !enumHead && e->stackShape[e->depth - 1] == 0) {
             /* A range head yields ints, which never destructure. */
             e->whyNot = "destructuring what a range yields";
             return false;
@@ -784,6 +975,18 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
              * worth a special case; the interpreter keeps it. */
             e->whyNot = "a pair loop binding one slot twice";
             return false;
+        }
+        /* Away from a head, SLOT_ITER shape 5 is the enumerate snapshot
+         * OP_INVOKE's arm pushed. That numbering is the function tier's own
+         * and has nothing to do with iterKind: shape 4 there is the dict view,
+         * whose head is iterKind 3. */
+        if (enumHead || (!pairHead && e->stackShape[e->depth - 1] == 5)) {
+            if (!emitForIterPairEnum(e, pslotA, pslotB, pjump, off,
+                                     enumHead)) {
+                return false;
+            }
+            off += 7;
+            break;
         }
 
         /* Component kinds come from the pair the source was holding when

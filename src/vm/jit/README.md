@@ -464,6 +464,7 @@ this table complete in both directions.
 | `JAITHON_JIT_MEMBERSHIP` | on | `in` against a container. |
 | `JAITHON_JIT_NEGATE` | on | Arithmetic negation. |
 | `JAITHON_JIT_TUPLE` | on | Tuple construction and unpacking. |
+| `JAITHON_LAZY_ENUMERATE` | on | `for (i, x) in xs.enumerate()` over a list. Read by the **interpreter** (`jaiLazyEnumerateOn`, vm.c) as well as this tier: `OP_INVOKE` replaces the eager `list.enumerate()` -- N 2-tuples and a list, all taken apart again by the pair head -- with an `ITER_LIST_ENUM` over one boxed snapshot when the next instruction is the `GET_ITER`, and both tiers arm that head (`emitForIterPairEnum`; OSR iterKind **5**, which takes a plain list head's prologue, reserved registers and index write-back -- not iterKind 4's, that being the list-of-2-tuples head, which shares the dict head's instead). A snapshot, not a view: the eager call copied the elements too, so a loop mutating `xs` sees what it always saw. Off restores the eager call and the refusal "a pair loop over something other than a live dict view or a list of 2-tuples", which is 96 of the 106 pair-loop sites in `lib/jaithon`. |
 
 ### Limits
 

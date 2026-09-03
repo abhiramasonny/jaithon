@@ -89,6 +89,7 @@ void jaiVMResetStack(void) {
 static void internWellKnownNames(void) {
     vm.strInit     = jaiStringInternC("init");
     vm.strItems    = jaiStringInternC("items");
+    vm.strEnumerate = jaiStringInternC("enumerate");
     vm.strStr      = jaiStringInternC("__str__");
     vm.strRepr     = jaiStringInternC("__repr__");
     vm.strEq       = jaiStringInternC("__eq__");
@@ -202,6 +203,7 @@ void jaiVMFree(void) {
     vm.strInit = vm.strStr = vm.strRepr = vm.strEq = vm.strLt = NULL;
     vm.strHash = vm.strLen = vm.strGetItem = vm.strSetItem = NULL;
     vm.strContains = vm.strIter = vm.strNext = vm.strCall = NULL;
+    vm.strItems = vm.strEnumerate = NULL;
     vm.strAdd = vm.strSub = vm.strMul = vm.strDiv = vm.strMod = NULL;
     vm.strPow = vm.strNeg = vm.strMain = vm.strSelf = vm.strMessage = NULL;
 

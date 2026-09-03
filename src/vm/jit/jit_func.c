@@ -75,7 +75,10 @@ unsigned osrReserved(const Emit *e) {
     if (!e->hasIter) return 1u;
     if (e->iterKind == 1) return 3u;
     /* A pair head -- dict items (3) or a list of 2-tuples (4) -- keeps the
-     * ObjIter and nothing else. */
+     * ObjIter and nothing else. The enumerate head (5) is a pair head too but
+     * not one of these: it walks its snapshot off the same iterator, index,
+     * limit and list registers a plain list head uses, so it falls through to
+     * the same reservation. */
     if (e->iterKind == 3 || e->iterKind == 4) return 2u;
     return 5u;
 }

@@ -448,11 +448,17 @@ typedef struct {
      * untouched, only its index rides in a register, and every exit writes it back. */
     bool      hasIter;
     /* 1 a unit-step range, 2 a list, 3 a dict-items view, 4 a list of 2-tuples
-     * at a pair head. 3 and 4 share a prologue and reserve the same single
-     * register, because both read the index out of the ObjIter every iteration
-     * and write it straight back -- they differ only in where emitForIterPair
-     * finds the pair, and so in what elemSample holds: the DICT itself for 3,
-     * the sampled TUPLE ELEMENT for 4. */
+     * at a pair head, 5 an enumerate snapshot (ITER_LIST_ENUM) at a pair head.
+     * 3 and 4 share a prologue and reserve the same single register, because
+     * both read the index out of the ObjIter every iteration and write it
+     * straight back -- they differ only in where emitForIterPair finds the
+     * pair, and so in what elemSample holds: the DICT itself for 3, the
+     * sampled TUPLE ELEMENT for 4. 5 shares neither of those: it is a LIST
+     * head that happens to bind two slots, so it takes 2's prologue, 2's
+     * reserved registers and 2's index write-back, and elemSample holds the
+     * sampled list ELEMENT. Nothing to do with the function tier's separate
+     * SLOT_ITER shape numbering, where 4 is the dict view and 5 is this
+     * snapshot only by coincidence of the next free digit. */
     uint8_t   iterKind;
     Value     elemSample;
     /* The sampled element's class is one of several the list holds, so the
@@ -914,6 +920,14 @@ int jitStringConcat(JitCallDesc *d);
 int jitMakeRangeIter(JitCallDesc *d);
 int jitMakeIter(JitCallDesc *d);
 int jitMakeItemsIter(JitCallDesc *d);
+int jitMakeEnumIter(JitCallDesc *d);
+/* The element a list head is about to bind, from `src[at]`, and whether the
+ * list's first 1024 elements hold instances of more than one class. Answers
+ * false when nulls are dense enough -- past one in 64 -- that a form pinned to
+ * the sampled class would bail once per null; see the table in
+ * jaiJitEnterOsr. Shared by the list head, the enumerate head and the
+ * function tier's enumerate arm, so all three refuse on the same data. */
+bool jitListHeadSample(const ObjList *src, int at, Value *sample, bool *mixed);
 int jitFormat(JitCallDesc *d);
 int jitListGrow(ObjList *list, uint64_t tag, int64_t payload);
 ObjInstance *jitInstanceAlloc(ObjClass *cls);

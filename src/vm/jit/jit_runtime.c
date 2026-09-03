@@ -289,6 +289,27 @@ int jitMakeItemsIter(JitCallDesc *d) {
     return it != NULL ? 0 : 1;
 }
 
+/* OP_INVOKE's lazy `xs.enumerate()` head, for compiled code: the same
+ * ITER_LIST_ENUM snapshot the interpreter builds at that site (vm.c), so the
+ * pair loop that follows walks the same thing under either tier. The emitted
+ * arm only reaches here with a SLOT_LIST receiver; the test is the same
+ * belt-and-braces jitMakeItemsIter carries, and it RAISES on the way out for
+ * the reason jitMakeIter's comment gives. */
+int jitMakeEnumIter(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    Value src = d->args[0];
+    if (!IS_LIST(src)) {
+        jaiGCPopRootRange();
+        (void)jaiThrow(vm.cTypeError, "'%s' object has no method 'enumerate'",
+                       jaiTypeNameStatic(src));
+        return 1;
+    }
+    ObjIter *it = jaiIterNewListEnum(AS_LIST(src));
+    d->result = OBJ_VAL(it);
+    jaiGCPopRootRange();
+    return 0;
+}
+
 /* f-string: the interpreter's parts, read off the operand stack, land here contiguously in args[].
  * Builtin path only -- compiler checks at compile time that the module hasn't rebound `str`; a rebind retires this form. */
 int jitFormat(JitCallDesc *d) {

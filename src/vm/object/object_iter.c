@@ -107,6 +107,13 @@ ObjIter *jaiIterNew(IterKind kind, Value source) {
                 it->limit = jaiRangeLength(AS_RANGE(source));
             break;
 
+        case ITER_LIST_ENUM:
+            /* The source is the snapshot itself, private to this iterator,
+             * so the count is final and no version is needed. */
+            if (IS_LIST(source))
+                it->limit = AS_LIST(source)->count;
+            break;
+
         case ITER_USER:
         case ITER_TRAIT:
         case ITER_GENERATOR:
@@ -114,6 +121,21 @@ ObjIter *jaiIterNew(IterKind kind, Value source) {
     }
 
     return it;
+}
+
+ObjIter *jaiIterNewListEnum(ObjList *src) {
+    const int n = src->count;
+    /* Boxed on purpose, whatever `src` is stored as: the pair step and both
+     * compiled tiers then read one width, and a copy is where boxing costs
+     * least. jaiListNew already roots itself across the reservation; nothing
+     * below allocates until the iterator, which roots its source. */
+    ObjList *snap = jaiListNew(n);
+    if (n > 0) {
+        Value *items = (Value *)snap->items;
+        for (int i = 0; i < n; i++) items[i] = jaiListGet(src, i);
+        snap->count = n;
+    }
+    return jaiIterNew(ITER_LIST_ENUM, OBJ_VAL(snap));
 }
 
 /* Both forms are fatal to the traversal, but they are reported apart because
@@ -320,6 +342,24 @@ bool jaiIterNext(ObjIter *it, Value *out) {
 
             *out = INT_VAL((int64_t)value);
             it->index = index + 1;
+            return true;
+        }
+
+        /* The general step, reached only when something other than the fused
+         * pair head asks -- `for pair in xs.enumerate()` bound whole, or a
+         * deopt landing on the unfused sequence. It builds the tuple the
+         * eager form would have held, so nothing downstream can tell. */
+        case ITER_LIST_ENUM: {
+            const int64_t index = it->index;
+            if (index >= it->limit) return false;
+
+            Value pair[2] = {INT_VAL(index),
+                             jaiListGet(AS_LIST(it->source), (int)index)};
+            jaiGCPushRoot(OBJ_VAL(it));
+            ObjTuple *tuple = jaiTupleNew(pair, 2);
+            jaiGCPopRoot();
+            it->index = index + 1;
+            *out = OBJ_VAL(tuple);
             return true;
         }
 

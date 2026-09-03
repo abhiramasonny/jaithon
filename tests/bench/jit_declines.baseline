@@ -4,6 +4,7 @@ __main__.<anonymous> at 19 stopped: OP_GET_GLOBAL: `point_polygon_test` is not a
 __main__.<anonymous> at 19 stopped: OP_GET_UPVALUE
 __main__.<anonymous> at 19 stopped: this loop head is out of compile attempts
 __main__.<anonymous> at 9 stopped: a list loop already past its last element
+__main__.document at 33 stopped: more live values than there are callee-saved registers
 __main__.frames at 23 stopped: OP_INVOKE: a static that has not compiled
 __main__.main at 12 stopped: OP_GET_GLOBAL: `adder` is not a compiled global function
 __main__.main at 158 stopped: OP_GET_GLOBAL: `count_occurrences` is not a compiled global function
@@ -32,6 +33,7 @@ __main__.repeats_for at 79 stopped: an indirect callee compiled against an older
 __main__.repeats_for at 84 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
 __main__.run at 110 stopped: OP_INVOKE: a receiver of kind int
 __main__.run at 110 stopped: an indirect call whose result kind is not scalar
+__main__.run at 110 stopped: an indirect callee compiled against an older module
 __main__.run at 110 stopped: this loop head is out of compile attempts
 __main__.run at 196 stopped: OP_INVOKE: a receiver of kind int
 __main__.run at 196 stopped: an indirect call whose result kind is not scalar
@@ -53,6 +55,7 @@ __main__.run_scalar at 168 stopped: an indirect callee compiled against an older
 __main__.run_scalar at 168 stopped: local 4 was given two kinds, float and int
 __main__.run_scalar at 168 stopped: slot 4 holds float, but the form was compiled for int
 __main__.run_scalar at 47 stopped: an indirect callee compiled against an older module
+__main__.storm at 18 stopped: OP_GET_GLOBAL: `checked` is not a compiled global function
 __main__.storm at 18 stopped: a call that can raise inside a try
 __main__.time_attn at 182 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
 __main__.time_attn at 289 stopped: OP_GET_GLOBAL: `multi_head_attention` is not a compiled global function
@@ -119,15 +122,19 @@ column.frame.of at 192 stopped: a list loop already past its last element
 column.frame.of at 305 stopped: a list loop already past its last element
 column.frame.of at 56 stopped: a list loop already past its last element
 column.frame.take at 114 stopped: a list loop already past its last element
+column.store.from_strs at 103 stopped: a list loop already past its last element
 column.store.validity_of at 102 stopped: OP_POP
 compiled.compile_step at 190 stopped: OP_GET_GLOBAL: `emit_layer` is not a compiled global function
 compiled.compile_step at 730 stopped: a global store of a kind that has no Value form
 compiled.compile_step at 730 stopped: a pair loop over something other than a live dict view
 compiled.parameter at 16 stopped: a pair loop already past its last element
 compiled.parameter at 16 stopped: a pair loop over something other than a live dict view
+compiled.parameter at 16 stopped: an enumerate loop already past its last element
 compiled.step_into at 124 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 7 and 8) have kinds int and instance
 compiled.step_into at 124 stopped: OP_INVOKE: `Tensor.buffer` is not a builtin of the observed receiver's type
 compiled.step_into at 124 stopped: a pair loop over something other than a live dict view
+compiled.step_into at 124 stopped: local 11 was given two kinds, instance and instance-or-null
+compiled.step_into at 124 stopped: local 9 was given two kinds, instance and instance-or-null
 concat_columns at 60 stopped: OP_JUMP_IF_CMP_FALSE
 concat_columns at 60 stopped: OP_JUMP_IF_CMP_FALSE: a comparison of object with object
 connected_components at 776 stopped: more than 8 instance slots to pin
@@ -139,6 +146,7 @@ core.stats.norm at 342 stopped: OP_GET_GLOBAL: `channel_stats` is not a compiled
 core.stats.norm at 342 stopped: this loop head is out of compile attempts
 core.stats.reduced at 102 stopped: a pair loop already past its last element
 core.stats.reduced at 102 stopped: a pair loop over something other than a live dict view
+core.stats.reduced at 102 stopped: an enumerate loop already past its last element
 distance_transform at 433 stopped: OP_ADD
 edge_preserving_filter at 317 stopped: an exponent other than 0.5
 element_count at 10 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
@@ -165,13 +173,16 @@ gemm.load_cache at 66 stopped: OP_GET_GLOBAL: `plan_from_text` is not a compiled
 gemm.load_cache at 66 stopped: local 2 was given two kinds, list and object
 gemm.plan_from_text at 112 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 4 and 5) have kinds int and instance
 gemm.plan_from_text at 112 stopped: OP_GET_FIELD_LOCAL: receiver local 5 has kind object, not instance
+gemm.plan_from_text at 112 stopped: OP_TYPE_GUARD: a `str` guard on a object
 gemm.plan_from_text at 112 stopped: a pair loop over something other than a live dict view
 gemm.warmup at 18 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
+gemm.warmup at 18 stopped: a list loop already past its last element
 get_gaussian_kernel at 137 stopped: an append reaching past the model
 get_gaussian_kernel at 266 stopped: OP_INVOKE: a module member that has not compiled
 get_structuring_element at 229 stopped: OP_INVOKE: a module member that has not compiled
 groupby.handle.aggregate at 102 stopped: a list loop already past its last element
 groupby.handle.aggregate at 102 stopped: more live values than there are callee-saved registers
+groupby.handle.free at 47 stopped: a list loop already past its last element
 groupby.handle.group_by at 302 stopped: a list loop already past its last element
 groupby.handle.init at 45 stopped: a list loop already past its last element
 groupby.handle.key_index at 47 stopped: a list loop already past its last element
@@ -180,8 +191,10 @@ groupby.handle.value_columns at 19 stopped: a list loop already past its last el
 hoist._build_blocks_hoist at 474 stopped: OP_GET_GLOBAL: `opcode` is not a compiled global function
 hull.hull_walk at 234 stopped: slot 36 holds null, but the form was compiled for int
 hull.hull_walk at 329 stopped: slot 36 holds null, but the form was compiled for int
+imgproc.contours.find_contours at 483 stopped: OP_GET_GLOBAL: `compress` is not a compiled global function
 imgproc.contours.find_contours at 483 stopped: a list loop already past its last element
 imgproc.contours.thick_contours at 160 stopped: a list loop already past its last element
+imgproc.contours.trace_all at 227 stopped: OP_GET_GLOBAL: `next_start` is not a compiled global function
 imgproc.drawing.init at 161 stopped: OP_GET_INDEX: the container has kind instance, not list
 imgproc.features.good_features_to_track at 1386 stopped: an append reaching past the model
 imgproc.features.good_features_to_track at 1386 stopped: this loop head is out of compile attempts
@@ -192,6 +205,7 @@ imgproc.filter.get_gaussian_kernel at 266 stopped: OP_INVOKE: a module member th
 imgproc.morph.element_is_solid at 94 stopped: a return inside an OSR loop
 imgproc.morph.get_structuring_element at 229 stopped: OP_INVOKE: a module member that has not compiled
 imgproc.morph.rank_filter at 139 stopped: a return inside an OSR loop
+index._index_layout at 180 stopped: a list loop already past its last element
 init at 161 stopped: OP_GET_INDEX: the container has kind instance, not list
 init at 19 stopped: an append reaching past the model
 init at 237 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
@@ -206,9 +220,11 @@ io.path.join at 15 stopped: a list loop already past its last element
 jaithon.ast.kinds.kinds at 1263 stopped: a pair loop over something other than a live dict view
 jaithon.ast.kinds.kinds at 1263 stopped: the body declares 72 slots and an entry record holds 64
 jaithon.ast.kinds.kinds at 1324 stopped: a pair loop over something other than a live dict view
+jaithon.ast.kinds.kinds at 1324 stopped: the body declares 72 slots and an entry record holds 64
 jaithon.ast.operators.operators at 744 stopped: OP_TYPE_GUARD: a `OpKind` guard on a object
 jaithon.ast.operators.operators at 744 stopped: a pair loop over something other than a live dict view
 jaithon.ast.schema._build_schemas at 10 stopped: an append reaching past the model
+jaithon.ast.schema.define at 4 stopped: a list loop already past its last element
 jaithon.ast_encode.ast_encode at 914 stopped: OP_TYPE_GUARD: a `str` guard on a object
 jaithon.compile.check.kinds._build_ordinals at 22 stopped: a pair loop over something other than a live dict view
 jaithon.compile.emit.opcode._build_op_bytes at 22 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 2 and 3) have kinds int and instance
@@ -220,26 +236,34 @@ jaithon.compile.parse.token_class._table at 101 stopped: a pair loop over someth
 join at 15 stopped: OP_GET_GLOBAL: `_is_absolute_text` is not a compiled global function
 join.merge.merge at 1025 stopped: a pair loop already past its last element
 join.merge.merge at 1025 stopped: a pair loop over something other than a live dict view
+join.merge.merge at 1025 stopped: an enumerate loop already past its last element
 join.merge.merge at 1391 stopped: OP_GET_INDEX: the container has kind object, not list
 join.merge.merge at 1391 stopped: a pair loop already past its last element
 join.merge.merge at 1391 stopped: a pair loop over something other than a live dict view
+join.merge.merge at 1391 stopped: an enumerate loop already past its last element
 join.merge.merge at 1589 stopped: OP_GET_INDEX: the container has kind object, not list
 join.merge.merge at 1589 stopped: a pair loop already past its last element
 join.merge.merge at 1589 stopped: a pair loop over something other than a live dict view
+join.merge.merge at 1589 stopped: an enumerate loop already past its last element
 join.merge.merge at 1978 stopped: a list loop already past its last element
 join.merge.merge at 594 stopped: a list loop already past its last element
+join.merge.merge at 699 stopped: a list loop already past its last element
 join.pairing.hash_lane at 29 stopped: a list loop already past its last element
+join.pairing.pair_rows at 162 stopped: an enumerate loop already past its last element
 join.pairing.pair_rows at 844 stopped: a pair loop already past its last element
 join.pairing.pair_rows at 844 stopped: a pair loop over something other than a live dict view
+join.pairing.pair_rows at 844 stopped: an enumerate loop already past its last element
 join.pairing.radix_order at 146 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
 join.pairing.radix_order at 146 stopped: this loop head is out of compile attempts
 jpeg.jpeg at 1020 stopped: the body declares 166 slots and an entry record holds 64
 kernels.reduce_leading at 150 stopped: OP_GET_GLOBAL: `cached_kernel` is not a compiled global function
 keys.encode.encode_keys at 212 stopped: a pair loop already past its last element
 keys.encode.encode_keys at 212 stopped: a pair loop over something other than a live dict view
+keys.encode.encode_keys at 212 stopped: an enumerate loop already past its last element
 keys.encode.encode_keys at 296 stopped: a list loop already past its last element
 keys.encode.encode_keys at 506 stopped: a list loop already past its last element
 keys.encode.encode_keys at 64 stopped: a list loop already past its last element
+keys.encode.gather at 65 stopped: a list loop already past its last element
 keys.encode.gather at 65 stopped: an append reaching past the model
 keys.encode.gather at 65 stopped: this loop head is out of compile attempts
 keys.encode.order at 431 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
@@ -247,6 +271,7 @@ keys.encode.spread_flags at 23 stopped: an append reaching past the model
 keys.encode.spread_flags at 88 stopped: an append reaching past the model
 keys.group.factorize at 355 stopped: a list loop already past its last element
 keys.group.value_counts at 641 stopped: a list loop already past its last element
+layers.output_shape at 12 stopped: an append reaching past the model
 load_cache at 66 stopped: OP_GET_GLOBAL: `plan_from_text` is not a compiled global function
 load_cache at 66 stopped: a local was given two different kinds
 load_cache at 66 stopped: local 2 was given two kinds, list and object
@@ -259,6 +284,7 @@ main at 412 stopped: OP_GET_GLOBAL: `block` is not a compiled global function
 main at 555 stopped: OP_GET_GLOBAL: `block` is not a compiled global function
 main at 58 stopped: OP_GET_GLOBAL: `step` is not a compiled global function
 main at 61 stopped: OP_FOR_ITER_BIND: loop variable in local 6 has kind instance, not instance
+manipulate.transpose at 167 stopped: a list loop already past its last element
 manipulate.transpose at 43 stopped: an append reaching past the model
 matmul._product at 159 stopped: a list loop already past its last element
 matmul._product at 681 stopped: OP_GET_GLOBAL: `_encode` is not a compiled global function
@@ -266,9 +292,11 @@ matmul._product at 681 stopped: this loop head is out of compile attempts
 matmul._uniform_step at 57 stopped: a return inside an OSR loop
 model._clear_grad at 11 stopped: local 2 was given two kinds, instance and instance-or-null
 model._ensure_grads at 11 stopped: a list loop already past its last element
+model._fit_fused_async at 187 stopped: OP_GET_FIELD_LOCAL: `_fused_train` is not a field of Sequential
 model._forward at 20 stopped: a list loop already past its last element
 model._forward at 20 stopped: an unpinned receiver's result kind
 model._fused_relu_layers at 127 stopped: a return inside an OSR loop
+model._refresh_execution_plan at 126 stopped: an unpinned receiver's result kind
 model._run_compiled_epoch at 192 stopped: a local of no known kind
 model._run_compiled_epoch at 192 stopped: local 14 was given two kinds, instance and instance-or-null
 model._run_compiled_epoch at 192 stopped: this loop head is out of compile attempts
@@ -298,6 +326,7 @@ photo.denoise.inpaint at 459 stopped: this loop head is out of compile attempts
 place at 25 stopped: OP_CALL
 prepare_state at 4 stopped: OP_GET_GLOBAL: `state_for` is not a compiled global function
 radix_order at 146 stopped: OP_GET_GLOBAL: `kernel_for` is not a compiled global function
+random._shape_of at 87 stopped: a list loop already past its last element
 random._shape_of at 87 stopped: an append reaching past the model
 rank_filter at 139 stopped: a return inside an OSR loop
 reduce._by_falling_stride at 7 stopped: a list loop already past its last element
@@ -306,9 +335,11 @@ reduce._plan at 1067 stopped: a list loop already past its last element
 reduce._plan at 218 stopped: a list loop already past its last element
 reduce._plan at 28 stopped: an append reaching past the model
 reduce._plan at 51 stopped: a list loop already past its last element
+reduce._plan at 568 stopped: a list loop already past its last element
 reduce._plan at 965 stopped: a list loop already past its last element
 reduce._reduced_count at 10 stopped: a list loop already past its last element
 reduce._result_shape at 26 stopped: a list loop already past its last element
+reduce._result_shape at 7 stopped: a list loop already past its last element
 reduce._result_shape at 7 stopped: an append reaching past the model
 reduce._scan at 593 stopped: a list loop already past its last element
 reduce._scan at 618 stopped: a list loop already past its last element
@@ -322,11 +353,14 @@ reduce.aggregate.frame_axis0 at 460 stopped: OP_FOR_ITER_PAIR: a pair's loop var
 reduce.aggregate.frame_axis0 at 460 stopped: OP_GET_GLOBAL: `empty_result` is not a compiled global function
 reduce.aggregate.frame_axis0 at 460 stopped: a pair loop already past its last element
 reduce.aggregate.frame_axis0 at 460 stopped: a pair loop over something other than a live dict view
+reduce.aggregate.frame_axis0 at 460 stopped: an enumerate loop already past its last element
 reduce.stats.batched_stats at 233 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 10 and 11) have kinds int and instance
 reduce.stats.batched_stats at 233 stopped: OP_GET_INDEX
 reduce.stats.batched_stats at 233 stopped: a pair loop already past its last element
 reduce.stats.batched_stats at 233 stopped: a pair loop over something other than a live dict view
+reduce.stats.batched_stats at 233 stopped: an enumerate loop already past its last element
 reduce.stats.borrow_lanes at 26 stopped: OP_GET_INDEX: the container has kind object, not list
+reduce.stats.borrow_lanes at 26 stopped: a list loop already past its last element
 reduce.stats.release_lanes at 11 stopped: a pair loop over something other than a live dict view
 reduce_leading at 150 stopped: OP_GET_GLOBAL: `cached_kernel` is not a compiled global function
 repeats_for at 12 stopped: an indirect callee compiled against an older module
@@ -422,6 +456,7 @@ stopped : OP_GET_FIELD_LOCAL: receiver local 5 has kind int, not instance
 stopped : OP_GET_FIELD_LOCAL: receiver local 7 has kind int, not instance
 stopped : OP_GET_FIELD_LOCAL: receiver local 8 has kind int, not instance
 stopped : OP_GET_FIELD_LOCAL: receiver local 9 has kind int, not instance
+stopped : OP_GET_INDEX
 stopped : OP_GET_INDEX: no live list to read an element kind off
 stopped : OP_GET_INDEX: the container has kind instance, not list
 stopped : OP_GET_INDEX: the container has kind instance-or-null, not list
@@ -440,6 +475,7 @@ stopped : OP_INVOKE: `Agg.counts_rows` is not a builtin of the observed receiver
 stopped : OP_INVOKE: `Dtype.is_dictionary` is not a builtin of the observed receiver's type
 stopped : OP_INVOKE: `Dtype.is_numeric` is not a builtin of the observed receiver's type
 stopped : OP_INVOKE: `Dtype.is_wide` is not a builtin of the observed receiver's type
+stopped : OP_INVOKE: `How.keeps_left` is not a builtin of the observed receiver's type
 stopped : OP_INVOKE: `dict.get` has no usable result kind (mixed)
 stopped : OP_INVOKE: `dict.get` has no usable result kind (something the tier does not name)
 stopped : OP_INVOKE: `list.enumerate` has no usable result kind (never observed)
@@ -573,6 +609,7 @@ tensor.backward at 293 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (local
 tensor.backward at 293 stopped: OP_GET_GLOBAL: `accumulate_grad` is not a compiled global function
 tensor.backward at 293 stopped: a pair loop already past its last element
 tensor.backward at 293 stopped: a pair loop over something other than a live dict view
+tensor.backward at 293 stopped: an enumerate loop already past its last element
 tensor.element_count at 40 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 tensor.element_count at 40 stopped: a list loop already past its last element
 tensor.init at 19 stopped: a list loop already past its last element

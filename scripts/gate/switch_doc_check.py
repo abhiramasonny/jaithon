@@ -35,6 +35,7 @@ SECTION = "## Every switch this tier reads"
 #: is verified to still exist where it says, so the exemption cannot go stale.
 ELSEWHERE = {
     "JAITHON_MEGA_STRESS": "src/vm/vm_cache.c",
+    "JAITHON_LAZY_ENUMERATE": "src/vm/vm.c",
 }
 
 

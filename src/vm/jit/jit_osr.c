@@ -653,12 +653,17 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
          * the list-of-tuples head as well as the dict one -- the step shared
          * with the function tier reloads all three every iteration rather than
          * hoisting them, which is exactly why iterKind 4 needs no prologue of
-         * its own. */
+         * its own. The enumerate head (5) is NOT one of these: it steps off
+         * the reserved registers like a plain list head, so it takes the
+         * branch below. */
         emit(&e, jaiA64MovX(JIT_PAIR_ITER_REG, 1));
     } else if (hasIter) {
         /* x1 is the iterator on entry. A range head reads everything it wants
          * out of it here and parks the pointer in the frame; a list head keeps
-         * it, because its version guard reads the iterator every iteration. */
+         * it, because its version guard reads the iterator every iteration.
+         * The enumerate head (5) is a list head here in every respect -- its
+         * source is the snapshot list -- except that it needs no version
+         * guard, the snapshot being private to its iterator. */
         unsigned rIter = iterKind == 1 ? 1u : JIT_ITER_REG;
         if (iterKind == 1) {
             emit(&e, jaiA64StrX(1, 31, e.iterFrameOffset));
@@ -746,7 +751,9 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     do {                                                                       \
         /* A pair head (3 and 4) keeps nothing in a register but the pointer,  \
          * and the step has already stored the index it advanced -- so every   \
-         * way out of one finds the ObjIter already current. */                \
+         * way out of one finds the ObjIter already current. The enumerate     \
+         * head (5) is not one of those: its index rides in JIT_IDX_REG and    \
+         * comes back here, as a list head's does. */                          \
         if (hasIter && iterKind != 3 && iterKind != 4) {                       \
             /* A range head left the iterator in the frame rather than in a    \
              * register, so it comes back here. Every stub this expands into   \
@@ -1099,7 +1106,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
  * the form here instead lets the head compile another one. */
 static bool osrFormStorageFits(const JaiOsrForm *form, const Value *slots,
                                uint8_t iterKind, uint8_t elemStg) {
-    if (iterKind == 2 && form->iterStg != LIST_STG_ANY &&
+    if ((iterKind == 2 || iterKind == 5) && form->iterStg != LIST_STG_ANY &&
         form->iterStg != elemStg) {
         return false;
     }
@@ -1137,11 +1144,48 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             return osrNo(fn, top, "a for-loop head whose stack top is not an iterator");
         iter = AS_ITER(it);
         if (pairTop) {
-            /* `for (k, v) in d.items()` at the top of the loop being entered.
-             * The sample is the dict itself -- the head arm reads the first
-             * live entry out of it for the component kinds, as the list head
-             * reads items[index]. */
-            if (iter->kind == ITER_DICT_ITEMS && IS_DICT(iter->source)) {
+            if (iter->kind == ITER_LIST_ENUM && IS_LIST(iter->source) &&
+                jaiLazyEnumerateOn()) {
+                /* `for (i, x) in xs.enumerate()` at the top of the loop being
+                 * entered, over the snapshot OP_INVOKE built. A LIST head in
+                 * every respect but the binding -- same reserved registers,
+                 * same prologue, same index write-back, same sample off
+                 * items[index], same census, same null-density refusal -- and
+                 * the pair arm binds the index beside the element. Its kind is
+                 * 5 and not 4 because 4 is the list-of-2-tuples head, which
+                 * shares the DICT head's prologue instead: the two are both
+                 * pair heads over a list and share nothing else.
+                 *
+                 * 96 of the 106 pair loops in lib/jaithon are this shape, and
+                 * every one of them was refused below -- as a user iterator,
+                 * `.enumerate()` having been one before the snapshot existed
+                 * to arm. */
+                ObjList *esrc = AS_LIST(iter->source);
+                int eat = (int)iter->index;
+                if (eat < 0 || eat >= esrc->count) {
+                    return osrNo(fn, top,
+                                 "an enumerate loop already past its last "
+                                 "element");
+                }
+                /* jaiIterNewListEnum always boxes, so this states what the
+                 * emitted stride of 16 rests on rather than naming a case
+                 * that arises. */
+                if (esrc->stg != LIST_STORE_BOXED) {
+                    return osrNo(fn, top,
+                                 "an enumerate snapshot that is not boxed");
+                }
+                if (!jitListHeadSample(esrc, eat, &elemSample, &elemMixed)) {
+                    return osrNo(fn, top,
+                                 "an enumerate loop whose elements are too "
+                                 "often null");
+                }
+                elemStg = (uint8_t)LIST_STORE_BOXED;
+                iterKind = 5;
+            } else if (iter->kind == ITER_DICT_ITEMS && IS_DICT(iter->source)) {
+                /* `for (k, v) in d.items()` at the top of the loop being
+                 * entered. The sample is the dict itself -- the head arm reads
+                 * the first live entry out of it for the component kinds, as
+                 * the list head reads items[index]. */
                 elemSample = iter->source;
                 iterKind = 3;
             } else if (jitPairListOn() && iter->kind == ITER_LIST &&
@@ -1233,7 +1277,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                  * and ranking the refusal by its count then credited the
                  * cheapest of them with the other two's sites. */
                 return osrNo(fn, top,
-                             iter->kind == ITER_LIST
+                             iter->kind == ITER_LIST_ENUM
+                                 ? "a pair loop over an enumerate snapshot, "
+                                   "with the lazy enumerate switched off"
+                             : iter->kind == ITER_LIST
                                  ? "a pair loop over a list, with the list "
                                    "pair head switched off"
                              : (iter->kind == ITER_USER ||
@@ -1265,59 +1312,38 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             int at = (int)iter->index;
             if (at < 0 || at >= src->count)
                 return osrNo(fn, top, "a list loop already past its last element");
-            elemSample = jaiListGet(src, at);
             elemStg = src->stg;
             iterKind = 2;
-            /* Whether the list holds one class or several. One sample cannot
-             * say, and getting it wrong is not merely a slower loop: a form
-             * compiled pinned to the sampled class fails its own entry guard
-             * on every later class, so the loop runs interpreted for the rest
-             * of the program with no second chance to notice. Capped because
-             * this runs per compile attempt and a list can be enormous; past
-             * the cap the pinned form is compiled as before and deoptimises if
-             * it was wrong, which is where this started. */
-            if (IS_INSTANCE(elemSample)) {
-                const ObjClass *first = AS_INSTANCE(elemSample)->klass;
-                int scan = src->count < 1024 ? src->count : 1024;
-                int nulls = 0;
-                for (int i = 0; i < scan; i++) {
-                    Value v = jaiListGet(src, i);
-                    if (IS_NULL(v)) { nulls++; continue; }
-                    if (!IS_INSTANCE(v)) continue;
-                    if (AS_INSTANCE(v)->klass != first) { elemMixed = true; }
-                }
-                /* A `list[T?]` holding nulls beside instances. The element
-                 * guard this form emits is a tag check against VAL_OBJ, so a
-                 * null bails out of the compiled loop -- and the loop is
-                 * re-entered on the next element, so the bail is paid per null
-                 * and not once.
-                 *
-                 * Refusing on PRESENCE is the obvious answer and it is the
-                 * wrong one; the question is DENSITY. Same probe throughout --
-                 * a 2M list[Node?], twenty passes of
-                 * `for x in xs { if x is null { t += 1 } }`, whole process,
-                 * best of three alternating runs under scripts/gpu_lock.sh:
-                 *
-                 *                    no nulls   1 in 3    1 in 1000
-                 *   declined            635       661        661
-                 *   no refusal          223     11604        296
-                 *   refuse on presence  219       661        661
-                 *   refuse past 1/64    223       662        280
-                 *
-                 * One null in three costs 17.6x with no refusal at all, which
-                 * is why a refusal has to exist. One null in a thousand is
-                 * 2.36x FASTER pinned than interpreted, which is what refusing
-                 * on presence throws away. The threshold keeps both ends.
-                 *
-                 * The proper fix is to widen the element to SLOT_MAYBE_INST so
-                 * the guard accepts a null and no bail happens at all, which
-                 * would retire this whole test. Until then, this.
-                 *
-                 * The class scan no longer stops at the first mismatch: the
-                 * null count needs the whole prefix, and the cap is what
-                 * bounds the cost. */
-                if (nulls * 64 > scan)
-                    return osrNo(fn, top, "a list loop whose elements are too often null");
+            /* Whether the list holds one class or several (jitListHeadSample,
+             * which the enumerate head and the function tier's enumerate arm
+             * share) -- and whether a `list[T?]` holds nulls beside its
+             * instances. The element guard this form emits is a tag check
+             * against VAL_OBJ, so a null bails out of the compiled loop -- and
+             * the loop is re-entered on the next element, so the bail is paid
+             * per null and not once.
+             *
+             * Refusing on PRESENCE is the obvious answer and it is the wrong
+             * one; the question is DENSITY. Same probe throughout -- a 2M
+             * list[Node?], twenty passes of
+             * `for x in xs { if x is null { t += 1 } }`, whole process, best
+             * of three alternating runs under scripts/gpu_lock.sh:
+             *
+             *                    no nulls   1 in 3    1 in 1000
+             *   declined            635       661        661
+             *   no refusal          223     11604        296
+             *   refuse on presence  219       661        661
+             *   refuse past 1/64    223       662        280
+             *
+             * One null in three costs 17.6x with no refusal at all, which is
+             * why a refusal has to exist. One null in a thousand is 2.36x
+             * FASTER pinned than interpreted, which is what refusing on
+             * presence throws away. The threshold keeps both ends.
+             *
+             * The proper fix is to widen the element to SLOT_MAYBE_INST so
+             * the guard accepts a null and no bail happens at all, which
+             * would retire this whole test. Until then, this. */
+            if (!jitListHeadSample(src, at, &elemSample, &elemMixed)) {
+                return osrNo(fn, top, "a list loop whose elements are too often null");
             }
         } else {
             return osrNo(fn, top, "an iterator kind with no loop-head arm");

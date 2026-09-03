@@ -257,6 +257,18 @@ static bool pairSplitFail(Value item) {
                     available, available == 1 ? "" : "s");
 }
 
+/* See vm.h. Cached, as every switch on a hot path is: getenv is O(environ),
+ * and a switch read per loop entry would let the shell's environment size
+ * into the measurement it exists to make. */
+bool jaiLazyEnumerateOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_LAZY_ENUMERATE");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 #define READ_BYTE()  (*ip++)
 #define READ_I8()    ((int8_t)*ip++)
 #define READ_U16()   (ip += 2, jaiReadU16(ip - 2))
@@ -1811,6 +1823,38 @@ static JaiRunResult runLoop(int baseFrameCount) {
                 }
             }
         } else if ((builtinTag = builtinShapeTag(receiver)) != 0) {
+            /* `for (i, x) in xs.enumerate()` on a list. The emitter lowers it
+             * to `INVOKE enumerate 0; GET_ITER; FOR_ITER_PAIR`, and the native
+             * behind that invoke builds N 2-tuples and a list holding them,
+             * every one of which the fused pair head then takes straight
+             * apart again -- 4M allocations of a 2M-iteration probe. Here the
+             * receiver is replaced with an ITER_LIST_ENUM over one boxed copy
+             * of its elements and the GET_ITER is skipped, so the pair step
+             * yields (index, element) with nothing built per iteration.
+             *
+             * A snapshot, not a view: `list.enumerate()` copied the elements
+             * too, so a loop that pushes to or reassigns `xs` sees exactly
+             * what it saw before, where ITER_LIST would raise. The next-opcode
+             * test is what confines this to a `for` head: a call whose result
+             * is kept -- `xs.enumerate().len()`, or with a start argument --
+             * still gets the list the checker typed it as.
+             *
+             * Same runtime dispatch as OP_GET_ITER_ITEMS, for the same
+             * reason: the emitter has no checker types (chunk.h's note on
+             * that opcode), so the shape is matched here, where the receiver
+             * is in hand. A list has no user methods, so name and argc are
+             * the whole identity of the native being replaced. */
+            if (JAI_UNLIKELY(argc == 0 && *ip == OP_GET_ITER) &&
+                IS_LIST(receiver) &&
+                AS_STRING(constants[nameIdx]) == vm.strEnumerate &&
+                jaiLazyEnumerateOn()) {
+                SAVE_STATE();
+                ObjIter *it = jaiIterNewListEnum(AS_LIST(receiver));
+                LOAD_STACK_ONLY();
+                stackTop[-1] = OBJ_VAL(it);
+                ip += 1;                 /* the OP_GET_ITER this stood in for */
+                VM_NEXT();
+            }
             /* Same idea for `xs.push(v)`. The cached value is the ObjNative
              * itself, not a bound wrapper: the receiver is already sitting in
              * the callee slot, which is exactly where a built-in method wants

@@ -376,6 +376,18 @@ JAI_INLINE bool pairSplit(Value item, Value *a, Value *b) {
 }
 
 JAI_INLINE PairStep iterStepPairFast(ObjIter *it, Value *a, Value *b) {
+    /* `for (i, x) in xs.enumerate()` over the snapshot OP_INVOKE took: the
+     * index is the first component and the element the second, and neither
+     * is boxed into a tuple on the way. No version test -- the snapshot is
+     * this iterator's own and nothing else can reach it. */
+    if (it->kind == ITER_LIST_ENUM) {
+        const int64_t index = it->index;
+        if (index >= it->limit) return PAIR_STEP_DONE;
+        *a = INT_VAL(index);
+        *b = jaiListGet(AS_LIST(it->source), (int)index);
+        it->index = index + 1;
+        return PAIR_STEP_VALUE;
+    }
     if (it->kind == ITER_DICT_ITEMS) {
         JaiTable *const table = &AS_DICT(it->source)->table;
         if (JAI_UNLIKELY(table->version != it->version)) return PAIR_STEP_SLOW;
