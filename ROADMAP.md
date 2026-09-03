@@ -304,21 +304,30 @@ to consume a tagged return is the obvious follow-up, and it is now measurable.
   568.7M -> 525.8M before inlining. The 91 `if kind == TokenKind.X` chains in
   `parse/` are the same fix and are next.
 
-### Held: the lazy `enumerate` iterator
+### Landed: the lazy `enumerate` iterator
 
-Built and measured (`JAITHON_LAZY_ENUMERATE`), NOT merged. It replaces the
-eager `list.enumerate()` -- a C native that builds N 2-tuples up front -- with
-a snapshot iterator the interpreter steps into two slots, plus arms in both
-tiers. On probes it is worth 15x interpreted instructions and turns 2,005,302
-allocations into 5,295. On `check lib/jaithon` it is **inside the noise floor**,
-and allocations fall only 5.1%, because the bodies it unblocks hit the next
-link of the same chain.
+`JAITHON_LAZY_ENUMERATE`. The eager `list.enumerate()` -- a C native building N
+2-tuples up front -- is replaced, when the next op is `OP_GET_ITER`, by a
+snapshot iterator the interpreter steps straight into two slots, plus arms in
+both tiers. On a 200k-element probe: **2,017,838 allocations become 1,306**, and
+interpreted instructions 384,013 -> 53,893, with identical output.
 
-Held for a concrete reason, not a doubt: it claims OSR `iterKind == 4`, and the
-pair-over-list-of-tuples head merged above already uses 4. The two must be
-renumbered against each other before either can carry the other -- a partial
-apply put both in one tree and it had to be reset. Its adversarial review never
-ran (the session hit its limit), so it has a builder's word and no refuter's.
+It was held because it claimed OSR `iterKind == 4`, which the pair-over-tuples
+head already used. The renumber to 5 turned out to be the smaller half of the
+problem: the enumerate step indexes `ObjList::items` and advances its own index
+register, so it is a LIST head and needs kind 2's prologue, `osrReserved == 5u`
+and `OSR_SYNC_ITER`'s index write-back. Every one of those ladders keys off "not
+3 and not 4" -- numbering it 4 would have silently given it the dict prologue,
+with no `JIT_START_REG` and no write-back.
+
+**The review rejected the first build over a real defect.** `jitListHeadSample`
+returned early on any non-instance sample, so the 1-in-64 null census never ran
+for a `list[int?]`; switching the arm on moved such loops off the protected
+kind-4 path onto an unprotected one -- 3,333,335 entry-guard bails and **1.15x
+slower than refusing**. That is the same hazard that made the pair arm 3.50x
+slower, wearing a different shape. The census now covers non-instance samples,
+which also closes an inherited hole in the plain bind head. On a 2M `list[int?]`
+at one null in three: no-JIT 0.45s, arm off 0.24s, **arm on 0.20s**, zero bails.
 
 ### What this says about the earlier plan
 
