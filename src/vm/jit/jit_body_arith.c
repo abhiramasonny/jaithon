@@ -149,6 +149,33 @@ bool emitAddSubDiv(Emit *e, ObjFunction *fn, uint8_t op, const uint8_t *code,
         if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_FLOAT &&
             e->stack[e->depth - 2] == SLOT_FLOAT) {
             unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
+            /* Float `/` by zero RAISES in the interpreter (floatArithmetic,
+             * vm_operator.c) and a bare `fdiv` does not -- it yields inf/nan.
+             * Without this guard the answer depends on which tier ran the
+             * division: the same shape as the three silent miscompiles this
+             * tier has already shipped and fixed.
+             *
+             * Nothing caught it because every `assert_throws(DivisionByZero…)`
+             * in the suite is INTEGER, and integer `/` is a hard whole-body
+             * refusal below -- so no test has ever entered this arm. A corpus
+             * cannot validate a path it never runs.
+             *
+             * FCMP against zero is exactly the interpreter's `y == 0.0` on
+             * both edges: Z sets for -0.0, which the interpreter also throws
+             * on, and stays clear for a NaN divisor, which it also divides.
+             *
+             * Placed BEFORE the pops, so the record deoptSite writes still
+             * describes both operands and the interpreter re-executes this
+             * OP_DIV and raises for itself. settleAll/fpReleaseAll first
+             * because branchOnDeopt refuses a deferred or borrowed entry --
+             * the same pair, for the same reason, as the float compare arm in
+             * jit_body_cmp.c. */
+            if (op == OP_DIV && jitFdivGuard()) {
+                settleAll(e);
+                fpReleaseAll(e);
+                emit(e, jaiA64FcmpDZero(fpOperand(e, ib)));
+                branchOnDeopt(e, JAI_A64_EQ);
+            }
             unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
             if (!popValueRaw(e, &rb, &kb)) return false;
             if (!popValueRaw(e, &ra, &ka)) return false;

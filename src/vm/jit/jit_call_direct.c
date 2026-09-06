@@ -112,6 +112,15 @@ bool jitAnyGuard(void) {
     return cached != 0;
 }
 
+bool jitFdivGuard(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FDIV_GUARD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool jitReturnKnownOn(void) {
     static int cached = -1;
     if (cached < 0) {

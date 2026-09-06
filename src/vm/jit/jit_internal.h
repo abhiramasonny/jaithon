@@ -1166,6 +1166,11 @@ void emitMaybeInstResult(Emit *e, unsigned dst, unsigned rat,
                                 uint32_t rshape, uint32_t deoptIp);
 bool jitAnyGuard(void);
 bool jitReturnKnownOn(void);
+/* The float divide-by-zero guard in emitAddSubDiv. ON by default -- it is a
+ * correctness fix, not an optimisation. JAITHON_JIT_FDIV_GUARD=0 exists only so
+ * its cost (one fcmp and one not-taken branch per compiled float division) can
+ * be A/B'd inside one binary, which is the only honest way to price it. */
+bool jitFdivGuard(void);
 bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
                            unsigned argc, uint32_t callOff, uint32_t after,

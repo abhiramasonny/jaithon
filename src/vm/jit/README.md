@@ -454,6 +454,7 @@ this table complete in both directions.
 | `JAITHON_JIT_RET_OBJTYPE` | on | Record the object type a callee returns. |
 | `JAITHON_JIT_RETURN_KNOWN` | on | Require a direct callee's walk to have reached a return. |
 | `JAITHON_JIT_ANY_GUARD` | on | Guard an `any`-typed value rather than refusing it. |
+| `JAITHON_JIT_FDIV_GUARD` | on | Raise on float `/` by zero, as the interpreter does. |
 | `JAITHON_JIT_CONCAT_LOCALS` | on | String concatenation into locals. |
 | `JAITHON_JIT_STRCMP` | on | String ordering comparisons. |
 | `JAITHON_JIT_STRCMP_EQ` | on | String equality. |
@@ -1022,6 +1023,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_LIST_SCALAR` | `jitListScalarResult` | predicting `sum`/`min`/`max`. |
 | `JAITHON_JIT_RETURN_KNOWN` | `jitReturnKnownOn` | refusing a direct callee whose walk never reached a return. `jitReturnKind` is written even then, so without this the arm trusts a value nothing established. |
 | `JAITHON_JIT_ANY_GUARD` | `jitAnyGuard` | the `list` / instance / `any` type-guard arms -- `any` is satisfied by every value, so its guard is genuinely nothing. |
+| `JAITHON_JIT_FDIV_GUARD` | `jitFdivGuard` | the float divide-by-zero guard in `emitAddSubDiv`. This one is a CORRECTNESS fix, not an optimisation: without it compiled `x / 0.0` yields inf where the interpreter raises `DivisionByZeroError`. The switch exists only to price the guard (one `fcmp`, one not-taken branch per compiled float division) inside one binary. Never ship with it off. |
 | `JAITHON_JIT_PIC` | `jitPicEnabled` | the one-way inline cache at an unpinned `OP_INVOKE`. |
 | `JAITHON_JIT_NULL_PAIR` | `jitNullPair` | `x == null` on a `SLOT_OBJ`. Equality only, and object kinds only: a `SLOT_INT` is also never null, but zero is a perfectly good int. |
 | `JAITHON_JIT_FUSED_DISCARD` | `jitFusedDiscard` | fusing `OP_POP_RETURN_NULL` after a discarded call. |
