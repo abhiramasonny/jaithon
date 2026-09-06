@@ -44,8 +44,9 @@ pub fn freeze_literals(program: Node, source: str) -> Node {
         if spelling.len() == 0 {
             return true
         }
+        # Slots are positioned per kind, so the new kind brings its own list.
         current.kind = NodeKind.Ident
-        current.fields = {"name": spelling}
+        current.fields = Node.ident(spelling).fields
         return false
     }, fn(_current: Node) -> void {})
     return program

@@ -8,6 +8,12 @@
 #: facade. Keeping the tables here rather than in `node.jai` is what lets a
 #: reader of the encoder stop at one file.
 #:
+#: A node stores its fields in a slot list rather than a dict, so the four
+#: tables at the bottom of this file are what turn a field NAME into a
+#: position: `_FIELD_INDEX`, and the three behind `tags_of` and `new_slots`.
+#: All four are derived from the same `_SCHEMAS` that `fields_of` answers
+#: from, and all four are built once, at module load.
+#:
 #: What is NOT here: the sub-structure builders. `param()`, `arg()` and their
 #: siblings fill a record out of `_RECORDS` and `_default_field`, but they
 #: build `Node`-carrying dicts and `Node.call` calls one of them, so they live
@@ -273,4 +279,115 @@ pub fn _default_field(name: str, tag: str) -> any {
     if tag == "vdk" { return DeclKind.Let }
     if tag == "compk" { return CompKind.List }
     return null
+}
+
+# Four views of _SCHEMAS, one per question a slot list gets asked: which slot
+# does this name occupy, what tag does this slot carry, what does a fresh slot
+# list look like, and which of its slots must not be shared. They are built
+# here, below `_default_field`, because `_build_default_slots` calls it.
+#
+# Keyed by the kind itself rather than by `_KIND_INDEX[kind]`, which is how
+# `_SCHEMAS` is indexed. That is one dict read where the two-table form is a
+# dict read and then a list read, and these four are read once per node built
+# and once per field touched.
+fn _build_field_index() -> dict[NodeKind, dict[str, int]] {
+    let indexes: dict[NodeKind, dict[str, int]] = {}
+    for kind in _KINDS {
+        let index: dict[str, int] = {}
+        var slot = 0
+        for (name, _tag) in _SCHEMAS[_KIND_INDEX[kind]] {
+            index[name] = slot
+            slot = slot + 1
+        }
+        indexes[kind] = index
+    }
+    return indexes
+}
+
+fn _build_tags() -> dict[NodeKind, list[str]] {
+    let tags: dict[NodeKind, list[str]] = {}
+    for kind in _KINDS {
+        tags[kind] = [tag for (_name, tag) in _SCHEMAS[_KIND_INDEX[kind]]]
+    }
+    return tags
+}
+
+fn _build_default_slots() -> dict[NodeKind, list[any]] {
+    let defaults: dict[NodeKind, list[any]] = {}
+    for kind in _KINDS {
+        let fields = _SCHEMAS[_KIND_INDEX[kind]]
+        defaults[kind] = [_default_field(name, tag) for (name, tag) in fields]
+    }
+    return defaults
+}
+
+# The slots `_default_field` answers with a fresh `[]`. A prebuilt row is
+# copied rather than rebuilt, and a shallow copy would hand every node of a
+# kind the SAME list, so these are the slots `new_slots` refills.
+#
+# Every row ends in -1. Most kinds declare no list field at all, and an empty
+# row leaves the tier nothing to sample -- it refuses the whole of `new_slots`
+# with "the live list is empty, so there is no exemplar", which costs every
+# node its slot list. The terminator is also the loop's condition, so it pays
+# for itself.
+fn _build_list_slots() -> dict[NodeKind, list[int]] {
+    let lists: dict[NodeKind, list[int]] = {}
+    for kind in _KINDS {
+        let slots: list[int] = []
+        var slot = 0
+        for (_name, tag) in _SCHEMAS[_KIND_INDEX[kind]] {
+            if tag in _ELEMENT_TAG { slots.push(slot) }
+            slot = slot + 1
+        }
+        slots.push(-1)
+        lists[kind] = slots
+    }
+    return lists
+}
+
+#: The slot each field of `kind` occupies, keyed by the name `fields_of` lists.
+#:
+#: A table rather than a `field_index(kind)` in front of it, and `pub` for the
+#: same reason `_RECORDS` is: `Node`'s accessors read it on every field
+#: touched, and a call in front of a container leaves the tier a kind it cannot
+#: name. That alone refused `Node.get` and cost 10.0M interpreted instructions
+#: of `check lib/jaithon`. It is NOT re-exported by the `jaithon.ast` facade —
+#: `node.jai` is the only reader, so the public surface is what it was.
+#:
+#: ```
+#: _FIELD_INDEX[NodeKind.Index]   # {"object": 0, "index": 1}
+#: ```
+pub let _FIELD_INDEX: dict[NodeKind, dict[str, int]] = _build_field_index()
+
+let _TAGS: dict[NodeKind, list[str]] = _build_tags()
+let _DEFAULT_SLOTS: dict[NodeKind, list[any]] = _build_default_slots()
+let _LIST_SLOTS: dict[NodeKind, list[int]] = _build_list_slots()
+
+#: The tag of each field of `kind`, in slot order.
+#:
+#: ```
+#: tags_of(NodeKind.Index)   # ["node", "node"]
+#: ```
+pub fn tags_of(kind: NodeKind) -> list[str] {
+    return _TAGS[kind]
+}
+
+#: A fresh slot list for `kind`, every slot holding that field's default.
+#:
+#: ```
+#: new_slots(NodeKind.StrLit)   # [null, 0], the `chars` and `length` defaults
+#: ```
+pub fn new_slots(kind: NodeKind) -> list[any] {
+    # Annotated, and not because the checker needs it: `.copy()` answers a
+    # container of no known kind, and the tier then refuses the store below
+    # with "an index store into an object that is not a dict" -- which is the
+    # whole of this function, once per node.
+    let slots: list[any] = _DEFAULT_SLOTS[kind].copy()
+    let refill = _LIST_SLOTS[kind]
+    var at = 0
+    while refill[at] >= 0 {
+        slots[refill[at]] = []
+        at = at + 1
+    }
+    return slots
 }

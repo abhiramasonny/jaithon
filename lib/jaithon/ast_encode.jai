@@ -669,8 +669,13 @@ pub fn from_json(text: str) -> Node {
 pub fn to_value(node: Node?) -> any {
     if node is null { return null }
     let out: dict[str, any] = {"kind": kind_name(node.kind), "span": _span_value(node.span)}
+    # `fields_of` lists a kind's fields in the order its slots hold them, so the
+    # position of the pair IS the slot. Every declared field has a slot, which
+    # is why there is no default to fall back to here.
+    var slot = 0
     for (name, tag) in fields_of(node.kind) {
-        out[name] = _value_of(node.fields.get(name, _default_field(name, tag)), tag)
+        out[name] = _value_of(node.fields[slot], tag)
+        slot = slot + 1
     }
     return out
 }
@@ -740,8 +745,10 @@ fn _node_from(value: any) -> Node? {
     if name is null { throw ValueError("an AST node object needs a `kind`") }
     let kind = kind_from_name(name)
     let node = Node(kind, span: _span_from(value.get("span", null)))
+    var slot = 0
     for (field, tag) in fields_of(kind) {
-        node.fields[field] = _from_value(value.get(field, null), field, tag)
+        node.fields[slot] = _from_value(value.get(field, null), field, tag)
+        slot = slot + 1
     }
     return node
 }

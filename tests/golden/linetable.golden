@@ -20,20 +20,20 @@ c7d540b035d5b33d48dbe7ad836cecac40a3122e632cc5753e6869af2f4210bc  182  examples/
 16944793281bdb25a732e843a267d9560db873e8c342ebef649c5e85e37c7c85  1006  examples/yolo_detect/detector.jai
 543016bc856f4a585d1b604b87e44e26ee96b86595aafc49a9607208ec637506  654  examples/yolo_detect/live.jai
 dfd5c07aba3fd854df8f92471901f7ef8a13948674baa332f0911a861c8fefa7  153  examples/yolo_detect/ort_check.jai
-3124bbe42b27cfa6417fcfc5376197e40682527799375a1d172b165cd888d79f  138  lib/jaithon/ast.jai
+d23ef40464864432ff2914774c7f0c906f9578a790302af6ec20105d2d19bcf9  138  lib/jaithon/ast.jai
 a4b4d57d97b8d0747baa7db109f37f46d5c7aa3c6ada719002da21f65febd59a  366  lib/jaithon/ast/kinds.jai
-2a931e5e53886d97cc17014912de6f30d27f0e957c0e9b9958263d74194cee67  1000  lib/jaithon/ast/node.jai
+5db74c0536bc68acc9dc61c752fc5512d646a03c8a5d7ce7a97d8e17b4036e81  1014  lib/jaithon/ast/node.jai
 037b01abaf517ab86cd8904a6136a02ee6584f47b510c97cec45ffa1fe69ae76  242  lib/jaithon/ast/operators.jai
-ae19b07ea450ada0830e67f7233fc8f9d4810319fdf5a3e7e1bded630c0fa176  1060  lib/jaithon/ast/schema.jai
+5ab5f0284747ffb5a8f46826850699e845021e9b85d21ddb217f4f1c05ce605f  1234  lib/jaithon/ast/schema.jai
 79ee24f65a56684f92c8341f34a6d0a6283e36745123d4a94d3a393c266c7b7d  236  lib/jaithon/ast/span.jai
 2b671a2def0dbf944975842e4f8d03f4fc511a6d034a4fd15d78fc6d841f1bbb  671  lib/jaithon/ast/tree.jai
 def705190cff019401a22b565c5094d5be7f92f3891f6b2fcb7857ed468e6dfa  320  lib/jaithon/ast/types.jai
-4403ac938084624f5432c5417b194707322217ff16d2eba6f12feffb0d240bf5  3554  lib/jaithon/ast_encode.jai
+bb5a2f1968aecb6d34ea241cc69a65fdb5445b1fa58fa80caa13a6e2684a6e04  3557  lib/jaithon/ast_encode.jai
 a2da964886b50968794676bc8255dc190673ad5b6b35d6b562d5f81e9601c7f5  4065  lib/jaithon/ast_unparse.jai
 0333c6857ff32225b9cb2992a3931634963a52e6e043bec8de8ade462e4d0403  1070  lib/jaithon/ast_visitor.jai
 557c8f55d5c868252a97df42664c4acb7dd89f1811dc0d123e75277c837ff2f6  767  lib/jaithon/compile/check/assign.jai
-711657a131ba6fbd5d6a09d08435b84d637909496b35412525012849a318bbbc  2572  lib/jaithon/compile/check/checker.jai
-0195d46ed7f687da00edffb187fb5a4b3aeca0df8465dc42737ccb57aad3d92d  2730  lib/jaithon/compile/check/ctx.jai
+e94d04dc299d86a2378a0eb6bfd1aa594b17599abf1bcd702f02f7670dff03a9  2557  lib/jaithon/compile/check/checker.jai
+2fcc27972fdafe172304f3d5cc20f286619a6266f85ec717ff5127a1bb2bad2f  2734  lib/jaithon/compile/check/ctx.jai
 18171344d43b71b5893132c3a6e2c3da58d80ead02afe5d3256002af0dde41c3  3672  lib/jaithon/compile/check/decl.jai
 9c732cb9bb00a5707792251fe1a455e7272f3dcf79defca0dcd05df6d03d9c5e  5179  lib/jaithon/compile/check/expr.jai
 4071305817ba876c4eacf7bb083bdcb871c81265bbb8f29d479c52f30795a2dd  2272  lib/jaithon/compile/check/fold.jai
@@ -131,7 +131,7 @@ d5c25237db91af8470c732d0a8a601e9cfc4b307380d27c6d80029ad3b0c03e6  335  lib/jaith
 63b602cc41e4b8ad2178988fa82a0aebd4c618ba7ffafe362961048231463433  606  lib/jaithon/tool/fmt/comment.jai
 80ae7b04e6246c61d1382a5feab15e1379dd03499b0bdf84ca5f74c637c0186a  572  lib/jaithon/tool/fmt/diff.jai
 137172667e7d6e5dcf3e4ec17e8468d3663a44589fc56c5669d0f4ff64e45c62  495  lib/jaithon/tool/fmt/driver.jai
-74f542e504ea164d0a5bf0996a6ac52f79f59865d4609dd0c032443c5236dd5c  237  lib/jaithon/tool/fmt/format.jai
+dcac55b8de299d299d508d45fb77a2767eef20991242ad0971df539771d603f0  239  lib/jaithon/tool/fmt/format.jai
 390e9aa98fafedf4ac5b4ed51d9b55a65ac8431addb4c80732b14864a4139f74  646  lib/jaithon/tool/fmt/layout.jai
 4848f57a2615034ea6e56a2dffda2f6a87a42b3d790fe6cb5dc76984d333f2a4  731  lib/jaithon/tool/fmt/migrate.jai
 fa1c0dab72f0c6acc89d44d672f5c148028ba7d204e8eefebf1ec30bb723cb6c  2991  lib/jaithon/tool/fmt/printer.jai
@@ -300,4 +300,4 @@ c99446f0a47d9ec65a760cb039c7a71e9b3a4e528b80c2e591cd93d0de2e3310  516  tests/gol
 f1942daa9ac333d8be760ceb2629af5de2b2eb506df1eea32e549bc2646df0f6  113  tests/golden/shadowing.jai
 fab4fc636bafe1f763c33f958e2fb658874df3a97e17405e101765edacd884ca  225  tests/golden/type_tests.jai
 e286562e8182f81293b8fa5a81fd887d852bf005743d2d0ab98a751d2e6820da  450  tests/golden/values_and_dispatch.jai
-# 302 files, 215794 instructions probed
+# 302 files, 215976 instructions probed

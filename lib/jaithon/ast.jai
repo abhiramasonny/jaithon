@@ -12,9 +12,10 @@
 #: - `from_json(to_json(node))` equals `node`.
 #: - Re-parsing `to_source(node)` yields `node` again, spans aside.
 #:
-#: A node is a kind, a span, and a `fields` dict keyed by the C field names.
-#: `fields_of(kind)` lists a kind's fields in the order the C emits them, each
-#: tagged with the shape of its value:
+#: A node is a kind, a span, and a `fields` slot list, one slot per field the
+#: kind declares. `fields_of(kind)` lists those fields in the order the C emits
+#: them, which is the order the slots hold them, each tagged with the shape of
+#: its value:
 #:
 #: | tag | Jaithon value |
 #: |---|---|

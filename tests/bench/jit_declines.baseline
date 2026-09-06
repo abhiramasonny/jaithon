@@ -11,6 +11,7 @@ __main__.main at 158 stopped: OP_GET_GLOBAL: `count_occurrences` is not a compil
 __main__.main at 2178 stopped: more than 16 instance slots to pin
 __main__.main at 27 stopped: local 4 was given two kinds, instance and instance-or-null
 __main__.main at 35 stopped: OP_GET_GLOBAL: `sum_values` is not a compiled global function
+__main__.main at 363 stopped: a list loop already past its last element
 __main__.main at 412 stopped: OP_GET_GLOBAL: `block` is not a compiled global function
 __main__.main at 58 stopped: OP_GET_GLOBAL: `step` is not a compiled global function
 __main__.main at 61 stopped: OP_FOR_ITER_BIND: loop variable in local 6 has kind instance, not instance
@@ -19,6 +20,7 @@ __main__.main at 76 stopped: OP_GET_GLOBAL: `timesAt` is not a compiled global f
 __main__.node_dict at 42 stopped: OP_GET_INDEX: the live dict is empty or holds more than one kind of value
 __main__.node_dict at 42 stopped: this loop head is out of compile attempts
 __main__.once at 60 stopped: OP_GET_INDEX: no live list to read an element kind off
+__main__.once at 60 stopped: a list loop already past its last element
 __main__.once at 66 stopped: OP_GET_INDEX: no live list to read an element kind off
 __main__.once at 66 stopped: OP_INVOKE: a method whose observed returns disagree
 __main__.optable_dict at 323 stopped: OP_GET_INDEX: the live dict is empty or holds more than one kind of value
@@ -62,6 +64,7 @@ __main__.time_attn at 289 stopped: OP_GET_GLOBAL: `multi_head_attention` is not 
 __main__.time_attn at 418 stopped: OP_GET_INDEX: no live list to read an element kind off
 __main__.time_shape at 256 stopped: OP_GET_GLOBAL: `matmul` is not a compiled global function
 __main__.time_shape at 505 stopped: OP_GET_INDEX: no live list to read an element kind off
+__main__.time_shape at 505 stopped: a list loop already past its last element
 __main__.walk at 100 stopped: OP_CALL
 __main__.walk at 163 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 4 and 2) have kinds object and instance
 __main__.walk at 163 stopped: OP_TYPE_GUARD: a `JNode` guard on a object
@@ -113,8 +116,10 @@ column.combine.concat_columns at 60 stopped: OP_GET_GLOBAL: `TypeError` is not a
 column.combine.concat_columns at 60 stopped: a list loop already past its last element
 column.combine.stack_lanes at 170 stopped: a list loop already past its last element
 column.combine.stack_lanes at 170 stopped: a local of no known kind
+column.frame.init at 237 stopped: a list loop already past its last element
 column.frame.init at 326 stopped: a list loop already past its last element
 column.frame.init at 326 stopped: an append reaching past the model
+column.frame.init at 356 stopped: an append reaching past the model
 column.frame.init at 95 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 column.frame.init at 95 stopped: a pair loop over something other than a live dict view
 column.frame.init at 95 stopped: this loop head is out of compile attempts
@@ -193,6 +198,7 @@ hull.hull_walk at 234 stopped: slot 36 holds null, but the form was compiled for
 hull.hull_walk at 329 stopped: slot 36 holds null, but the form was compiled for int
 imgproc.contours.find_contours at 483 stopped: OP_GET_GLOBAL: `compress` is not a compiled global function
 imgproc.contours.find_contours at 483 stopped: a list loop already past its last element
+imgproc.contours.find_contours at 539 stopped: a list loop already past its last element
 imgproc.contours.thick_contours at 160 stopped: a list loop already past its last element
 imgproc.contours.trace_all at 227 stopped: OP_GET_GLOBAL: `next_start` is not a compiled global function
 imgproc.drawing.init at 161 stopped: OP_GET_INDEX: the container has kind instance, not list
@@ -200,7 +206,9 @@ imgproc.features.good_features_to_track at 1386 stopped: an append reaching past
 imgproc.features.good_features_to_track at 1386 stopped: this loop head is out of compile attempts
 imgproc.features.space_out at 27 stopped: OP_POP
 imgproc.filter._binomial at 22 stopped: slot 5 holds null, but the form was compiled for int
+imgproc.filter.get_gaussian_kernel at 137 stopped: a list loop already past its last element
 imgproc.filter.get_gaussian_kernel at 137 stopped: an append reaching past the model
+imgproc.filter.get_gaussian_kernel at 137 stopped: this loop head is out of compile attempts
 imgproc.filter.get_gaussian_kernel at 266 stopped: OP_INVOKE: a module member that has not compiled
 imgproc.morph.element_is_solid at 94 stopped: a return inside an OSR loop
 imgproc.morph.get_structuring_element at 229 stopped: OP_INVOKE: a module member that has not compiled
@@ -223,6 +231,9 @@ jaithon.ast.kinds.kinds at 1324 stopped: a pair loop over something other than a
 jaithon.ast.kinds.kinds at 1324 stopped: the body declares 72 slots and an entry record holds 64
 jaithon.ast.operators.operators at 744 stopped: OP_TYPE_GUARD: a `OpKind` guard on a object
 jaithon.ast.operators.operators at 744 stopped: a pair loop over something other than a live dict view
+jaithon.ast.schema._build_default_slots at 52 stopped: OP_GET_GLOBAL: `_default_field` is not a compiled global function
+jaithon.ast.schema._build_default_slots at 52 stopped: a pair loop already past its last element
+jaithon.ast.schema._build_list_slots at 52 stopped: a pair loop already past its last element
 jaithon.ast.schema._build_schemas at 10 stopped: an append reaching past the model
 jaithon.ast.schema.define at 4 stopped: a list loop already past its last element
 jaithon.ast_encode.ast_encode at 914 stopped: OP_TYPE_GUARD: a `str` guard on a object
@@ -334,6 +345,7 @@ reduce._plan at 1033 stopped: a list loop already past its last element
 reduce._plan at 1067 stopped: a list loop already past its last element
 reduce._plan at 218 stopped: a list loop already past its last element
 reduce._plan at 28 stopped: an append reaching past the model
+reduce._plan at 28 stopped: this loop head is out of compile attempts
 reduce._plan at 51 stopped: a list loop already past its last element
 reduce._plan at 568 stopped: a list loop already past its last element
 reduce._plan at 965 stopped: a list loop already past its last element
@@ -349,6 +361,7 @@ reduce.aggregate.accepted_columns at 24 stopped: OP_GET_GLOBAL: `agg_accepts` is
 reduce.aggregate.accepted_columns at 24 stopped: a pair loop over something other than a live dict view
 reduce.aggregate.cells_column at 329 stopped: a list loop already past its last element
 reduce.aggregate.common_dtype at 55 stopped: OP_GET_GLOBAL: `result_dtype` is not a compiled global function
+reduce.aggregate.common_dtype at 55 stopped: a list loop already past its last element
 reduce.aggregate.frame_axis0 at 460 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 12 and 13) have kinds int and instance
 reduce.aggregate.frame_axis0 at 460 stopped: OP_GET_GLOBAL: `empty_result` is not a compiled global function
 reduce.aggregate.frame_axis0 at 460 stopped: a pair loop already past its last element
@@ -397,6 +410,7 @@ shape.cat at 700 stopped: a list loop already past its last element
 shape.cat at 700 stopped: more live values than there are callee-saved registers
 shape.contiguous_strides at 7 stopped: a list loop already past its last element
 shape.contiguous_strides at 7 stopped: an append reaching past the model
+shape.element_count at 10 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 shape.element_count at 10 stopped: a list loop already past its last element
 shape.enclosing.welzl_walk at 165 stopped: slot 16 holds null, but the form was compiled for int
 shape.enclosing.welzl_walk at 165 stopped: slot 28 holds null, but the form was compiled for float
@@ -404,6 +418,7 @@ shape.enclosing.welzl_walk at 341 stopped: slot 28 holds null, but the form was 
 shape.is_contiguous at 42 stopped: a return inside an OSR loop
 shape.normalize_axes at 28 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
 shape.pad2d at 82 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global function
+sorting._run_network at 66 stopped: OP_GET_GLOBAL: `kernel_of` is not a compiled global function
 sorting._run_network at 85 stopped: OP_GET_GLOBAL: `_log2` is not a compiled global function
 sorting._run_network at 85 stopped: OP_GET_GLOBAL: `kernel_of` is not a compiled global function
 sorting._run_network at 85 stopped: this loop head is out of compile attempts
@@ -605,6 +620,7 @@ stopped: the operand stack alone exceeds the registers (8 locals, 15 stack)
 stopped: too many roots
 storm at 18 stopped: a call that can raise inside a try
 tensor._collect_intermediates at 12 stopped: an `is` against something other than null
+tensor._collect_intermediates at 12 stopped: local 4 was given two kinds, instance and instance-or-null
 tensor.backward at 293 stopped: OP_FOR_ITER_PAIR: a pair's loop variables (locals 9 and 10) have kinds int and instance
 tensor.backward at 293 stopped: OP_GET_GLOBAL: `accumulate_grad` is not a compiled global function
 tensor.backward at 293 stopped: a pair loop already past its last element
@@ -624,6 +640,7 @@ time_shape at 349 stopped: a type guard the kinds cannot settle
 time_shape at 503 stopped: OP_GET_INDEX: the container has kind object, not list
 trace_all at 225 stopped: OP_GET_GLOBAL: `next_start` is not a compiled global function
 transpose at 43 stopped: an append reaching past the model
+ufunc._conversions at 21 stopped: OP_GET_GLOBAL: `dtype_is_integer` is not a compiled global function
 validity_of at 102 stopped: OP_POP
 value_columns at 19 stopped: OP_GET_GLOBAL: `supports` is not a compiled global function
 video.optflow.build_pyramid at 27 stopped: OP_GET_GLOBAL: `pyr_down` is not a compiled global function

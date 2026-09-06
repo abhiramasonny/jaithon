@@ -868,7 +868,10 @@ fn _wrap_in_cast(c: Ctx, node: Node?, to: Type?, widen: bool) -> void {
     if node is null or to is null or node.kind == NodeKind.Cast { return }
     if not widen and _mentions_generic_param(to) { return }
 
-    let inner = Node(node.kind, node.fields, node.span)
+    # `node` is rewritten in place below, so the operand needs a slot list of
+    # its own rather than the one it is about to lose.
+    let inner = Node(node.kind, span: node.span)
+    inner.fields = node.fields.copy()
     c.set_type(inner, c.type_of(node))
     c.resolution.bind(inner, c.resolution.symbol_of(node))
     let scope = c.resolution.scope_of(node)

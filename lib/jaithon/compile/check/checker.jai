@@ -210,8 +210,8 @@ fn _generic_arity(d: TypeDecl?) -> int {
     if d == null { return 0 }
     let node = d.node
     if node == null { return 0 }
-    if "generics" not in node.fields { return 0 }
-    let generics = node.fields["generics"]
+    if not node.has("generics") { return 0 }
+    let generics = node.get("generics")
     if generics is list { return generics.len() }
     return 0
 }
@@ -386,7 +386,7 @@ fn _register_all(c: Ctx, node: any) -> void {
             node.kind == NodeKind.EnumDecl {
             let _ = register_decl(c, node)
         }
-        for key in node.fields.keys() { _register_all(c, node.fields[key]) }
+        for value in node.fields { _register_all(c, value) }
     } elif node is list {
         for item in node { _register_all(c, item) }
     }
@@ -515,7 +515,7 @@ fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
                 }
             }
         }
-        for key in node.fields.keys() { _import_pass(c, node.fields[key], loader, from_dir) }
+        for value in node.fields { _import_pass(c, value, loader, from_dir) }
     } elif node is list {
         for item in node { _import_pass(c, item, loader, from_dir) }
     } elif node is dict {
@@ -795,7 +795,7 @@ fn _alias_pass(c: Ctx, node: any) -> void {
                 }
             }
         }
-        for key in node.fields.keys() { _alias_pass(c, node.fields[key]) }
+        for value in node.fields { _alias_pass(c, value) }
     } elif node is list {
         for item in node { _alias_pass(c, item) }
     } elif node is dict {
@@ -811,7 +811,7 @@ fn _signature_pass(c: Ctx, node: any) -> void {
                 c.set_symbol_type(symbol, signature_of(c, node, false))
             }
         }
-        for key in node.fields.keys() { _signature_pass(c, node.fields[key]) }
+        for value in node.fields { _signature_pass(c, value) }
     } elif node is list {
         for item in node { _signature_pass(c, item) }
     } elif node is dict {

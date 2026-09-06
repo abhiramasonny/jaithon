@@ -14,7 +14,8 @@
 #: Those only ever consume a `Node`, so they sit downstream in `tree.jai`.
 from jaithon.ast.kinds import DeclKind, NodeKind, Visibility, kind_name
 from jaithon.ast.operators import OpKind, op_text
-from jaithon.ast.schema import _ELEMENT_TAG, _RECORDS, _default_field, fields_of, record_fields
+from jaithon.ast.schema import _ELEMENT_TAG, _FIELD_INDEX, _RECORDS, _default_field, new_slots
+from jaithon.ast.schema import record_fields, tags_of
 from jaithon.ast.span import Span
 from jaithon.ast.types import TypeExpr
 
@@ -24,6 +25,19 @@ from jaithon.ast.types import TypeExpr
 #: overlays `fields`, so a node is always complete and `to_json` never has to
 #: guess. A name the kind does not declare raises `KeyError` — that is how a
 #: typo in a tree-building pass is caught at the point of the mistake.
+#:
+#: The fields live in a slot list positioned by `_FIELD_INDEX[kind]`, not in a
+#: dict of their own: a dict per node was 401k of the run's allocations and the
+#: one dict behind most of the tier's "the live dict is empty or holds more
+#: than one kind of value" refusals. Nothing outside this class needs to know
+#: that — the seven accessors below take the same names and raise the same
+#: errors, and the slot list is in the order `fields_of(kind)` lists, which is
+#: the order the C emits and the order `ast_encode` writes.
+#:
+#: The accessors read `_FIELD_INDEX` rather than a function over it, and
+#: `schema.jai` says why: a call in front of a container leaves the tier a kind
+#: it cannot name, which refuses `get` outright and costs 10.0M interpreted
+#: instructions of `check lib/jaithon`.
 #:
 #: ```
 #: let call = Node.call(Node.ident("f"), [Node.int_lit(1)])
@@ -35,20 +49,26 @@ pub class Node {
     pub var kind: NodeKind
     #: Where the node was written.
     pub var span: Span
-    #: The kind's fields, keyed by the C field names `fields_of` lists.
-    pub var fields: dict[str, any]
+    #: The kind's fields, one slot per field, in the order `fields_of` lists.
+    pub var fields: list[any]
 
     #: Create a node of `kind`, overlaying `fields` on that kind's defaults.
     pub fn init(self, kind: NodeKind, fields: dict[str, any]? = null, span: Span? = null) {
         self.kind = kind
         self.span = span ?? Span.none()
-        self.fields = {}
-        for (name, tag) in fields_of(kind) { self.fields[name] = _default_field(name, tag) }
-        for (name, value) in (fields ?? {}).items() {
-            if name not in self.fields {
+        self.fields = new_slots(kind)
+        if fields is null { return }
+        # The overlay stays interpreted whatever this is written as: the tier's
+        # index-store arm wants one kind of value, and `fields` carries every
+        # kind a field can hold. What the slot list buys here is the loop that
+        # is GONE -- the walk of `fields_of(kind)` that called `_default_field`
+        # once per field of every node built.
+        let index = _FIELD_INDEX[kind]
+        for (name, value) in fields.items() {
+            if name not in index {
                 throw KeyError(f"{kind_name(kind)} has no field `{name}`")
             }
-            self.fields[name] = value
+            self.fields[index[name]] = value
         }
     }
 
@@ -217,15 +237,16 @@ pub class Node {
 
     #: Whether this kind declares a field called `name`.
     pub fn has(self, name: str) -> bool {
-        return name in self.fields
+        return name in _FIELD_INDEX[self.kind]
     }
 
     #: The raw value of `name`, raising `KeyError` when the kind has no such field.
     pub fn get(self, name: str) -> any {
-        if name not in self.fields {
+        let index = _FIELD_INDEX[self.kind]
+        if name not in index {
             throw KeyError(f"{kind_name(self.kind)} has no field `{name}`")
         }
-        return self.fields[name]
+        return self.fields[index[name]]
     }
 
     #: Set `name` and return self, so builders chain.
@@ -234,10 +255,11 @@ pub class Node {
     #: Node.ident("x").set("name", "y").text("name")   # "y"
     #: ```
     pub fn set(self, name: str, value: any) -> Node {
-        if name not in self.fields {
+        let index = _FIELD_INDEX[self.kind]
+        if name not in index {
             throw KeyError(f"{kind_name(self.kind)} has no field `{name}`")
         }
-        self.fields[name] = value
+        self.fields[index[name]] = value
         return self
     }
 
@@ -439,8 +461,8 @@ pub fn children_of(node: Node) -> list[Node] {
         return out
     }
 
-    for (name, tag) in fields_of(node.kind) {
-        _collect_children(out, node.fields.get(name, null), tag)
+    for (slot, tag) in tags_of(node.kind).enumerate() {
+        _collect_children(out, node.fields[slot], tag)
     }
     return out
 }

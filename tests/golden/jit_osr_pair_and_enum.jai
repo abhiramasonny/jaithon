@@ -1,3 +1,14 @@
+#: gc-stress-every: 1000
+#:
+#: This golden exists to hold TWO OSR pair heads hot at once, which means
+#: 200,000-element loops run several times over -- so the suite's default
+#: cadence of one collection per 20 allocations does not finish. It ran 27
+#: minutes at 86% CPU before this line existed. The cost is close to quadratic:
+#: every=200 takes 19.2s, 500 takes 7.1s, 1000 takes 3.9s.
+#:
+#: Coverage is not gutted by the larger number. run_tests.sh picked its default
+#: by requiring that no golden collect fewer than 57 times; this one collects
+#: 1,856 times at 1000.
 #: The two pair-loop OSR heads in ONE program, hot at the same time.
 #:
 #: `for (a, b) in ps` over a list of 2-tuples is iterKind 4 (JAITHON_JIT_PAIR_LIST);
@@ -12,10 +23,11 @@
 #: Every number here must match JAITHON_NO_JIT=1, JAITHON_JIT_PAIR_LIST=0 and
 #: JAITHON_LAZY_ENUMERATE=0. The tiers are accelerators that may always decline
 #: and must never answer differently.
-
 class Node {
     pub var k: int
+
     fn init(self, k: int) -> void { self.k = k }
+
     pub fn weight(self) -> int { return self.k * 2 }
 }
 
