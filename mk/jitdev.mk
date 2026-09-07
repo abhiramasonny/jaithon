@@ -117,14 +117,25 @@ kind-fuzz: $(TARGET)
 # the flaky-gate problem, and tying it to every `make test` would buy the
 # project a gate nobody trusts. Run it deliberately, like jit-declines-check.
 #
-# Teeth, on the tree it was written against (2c3807cc, no local edits): seeds
-# 0..999 turned up 10 programs the tier gets wrong. Seven SEGFAULT, and every
-# one of the seven faults at the same instruction -- the `case SLOT_INST` kind
-# check in jaiJitEnterOsr, which reaches AS_OBJ(v)->type through a slot holding
-# an object TAG over a null pointer. Three print a different number; the
-# smallest of those (seed 232) reduces to a nullable local read through `??`
-# on the first iteration after its `if` stops firing. None of the 3,258 tests
-# in `make test` covers any of it.
+# Teeth, HISTORICAL, on 2c3807cc (the tree this was written against): seeds
+# 0..999 turned up 10 programs the tier got wrong. Seven SEGFAULTed, every one
+# at the same instruction -- the `case SLOT_INST` kind check in jaiJitEnterOsr,
+# reaching AS_OBJ(v)->type through a slot holding an object TAG over a null
+# pointer. Three printed a different number; the smallest (seed 232) reduced to
+# a nullable local read through `??` on the first iteration after its `if`
+# stopped firing. Nothing in `make test` covered any of it.
+#
+# ALL TEN ARE GONE as of 2026-09-07 (a9d4b791). Re-measured after the 279
+# commits that landed on main: seeds 0..2199, 2200 programs x 6 configurations
+# at warm=1500, ZERO disagreements -- and seed 232 specifically passes. So do
+# not read the paragraph above as a live expectation: a clean run today is the
+# correct result, not a broken fuzzer. What it still records is the SHAPE of
+# what this finds when it finds anything, which is why it is kept.
+#
+# The corollary matters more than the numbers: this fuzzer is now the only
+# thing standing between that class of bug and a release, because the repros it
+# already caught live in tests/fuzz/found/ and, until c5ecaa33 wired them into
+# the gate, nothing ran them at all.
 #
 # 400 programs x 5 configurations at warm=1500 measured 257s wall on twelve
 # cores; 600 more measured 507s on ten. A hit prints the seed; reduce it with
@@ -141,3 +152,23 @@ jit-fuzz: $(TARGET)
 .PHONY: match-fuzz
 match-fuzz: $(TARGET)
 	@python3 tests/fuzz/match_differential.py --count $(MATCH_FUZZ_COUNT)
+
+# The control-flow differential: the SHAPES the other fuzzers never emit.
+#
+# kind_mutation and iter_mutation hold the shape fixed and vary a kind;
+# differential.py generates from a grammar biased at what the tier compiles.
+# This one varies the shape instead -- try/catch caught and propagating, defer
+# on an early return and while an exception unwinds, labelled break and
+# continue, match, returns from inside nested loops, closures called after the
+# local they captured moved on, bounded recursion -- while keeping the tag-lie
+# bias its header credits with finding the last three bugs: a `mode` parameter
+# decides which branch writes a slot, and main warms ONE mode before calling
+# the rest, so every compiled specialisation is built from mode 0 and then
+# violated.
+#
+# It had no target until 2026-09-07 and so was never run from the build at all,
+# which is how a fuzzer quietly stops being maintained. Out of `make test` for
+# the same reason as its siblings.
+.PHONY: flow-fuzz
+flow-fuzz: $(TARGET)
+	@python3 tests/fuzz/control_flow.py --count $(FLOW_FUZZ_COUNT)

@@ -84,6 +84,10 @@ FUZZ_WARM  ?= 1500
 # How many generated `match` bodies `make match-fuzz` runs through its six
 # configurations. Four to a program, so this is fifty programs at the default.
 MATCH_FUZZ_COUNT ?= 200
+# How many generated programs `make flow-fuzz` runs. It varies the SHAPE --
+# try/catch, defer, labelled break, closures outliving their capture -- where
+# the other fuzzers vary a kind, so it is one program per count, not four.
+FLOW_FUZZ_COUNT ?= 200
 EXTRA_LDFLAGS ?=
 
 # zlib inflates the seed's images. boot/seed.bin holds them deflated, one
