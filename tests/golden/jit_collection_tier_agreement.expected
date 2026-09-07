@@ -1,0 +1,11 @@
+warm 8400
+missing KeyError
+has-no false
+slice-past 4
+slice-neg 2
+sslice-past cdef
+sslice-rev 
+find-absent -1
+tup0 7
+tup9 IndexError
+pop-empty IndexError
