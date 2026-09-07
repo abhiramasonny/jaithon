@@ -1,0 +1,23 @@
+warm 36000 1000.0 b 2000.0
+MAX+1 Overflow
+MIN-1 Overflow
+MAX*2 Overflow
+-MIN Overflow
+1/0 DivZero
+MIN/-1 9.223372036854776e+18
+1mod0 DivZero
+MINmod-1 0
+1//0 DivZero
+MIN//-1 raised
+2**-1 raised
+MAX**2 Overflow
+1<<64 0
+1<<-1 raised
+xs99 IndexError
+xs-99 IndexError
+xs-1 70
+fdiv0 DivZero
+fdivn0 DivZero
+fmod0 DivZero
+s99 IndexError
+s-1 c
