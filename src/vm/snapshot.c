@@ -244,6 +244,27 @@ void jaiSnapshotAudit(const char *when) {
         }
     }
 
+    /* The single most favourable fact the design rests on, checked rather than
+     * quoted: `ObjString::hash` is a CONTENT hash (jaiHashBytes over the bytes,
+     * cached lazily, 0 meaning "not computed yet"). If that holds, every hash
+     * table in the image stays valid when it is mapped at a different address,
+     * and no table has to be rebuilt on load. If it did NOT hold -- if any hash
+     * mixed in an address -- the whole technique would be impossible here, and
+     * that is the kind of thing worth finding before writing a byte. */
+    {
+        unsigned long long hashed = 0, unhashed = 0, wrong = 0;
+        for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+            if (o->type != OBJ_STRING) continue;
+            ObjString *str = (ObjString *)o;
+            if (str->hash == 0) { unhashed++; continue; }
+            hashed++;
+            if (str->hash != jaiHashBytes(str->chars, str->length)) wrong++;
+        }
+        fprintf(stderr,
+                "[snapshot] string hashes: %llu cached, %llu never hashed, "
+                "%llu DISAGREE with a recompute\n", hashed, unhashed, wrong);
+    }
+
     fprintf(stderr, "[snapshot] verdict: %s\n",
             (openFiles == 0 && jitCode == 0 && jitLoops == 0 &&
              osrForms == 0 && constIndex == 0 && openUpvalues == 0 &&
