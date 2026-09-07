@@ -100,7 +100,7 @@ pub class _Printer {
     pub fn column(self) -> int { return self.depth * _INDENT.len() }
 
     pub fn render(self) -> list[str] {
-        pub let text: list[str] = []
+        let text: list[str] = []
         var index = 0
         while index < self.out.len() {
             if self.out[index].comment is null {

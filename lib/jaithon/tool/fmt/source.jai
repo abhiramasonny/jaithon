@@ -9,8 +9,8 @@ pub class _Source {
     pub fn init(self, text: str) {
         var byte = 0
         var index = 0
-        pub let offsets: list[int] = []
-        pub let starts: list[int] = [0]
+        let offsets: list[int] = []
+        let starts: list[int] = [0]
         for character in text {
             offsets.push(byte)
             byte += _utf8_length(ord(character))

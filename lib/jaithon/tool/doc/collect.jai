@@ -75,7 +75,7 @@ class _LineIndex {
 
     pub fn init(self, source: str) {
         var byte = 0
-        pub let starts: list[int] = [0]
+        let starts: list[int] = [0]
         for character in source {
             byte += _utf8_length(ord(character))
             if character == "\n" { starts.push(byte) }

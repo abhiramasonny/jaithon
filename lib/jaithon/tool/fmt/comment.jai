@@ -153,7 +153,7 @@ pub class _Trivia {
     }
 
     pub fn take_leading(self, line: int) -> list[Comment] {
-        pub let taken: list[Comment] = []
+        let taken: list[Comment] = []
         var index = self.cursor
         while index < self.items.len() and self.items[index].line < line {
             if not self.used[index] and self.items[index].own_line {
