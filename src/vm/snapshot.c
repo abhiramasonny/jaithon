@@ -335,6 +335,91 @@ void jaiSnapshotAudit(const char *when) {
                 tableBytes, listBytes, upvalBytes);
     }
 
+    /* WRITER, SLICE ONE: assign every live object an index and rewrite the
+     * direct header pointers as indices, then check the result round-trips.
+     * Owned arrays are NOT carried yet -- this slice exists to prove the two
+     * things everything else rests on: that a stable numbering can be assigned
+     * over the collector's live list, and that every pointer an image would
+     * store resolves back to exactly the object it came from.
+     *
+     * Index 0 is reserved for NULL so a missing pointer is not confusable with
+     * the first object. */
+    if (getenv("JAITHON_SNAPSHOT_WRITE") != NULL) {
+        size_t icap = 1;
+        while (icap < total * 4u) icap <<= 1;
+        if (icap < 1024) icap = 1024;
+        Obj **key = (Obj **)calloc(icap, sizeof(Obj *));
+        uint32_t *val = (uint32_t *)calloc(icap, sizeof(uint32_t));
+        if (key != NULL && val != NULL) {
+            uint32_t next = 1;
+            for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+                size_t h = ((uintptr_t)o >> 4) & (icap - 1);
+                while (key[h] != NULL) h = (h + 1) & (icap - 1);
+                key[h] = o; val[h] = next++;
+            }
+#define IDX(p) ({                                                             \
+        Obj *_q = (Obj *)(p);                                                 \
+        uint32_t _i = 0;                                                      \
+        if (_q != NULL) {                                                     \
+            size_t _h = ((uintptr_t)_q >> 4) & (icap - 1);                    \
+            while (key[_h] != NULL) {                                         \
+                if (key[_h] == _q) { _i = val[_h]; break; }                   \
+                _h = (_h + 1) & (icap - 1);                                   \
+            }                                                                 \
+        }                                                                     \
+        _i; })
+            /* The inverse: index -> object, which the reader would build from
+             * the image. Checking IDX and this agree on every pointer is the
+             * round trip, minus the bytes. */
+            Obj **byIndex = (Obj **)calloc(next, sizeof(Obj *));
+            if (byIndex != NULL) {
+                for (Obj *o = vm.gc->objects; o != NULL; o = o->next)
+                    byIndex[IDX(o)] = o;
+
+                unsigned long long rewritten = 0, bad = 0;
+#define ROUND(owner, p) do {                                                  \
+        uint32_t _i = IDX(p);                                                 \
+        rewritten++;                                                          \
+        if ((p) == NULL) { if (_i != 0) bad++; }                              \
+        else if (_i == 0 || _i >= next || byIndex[_i] != (Obj *)(p)) bad++;   \
+    } while (0)
+                for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+                    switch (o->type) {
+                    case OBJ_STRING: ROUND(o, ((ObjString *)o)->owner); break;
+                    case OBJ_FUNCTION: {
+                        ObjFunction *f = (ObjFunction *)o;
+                        ROUND(o, f->name); ROUND(o, f->qualifiedName);
+                        ROUND(o, f->module); ROUND(o, f->jitBlockedOn);
+                        break;
+                    }
+                    case OBJ_CLOSURE: ROUND(o, ((ObjClosure *)o)->fn); break;
+                    case OBJ_INSTANCE: ROUND(o, ((ObjInstance *)o)->klass); break;
+                    case OBJ_MODULE: {
+                        ObjModule *m = (ObjModule *)o;
+                        ROUND(o, m->name); ROUND(o, m->path); ROUND(o, m->body);
+                        break;
+                    }
+                    case OBJ_CLASS: {
+                        ObjClass *c = (ObjClass *)o;
+                        ROUND(o, c->name); ROUND(o, c->superclass);
+                        break;
+                    }
+                    case OBJ_NATIVE: ROUND(o, ((ObjNative *)o)->name); break;
+                    default: break;
+                    }
+                }
+#undef ROUND
+                fprintf(stderr,
+                        "[snapshot] numbering: %u indices assigned, "
+                        "%llu pointers rewritten and resolved back, %llu WRONG\n",
+                        next - 1, rewritten, bad);
+                free(byIndex);
+            }
+#undef IDX
+        }
+        free(key); free(val);
+    }
+
     fprintf(stderr, "[snapshot] verdict: %s\n",
             (openFiles == 0 && jitCode == 0 && jitLoops == 0 &&
              osrForms == 0 && constIndex == 0 && openUpvalues == 0 &&
