@@ -247,6 +247,13 @@ if [[ "$SUITE" == "jaitensor" ]]; then
     # though it were the code's.
     capture=()
     [[ "${CAPTURE_BASELINE:-}" == "1" ]] && capture=(--capture-baseline)
+    # `"${capture[@]}"` on an EMPTY array is an unbound-variable error under
+    # `set -u` in bash 3.2, which is what macOS ships -- so `make bench
+    # jaitensor` died before running a single benchmark on the one platform
+    # this project targets, and only on the common path, since setting
+    # CAPTURE_BASELINE=1 makes the array non-empty and hides it. The
+    # `${a[@]+...}` form expands to nothing when the array is empty and to its
+    # elements otherwise, on every bash.
     exec python3 "$ROOT/tests/bench/jaitensor/run_suite.py" \
         --root "$ROOT" \
         --jaithon "$JAITHON" \
@@ -254,7 +261,7 @@ if [[ "$SUITE" == "jaitensor" ]]; then
         --level "$LEVEL" \
         --runs "$RUNS" \
         --build-kind "$BUILD_KIND" \
-        "${capture[@]}"
+        ${capture[@]+"${capture[@]}"}
 fi
 
 printf '%sbuilding ports...%s\r' "$DIM" "$RESET"
