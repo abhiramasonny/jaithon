@@ -492,6 +492,75 @@ void jaiSnapshotAudit(const char *when) {
                                 arrRecs++; arrBytes += n * sizeof(uint32_t);
                             }
                         }
+                        /* SLICE FOUR: JaiTables, and the Values inside them.
+                         * This is the shape the rest of the tail reduces to --
+                         * dict, set, module globals/exports, a class's five, a
+                         * trait's two, an enum's methods are all the same
+                         * struct. A Value goes out as {tag, payload}, with the
+                         * payload replaced by an INDEX when it points at an
+                         * object; that is the only part a plain memcpy would
+                         * get wrong.
+                         *
+                         * `hash` rides along verbatim: §11 proved every string
+                         * hash is content-derived and recomputes identically,
+                         * so a table stays valid at a different address. */
+                        unsigned long long tblRecs = 0, tblEntries = 0;
+#define WRITE_VALUE(v) do {                                                   \
+        uint32_t _t = (uint32_t)(v).type;                                     \
+        uint64_t _p;                                                          \
+        if (IS_OBJ(v)) _p = (uint64_t)IDX(AS_OBJ(v));                         \
+        else memcpy(&_p, &(v).as, sizeof _p);                                 \
+        fwrite(&_t, sizeof _t, 1, f);                                         \
+        fwrite(&_p, sizeof _p, 1, f);                                         \
+    } while (0)
+#define WRITE_TABLE_K(o, t, k) do {                                           \
+        uint32_t _ix = IDX(o), _kind = (k);                                   \
+        uint32_t _cap = (uint32_t)(t)->capacity;                              \
+        fwrite(&_ix, sizeof _ix, 1, f);                                       \
+        fwrite(&_kind, sizeof _kind, 1, f);                                   \
+        fwrite(&_cap, sizeof _cap, 1, f);                                     \
+        for (uint32_t _e = 0; _e < _cap; _e++) {                              \
+            JaiEntry *_en = &(t)->entries[_e];                                \
+            WRITE_VALUE(_en->key);                                            \
+            WRITE_VALUE(_en->value);                                          \
+            fwrite(&_en->hash, sizeof _en->hash, 1, f);                       \
+            fwrite(&_en->order, sizeof _en->order, 1, f);                     \
+            tblEntries++;                                                     \
+        }                                                                     \
+        tblRecs++;                                                            \
+    } while (0)
+/* An object may own more than one table -- a module owns globals AND exports --
+ * so the record carries WHICH, not just the owner. Without it the reader
+ * matched by capacity and mis-paired 24 of 312 when the two happened to be
+ * the same size. */
+#define WRITE_TABLE(o, t) WRITE_TABLE_K(o, t, 4)
+                        for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+                            switch (o->type) {
+                            case OBJ_DICT: {
+                                ObjDict *d = (ObjDict *)o;
+                                if (d->table.entries) WRITE_TABLE(o, &d->table);
+                                break;
+                            }
+                            case OBJ_SET: {
+                                ObjSet *st = (ObjSet *)o;
+                                if (st->table.entries) WRITE_TABLE(o, &st->table);
+                                break;
+                            }
+                            case OBJ_MODULE: {
+                                ObjModule *m = (ObjModule *)o;
+                                if (m->globals.entries) WRITE_TABLE(o, &m->globals);
+                                if (m->exports.entries) WRITE_TABLE_K(o, &m->exports, 5);
+                                break;
+                            }
+                            default: break;
+                            }
+                        }
+#undef WRITE_TABLE
+#undef WRITE_VALUE
+                        fprintf(stderr,
+                                "[snapshot] tables: %llu written, %llu entries\n",
+                                tblRecs, tblEntries);
+
                         fprintf(stderr,
                                 "[snapshot] arrays: %llu records, %llu bytes "
                                 "(inline caches deliberately omitted)\n",
@@ -556,8 +625,14 @@ void jaiSnapshotAudit(const char *when) {
                                 while (fread(&aix, sizeof aix, 1, g) == 1 &&
                                        fread(&akind, sizeof akind, 1, g) == 1 &&
                                        fread(&an, sizeof an, 1, g) == 1) {
+                                    /* A table record is capacity ENTRIES, each
+                                     * {tag,payload} x2 + hash + order. */
                                     size_t want = akind == 3
-                                                    ? an * sizeof(uint32_t) : an;
+                                                    ? an * sizeof(uint32_t)
+                                                : (akind == 4 || akind == 5)
+                                                    ? (size_t)an * (2u * (sizeof(uint32_t) + sizeof(uint64_t))
+                                                                    + sizeof(uint64_t) + sizeof(int32_t))
+                                                    : an;
                                     if (want > bufCap) {
                                         unsigned char *nb = (unsigned char *)
                                             realloc(buf, want);
@@ -580,6 +655,63 @@ void jaiSnapshotAudit(const char *when) {
                                         if ((uint32_t)fo->chunk.lineStreamLen != an ||
                                             (an && memcmp(buf, fo->chunk.lineStream, an)))
                                             amis++;
+                                    } else if (akind == 4 || akind == 5) {
+                                        /* Compare every entry against the live
+                                         * table: tags identical, object
+                                         * payloads resolving back to the same
+                                         * object, hash and order verbatim. */
+                                        const JaiTable *lt = NULL;
+                                        if (orig->type == OBJ_DICT)
+                                            lt = &((ObjDict *)orig)->table;
+                                        else if (orig->type == OBJ_SET)
+                                            lt = &((ObjSet *)orig)->table;
+                                        else if (orig->type == OBJ_MODULE) {
+                                            ObjModule *mo = (ObjModule *)orig;
+                                            lt = akind == 5 ? &mo->exports
+                                                            : &mo->globals;
+                                        }
+                                        if (lt == NULL || (uint32_t)lt->capacity != an) {
+                                            fprintf(stderr, "[snapshot]   table miss: kind=%u owner=%d an=%u cap=%d\n",
+                                                    akind, (int)orig->type, an,
+                                                    lt ? lt->capacity : -1);
+                                            amis++;
+                                        } else {
+                                            const unsigned char *q = buf;
+                                            for (uint32_t e = 0; e < an; e++) {
+                                                uint32_t kt, vt; uint64_t kp, vp, hh;
+                                                int32_t ord;
+                                                memcpy(&kt, q, 4); q += 4;
+                                                memcpy(&kp, q, 8); q += 8;
+                                                memcpy(&vt, q, 4); q += 4;
+                                                memcpy(&vp, q, 8); q += 8;
+                                                memcpy(&hh, q, 8); q += 8;
+                                                memcpy(&ord, q, 4); q += 4;
+                                                const JaiEntry *le = &lt->entries[e];
+                                                if (kt != (uint32_t)le->key.type ||
+                                                    vt != (uint32_t)le->value.type ||
+                                                    hh != le->hash || ord != le->order) {
+                                                    fprintf(stderr, "[snapshot]   entry miss: kind=%u owner=%d e=%u kt=%u/%u vt=%u/%u\n",
+                                                            akind, (int)orig->type, e, kt, (unsigned)le->key.type, vt, (unsigned)le->value.type);
+                                                    amis++; break;
+                                                }
+                                                if (IS_OBJ(le->key) &&
+                                                    (kp >= next || byIndex[kp] != AS_OBJ(le->key))) {
+                                                    fprintf(stderr, "[snapshot]   key miss: owner=%d e=%u kp=%llu next=%u objtype=%d\n",
+                                                            (int)orig->type, e,
+                                                            (unsigned long long)kp, next,
+                                                            (int)AS_OBJ(le->key)->type);
+                                                    amis++; break;
+                                                }
+                                                if (IS_OBJ(le->value) &&
+                                                    (vp >= next || byIndex[vp] != AS_OBJ(le->value))) {
+                                                    fprintf(stderr, "[snapshot]   val miss: owner=%d e=%u vp=%llu next=%u objtype=%d\n",
+                                                            (int)orig->type, e,
+                                                            (unsigned long long)vp, next,
+                                                            (int)AS_OBJ(le->value)->type);
+                                                    amis++; break;
+                                                }
+                                            }
+                                        }
                                     } else if (akind == 3) {
                                         ObjClosure *co = (ObjClosure *)orig;
                                         if ((uint32_t)co->upvalueCount != an) amis++;
