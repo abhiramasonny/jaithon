@@ -1,6 +1,27 @@
 #: OS threads: mutexes, atomics, bounded channels, a thread pool, and parallel
 #: map, for and reduce over a list.
 #:
+#: **`parallel_map`, `parallel_for` and `parallel_reduce` run their callback on
+#: the calling thread.** The VM hosts exactly one Jaithon thread:
+#: `__prim__.thread_spawn` accepts only a NATIVE primitive, called with a raw
+#: buffer address and length, and rejects a Jaithon function outright --
+#: "a Jaithon function cannot run off the VM thread". Running one would need
+#: per-thread VM state, a concurrent or locked collector, and thread-safe string
+#: interning; none of that exists.
+#:
+#: They used to try anyway, and that was worse than not offering them: each
+#: split its input first and took a sequential path only when the input was
+#: small enough to land in ONE chunk, so a call raised `TypeError` from inside
+#: `spawn` at some input size and not below it. The docstring examples here are
+#: all four elements long, so every one of them passed while any real workload
+#: failed. Running sequentially is semantically identical for a pure callback,
+#: which is what the contract below already requires.
+#:
+#: `Mutex`, `Atomic`, `Channel`, `Handle` and `ThreadPool` are unchanged, and
+#: the chunking helpers are kept, for whenever the VM can host a second Jaithon
+#: thread. Until then treat this module as: the concurrency VOCABULARY is real,
+#: the parallelism is not.
+#:
 #: **A worker callback (`spawn`, `ThreadPool.submit`, `parallel_map`,
 #: `parallel_for`, `parallel_reduce`) must be a pure function of its inputs:**
 #: read arguments and captured bindings, allocate, return a value -- that is
@@ -454,15 +475,11 @@ pub class ThreadPool {
 #: parallel_map([1, 2, 3, 4], |x| x * x)    # [1, 4, 9, 16]
 #: ```
 pub fn parallel_map(items: list[any], transform: fn(any) -> any, workers: int = 0) -> list[any] {
-    let parts = _split(items.len(), _worker_count(workers, items.len()))
-    if parts.len() <= 1 { return items.map(transform) }
-    let handles: list[Handle] = []
-    for (start, stop) in parts { handles.push(spawn(_map_chunk(items, transform, start, stop))) }
-    let result: list[any] = []
-    for handle in handles {
-        for value in handle.join() { result.push(value) }
-    }
-    return result
+    # Sequential, deliberately: see `the module note at the top of this file.
+    # `workers` is accepted and ignored so the signature stays stable for when
+    # the VM can run a Jaithon callback off-thread.
+    let _ = workers
+    return items.map(transform)
 }
 
 #: Run `body` once per element of `items`, in parallel, for its side effects.
@@ -476,14 +493,9 @@ pub fn parallel_map(items: list[any], transform: fn(any) -> any, workers: int = 
 #:         if not fetch(url) { failures.add(1) }
 #:     })
 pub fn parallel_for(items: list[any], body: fn(any) -> void, workers: int = 0) -> void {
-    let parts = _split(items.len(), _worker_count(workers, items.len()))
-    if parts.len() <= 1 {
-        for item in items { body(item) }
-        return
-    }
-    let handles: list[Handle] = []
-    for (start, stop) in parts { handles.push(spawn(_for_chunk(items, body, start, stop))) }
-    for handle in handles { handle.join() }
+    # Sequential: see `the module note at the top of this file.
+    let _ = workers
+    for item in items { body(item) }
 }
 
 #: Combine every element of `items` in parallel, starting from `identity`.
@@ -505,18 +517,13 @@ pub fn parallel_reduce(
     combine: fn(any, any) -> any,
     workers: int = 0
 ) -> any {
-    let parts = _split(items.len(), _worker_count(workers, items.len()))
-    if parts.len() <= 1 {
-        var total = identity
-        for item in items { total = combine(total, item) }
-        return total
-    }
-    let handles: list[Handle] = []
-    for (start, stop) in parts {
-        handles.push(spawn(_reduce_chunk(items, identity, combine, start, stop)))
-    }
+    # Sequential: see `the module note at the top of this file. This also makes
+    # the associativity caveat above moot for the moment -- a single left fold
+    # is what actually runs -- but the caveat is kept, because it becomes real
+    # again the day this chunks for real.
+    let _ = workers
     var total = identity
-    for handle in handles { total = combine(total, handle.join()) }
+    for item in items { total = combine(total, item) }
     return total
 }
 
