@@ -435,18 +435,65 @@ void jaiSnapshotAudit(const char *when) {
                         unsigned long long wrote = 0, bytes = 0;
                         fwrite(&magic, sizeof magic, 1, f);
                         fwrite(&next, sizeof next, 1, f);
+                        /* The payload goes out with its header pointers
+                         * REWRITTEN AS INDICES, which is what makes the image
+                         * loadable rather than merely comparable: a raw pointer
+                         * means nothing in the next process. `Obj::next` is
+                         * cleared outright -- it is the collector's own list and
+                         * the reader rebuilds it as it allocates.
+                         *
+                         * Written from a copy, so the live object is untouched;
+                         * the audit that follows still sees the real heap. */
+                        unsigned char *tmp = NULL;
+                        size_t tmpCap = 0;
                         for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
                             size_t sole = jaiObjSoleBlock(o);
                             if (sole == 0) continue;
                             uint32_t ix = IDX(o);
                             uint32_t ty = (uint32_t)o->type;
                             uint32_t sz = (uint32_t)sole;
+                            if (sole > tmpCap) {
+                                unsigned char *nt = (unsigned char *)realloc(tmp, sole);
+                                if (nt == NULL) break;
+                                tmp = nt; tmpCap = sole;
+                            }
+                            memcpy(tmp, o, sole);
+                            Obj *co = (Obj *)tmp;
+                            co->next = NULL;
+#define PIN(field) do { (field) = (void *)(uintptr_t)IDX(field); } while (0)
+                            switch (o->type) {
+                            case OBJ_STRING: {
+                                ObjString *cs = (ObjString *)co;
+                                PIN(cs->owner);
+                                /* `chars` points at this object's own trailing
+                                 * bytes (§10 proved none is shared), so it is
+                                 * an OFFSET from the header, not an index. */
+                                cs->chars = (char *)(uintptr_t)
+                                    ((const char *)((ObjString *)o)->chars
+                                     - (const char *)o);
+                                break;
+                            }
+                            case OBJ_INSTANCE: PIN(((ObjInstance *)co)->klass); break;
+                            case OBJ_NATIVE: {
+                                ObjNative *cn = (ObjNative *)co;
+                                PIN(cn->name);
+                                /* Re-bound by name on load; a code address and
+                                 * a pointer into binary static storage are both
+                                 * meaningless in the next process. */
+                                cn->fn = NULL;
+                                cn->paramNames = NULL;
+                                break;
+                            }
+                            default: break;
+                            }
+#undef PIN
                             fwrite(&ix, sizeof ix, 1, f);
                             fwrite(&ty, sizeof ty, 1, f);
                             fwrite(&sz, sizeof sz, 1, f);
-                            fwrite(o, 1, sole, f);
+                            fwrite(tmp, 1, sole, f);
                             wrote++; bytes += sole;
                         }
+                        free(tmp);
                         /* SLICE THREE: the arrays these objects OWN. Two
                          * shapes, and one of each is enough to prove the case:
                          * a plain byte array (a chunk's code and its line
@@ -675,10 +722,39 @@ void jaiSnapshotAudit(const char *when) {
                                     Obj *orig = ix < next ? byIndex[ix] : NULL;
                                     if (orig == NULL ||
                                         (uint32_t)orig->type != ty ||
-                                        jaiObjSoleBlock(orig) != sz ||
-                                        memcmp(buf, orig, sz) != 0) {
+                                        jaiObjSoleBlock(orig) != sz) {
                                         mismatch++;
+                                        continue;
                                     }
+                                    /* The payload is no longer byte-identical --
+                                     * pointers are indices now -- so check that
+                                     * each pinned field resolves back to the
+                                     * object the live one points at. */
+                                    Obj *co = (Obj *)buf;
+                                    if (co->next != NULL) { mismatch++; continue; }
+#define UNPIN(cf, lf) do {                                                    \
+        uintptr_t _i = (uintptr_t)(cf);                                       \
+        if ((lf) == NULL) { if (_i != 0) mismatch++; }                        \
+        else if (_i == 0 || _i >= next || byIndex[_i] != (Obj *)(lf))         \
+            mismatch++;                                                       \
+    } while (0)
+                                    if (ty == OBJ_STRING) {
+                                        ObjString *cs = (ObjString *)co;
+                                        ObjString *ls = (ObjString *)orig;
+                                        UNPIN(cs->owner, ls->owner);
+                                        if ((uintptr_t)cs->chars !=
+                                            (uintptr_t)((const char *)ls->chars
+                                                        - (const char *)ls))
+                                            mismatch++;
+                                    } else if (ty == OBJ_INSTANCE) {
+                                        UNPIN(((ObjInstance *)co)->klass,
+                                              ((ObjInstance *)orig)->klass);
+                                    } else if (ty == OBJ_NATIVE) {
+                                        UNPIN(((ObjNative *)co)->name,
+                                              ((ObjNative *)orig)->name);
+                                        if (((ObjNative *)co)->fn != NULL) mismatch++;
+                                    }
+#undef UNPIN
                                 }
                             } else {
                                 mismatch++;
