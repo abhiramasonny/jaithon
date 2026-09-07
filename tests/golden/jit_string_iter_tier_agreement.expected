@@ -11,4 +11,7 @@ one len=1 nl=0 same=true up=-
 tail len=4 nl=0 same=true up=-
 upper len=5 nl=0 same=true up=C
 nested 58
+osr ascii 440000
+osr light 161600
+osr wide 128000
 last € eq=true len=1

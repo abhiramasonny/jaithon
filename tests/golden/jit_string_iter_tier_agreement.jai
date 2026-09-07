@@ -17,6 +17,13 @@
 #: character compared and concatenated afterwards so the yielded object is
 #: proved to be a real interned string and not a raw byte.
 #:
+#: gc-stress-every: 2000
+#:
+#: The three `osr_scan` strings are large on purpose -- a per-character loop has
+#: to be long enough to reach the OSR tier at all, and the density census only
+#: runs there. That makes this golden the slowest in the set under --gc-stress,
+#: hence the interval above.
+#:
 #: Every body is called 400 times before the edge value arrives, so the edge is
 #: taken in compiled code. Output must be byte-identical under JAITHON_NO_JIT=1;
 #: the golden runner also re-runs it at JAITHON_JIT_THRESHOLD=1 and under
@@ -45,6 +52,18 @@ fn first_upper(text: str) -> str {
         if c >= "A" and c <= "Z" { return c }
     }
     return "-"
+}
+
+#: Long enough to reach the OSR tier, which has its own head (iterKind 6) with
+#: its own density census -- the bodies above are all function-tier.
+fn osr_scan(text: str) -> int {
+    var n = 0
+    var runs = 0
+    for c in text {
+        n += 1
+        if c == "z" { runs += 1 }
+    }
+    return n * 2 + runs
 }
 
 fn nested_count(rows: list[str]) -> int {
@@ -96,6 +115,16 @@ fn main() {
 
     print("nested " + str(nested_count([ascii, two, three, four, mixed,
                                         empty, one, tail, upper])))
+
+    # The OSR head: pure ASCII (compiles), a light sprinkle of multi-byte
+    # scalars (compiles, and bails on each one), and mostly non-ASCII (the
+    # density census refuses it and the interpreter walks it).
+    let big_ascii = "abcdefghijklmnopqrstuvwxyz\n" * 8000
+    let big_light = ("abcdefghij" * 20 + "é\n") * 400
+    let big_wide = "日本語テキスト\n" * 8000
+    print("osr ascii " + str(osr_scan(big_ascii)))
+    print("osr light " + str(osr_scan(big_light)))
+    print("osr wide " + str(osr_scan(big_wide)))
 
     # The loop variable escaping the loop: it must be a real interned string.
     var last = "-"

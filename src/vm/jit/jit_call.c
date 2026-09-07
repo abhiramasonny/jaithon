@@ -307,6 +307,19 @@ bool jitIterStorage(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_STR_HEAD=0 refuses ITER_STRING at an OSR loop head, which is what
+ * the tier did until 2026-09-07 ("an iterator kind with no loop-head arm"), so
+ * the head can be A/B'd in one binary. Off, a per-character loop long enough to
+ * reach the OSR tier runs entirely interpreted: 290ms against 30ms. */
+bool jitStringHead(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_STR_HEAD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],

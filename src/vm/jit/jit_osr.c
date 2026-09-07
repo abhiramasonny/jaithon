@@ -3,10 +3,7 @@
 #include "vm/jit/jit.h"
 
 #include "vm/jit/jit_arm64.h"
-/* For jaiJitFieldReadFor: which builtins are one load from their receiver. */
 #include "vm/jit/jit_field_read.h"
-/* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
-/* For jaiOpBranchOperandAt: says which opcodes carry a branch target. */
 #include "vm/vm.h"
 
 #include <stdio.h>
@@ -16,10 +13,6 @@
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
-
-/* ------------------------------------------------------------------ */
-/* On-stack replacement                                                 */
-/* ------------------------------------------------------------------ */
 
 /* Returns the bytecode offset the interpreter should continue from. */
 #ifdef JAI_ALLOC_CENSUS
@@ -56,12 +49,6 @@ void jaiDeoptHitEmit(Emit *e, const char *fn, uint32_t top, unsigned ord,
 typedef int64_t (*OsrFn)(Value *slots);
 typedef int64_t (*OsrFnIter)(Value *slots, ObjIter *iter);
 
-/* The OP_LOOP that jumps back to `top`, and so the end of the loop. Gives up
- * on OP_CLOSURE, whose length depends on its operands. */
-/* findLoopEnd walks from `top` itself, so if that offset is mid-instruction the walk decodes operand
- * bytes as opcodes and can find a plausible-but-wrong OP_LOOP -- nbody's advance was once compiled from offset 128, inside a GET_LOCAL2's operands. Walking from the start (isInstructionStart, below) costs one scan per compile and removes the question. */
-/* OP_CLOSURE is the one variable-length instruction (u24 constant index + 3 bytes/upvalue, count
- * from the function the index names). Treating it as undecodable once refused OSR for the WHOLE CHUNK (both walks below scan from offset 0), so a module declaring a class or function before its hot loop -- i.e. every one of them -- could never enter a compiled loop at module scope, silently: compileOsr was never even reached, so nothing was there to report a decline. */
 int instructionLength(const Chunk *c, int off) {
     uint8_t op = c->code[off];
     if (op != OP_CLOSURE) {
@@ -76,8 +63,6 @@ int instructionLength(const Chunk *c, int off) {
     return 4 + 3 * (int)AS_FUNCTION(fnv)->upvalueCount;
 }
 
-/* A slot captured BY REFERENCE by a closure is aliased by an ObjUpvalue pointing straight into the
- * VM's slot array; caching it in a register during OSR makes them different storage for the loop's duration -- reads through the closure see a frozen value, writes through it are lost. (`var base=3; let f=|x| x+base; while .. { acc=f(acc); base+=1 }` once returned a different, always-short sum every run, since OSR triggers on a timer tick.) Scans the WHOLE enclosing function, not just the loop region, since the capture can be anywhere. `how` bit 1 = by-value capture (safe, copies into a closed cell); bit 0 alone = by-reference. Marks individual slots, not chunk-wide, since the register plan is per-slot. Returns false (keep everything in memory) if the chunk doesn't decode. */
 static bool chunkByRefCaptures(const Chunk *c, bool *byRef, unsigned nslots) {
     for (unsigned i = 0; i < nslots; i++) byRef[i] = false;
     for (int off = 0; off < c->count;) {
@@ -106,21 +91,6 @@ static bool isInstructionStart(const Chunk *c, uint32_t top) {
     return false;
 }
 
-/* Where the loop whose head is `top` ends: after its LAST back edge, not its
- * first.
- *
- * A loop has one back edge for the ordinary path off the bottom and one more
- * for every `continue`, and a `continue` comes FIRST -- it is written near the
- * top of the body, which is the point of it. Stopping at the first meant the
- * compiled region was the prefix before the `continue` and everything after it
- * ran interpreted, so the more often the `continue` was SKIPPED the slower the
- * loop got: measured over three hundred thousand elements, 0.25ms when every
- * iteration took the `continue` against 7.6ms when none did, for the same loop
- * written with an `if` in 0.29ms.
- *
- * Only this loop's own back edges name `top`: an inner loop's name the inner
- * head, and a later loop's name its own. So the last one is this loop's bottom
- * however many `continue`s are between. */
 static uint32_t findLoopEnd(const Chunk *c, uint32_t top, bool wholeBody) {
     uint32_t end = 0;
     for (int off = (int)top; off < c->count;) {
@@ -139,8 +109,6 @@ static uint32_t findLoopEnd(const Chunk *c, uint32_t top, bool wholeBody) {
     return end;
 }
 
-/* How many loops enclose each byte, so slots can be ranked by heat: every OP_LOOP is a back edge, the
- * range it jumps over is its body, and one pass counting those ranges is enough to put the innermost loop's variables ahead of the setup around them (doesn't need to be exact). File static since both Emit structures read the same table and compilation isn't reentrant; a chunk longer than JIT_MAX_DEPTH_MAP just goes unweighted. */
 #define JIT_MAX_DEPTH_MAP 8192
 static uint8_t gLoopDepth[JIT_MAX_DEPTH_MAP];
 
@@ -164,22 +132,11 @@ static unsigned loopDepthTable(const Chunk *c) {
     return (unsigned)n;
 }
 
-/* The table, filled and handed back, so the function tier can ask for it
- * without gLoopDepth being visible where it is declared. */
 const uint8_t *loopDepthFor(const Chunk *c, unsigned *count) {
     *count = loopDepthTable(c);
     return gLoopDepth;
 }
 
-/* An OSR entry that refuses without a word makes the whole body invisible.
- * It never reaches the tier's log, so a ranking can only say "never
- * considered" and the reason is gone -- there is nowhere to look it up.
- * `good_features_to_track` sat at 16.6% of the jaicv benchmark in exactly
- * that state: hot, sampled, refused, and unnamed.
- *
- * Same wording and format as the body walker's refusals, so the report joins
- * these to the interpreted-work attribution without knowing they came from a
- * different path. */
 static int osrNo(ObjFunction *fn, uint32_t top, const char *why) {
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] osr %s at %u stopped: %s\n",
@@ -188,9 +145,6 @@ static int osrNo(ObjFunction *fn, uint32_t top, const char *why) {
     return 0;
 }
 
-/* The entry guards, which say what the form wants and what the frame holds.
- * A form that exists and is never entered looks identical to one that was
- * never compiled unless the mismatch is named. */
 static int osrNoSlot(ObjFunction *fn, uint32_t top, unsigned slot,
                      SlotKind want, Value held) {
     if (getenv("JAI_JIT_WHY")) {
@@ -203,10 +157,6 @@ static int osrNoSlot(ObjFunction *fn, uint32_t top, unsigned slot,
     return 0;
 }
 
-
-/* How many compiled loops one body may keep. Only lets the old, smaller table
- * be put back in the same binary, so the change can be measured against
- * itself; the table itself is sized JAI_OSR_MAX. */
 static unsigned osrFormCap(void) {
     static unsigned cap;
     if (cap == 0) {
@@ -217,8 +167,6 @@ static unsigned osrFormCap(void) {
     return cap;
 }
 
-/* The record is sized JAI_OSR_SLOTS; this only lets the old, smaller cap be
- * put back in the same binary, so the change can be measured against itself. */
 static unsigned osrSlotCap(void) {
     static unsigned cap;
     if (cap == 0) {
@@ -229,9 +177,6 @@ static unsigned osrSlotCap(void) {
     return cap;
 }
 
-/* Same, for the compile path, which reports failure as a bool. Everything
- * before the emitter refused without a word, so a body that never got past
- * these looked to the log exactly like one that was never sampled. */
 static bool osrNoB(ObjFunction *fn, uint32_t top, const char *why) {
     (void)osrNo(fn, top, why);
     return false;
@@ -244,44 +189,13 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            const bool *nullable, bool *needNullable,
                            const bool *dynamic, bool *needDynamic);
 
-/* The loop tier had no retry at all, where the function tier has had one since
- * `nullableLocal` existed: a slot the walk cannot settle on one kind for simply
- * declined the whole loop. That is `var at = head` followed by `at = at.next`
- * -- an instance seeded from the slot, then a maybe-instance assigned into it
- * -- which is every list and tree walk there is, and the shape a parser's inner
- * loops are made of. Two attempts: the second seeds the slots the first asked
- * for as nullable.
- *
- * MEASURED, and only as a chain. On its own this changes nothing: widening the
- * local moves the refusal from the assignment to the `at.follow()` call, and
- * accepting a nullable RETURN kind (see emitMaybeInstResult) moves it back to
- * the assignment. All three together plus the maybe-instance receiver at
- * OP_INVOKE take a 200-node list walked 20000 times from 137 ms to 38 ms,
- * best of seven alternating runs under scripts/gpu_lock.sh with no overlap
- * between the two sets -- 3.6x, and it is a decline-to-compile transition,
- * not a micro-optimisation: `walk` goes from no compiled form at either loop
- * head to both.
- *
- * RULED OUT: the self-hosted compiler does not move. `check --no-cache` over
- * four compiler files is 2143 ms against 2146 ms median of nine, inside the
- * spread, even though the return-kind gate alone stops 64 sites in one file.
- * Those bodies clear it and stop at the next wall (OP_INVOKE on a receiver
- * whose class the model cannot pin, and OP_GET_FIELD_LOCAL). Kept for the
- * loops it does unblock, on the same reasoning the enum fold was. */
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                        uint8_t iterKind, Value elemSample, bool elemMixed,
                        uint8_t elemStg,
                        bool wholeBody, bool noInline) {
     bool nullable[JIT_MAX_SLOTS + 1];
     bool needNullable[JIT_MAX_SLOTS + 1];
-    /* Same ledger the function tier has kept since it grew one: a slot given
-     * two kinds does not give the loop up, it asks to carry its tag and the
-     * walk runs again with that decided from the start. OSR had the nullable
-     * half of this and not the dynamic half, and a comprehension is exactly
-     * what needed it -- the front end reuses one slot for the loop variable and
-     * for the result, so `[x * 2 for x in xs]` seeds the slot as a list from
-     * the previous iteration and then binds an int into it. Three attempts,
-     * because a body can want both widenings and neither implies the other. */
+
     bool dynamic[JIT_MAX_SLOTS + 1];
     bool needDynamic[JIT_MAX_SLOTS + 1];
     memset(nullable, 0, sizeof nullable);
@@ -317,8 +231,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     uint32_t end = findLoopEnd(&fn->chunk, top, wholeBody);
     if (end == 0 || end <= top)
         return osrNoB(fn, top, "no loop body could be found from this head");
-    /* The entry re-checks every slot, so this is the size of that record --
-     * nbody's advance declares nineteen. */
     if (fn->maxSlots < 1 || (unsigned)fn->maxSlots > osrSlotCap()) {
         char said[96];
         snprintf(said, sizeof said,
@@ -345,7 +257,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     e.elemSample = elemSample;
     e.elemMixed  = elemMixed;
     e.elemStg    = elemStg;
-    /* See Emit::rangeHead. */
     if (top + 9u <= (uint32_t)fn->chunk.count &&
         fn->chunk.code[top] == OP_FOR_RANGE_BIND) {
         e.rangeHead = true;
@@ -371,19 +282,9 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     e.savedCount = JIT_MAX_SAVED;
     memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
-    /* Each slot takes the kind it holds right now. The entry re-checks them on
-     * every later entry, so this is a specialisation, not an assumption. */
     for (unsigned i = 0; i < e.locals; i++) {
         Value v = slots[i];
         e.localTyped[i] = true;
-        /* A frame's slots run to fn->maxSlots, and the ones the program has
-         * not reached yet hold whatever the last frame at that depth left --
-         * including a VAL_OBJ tag over a NULL pointer. IS_LIST and IS_INSTANCE
-         * both dereference before they test, so without this the COMPILER
-         * reads Obj::type off address zero: EXC_BAD_ACCESS inside
-         * compileOsrOnce, once in eight runs of tests/bench/jaiframe/frameops
-         * and never in the test suite, because it needs a slot that is both
-         * stale and untouched at the moment a loop goes hot. */
         if (IS_OBJ(v) && AS_OBJ(v) == NULL) {
             e.localKind[i] = SLOT_OPAQUE;
             e.localTyped[i] = false;
@@ -394,30 +295,17 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         else if (IS_BOOL(v))  e.localKind[i] = SLOT_BOOL;
         else if (IS_LIST(v))  e.localKind[i] = SLOT_LIST;
         else if (IS_INSTANCE(v) && AS_INSTANCE(v)->klass != NULL) {
-            /* A slot an earlier attempt found sometimes-null takes the wider
-             * kind from the start; the class still comes from what is in the
-             * slot NOW, which a maybe-instance is a correct supertype of. */
             e.localKind[i]  = nullable[i] ? SLOT_MAYBE_INST : SLOT_INST;
             e.localClass[i] = AS_INSTANCE(v)->klass;
             e.localShape[i] = AS_INSTANCE(v)->klass->shapeId;
         } else if (IS_OBJ(v)) {
             e.localKind[i] = SLOT_OBJ;
         } else {
-            /* Nothing recognisable in it yet -- a slot the loop assigns before
-             * it reads. It takes its kind from the first thing bound to it. */
             e.localKind[i] = SLOT_OPAQUE;
             e.localTyped[i] = false;
         }
     }
 
-
-    /* Runs AFTER the seeding above, not before: it used to measure a body where every slot was still an
-     * untyped int (zeroed), a different program from the one being compiled, corrupting the maxValue the register decision rests on. Also narrows `locals` to what the loop actually names -- OSR started from the whole enclosing function's `maxSlots` (18-20 for real bodies), so `reserved + locals + maxValue <= 10` could never hold and register-resident locals were unreachable for any real function. */
-    /* Registers for the slots that earn them, memory for the rest. The
-     * reserved four (or one) plus the X locals plus the deepest expression
-     * must all sit inside the ten callee-saved registers; a first pass
-     * measures the last of those, and which slots are named at all, and how
-     * often each of them is named inside the innermost loop. */
     unsigned probeMaxValue = 0;
     unsigned probeMaxValueAll = 0;
     unsigned probeStranded = 0;
@@ -443,7 +331,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         probe.limitLiteral = -1; probe.bailBlock = -1; probe.exceptionExit = -1;
         probe.loopDepth = gLoopDepth;
         probe.loopDepthCount = e.loopDepthCount;
-        /* "Never seen" is an empty range, not offset zero. */
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             probe.slotWriteLo[i] = UINT32_MAX;
             probe.slotIndexLo[i] = UINT32_MAX;
@@ -468,39 +355,10 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             probeMaxValueAll = probe.maxValueAll;
             probeClobberDepth = probe.clobberDepth;
             probeRan = true;
-
-            /* A body that never calls out and never inlines can put its
-             * operand stack in x0..x8 instead of above the locals, and then
-             * the whole callee-saved bank is the locals'. This is the
-             * difference between a five-deep expression leaving room for two
-             * locals and a seven-deep one leaving room for none -- and the
-             * loops that go seven deep are exactly the ones with several rows
-             * or accumulators to keep. */
             e.scratchValues = !probe.clobbersScratch &&
                               probe.maxValueAll <= JIT_INL_COUNT;
-            /* Under split stress the split is preferred to the whole-scratch
-             * bank, because it is the two-run layout that has the boundary in
-             * it and the whole-scratch one does not. */
             if (jitSplitStress()) e.scratchValues = false;
-            /* A body that DOES call still need not keep its WHOLE stack in the
-             * callee-saved bank -- only the part of it that can be live while
-             * a helper runs, which is everything below the deepest the stack
-             * ever is at a call. life's `step` goes five deep summing nine
-             * neighbours and two deep at its `row.push`, so three of its five
-             * operand registers were being held against a call that can never
-             * see them, while five of its locals sat in memory.
-             *
-             * Not offered to a body that inlines: an inlined body takes x0..x8
-             * for its own entries (inlineOwnBank), and both cannot have them.
-             * Not offered to the function tier either, which does not run this
-             * code -- x0..x3 are its arguments and the roadmap prices the same
-             * change there at +-1%. */
             unsigned wantSplit = probe.clobberDepth;
-            /* Stress: a body with no calls at all has clobberDepth 0, and a
-             * split at 0 is no split. Moving the boundary up to 1 is still
-             * sound there -- nothing can clobber x0..x8 in a body that never
-             * calls -- and it is what puts the two-run layout under every
-             * existing gate rather than under the few bodies that want it. */
             if (jitSplitStress() && wantSplit == 0) wantSplit = 1;
             if (!e.scratchValues && !probe.inlined &&
                 (probe.clobbersScratch || jitSplitStress()) &&
@@ -508,50 +366,13 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 probe.maxValue - wantSplit <= JIT_SCRATCH_BANK_COUNT) {
                 e.splitAt = wantSplit;
             }
-            /* What is left over after the loop's own reserved registers and
-             * the deepest expression the body builds. maxValue is model state,
-             * not a register number, so measuring it in memory mode and
-             * spending it here is sound. Under a split only the half below
-             * `splitAt` is charged to the callee-saved bank. */
             unsigned overhead = osrReserved(&e) +
                                 (e.scratchValues ? 0u
                                  : e.splitAt != 0 ? e.splitAt
                                                   : probe.maxValue);
             unsigned availX = overhead < JIT_MAX_SAVED
                                   ? JIT_MAX_SAVED - overhead : 0u;
-            /* Ranked by what a register SAVES, on the same ledgers and through
-             * the same planner as the function tier -- not by how often the
-             * body names the slot, which is what this used to do. Both counts
-             * are weighted by loop nesting the same way, so the difference is
-             * not "flat versus weighted": it is that one pooled counter had to
-             * answer two questions it cannot tell apart. It could not say which
-             * BANK a slot wants (a float read costs an `ldr d` from memory and
-             * an `fmov` from an X home, so the two banks are not worth the same
-             * to it), and it could not say that a WRITE is worth twice a read
-             * here, because an OSR slot's memory home is the interpreter's own
-             * Value and takes the tag as well as the payload. A loop variable
-             * assigned every iteration is exactly the case both mistakes fell
-             * on, which is the case OSR exists for.
-             *
-             * The slots the ledgers cannot rule out on their own are handed
-             * over as `skip`: one captured by reference by a closure, which is
-             * aliased by an ObjUpvalue pointing into the VM's slot array and so
-             * must stay in memory whatever it saves (see chunkByRefCaptures);
-             * one the probe found dynamic, which keeps its run-time tag and has
-             * nowhere but the frame to put it; and, when the chunk would not
-             * decode at all, every slot -- the by-reference scan is what makes
-             * a register safe here, so failing it means registers for nobody.
-             *
-             * `slotUse` stays in that mask rather than being retired for the
-             * ledgers, so the set of slots this can place is the old one
-             * narrowed, never widened. The two disagree in one direction only:
-             * slotUse goes uncounted past JIT_MAX_DEPTH_MAP (a chunk over 8KB),
-             * where the ledgers still count at weight 1, so retiring it would
-             * hand registers to slots in a region no gate has ever planned for.
-             * Whatever the ledgers rank last is dropped by the zero-gain
-             * exclusion anyway, which is the accurate half of the old test:
-             * slotUse counts localInRange, a bounds CHECK made at more sites
-             * than actually read or write the slot. */
+
             bool byRef[JIT_MAX_SLOTS + 1];
             bool decoded = chunkByRefCaptures(&fn->chunk, byRef, e.locals);
             bool skip[JIT_MAX_SLOTS + 1];
@@ -559,14 +380,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 skip[i] = !decoded || i >= e.locals || byRef[i] ||
                           probe.dynamicLocal[i] || probe.slotUse[i] == 0;
             }
-            /* `probeStranded` is the count of slots that earned a register and
-             * found none left -- what a wider bank would buy, and 0 far more
-             * often than the decline census suggests. */
             planSlotRegisters(&e, &probe, availX, skip, &probeStranded);
 
-            /* What planHoists needs: where each slot was written, where it was
-             * subscripted, where the body can destroy a caller-saved register,
-             * and the registers nothing else claims. */
             e.bodyCalls = probe.clobbersScratch;
             for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
                 e.slotWriteLo[i]  = probe.slotWriteLo[i];
@@ -586,23 +401,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 e.clobberOff[i] = probe.clobberOff[i];
             }
 
-            /* Which sampled storages the real pass may emit against.
-             *
-             * A slot ASSIGNED inside the region cannot be pinned: the tier's
-             * OP_ELEM_KIND arm writes elemKind without specialising, so a
-             * `var f: list[bool] = []` at the top of a loop body makes a BOXED
-             * list every round while the pin, taken from the frame before
-             * entry, still says U8. A sieve written that way read every
-             * element one byte wide out of a sixteen-byte array and printed a
-             * different prime count on each run.
-             *
-             * A region that CALLS OUT cannot pin either: jaiListBox is
-             * reachable from ordinary builtins -- a sort, a concat of two
-             * storages, a put of a kind the store cannot hold -- and it
-             * de-specialises the list with nothing the compiled body could
-             * watch. The same test planHoists makes of a hoisted header, for
-             * the same reason: the entry guard proves a fact, and this is
-             * whether the body can invalidate it. */
             bool bodyCallsOut = regionCalls(&e, top, end);
             for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
                 e.localStgPin[i] =
@@ -610,21 +408,9 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                     !(e.slotWriteHi[i] >= top && e.slotWriteLo[i] < end);
             }
             e.elemStgPin = !bodyCallsOut;
-            /* x13..x17 are nobody's in any body -- a call destroys them, which
-             * is why only a call-free REGION may hold anything there, and
-             * planHoists is what tests that. Offering them unconditionally is
-             * the whole per-region change: they used to be withheld from every
-             * body containing a call, including the ones whose inner loop is
-             * the entire benchmark. */
             for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {
                 e.hoistPool[e.hoistPoolCount++] = (uint8_t)(JIT_FREE_FIRST + r);
             }
-            /* Whatever the operand stack left at the top of its own bank.
-             * Only when it IS that bank -- otherwise those registers are
-             * carrying operands, or an inlined body has x0..x8 to itself and
-             * none of it is spare. `scratchValues` is a whole-body claim and
-             * has to stay one: unlike x13..x17, these registers have another
-             * owner outside the region. */
             if (e.scratchValues) {
                 for (unsigned r = probe.maxValueAll;
                      r < JIT_SCRATCH_BANK_COUNT; r++) {
@@ -633,10 +419,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 }
             }
         } else {
-            /* The probe is where a kind clash is found -- the real walk below
-             * runs on the same seed and would only find it again -- so its
-             * request for a wider one has to travel back to the retry loop
-             * from here. */
             memcpy(needNullable, probe.needNullable, sizeof probe.needNullable);
             memcpy(needDynamic, probe.needDynamic, sizeof probe.needDynamic);
         }
@@ -645,9 +427,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
 
     unsigned frame = 16u + 8u * JIT_MAX_SAVED + (unsigned)sizeof(JitCallDesc);
     e.descOffset = 16u + 8u * JIT_MAX_SAVED;
-    /* The ObjIter, for the heads that do not keep it in a register. Sixteen
-     * bytes so the frame stays 16-aligned without a second rounding. */
-    e.iterFrameOffset = (frame + 7u) & ~7u;   /* str/ldr scale the offset by 8 */
+    e.iterFrameOffset = (frame + 7u) & ~7u;
     frame = e.iterFrameOffset + 16u;
     e.fpSaveOffset = frame;
     frame += 8u * JIT_FP_MAX_SAVED;
@@ -657,17 +437,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     emitSaveRestore(&e, true);
     emitFpSaveRestore(&e, true);
     emit(&e, jaiA64MovX(JIT_SLOTS_REG, 0));
-    /* Payloads only: the entry has already checked every slot's kind, so there
-     * is nothing left to guard here.
-     *
-     * Except the width. Unlike the function tier, which marshals every argument
-     * through jitArgIn and hands a bool over as a clean 0 or 1, these slots
-     * are the interpreter's own and BOOL_VAL is a one-byte `strb` -- the seven
-     * bytes above a bool are whatever that slot last held. An eight-byte load
-     * puts that garbage in a SLOT_BOOL register, and every consumer of one
-     * tests the whole word, so `if flag {` took the wrong arm whenever the
-     * slot had previously held anything with a high byte set. Silent: the
-     * program ran, and computed the other branch. */
     for (unsigned i = 0; i < e.locals; i++) {
         if (e.slotXReg[i] != 0 && e.localKind[i] == SLOT_BOOL) {
             emit(&e, jaiA64LdrByte(e.slotXReg[i], JIT_SLOTS_REG, i * 16u + 8u));
@@ -678,23 +447,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         }
     }
     if (hasIter && (iterKind == 3 || iterKind == 4)) {
-        /* A pair head keeps only the pointer: its index, limit and version all
-         * live in the ObjIter and the step reads them there, so there is
-         * nothing to hoist here and nothing to write back at an exit. True of
-         * the list-of-tuples head as well as the dict one -- the step shared
-         * with the function tier reloads all three every iteration rather than
-         * hoisting them, which is exactly why iterKind 4 needs no prologue of
-         * its own. The enumerate head (5) is NOT one of these: it steps off
-         * the reserved registers like a plain list head, so it takes the
-         * branch below. */
         emit(&e, jaiA64MovX(JIT_PAIR_ITER_REG, 1));
     } else if (hasIter) {
-        /* x1 is the iterator on entry. A range head reads everything it wants
-         * out of it here and parks the pointer in the frame; a list head keeps
-         * it, because its version guard reads the iterator every iteration.
-         * The enumerate head (5) is a list head here in every respect -- its
-         * source is the snapshot list -- except that it needs no version
-         * guard, the snapshot being private to its iterator. */
         unsigned rIter = iterKind == 1 ? 1u : JIT_ITER_REG;
         if (iterKind == 1) {
             emit(&e, jaiA64StrX(1, 31, e.iterFrameOffset));
@@ -706,11 +460,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         emit(&e, jaiA64LdrX(JIT_LIM_REG, rIter,
                             (unsigned)offsetof(ObjIter, limit)));
         if (iterKind == 1) {
-            /* A range yields start + index, so both bounds are shifted by the
-             * start once, here, and the loop runs on the yielded value
-             * directly. ObjIter.source is a Value, so the object pointer sits
-             * eight bytes into it. jaiJitEnterOsr has already established that
-             * start + limit does not overflow. */
             emit(&e, jaiA64LdrX(JIT_SCRATCH_A, rIter,
                                 (unsigned)offsetof(ObjIter, source) + 8));
             emit(&e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
@@ -718,7 +467,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             emit(&e, jaiA64AddX(JIT_IDX_REG, JIT_IDX_REG, JIT_SCRATCH_A));
             emit(&e, jaiA64AddX(JIT_LIM_REG, JIT_LIM_REG, JIT_SCRATCH_A));
         } else {
-            /* A list head keeps the ObjList itself in JIT_START_REG. */
             emit(&e, jaiA64LdrX(JIT_START_REG, rIter,
                                 (unsigned)offsetof(ObjIter, source) + 8));
         }
@@ -726,19 +474,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
 
     planHoists(&e, fn);
     if (getenv("JAI_JIT_WHY")) {
-        /* The register arithmetic, not just the verdict, and for a body that
-         * COMPILES as much as one that does not: "declined for want of a
-         * register" is only half the census -- the other half is a body that
-         * fitted with nothing left over, which is what a bank decision is
-         * chosen against. Printed here rather than in the failure arm because
-         * this is the point where every number in it is final.
-         *
-         * Only when the measuring pass got through: a loop that declined
-         * before the register plan has zeroed numbers, and printing them reads
-         * as "nought entries deep", which is a different and false claim.
-         *
-         * Its own line, and without the words the decline census greps for, so
-         * that adding it cannot invent census entries. */
         if (probeRan) fprintf(stderr,
                 "[jit] osr %s at %u registers: %u reserved, %u stack "
                 "(%u incl. inlined), %u deep at a call, %u x-locals, "
@@ -869,27 +604,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     for (unsigned i = 0; i < e.exitCount; i++) {
         e.exitStub[i] = (int)e.count;
         OSR_SYNC_ITER();
-        /* An ordinary way out carries no operand stack of its own, and has to
-         * say so.
-         *
-         * `gDeopt` is one global record, on the reasoning that only one body
-         * can be deoptimising at a time. That holds for a body and its own
-         * stubs; it does not hold across a call. A compiled callee that
-         * deopts part way through this region writes the record, is put back
-         * on its feet by its own return path, and leaves `nstack` behind --
-         * and the C side reads `nstack` after every way out of the region,
-         * not only after a deopt. So a region that had called such a callee
-         * and then finished its loop normally pushed the callee's leftover
-         * operand stack onto this frame's.
-         *
-         * What that cost: `for n in xs` around an inner loop calling a
-         * compiled method left two extra values above the enclosing loop's
-         * iterator, so the next `OP_FOR_ITER_BIND` peeked one of them and
-         * the loop died with "expected an iterator, not 'int'". Only under
-         * `--gc-stress`, which is what made the callee deopt reliably.
-         *
-         * Clearing it here is the narrow fix: every way out of a region now
-         * states its own record rather than inheriting one. */
         emitConst64(&e, JIT_SCRATCH_A,
                     (int64_t)(uintptr_t)&gDeopt.nstack);
         emitConst64(&e, JIT_SCRATCH_B, 0);
@@ -930,8 +644,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 continue;
             }
             if (e.deopt[k].lastFromDesc && i + 1 == e.deopt[k].depth) {
-                /* Result of an already-happened call lives in the descriptor with whatever tag the callee actually
-                 * returned. The function tier's stub knew this; this OSR one didn't, and alloc_churn came back 982406343 instead of 550770565 under deopt stress -- the entire reason this lastFromDesc branch exists. */
                 unsigned rat = e.descOffset +
                                (unsigned)offsetof(JitCallDesc, result);
                 emit(&e, jaiA64LdrW(JIT_SCRATCH_B, 31, rat));
@@ -1185,20 +897,6 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         if (pairTop) {
             if (iter->kind == ITER_LIST_ENUM && IS_LIST(iter->source) &&
                 jaiLazyEnumerateOn()) {
-                /* `for (i, x) in xs.enumerate()` at the top of the loop being
-                 * entered, over the snapshot OP_INVOKE built. A LIST head in
-                 * every respect but the binding -- same reserved registers,
-                 * same prologue, same index write-back, same sample off
-                 * items[index], same census, same null-density refusal -- and
-                 * the pair arm binds the index beside the element. Its kind is
-                 * 5 and not 4 because 4 is the list-of-2-tuples head, which
-                 * shares the DICT head's prologue instead: the two are both
-                 * pair heads over a list and share nothing else.
-                 *
-                 * 96 of the 106 pair loops in lib/jaithon are this shape, and
-                 * every one of them was refused below -- as a user iterator,
-                 * `.enumerate()` having been one before the snapshot existed
-                 * to arm. */
                 ObjList *esrc = AS_LIST(iter->source);
                 int eat = (int)iter->index;
                 if (eat < 0 || eat >= esrc->count) {
@@ -1206,9 +904,6 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                                  "an enumerate loop already past its last "
                                  "element");
                 }
-                /* jaiIterNewListEnum always boxes, so this states what the
-                 * emitted stride of 16 rests on rather than naming a case
-                 * that arises. */
                 if (esrc->stg != LIST_STORE_BOXED) {
                     return osrNo(fn, top,
                                  "an enumerate snapshot that is not boxed");
@@ -1221,33 +916,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                 elemStg = (uint8_t)LIST_STORE_BOXED;
                 iterKind = 5;
             } else if (iter->kind == ITER_DICT_ITEMS && IS_DICT(iter->source)) {
-                /* `for (k, v) in d.items()` at the top of the loop being
-                 * entered. The sample is the dict itself -- the head arm reads
-                 * the first live entry out of it for the component kinds, as
-                 * the list head reads items[index]. */
                 elemSample = iter->source;
                 iterKind = 3;
             } else if (jitPairListOn() && iter->kind == ITER_LIST &&
                        IS_LIST(iter->source)) {
-                /* `for (a, b) in fields_of(kind)` -- a list of 2-tuples.
-                 * emitForIterPair's non-dict tail is a complete inline step
-                 * for exactly this, and the whole-function tier already
-                 * reaches it; only this gate refused the head, so the two
-                 * tiers disagreed about a shape neither of them had to.
-                 *
-                 * The sample here is the ELEMENT, not the source container --
-                 * the opposite of kind 3, and the one thing about the two that
-                 * is not shared. Taken from the list at the iterator's own
-                 * index rather than from the loop variable's slot, for the
-                 * reason the list-bind head below records: the slot holds
-                 * whatever the previous iteration left there, which aims the
-                 * kind guard at the wrong type.
-                 *
-                 * Nothing is promised by this sample. The step guards the
-                 * iterator kind, the object type, the version, the bound, the
-                 * storage, the element tag, OBJ_TUPLE and the count of 2, and
-                 * then each component tag -- all of it before the index is
-                 * advanced or a local is written. */
                 ObjList *psrc = AS_LIST(iter->source);
                 int pat = (int)iter->index;
                 if (pat < 0 || pat >= psrc->count) {
@@ -1260,20 +932,6 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                                  "a pair loop over a list of something other "
                                  "than 2-tuples");
                 }
-                /* One sample pins BOTH component tags, and the step's
-                 * component guard is a tag compare -- so a null where the
-                 * sample had an int bails out of the compiled loop, and the
-                 * loop is re-entered on the next element, so the bail is paid
-                 * per null. The first build of this arm had no scan here and
-                 * a `list[tuple[str, int?]]` with nulls at 1 in 3 ran 3.50x
-                 * SLOWER than never compiling. Same question as the list-bind
-                 * head below, same answer: DENSITY, not presence, over the
-                 * same capped prefix, at the same 1-in-64 -- and the scan
-                 * counts a component of another kind alongside a null, since
-                 * the guard cannot tell the two apart. A sample whose own
-                 * component is null would be refused by emitForIterPair four
-                 * compile attempts later; refusing it here names it and
-                 * spends nothing. */
                 {
                     const ObjTuple *st = AS_TUPLE(pel);
                     if (IS_NULL(st->items[0]) || IS_NULL(st->items[1])) {
@@ -1310,11 +968,6 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
                 elemStg = psrc->stg;
                 iterKind = 4;
             } else {
-                /* Named, because one string used to cover at least three
-                 * shapes with very different costs -- a list of 2-tuples, a
-                 * user iterator such as `.enumerate()`, and everything else --
-                 * and ranking the refusal by its count then credited the
-                 * cheapest of them with the other two's sites. */
                 return osrNo(fn, top,
                              iter->kind == ITER_LIST_ENUM
                                  ? "a pair loop over an enumerate snapshot, "
@@ -1384,6 +1037,39 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             if (!jitListHeadSample(src, at, &elemSample, &elemMixed)) {
                 return osrNo(fn, top, "a list loop whose elements are too often null");
             }
+        } else if (iter->kind == ITER_STRING && IS_STRING(iter->source) &&
+                   jitStringHead()) {
+            /* The head steps ASCII inline and DEOPTS on a byte >= 0x80, so the
+             * question a new head owes is density, not presence
+             * (a-new-loop-head-needs-a-density-census): a bail leaves the
+             * compiled loop and re-enters it, so a string that is mostly
+             * multi-byte would pay that per character and come out slower than
+             * refusing outright.
+             *
+             * Same 1-in-64 threshold the list head uses for nulls, and for the
+             * same reason: source text, identifiers, JSON keys and log lines
+             * are ASCII with the occasional accent, while text that is mostly
+             * non-ASCII is better left to the interpreter's decoder. Sampled
+             * from the CURRENT index forward, because that is the part the
+             * compiled loop will actually walk. */
+            ObjString *src = AS_STRING(iter->source);
+            int64_t at = iter->index;
+            if (at < 0 || at >= (int64_t)src->length)
+                return osrNo(fn, top, "a string loop already past its last byte");
+            int64_t scan = (int64_t)src->length - at;
+            if (scan > 4096) scan = 4096;
+            int64_t wide = 0;
+            for (int64_t i = 0; i < scan; i++)
+                if ((unsigned char)src->chars[at + i] >= 0x80u) wide++;
+            if (wide * 64 > scan)
+                return osrNo(fn, top, "a string loop that is mostly non-ASCII");
+            {
+                ObjString *empty = jaiStringIntern("", 0);
+                if (empty == NULL)
+                    return osrNo(fn, top, "no interned empty string to sample");
+                elemSample = OBJ_VAL((Obj *)empty);
+            }
+            iterKind = 6;
         } else {
             return osrNo(fn, top, "an iterator kind with no loop-head arm");
         }

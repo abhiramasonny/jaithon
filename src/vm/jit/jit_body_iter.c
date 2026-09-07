@@ -689,6 +689,66 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
         unsigned slot = jaiReadU16(code + off + 3);
         if (!localInRange(e, slot)) return false;
 
+        if (e->iterKind == 6) {
+            /* A STRING at the loop head. The reserved registers mean what they
+             * do for a list, with one substitution: JIT_IDX_REG and JIT_LIM_REG
+             * are BYTE offsets, not element counts, because that is what
+             * ObjIter carries for an ITER_STRING (object_iter.c). JIT_START_REG
+             * holds the ObjString.
+             *
+             * No version guard, unlike the list head: a string is immutable, so
+             * there is nothing that can change under the loop.
+             *
+             * A byte >= 0x80 deoptimises rather than decoding UTF-8 inline, for
+             * the reason emitForIterBind's shape-5 arm gives: the interpreter
+             * allocates a fresh ObjString for a multi-byte scalar, and nothing
+             * has been advanced when the guard fires, so the resume point is
+             * this instruction. The DENSITY question a new head owes
+             * (jitStringHeadSample, called from compileOsr) is answered before
+             * the form is built rather than here.
+             *
+             * Without this the whole shape was refused -- "an iterator kind
+             * with no loop-head arm" -- so a per-character loop long enough to
+             * reach the OSR tier ran entirely interpreted: 290ms against 30ms
+             * for the same work written as an indexed `while`. */
+            Value sample = e->elemSample;
+            if (!IS_STRING(sample)) {
+                return subWhy(e, "a string head with no string to look at");
+            }
+            if (!adoptLocalKindSeen(e, slot, SLOT_OBJ, 0, NULL, sample)) {
+                return subWhy(e, "loop variable in local %u has kind %s, "
+                                 "not a string", slot,
+                              slotKindName(e->localKind[slot]));
+            }
+            e->iterSlot = slot;
+            e->iterExit = (uint32_t)((int32_t)(off + 5) + jump);
+
+            emit(e, jaiA64SubsXReg(31, JIT_IDX_REG, JIT_LIM_REG));
+            branchTo(e, e->iterExit, true, JAI_A64_GE);
+
+            emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_START_REG,
+                               (unsigned)offsetof(ObjString, chars)));
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                  JIT_IDX_REG, 0));
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
+            /* 128 is an imm12, so the compare needs no register. */
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 128));
+            branchOnDeopt(e, JAI_A64_HS);
+
+            /* All 128 slots are filled from the end of jaiVMInit, so this is a
+             * load and not a load plus a null test. What the table holds is
+             * interned by construction. */
+            emitConst64(e, JIT_SCRATCH_C,
+                        (int64_t)(uintptr_t)jaiAsciiCharTable());
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                  JIT_SCRATCH_B, 3));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            localOut(e, slot, JIT_SCRATCH_A);
+            emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
+            off += 5;
+            break;
+        }
+
         if (e->iterKind == 2) {
             /* A list at the loop head: reserved registers mean what they do for a range, except JIT_START_REG
              * holds the ObjList instead of a first value. Without this, a top-level `for x in xs` was never even attempted -- the gate refused anything not a range before compileOsr ran, so not even a decline was recorded. */

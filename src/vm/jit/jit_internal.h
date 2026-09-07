@@ -21,19 +21,6 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 
 #define JIT_FIRST_SAVED 19u   /* x19..x28 are callee-saved and ours */
 #define JIT_MAX_SAVED   10u
-/* How many live values one call out can root, which is NOT the register budget
- * above even though it was the same number for a long time. The register count
- * is a hardware fact: x19..x28 is ten and cannot be more. The root count is the
- * length of an ARRAY on the frame, and what it bounds is mostly LOCALS --
- * emitRootFill walks every object-kind local, and a local that earned no
- * register lives in memory, so the count is not tied to the ten at all.
- *
- * Sharing the constant made "too many roots" one of the hottest refusals in
- * jaicv: eighty attempts at each of five offsets in one `imgproc` run, on a
- * package whose functions routinely hold a dozen Mats. The price of the split
- * is 14 more Values (224 bytes) on the frame of a body that calls out, which
- * carries it past the 504 bytes that keep the cheap stp-pre prologue -- one or
- * two extra instructions once per body, against a whole body compiling. */
 #define JIT_MAX_ROOTS   24u
 /* Model entries, not register count -- an inlined body's operand-stack entries live in their own bank, wider than x19..x28. */
 #define JIT_MAX_STACK   20u
@@ -74,45 +61,10 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 /* Repeated from the register plan below, which cannot be declared this early:
  * x0..x8, the bank a call-free body's operand stack uses. */
 #define JIT_SCRATCH_BANK_COUNT 9u
-
-/* ------------------------------------------------------------------ */
-/* Calling out of compiled code                                         */
-/* ------------------------------------------------------------------ */
-
-/* How many Values one call out of compiled code can carry. It bounds four
- * things at once: a descriptor call's arguments, an invoke's (receiver + this
- * minus one), an f-string's parts, and the fields a simple constructor stores.
- *
- * Was 4. The self-hosted compiler checking parser.jai stopped at
- * "OP_INVOKE: 5 arguments, past the cap of 3" eighty times at ONE osr loop --
- * a hot one -- and also wanted six and seven elsewhere; 8 covers every arity
- * that corpus asks for. The price is 4 more Values (64 bytes) on the frame of
- * every compiled body that calls out, which is stack, never touched beyond
- * what is used.
- *
- * Then 8 was not enough either, and the way that surfaced is worth keeping.
- * Teaching OP_GET_GLOBAL to resolve the `__prim__` namespace made jaicv's
- * `span` twice as slow, because `__prim__.fill_span(...)` takes TEN arguments
- * and `fill_convex` eleven. While `__prim__` had no arm the walk took the SOFT
- * unarmed path and skipped the receiver, all ten pushes and the invoke as one
- * block, so span's prologue compiled; once it resolved, the walk reached this
- * cap, which refuses HARD and declined the whole function.
- *
- * Two agents tried to dodge the wall with a lookahead that only resolves
- * `__prim__` when the paired invoke would fit. That was refuted: it finds the
- * FIRST invoke, not the paired one, so an argument containing its own method
- * call walks straight back into the wall. Removing the wall is the fix.
- *
- * 12 covers `fill_convex`'s eleven. The price is 4 more Values (64 bytes) on
- * a calling body's frame, and it carries that frame past the 504 bytes that
- * keep the cheap stp-pre prologue -- which JIT_MAX_ROOTS above already does,
- * for the same reason and at the same price: framePairFits() falls back to one
- * or two extra instructions once per body, against a whole body compiling. */
 #define JIT_MAX_ARGS_OUT 12
 
 /* Values first in JitCallDesc so every field is 8-aligned and the emitted stores can use scaled forms. */
 typedef struct JitCallDesc {
-    /* link/nroots come first so `roots` sits at a fixed offset from the chain head; link != NULL means this descriptor is on the collector's walk chain. */
     struct JitCallDesc *link;
     int64_t nroots;
     Value   roots[JIT_MAX_ROOTS];
@@ -120,27 +72,14 @@ typedef struct JitCallDesc {
     Value   args[JIT_MAX_ARGS_OUT];
     Value   result;
     int64_t argc;
-    /* aux: only OP_GET_SLICE uses it, for which of start/stop/step are present -- `xs[null:3]` vs `xs[:3]` can't be told apart from the values alone. */
     int64_t aux;
 } JitCallDesc;
 
-/* Global, not a frame field: the compiled frame is gone by the time C looks, and the VM is single-threaded so only one body can be deoptimising at a time. */
 typedef struct {
     int64_t ip;
     int64_t base;
     int64_t nlocals;
     int64_t nstack;
-    /* Bit i: local i is NOT described by this record and must be left as the
-     * frame already has it. SLOT_OPAQUE means "the compiled body never reads
-     * this slot", which jitArgIn relies on to pass a raw 0 for an argument of
-     * a kind the tier has no register for -- but a DEOPT hands the frame to
-     * the interpreter, and the interpreter does read it. Writing the record's
-     * null over it turned `enter_foreign(module)` into `enter_foreign(null)`
-     * and the whole compiler then failed to resolve an imported type.
-     * bindCallArgs runs before jaiJitApplyDeopt at every call site, so the
-     * real argument is already there; the fix is to not touch it.
-     * The OSR tier has always got this right -- OSR_SYNC_ITER skips a slot
-     * whose tag is VAL_NULL -- which is why only the function tier was wrong. */
     int64_t skipLocals;
     Value   locals[JIT_MAX_SLOTS + 1];
     Value   stack[JIT_MAX_STACK + 1];
@@ -171,44 +110,14 @@ typedef enum {
                    * tag is VAL_NULL rather than the VAL_OBJ every other kind chain in this file falls through to. */
     SLOT_OBJ,     /* Heap object of a type this tier doesn't model, held raw: may only be read, passed, stored and rooted. */
     SLOT_LIST,    /* ObjList *, raw -- safe for the same reason an instance is: nothing moves, and a call spills it as a root first. */
-    /* Some heap object or null, class unknown: SLOT_OBJ's permissions (read,
- * pass, store, root) minus the promise that it is non-null, and without
- * SLOT_MAYBE_INST's promise that the non-null case is an instance of one
- * shape. What `-> OpKind?` returns. Produced ONLY by mergeReturnKind and
- * consumed only where a return kind is; pushValue refuses it, so none of the
- * ninety-odd sites that treat SLOT_MAYBE_INST as instance-like can see it. */
     SLOT_MAYBE_OBJ,
-    /* A RETURN KIND ONLY. A body whose return sites disagree -- `-1` on one
-     * edge, `[]` on another, `0.0` on a third -- returns whatever each site
-     * held, and says which by carrying that site's Value tag in bits 8..15 of
-     * JitResult::bailed (JIT_RET_TAG_SHIFT). jitResultOut rebuilds the Value
-     * from (tag, payload). It is never an operand-stack entry, never a
-     * local's kind, never in a deopt record or an OSR form: pushValue3 and
-     * adoptLocalKindSeen refuse it, and every compiled caller's accept-list
-     * refuses a callee that returns it, so the tag bits only ever reach C. */
     SLOT_DYNAMIC
 } SlotKind;
 
-/* Where a SLOT_DYNAMIC body puts the return site's Value tag: bits 8..15 of
- * JitResult::bailed. The verdict stays in the low byte, so every consumer of
- * x1 that expects 0/1/2/4 keeps working unchanged -- a compiled caller never
- * calls a SLOT_DYNAMIC body directly, and the C side masks. */
 #define JIT_RET_TAG_SHIFT 8u
 
-/* stackSignatureAt packs a whole SlotKind into four bits per operand-stack
- * entry, and that packing is what makes a join with two disagreeing kinds a
- * refusal rather than a miscompile. It used to pack two bits, four kind pairs
- * collided, and a body returning `1.5` on one edge and a string on the other
- * compiled and segfaulted (tests/golden/jit_join_kind_collision.jai). A
- * sixteenth kind is the last one that fits. */
 _Static_assert(SLOT_MAYBE_OBJ <= 15,
                "a SlotKind must fit the four bits stackSignatureAt packs it into");
-/* SLOT_DYNAMIC is the seventeenth kind and does NOT fit those four bits. That
- * is fine only because it never reaches the operand stack -- pushValue3
- * refuses it -- so stackSignatureAt never packs it. The assert above pins the
- * last kind that MAY be packed; this one pins the claim that nothing past it
- * is a stack kind. A new kind that can be pushed goes BEFORE SLOT_MAYBE_OBJ
- * and must fit. */
 _Static_assert(SLOT_DYNAMIC == SLOT_MAYBE_OBJ + 1 && SLOT_DYNAMIC == 16,
                "SLOT_DYNAMIC is a return kind only: it is never packed into a "
                "stack signature, so it alone may sit past the four-bit limit");
@@ -228,21 +137,6 @@ _Static_assert(SLOT_DYNAMIC == SLOT_MAYBE_OBJ + 1 && SLOT_DYNAMIC == 16,
 #define JIT_FP_FIRST_SAVED 8u
 #define JIT_FP_MAX_SAVED   8u
 
-/* Some fixup targets are not bytecode offsets at all: they are sentinels at the
- * top of the u32 range, each one a base minus an index into a table.
- *
- * The bases are DERIVED from the table sizes rather than written down, because
- * hand-picked ones overlapped. FIXUP_DEOPT was UINT32_MAX-7 minus an index into
- * a 160-entry table, so it ran down to UINT32_MAX-166 -- straight through
- * FIXUP_EXIT at UINT32_MAX-100. The resolver tests EXIT first, so **deopt sites
- * 93 through 100 would have resolved to an exit stub**: a compiled body jumping
- * out of its loop where it meant to hand back to the interpreter.
- *
- * It was never reachable, which is why it sat here: the largest deopt count
- * anyone had seen was 16. It is 47 today across the benchmark suite, because a
- * day of adding guards to the tier moved it halfway. Deriving the bases makes
- * the overlap impossible rather than merely unlikely, and the assertions below
- * fail the build if a future table size reintroduces it. */
 #define JIT_MAX_DEOPT     160u
 #define JIT_MAX_EXIT      8u
 /* Self-calls and direct calls to a callee that writes share this table, so it
@@ -338,57 +232,11 @@ typedef struct {
      * object it is the element's own live sample, which was already being held
      * here and is reachable for the same reasons it was. */
     Value     stackElem[JIT_MAX_STACK];
-    /* The element type this list was DECLARED with, as a FieldKind + 1, or 0
-     * for "nothing was declared". A fact rather than a prediction: the
-     * emitter stamps it with OP_ELEM_KIND while the list is still empty, and
-     * the interpreter's jaiListSpecialise pins the storage from the same byte.
-     *
-     * It exists because a sample cannot. A local built inside the body -- and
-     * then filled by a callee that mutates it through the alias, never
-     * reassigning it -- holds nothing at the moment the tier looks, so
-     * stackSeen is empty for the whole life of the compile. That is not a gap
-     * to be closed by sampling harder; the value provably does not exist yet.
-     * jaicv's `min_area_rect` is exactly that shape and was the single largest
-     * refusal on the benchmark. */
     uint8_t   stackElemDecl[JIT_MAX_STACK];
     int       stackLocal[JIT_MAX_STACK];
-    /* This entry is not merely a string by sample -- it came out of the shared
-     * one-byte ASCII table, so it IS an interned ObjString, and the guards a
-     * string compare would otherwise emit for it are dead code. A proof, not a
-     * prediction, so it may delete a guard rather than only choose one.
-     *
-     * A prediction survives a branch merge harmlessly (a wrong guess still
-     * guards); a proof does not, because the other edge into a join carries a
-     * value this walk never saw. The linear walk models only the fall-through
-     * edge, so every flag is dropped at any offset something else can reach --
-     * see the clearStackProofs call in the walk. */
     bool      stackAscii[JIT_MAX_STACK];
-
-    /* This entry is the shared payload-less value of the enum variant named
-     * by stackSeen -- baked as a constant pointer by the `Enum.Variant` fold
-     * in OP_GET_FIELD, not merely observed to be one. A proof of the same
-     * kind as stackAscii and retired at the same offsets, and for the same
-     * reason: it deletes work (the pointer compare in OP_EQ stands in for
-     * jaiValuesEqual) rather than choosing a guard. */
     bool      stackUnit[JIT_MAX_STACK];
-
-    /* This entry is the `null` literal itself -- OP_NULL, not merely something
-     * whose kind admits a null. It has to be tracked separately because
-     * OP_NULL pushes SLOT_MAYBE_INST (a null literal and an instance have to
-     * agree on a kind, or `var x: Box? = null` gives its local two of them),
-     * so the kind alone cannot tell `x is null` from `x is y`. A proof of the
-     * same kind as the two above and retired at the same offsets. */
     bool      stackNullLit[JIT_MAX_STACK];
-
-    /* Fields already stored this call, with their kind: a read of one needs no tag check since nothing
-     * can have changed it -- e.g. `self.n = self.n + 1; return self.n` would otherwise bail-after-write, which the tier refuses.
-     *
-     * "Nothing can have changed it" was once true because the body could not
-     * call at all. It can now, so the claim is only as good as its
-     * invalidations, and there are four (see forgetFieldKinds and
-     * forgetFieldKindsOfLocal): another store to the same field slot
-     * (recordFieldStore), a call, an offset a branch can land on, and a write
-     * to the local the entry names. */
     struct { int local; uint16_t field; SlotKind kind; } known[16];
     unsigned  knownCount;
     SlotKind  localKind[JIT_MAX_SLOTS + 1];
@@ -739,17 +587,6 @@ typedef struct {
     } grow[JIT_MAX_GROW];
     unsigned  growCount;
     uint32_t  curOffset;
-    /* Diagnostic only (JAI_JIT_CHAIN=1). Offsets this walk must not try to arm,
-     * so that a body which refuses at one instruction can be walked PAST it to
-     * find what it would refuse at next.
-     *
-     * A refusal is a chain, and the single most expensive question about this
-     * tier is "what would this body stop at next?" -- answered until now by
-     * building the fix and re-running, which is a day per link and how three
-     * separate changes came to measure exactly zero. Forcing the unarmed path
-     * at a known offset and recompiling answers it in a second, and it reuses
-     * a well-tested mechanism rather than continuing a walk whose model has
-     * gone inconsistent (which segfaults). */
     uint32_t  chainSkip[JIT_MAX_CHAIN];
     unsigned  chainSkipCount;
     /* Model as it stood at the start of `curOffset`, before that instruction's own pushes -- a guard fires
@@ -1157,6 +994,7 @@ DiscardKind discardedAfter(const uint8_t *code, int at, int count);
 bool emitFusedReturnNull(Emit *e, ObjFunction *fn);
 bool jitStrIter(void);
 bool jitIterStorage(void);
+bool jitStringHead(void);
 #ifdef JAI_ALLOC_CENSUS
 void jaiDeoptHitEmit(Emit *e, const char *fn, uint32_t top, unsigned ord,
                      uint32_t ip);
