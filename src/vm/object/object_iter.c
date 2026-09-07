@@ -50,7 +50,43 @@ static inline ObjString *traitNextName(void) {
 
 /* True when instances of `v`'s class answer `name`. Inherited methods are
  * copied down at class creation, so one table lookup is the whole answer. */
+#ifdef JAI_ALLOC_CENSUS
+/* Iterator allocations, split by kind. The object census in object.c counts
+ * OBJ_ITER as one bucket; this says which loop shape built them, which is what
+ * you need to price "elide the ObjIter for `for x in list`" before building it.
+ *
+ * That pricing has been done, on tests/bench/graph_bfs and on a 3M-entry probe:
+ * an ObjIter costs ~12.3ns all-in, so elision is worth ~0.2% of `make bench`
+ * and ~0.3% of a `fmt --check lib`. Not worth the tier's deopt hazard. Kept
+ * because the next allocation-shape question will want the same breakdown. */
+#include <stdio.h>
+#include <stdlib.h>
+static uint64_t jaiIterCensus[16];
+static void jaiIterCensusReport(void) {
+    static const char *const names[] = {
+        "LIST", "TUPLE", "STRING", "BYTES", "DICT_KEYS", "DICT_ITEMS",
+        "SET", "RANGE", "USER", "TRAIT", "GENERATOR", "LIST_ENUM"
+    };
+    uint64_t total = 0;
+    for (int i = 0; i < 16; i++) total += jaiIterCensus[i];
+    fprintf(stderr, "iter-census: total=%llu", (unsigned long long)total);
+    for (int i = 0; i < (int)(sizeof names / sizeof names[0]); i++)
+        if (jaiIterCensus[i])
+            fprintf(stderr, " %s=%llu", names[i],
+                    (unsigned long long)jaiIterCensus[i]);
+    fprintf(stderr, "\n");
+}
+static void jaiIterCensusBump(IterKind kind) {
+    static bool armed = false;
+    if (!armed) { armed = true; atexit(jaiIterCensusReport); }
+    if ((unsigned)kind < 16) jaiIterCensus[(unsigned)kind]++;
+}
+#endif
+
 ObjIter *jaiIterNew(IterKind kind, Value source) {
+#ifdef JAI_ALLOC_CENSUS
+    jaiIterCensusBump(kind);
+#endif
     const bool rootSource = IS_OBJ(source);
     if (rootSource) jaiGCPushRoot(source);
 
@@ -375,6 +411,7 @@ bool jaiIterNext(ObjIter *it, Value *out) {
 }
 
 bool jaiGetIter(Value v, Value *out) {
+
     if (IS_OBJ(v)) {
         switch (OBJ_TYPE(v)) {
             case OBJ_ITER:
