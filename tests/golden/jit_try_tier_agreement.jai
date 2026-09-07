@@ -21,6 +21,7 @@
 #: try/catch/finally where finally must still run; a raise from inside an
 #: OSR-compiled `while` inside a try; an explicit `throw` from a hot body; and
 #: a catch that re-throws to an outer handler.
+fn guarded_ovf(a: int, b: int) -> int {
     try { return a + b } catch _e: OverflowError { return -1 }
 }
 fn guarded_idx(xs: list[int], i: int) -> int {
