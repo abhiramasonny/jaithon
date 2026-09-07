@@ -110,6 +110,43 @@ void jaiSnapshotAudit(const char *when) {
             "open-upvalue=%llu nameless-native=%llu\n",
             openFiles, closedFiles, jitCode, jitLoops, osrForms, constIndex,
             openUpvalues, namelessNatives);
+    /* What an image would actually have to COPY. Objects are individually
+     * allocated -- a size-classed slab under 512 bytes, plain malloc above --
+     * so nothing can be mapped as a region; every object and every array it
+     * owns has to be copied and then relocated. jaiObjSoleBlock answers the
+     * first half: a non-zero size means the object's whole footprint is its own
+     * block, and zero means it owns arrays or a table that need their own
+     * copy logic. Counting the second group is the real measure of how much
+     * writer code this needs. */
+    unsigned long long soleBytes = 0, soleCount = 0, ownsArrays = 0;
+    unsigned long long ownsByType[OBJ_TYPE_COUNT];
+    for (int i = 0; i < OBJ_TYPE_COUNT; i++) ownsByType[i] = 0;
+    /* A string whose `chars` point into a SHARED ObjStrBuf rather than at its
+     * own trailing bytes: the image cannot copy those bytes with the string,
+     * and the pointer has to be relocated against the buffer instead. */
+    unsigned long long sharedStrings = 0, ownStrings = 0;
+    for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+        size_t sole = jaiObjSoleBlock(o);
+        if (sole != 0) { soleCount++; soleBytes += sole; }
+        else { ownsArrays++; if (o->type < OBJ_TYPE_COUNT) ownsByType[o->type]++; }
+        if (o->type == OBJ_STRING) {
+            if (((ObjString *)o)->owner != NULL) sharedStrings++;
+            else ownStrings++;
+        }
+    }
+    fprintf(stderr,
+            "[snapshot] copy plan: %llu self-contained objects (%llu bytes), "
+            "%llu own arrays or tables\n",
+            soleCount, soleBytes, ownsArrays);
+    for (int i = 0; i < OBJ_TYPE_COUNT; i++) {
+        if (ownsByType[i] != 0)
+            fprintf(stderr, "[snapshot]   owns-arrays %-10s %llu\n",
+                    kindName[i] != NULL ? kindName[i] : "?", ownsByType[i]);
+    }
+    fprintf(stderr,
+            "[snapshot] strings: %llu own their bytes, %llu point into a "
+            "shared buffer\n", ownStrings, sharedStrings);
+
     fprintf(stderr, "[snapshot] verdict: %s\n",
             (openFiles == 0 && jitCode == 0 && jitLoops == 0 &&
              osrForms == 0 && constIndex == 0 && openUpvalues == 0 &&
