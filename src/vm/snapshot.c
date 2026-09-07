@@ -465,26 +465,32 @@ void jaiSnapshotAudit(const char *when) {
                                 ObjFunction *fn = (ObjFunction *)o;
                                 uint32_t kind = 1;      /* chunk code */
                                 uint32_t n = (uint32_t)fn->chunk.count;
+                                uint32_t blen = n;
                                 fwrite(&ix, sizeof ix, 1, f);
                                 fwrite(&kind, sizeof kind, 1, f);
                                 fwrite(&n, sizeof n, 1, f);
+                                fwrite(&blen, sizeof blen, 1, f);
                                 if (n) fwrite(fn->chunk.code, 1, n, f);
                                 arrRecs++; arrBytes += n;
 
                                 kind = 2;               /* line stream */
                                 n = (uint32_t)fn->chunk.lineStreamLen;
+                                blen = n;
                                 fwrite(&ix, sizeof ix, 1, f);
                                 fwrite(&kind, sizeof kind, 1, f);
                                 fwrite(&n, sizeof n, 1, f);
+                                fwrite(&blen, sizeof blen, 1, f);
                                 if (n) fwrite(fn->chunk.lineStream, 1, n, f);
                                 arrRecs++; arrBytes += n;
                             } else if (o->type == OBJ_CLOSURE) {
                                 ObjClosure *cl = (ObjClosure *)o;
                                 uint32_t kind = 3;      /* upvalues, as indices */
                                 uint32_t n = (uint32_t)cl->upvalueCount;
+                                uint32_t blen = n * (uint32_t)sizeof(uint32_t);
                                 fwrite(&ix, sizeof ix, 1, f);
                                 fwrite(&kind, sizeof kind, 1, f);
                                 fwrite(&n, sizeof n, 1, f);
+                                fwrite(&blen, sizeof blen, 1, f);
                                 for (uint32_t u = 0; u < n; u++) {
                                     uint32_t ui = IDX(cl->upvalues[u]);
                                     fwrite(&ui, sizeof ui, 1, f);
@@ -516,9 +522,11 @@ void jaiSnapshotAudit(const char *when) {
 #define WRITE_TABLE_K(o, t, k) do {                                           \
         uint32_t _ix = IDX(o), _kind = (k);                                   \
         uint32_t _cap = (uint32_t)(t)->capacity;                              \
+        uint32_t _bl = _cap * 36u;   /* 4+8 key, 4+8 value, 8 hash, 4 order */                                            \
         fwrite(&_ix, sizeof _ix, 1, f);                                       \
         fwrite(&_kind, sizeof _kind, 1, f);                                   \
         fwrite(&_cap, sizeof _cap, 1, f);                                     \
+        fwrite(&_bl, sizeof _bl, 1, f);                                       \
         for (uint32_t _e = 0; _e < _cap; _e++) {                              \
             JaiEntry *_en = &(t)->entries[_e];                                \
             WRITE_VALUE(_en->key);                                            \
@@ -550,6 +558,54 @@ void jaiSnapshotAudit(const char *when) {
                                 ObjModule *m = (ObjModule *)o;
                                 if (m->globals.entries) WRITE_TABLE(o, &m->globals);
                                 if (m->exports.entries) WRITE_TABLE_K(o, &m->exports, 5);
+                                break;
+                            }
+                            case OBJ_CLASS: {
+                                /* Five tables, and they are what a class IS --
+                                 * methods dominates. Kinds 6..10 so the reader
+                                 * can tell them apart, the lesson the module's
+                                 * two tables taught. */
+                                ObjClass *c = (ObjClass *)o;
+                                if (c->methods.entries)    WRITE_TABLE_K(o, &c->methods, 6);
+                                if (c->statics.entries)    WRITE_TABLE_K(o, &c->statics, 7);
+                                if (c->getters.entries)    WRITE_TABLE_K(o, &c->getters, 8);
+                                if (c->setters.entries)    WRITE_TABLE_K(o, &c->setters, 9);
+                                if (c->restricted.entries) WRITE_TABLE_K(o, &c->restricted, 10);
+                                break;
+                            }
+                            case OBJ_ENUM: {
+                                ObjEnum *en = (ObjEnum *)o;
+                                if (en->methods.entries) WRITE_TABLE_K(o, &en->methods, 11);
+                                break;
+                            }
+                            case OBJ_LIST: {
+                                /* Items, at the storage's own width. A BOXED
+                                 * list holds Values and needs the same index
+                                 * substitution a table entry does; the unboxed
+                                 * widths are raw bytes. */
+                                ObjList *l = (ObjList *)o;
+                                if (l->items == NULL || l->count == 0) break;
+                                uint32_t lix = IDX(o), lkind = 12;
+                                uint32_t n = (uint32_t)l->count;
+                                uint32_t stg = (uint32_t)l->stg;
+                                uint32_t blen = 4u + (l->stg == LIST_STORE_BOXED
+                                        ? n * 12u
+                                        : n * (l->stg == LIST_STORE_U8 ? 1u : 8u));
+                                fwrite(&lix, sizeof lix, 1, f);
+                                fwrite(&lkind, sizeof lkind, 1, f);
+                                fwrite(&n, sizeof n, 1, f);
+                                fwrite(&blen, sizeof blen, 1, f);
+                                fwrite(&stg, sizeof stg, 1, f);
+                                if (l->stg == LIST_STORE_BOXED) {
+                                    for (uint32_t e = 0; e < n; e++) {
+                                        Value ev = ((Value *)l->items)[e];
+                                        WRITE_VALUE(ev);
+                                    }
+                                } else {
+                                    size_t w = l->stg == LIST_STORE_U8 ? 1u : 8u;
+                                    fwrite(l->items, w, n, f);
+                                }
+                                tblRecs++;
                                 break;
                             }
                             default: break;
@@ -622,17 +678,12 @@ void jaiSnapshotAudit(const char *when) {
                             {
                                 uint32_t aix, akind, an;
                                 unsigned long long ar = 0, amis = 0;
+                                uint32_t ablen;
                                 while (fread(&aix, sizeof aix, 1, g) == 1 &&
                                        fread(&akind, sizeof akind, 1, g) == 1 &&
-                                       fread(&an, sizeof an, 1, g) == 1) {
-                                    /* A table record is capacity ENTRIES, each
-                                     * {tag,payload} x2 + hash + order. */
-                                    size_t want = akind == 3
-                                                    ? an * sizeof(uint32_t)
-                                                : (akind == 4 || akind == 5)
-                                                    ? (size_t)an * (2u * (sizeof(uint32_t) + sizeof(uint64_t))
-                                                                    + sizeof(uint64_t) + sizeof(int32_t))
-                                                    : an;
+                                       fread(&an, sizeof an, 1, g) == 1 &&
+                                       fread(&ablen, sizeof ablen, 1, g) == 1) {
+                                    size_t want = ablen;
                                     if (want > bufCap) {
                                         unsigned char *nb = (unsigned char *)
                                             realloc(buf, want);
@@ -655,7 +706,33 @@ void jaiSnapshotAudit(const char *when) {
                                         if ((uint32_t)fo->chunk.lineStreamLen != an ||
                                             (an && memcmp(buf, fo->chunk.lineStream, an)))
                                             amis++;
-                                    } else if (akind == 4 || akind == 5) {
+                                    } else if (akind == 12) {
+                                        /* List items: storage width first. */
+                                        ObjList *lo = (ObjList *)orig;
+                                        uint32_t stg = 0;
+                                        memcpy(&stg, buf, 4);
+                                        const unsigned char *q = buf + 4;
+                                        if (orig->type != OBJ_LIST ||
+                                            (uint32_t)lo->count != an ||
+                                            stg != (uint32_t)lo->stg) {
+                                            amis++;
+                                        } else if (stg == LIST_STORE_BOXED) {
+                                            for (uint32_t e = 0; e < an; e++) {
+                                                uint32_t vt; uint64_t vp;
+                                                memcpy(&vt, q, 4); q += 4;
+                                                memcpy(&vp, q, 8); q += 8;
+                                                Value lv = ((Value *)lo->items)[e];
+                                                if (vt != (uint32_t)lv.type ||
+                                                    (IS_OBJ(lv) &&
+                                                     (vp >= next || byIndex[vp] != AS_OBJ(lv)))) {
+                                                    amis++; break;
+                                                }
+                                            }
+                                        } else {
+                                            size_t w = stg == LIST_STORE_U8 ? 1u : 8u;
+                                            if (memcmp(q, lo->items, w * an) != 0) amis++;
+                                        }
+                                    } else if (akind >= 4 && akind <= 11) {
                                         /* Compare every entry against the live
                                          * table: tags identical, object
                                          * payloads resolving back to the same
@@ -669,6 +746,17 @@ void jaiSnapshotAudit(const char *when) {
                                             ObjModule *mo = (ObjModule *)orig;
                                             lt = akind == 5 ? &mo->exports
                                                             : &mo->globals;
+                                        }
+                                        else if (orig->type == OBJ_CLASS) {
+                                            ObjClass *co = (ObjClass *)orig;
+                                            lt = akind == 6  ? &co->methods
+                                               : akind == 7  ? &co->statics
+                                               : akind == 8  ? &co->getters
+                                               : akind == 9  ? &co->setters
+                                                             : &co->restricted;
+                                        }
+                                        else if (orig->type == OBJ_ENUM) {
+                                            lt = &((ObjEnum *)orig)->methods;
                                         }
                                         if (lt == NULL || (uint32_t)lt->capacity != an) {
                                             fprintf(stderr, "[snapshot]   table miss: kind=%u owner=%d an=%u cap=%d\n",
