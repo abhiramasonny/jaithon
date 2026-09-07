@@ -907,7 +907,8 @@ bool emitGetGlobal(Emit *e, ObjFunction *fn, ObjClosure *closure,
                  * against 14 ms for the same function guarded by a plain
                  * `return`. The unarmed path already exists for exactly
                  * this -- see emitUnarmedDeopt. */
-                if (!e->osr && emitUnarmedDeopt(e, &fn->chunk, &off, stop)) {
+                if ((!e->osr || jitOsrGlobalSoft()) &&
+                    emitUnarmedDeopt(e, &fn->chunk, &off, stop)) {
                     break;
                 }
                 if (e->failed) return false;

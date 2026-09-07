@@ -365,6 +365,19 @@ static bool jitInvokeSoft(void) {
  * has never watched return. Measuring them together hides which is which. */
 /* JAITHON_JIT_GLOBAL_ENUM=0 sends a module-level enum back down the by-address
  * path, as before 2026-09-07, so the arm can be A/B'd in one binary. */
+/* JAITHON_JIT_OSR_GLOBAL_SOFT=0 restores the `!e->osr` gate on OP_GET_GLOBAL's
+ * unarmed fallback, i.e. an OSR loop declines outright when it names a global
+ * whose callee has not compiled. On, the loop is compiled up to that read and
+ * interprets from there, as the function tier already does. */
+bool jitOsrGlobalSoft(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_OSR_GLOBAL_SOFT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool jitGlobalEnum(void) {
     static int cached = -1;
     if (cached < 0) {

@@ -968,6 +968,7 @@ bool raiseExitAllowed(Emit *e, const char *what);
 bool negatedCondition(uint8_t cmp, unsigned *out);
 ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx);
 bool jitGlobalEnum(void);
+bool jitOsrGlobalSoft(void);
 bool firstLiveEntry(const JaiTable *t, Value *key, Value *value);
 ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
                                    Value *out);

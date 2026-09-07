@@ -71,6 +71,22 @@ pub fn scan_comments(source: str) -> list[Comment] {
     var line = 1
     var column = 1
     var code_seen = false
+    # Hoisted out of the `#` arm below, and NOT for style. The OSR loop tier
+    # guards every slot the form was compiled against, and a slot declared
+    # inside a branch is UNBOUND on every iteration that does not take it --
+    # so entry was refused with "slot N holds null, but the form was compiled
+    # for int" and this loop, the largest single interpreted body in
+    # `fmt --check`, never once ran compiled. Each is assigned before it is
+    # read, so hoisting changes nothing about what the function computes.
+    var start_line = 0
+    var start_column = 0
+    var depth = 0
+    # Hoisted for a second reason: `piece` (an instance) and `raw` (a bool) sat
+    # in DIFFERENT arms of the same `if`, so the compiler gave them one slot and
+    # the tier saw "local 13 was given two kinds, bool and instance" and refused
+    # the loop head. Separate declarations mean separate slots.
+    var piece = StringBuilder()
+    var raw = false
 
     while index < length {
         let character = chars[index]
@@ -80,11 +96,11 @@ pub fn scan_comments(source: str) -> list[Comment] {
             code_seen = false
             index += 1
         } elif character == "#" {
-            let start_line = line
-            let start_column = column
-            let piece = StringBuilder()
+            start_line = line
+            start_column = column
+            piece = StringBuilder()
             if index + 1 < length and chars[index + 1] == "*" {
-                var depth = 0
+                depth = 0
                 while index < length {
                     if chars[index] == "#" and index + 1 < length and chars[index + 1] == "*" {
                         depth += 1
@@ -126,7 +142,7 @@ pub fn scan_comments(source: str) -> list[Comment] {
             )
             code_seen = true
         } elif character == "\"" or character == "'" {
-            let raw = index > 0 and chars[index - 1] == "r"
+            raw = index > 0 and chars[index - 1] == "r"
             let (next, next_line, next_column) = _skip_string(chars, index, line, column, raw)
             index = next
             line = next_line
