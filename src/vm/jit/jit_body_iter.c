@@ -85,7 +85,14 @@ bool emitGetIter(Emit *e, int *offp) {
             if (!popValue(e, &rdrop, NULL)) return false;
             /* Shape 1 marks an iterator the runtime has to step; a range is 0 and gets the inline path. Rides on
              * the stack entry, not the Emit, since a function can build both -- nbody's `advance` runs two range loops then a list loop, and one whole-compile flag made the path taken depend on what came before it. */
-            if (!pushValue3(e, SLOT_ITER, 1, NULL, sample, -1)) return false;
+            /* Shape 5 is a STRING, which shape 1 used to cover. It needs one of
+             * its own because the sample cannot tell the two apart -- a list OF
+             * strings carries a string sample too -- and the step arm reads
+             * ObjString's header either way. Under shape 1 that arm guarded
+             * `kind == ITER_LIST`, so every `for c in text` bailed at the loop
+             * head on every call and ran interpreted. */
+            if (!pushValue3(e, SLOT_ITER, strIter ? 5u : 1u, NULL, sample, -1))
+                return false;
             emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                                e->descOffset +
                                    (unsigned)offsetof(JitCallDesc, result) + 8));
@@ -332,6 +339,93 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                 e->whyNot = "a non-destructuring loop over dict items";
                 return false;
             }
+            /* `for c in <string>`, stepped inline: the interpreter's
+             * ITER_STRING fast path (object_iter.c), instruction for
+             * instruction. `index` is a BYTE offset and `limit` the byte
+             * length, so the ASCII step is one ldrb and an add -- and it
+             * allocates nothing, because the character it yields is the shared
+             * one-byte string jaiVMInit filled every slot of.
+             *
+             * A byte >= 0x80 deoptimises rather than decoding UTF-8 inline: the
+             * interpreter's arm allocates a fresh ObjString for a multi-byte
+             * scalar, which is not something this can emit, and the resume
+             * point is this instruction with nothing yet advanced. Source text
+             * is overwhelmingly ASCII, so the bail is rare -- and it is paid
+             * per non-ASCII character, not per loop, the same way the list
+             * head's null bail is.
+             *
+             * Worth an arm because BOTH tiers used to give up here: the OSR
+             * head refuses ITER_STRING outright ("an iterator kind with no
+             * loop-head arm") and the function tier compiled the body but
+             * deoptimised at the loop head on every call. A per-character loop
+             * measured 290ms against 30ms for the same work written as an
+             * indexed `while`. */
+            if (iterShape == 5) {
+                Value sample = e->stackSeen[e->depth - 1];
+                if (!IS_STRING(sample)) {
+                    e->whyNot = "a string loop with no string to look at";
+                    return false;
+                }
+                if (!adoptLocalKindSeen(e, fslot, SLOT_OBJ, 0, NULL, sample)) {
+                    return subWhy(e, "loop variable in local %u has kind "
+                                     "%s, not a string", fslot,
+                                  slotKindName(e->localKind[fslot]));
+                }
+
+                /* Only OP_GET_ITER's string arm makes a shape-5 SLOT_ITER, and
+                 * SLOT_ITER is never adopted into a local. Checked anyway, one
+                 * load: reading ObjString's header off an ObjList is the one
+                 * failure mode this tier is not allowed. */
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIt,
+                                   (unsigned)offsetof(ObjIter, kind)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ITER_STRING));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
+                                   (unsigned)offsetof(ObjIter, source) + 8));
+
+                /* `limit` is the byte length sampled when the iterator was
+                 * built. A string is immutable, so unlike the list arm there is
+                 * no version to check. */
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, rIt,
+                                   (unsigned)offsetof(ObjIter, index)));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIt,
+                                   (unsigned)offsetof(ObjIter, limit)));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                /* The exhausted arm drops the iterator, so the target is
+                 * reached one entry shallower than this branch leaves from. */
+                branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
+                              JAI_A64_GE,
+                              (int)stackSignatureAt(e, e->depth - 1));
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                   (unsigned)offsetof(ObjString, chars)));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                      JIT_SCRATCH_A, 0));
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
+                /* 128 is an imm12, so the compare needs no register. */
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 128));
+                branchOnDeopt(e, JAI_A64_HS);
+
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_A, 1));
+                emit(e, jaiA64StrX(JIT_SCRATCH_C, rIt,
+                                   (unsigned)offsetof(ObjIter, index)));
+
+                /* All 128 slots are filled from the end of jaiVMInit, so this
+                 * is a load and not a load plus a null test. */
+                emitConst64(e, JIT_SCRATCH_C,
+                            (int64_t)(uintptr_t)jaiAsciiCharTable());
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                      JIT_SCRATCH_B, 3));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+                localOut(e, fslot, JIT_SCRATCH_A);
+                /* The index store is a heap write, as the call-out this
+                 * replaced was. */
+                e->wroteHeap = true;
+                off += 5;
+                break;
+            }
+
             if (iterShape != 0 && iterShape != 2 && iterShape != 3) {
                 /* A list iterator, stepped inline (jaiIterNext's ITER_LIST
                  * case, instruction for instruction) rather than through

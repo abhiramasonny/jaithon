@@ -1157,6 +1157,10 @@ DiscardKind discardedAfter(const uint8_t *code, int at, int count);
 bool emitFusedReturnNull(Emit *e, ObjFunction *fn);
 bool jitStrIter(void);
 bool jitIterStorage(void);
+#ifdef JAI_ALLOC_CENSUS
+void jaiDeoptHitEmit(Emit *e, const char *fn, uint32_t top, unsigned ord,
+                     uint32_t ip);
+#endif
 bool pushLocalAsValue(Emit *e, unsigned slot);
 bool jitConcatLocals(void);
 bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,

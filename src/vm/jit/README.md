@@ -459,6 +459,7 @@ this table complete in both directions.
 | `JAITHON_JIT_STRCMP` | on | String ordering comparisons. |
 | `JAITHON_JIT_STRCMP_EQ` | on | String equality. |
 | `JAITHON_JIT_STR_ITER` | on | Iterating a string. |
+| `JAITHON_JIT_ITER_STG` | on | Dispatch on list storage at a nested `for-in`. |
 | `JAITHON_JIT_OBJ_EQ` | on | Object identity comparison. |
 | `JAITHON_JIT_NULL_PAIR` | on | The null-compare pair fusion. |
 | `JAITHON_JIT_FUSED_DISCARD` | on | Fuse a call whose result is discarded. |
@@ -1028,6 +1029,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_NULL_PAIR` | `jitNullPair` | `x == null` on a `SLOT_OBJ`. Equality only, and object kinds only: a `SLOT_INT` is also never null, but zero is a perfectly good int. |
 | `JAITHON_JIT_FUSED_DISCARD` | `jitFusedDiscard` | fusing `OP_POP_RETURN_NULL` after a discarded call. |
 | `JAITHON_JIT_STR_ITER` | `jitStrIter` | iterating a string. |
+| `JAITHON_JIT_ITER_STG` | `jitIterStorage` | the storage dispatch at a NESTED `for x in <list>` (`emitForIterBind`'s shape-1 arm). Off, that arm emits `emitListBoxedGuard` alone, which is what it did until 2026-09-07: a `push`-built `list[int]` is `LIST_STORE_I64`, so the guard failed on every loop entry and the inner loop ran interpreted. Worth 3.6x on a nested-loop probe and 2x on `graph_bfs`. The switch exists to price it in one binary. |
 | `JAITHON_JIT_CONCAT_LOCALS` | `jitConcatLocals` | `a + b` on two `SLOT_OBJ` locals. |
 | `JAITHON_JIT_MEMBERSHIP` | `jitMembership` | `in`. |
 | `JAITHON_JIT_TUPLE` | `jitTuple` | building and unpacking tuples. |

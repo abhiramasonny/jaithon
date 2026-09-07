@@ -755,6 +755,13 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * instruction, and the offset of the instruction itself. */
     for (unsigned k = 0; k < e.deoptCount; k++) {
         e.deopt[k].stub = (int)e.count;
+#ifdef JAI_ALLOC_CENSUS
+        /* Same counter the OSR tier's stubs carry (jit_osr.c): a guard whose
+         * fired count tracks a loop's iteration count is an armed path that
+         * never sticks, which reads as healthy in every other diagnostic. */
+        jaiDeoptHitEmit(&e, closure->fn->name ? closure->fn->name->chars : "?",
+                        0, k, (uint32_t)e.deopt[k].ip);
+#endif
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gDeopt);
 
         uint64_t skipLocals = 0;

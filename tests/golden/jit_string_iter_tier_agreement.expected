@@ -1,0 +1,14 @@
+warm 10800 abc def
+ghi
+ -
+ascii len=12 nl=2 same=true up=-
+two len=10 nl=0 same=true up=-
+three len=7 nl=0 same=true up=-
+four len=12 nl=0 same=true up=-
+mixed len=7 nl=1 same=true up=-
+empty len=0 nl=0 same=true up=-
+one len=1 nl=0 same=true up=-
+tail len=4 nl=0 same=true up=-
+upper len=5 nl=0 same=true up=C
+nested 58
+last € eq=true len=1

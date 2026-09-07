@@ -36,9 +36,20 @@ static void jaiDeoptHitReport(void) {
                 jaiDeoptHitName[i], jaiDeoptHitTop[i], jaiDeoptHitOrd[i],
                 jaiDeoptHitIp[i], (unsigned long long)jaiDeoptHits[i]);
 }
-static void jaiDeoptHitArm(void) {
+void jaiDeoptHitEmit(Emit *e, const char *fn, uint32_t top, unsigned ord,
+                     uint32_t ip) {
     static bool armed = false;
     if (!armed) { armed = true; atexit(jaiDeoptHitReport); }
+    if (jaiDeoptHitCount >= JAI_DEOPT_HIT_MAX) return;
+    unsigned slot = jaiDeoptHitCount++;
+    jaiDeoptHitName[slot] = fn;
+    jaiDeoptHitTop[slot]  = top;
+    jaiDeoptHitIp[slot]   = ip;
+    jaiDeoptHitOrd[slot]  = ord;
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jaiDeoptHits[slot]);
+    emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+    emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_B, 1));
+    emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
 }
 #endif
 
@@ -969,20 +980,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
          * three others says nothing on its own; this makes each one countable,
          * which is the difference between "the nested for-in arm deopts" and
          * knowing WHICH of its four guards is the one that never holds. */
-        jaiDeoptHitArm();
-        if (jaiDeoptHitCount < JAI_DEOPT_HIT_MAX) {
-            unsigned slot = jaiDeoptHitCount++;
-                    jaiDeoptHitName[slot] = closure->fn->name
-                                        ? closure->fn->name->chars : "?";
-            jaiDeoptHitTop[slot]  = top;
-            jaiDeoptHitIp[slot]   = (uint32_t)e.deopt[k].ip;
-            jaiDeoptHitOrd[slot]  = k;
-            emitConst64(&e, JIT_SCRATCH_A,
-                        (int64_t)(uintptr_t)&jaiDeoptHits[slot]);
-            emit(&e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-            emit(&e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_B, 1));
-            emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-        }
+        jaiDeoptHitEmit(&e, closure->fn->name ? closure->fn->name->chars : "?",
+                        top, k, (uint32_t)e.deopt[k].ip);
 #endif
         emitConst64(&e, 0, (int64_t)e.deopt[k].ip);
         emitEpilogue(&e, 0);
