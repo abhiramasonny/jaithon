@@ -186,6 +186,53 @@ for src in "$ROOT"/tests/golden/*.jai; do
     done
 done
 
+# ------------------------------------------------- 2b. fuzzer bug repros
+#
+# tests/fuzz/found/ holds the programs that caught real miscompiles. Nothing ran
+# them: they sat as artifacts, so a regression that reintroduced any of those
+# bugs would be caught only by a fuzz run that happened to reinvent the same
+# shape. Every one of them is a DIFFERENTIAL -- there is no expected output to
+# maintain, because the oracle is the tier's own contract (src/vm/jit/jit.h):
+# declining is always allowed, answering differently never is.
+#
+# The configurations are the fuzzer's, not the golden runner's, and that
+# matters: these bugs were found under TICK_US (the OSR loop tier) and
+# SPLIT_STRESS (the split operand bank), neither of which any golden runs.
+# DEOPT_STRESS and THRESHOLD=1 alone would not have caught them.
+#
+# A file opts OUT with `#: differential-exempt: yes`, which exactly one does --
+# recursion_depth_limit.jai, where the compiled tier deliberately does not
+# enforce the interpreter's frame limit. See "The one divergence that is
+# deliberate" in src/vm/jit/README.md.
+printf '%sFuzzer bug repros%s\n' "$BOLD" "$RESET"
+for src in "$ROOT"/tests/fuzz/found/*.jai; do
+    name="fuzz/$(basename "$src" .jai)"
+    matches_filter "$name" || continue
+    if sed -n 's/^#: *differential-exempt: *\(yes\).*/\1/p' "$src" | head -1 \
+       | grep -q yes; then
+        record_skip "$name" "differential-exempt (deliberate divergence)"
+        continue
+    fi
+    start=$(now_ms)
+    reference="$(JAITHON_NO_JIT=1 "$JAITHON" run "$src" 2>&1)"
+    bad=""
+    for cfg in "" "JAITHON_JIT_TICK_US=50" "JAITHON_JIT_DEOPT_STRESS=1" \
+               "JAITHON_JIT_THRESHOLD=1" "JAITHON_JIT_SPLIT_STRESS=1"; do
+        actual="$(env $cfg "$JAITHON" run "$src" 2>&1)"
+        if [[ "$actual" != "$reference" ]]; then
+            bad+="under ${cfg:-default}:
+$(diff <(printf '%s\n' "$reference") <(printf '%s\n' "$actual") | head -20)
+"
+        fi
+    done
+    elapsed=$(( $(now_ms) - start ))
+    if [[ -z "$bad" ]]; then
+        record_pass "$name" "$elapsed"
+    else
+        record_fail "$name" "$bad"
+    fi
+done
+
 # ------------------------------------------------------------------ 3. unit
 printf '%sUnit tests%s\n' "$BOLD" "$RESET"
 unit_args=(test --verbose)

@@ -1,3 +1,4 @@
+#: differential-exempt: yes
 #: The compiled tier does not enforce the interpreter's frame limit, so this
 #: prints 1100 with the JIT on and RuntimeError without it. All six compiled
 #: configurations disagree with the reference. DELIBERATE, and now written
