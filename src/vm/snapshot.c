@@ -447,6 +447,56 @@ void jaiSnapshotAudit(const char *when) {
                             fwrite(o, 1, sole, f);
                             wrote++; bytes += sole;
                         }
+                        /* SLICE THREE: the arrays these objects OWN. Two
+                         * shapes, and one of each is enough to prove the case:
+                         * a plain byte array (a chunk's code and its line
+                         * stream) and a POINTER array (a closure's upvalues),
+                         * which must go out as indices like any other pointer.
+                         *
+                         * Inline caches are deliberately NOT written -- see the
+                         * design note. They are 66% of the array bytes and a
+                         * pure memo; `cacheAt` already degrades to the slow
+                         * path on a NULL, which is the state a fresh process is
+                         * in anyway. */
+                        unsigned long long arrRecs = 0, arrBytes = 0;
+                        for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+                            uint32_t ix = IDX(o);
+                            if (o->type == OBJ_FUNCTION) {
+                                ObjFunction *fn = (ObjFunction *)o;
+                                uint32_t kind = 1;      /* chunk code */
+                                uint32_t n = (uint32_t)fn->chunk.count;
+                                fwrite(&ix, sizeof ix, 1, f);
+                                fwrite(&kind, sizeof kind, 1, f);
+                                fwrite(&n, sizeof n, 1, f);
+                                if (n) fwrite(fn->chunk.code, 1, n, f);
+                                arrRecs++; arrBytes += n;
+
+                                kind = 2;               /* line stream */
+                                n = (uint32_t)fn->chunk.lineStreamLen;
+                                fwrite(&ix, sizeof ix, 1, f);
+                                fwrite(&kind, sizeof kind, 1, f);
+                                fwrite(&n, sizeof n, 1, f);
+                                if (n) fwrite(fn->chunk.lineStream, 1, n, f);
+                                arrRecs++; arrBytes += n;
+                            } else if (o->type == OBJ_CLOSURE) {
+                                ObjClosure *cl = (ObjClosure *)o;
+                                uint32_t kind = 3;      /* upvalues, as indices */
+                                uint32_t n = (uint32_t)cl->upvalueCount;
+                                fwrite(&ix, sizeof ix, 1, f);
+                                fwrite(&kind, sizeof kind, 1, f);
+                                fwrite(&n, sizeof n, 1, f);
+                                for (uint32_t u = 0; u < n; u++) {
+                                    uint32_t ui = IDX(cl->upvalues[u]);
+                                    fwrite(&ui, sizeof ui, 1, f);
+                                }
+                                arrRecs++; arrBytes += n * sizeof(uint32_t);
+                            }
+                        }
+                        fprintf(stderr,
+                                "[snapshot] arrays: %llu records, %llu bytes "
+                                "(inline caches deliberately omitted)\n",
+                                arrRecs, arrBytes);
+
                         long end = ftell(f);
                         fclose(f);
                         fprintf(stderr,
@@ -475,7 +525,8 @@ void jaiSnapshotAudit(const char *when) {
                                 bufCap = 65536;
                                 buf = (unsigned char *)malloc(bufCap);
                                 if (buf == NULL) { mismatch++; goto readDone; }
-                                while (fread(&ix, sizeof ix, 1, g) == 1 &&
+                                while (read < wrote &&
+                                       fread(&ix, sizeof ix, 1, g) == 1 &&
                                        fread(&ty, sizeof ty, 1, g) == 1 &&
                                        fread(&sz, sizeof sz, 1, g) == 1) {
                                     if (sz > bufCap) {
@@ -496,6 +547,56 @@ void jaiSnapshotAudit(const char *when) {
                                 }
                             } else {
                                 mismatch++;
+                            }
+                            /* The array section, checked the same way: every
+                             * record against the live array it came from. */
+                            {
+                                uint32_t aix, akind, an;
+                                unsigned long long ar = 0, amis = 0;
+                                while (fread(&aix, sizeof aix, 1, g) == 1 &&
+                                       fread(&akind, sizeof akind, 1, g) == 1 &&
+                                       fread(&an, sizeof an, 1, g) == 1) {
+                                    size_t want = akind == 3
+                                                    ? an * sizeof(uint32_t) : an;
+                                    if (want > bufCap) {
+                                        unsigned char *nb = (unsigned char *)
+                                            realloc(buf, want);
+                                        if (nb == NULL) { amis++; break; }
+                                        buf = nb; bufCap = want;
+                                    }
+                                    if (want && fread(buf, 1, want, g) != want) {
+                                        amis++; break;
+                                    }
+                                    ar++;
+                                    Obj *orig = aix < next ? byIndex[aix] : NULL;
+                                    if (orig == NULL) { amis++; continue; }
+                                    if (akind == 1) {
+                                        ObjFunction *fo = (ObjFunction *)orig;
+                                        if ((uint32_t)fo->chunk.count != an ||
+                                            (an && memcmp(buf, fo->chunk.code, an)))
+                                            amis++;
+                                    } else if (akind == 2) {
+                                        ObjFunction *fo = (ObjFunction *)orig;
+                                        if ((uint32_t)fo->chunk.lineStreamLen != an ||
+                                            (an && memcmp(buf, fo->chunk.lineStream, an)))
+                                            amis++;
+                                    } else if (akind == 3) {
+                                        ObjClosure *co = (ObjClosure *)orig;
+                                        if ((uint32_t)co->upvalueCount != an) amis++;
+                                        else for (uint32_t u = 0; u < an; u++) {
+                                            uint32_t ui;
+                                            memcpy(&ui, buf + u * sizeof(uint32_t),
+                                                   sizeof ui);
+                                            if (ui >= next ||
+                                                byIndex[ui] != (Obj *)co->upvalues[u]) {
+                                                amis++; break;
+                                            }
+                                        }
+                                    }
+                                }
+                                fprintf(stderr,
+                                        "[snapshot] read back %llu array "
+                                        "records, %llu MISMATCH\n", ar, amis);
                             }
                         readDone:
                             free(buf);
