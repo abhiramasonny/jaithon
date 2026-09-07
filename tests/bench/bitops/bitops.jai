@@ -5,6 +5,19 @@
 #: string, no dict — so a number here is arithmetic and the loops around it and
 #: nothing else. Every value is kept inside 32 bits, so the ports cannot differ
 #: by an overflow.
+#:
+#: THE C++ PEER DOES NOT RUN THIS LOOP. Measured 2026-09-07: clang -O2
+#: recognises the `v & (v - 1)` idiom and emits `cnt.8b` + `uaddlv.8b`, the ARM
+#: hardware population count -- two instructions in place of the whole
+#: sixteen-iteration loop. So the 3.7x this benchmark reports is idiom
+#: recognition, not codegen quality, and "written out by hand" above does NOT
+#: make the ports comparable the way it intends.
+#:
+#: jaithon's side is close to its floor already: the inner loop runs at
+#: 0.592 ns/iteration against an empty loop's 0.577, i.e. the bit twiddling is
+#: nearly free and only the loop remains. Removing the two never-taken overflow
+#: branches from it measures exactly zero, and so does hand-inlining popcount to
+#: delete the call. Do not read this row as a jaithon deficiency to optimise.
 from std.os import env_or
 
 let LEVEL = env_or("BENCH_LEVEL", "hard")
