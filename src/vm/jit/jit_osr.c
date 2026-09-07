@@ -22,6 +22,26 @@
 /* ------------------------------------------------------------------ */
 
 /* Returns the bytecode offset the interpreter should continue from. */
+#ifdef JAI_ALLOC_CENSUS
+#define JAI_DEOPT_HIT_MAX 512
+uint64_t    jaiDeoptHits[JAI_DEOPT_HIT_MAX];
+const char *jaiDeoptHitName[JAI_DEOPT_HIT_MAX];
+uint32_t    jaiDeoptHitTop[JAI_DEOPT_HIT_MAX];
+uint32_t    jaiDeoptHitIp[JAI_DEOPT_HIT_MAX];
+unsigned    jaiDeoptHitOrd[JAI_DEOPT_HIT_MAX];
+unsigned    jaiDeoptHitCount;
+static void jaiDeoptHitReport(void) {
+    for (unsigned i = 0; i < jaiDeoptHitCount; i++)
+        fprintf(stderr, "[hit] %s@%u guard#%u ip=%u fired=%llu\n",
+                jaiDeoptHitName[i], jaiDeoptHitTop[i], jaiDeoptHitOrd[i],
+                jaiDeoptHitIp[i], (unsigned long long)jaiDeoptHits[i]);
+}
+static void jaiDeoptHitArm(void) {
+    static bool armed = false;
+    if (!armed) { armed = true; atexit(jaiDeoptHitReport); }
+}
+#endif
+
 typedef int64_t (*OsrFn)(Value *slots);
 typedef int64_t (*OsrFnIter)(Value *slots, ObjIter *iter);
 
@@ -944,6 +964,26 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
         emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
                             (unsigned)offsetof(JitDeoptRecord, base)));
+#ifdef JAI_ALLOC_CENSUS
+        /* Which guard actually fires. A stub that resumes at the same ip as
+         * three others says nothing on its own; this makes each one countable,
+         * which is the difference between "the nested for-in arm deopts" and
+         * knowing WHICH of its four guards is the one that never holds. */
+        jaiDeoptHitArm();
+        if (jaiDeoptHitCount < JAI_DEOPT_HIT_MAX) {
+            unsigned slot = jaiDeoptHitCount++;
+                    jaiDeoptHitName[slot] = closure->fn->name
+                                        ? closure->fn->name->chars : "?";
+            jaiDeoptHitTop[slot]  = top;
+            jaiDeoptHitIp[slot]   = (uint32_t)e.deopt[k].ip;
+            jaiDeoptHitOrd[slot]  = k;
+            emitConst64(&e, JIT_SCRATCH_A,
+                        (int64_t)(uintptr_t)&jaiDeoptHits[slot]);
+            emit(&e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+            emit(&e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_B, 1));
+            emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+        }
+#endif
         emitConst64(&e, 0, (int64_t)e.deopt[k].ip);
         emitEpilogue(&e, 0);
     }

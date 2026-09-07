@@ -66,6 +66,39 @@ void jaiPopRoots(int n)     { jaiGCPopRoots(n); }
 /* The LOOP safepoint (spec/BYTECODE.md §10): the one place a long-running
  * program can be interrupted and the one place a collection is guaranteed to
  * be able to run. */
+#ifdef JAI_ALLOC_CENSUS
+/* Which OSR head was entered, and where its compiled form handed control back.
+ * A form that resumes at a NESTED loop head is compiling only the prefix of its
+ * body; the rest of every outer iteration then runs interpreted. */
+#include <stdlib.h>
+typedef struct { const char *fn; uint32_t top; uint32_t resume; uint64_t n; int outcome; } OsrTallyRow;
+static OsrTallyRow jaiOsrRows[64];
+static unsigned jaiOsrRowCount;
+static void jaiOsrTallyReport(void) {
+    for (unsigned i = 0; i < jaiOsrRowCount; i++)
+        fprintf(stderr, "[osr] %s@%u outcome=%d resume=%u n=%llu\n",
+                jaiOsrRows[i].fn, jaiOsrRows[i].top, jaiOsrRows[i].outcome,
+                jaiOsrRows[i].resume, (unsigned long long)jaiOsrRows[i].n);
+}
+static void jaiOsrTally(const char *fn, uint32_t top, int outcome, uint32_t resume) {
+    static bool armed = false;
+    if (!armed) { armed = true; atexit(jaiOsrTallyReport); }
+    for (unsigned i = 0; i < jaiOsrRowCount; i++)
+        if (jaiOsrRows[i].top == top && jaiOsrRows[i].fn == fn &&
+            jaiOsrRows[i].resume == resume && jaiOsrRows[i].outcome == outcome) {
+            jaiOsrRows[i].n++; return;
+        }
+    if (jaiOsrRowCount < 64) {
+        jaiOsrRows[jaiOsrRowCount].fn = fn;
+        jaiOsrRows[jaiOsrRowCount].top = top;
+        jaiOsrRows[jaiOsrRowCount].resume = resume;
+        jaiOsrRows[jaiOsrRowCount].outcome = outcome;
+        jaiOsrRows[jaiOsrRowCount].n = 1;
+        jaiOsrRowCount++;
+    }
+}
+#endif
+
 static bool safepoint(void) {
     if (JAI_UNLIKELY(jaiInterrupted == 2)) {
         jaiInterrupted = 0;
@@ -101,6 +134,10 @@ static bool safepoint(void) {
             if (form != NULL && form->declines < JAI_OSR_GIVE_UP) {
                 uint32_t resumeAt = 0;
                 int outcome = jaiJitEnterOsr(top->closure, at, &resumeAt);
+#ifdef JAI_ALLOC_CENSUS
+                jaiOsrTally(f->name != NULL ? f->name->chars : "?", at,
+                            outcome, resumeAt);
+#endif
                 if (outcome == 2) return false;
                 if (outcome == 1) {
                     top->ip = f->chunk.code + resumeAt;
