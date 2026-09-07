@@ -320,6 +320,19 @@ bool jitStringHead(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_COMP_ACC=0 makes a list comprehension's append refuse again ("an
+ * append reaching past the model"), which is what the tier did until
+ * 2026-09-07, so the arm can be A/B'd in one binary. Off, every comprehension
+ * in the language runs its loop interpreted. */
+bool jitCompAcc(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_COMP_ACC");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],

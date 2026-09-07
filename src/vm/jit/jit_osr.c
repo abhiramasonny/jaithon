@@ -63,6 +63,54 @@ int instructionLength(const Chunk *c, int off) {
     return 4 + 3 * (int)AS_FUNCTION(fnv)->upvalueCount;
 }
 
+/* A list comprehension's accumulator, if this loop region has exactly one.
+ *
+ * `OP_BUILD_LIST` pushes the accumulator, then `OP_GET_ITER` the iterator, and
+ * only then does the loop head follow -- so at an `OP_LIST_APPEND` inside the
+ * body the container sits at an operand depth the OSR model never saw. The
+ * model's depth at an offset is `chunkDepth[off] - chunkDepth[top]`, so the
+ * container is out of its reach exactly when that difference is <= `back`, and
+ * the append arm has to read the frame instead.
+ *
+ * The operand stack begins at slot `locals`, so the container's absolute frame
+ * slot is `locals + chunkDepth[off] - 1 - back`. Confirmed against the
+ * interpreter, which knows the answer outright: on `[c for c in src]` the
+ * compile-time formula and `&PEEK(back) - frame->slots` both give 10.
+ *
+ * Refuses (returns false, so the append keeps refusing as before) when the
+ * region holds appends to two DIFFERENT slots, because only one register is
+ * reserved. Must be called BEFORE the measuring probe, which may shrink
+ * `e.locals` to the slots actually used and would then give a different -- and
+ * wrong -- absolute slot. */
+static bool findComprehensionAcc(const ObjFunction *fn, const int *chunkDepth,
+                                 uint32_t top, uint32_t end, unsigned locals,
+                                 int *slotOut) {
+    int found = -1;
+    if (chunkDepth == NULL || top >= end) return false;
+    int dTop = chunkDepth[top];
+    if (dTop < 0) return false;
+    for (uint32_t off = top; off < end; ) {
+        int len = instructionLength(&fn->chunk, (int)off);
+        if (len <= 0) return false;
+        if (fn->chunk.code[off] == OP_LIST_APPEND) {
+            unsigned back = jaiReadU16(fn->chunk.code + off + 1);
+            int d = chunkDepth[off];
+            if (d < 0) return false;
+            if (d - dTop > (int)back) { off += (uint32_t)len; continue; }
+            int pos = d - 1 - (int)back;
+            if (pos < 0) return false;
+            int abs = (int)locals + pos;
+            if (abs < 0 || abs > JIT_MAX_SLOTS) return false;
+            if (found >= 0 && found != abs) return false;
+            found = abs;
+        }
+        off += (uint32_t)len;
+    }
+    if (found < 0) return false;
+    *slotOut = found;
+    return true;
+}
+
 static bool chunkByRefCaptures(const Chunk *c, bool *byRef, unsigned nslots) {
     for (unsigned i = 0; i < nslots; i++) byRef[i] = false;
     for (int off = 0; off < c->count;) {
@@ -279,6 +327,14 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     e.offsetToDepth = depths;
     e.chunkDepth = chunkDepth;
     e.chunkDepthCount = fn->chunk.count + 1;
+    {
+        int accSlot = 0;
+        if (jitCompAcc() &&
+            findComprehensionAcc(fn, chunkDepth, top, end, e.locals, &accSlot)) {
+            e.accSlot = accSlot;
+            e.accWanted = true;
+        }
+    }
     e.savedCount = JIT_MAX_SAVED;
     memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
@@ -325,6 +381,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         probe.osrTop = top; probe.osrEnd = end; probe.base = 0;
         probe.noInline = noInline;
         probe.locals = e.locals; probe.callsOut = true; probe.observed = slots;
+        probe.accSlot = e.accSlot; probe.accWanted = e.accWanted;
         probe.scratchRoom = JIT_SCRATCH_BANK_COUNT;
         probe.offsetToInst = map; probe.offsetToDepth = depths;
         probe.chunkDepth = chunkDepth; probe.chunkDepthCount = fn->chunk.count + 1;

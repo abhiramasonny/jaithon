@@ -72,15 +72,23 @@ void emit(Emit *e, uint32_t word) {
 /* OSR reserves only the slots pointer plus (for a range loop) the iterator's index and limit --
  * not the ObjIter or the start, which are folded in via a prologue bias. Bias is sound only while start+limit fits int64; jaiJitEnterOsr refuses entry otherwise since that's a property of the iterator, not the code. */
 unsigned osrReserved(const Emit *e) {
-    if (!e->hasIter) return 1u;
-    if (e->iterKind == 1) return 3u;
+    unsigned acc = e->accWanted ? 1u : 0u;
+    if (!e->hasIter) return 1u + acc;
+    if (e->iterKind == 1) return 3u + acc;
     /* A pair head -- dict items (3) or a list of 2-tuples (4) -- keeps the
      * ObjIter and nothing else. The enumerate head (5) is a pair head too but
      * not one of these: it walks its snapshot off the same iterator, index,
      * limit and list registers a plain list head uses, so it falls through to
      * the same reservation. */
-    if (e->iterKind == 3 || e->iterKind == 4) return 2u;
-    return 5u;
+    if (e->iterKind == 3 || e->iterKind == 4) return 2u + acc;
+    return 5u + acc;
+}
+
+/* The comprehension accumulator's register: the LAST of the reserved block, so
+ * the named ones (JIT_SLOTS_REG and friends) keep their fixed offsets whatever
+ * the head kind reserves. Only meaningful when e->accWanted. */
+unsigned osrAccReg(const Emit *e) {
+    return JIT_FIRST_SAVED + osrReserved(e) - 1u;
 }
 
 static unsigned regBase(const Emit *e) {

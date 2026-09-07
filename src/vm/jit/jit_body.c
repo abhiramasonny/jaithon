@@ -1085,7 +1085,43 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         case OP_LIST_APPEND: {
             unsigned back = jaiReadU16(code + off + 1);
             if (e->depth < back + 1u) {
-                e->whyNot = "an append reaching past the model"; return false;
+                /* A comprehension: the accumulator was pushed before the loop
+                 * head, so the model never saw it. compileOsr worked out which
+                 * frame slot holds it (findComprehensionAcc) and reserved a
+                 * callee-saved register, because emitListStore needs the
+                 * container somewhere that survives its four loads and the grow
+                 * stub's call -- every scratch is spoken for inside it, and a
+                 * hoist register can never be placed in a loop that appends,
+                 * since an append IS a call as far as regionCalls is concerned.
+                 *
+                 * Reloaded from the frame at every append rather than hoisted
+                 * once: the register is then a pure cache of a slot the
+                 * interpreter still owns, so a deopt needs no write-back, and
+                 * nothing has to assume the slot's contents are stable. The
+                 * guard is what makes a wrong slot a deopt instead of a store
+                 * through a bad pointer. */
+                if (!e->osr || !e->accWanted) {
+                    e->whyNot = "an append reaching past the model";
+                    return false;
+                }
+                unsigned rAcc = osrAccReg(e);
+                unsigned at = (unsigned)e->accSlot * 16u;
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SLOTS_REG, at));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, VAL_OBJ));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrX(rAcc, JIT_SLOTS_REG, at + 8u));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rAcc,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+                branchOnDeopt(e, JAI_A64_NE);
+                if (!emitListStore(e, e->stack[e->depth - 1], rAcc,
+                                   pushReg(e) - 1, -1)) {
+                    return false;
+                }
+                unsigned dropAcc;
+                if (!popValue(e, &dropAcc, NULL)) return false;
+                off += 3;
+                break;
             }
             unsigned lidx = e->depth - 1u - back;
             if (e->stack[lidx] != SLOT_LIST) {

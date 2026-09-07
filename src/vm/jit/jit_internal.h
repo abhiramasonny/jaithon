@@ -276,6 +276,17 @@ typedef struct {
     /* Slot 0 is the callee for a plain call, the RECEIVER for a method (so `self.x` reads it). Touching
      * it turns it into an ordinary local plus an extra incoming argument; untouched (every plain function), it costs nothing. */
     unsigned  base;
+    /* A list comprehension's accumulator. `OP_BUILD_LIST` pushes it BEFORE the
+     * loop head, so it sits below the window the OSR model tracks and
+     * `OP_LIST_APPEND` used to refuse outright -- which left every comprehension
+     * in the language running interpreted. It lives at a fixed FRAME SLOT for
+     * the whole loop, so the append arm reloads it from there through
+     * JIT_SLOTS_REG rather than trusting a hoist, and guards that what it found
+     * is really a list. `accWanted` costs one reserved callee-saved register
+     * (see osrReserved), because emitListStore needs the container in a
+     * register that survives its four loads and the grow stub's call. */
+    int       accSlot;
+    bool      accWanted;
     bool      usesSlot0;
     /* Highest slot the body actually names -- not maxSlots, the (routinely larger) frame window the
      * interpreter reserves. Every slot here costs one of the ten callee-saved registers. */
@@ -783,6 +794,7 @@ const uint8_t *loopDepthFor(const Chunk *c, unsigned *count);
 const char *slotKindName(SlotKind k);
 void emit(Emit *e, uint32_t word);
 unsigned osrReserved(const Emit *e);
+unsigned osrAccReg(const Emit *e);
 void emitTagFor(Emit *e, SlotKind kind, unsigned payloadReg,
                        unsigned tagReg, unsigned spare);
 uint8_t localStgOf(const Emit *e, unsigned slot);
@@ -995,6 +1007,7 @@ bool emitFusedReturnNull(Emit *e, ObjFunction *fn);
 bool jitStrIter(void);
 bool jitIterStorage(void);
 bool jitStringHead(void);
+bool jitCompAcc(void);
 #ifdef JAI_ALLOC_CENSUS
 void jaiDeoptHitEmit(Emit *e, const char *fn, uint32_t top, unsigned ord,
                      uint32_t ip);
