@@ -18,3 +18,16 @@ jainum:
 
 jaiframe:
 	@:
+
+# What a process costs before it does any of your work.
+#
+# `bench` above times 25 programs and none of them measure STARTUP, so the cost
+# every `check`, `fmt`, `ast` and every edit-run cycle pays was invisible until
+# someone looked: ~15ms to build the self-hosted front end, against a 2ms
+# process floor. Reports rather than asserts, and keeps no baseline file, for
+# the same reason jit_coverage.sh keeps none.
+#
+# N=40 make startup-cost   for a steadier mean; the default is 20.
+.PHONY: startup-cost
+startup-cost: $(TARGET)
+	@./scripts/dev/startup_cost.sh
