@@ -1,0 +1,5 @@
+error[E0102]: expected an expression, found `}`
+   --> /Users/abhiramasonny/Developer/projects/jaithon/tests/golden/jit_try_tier_agreement.jai:25:1
+    |
+ 25 | }
+    | ^
