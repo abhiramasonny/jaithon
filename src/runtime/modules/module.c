@@ -594,6 +594,18 @@ ObjModule *jaiImportFrontEndModule(const char *dottedName) {
     sLoadingFrontEnd = true;
     ObjModule *module = jaiImportModule(dottedName, NULL);
     sLoadingFrontEnd = wasLoading;
+    /* The other candidate snapshot point, and the one that matters most.
+     * `check`, `fmt`, `ast`, `doc` and `test` never reach warmFrontEnd: this
+     * function sets sLoadingFrontEnd itself, which is precisely the guard
+     * maybeWarmFor bails on, so they build the front end HERE instead. Audited
+     * once per process and only under JAITHON_SNAPSHOT_AUDIT. */
+    if (!wasLoading && module != NULL) {
+        static bool audited = false;
+        if (!audited) {
+            audited = true;
+            jaiSnapshotAudit("jaiImportFrontEndModule");
+        }
+    }
     return module;
 }
 
