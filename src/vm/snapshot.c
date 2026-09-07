@@ -630,7 +630,17 @@ void jaiSnapshotAudit(const char *when) {
                                 wrote, bytes, end, path);
 
                         /* Read it back and check every record against the live
-                         * object it came from, byte for byte. */
+                         * object it came from, byte for byte.
+                         *
+                         * TIMED, because this is the cheapest honest proxy for
+                         * what a real load would cost: it opens the file, reads
+                         * every byte, and touches every record. A real reader
+                         * does that plus allocation and relocation, and does
+                         * NOT do the comparisons -- so this bounds the load
+                         * from a direction that cannot flatter it. If this is
+                         * slow, the whole technique is worth less than §5
+                         * claims and it is better to know now. */
+                        double rt0 = jaiClockMonotonic();
                         FILE *g = fopen(path, "rb");
                         if (g != NULL) {
                             uint32_t m2 = 0, n2 = 0;
@@ -823,7 +833,9 @@ void jaiSnapshotAudit(const char *when) {
                             fclose(g);
                             fprintf(stderr,
                                     "[snapshot] read back %llu objects, "
-                                    "%llu MISMATCH\n", read, mismatch);
+                                    "%llu MISMATCH, whole read pass %.3f ms\n",
+                                    read, mismatch,
+                                    (jaiClockMonotonic() - rt0) * 1000.0);
                         }
                     }
                 }
