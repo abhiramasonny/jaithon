@@ -413,6 +413,99 @@ void jaiSnapshotAudit(const char *when) {
                         "[snapshot] numbering: %u indices assigned, "
                         "%llu pointers rewritten and resolved back, %llu WRONG\n",
                         next - 1, rewritten, bad);
+
+                /* SLICE TWO: write the self-contained objects to a file and
+                 * read them back. These are the 63% whose entire footprint is
+                 * their own block (jaiObjSoleBlock non-zero), so they need no
+                 * array logic and isolate the question this slice is about:
+                 * does the byte layout survive a write and a read?
+                 *
+                 * The record is {index, type, size, payload}. Payload is the
+                 * object's own bytes verbatim -- pointers inside are NOT yet
+                 * rewritten here, because slice one already proved the rewrite
+                 * resolves and doing it twice would test nothing new. What is
+                 * tested is that every byte comes back. */
+                const char *path = getenv("JAITHON_SNAPSHOT_WRITE");
+                if (path[0] != '\0' && path[0] != '1') {
+                    FILE *f = fopen(path, "wb");
+                    if (f == NULL) {
+                        fprintf(stderr, "[snapshot] cannot write %s\n", path);
+                    } else {
+                        uint32_t magic = 0x4a414931u; /* "JAI1" */
+                        unsigned long long wrote = 0, bytes = 0;
+                        fwrite(&magic, sizeof magic, 1, f);
+                        fwrite(&next, sizeof next, 1, f);
+                        for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+                            size_t sole = jaiObjSoleBlock(o);
+                            if (sole == 0) continue;
+                            uint32_t ix = IDX(o);
+                            uint32_t ty = (uint32_t)o->type;
+                            uint32_t sz = (uint32_t)sole;
+                            fwrite(&ix, sizeof ix, 1, f);
+                            fwrite(&ty, sizeof ty, 1, f);
+                            fwrite(&sz, sizeof sz, 1, f);
+                            fwrite(o, 1, sole, f);
+                            wrote++; bytes += sole;
+                        }
+                        long end = ftell(f);
+                        fclose(f);
+                        fprintf(stderr,
+                                "[snapshot] wrote %llu objects, %llu payload "
+                                "bytes, %ld file bytes -> %s\n",
+                                wrote, bytes, end, path);
+
+                        /* Read it back and check every record against the live
+                         * object it came from, byte for byte. */
+                        FILE *g = fopen(path, "rb");
+                        if (g != NULL) {
+                            uint32_t m2 = 0, n2 = 0;
+                            unsigned long long read = 0, mismatch = 0;
+                            unsigned char *buf = NULL;
+                            size_t bufCap = 0;
+                            if (fread(&m2, sizeof m2, 1, g) == 1 &&
+                                fread(&n2, sizeof n2, 1, g) == 1 &&
+                                m2 == magic && n2 == next) {
+                                uint32_t ix, ty, sz;
+                                /* Heap, and grown on demand: a self-contained
+                                 * object is not necessarily small -- an
+                                 * ObjString carries its bytes, and the front
+                                 * end holds several past 4KB. A fixed stack
+                                 * buffer silently truncated the read at 3,585
+                                 * of 7,009 records. */
+                                bufCap = 65536;
+                                buf = (unsigned char *)malloc(bufCap);
+                                if (buf == NULL) { mismatch++; goto readDone; }
+                                while (fread(&ix, sizeof ix, 1, g) == 1 &&
+                                       fread(&ty, sizeof ty, 1, g) == 1 &&
+                                       fread(&sz, sizeof sz, 1, g) == 1) {
+                                    if (sz > bufCap) {
+                                        unsigned char *nb = (unsigned char *)
+                                            realloc(buf, sz);
+                                        if (nb == NULL) { mismatch++; break; }
+                                        buf = nb; bufCap = sz;
+                                    }
+                                    if (fread(buf, 1, sz, g) != sz) { mismatch++; break; }
+                                    read++;
+                                    Obj *orig = ix < next ? byIndex[ix] : NULL;
+                                    if (orig == NULL ||
+                                        (uint32_t)orig->type != ty ||
+                                        jaiObjSoleBlock(orig) != sz ||
+                                        memcmp(buf, orig, sz) != 0) {
+                                        mismatch++;
+                                    }
+                                }
+                            } else {
+                                mismatch++;
+                            }
+                        readDone:
+                            free(buf);
+                            fclose(g);
+                            fprintf(stderr,
+                                    "[snapshot] read back %llu objects, "
+                                    "%llu MISMATCH\n", read, mismatch);
+                        }
+                    }
+                }
                 free(byIndex);
             }
 #undef IDX
