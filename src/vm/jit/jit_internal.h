@@ -1008,6 +1008,7 @@ bool jitStrIter(void);
 bool jitIterStorage(void);
 bool jitStringHead(void);
 bool jitCompAcc(void);
+bool jitBuiltinClass(void);
 #ifdef JAI_ALLOC_CENSUS
 void jaiDeoptHitEmit(Emit *e, const char *fn, uint32_t top, unsigned ord,
                      uint32_t ip);

@@ -333,6 +333,18 @@ bool jitCompAcc(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_BUILTIN_CLASS=0 makes globalClass ignore `vm.builtins` again, so
+ * the arm can be A/B'd in one binary. Off, every `throw <BuiltinError>(…)` stops
+ * the walk with "is not a compiled global function". */
+bool jitBuiltinClass(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_BUILTIN_CLASS");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],

@@ -1,0 +1,6 @@
+warm ok599 350
+caught ["ok0", "ok1", "ok2", "key", "ok4", "index", "ok6", "ok7", "ok8", "ok9", "ok10", "key"]
+base ["ok0", "ok1", "ok2", "base", "ok4", "base", "ok6", "ok7", "ok8", "ok9", "ok10", "base"]
+shadow mine0mine1mine2
+shadow-tag direct
+names <class KeyError> <class IndexError>

@@ -23,7 +23,27 @@ ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx) {
     Value name = fn->chunk.constants.data[nameIdx];
     if (!IS_STRING(name)) return NULL;
     Value bound;
-    if (!jaiModuleGet(fn->module, AS_STRING(name), &bound)) return NULL;
+    if (jaiModuleGet(fn->module, AS_STRING(name), &bound))
+        return IS_CLASS(bound) ? AS_CLASS(bound) : NULL;
+    /* A BUILTIN class -- every exception type, which is what `throw KeyError(…)`
+     * names. Those live only in `vm.builtins` (jaiDefineGlobal, from
+     * defineErrorClass in errors.c), never in the throwing module's own table,
+     * and no resolver here used to look there for a CLASS: globalNative and
+     * globalNamespace check `vm.builtins` but accept only IS_NATIVE and
+     * IS_MODULE. So the whole chain fell through to "is not a compiled global
+     * function" and the walk stopped -- permanently, since no later compile can
+     * make a builtin class into one. `ast.node.init` is the shape that pays for
+     * it: a `throw KeyError` on its unknown-field branch stopped the loop that
+     * builds every AST node.
+     *
+     * Module first, exactly as globalNative resolves a bare builtin, so a
+     * module-level binding is never mistaken for the builtin; the module
+     * version check at entry retires this form if one appears later. A name the
+     * module binds to a NON-class returns NULL here rather than falling
+     * through, because that binding is what the program means. */
+    if (vm.builtins == NULL) return NULL;
+    if (!jitBuiltinClass()) return NULL;
+    if (!jaiModuleGet(vm.builtins, AS_STRING(name), &bound)) return NULL;
     return IS_CLASS(bound) ? AS_CLASS(bound) : NULL;
 }
 

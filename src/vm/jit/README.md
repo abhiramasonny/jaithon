@@ -462,6 +462,7 @@ this table complete in both directions.
 | `JAITHON_JIT_ITER_STG` | on | Dispatch on list storage at a nested `for-in`. |
 | `JAITHON_JIT_STR_HEAD` | on | `for c in <string>` as an OSR loop head. |
 | `JAITHON_JIT_COMP_ACC` | on | A list comprehension's append, through the frame. |
+| `JAITHON_JIT_BUILTIN_CLASS` | on | Resolve a builtin class (every exception type). |
 | `JAITHON_JIT_OBJ_EQ` | on | Object identity comparison. |
 | `JAITHON_JIT_NULL_PAIR` | on | The null-compare pair fusion. |
 | `JAITHON_JIT_FUSED_DISCARD` | on | Fuse a call whose result is discarded. |
@@ -1032,6 +1033,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_FUSED_DISCARD` | `jitFusedDiscard` | fusing `OP_POP_RETURN_NULL` after a discarded call. |
 | `JAITHON_JIT_STR_ITER` | `jitStrIter` | iterating a string. |
 | `JAITHON_JIT_STR_HEAD` | `jitStringHead` | `ITER_STRING` at an OSR loop head (`iterKind` 6). Off, `compileOsr` refuses it with "an iterator kind with no loop-head arm", which is what the tier did until 2026-09-07 -- a per-character loop long enough to reach the OSR tier then ran entirely interpreted, 290ms against 30ms for the same work as an indexed `while`. Worth 11% of `fmt --check lib/jaithon`. The head steps ASCII inline and deopts on a byte >= 0x80, so `compileOsr` samples the string first and refuses one that is more than 1-in-64 non-ASCII BYTES. |
+| `JAITHON_JIT_BUILTIN_CLASS` | `jitBuiltinClass` | `globalClass` falling back to `vm.builtins` for a CLASS. Builtin exception types live only there, and no resolver looked for a class in it -- `globalNative`/`globalNamespace` check `vm.builtins` but accept only IS_NATIVE/IS_MODULE -- so `throw KeyError(…)` stopped the walk with "is not a compiled global function", permanently, since no later compile can make a builtin class into one. |
 | `JAITHON_JIT_COMP_ACC` | `jitCompAcc` | reaching a list comprehension's accumulator through its FRAME SLOT at `OP_LIST_APPEND`. The accumulator is pushed before the loop head, so it sits below the window the OSR model tracks; off, the append refuses with "an append reaching past the model" and every comprehension in the language runs its loop interpreted. Costs one reserved callee-saved register (`osrReserved`) on any loop region that contains such an append. |
 | `JAITHON_JIT_ITER_STG` | `jitIterStorage` | the storage dispatch at a NESTED `for x in <list>` (`emitForIterBind`'s shape-1 arm). Off, that arm emits `emitListBoxedGuard` alone, which is what it did until 2026-09-07: a `push`-built `list[int]` is `LIST_STORE_I64`, so the guard failed on every loop entry and the inner loop ran interpreted. Worth 3.6x on a nested-loop probe and 2x on `graph_bfs`. The switch exists to price it in one binary. |
 | `JAITHON_JIT_CONCAT_LOCALS` | `jitConcatLocals` | `a + b` on two `SLOT_OBJ` locals. |
