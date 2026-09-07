@@ -345,6 +345,50 @@ bool jitBuiltinClass(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_INVOKE_SOFT=0 makes emitInvoke's two DEAD-PATH refusals decline
+ * the whole body again, as they did until 2026-09-07, so the arm can be A/B'd
+ * in one binary. The two are the cold-callee arm ("a method that has not
+ * returned yet") and the last-resort receiver-kind arm ("a receiver of kind
+ * ..."); both sit on paths that execute zero times on the compiler workloads
+ * and both cost the entire enclosing function. */
+static bool jitInvokeSoft(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_INVOKE_SOFT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The two sites are switched apart because they do not behave alike: one is a
+ * receiver kind the arms above cannot take, the other a callee the interpreter
+ * has never watched return. Measuring them together hides which is which. */
+bool jitInvokeSoftRecv(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_INVOKE_SOFT_RECV");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0 && jitInvokeSoft();
+}
+
+/* OFF by default, and the numbers are why. Softening the cold-callee arm is a
+ * clear win on `check lib/jaithon/compile/check/checker.jai` -- 32.95M
+ * interpreted instructions to 32.15M, and 31.80M with the receiver arm too --
+ * and a clear LOSS on `fmt --check lib/jaithon`, which goes 115.4M to 120.6M
+ * alone and drags the pair to 118.3M when the receiver arm on its own reaches
+ * 109.9M. So it is kept, switched, and off: the eight parse-error methods it
+ * unblocks are real, but whatever it displaces on the formatter costs more than
+ * they save. Set JAITHON_JIT_INVOKE_SOFT_COLD=1 to measure it again. */
+bool jitInvokeSoftCold(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_INVOKE_SOFT_COLD");
+        cached = (v != NULL && v[0] == '1') ? 1 : 0;
+    }
+    return cached != 0 && jitInvokeSoft();
+}
+
 bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],

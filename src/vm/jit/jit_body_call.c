@@ -562,6 +562,12 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                         bool *afterUncondp) {
     int off = *offp;
     bool afterUncond = *afterUncondp;
+    /* For the two dead-path refusals below. Softening is only sound when this
+     * arm has emitted nothing and moved nothing, which is what the module-native
+     * fallback already guards on further down; taken at the very top so any
+     * earlier mutation inside emitInvoke declines hard exactly as before. */
+    const unsigned invCount = e->count;
+    const unsigned invDepth = e->depth;
     do {
         uint32_t nameIdx = jaiReadU24(code + off + 1);
         unsigned argc    = code[off + 4];
@@ -907,7 +913,21 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             DiscardKind mdisc = discardedAfter(code, off + 7, count);
             bool mdiscarded = mdisc != DISCARD_NO;
             if (!haveKind && !mdiscarded) {
-                return subWhy(e, mwhy, slotKindName(rkind));
+                (void)subWhy(e, mwhy, slotKindName(rkind));
+                /* Same softening as the receiver-kind arm above, and it pays
+                 * for the same reason: on `check lib/jaithon/...` this is the
+                 * SOLE named blocker on eight parse-ERROR methods
+                 * (_parse_statement, _expect, _end_statement, _expect_block,
+                 * _parse_params, _parse_range, _parse_pattern_primary,
+                 * _expect_ident_name) that never run in a clean check, and it
+                 * costs each of them its whole body. */
+                if (jitInvokeSoftCold() && !e->failed &&
+                    e->count == invCount && e->depth == invDepth) {
+                    fpSyncAll(e);
+                    settleAll(e);
+                    goto unarmedOpcode;
+                }
+                return JIT_ARM_REFUSED;
             }
 
             /* Straight to the method's compiled entry since the receiver's class is fixed here (SLOT_INST
@@ -1334,7 +1354,20 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
              * an invoke on a SLOT_CLASS receiver, not the field read plus
              * call it looks like, and docs/probes/p33_static_call.jai runs
              * 72,434,801 interpreted instructions on account of it. */
-            return subWhy(e, "a receiver of kind %s", slotKindName(rk));
+            /* Dead path, softened: interpret THIS invoke rather than the
+             * whole body. `the kind` names the reason either way, so the census
+             * still sees it. Guarded on having emitted nothing and moved
+             * nothing, and settled first -- the walk's own skip protocol --
+             * because a value left deferred or in the FP bank cannot be
+             * described by the deopt record the unarmed path writes. */
+            (void)subWhy(e, "a receiver of kind %s", slotKindName(rk));
+            if (jitInvokeSoftRecv() && !e->failed &&
+                e->count == invCount && e->depth == invDepth) {
+                fpSyncAll(e);
+                settleAll(e);
+                goto unarmedOpcode;
+            }
+            return JIT_ARM_REFUSED;
         }
         if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
         Value nameVal = fn->chunk.constants.data[nameIdx];
