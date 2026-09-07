@@ -147,6 +147,103 @@ void jaiSnapshotAudit(const char *when) {
             "[snapshot] strings: %llu own their bytes, %llu point into a "
             "shared buffer\n", ownStrings, sharedStrings);
 
+    /* Is the field table COMPLETE? An image relocates pointers field by field,
+     * so a field nobody listed is a pointer copied verbatim into the new
+     * address space. The way to find out is not to re-read the headers but to
+     * follow every pointer this code believes exists and check it lands on an
+     * object the collector agrees is live. A miss is either a field enumerated
+     * wrongly or a pointer into memory the image would not carry.
+     *
+     * Direct Obj* fields only. Table and list CONTENTS are Values the GC
+     * already traces and blackenObject is the authority on those; what has
+     * historically been missed here is the plain pointer hanging off a header
+     * (ObjString::owner, ObjFunction::module, ::jitBlockedOn). */
+    {
+        /* Open-addressed membership set over the live list. Power of two, and
+         * generously sized so the probe stays short at this object count. */
+        size_t cap = 1;
+        while (cap < total * 4u) cap <<= 1;
+        if (cap < 1024) cap = 1024;
+        Obj **seen = (Obj **)calloc(cap, sizeof(Obj *));
+        if (seen != NULL) {
+            for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+                size_t h = ((uintptr_t)o >> 4) & (cap - 1);
+                while (seen[h] != NULL) h = (h + 1) & (cap - 1);
+                seen[h] = o;
+            }
+#define LIVE(p) ({                                                            \
+        Obj *_q = (Obj *)(p);                                                 \
+        bool _ok = true;                                                      \
+        if (_q != NULL) {                                                     \
+            size_t _h = ((uintptr_t)_q >> 4) & (cap - 1);                     \
+            _ok = false;                                                      \
+            while (seen[_h] != NULL) {                                        \
+                if (seen[_h] == _q) { _ok = true; break; }                    \
+                _h = (_h + 1) & (cap - 1);                                    \
+            }                                                                 \
+        }                                                                     \
+        _ok; })
+            unsigned long long checked = 0, missed = 0;
+            unsigned long long missByType[OBJ_TYPE_COUNT];
+            for (int i = 0; i < OBJ_TYPE_COUNT; i++) missByType[i] = 0;
+#define CHECK(owner, p) do {                                                  \
+        checked++;                                                            \
+        if (!LIVE(p)) { missed++; missByType[(owner)->type]++; }              \
+    } while (0)
+            for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+                switch (o->type) {
+                case OBJ_STRING:
+                    CHECK(o, ((ObjString *)o)->owner);
+                    break;
+                case OBJ_FUNCTION: {
+                    ObjFunction *f = (ObjFunction *)o;
+                    CHECK(o, f->name);
+                    CHECK(o, f->qualifiedName);
+                    CHECK(o, f->module);
+                    CHECK(o, f->jitBlockedOn);
+                    break;
+                }
+                case OBJ_CLOSURE:
+                    CHECK(o, ((ObjClosure *)o)->fn);
+                    break;
+                case OBJ_INSTANCE:
+                    CHECK(o, ((ObjInstance *)o)->klass);
+                    break;
+                case OBJ_MODULE: {
+                    ObjModule *m = (ObjModule *)o;
+                    CHECK(o, m->name);
+                    CHECK(o, m->path);
+                    CHECK(o, m->body);
+                    break;
+                }
+                case OBJ_CLASS: {
+                    ObjClass *c = (ObjClass *)o;
+                    CHECK(o, c->name);
+                    CHECK(o, c->superclass);
+                    break;
+                }
+                case OBJ_NATIVE:
+                    CHECK(o, ((ObjNative *)o)->name);
+                    break;
+                default:
+                    break;
+                }
+            }
+#undef CHECK
+#undef LIVE
+            fprintf(stderr,
+                    "[snapshot] field closure: %llu direct pointers checked, "
+                    "%llu land outside the live set\n", checked, missed);
+            for (int i = 0; i < OBJ_TYPE_COUNT; i++) {
+                if (missByType[i] != 0)
+                    fprintf(stderr, "[snapshot]   MISS in %s: %llu\n",
+                            kindName[i] != NULL ? kindName[i] : "?",
+                            missByType[i]);
+            }
+            free(seen);
+        }
+    }
+
     fprintf(stderr, "[snapshot] verdict: %s\n",
             (openFiles == 0 && jitCode == 0 && jitLoops == 0 &&
              osrForms == 0 && constIndex == 0 && openUpvalues == 0 &&
