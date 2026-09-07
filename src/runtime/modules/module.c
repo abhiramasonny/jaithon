@@ -94,6 +94,11 @@ static bool          sOptionsSet;
  * is precisely the job the seed takes over once C is gone. */
 void jaiSnapshotAudit(const char *when);
 
+/* Front-end load timing, JAI_FRONTEND_TIME only. */
+static double gFeDeser;
+static int    gFeModules;
+static bool   gFeTiming;
+
 static bool          sLoadingFrontEnd;
 /* Set once the front end has been pulled in; see loadModuleBody. */
 static bool          sFrontEndWarmed;
@@ -351,9 +356,11 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
     if (sLoadingFrontEnd && !seedDisabled()) {
         const JaiSeedEntry *seeded = jaiSeedFind(path);
         if (seeded != NULL) {
+            double dt0 = gFeTiming ? jaiClockMonotonic() : 0.0;
             ObjFunction *fromSeed = jaiDeserializeSeed(seeded->image,
                                                        seeded->length,
                                                        module, hash);
+            if (gFeTiming) { gFeDeser += jaiClockMonotonic() - dt0; gFeModules++; }
             if (fromSeed != NULL) {
                 if (traceLoads()) fprintf(stderr, "load seed    %s\n", path);
                 return fromSeed;
@@ -486,7 +493,12 @@ static bool runModuleBody(ObjModule *module, ObjFunction *body) {
     module->body = closure;
 
     Value ignored = NULL_VAL;
-    if (!jaiCallValue(OBJ_VAL(closure), 0, NULL, &ignored)) {
+    /* NOT timed here: a module top-level imports other modules, so runModuleBody
+     * nests and any accumulated total double-counts (it read 45-77ms against a
+     * 17.7ms wall). Deserialisation below does not recurse, so that number is
+     * clean and the remainder is reported by subtraction. */
+    bool ranOk = jaiCallValue(OBJ_VAL(closure), 0, NULL, &ignored);
+    if (!ranOk) {
         module->state = MOD_FAILED;
         return false;
     }
@@ -591,9 +603,23 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
 
 ObjModule *jaiImportFrontEndModule(const char *dottedName) {
     bool wasLoading = sLoadingFrontEnd;
+    double t0 = 0.0;
+    if (!wasLoading && getenv("JAI_FRONTEND_TIME")) {
+        gFeTiming = true; gFeDeser = 0.0; gFeModules = 0;
+        t0 = jaiClockMonotonic();
+    }
     sLoadingFrontEnd = true;
     ObjModule *module = jaiImportModule(dottedName, NULL);
     sLoadingFrontEnd = wasLoading;
+    if (t0 != 0.0)
+    {
+        gFeTiming = false;
+        fprintf(stderr, "[fe] import %s: %.3f ms total = %.3f deserialise "
+                        "(%d modules) + %.3f running their top levels\n",
+                dottedName, (jaiClockMonotonic() - t0) * 1000.0,
+                gFeDeser * 1000.0, gFeModules,
+                ((jaiClockMonotonic() - t0) - gFeDeser) * 1000.0);
+    }
     /* The other candidate snapshot point, and the one that matters most.
      * `check`, `fmt`, `ast`, `doc` and `test` never reach warmFrontEnd: this
      * function sets sLoadingFrontEnd itself, which is precisely the guard

@@ -265,6 +265,76 @@ void jaiSnapshotAudit(const char *when) {
                 "%llu DISAGREE with a recompute\n", hashed, unhashed, wrong);
     }
 
+    /* Exact image size. The headers are the small half -- what an image must
+     * actually carry is the arrays hanging off them, and until they are added
+     * up "11.4MB of live heap" is a GC number, not a plan. Sizes below are the
+     * ALLOCATED capacity, not the used count, because that is what a copy has
+     * to reproduce for the structure to keep working. */
+    {
+        unsigned long long arrayBytes = 0;
+        unsigned long long chunkCode = 0, chunkConsts = 0, chunkLines = 0;
+        unsigned long long chunkCaches = 0, tableBytes = 0, listBytes = 0;
+        unsigned long long upvalBytes = 0, unaccounted = 0;
+#define TBL(t) (unsigned long long)((size_t)(t)->capacity * sizeof(JaiEntry) + \
+                                    (size_t)(t)->capacity * sizeof(int32_t))
+        for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
+            if (jaiObjSoleBlock(o) != 0) continue;
+            switch (o->type) {
+            case OBJ_LIST: {
+                ObjList *l = (ObjList *)o;
+                size_t w = l->stg == LIST_STORE_BOXED ? sizeof(Value)
+                         : l->stg == LIST_STORE_U8    ? 1u : 8u;
+                listBytes += (unsigned long long)l->capacity * w;
+                break;
+            }
+            case OBJ_DICT: tableBytes += TBL(&((ObjDict *)o)->table); break;
+            case OBJ_SET:  tableBytes += TBL(&((ObjSet *)o)->table);  break;
+            case OBJ_MODULE: {
+                ObjModule *m = (ObjModule *)o;
+                tableBytes += TBL(&m->globals) + TBL(&m->exports);
+                break;
+            }
+            case OBJ_CLOSURE:
+                upvalBytes += (unsigned long long)
+                    ((ObjClosure *)o)->upvalueCount * sizeof(ObjUpvalue *);
+                break;
+            case OBJ_FUNCTION: {
+                ObjFunction *f = (ObjFunction *)o;
+                chunkCode   += (unsigned long long)f->chunk.capacity;
+                chunkConsts += (unsigned long long)f->chunk.constants.capacity
+                             * sizeof(Value);
+                chunkLines  += (unsigned long long)f->chunk.lineStreamCap;
+                chunkCaches += (unsigned long long)f->chunk.cacheCapacity
+                             * sizeof(InlineCache);
+                break;
+            }
+            default:
+                /* class, trait, enum: several tables and arrays each, and only
+                 * 121 objects between them -- counted as unaccounted rather
+                 * than guessed at, so the total below is honest about what it
+                 * does not yet include. */
+                unaccounted++;
+                break;
+            }
+        }
+#undef TBL
+        arrayBytes = chunkCode + chunkConsts + chunkLines + chunkCaches
+                   + tableBytes + listBytes + upvalBytes;
+        fprintf(stderr,
+                "[snapshot] image size: %llu bytes of headers + %llu of arrays "
+                "= %llu total (%llu objects not yet sized)\n",
+                soleBytes + (total - soleCount) * 64ull, arrayBytes,
+                soleBytes + (total - soleCount) * 64ull + arrayBytes,
+                unaccounted);
+        fprintf(stderr,
+                "[snapshot]   chunk code %llu, constants %llu, lines %llu, "
+                "caches %llu\n", chunkCode, chunkConsts, chunkLines,
+                chunkCaches);
+        fprintf(stderr,
+                "[snapshot]   tables %llu, list items %llu, upvalue arrays %llu\n",
+                tableBytes, listBytes, upvalBytes);
+    }
+
     fprintf(stderr, "[snapshot] verdict: %s\n",
             (openFiles == 0 && jitCode == 0 && jitLoops == 0 &&
              osrForms == 0 && constIndex == 0 && openUpvalues == 0 &&
