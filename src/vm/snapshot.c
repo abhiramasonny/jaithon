@@ -40,6 +40,34 @@
 
 void jaiSnapshotAudit(const char *when);
 
+/* The bytes of an object's own HEADER, for every kind.
+ *
+ * jaiObjSoleBlock answers only for objects whose whole footprint is that block
+ * and returns 0 for the nine kinds that own arrays -- the right answer to "can
+ * this be freed with one call", the wrong one to "how many bytes is the
+ * header". An image needs the second. Using the first meant the array-owning
+ * kinds were never written AT ALL: every ObjClass was missing from the image,
+ * so all 145 instances relocated their `klass` to nothing. Only the
+ * reconstruction pass showed it -- the writer and the byte-comparison both
+ * reported a clean round trip. */
+static size_t snapshotHeaderSize(const Obj *o) {
+    size_t sole = jaiObjSoleBlock(o);
+    if (sole != 0) return sole;
+    switch (o->type) {
+    case OBJ_LIST:     return sizeof(ObjList);
+    case OBJ_DICT:     return sizeof(ObjDict);
+    case OBJ_SET:      return sizeof(ObjSet);
+    case OBJ_FUNCTION: return sizeof(ObjFunction);
+    case OBJ_CLOSURE:  return sizeof(ObjClosure);
+    case OBJ_CLASS:    return sizeof(ObjClass);
+    case OBJ_TRAIT:    return sizeof(ObjTrait);
+    case OBJ_MODULE:   return sizeof(ObjModule);
+    case OBJ_ENUM:     return sizeof(ObjEnum);
+    case OBJ_FILE:     return sizeof(ObjFile);
+    default:           return 0;
+    }
+}
+
 void jaiSnapshotAudit(const char *when) {
     if (getenv("JAITHON_SNAPSHOT_AUDIT") == NULL) return;
     if (vm.gc == NULL) return;
@@ -447,7 +475,7 @@ void jaiSnapshotAudit(const char *when) {
                         unsigned char *tmp = NULL;
                         size_t tmpCap = 0;
                         for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
-                            size_t sole = jaiObjSoleBlock(o);
+                            size_t sole = snapshotHeaderSize(o);
                             if (sole == 0) continue;
                             uint32_t ix = IDX(o);
                             uint32_t ty = (uint32_t)o->type;
@@ -474,6 +502,47 @@ void jaiSnapshotAudit(const char *when) {
                                 break;
                             }
                             case OBJ_INSTANCE: PIN(((ObjInstance *)co)->klass); break;
+                            case OBJ_FUNCTION: {
+                                ObjFunction *cf = (ObjFunction *)co;
+                                PIN(cf->name); PIN(cf->qualifiedName);
+                                PIN(cf->module); PIN(cf->jitBlockedOn);
+                                /* Arena addresses with no by-name route back:
+                                 * reset to cold, which is what a fresh process
+                                 * has anyway (§9 measured 2 and 5-8 of these
+                                 * live at the snapshot point, so this is
+                                 * required, not defensive). Owned arrays are
+                                 * separate records; their pointers are rebuilt
+                                 * on load, not carried. */
+                                cf->jitCode = NULL; cf->jitFunc = NULL;
+                                cf->jitLoop = NULL; cf->osrForms = NULL;
+                                cf->osrCount = 0;
+                                cf->chunk.code = NULL; cf->chunk.lineStream = NULL;
+                                cf->chunk.caches = NULL;
+                                cf->chunk.cacheCapacity = 0;
+                                cf->chunk.constIndex = NULL;
+                                cf->paramNames = NULL;
+                                break;
+                            }
+                            case OBJ_CLOSURE: {
+                                ObjClosure *cc = (ObjClosure *)co;
+                                PIN(cc->fn); cc->upvalues = NULL; break;
+                            }
+                            case OBJ_CLASS: {
+                                ObjClass *cc = (ObjClass *)co;
+                                PIN(cc->name); PIN(cc->qualifiedName);
+                                PIN(cc->superclass);
+                                cc->fields = NULL; cc->traits = NULL; break;
+                            }
+                            case OBJ_MODULE: {
+                                ObjModule *cm = (ObjModule *)co;
+                                PIN(cm->name); PIN(cm->path); PIN(cm->body);
+                                break;
+                            }
+                            case OBJ_ENUM: {
+                                ObjEnum *ce = (ObjEnum *)co;
+                                PIN(ce->name); ce->variants = NULL; break;
+                            }
+                            case OBJ_LIST: ((ObjList *)co)->items = NULL; break;
                             case OBJ_NATIVE: {
                                 ObjNative *cn = (ObjNative *)co;
                                 PIN(cn->name);
@@ -722,7 +791,7 @@ void jaiSnapshotAudit(const char *when) {
                                     Obj *orig = ix < next ? byIndex[ix] : NULL;
                                     if (orig == NULL ||
                                         (uint32_t)orig->type != ty ||
-                                        jaiObjSoleBlock(orig) != sz) {
+                                        snapshotHeaderSize(orig) != sz) {
                                         mismatch++;
                                         continue;
                                     }
@@ -904,6 +973,168 @@ void jaiSnapshotAudit(const char *when) {
                                         "[snapshot] read back %llu array "
                                         "records, %llu MISMATCH\n", ar, amis);
                             }
+                            /* SLICE SEVEN: RECONSTRUCT. Allocate a fresh object
+                             * per record from the image alone, relocate its
+                             * indices back into pointers, and check the rebuilt
+                             * graph has the same topology as the live one.
+                             *
+                             * Plain malloc, not the collector: this proves
+                             * relocation, and reconstructing into the real heap
+                             * belongs with the wiring-in step. Objects only --
+                             * arrays and tables are already proven to survive
+                             * the round trip, and attaching them needs the
+                             * allocator this slice deliberately avoids. */
+                            {
+                                double lt0 = jaiClockMonotonic();
+                                Obj **rebuilt = (Obj **)calloc(next, sizeof(Obj *));
+                                FILE *h = fopen(path, "rb");
+                                unsigned long long made = 0, relocBad = 0;
+                                if (rebuilt != NULL && h != NULL) {
+                                    uint32_t m3, n3;
+                                    if (fread(&m3, 4, 1, h) == 1 &&
+                                        fread(&n3, 4, 1, h) == 1 && n3 == next) {
+                                        uint32_t ix, ty, sz;
+                                        unsigned long long left = wrote;
+                                        while (left-- &&
+                                               fread(&ix, 4, 1, h) == 1 &&
+                                               fread(&ty, 4, 1, h) == 1 &&
+                                               fread(&sz, 4, 1, h) == 1) {
+                                            unsigned char *mem =
+                                                (unsigned char *)malloc(sz);
+                                            if (mem == NULL) break;
+                                            if (fread(mem, 1, sz, h) != sz) {
+                                                free(mem); break;
+                                            }
+                                            if (ix < next) rebuilt[ix] = (Obj *)mem;
+                                            made++;
+                                        }
+                                    }
+                                    fclose(h);
+
+                                    /* Relocate: index -> pointer, offset ->
+                                     * address. A zero index is NULL; anything
+                                     * out of range is a corrupt image and must
+                                     * be caught here, not dereferenced. */
+#define RELOC(f) do {                                                         \
+        uintptr_t _i = (uintptr_t)(f);                                        \
+        if (_i == 0) { (f) = NULL; }                                          \
+        else if (_i >= next || rebuilt[_i] == NULL) { relocBad++; (f) = NULL; }\
+        else { (f) = (void *)rebuilt[_i]; }                                   \
+    } while (0)
+                                    for (uint32_t i = 1; i < next; i++) {
+                                        Obj *r = rebuilt[i];
+                                        if (r == NULL) continue;
+                                        switch (r->type) {
+                                        case OBJ_STRING: {
+                                            ObjString *rs = (ObjString *)r;
+                                            RELOC(rs->owner);
+                                            rs->chars = (char *)r +
+                                                        (uintptr_t)rs->chars;
+                                            break;
+                                        }
+                                        case OBJ_INSTANCE:
+                                            RELOC(((ObjInstance *)r)->klass);
+                                            break;
+                                        case OBJ_FUNCTION: {
+                                            ObjFunction *rf = (ObjFunction *)r;
+                                            RELOC(rf->name); RELOC(rf->qualifiedName);
+                                            RELOC(rf->module); RELOC(rf->jitBlockedOn);
+                                            break;
+                                        }
+                                        case OBJ_CLOSURE:
+                                            RELOC(((ObjClosure *)r)->fn); break;
+                                        case OBJ_CLASS: {
+                                            ObjClass *rc = (ObjClass *)r;
+                                            RELOC(rc->name); RELOC(rc->qualifiedName);
+                                            RELOC(rc->superclass); break;
+                                        }
+                                        case OBJ_MODULE: {
+                                            ObjModule *rm = (ObjModule *)r;
+                                            RELOC(rm->name); RELOC(rm->path);
+                                            RELOC(rm->body); break;
+                                        }
+                                        case OBJ_ENUM:
+                                            RELOC(((ObjEnum *)r)->name); break;
+                                        case OBJ_NATIVE:
+                                            RELOC(((ObjNative *)r)->name);
+                                            break;
+                                        default: break;
+                                        }
+                                    }
+#undef RELOC
+                                    /* Topology check: every relocated pointer
+                                     * must land on the rebuilt object at the
+                                     * same index as the live one's target. */
+                                    unsigned long long topo = 0, topoBad = 0;
+                                    for (uint32_t i = 1; i < next; i++) {
+                                        Obj *r = rebuilt[i], *o2 = byIndex[i];
+                                        if (r == NULL || o2 == NULL) continue;
+                                        if (r->type != o2->type) { topoBad++; continue; }
+                                        if (r->type == OBJ_STRING) {
+                                            ObjString *rs = (ObjString *)r;
+                                            ObjString *os = (ObjString *)o2;
+                                            topo++;
+                                            if (rs->length != os->length ||
+                                                memcmp(rs->chars, os->chars,
+                                                       os->length) != 0)
+                                                topoBad++;
+                                            if ((rs->owner == NULL) != (os->owner == NULL))
+                                                topoBad++;
+                                        } else if (r->type == OBJ_INSTANCE) {
+                                            topo++;
+                                            ObjClass *rk = ((ObjInstance *)r)->klass;
+                                            ObjClass *ok = ((ObjInstance *)o2)->klass;
+                                            if ((rk == NULL) != (ok == NULL) ||
+                                                (ok != NULL &&
+                                                 rebuilt[IDX(ok)] != (Obj *)rk))
+                                                topoBad++;
+                                        } else if (r->type == OBJ_FUNCTION) {
+                                            topo++;
+                                            ObjModule *rm2 = ((ObjFunction *)r)->module;
+                                            ObjModule *om2 = ((ObjFunction *)o2)->module;
+                                            if ((rm2 == NULL) != (om2 == NULL) ||
+                                                (om2 != NULL &&
+                                                 rebuilt[IDX(om2)] != (Obj *)rm2))
+                                                topoBad++;
+                                        } else if (r->type == OBJ_CLOSURE) {
+                                            topo++;
+                                            ObjFunction *rf2 = ((ObjClosure *)r)->fn;
+                                            ObjFunction *of2 = ((ObjClosure *)o2)->fn;
+                                            if ((rf2 == NULL) != (of2 == NULL) ||
+                                                (of2 != NULL &&
+                                                 rebuilt[IDX(of2)] != (Obj *)rf2))
+                                                topoBad++;
+                                        } else if (r->type == OBJ_CLASS) {
+                                            topo++;
+                                            ObjClass *rs2 = ((ObjClass *)r)->superclass;
+                                            ObjClass *os2 = ((ObjClass *)o2)->superclass;
+                                            if ((rs2 == NULL) != (os2 == NULL) ||
+                                                (os2 != NULL &&
+                                                 rebuilt[IDX(os2)] != (Obj *)rs2))
+                                                topoBad++;
+                                        } else if (r->type == OBJ_NATIVE) {
+                                            topo++;
+                                            ObjString *rn = ((ObjNative *)r)->name;
+                                            ObjString *on = ((ObjNative *)o2)->name;
+                                            if ((rn == NULL) != (on == NULL) ||
+                                                (on != NULL &&
+                                                 rebuilt[IDX(on)] != (Obj *)rn))
+                                                topoBad++;
+                                        }
+                                    }
+                                    fprintf(stderr,
+                                            "[snapshot] rebuilt %llu objects in "
+                                            "%.3f ms, %llu bad relocations, "
+                                            "%llu topology checks, %llu WRONG\n",
+                                            made,
+                                            (jaiClockMonotonic() - lt0) * 1000.0,
+                                            relocBad, topo, topoBad);
+                                    for (uint32_t i = 1; i < next; i++)
+                                        free(rebuilt[i]);
+                                }
+                                free(rebuilt);
+                            }
+
                         readDone:
                             free(buf);
                             fclose(g);
