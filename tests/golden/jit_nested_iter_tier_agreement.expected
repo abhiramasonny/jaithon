@@ -1,0 +1,11 @@
+ints pushed 496
+ints boxed 28
+floats 136.0
+bools 11
+strs 0-0;0-1;0-2;1-0;1-1;1-2;2-0;2-1;2-2;3-0;3-1;3-2;
+depth2 126
+warm 264400
+warmf 54400.0
+edges 10
+mixed 2
+mutate raised container changed size during iteration

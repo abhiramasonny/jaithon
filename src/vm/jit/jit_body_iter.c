@@ -389,10 +389,18 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
 
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
                                    (unsigned)offsetof(ObjIter, source) + 8));
-                /* Nothing names this list -- it is whatever the iterator
-                 * was built over -- so the storage is proved rather than
-                 * pinned. */
-                emitListBoxedGuard(e, JIT_SCRATCH_C, JIT_SCRATCH_A);
+                /* Nothing names this list -- it is whatever the iterator was
+                 * built over -- so the storage is dispatched rather than
+                 * pinned. This was `emitListBoxedGuard` alone, and a
+                 * push-built `list[int]` is LIST_STORE_I64, so that guard
+                 * failed on EVERY entry of every nested loop over one: the
+                 * form left compiled code and the inner loop ran interpreted.
+                 * Same program, same output, 55ms with a boxed literal and
+                 * 200ms with the identical list built by `push`. It is the
+                 * mistake listAccessFor's own comment records having made
+                 * once already ("ruinous rather than merely slower"). */
+                ListAccess nAcc = listAccessFor(e, JIT_SCRATCH_C, -1, ek,
+                                                JIT_SCRATCH_A);
 
                 /* Mutation first, as jaiIterNext tests it: a list that grew
                  * or shrank under the loop must raise, and the version is
@@ -420,10 +428,15 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
 
                 /* Reload items rather than hoisting: a reallocation bumps
                  * the version, which the guard above covers. */
-                emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                /* JIT_SCRATCH_D is the dispatch scratch: JIT_SCRATCH_A still
+                 * holds the index and must reach the advance below. */
+                int nSkip = listDispatchBegin(e, &nAcc, JIT_SCRATCH_C,
+                                              JIT_SCRATCH_D);
+                unsigned nBase = JIT_SCRATCH_C;
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, nBase,
                                    (unsigned)offsetof(ObjList, items)));
                 emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                      JIT_SCRATCH_A, 4));
+                                      JIT_SCRATCH_A, listStgShift(nAcc.stg)));
 
                 emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, etag));
@@ -461,6 +474,26 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                     branchOnDeopt(e, JAI_A64_NE);
                 }
 
+                /* Both arms leave JIT_SCRATCH_C ON the payload, as the OSR
+                 * head's own list arm does, so one load below serves either.
+                 * The unboxed arm reloads the list out of the iterator
+                 * because the boxed arm above overwrote the pointer with
+                 * `items`; JIT_START_REG holds it for the head's arm, and
+                 * there is no such register here. Nothing to check on an
+                 * unboxed element: no tag, and no object behind it. */
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 8));
+                if (nSkip >= 0) {
+                    int nJoin = listDispatchElse(e, nSkip);
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
+                                       (unsigned)offsetof(ObjIter, source) + 8));
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                       (unsigned)offsetof(ObjList, items)));
+                    emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                          JIT_SCRATCH_A,
+                                          listStgShift(nAcc.alt)));
+                    listDispatchEnd(e, nJoin);
+                }
+
                 /* Past the last guard: advance, then bind. The advance goes
                  * first because localOut may use JIT_SCRATCH_C/D for the
                  * tag and the index has to be stored out of a register the
@@ -471,9 +504,9 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                 emit(e, jaiA64StrX(JIT_SCRATCH_B, rIt,
                                    (unsigned)offsetof(ObjIter, index)));
                 if (ek == SLOT_BOOL) {
-                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
                 } else {
-                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 8));
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
                 }
                 localOut(e, fslot, JIT_SCRATCH_A);
                 /* The index store is a heap write, as the call-out this
