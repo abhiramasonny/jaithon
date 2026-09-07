@@ -312,7 +312,12 @@ fn trace_all(values: list[float], rows: int, cols: int) -> list[Border] {
     let stride = cols + 2
     let need = stride * (rows + 2)
     if _grid.len() != need or _grid_stride != stride {
-        _grid = [0] * need
+        #: `[0] * need` builds a BOXED list -- the repetition copies a
+        #: one-element literal, and jaiListSpecialise only ever converts an
+        #: empty one. `list_filled` decides its storage from the fill while the
+        #: list is still empty, so this is an int64 array and the C scan reads
+        #: it eight bytes at a time with no tag.
+        _grid = __prim__.list_filled(need, 0)
         _grid_stride = stride
     }
     let grid = _grid

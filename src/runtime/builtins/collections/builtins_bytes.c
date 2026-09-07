@@ -3,6 +3,7 @@
 #include <math.h>
 
 #include "runtime/builtins/collections/builtins_seq.h"
+#include <stdlib.h>
 #include "runtime/builtins/text/builtins_str.h"
 #include "runtime/methods.h"
 #include "runtime/parallel.h"
@@ -695,6 +696,20 @@ static bool primListFilled(int argc, Value *args, Value *out) {
     Value fill = argc > 1 ? args[1] : INT_VAL(0);
     ObjList *list = jaiListNew((int)count);
     if (list == NULL) return false;
+    /* Unboxed storage, decided from the fill and taken while the list is still
+     * EMPTY -- which is the only state jaiListSpecialise accepts, and the
+     * reason it has to happen here rather than after the writes. Without it
+     * every preallocation in jaicv and jaitensor is a boxed Value[]: sixteen
+     * bytes and a tag per element, where an int or a float needs eight and
+     * none. Measured on the contours grid, a boxed 2M-cell grid made the C
+     * scan 1.29x against the library version and an unboxed one made it 4.4x,
+     * so the storage was most of the prize.
+     *
+     * The specialisation is by KIND, so a fill of some other type simply
+     * leaves the list boxed. */
+    if (IS_INT(fill))        jaiListSpecialise(list, FIELD_KIND_INT);
+    else if (IS_FLOAT(fill)) jaiListSpecialise(list, FIELD_KIND_FLOAT);
+    else if (IS_BOOL(fill))  jaiListSpecialise(list, FIELD_KIND_BOOL);
     /* Rooted across the reserve: growing the backing array can collect. */
     jaiGCPushRoot(OBJ_VAL(list));
     jaiListReserve(list, (int)count);
