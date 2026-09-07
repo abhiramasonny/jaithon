@@ -47,6 +47,24 @@ ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx) {
     return IS_CLASS(bound) ? AS_CLASS(bound) : NULL;
 }
 
+/* The enum a module-level name is bound to, resolved the way globalClass
+ * resolves a class: the module's own table first, then vm.builtins, and a name
+ * bound to something that is not an enum resolves to NULL rather than falling
+ * through. */
+static ObjEnum *globalEnum(ObjClosure *closure, uint32_t nameIdx) {
+    ObjFunction *fn = closure->fn;
+    if (fn->module == NULL) return NULL;
+    if (nameIdx >= (uint32_t)fn->chunk.constants.count) return NULL;
+    Value name = fn->chunk.constants.data[nameIdx];
+    if (!IS_STRING(name)) return NULL;
+    Value bound;
+    if (jaiModuleGet(fn->module, AS_STRING(name), &bound))
+        return IS_ENUM(bound) ? (ObjEnum *)AS_OBJ(bound) : NULL;
+    if (vm.builtins == NULL) return NULL;
+    if (!jaiModuleGet(vm.builtins, AS_STRING(name), &bound)) return NULL;
+    return IS_ENUM(bound) ? (ObjEnum *)AS_OBJ(bound) : NULL;
+}
+
 /* The first entry a dict walk would yield, for the component kinds the compiled
  * pair head specialises on -- the dict equivalent of taking items[0] off a list.
  * False for a dict with nothing live in it, which declines rather than guessing.
@@ -683,10 +701,39 @@ bool emitGetGlobal(Emit *e, ObjFunction *fn, ObjClosure *closure,
             e->stackAscii[e->depth] = false;
             e->stackNullLit[e->depth] = false;
             e->stackUnit[e->depth]  = false;
+            e->stackPinned[e->depth] = false;
             e->stack[e->depth++]    = SLOT_CLASS;
             off += 6;
             break;
         }
+        /* An ENUM, resolved now and pinned by the same module-version check
+         * the class arm above relies on. `TokenKind.Plus` is OP_GET_GLOBAL
+         * "TokenKind" followed by OP_GET_FIELD "Plus", and without this the
+         * global goes down the BY-ADDRESS path: a JaiEntry load behind a tag
+         * guard, and then the enum-variant fold in jit_body_field.c adds an
+         * Obj.type check and a shapeId check of its own. Four deopt records per
+         * site, and `lexer._punct_kind` is 51 such sites -- 316 records against
+         * a JIT_MAX_DEOPT of 160, so it exhausted the table and died 25 field
+         * reads in, taking the whole body with it.
+         *
+         * Baking the enum BY VALUE is sound for exactly the reason the class,
+         * function and native arms are: jaiValueIsInertGlobal (value.h) returns
+         * false for OBJ_ENUM, so rebinding the name bumps ObjModule::version and
+         * retires this form. Teaching this arm a new kind means updating that
+         * function too -- the comment above the four arms says so. */
+        {
+            ObjEnum *gen = jitGlobalEnum() ? globalEnum(closure, nameIdx) : NULL;
+            if (gen != NULL) {
+                if (e->depth >= JIT_MAX_STACK) return false;
+                if (!pushValue3(e, SLOT_OBJ, 0, NULL, OBJ_VAL(gen), -1))
+                    return false;
+                e->stackPinned[e->depth - 1] = true;
+                emitConst64(e, pushReg(e) - 1, (int64_t)(uintptr_t)gen);
+                off += 6;
+                break;
+            }
+        }
+
         /* A plain function, resolved now and pinned by the same
          * module-version check. Only one that has itself compiled -- and
          * the reason is NOT soundness, which is what this comment used to
@@ -893,6 +940,7 @@ bool emitGetGlobal(Emit *e, ObjFunction *fn, ObjClosure *closure,
             e->stackAscii[e->depth] = false;
             e->stackNullLit[e->depth] = false;
             e->stackUnit[e->depth]  = false;
+            e->stackPinned[e->depth] = false;
             e->stack[e->depth++]    = SLOT_NATIVE;
             off += 6;
             break;
@@ -907,6 +955,7 @@ bool emitGetGlobal(Emit *e, ObjFunction *fn, ObjClosure *closure,
         e->stackAscii[e->depth] = false;
         e->stackNullLit[e->depth] = false;
         e->stackUnit[e->depth]  = false;
+        e->stackPinned[e->depth] = false;
         e->stack[e->depth++]    = SLOT_FUNC;
         off += 6;
         break;

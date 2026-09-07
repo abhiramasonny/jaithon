@@ -1,0 +1,7 @@
+warm 820
+names red green blue amber violet teal rose slate 
+classify ["red", "green", "blue", "amber", "violet", "teal", "rose", "slate"]
+bounded blue slate
+shadowed not the enum
+shapes dot / line 3 / box 2x5
+same true diff false

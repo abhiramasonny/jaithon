@@ -36,6 +36,7 @@ bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
                 e->stackAscii[e->depth - 1] = false;
                 e->stackNullLit[e->depth - 1] = false;
                 e->stackUnit[e->depth - 1]  = false;
+                e->stackPinned[e->depth - 1] = false;
                 e->stackObjType[e->depth - 1] = 0;
                 e->stackElem[e->depth - 1] = NULL_VAL;
             } else if (k != SLOT_FLOAT) {
@@ -484,18 +485,27 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
             if (tag >= 0 && en->variants[tag].arity == 0 &&
                 en->variants[tag].unit != NULL) {
                 ObjEnumVal *unit = en->variants[tag].unit;
-                /* This path guards, so nothing may still be deferred. */
-                settleAll(e);
-                unsigned rcv = valueXReg(e, e->valueDepth - 1);
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rcv,
-                                   (unsigned)offsetof(Obj, type)));
-                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_ENUM));
-                branchOnDeopt(e, JAI_A64_NE);
-                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rcv,
-                                   (unsigned)offsetof(ObjEnum, shapeId)));
-                emitConst64(e, JIT_SCRATCH_B, (int64_t)en->shapeId);
-                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
-                branchOnDeopt(e, JAI_A64_NE);
+                /* A PINNED receiver is a compile-time constant that
+                 * OP_GET_GLOBAL resolved out of the module and that
+                 * ObjModule::version already covers, so both guards below have
+                 * nothing left to prove and the deopt records they cost are
+                 * pure loss. That is not a micro-saving: at four records a site
+                 * `lexer._punct_kind`'s 51 `TokenKind.X` reads needed 316
+                 * against a cap of 160, so the body did not compile at all. */
+                if (!e->stackPinned[e->depth - 1]) {
+                    /* This path guards, so nothing may still be deferred. */
+                    settleAll(e);
+                    unsigned rcv = valueXReg(e, e->valueDepth - 1);
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rcv,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_ENUM));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rcv,
+                                       (unsigned)offsetof(ObjEnum, shapeId)));
+                    emitConst64(e, JIT_SCRATCH_B, (int64_t)en->shapeId);
+                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
                 unsigned droppedEnum;
                 if (!popValue(e, &droppedEnum, NULL)) return false;
                 if (!pushValue3(e, SLOT_OBJ, 0, NULL, OBJ_VAL(unit), -1)) {
@@ -607,6 +617,7 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                 e->stackAscii[e->depth] = false;
                 e->stackNullLit[e->depth] = false;
                 e->stackUnit[e->depth]  = false;
+                e->stackPinned[e->depth] = false;
                 e->stack[e->depth++]    = SLOT_FUNC;
                 off += 6;
                 break;

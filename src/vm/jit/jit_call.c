@@ -363,6 +363,17 @@ static bool jitInvokeSoft(void) {
 /* The two sites are switched apart because they do not behave alike: one is a
  * receiver kind the arms above cannot take, the other a callee the interpreter
  * has never watched return. Measuring them together hides which is which. */
+/* JAITHON_JIT_GLOBAL_ENUM=0 sends a module-level enum back down the by-address
+ * path, as before 2026-09-07, so the arm can be A/B'd in one binary. */
+bool jitGlobalEnum(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_GLOBAL_ENUM");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool jitInvokeSoftRecv(void) {
     static int cached = -1;
     if (cached < 0) {

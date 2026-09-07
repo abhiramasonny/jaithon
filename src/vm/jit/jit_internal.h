@@ -236,6 +236,14 @@ typedef struct {
     int       stackLocal[JIT_MAX_STACK];
     bool      stackAscii[JIT_MAX_STACK];
     bool      stackUnit[JIT_MAX_STACK];
+    /* This entry is a compile-time constant resolved out of the module, not a
+     * value loaded at run time -- so its type is a FACT and the arms that
+     * consume it owe no guard. Only OP_GET_GLOBAL's by-value arms set it, and
+     * ObjModule::version retires the whole form if the binding could change
+     * (jaiValueIsInertGlobal decides which kinds qualify). Rides alongside
+     * SLOT_OBJ rather than taking a SlotKind of its own: the kind is 4 bits
+     * and full. */
+    bool      stackPinned[JIT_MAX_STACK];
     bool      stackNullLit[JIT_MAX_STACK];
     struct { int local; uint16_t field; SlotKind kind; } known[16];
     unsigned  knownCount;
@@ -959,6 +967,7 @@ unsigned ovfDest(const Emit *e, unsigned home);
 bool raiseExitAllowed(Emit *e, const char *what);
 bool negatedCondition(uint8_t cmp, unsigned *out);
 ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx);
+bool jitGlobalEnum(void);
 bool firstLiveEntry(const JaiTable *t, Value *key, Value *value);
 ObjFunction *globalFunction(ObjClosure *closure, uint32_t nameIdx,
                                    Value *out);
