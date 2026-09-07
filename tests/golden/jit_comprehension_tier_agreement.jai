@@ -35,6 +35,29 @@ fn c_nested(n: int) -> list[list[int]] {
     return [[j for j in 0..i] for i in 0..n]
 }
 
+#: The accumulator's reserved register is numbered as the LAST of the reserved
+#: block, so it must land clear of the named ones for EVERY head kind:
+#: no-iterator (only JIT_SLOTS_REG reserved), range (which leaves JIT_START_REG's
+#: slot free), pair, and list/string. The bodies above cover range, list and
+#: string heads; these two cover the other two.
+fn c_in_while(n: int) -> list[int] {
+    var out: list[int] = []
+    var i = 0
+    while i < n {
+        out = [x + i for x in [1, 2, 3]]
+        i += 1
+    }
+    return out
+}
+
+fn c_in_pairs(d: dict[str, int]) -> list[str] {
+    var last: list[str] = []
+    for (k, v) in d.items() {
+        last = [k + str(v + j) for j in 0..2]
+    }
+    return last
+}
+
 fn sum_of(xs: list[int]) -> int {
     var t = 0
     for x in xs { t += x }
@@ -66,6 +89,20 @@ fn main() {
     print("lists " + str(c_lists(3)))
     print("filter " + str(c_filter(base)))
     print("nested " + str(c_nested(4)))
+
+    # A comprehension whose ENCLOSING loop is a plain `while` (no iterator
+    # reserved) and one inside a dict-items pair head.
+    var dw: dict[str, int] = {}
+    dw["a"] = 1
+    dw["b"] = 2
+    var warmw: list[int] = []
+    var warmp: list[str] = []
+    for _i in 0..400 {
+        warmw = c_in_while(4)
+        warmp = c_in_pairs(dw)
+    }
+    print("while " + str(warmw) + " " + str(c_in_while(1)))
+    print("pairs " + str(warmp))
 
     # Empty sources, after the loops are already compiled.
     let empty: list[int] = []
