@@ -399,8 +399,16 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                  * 200ms with the identical list built by `push`. It is the
                  * mistake listAccessFor's own comment records having made
                  * once already ("ruinous rather than merely slower"). */
-                ListAccess nAcc = listAccessFor(e, JIT_SCRATCH_C, -1, ek,
-                                                JIT_SCRATCH_A);
+                ListAccess nAcc;
+                if (jitIterStorage()) {
+                    nAcc = listAccessFor(e, JIT_SCRATCH_C, -1, ek,
+                                         JIT_SCRATCH_A);
+                } else {
+                    nAcc.stg = (uint8_t)LIST_STORE_BOXED;
+                    nAcc.alt = (uint8_t)LIST_STORE_BOXED;
+                    nAcc.dynamic = false;
+                    emitListBoxedGuard(e, JIT_SCRATCH_C, JIT_SCRATCH_A);
+                }
 
                 /* Mutation first, as jaiIterNext tests it: a list that grew
                  * or shrank under the loop must raise, and the version is

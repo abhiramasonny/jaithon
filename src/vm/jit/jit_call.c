@@ -294,6 +294,19 @@ bool jitStrIter(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_ITER_STG=0 puts the nested `for x in <list>` arm back on
+ * `emitListBoxedGuard` alone, so the storage dispatch can be A/B'd in one
+ * binary. Off, an unboxed list deoptimises on every loop entry and the inner
+ * loop runs interpreted -- 3.6x on a nested-loop probe, 2x on graph_bfs. */
+bool jitIterStorage(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_STG");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool pushLocalAsValue(Emit *e, unsigned slot) {
     if (!pushValue3(e, e->localKind[slot], e->localShape[slot],
                     e->localClass[slot],

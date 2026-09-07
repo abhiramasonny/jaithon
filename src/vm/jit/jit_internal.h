@@ -1156,6 +1156,7 @@ bool nullLiteralPair(const Emit *e, uint8_t op, SlotKind ka, SlotKind kb);
 DiscardKind discardedAfter(const uint8_t *code, int at, int count);
 bool emitFusedReturnNull(Emit *e, ObjFunction *fn);
 bool jitStrIter(void);
+bool jitIterStorage(void);
 bool pushLocalAsValue(Emit *e, unsigned slot);
 bool jitConcatLocals(void);
 bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,
