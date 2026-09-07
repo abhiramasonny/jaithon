@@ -43,6 +43,19 @@ def probe_names(source):
     return re.findall(r"^fn (probe\d+)\(", source, re.MULTILINE)
 
 
+def bare(name):
+    """`[jit]` labels a body `module.function`; the probe names are bare.
+
+    jit_why.c's jitFnLabel qualifies every diagnostic it prints, because a bare
+    name is ambiguous -- `check lib/std` has three hot functions called `init`.
+    This script predates that and compared `__main__.probe1` against `probe1`,
+    so every match failed and the whole report read 0.0% on a corpus that in
+    fact compiles hundreds of bodies per program. Strip the module here rather
+    than loosening the regexes, so an unqualified label still matches.
+    """
+    return name.rsplit(".", 1)[-1]
+
+
 def one(seed, warm, timeout):
     source = progen.generate(seed, warm).render()
     names = probe_names(source)
@@ -62,16 +75,16 @@ def one(seed, warm, timeout):
     fn, osr, why, cut = set(), set(), [], {}
     for ln in err.splitlines():
         m = COMPILED.match(ln)
-        if m and m.group(1) in names:
+        if m and bare(m.group(1)) in names:
             fn.add(m.group(1))
         m = OSR.match(ln)
-        if m and m.group(1) in names:
+        if m and bare(m.group(1)) in names:
             osr.add(m.group(1))
         m = STOPPED.match(ln)
-        if m and m.group(1) in names:
+        if m and bare(m.group(1)) in names:
             why.append(m.group(2))
         m = WALKED.match(ln)
-        if m and m.group(1) in names:
+        if m and bare(m.group(1)) in names:
             why.append("walked only to " + m.group(2))
             # A compiled body is not a compiled BODY: the walk stops at the
             # first opcode this tier does not model and everything after it is
