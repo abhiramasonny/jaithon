@@ -92,6 +92,8 @@ static bool          sOptionsSet;
  * `jaithon.compile` under --front=jai recurses without this. Inside the window
  * the C front end compiles whatever the compiler's own closure needs -- which
  * is precisely the job the seed takes over once C is gone. */
+void jaiSnapshotAudit(const char *when);
+
 static bool          sLoadingFrontEnd;
 /* Set once the front end has been pulled in; see loadModuleBody. */
 static bool          sFrontEndWarmed;
@@ -249,6 +251,10 @@ static void warmFrontEnd(void) {
     (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
     sLoadingFrontEnd = false;
     jaiClearException();
+    /* The candidate snapshot point: the front end is built and no user code has
+     * run. Reports only, and only under JAITHON_SNAPSHOT_AUDIT. See
+     * src/vm/snapshot.c and docs/research/PLAN-startup-snapshot.md. */
+    jaiSnapshotAudit("warmFrontEnd");
 }
 
 /* Warm the front end if loading `path` is about to need it.
