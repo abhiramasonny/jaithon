@@ -765,7 +765,7 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
             return subWhy(e, "an instance receiver with no class pinned");
         }
         if (e->stack[e->depth - 1] == SLOT_MAYBE_INST) {
-            emit(e, jaiA64SubsXImm(31, valueBankReg(e, e->valueDepth - 1), 0));
+            emit(e, jaiA64SubsXImm(31, valueXReg(e, e->valueDepth - 1), 0));
             branchOnDeopt(e, JAI_A64_EQ);
         }
         if (nameIdx >= (uint32_t)fn->chunk.constants.count) {
@@ -813,7 +813,7 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
             }
             unsigned dbase = (unsigned)offsetof(ObjInstance, fields) +
                              (unsigned)info->slot * (unsigned)sizeof(Value);
-            unsigned drr = valueBankReg(e, e->valueDepth - 1);
+            unsigned drr = valueXReg(e, e->valueDepth - 1);
             /* Guard BEFORE the receiver comes off the model, as the
              * sampled path below does: a deopt here resumes at this
              * instruction, and the interpreter's stack still has the
@@ -917,7 +917,7 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
 
         unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
                          (unsigned)info->slot * (unsigned)sizeof(Value);
-        unsigned rr = valueBankReg(e, e->valueDepth - 1);
+        unsigned rr = valueXReg(e, e->valueDepth - 1);
         SlotKind already = knownFieldKind(e, fromLocal, info->slot);
         if (kind == SLOT_MAYBE_INST) {
             /* The same three guards the local arm emits, branch-free by the
