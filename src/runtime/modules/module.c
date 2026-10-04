@@ -58,6 +58,7 @@
 #include "boot/seed.h"
 #include "runtime/modules/frontend.h"
 #include "vm/jit/jit.h"
+#include "vm/gc.h"
 #include "runtime/modules/module_internal.h"
 
 #include "common/diag.h"
@@ -249,11 +250,52 @@ static bool selfHosting(void) {
  * So the warm happens at the first module that is going to need compiling,
  * BEFORE that module is published as MOD_LOADING -- see maybeWarmFor. Then
  * the compiler's own imports find std.math untouched and load it normally. */
+/* Loading the front end builds ~10MB of objects that live for the rest of
+ * the process, and it used to trigger one collection partway through: a full
+ * mark of everything built so far that freed ~53KB, ~5% of an edit-then-run.
+ * So collection is paused while the front end loads and the next one is then
+ * budgeted from the heap as it stands, which is what a collection at the end
+ * would have done (jaiGCRebase). Measured together with the intern sizing
+ * below: -2.3% cycles on a one-line `check`, -4.7% on edit-then-run. --gc-stress keeps collecting, since finding
+ * what a collection breaks is its whole job.
+ *
+ * The intern table is sized for the front end's ~5,000 strings up front too:
+ * it otherwise doubles its way from 8 slots to 16K, rehashing every string
+ * interned so far at each step.
+ *
+ * JAITHON_FRONTEND_LOAD_TUNE=0 does neither. */
+#define JAI_FRONTEND_INTERNED 6000
+
+static bool frontEndTuneOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("JAITHON_FRONTEND_LOAD_TUNE");
+        cached = (s != NULL && strcmp(s, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool frontEndLoadBegin(void) {
+    if (!frontEndTuneOn()) return false;
+    jaiTableReserve(jaiInternTable(), JAI_FRONTEND_INTERNED);
+    if (vm.gcStress || vm.gc == NULL || !vm.gc->enabled) return false;
+    jaiGCEnable(false);
+    return true;
+}
+
+static void frontEndLoadEnd(bool paused) {
+    if (!paused) return;
+    jaiGCEnable(true);
+    jaiGCRebase();
+}
+
 static void warmFrontEnd(void) {
     if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return;
     sFrontEndWarmed = true;
     sLoadingFrontEnd = true;
+    bool paused = frontEndLoadBegin();
     (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+    frontEndLoadEnd(paused);
     sLoadingFrontEnd = false;
     jaiClearException();
     /* The candidate snapshot point: the front end is built and no user code has
@@ -968,7 +1010,9 @@ ObjModule *jaiImportFrontEndModule(const char *dottedName) {
         t0 = jaiClockMonotonic();
     }
     sLoadingFrontEnd = true;
+    bool paused = !wasLoading && frontEndLoadBegin();
     ObjModule *module = jaiImportModule(dottedName, NULL);
+    frontEndLoadEnd(paused);
     sLoadingFrontEnd = wasLoading;
     if (t0 != 0.0)
     {
@@ -1193,7 +1237,9 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
      * compiling it with itself is the recursion this guard exists to stop. */
     bool wasLoading = sLoadingFrontEnd;
     sLoadingFrontEnd = true;
+    bool paused = !wasLoading && frontEndLoadBegin();
     ObjModule *compiler = jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+    frontEndLoadEnd(paused);
     sLoadingFrontEnd = wasLoading;
     if (compiler == NULL) {
         jaiClearException();

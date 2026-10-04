@@ -175,6 +175,14 @@ void jaiGCEnable(bool enabled) {
     jaiGCSyncLimit();
 }
 
+void jaiGCRebase(void) {
+    GCState *g = activeGC();
+    if (g == NULL) return;
+    size_t next = gcNextThreshold(g, gcLiveBytes(g));
+    if (next > g->nextGC) g->nextGC = next;
+    jaiGCSyncLimit();
+}
+
 //marking
 
 /* The collector half of the allocation census (see object.c); same build.

@@ -50,6 +50,11 @@ void jaiGCFree(GCState *gc);
 void jaiGCMaybeCollect(void);
 void jaiGCCollect(void);
 void jaiGCEnable(bool enabled);
+/* Budget the next collection from the heap as it stands now, as a collection
+ * at this point would have, without collecting. Only ever raises the
+ * threshold. For a phase that has just built data that will live for the
+ * rest of the process (the self-hosted front end). */
+void jaiGCRebase(void);
 
 extern GCState *jaiGCActive;
 extern bool     jaiGCInCollect;
