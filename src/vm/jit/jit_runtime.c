@@ -429,12 +429,36 @@ int jitFormat(JitCallDesc *d) {
     return 0;
 }
 
+/* A list whose storage is not settled yet: a push that grows it past
+ * JAI_LIST_SHAPE_AT may still unbox it (jaiListShapeOnGrow, from jaiListPush
+ * or from jitListGrow below), so a loop form must not pin the BOXED it has
+ * now. Capacity only grows without a call, so a list past that size at a
+ * form's entry stays past it for the whole region, and one under it is never
+ * pinned -- not at compile time (compileOsrOnce) and not at entry
+ * (osrFormStorageFits). Conservative about content on purpose: a compiled
+ * store can turn a list of strings into a list of ints before the push. */
+bool jitListShapeable(Value v) {
+    if (!IS_LIST(v)) return false;
+    ObjList *l = AS_LIST(v);
+    return l->capacity <= JAI_LIST_SHAPE_AT &&
+           l->stg == LIST_STORE_BOXED && l->elemKind == FIELD_KIND_ANY &&
+           jaiListShapeGrownOn();
+}
+
 /* No descriptor/roots: growing a list cannot collect -- jaiListReserve->jaiRealloc never triggers the
  * marker (gc.c: collections only happen at jaiGCMaybeCollect safepoints). Returns 1 if it raised (list past INT32_MAX). */
-int jitListGrow(ObjList *list, uint64_t tag, int64_t payload) {
+/* The compiled half of jaiListPush's shaping at growth: the same test on the
+ * same list, so an untyped list comes out the same width whichever tier
+ * pushed it past its first eight. Only for a site that dispatches on storage
+ * after the grow -- a site emitted at one pinned storage would go on storing
+ * at that width. jaiListShapeOnGrow's allocation is the one jaiListReserve
+ * would have made, and collects no more than it. */
+int jitListGrow(ObjList *list, uint64_t tag, int64_t payload,
+                int64_t mayShape) {
     Value pending;
     pending.type = (ValueType)tag;
     pending.as.integer = payload;
+    if (mayShape != 0 && jaiListShapeOnGrow(list, pending)) return 0;
     jaiGCPushRoot(OBJ_VAL(list));
     jaiGCPushRoot(pending);
     if (list->capacity > INT32_MAX / 2) {

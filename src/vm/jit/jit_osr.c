@@ -699,6 +699,16 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             if (jitSplitStress()) e.scratchValues = false;
             unsigned wantSplit = probe.clobberDepth;
             if (jitSplitStress() && wantSplit == 0) wantSplit = 1;
+            /* Every call sits at depth zero: no value is ever live across one,
+             * so all of them could go in x0..x8 -- but a split at zero is
+             * "no split", which sends them ALL to the callee-saved bank. One
+             * entry there is the nearest the encoding can say. Reached far
+             * more often once an append stops counting as a call, since a
+             * loop's remaining call is then often a `[]` built at depth zero
+             * (matrix_mul's outer loop lost two local homes to this). */
+            if (jitGrowKeeps() && wantSplit == 0 && probe.clobbersScratch) {
+                wantSplit = 1;
+            }
             if (!e.scratchValues && !probe.inlined &&
                 (probe.clobbersScratch || jitSplitStress()) &&
                 probe.maxValue > wantSplit &&
@@ -742,12 +752,37 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             for (unsigned i = 0; i < probe.clobberCount; i++) {
                 e.clobberOff[i] = probe.clobberOff[i];
             }
+            e.pushCount = probe.pushCount;
+            e.pushSpill = probe.pushSpill;
+            for (unsigned i = 0; i < probe.pushCount; i++) {
+                e.pushOff[i]  = probe.pushOff[i];
+                e.pushSlot[i] = probe.pushSlot[i];
+            }
+            e.stampCount = probe.stampCount;
+            e.stampSpill = probe.stampSpill;
+            for (unsigned i = 0; i < probe.stampCount; i++) {
+                e.stampOff[i] = probe.stampOff[i];
+            }
 
-            bool bodyCallsOut = regionCalls(&e, top, end);
+            /* A storage pin is proved once, at entry, so the region must hold
+             * nothing that could change a list's `stg` after it: a call out
+             * (anything may box a list), or an OP_ELEM_KIND stamping an empty
+             * one. An append is neither for a list that is past
+             * JAI_LIST_SHAPE_AT or already unboxed -- a compiled append stores
+             * at the storage it finds or deoptimises, and jitListGrow keeps
+             * the width such a list has -- which is why a keeping grow stub
+             * no longer costs a loop its pins. A small boxed one is the
+             * exception: a dispatching append through another name can
+             * unbox it at its next growth (jaiListShapeOnGrow), so it is not
+             * pinned here, and osrFormStorageFits turns away an entry that
+             * brings one to a form that pinned it BOXED. */
+            bool bodyCallsOut = regionCalls(&e, top, end) ||
+                                (jitGrowKeeps() && regionStamps(&e, top, end));
             for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
                 e.localStgPin[i] =
                     !bodyCallsOut &&
-                    !(e.slotWriteHi[i] >= top && e.slotWriteLo[i] < end);
+                    !(e.slotWriteHi[i] >= top && e.slotWriteLo[i] < end) &&
+                    !(i < e.locals && jitListShapeable(slots[i]));
             }
             e.elemStgPin = !bodyCallsOut;
             for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {
@@ -755,6 +790,22 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             }
             if (e.scratchValues) {
                 for (unsigned r = probe.maxValueAll;
+                     r < JIT_SCRATCH_BANK_COUNT; r++) {
+                    e.hoistPool[e.hoistPoolCount++] =
+                        (uint8_t)(JIT_INL_BANK + r);
+                }
+            } else if (e.splitAt != 0 && jitSplitHoistsOn() &&
+                       probe.maxValue >= e.splitAt) {
+                /* A split bank holds entries `splitAt` and up in x0.., so the
+                 * top of the scratch bank is as free as it is under
+                 * scratchValues -- nothing is inlined (a split is never chosen
+                 * for a body that inlines), and a hoist only ever lives in a
+                 * loop with no call to clobber it. valueBankRoom honours the
+                 * scratchRoom the hoists lower, for the reason it does in the
+                 * scratchValues case. A stencil's outer loop calls (it builds
+                 * a row), which is exactly what makes it split -- and it is
+                 * where three rows want hoisting and x13..x17 holds two. */
+                for (unsigned r = probe.maxValue - e.splitAt;
                      r < JIT_SCRATCH_BANK_COUNT; r++) {
                     e.hoistPool[e.hoistPoolCount++] =
                         (uint8_t)(JIT_INL_BANK + r);
@@ -1070,6 +1121,9 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         else if (f->targetOffset <= FIXUP_GROW &&
                  f->targetOffset > FIXUP_GROW - JIT_MAX_GROW)
             target = e.grow[FIXUP_GROW - f->targetOffset].stub;
+        else if (f->targetOffset <= FIXUP_COLD &&
+                 f->targetOffset > FIXUP_COLD - JIT_MAX_COLD)
+            target = e.cold[FIXUP_COLD - f->targetOffset].stub;
         else if (f->targetOffset <= FIXUP_OVF && f->targetOffset >= FIXUP_OVF - 2u)
             target = e.overflowStub[FIXUP_OVF - f->targetOffset];
         else {
@@ -1229,6 +1283,12 @@ static bool osrFormStorageFits(const JaiOsrForm *form, const Value *slots,
         if ((SlotKind)(form->kinds[i] & 0x0Fu) != SLOT_LIST) continue;
         if (!IS_LIST(slots[i])) return false;
         if (AS_LIST(slots[i])->stg != want) return false;
+        /* A form compiled over a long boxed list, entered with a short one:
+         * the region's appends through an alias could unbox it under the
+         * pin (see compileOsrOnce). */
+        if (want == LIST_STORE_BOXED && jitListShapeable(slots[i])) {
+            return false;
+        }
     }
     return true;
 }

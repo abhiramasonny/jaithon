@@ -713,10 +713,119 @@ unsigned valueBankRoom(const Emit *e) {
      * the answer is that smaller number, so the push declines rather than
      * running off the end of the bank. */
     if (e->splitAt != 0) {
-        return saved < e->splitAt ? saved
-                                  : e->splitAt + JIT_SCRATCH_BANK_COUNT;
+        /* Less, in the loop tier, by whatever the hoists took off the top of
+         * the scratch bank (see jitSplitHoistsOn). */
+        unsigned room = JIT_SCRATCH_BANK_COUNT;
+        if (e->osr && e->scratchRoom < room) room = e->scratchRoom;
+        return saved < e->splitAt ? saved : e->splitAt + room;
     }
     return saved;
+}
+
+/* JAITHON_JIT_SPLIT_HOISTS=0 keeps a split body's hoists to x13..x17. On by
+ * default; see the pool in compileOsr. */
+bool jitSplitHoistsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_SPLIT_HOISTS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* JAITHON_JIT_HOIST_PARTIAL=0 hoists a list header only out of a loop that
+ * holds every subscript of its slot. On by default; see planHoists. */
+bool jitHoistPartialOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_PARTIAL");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* JAITHON_JIT_INDEXED_LOAD=0 reads a bounds-proved unboxed element with the
+ * add-then-load pair. On by default; see OP_GET_INDEX. */
+bool jitIndexedLoadOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_INDEXED_LOAD");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* JAITHON_JIT_GROW_KEEPS=0 puts the list-grow stub back to an ordinary call
+ * out. On by default.
+ *
+ * An append whose list is full branches to a stub that calls jitListGrow and
+ * comes back. That call made every loop holding a `push` a CALLING loop to the
+ * rest of the tier: no hoisted header (regionCalls), no pinned storage, and an
+ * operand stack pushed out of x0..x8 -- so a loop that reads three rows and
+ * builds a fourth paid the full dispatching price on every read, for the sake
+ * of a call that runs a few dozen times in a million appends. With the switch
+ * on the stub saves every caller-saved register a body can hold a value in
+ * around the call, and the append stops being a clobber; what it still does --
+ * move ONE list's items and count -- is recorded separately (notePushTarget)
+ * and is the only thing a hoist over it has to answer to. */
+bool jitGrowKeeps(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_GROW_KEEPS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* JAITHON_JIT_HOIST_PIN=0 leaves a hoisted header's element accesses
+ * dispatching on the list's storage. On by default.
+ *
+ * A storage pin is proved once, at OSR entry, and only for a slot the whole
+ * region never writes. The rows of a stencil are written by the OUTER loop
+ * (`let up = board[r - 1]`), so they were never pinned, and every one of a
+ * cell's eight reads paid a load, a compare and a branch to learn a storage
+ * that cannot change for the length of the inner loop: nothing in it writes
+ * the slot, calls out, or stamps a storage (planHoists and regionStamps say
+ * so). The hoist already runs once per entry to that loop, so it proves the
+ * storage there -- the one the slot held when the form was compiled -- and
+ * deoptimises to the loop head if a later entry brings another. */
+bool jitHoistPinOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_PIN");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* An append to the list held in local `slot` (or JIT_PUSH_UNKNOWN /
+ * JIT_PUSH_FRESH) is about to be emitted. See Emit::pushOff. */
+void notePushTarget(Emit *e, int slot) {
+    if (!e->measuring) return;
+    if (e->pushCount >= JIT_MAX_PUSHREC) { e->pushSpill = true; return; }
+    /* An inlined body's offsets are the callee's; the caller's own call site
+     * is the offset every loop range here is measured in. And its locals are
+     * the callee's too, so a slot number means nothing to the caller. */
+    if (e->inlining) slot = JIT_PUSH_UNKNOWN;
+    e->pushOff[e->pushCount]  = e->inlining ? e->inlIp : e->curOffset;
+    e->pushSlot[e->pushCount] = (int16_t)slot;
+    e->pushCount++;
+}
+
+/* An OP_ELEM_KIND that may change an empty list's storage. See
+ * Emit::stampOff. */
+void noteStorageStamp(Emit *e) {
+    if (!e->measuring) return;
+    if (e->stampCount >= JIT_MAX_PUSHREC) { e->stampSpill = true; return; }
+    e->stampOff[e->stampCount++] = e->inlining ? e->inlIp : e->curOffset;
+}
+
+bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi) {
+    if (e->stampSpill) return true;
+    for (unsigned i = 0; i < e->stampCount; i++) {
+        if (e->stampOff[i] >= lo && e->stampOff[i] < hi) return true;
+    }
+    return false;
 }
 
 /* Something about to be emitted can destroy x0..x8 with the body still live:

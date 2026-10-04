@@ -397,8 +397,36 @@ bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag,
  * costs far more than the work itself (list_ops spent all its time on the
  * call). A full list goes out to the `grow` stubs' realloc helper and comes
  * straight back; see there for why this used to be a deopt and what it cost. */
+/* JAITHON_JIT_GROW_KEEPS_LOOPS=0 lets an append outside every loop keep the
+ * registers too. On by default.
+ *
+ * What a keeping grow stub buys is a loop: a hoisted header or a pinned
+ * storage that would otherwise die at the append's call. An append that sits
+ * in no loop of its body -- the third field of a record built by push -- has
+ * nothing hoisted across it, and each list it builds grows once, so the stub
+ * saving every register costs the whole difference on every call. There the
+ * grow is an ordinary call again, exactly as it was before the stub kept
+ * anything. Measured where the walk measures everything else: the caller's
+ * own offset for an inlined body, so an inlined builder called from a loop
+ * still keeps. */
+static bool jitGrowKeepsLoopsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_GROW_KEEPS_LOOPS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static bool growKeepsHere(const Emit *e) {
+    if (!jitGrowKeepsLoopsOn() || e->osr) return true;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    return e->loopDepth != NULL && at < e->loopDepthCount &&
+           e->loopDepth[at] > 0;
+}
+
 bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
-                          int slot) {
+                          int slot, int target) {
     unsigned vtag = vk == SLOT_INT   ? VAL_INT
                   : vk == SLOT_FLOAT ? VAL_FLOAT
                   : vk == SLOT_BOOL  ? VAL_BOOL
@@ -435,13 +463,24 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
      * (see emitGrowStubs). */
     if (!raiseExitAllowed(e, "a list growth inside a try")) return false;
 
-    noteScratchClobber(e);
+    /* With the grow stub keeping the registers the append is not a clobber:
+     * it is recorded as what it is -- a write to one list's header -- so a
+     * hoist over it can prove it is not that list. See jitGrowKeeps. */
+    bool keeps = jitGrowKeeps() && growKeepsHere(e);
+    if (keeps) {
+        notePushTarget(e, target);
+    } else {
+        noteScratchClobber(e);
+    }
     unsigned gi = e->growCount++;
     e->grow[gi].listReg  = rList;
     e->grow[gi].valReg   = rVal;
     e->grow[gi].tag      = vtag;
     e->grow[gi].countReg = JIT_SCRATCH_A;
     e->grow[gi].stub     = -1;
+    e->grow[gi].keeps    = keeps;
+    e->grow[gi].shape    = pAcc.dynamic;
+    e->grow[gi].target   = (int16_t)(e->inlining ? JIT_PUSH_UNKNOWN : target);
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_GROW - gi;
@@ -456,12 +495,44 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
     /* JIT_SCRATCH_C is the items pointer and JIT_SCRATCH_A the index; every
      * arm below starts from those two, so the test costs a load, a compare and
      * two branches and touches nothing else. */
+    /* As an element read's: the predicted unboxed arm falls through and the
+     * boxed one waits after the body (jitDispatchColdOn), because inline one
+     * of the two always took a branch and the unboxed one is the common one. */
+    bool pCold = false;
+    if (pAcc.dynamic && pAcc.stg == LIST_STORE_BOXED &&
+        jitDispatchColdOn() && e->coldCount < JIT_MAX_COLD &&
+        e->fixupCount < JIT_MAX_FIXUPS) {
+        int dk = deoptRecordNow(e);
+        if (dk >= 0) {
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_D, rList,
+                                  (unsigned)offsetof(ObjList, stg)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, pAcc.alt));
+            unsigned ci = e->coldCount++;
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_COLD - ci;
+            e->fixups[e->fixupCount].conditional  = true;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, jaiA64BCond(JAI_A64_NE, 0));
+            emitListElemStore(e, pAcc.alt, vtag, rVal);
+            e->cold[ci].stub     = -1;
+            e->cold[ci].returnTo = (int)e->count;
+            e->cold[ci].insn     = 0;
+            e->cold[ci].kind     = 3;
+            e->cold[ci].deoptK   = dk;
+            e->cold[ci].rOut     = (uint8_t)rVal;
+            e->cold[ci].tag      = vtag;
+            pCold = true;
+        }
+    }
+    if (!pCold) {
     int pSkip = listDispatchBegin(e, &pAcc, rList, JIT_SCRATCH_D);
     emitListElemStore(e, pAcc.stg, vtag, rVal);
     if (pSkip >= 0) {
         int pJoin = listDispatchElse(e, pSkip);
         emitListElemStore(e, pAcc.alt, vtag, rVal);
         listDispatchEnd(e, pJoin);
+    }
     }
     emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
     emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,

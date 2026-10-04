@@ -7,6 +7,7 @@
 /* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
 /* For jaiOpBranchOperandAt: says which opcodes carry a branch target. */
 #include "vm/vm.h"
+#include "vm/gc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -682,7 +683,269 @@ bool jaiCallPreparedFn1(JaiPreparedFn1 *p, Value arg, Value *out) {
     return callFn1Rerun(base, out);
 }
 
+/* JAITHON_MAP_RUN=0 sends every element of a map back through
+ * jaiCallPreparedFn1 one call at a time. On by default. */
+bool jaiMapRunOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_MAP_RUN");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* See vm.h. jaiCallPreparedFn1's flat path, with the loop moved inside it.
+ *
+ * Per element, jaiCallPreparedFn1 is a non-inlined call with five callee-saved
+ * pairs to save and restore, a staleness test of four loads, a window set up
+ * and torn down, and then the caller boxes the element out of the source and
+ * back into the result through two storage switches. None of that depends on
+ * the element. Here the window is built once and the staleness test is the two
+ * compares that CAN change between elements -- a body that bails or recompiles
+ * moves fn->jitFunc, and one that defines a global moves the module version --
+ * so what is left per element is the load, the call and the store.
+ *
+ * Taken for a callee whose one parameter is an int or a float and whose result
+ * is an int, a float or a bool -- the kinds whose register form is the whole
+ * value. Anything else stops the run, and the caller takes that element the
+ * ordinary way. The one exception is a call that comes back with a non-zero
+ * verdict, which has already happened and so cannot be handed back; it is
+ * finished exactly as jaiCallPreparedFn1 would finish it. */
+int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
+                         ObjList *dst, bool *ok) {
+    *ok = true;
+    if (!p->flat || p->nargs != 1) return from;
+    ObjFunction *fn = p->fn;
+    if (fn->jitArgBase != 1) return from;
+    SlotKind pk = (SlotKind)fn->jitParamKind[0];
+    SlotKind rk = (SlotKind)p->returnKind;
+    if (pk != SLOT_INT && pk != SLOT_FLOAT) return from;
+    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL) return from;
+    void *entry = p->entry;
+    uint32_t mv = p->moduleVersion;
+    Value *base = vm.stackTop;
+    if (base > p->limit) return from;
+    base[0] = p->callee;
+    base[1] = pk == SLOT_INT ? INT_VAL(0) : FLOAT_VAL(0.0);
+    vm.stackTop = base + 2;
+    /* The result storage that takes this kind as it is, if any. */
+    uint8_t rawStg = rk == SLOT_INT   ? (uint8_t)LIST_STORE_I64
+                   : rk == SLOT_FLOAT ? (uint8_t)LIST_STORE_F64
+                                      : (uint8_t)LIST_STORE_U8;
+
+    int i = from;
+    for (; i < src->count; i++) {
+        if (JAI_UNLIKELY(fn->jitFunc != entry ||
+                         fn->module->version != mv)) {
+            break;
+        }
+        int64_t a0;
+        /* Re-read every time: the callee may push onto, box, or shrink the
+         * very list being mapped, and the loop bound above is live for the
+         * same reason. */
+        uint8_t stg = src->stg;
+        if (stg == (uint8_t)LIST_STORE_I64 && pk == SLOT_INT) {
+            a0 = ((const int64_t *)src->items)[i];
+        } else if (stg == (uint8_t)LIST_STORE_F64 && pk == SLOT_FLOAT) {
+            memcpy(&a0, &((const double *)src->items)[i], sizeof a0);
+        } else if (stg == (uint8_t)LIST_STORE_BOXED) {
+            Value v = ((const Value *)src->items)[i];
+            if (pk == SLOT_INT ? !IS_INT(v) : !IS_FLOAT(v)) break;
+            memcpy(&a0, &v.as, sizeof a0);
+        } else {
+            break;
+        }
+        /* The cell's tag was written once, above the loop; only the payload
+         * changes -- an int's value or a double's bits, which is also what
+         * the compiled body takes in its argument register (jitArgIn). */
+        base[1].as.integer = a0;
+        int frameBase = vm.frameCount;
+        JitResult r = ((Fn1)(uintptr_t)entry)(a0);
+        Value mapped;
+        if (JAI_LIKELY(r.bailed == 0)) {
+            if (rk == SLOT_INT) {
+                mapped = INT_VAL(r.value);
+            } else if (rk == SLOT_FLOAT) {
+                double d;
+                memcpy(&d, &r.value, sizeof d);
+                mapped = FLOAT_VAL(d);
+            } else {
+                mapped = BOOL_VAL(r.value != 0);
+            }
+        } else {
+            JaiJitOutcome outcome = jitResultOut(fn, r, base);
+            bool good;
+            if (outcome == JAI_JIT_DONE) {
+                mapped = base[0];
+                good = true;
+            } else if (outcome == JAI_JIT_ERROR) {
+                good = false;
+            } else if (outcome == JAI_JIT_DEOPT) {
+                good = jaiFinishJitDeopt1(p->closure, base, frameBase,
+                                          &mapped);
+            } else {
+                good = callFn1Rerun(base, &mapped);
+            }
+            vm.stackTop = base;
+            if (!good) {
+                *ok = false;
+                return i;
+            }
+            /* Another kind, perhaps, and the window is gone: store it the
+             * ordinary way and hand the rest back to the caller, which will
+             * prepare again before the next run. */
+            if (JAI_LIKELY(dst->count < dst->capacity)) {
+                jaiListPut(dst, dst->count++, mapped);
+            } else {
+                jaiGCPushRoot(mapped);
+                jaiListPush(dst, mapped);
+                jaiGCPopRoot();
+            }
+            dst->version++;
+            if (vm.hasException) *ok = false;
+            return i + 1;
+        }
+        /* Into the result at whichever width it has, without jaiListPut's
+         * four-way switch: boxed is what jaiListNew made, and the one unboxed
+         * storage this kind fits is the only other that takes it as it is. */
+        int at = dst->count;
+        if (JAI_LIKELY(at < dst->capacity &&
+                       dst->stg == (uint8_t)LIST_STORE_BOXED)) {
+            ((Value *)dst->items)[at] = mapped;
+            dst->count = at + 1;
+        } else if (at < dst->capacity && dst->stg == rawStg) {
+            jaiListSetRaw(dst, at, mapped);
+            dst->count = at + 1;
+        } else if (at < dst->capacity) {
+            jaiListPut(dst, dst->count++, mapped);
+        } else {
+            jaiListPush(dst, mapped);
+        }
+        dst->version++;
+        if (JAI_UNLIKELY(vm.hasException)) {
+            vm.stackTop = base;
+            *ok = false;
+            return i + 1;
+        }
+    }
+    vm.stackTop = base;
+    return i;
+}
+
+/* See vm.h. The same run for list.filter: a flat callee that takes an int or
+ * a float and returns a bool, every per-callee check and the stack window
+ * hoisted out of the loop, and the element itself appended when the verdict is
+ * true -- through jaiListPush, which is what listFilter's own loop calls, so
+ * the result is built the same way (and given the same storage) as before.
+ * Anything else stops the run; a call that comes back with a non-zero verdict
+ * is finished as jaiCallPreparedFn1 finishes it and its answer checked as
+ * callPredicate checks it. */
+int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
+                         ObjList *dst, bool *ok) {
+    *ok = true;
+    if (!p->flat || p->nargs != 1 ||
+        p->returnKind != (uint8_t)SLOT_BOOL) {
+        return from;
+    }
+    ObjFunction *fn = p->fn;
+    if (fn->jitArgBase != 1) return from;
+    SlotKind pk = (SlotKind)fn->jitParamKind[0];
+    if (pk != SLOT_INT && pk != SLOT_FLOAT) return from;
+    void *entry = p->entry;
+    uint32_t mv = p->moduleVersion;
+    Value *base = vm.stackTop;
+    if (base > p->limit) return from;
+    base[0] = p->callee;
+    base[1] = pk == SLOT_INT ? INT_VAL(0) : FLOAT_VAL(0.0);
+    vm.stackTop = base + 2;
+
+    int i = from;
+    for (; i < src->count; i++) {
+        if (JAI_UNLIKELY(fn->jitFunc != entry ||
+                         fn->module->version != mv)) {
+            break;
+        }
+        Value item;
+        int64_t a0;
+        uint8_t stg = src->stg;
+        if (stg == (uint8_t)LIST_STORE_BOXED) {
+            item = ((const Value *)src->items)[i];
+            if (pk == SLOT_INT ? !IS_INT(item) : !IS_FLOAT(item)) break;
+        } else if (stg == (uint8_t)LIST_STORE_I64 && pk == SLOT_INT) {
+            item = INT_VAL(((const int64_t *)src->items)[i]);
+        } else if (stg == (uint8_t)LIST_STORE_F64 && pk == SLOT_FLOAT) {
+            item = FLOAT_VAL(((const double *)src->items)[i]);
+        } else {
+            break;
+        }
+        /* An int's payload, or a double's bits: what the compiled body
+         * takes in its argument register either way (jitArgIn). */
+        memcpy(&a0, &item.as, sizeof a0);
+        base[1].as.integer = a0;
+        int frameBase = vm.frameCount;
+        JitResult r = ((Fn1)(uintptr_t)entry)(a0);
+        bool keep;
+        if (JAI_LIKELY(r.bailed == 0)) {
+            keep = r.value != 0;
+        } else {
+            Value verdict;
+            JaiJitOutcome outcome = jitResultOut(fn, r, base);
+            bool good;
+            if (outcome == JAI_JIT_DONE) {
+                verdict = base[0];
+                good = true;
+            } else if (outcome == JAI_JIT_ERROR) {
+                good = false;
+            } else if (outcome == JAI_JIT_DEOPT) {
+                good = jaiFinishJitDeopt1(p->closure, base, frameBase,
+                                          &verdict);
+            } else {
+                good = callFn1Rerun(base, &verdict);
+            }
+            vm.stackTop = base;
+            if (good && !IS_BOOL(verdict)) {
+                (void)jaiThrow(vm.cTypeError,
+                               "list.filter(): the predicate must return "
+                               "bool, not %s", jaiTypeNameStatic(verdict));
+                good = false;
+            }
+            if (!good) {
+                *ok = false;
+                return i;
+            }
+            if (AS_BOOL(verdict)) jaiListPush(dst, item);
+            if (vm.hasException) *ok = false;
+            return i + 1;
+        }
+        if (keep) {
+            jaiListPush(dst, item);
+            if (JAI_UNLIKELY(vm.hasException)) {
+                vm.stackTop = base;
+                *ok = false;
+                return i + 1;
+            }
+        }
+    }
+    vm.stackTop = base;
+    return i;
+}
+
 #else
+
+int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
+                         ObjList *dst, bool *ok) {
+    (void)p; (void)src; (void)dst;
+    *ok = true;
+    return from;
+}
+
+int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
+                         ObjList *dst, bool *ok) {
+    (void)p; (void)src; (void)dst;
+    *ok = true;
+    return from;
+}
+bool jaiMapRunOn(void) { return false; }
 
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return JAI_JIT_DECLINED;

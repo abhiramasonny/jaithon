@@ -205,6 +205,80 @@ void jaiListTouch(ObjList *list) {
     list->version++;
 }
 
+/* JAITHON_LIST_SHAPE_GROWN=0 leaves an untyped list boxed whatever it holds.
+ * On by default.
+ *
+ * `var xs = []` promises nothing, so it has always been built boxed: sixteen
+ * bytes an element for a list that, overwhelmingly, is then filled with ints
+ * -- twice the memory to write, to copy on every growth, and to read back.
+ * So a list that outgrows its first eight elements while every one of them,
+ * and the one arriving, is the same int, float or bool takes the unboxed
+ * storage `var xs: list[int] = []` would have had, at the growth it was about
+ * to make anyway: the copy that growth does is the conversion.
+ *
+ * Not on the FIRST push. That shaped `[id, name, score]` to I64 for one
+ * element and boxed it again on the next -- an extra allocation and copy for
+ * every record built that way, and in compiled code a deoptimisation on the
+ * second push, every call (0.39x on a hot record builder). A list that is
+ * still under eight long is cheap to keep boxed; one past it is where the
+ * width pays.
+ *
+ * It promises no more than before -- elemKind stays FIELD_KIND_ANY, and a
+ * later element of another kind de-specialises it the way any unboxed list
+ * is, once. Both tiers shape here (jaiListPush, and jitListGrow for a compiled
+ * site that dispatches on storage) on the same test, so they build the same
+ * storage; a compiled site that does not dispatch can never see a list this
+ * could shape -- see jitListShapeable, which keeps every loop form from
+ * pinning one. */
+static bool shapeAtGrowthOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *s = getenv("JAITHON_LIST_SHAPE_GROWN");
+        on = (s != NULL && s[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+bool jaiListShapeGrownOn(void) { return shapeAtGrowthOn(); }
+
+bool jaiListShapeOnGrow(ObjList *list, Value v) {
+    if (JAI_LIKELY(list->capacity != JAI_LIST_SHAPE_AT) ||
+        list->count != JAI_LIST_SHAPE_AT ||
+        list->stg != LIST_STORE_BOXED || list->elemKind != FIELD_KIND_ANY) {
+        return false;
+    }
+    if (!shapeAtGrowthOn() || !unboxEnabled()) return false;
+    uint8_t stg;
+    if (IS_INT(v))        stg = LIST_STORE_I64;
+    else if (IS_FLOAT(v)) stg = LIST_STORE_F64;
+    else if (IS_BOOL(v))  stg = LIST_STORE_U8;
+    else return false;
+
+    const Value *old = (const Value *)list->items;
+    const int n = list->count;
+    for (int i = 0; i < n; i++) {
+        if (old[i].type != v.type) return false;
+    }
+
+    const int cap = JAI_GROW_CAP(list->capacity);
+    const size_t w = jaiListStoreWidth(stg);
+    jaiGCPushRoot(OBJ_VAL(list));
+    jaiGCPushRoot(v);
+    char *fresh = JAI_GROW_ARRAY(char, NULL, 0, (size_t)cap * w);
+    jaiGCPopRoots(2);
+
+    /* `old` is still the list's array: nothing moves it, and a collection
+     * the allocation ran would have marked through it. */
+    old = (const Value *)list->items;
+    const int oldCap = list->capacity;
+    list->items = fresh;
+    list->capacity = cap;
+    list->stg = stg;
+    for (int i = 0; i < n; i++) jaiListSetRaw(list, i, old[i]);
+    JAI_FREE_ARRAY(Value, (Value *)old, oldCap);
+    return true;
+}
+
 void jaiListPush(ObjList *list, Value v) {
     /* The guard belongs HERE, not in the `list.push` builtin: a typed receiver
      * and an `any` one reach the list through different entry points, and
@@ -219,8 +293,9 @@ void jaiListPush(ObjList *list, Value v) {
         return;
     }
     if (JAI_UNLIKELY(list->count >= list->capacity) &&
-        !listGrowFor(list, v))
+        !jaiListShapeOnGrow(list, v) && !listGrowFor(list, v)) {
         return;
+    }
 
     if (JAI_UNLIKELY(!jaiListStoreAccepts(list, v))) (void)jaiListBox(list);
     jaiListSetRaw(list, list->count++, v);
@@ -353,7 +428,11 @@ ObjList *jaiListConcat(ObjList *a, ObjList *b) {
     }
     ObjList *out = jaiListNew(0);
     if (stg != LIST_STORE_BOXED) {
-        out->elemKind = a->elemKind;
+        /* The element kind is a promise, not a storage: an untyped list can
+         * hold unboxed storage too (see shapeAtGrowthOn), and `list[int] +
+         * untyped` promised nothing about the result before that existed. */
+        out->elemKind = a->elemKind == b->elemKind ? a->elemKind
+                                                   : (uint8_t)FIELD_KIND_ANY;
         out->stg = stg;
     }
     jaiGCPushRoot(OBJ_VAL(out));

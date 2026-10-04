@@ -60,6 +60,14 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
  * rather than of the whole body. Past this the body answers yes everywhere,
  * which is the same answer it gave before the range existed. */
 #define JIT_MAX_CLOBBER 24u
+/* Appends and storage stamps the measuring pass records per body; see
+ * Emit::pushOff. Running out answers "unknown", which only costs a hoist. */
+#define JIT_MAX_PUSHREC 24u
+/* A hoisted header is proved distinct from at most this many append targets
+ * at the hoist; a loop appending to more lists hoists nothing. */
+#define JIT_MAX_HOIST_ALIAS 4u
+#define JIT_PUSH_UNKNOWN (-1)
+#define JIT_PUSH_FRESH   (-2)
 /* Distinct offsets the `match` arms may branch to across a discarded OP_POP
  * (see matchMissResume). One per alternative of one `match`, and `_is_operator`
  * in the lexer -- the largest in the tree -- has 40. Past this the arm refuses,
@@ -159,13 +167,17 @@ _Static_assert(SLOT_DYNAMIC == SLOT_MAYBE_OBJ + 1 && SLOT_DYNAMIC == 16,
 #define FIXUP_EXIT     (FIXUP_DEOPT - JIT_MAX_DEOPT)         /* minus an exit index */
 #define FIXUP_SELFSLOW (FIXUP_EXIT - JIT_MAX_EXIT)           /* minus a self-call index */
 #define FIXUP_GROW     (FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW)  /* minus a growth index */
+#define JIT_MAX_COLD      48u
+#define FIXUP_COLD     (FIXUP_GROW - JIT_MAX_GROW)           /* minus a cold index */
 
 /* Every sentinel range must stay above any offset a real chunk can have. A
  * chunk that large is not representable long before this matters, so half the
  * u32 range is an enormous margin -- the point is that the build fails if the
  * tables ever grow enough to reach down into bytecode-offset territory. */
-_Static_assert(FIXUP_GROW - JIT_MAX_GROW > UINT32_MAX / 2u,
+_Static_assert(FIXUP_COLD - JIT_MAX_COLD > UINT32_MAX / 2u,
                "jit fixup sentinels have grown down into bytecode offsets");
+_Static_assert(FIXUP_COLD < FIXUP_GROW - (JIT_MAX_GROW - 1u),
+               "jit growth and cold fixup ranges overlap");
 _Static_assert(FIXUP_EXIT < FIXUP_DEOPT - (JIT_MAX_DEOPT - 1u),
                "jit deopt and exit fixup ranges overlap");
 _Static_assert(FIXUP_SELFSLOW < FIXUP_EXIT - (JIT_MAX_EXIT - 1u),
@@ -482,6 +494,29 @@ typedef struct {
     uint32_t  clobberOff[JIT_MAX_CLOBBER];
     unsigned  clobberCount;
     bool      clobberSpill;
+    /* Every list append the body makes, when the grow stub keeps the
+     * registers (jitGrowKeeps): such an append is no longer a clobber, so
+     * regionCalls stops seeing it -- but it still moves ONE list's `items`
+     * and `count`, and a header hoisted over it must not be that list. So the
+     * measuring pass records, per append, the local the target was read out
+     * of: a slot, JIT_PUSH_UNKNOWN for a target with no local behind it (a
+     * field, a subscript, a call's result), or JIT_PUSH_FRESH for a
+     * comprehension's accumulator, which no local can name while its loop
+     * runs. planHoists asks this before hoisting anything over an append.
+     * Overflow sets `pushSpill`, which reads as an unknown target everywhere. */
+    uint32_t  pushOff[JIT_MAX_PUSHREC];
+    int16_t   pushSlot[JIT_MAX_PUSHREC];
+    unsigned  pushCount;
+    bool      pushSpill;
+    /* Every OP_ELEM_KIND that may stamp an unboxed storage onto an empty list.
+     * It is the one thing compiled code does that changes a list's `stg`
+     * without calling out, and with appends no longer counting as calls a
+     * loop could otherwise pin a slot's storage over one -- `var b: list[int]
+     * = a` re-stamping the empty list `a` pinned BOXED, and the append that
+     * follows storing at the wrong width. A region holding one pins nothing. */
+    uint32_t  stampOff[JIT_MAX_PUSHREC];
+    unsigned  stampCount;
+    bool      stampSpill;
     /* The deepest the operand stack ever was at one of those sites. Every entry
      * live when a helper runs is below it, so every entry AT or ABOVE it is
      * provably never live across a call -- which is the whole condition for
@@ -549,6 +584,18 @@ typedef struct {
          * countReg `length`, and the head has already proved the local is a
          * string whose every scalar is one byte. See planHoists. */
         bool     str;
+        /* Every subscript of the slot lies inside this loop, so the slot's
+         * span is this loop's and the head may prove its bounds. */
+        bool     inside;
+        /* The locals the loop appends to. Not this slot (planHoists refused
+         * that), but possibly the same LIST under another name, so the hoist
+         * proves the pointers differ before the loop runs. */
+        uint8_t  aliasCount;
+        uint8_t  aliasSlot[JIT_MAX_HOIST_ALIAS];
+        /* The storage this hoist proves at the head, so every access inside
+         * the loop is emitted at it with no test (see jitHoistPinOn). */
+        bool     stgPin;
+        uint8_t  stg;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
     /* Loop-invariant FACTS about a string local, proved once at a loop head
@@ -647,8 +694,40 @@ typedef struct {
         unsigned valReg;
         unsigned tag;
         unsigned countReg;
+        /* The stub saves and restores every caller-saved register the body
+         * can hold a value in, so the append is not a clobber (see
+         * jitGrowKeeps). Decided per site, at the site, so the stub can never
+         * disagree with what the walk assumed. */
+        bool     keeps;
+        /* The site dispatches on storage after the grow, so jitListGrow may
+         * unbox an untyped list it grows past JAI_LIST_SHAPE_AT. Cleared by
+         * emitGrowStubs when the body also appends an object to the same
+         * local (see jitShapeSiblingsOn). */
+        bool     shape;
+        /* The local appended to, or JIT_PUSH_UNKNOWN (also for an inlined
+         * body, whose slots are the callee's). */
+        int16_t  target;
     } grow[JIT_MAX_GROW];
     unsigned  growCount;
+    /* One instruction a rare branch takes out of line and comes straight
+     * back from (see emitColdFixup), so the common path falls through. */
+    struct {
+        int      stub;
+        int      returnTo;
+        uint32_t insn;
+        /* 0: `insn` and back. 1: a bounds check's negative-index arm (see
+         * emitBoundsNormalise): add the count, re-check, deopt to record
+         * `deoptK` or come back. */
+        uint8_t  kind;
+        uint8_t  rOut, rCount;
+        bool     countW;
+        int      deoptK;
+        /* kind 2: an element read's BOXED arm (see OP_GET_INDEX): the items
+         * register and the tag the element must carry. */
+        uint8_t  rItems;
+        uint32_t tag;
+    } cold[JIT_MAX_COLD];
+    unsigned  coldCount;
     uint32_t  curOffset;
     uint32_t  chainSkip[JIT_MAX_CHAIN];
     unsigned  chainSkipCount;
@@ -841,7 +920,9 @@ int jitMakeEnumIter(JitCallDesc *d);
  * function tier's enumerate arm, so all three refuse on the same data. */
 bool jitListHeadSample(const ObjList *src, int at, Value *sample, bool *mixed);
 int jitFormat(JitCallDesc *d);
-int jitListGrow(ObjList *list, uint64_t tag, int64_t payload);
+int jitListGrow(ObjList *list, uint64_t tag, int64_t payload,
+                int64_t mayShape);
+bool jitListShapeable(Value v);
 ObjInstance *jitInstanceAlloc(ObjClass *cls);
 ObjIter *jitIterAlloc(Obj *source);
 bool jitIterAllocOn(void);
@@ -927,6 +1008,14 @@ void emitEpilogue(Emit *e, unsigned bailed);
 void emitEpilogueKeepX1(Emit *e);
 void emitReturnLeave(Emit *e, SlotKind k);
 bool jitSplitStress(void);
+bool jitGrowKeeps(void);
+bool jitHoistPinOn(void);
+bool jitSplitHoistsOn(void);
+bool jitHoistPartialOn(void);
+bool jitIndexedLoadOn(void);
+void notePushTarget(Emit *e, int slot);
+void noteStorageStamp(Emit *e);
+bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi);
 bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi);
 void planHoists(Emit *e, ObjFunction *fn);
 const char *declineReason(Emit *e);
@@ -1117,7 +1206,7 @@ const char *jaiFeedbackName(uint8_t fb);
 bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag,
                              uint8_t *objType);
 bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
-                          int slot);
+                          int slot, int target);
 bool siteInvokeResultKind(const Chunk *chunk, uint16_t cacheIdx,
                                  SlotKind *k, unsigned *tag);
 bool rawObjValue(Value v);
@@ -1204,6 +1293,11 @@ void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
 bool powerOfTwoShift(int64_t k, unsigned *shift);
 bool inlineMethodCall(Emit *e, ObjFunction *caller, ObjClosure *method,
                       unsigned argc, uint32_t callOff);
+bool emitColdFixup(Emit *e, unsigned rrem, uint32_t insn);
+int deoptRecordNow(Emit *e);
+bool jitDeoptStressOn(void);
+bool jitBoundsColdOn(void);
+bool jitDispatchColdOn(void);
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg);
 bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,

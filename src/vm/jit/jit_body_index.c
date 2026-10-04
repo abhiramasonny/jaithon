@@ -761,6 +761,40 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
         } else {
             emitListHeader(e, rList, gItems, gCount);
         }
+        /* Everything about this element is settled before a word of it is
+         * read: the head proved the index in bounds and non-negative, the
+         * header is in registers, and the storage is static and unboxed,
+         * so there is no tag to check and the stride is the access width.
+         * One register-offset load does what the add, the copy into the
+         * normalisation scratch and the load did (jitIndexedLoadOn). */
+        if (!gAcc.dynamic && gAcc.stg != LIST_STORE_BOXED &&
+            jitIndexedLoadOn()) {
+            /* Not proved at the head: normalised and checked here as every
+             * subscript is, and then the same single load off the result. */
+            unsigned rI = rIdx;
+            if (!(gHoisted && gh >= 0)) {
+                emitBoundsNormalise(e, rIdx, gCount, JIT_SCRATCH_B, true);
+                rI = JIT_SCRATCH_B;
+            }
+            unsigned dg1, dg2;
+            if (!popValue(e, &dg1, NULL)) return false;
+            if (!popValue(e, &dg2, NULL)) return false;
+            if (!pushValue3(e, kind, elemShape, elemClass, elem, -1)) {
+                return false;
+            }
+            if (kind == SLOT_BOOL) {
+                emit(e, jaiA64LdrByteIdx(pushReg(e) - 1, gItems, rI));
+            } else if (kind == SLOT_FLOAT &&
+                       fpWorthLoading(e, code, off + 1, stop)) {
+                unsigned idx = e->valueDepth - 1;
+                emit(e, jaiA64LdrDIdx(fpRegAt(e, idx), gItems, rI));
+                fpClaim(e, idx);
+            } else {
+                emit(e, jaiA64LdrXIdx(pushReg(e) - 1, gItems, rI));
+            }
+            off += 1;
+            break;
+        }
         if (gHoisted) {
             /* The head proved it. Only the normalisation copy is left, and
              * a shaped index is non-negative by that same proof, so even
@@ -774,6 +808,42 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
          * on the element, which is what lets one load serve them: a boxed
          * element's payload is eight bytes into it, an unboxed element IS
          * its payload. */
+        /* The predicted (unboxed) arm falls through and the boxed one waits
+         * after the body (jitDispatchColdOn). Inline, one of the two always
+         * took a branch -- the `b.eq` to the unboxed arm, or the boxed arm's
+         * `b` over it -- and since an untyped list of ints is unboxed too
+         * once it is longer than eight (JAITHON_LIST_SHAPE_GROWN), the taken
+         * one was the common one. */
+        bool gColdDone = false;
+        if (gAcc.dynamic && gAcc.stg == LIST_STORE_BOXED &&
+            (kind == SLOT_INT || kind == SLOT_FLOAT || kind == SLOT_BOOL) &&
+            jitDispatchColdOn() && e->coldCount < JIT_MAX_COLD &&
+            e->fixupCount < JIT_MAX_FIXUPS) {
+            int dk = deoptRecordNow(e);
+            if (dk >= 0) {
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_D, rList,
+                                      (unsigned)offsetof(ObjList, stg)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, gAcc.alt));
+                unsigned ci = e->coldCount++;
+                e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                e->fixups[e->fixupCount].targetOffset = FIXUP_COLD - ci;
+                e->fixups[e->fixupCount].conditional  = true;
+                e->fixups[e->fixupCount].depth        = -1;
+                e->fixupCount++;
+                emit(e, jaiA64BCond(JAI_A64_NE, 0));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems, JIT_SCRATCH_B,
+                                      listStgShift(gAcc.alt)));
+                e->cold[ci].stub     = -1;
+                e->cold[ci].returnTo = (int)e->count;
+                e->cold[ci].insn     = 0;
+                e->cold[ci].kind     = 2;
+                e->cold[ci].deoptK   = dk;
+                e->cold[ci].rItems   = (uint8_t)gItems;
+                e->cold[ci].tag      = tag;
+                gColdDone = true;
+            }
+        }
+        if (!gColdDone) {
         int gSkip = listDispatchBegin(e, &gAcc, rList, JIT_SCRATCH_D);
 
         emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems,
@@ -825,6 +895,7 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems, JIT_SCRATCH_B,
                                   listStgShift(gAcc.alt)));
             listDispatchEnd(e, gJoin);
+        }
         }
 
         unsigned d1, d2;
@@ -941,6 +1012,23 @@ bool emitSetIndex(Emit *e, int *offp) {
         } else {
             emitListHeader(e, rList, sItems, sCount);
         }
+        if (!sAcc.dynamic && sAcc.stg != LIST_STORE_BOXED &&
+            jitIndexedLoadOn()) {
+            /* The store half of the single-load read: static unboxed storage
+             * needs no tag and its stride is the access width, so the
+             * element is one register-offset store off the index. A double
+             * is stored from its X register, as emitElemStoreAt does. */
+            unsigned rI = rIdx;
+            if (!(sHoisted && sh >= 0)) {
+                emitBoundsNormalise(e, rIdx, sCount, JIT_SCRATCH_B, true);
+                rI = JIT_SCRATCH_B;
+            }
+            if (sAcc.stg == LIST_STORE_U8) {
+                emit(e, jaiA64StrByteIdx(rVal, sItems, rI));
+            } else {
+                emit(e, jaiA64StrXIdx(rVal, sItems, rI));
+            }
+        } else {
         if (sHoisted) {
             emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
         } else {
@@ -953,6 +1041,7 @@ bool emitSetIndex(Emit *e, int *offp) {
             int sJoin = listDispatchElse(e, sSkip);
             emitElemStoreAt(e, sAcc.alt, sItems, JIT_SCRATCH_B, vtag, rVal);
             listDispatchEnd(e, sJoin);
+        }
         }
         /* jaiListTouch: the count has not changed, so only the version
          * tells an iterator that the list moved under it. */

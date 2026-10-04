@@ -259,6 +259,31 @@ void jaiPrepareFn1(Value callee, JaiPreparedFn1 *prepared);
  * including every fallback it makes. */
 bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out);
 
+/* The length at which an untyped boxed list that has held only one of int,
+ * float or bool takes that kind's unboxed storage, on the push that grows it
+ * past this many (object_collection.c, jaiListShapeOnGrow). Returns true when
+ * it did, with room made for that push; false leaves the list untouched for
+ * the ordinary growth. JAITHON_LIST_SHAPE_GROWN=0 turns it off. */
+#define JAI_LIST_SHAPE_AT 8
+bool jaiListShapeOnGrow(ObjList *list, Value v);
+bool jaiListShapeGrownOn(void);
+
+/* A run of jaiCallPreparedFn1 over `src` from element `from`, appending each
+ * result to `dst` -- for a flat callee that takes an int or a float and
+ * returns an int, a float or a bool, with every per-callee check and the stack
+ * window hoisted out of the loop. Stops
+ * at the first element it cannot take that way and returns its index (`from`
+ * itself when it took none); the caller takes that element the ordinary way
+ * and may call again. `*ok` false means the callee raised, and the caller must
+ * stop. JAITHON_MAP_RUN=0 turns it off (jaiMapRunOn). */
+int  jaiMapPreparedFn1Run(JaiPreparedFn1 *prepared, ObjList *src, int from,
+                          ObjList *dst, bool *ok);
+bool jaiMapRunOn(void);
+/* The same run for list.filter: a flat callee taking an int or a float and
+ * returning a bool; each element it keeps is appended to `dst`. */
+int  jaiFilterPreparedFn1(JaiPreparedFn1 *prepared, ObjList *src, int from,
+                          ObjList *dst, bool *ok);
+
 /* Finish, in the interpreter, a one-argument compiled call that deoptimised
  * part-way: the body already ran and may have written, so it must not be
  * re-entered from the top. `base` is the two-cell window [closure, argument]
