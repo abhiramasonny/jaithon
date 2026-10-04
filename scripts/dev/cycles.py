@@ -15,10 +15,15 @@
 #:     scripts/dev/cycles.py --ab ./jaithon-base ./jaithon -- run x.jai
 #:     scripts/dev/cycles.py --env JAITHON_FOO=0 JAITHON_FOO=1 -- ./jaithon run x.jai
 #:
+#: With --env the two settings share one binary and are interleaved A,B,A,B.
+#:
 #: With --ab the first word after `--` is replaced by each binary in turn; the
-#: rest of the command is shared. Runs are interleaved A,B,A,B and the first
-#: pair is discarded (a cold __jaicache__ or a cold page cache is not the
-#: change being measured).
+#: rest of the command is shared. Two builds from different sources have
+#: different build fingerprints and `__jaicache__` is keyed on it, so
+#: alternating them run by run makes EVERY sample recompile the stdlib (10x the
+#: real runtime on json_parse, and a 1.86x change read as 1.16x). --ab therefore
+#: runs BLOCKS -- A block, B block, A block -- and discards the first run of
+#: each. Prefer an env switch in one binary whenever the change allows one.
 
 import argparse
 import os
@@ -93,13 +98,18 @@ def main():
         k, _, v = a.env[which].partition("=")
         return cmd, {k: v}
 
-    run_once(*side(0))
-    run_once(*side(1))
     A, B, A2 = [], [], []
-    for i in range(a.n):
-        A.append(run_once(*side(0)))
-        B.append(run_once(*side(1)))
-        A2.append(run_once(*side(0)))
+    if a.ab:
+        for rows, which in ((A, 0), (B, 1), (A2, 0)):
+            run_once(*side(which))  # discard: this block's cold cache
+            rows.extend(run_once(*side(which)) for _ in range(a.n))
+    else:
+        run_once(*side(0))
+        run_once(*side(1))
+        for i in range(a.n):
+            A.append(run_once(*side(0)))
+            B.append(run_once(*side(1)))
+            A2.append(run_once(*side(0)))
     ma = summarise(A, "A")
     mb = summarise(B, "B")
     ma2 = summarise(A2, "A again")
