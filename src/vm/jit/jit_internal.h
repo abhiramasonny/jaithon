@@ -821,6 +821,8 @@ bool jitListHeadSample(const ObjList *src, int at, Value *sample, bool *mixed);
 int jitFormat(JitCallDesc *d);
 int jitListGrow(ObjList *list, uint64_t tag, int64_t payload);
 ObjInstance *jitInstanceAlloc(ObjClass *cls);
+ObjIter *jitIterAlloc(Obj *source);
+bool jitIterAllocOn(void);
 int jitNewInstance(JitCallDesc *d);
 int jitGetSlice(JitCallDesc *d);
 int jitGetIndexDict(JitCallDesc *d);

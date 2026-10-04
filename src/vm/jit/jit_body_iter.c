@@ -82,9 +82,34 @@ bool emitGetIter(Emit *e, int *offp) {
                 }
                 return false;
             }
+            /* The leaf first, as emitCallOut does for an instance: it hands
+             * back the iterator in x0, or NULL when only the descriptor path
+             * (which may collect) can make one. Both paths leave it in
+             * JIT_SCRATCH_C. */
+            unsigned skipSlow = 0;
+            bool fastIter = jitIterAllocOn() && !e->inlining;
+            if (fastIter) {
+                unsigned rsrc = xHeldIn(e, e->valueDepth - 1);
+                if (rsrc != 0) emit(e, jaiA64MovX(0, rsrc));
+                emitConst64(e, JIT_SCRATCH_A,
+                            (int64_t)(uintptr_t)&jitIterAlloc);
+                noteScratchClobber(e);
+                emit(e, jaiA64Blr(JIT_SCRATCH_A));
+                emit(e, jaiA64MovX(JIT_SCRATCH_C, 0));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
+                skipSlow = e->count;
+                emit(e, jaiA64BCond(JAI_A64_NE, 0));   /* patched below */
+            }
             if (!emitDescriptor(e, NULL_VAL, e->depth - 1, 1,
                                 (void *)&jitMakeIter)) {
                 return false;
+            }
+            emit(e, jaiA64LdrX(JIT_SCRATCH_C, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            if (fastIter && skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
+                e->code[skipSlow] =
+                    jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
             }
             unsigned rdrop;
             if (!popValue(e, &rdrop, NULL)) return false;
@@ -98,9 +123,7 @@ bool emitGetIter(Emit *e, int *offp) {
              * head on every call and ran interpreted. */
             if (!pushValue3(e, SLOT_ITER, strIter ? 5u : 1u, NULL, sample, -1))
                 return false;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                               e->descOffset +
-                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
             e->wroteHeap = true;
             off += 1;
             break;

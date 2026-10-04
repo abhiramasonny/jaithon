@@ -453,6 +453,66 @@ ObjInstance *jitInstanceAlloc(ObjClass *cls) {
     return inst;
 }
 
+/* JAITHON_JIT_ITER_ALLOC=0 builds every loop iterator through the jitMakeIter
+ * descriptor again. */
+bool jitIterAllocOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_ALLOC");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The iterator `for x in xs` / `for c in text` opens with, made the way
+ * jitInstanceAlloc makes an instance: a leaf that cannot collect, declining
+ * (NULL) whenever a collection is wanted, so the caller falls back to the
+ * jitMakeIter descriptor and its roots. Every field is the one jaiIterNew
+ * writes for ITER_LIST and ITER_STRING -- kind, source, the limit sampled
+ * now, the list's version -- and the index starts at zero. A loop entered
+ * per call over a short word or a three-element list paid the descriptor's
+ * stores and root push for 40 bytes; that was most of what such a call cost
+ * over the same loop written with an index. */
+ObjIter *jitIterAlloc(Obj *source) {
+#ifdef JAI_ALLOC_CENSUS
+    (void)source;
+    return NULL;   /* keep the census counting every iterator */
+#else
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    GCState *g = jaiGCActive;
+    if (JAI_UNLIKELY(g == NULL || source == NULL)) return NULL;
+    if (JAI_UNLIKELY(!jaiSmallServes(sizeof(ObjIter)))) return NULL;
+
+    IterKind kind;
+    int64_t limit;
+    uint32_t version = 0;
+    if (source->type == OBJ_LIST) {
+        kind = ITER_LIST;
+        limit = ((ObjList *)source)->count;
+        version = ((ObjList *)source)->version;
+    } else if (source->type == OBJ_STRING) {
+        kind = ITER_STRING;
+        limit = (int64_t)((ObjString *)source)->length;
+    } else {
+        return NULL;
+    }
+
+    ObjIter *it = (ObjIter *)jaiSmallNew(sizeof(ObjIter));
+    memset(it, 0, sizeof *it);
+    Obj *obj = (Obj *)it;
+    obj->type = OBJ_ITER;
+    it->kind = kind;
+    it->source = OBJ_VAL(source);
+    it->index = 0;
+    it->limit = limit;
+    it->version = version;
+    obj->next = g->objects;
+    g->objects = obj;
+    vm.allocCount++;
+    return it;
+#endif
+}
+
 int jitNewInstance(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));
