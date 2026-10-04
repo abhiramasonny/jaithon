@@ -374,6 +374,47 @@ ObjInstance *jitInstanceAlloc(ObjClass *cls) {
     return inst;
 }
 
+/* The ITER_LIST iterator jaiIterNew builds, as a leaf: no descriptor, no
+ * roots, no collection. jitInstanceAlloc's reasoning, unchanged --
+ * jaiGCWanted() false is gc.c's own proof that nothing collects here, and the
+ * object is complete before it is linked in -- and NULL, when a collection is
+ * due, sends the caller down the descriptor path that may collect.
+ *
+ * `for x in xs` nested in a loop builds one of these on every entry, and the
+ * descriptor around jitMakeIter -- a dozen stores, the root fill of every
+ * live object in the body, the root range pushed and popped -- cost more than
+ * the 64 bytes it allocates. graph_bfs does it once per node visited. */
+ObjIter *jitListIterAlloc(ObjList *list) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+
+    GCState *g = jaiGCActive;
+    if (JAI_UNLIKELY(g == NULL || list == NULL)) return NULL;
+    if (JAI_UNLIKELY(!jaiSmallServes(sizeof(ObjIter)))) return NULL;
+#ifdef JAI_ALLOC_CENSUS
+    /* The census counts what jaiIterNew counts; keep it on that path. */
+    return NULL;
+#endif
+
+    ObjIter *it = (ObjIter *)jaiSmallNew(sizeof(ObjIter));
+    Obj *obj = (Obj *)it;
+    obj->type = OBJ_ITER;
+    obj->isMarked = false;
+    obj->subFlag = false;
+    obj->subFlag2 = false;
+
+    it->kind = ITER_LIST;
+    it->source = OBJ_VAL(list);
+    it->index = 0;
+    it->limit = list->count;
+    it->version = list->version;
+
+    obj->next = g->objects;
+    g->objects = obj;
+
+    vm.allocCount++;
+    return it;
+}
+
 int jitNewInstance(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));

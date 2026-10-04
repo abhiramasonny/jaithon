@@ -868,6 +868,8 @@ bool jitGrowKeeps(void);
 bool jitHoistPinOn(void);
 bool jitSplitHoistsOn(void);
 bool jitHoistPartialOn(void);
+bool jitFastIterOn(void);
+ObjIter *jitListIterAlloc(ObjList *list);
 void notePushTarget(Emit *e, int slot);
 void noteStorageStamp(Emit *e);
 bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi);
