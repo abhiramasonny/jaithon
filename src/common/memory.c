@@ -911,12 +911,6 @@ bool jaiWriteFile(const char *path, const void *data, size_t len) {
     return ok;
 }
 
-bool jaiPathExists(const char *path) {
-    struct stat st;
-    if (path == NULL) return false;
-    return stat(path, &st) == 0;
-}
-
 bool jaiPathIsDir(const char *path) {
     struct stat st;
     if (path == NULL) return false;

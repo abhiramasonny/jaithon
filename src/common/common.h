@@ -273,7 +273,6 @@ bool    jaiUtf8Validate(const char *s, size_t len);
 
 char *jaiReadFile(const char *path, size_t *outLen);
 bool  jaiWriteFile(const char *path, const void *data, size_t len);
-bool  jaiPathExists(const char *path);
 bool  jaiPathIsDir(const char *path);
 bool  jaiMakeDirs(const char *path);
 void  jaiPathJoin(char *out, size_t outSize, const char *a, const char *b);
