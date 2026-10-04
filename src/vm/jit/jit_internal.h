@@ -989,8 +989,6 @@ void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount);
 int hoistFor(const Emit *e, int slot);
 int hoistForStr(const Emit *e, int slot);
-bool jitStrHoist(void);
-bool jitStrFacts(void);
 ObjDict *jitDictExemplar(void);
 bool jitFieldDict(void);
 bool jitIterSoft(void);

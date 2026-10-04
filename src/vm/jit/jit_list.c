@@ -267,7 +267,7 @@ int hoistForStr(const Emit *e, int slot) {
 /* JAITHON_JIT_STR_FACTS=0 stops planStrFacts proving anything at a loop head,
  * so each `s[i]` and each identity compare on a loop-invariant string local
  * guards its own operand again, every iteration. Default on. */
-bool jitStrFacts(void) {
+static bool jitStrFacts(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_STR_FACTS");
@@ -401,7 +401,7 @@ void planStrFacts(Emit *e, ObjFunction *fn) {
  * `s[i]` in a loop goes back to proving, per character, that `s` is a string
  * and that it is all one-byte scalars, and to reloading `chars` and `length`.
  * Default on. */
-bool jitStrHoist(void) {
+static bool jitStrHoist(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_STR_HOIST");
