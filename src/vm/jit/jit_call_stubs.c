@@ -178,7 +178,38 @@ static void growKeepArg(Emit *e, unsigned dst, unsigned src) {
     }
 }
 
+/* JAITHON_JIT_SHAPE_SIBLINGS=0 lets every dispatching append shape. On by
+ * default.
+ *
+ * An append that may unbox the list it grows (Emit::grow[].shape) does not,
+ * when the same body also appends an object to the same local: `var r = []`,
+ * ten ints, then `r.push("end")`. Shaped, the list reaches that last append
+ * unboxed, its boxed-storage guard fails, and the body deoptimises -- every
+ * call, 0.54x on a hot builder of such lists. Unshaped, nothing in this body
+ * changes; the append after the grow dispatches on whatever storage the list
+ * has, so declining to shape is never wrong, only a list left boxed. */
+static bool jitShapeSiblingsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_SHAPE_SIBLINGS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 void emitGrowStubs(Emit *e) {
+    if (jitShapeSiblingsOn()) {
+        for (unsigned gi = 0; gi < e->growCount; gi++) {
+            if (!e->grow[gi].shape || e->grow[gi].target < 0) continue;
+            for (unsigned gj = 0; gj < e->growCount; gj++) {
+                if (e->grow[gj].target == e->grow[gi].target &&
+                    e->grow[gj].tag == VAL_OBJ) {
+                    e->grow[gi].shape = false;
+                    break;
+                }
+            }
+        }
+    }
     for (unsigned gi = 0; gi < e->growCount; gi++) {
         e->grow[gi].stub = (int)e->count;
         if (e->grow[gi].keeps) {

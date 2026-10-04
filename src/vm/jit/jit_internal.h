@@ -656,8 +656,13 @@ typedef struct {
          * disagree with what the walk assumed. */
         bool     keeps;
         /* The site dispatches on storage after the grow, so jitListGrow may
-         * give an untyped empty list its first element's storage. */
+         * unbox an untyped list it grows past JAI_LIST_SHAPE_AT. Cleared by
+         * emitGrowStubs when the body also appends an object to the same
+         * local (see jitShapeSiblingsOn). */
         bool     shape;
+        /* The local appended to, or JIT_PUSH_UNKNOWN (also for an inlined
+         * body, whose slots are the callee's). */
+        int16_t  target;
     } grow[JIT_MAX_GROW];
     unsigned  growCount;
     /* One instruction a rare branch takes out of line and comes straight
