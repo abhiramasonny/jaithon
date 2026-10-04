@@ -23,10 +23,24 @@ pub const DIST_WELSCH = 6
 #: Fit a line by the Huber loss.
 pub const DIST_HUBER = 7
 
+#: Whether `match_shapes` takes Hu invariants from `__prim__.points_hu`, which
+#: makes them from the points without the two `Moments` objects between.
+#: Read once; `JAICV_NATIVE_MEASURES=0` turns it off with `moments`.
+let _native_hu = (env("JAICV_NATIVE_MEASURES") ?? "1") != "0"
+
+#: The Hu invariants of a contour, which is `hu_moments(moments(points))`.
+fn hu_of(points: list[Point]) -> list[float] {
+    if _native_hu {
+        let native = __prim__.points_hu(points)
+        if native is not null { return native }
+    }
+    return hu_moments(moments(points))
+}
+
 #: Compare two shapes by their Hu moments.
 pub fn match_shapes(a: list[Point], b: list[Point], method: int = CONTOURS_MATCH_I1) -> float {
-    let ha = hu_moments(moments(a))
-    let hb = hu_moments(moments(b))
+    let ha = hu_of(a)
+    let hb = hu_of(b)
     var total = 0.0
     var worst = 0.0
     for index in 0..7 {

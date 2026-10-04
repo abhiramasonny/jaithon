@@ -1146,6 +1146,127 @@ static bool primPointsFitLine(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `points_hu(points)` -- the seven Hu invariants of a contour of one or more
+ * points, as `hu_moments(moments(points))` makes them: the ten Green's
+ * theorem sums, signed and scaled as `moments_of_sums` scales them, the
+ * central and normalised moments as `Moments.init` derives them, and the
+ * seven combinations `hu_moments` takes -- each operation the Jaithon's, in
+ * its order. `match_shapes` asks for two of these a comparison, and making
+ * each through two objects and their twenty-four fields was most of its cost:
+ * 3600 comparisons took 21.7 ms against OpenCV's 2.9.
+ *
+ * Returns a new list of seven floats, or null when a point is not an object
+ * with integer `x` and `y`. */
+static bool primPointsHu(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *contour;
+    if (!jaiArgList(args[0], 1, "points_hu", &contour)) return false;
+    *out = NULL_VAL;
+    const int count = contour->count;
+    if (count == 0) return true;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    int64_t ix, iy;
+    if (!jaiReadPoint(&reader, jaiListGet(contour, count - 1), &ix, &iy)) return true;
+    double a00 = 0.0, a10 = 0.0, a01 = 0.0, a20 = 0.0, a11 = 0.0;
+    double a02 = 0.0, a30 = 0.0, a21 = 0.0, a12 = 0.0, a03 = 0.0;
+    double px = (double)ix, py = (double)iy;
+    double px2 = px * px, py2 = py * py;
+    for (int index = 0; index < count; index++) {
+        if (!jaiReadPoint(&reader, jaiListGet(contour, index), &ix, &iy)) return true;
+        const double x = (double)ix, y = (double)iy;
+        const double x2 = x * x, y2 = y * y;
+        const double cross = px * y - x * py;
+        const double sx = px + x, sy = py + y;
+        a00 += cross;
+        a10 += cross * sx;
+        a01 += cross * sy;
+        a20 += cross * (px * sx + x2);
+        a11 += cross * (px * (sy + py) + x * (sy + y));
+        a02 += cross * (py * sy + y2);
+        a30 += cross * sx * (px2 + x2);
+        a03 += cross * sy * (py2 + y2);
+        a21 += cross * (px2 * (3.0 * py + y) + 2.0 * px * x * sy + x2 * (py + 3.0 * y));
+        a12 += cross * (py2 * (3.0 * px + x) + 2.0 * py * y * sx + y2 * (px + 3.0 * x));
+        px = x;
+        py = y;
+        px2 = x2;
+        py2 = y2;
+    }
+
+    /* `moments_of_sums`. */
+    double m[10] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    if (!(fabs(a00) <= 1e-12)) {
+        const double sign = a00 > 0.0 ? 1.0 : -1.0;
+        m[0] = a00 * sign / 2.0;
+        m[1] = a10 * sign / 6.0;
+        m[2] = a01 * sign / 6.0;
+        m[3] = a20 * sign / 12.0;
+        m[4] = a11 * sign / 24.0;
+        m[5] = a02 * sign / 12.0;
+        m[6] = a30 * sign / 20.0;
+        m[7] = a21 * sign / 60.0;
+        m[8] = a12 * sign / 60.0;
+        m[9] = a03 * sign / 20.0;
+    }
+    const double m00 = m[0], m10 = m[1], m01 = m[2], m20 = m[3], m11 = m[4];
+    const double m02 = m[5], m30 = m[6], m21 = m[7], m12 = m[8], m03 = m[9];
+
+    /* `Moments.init`. */
+    double inverse = 0.0, cx = 0.0, cy = 0.0;
+    if (fabs(m00) > 1e-12) {
+        inverse = 1.0 / m00;
+        cx = m10 * inverse;
+        cy = m01 * inverse;
+    }
+    const double mu20 = m20 - m10 * cx;
+    double mu11 = m11 - m10 * cy;
+    const double mu02 = m02 - m01 * cy;
+    const double kept11 = mu11;
+    const double mu30 = m30 - cx * (3.0 * mu20 + cx * m10);
+    mu11 = mu11 + mu11;
+    const double mu21 = m21 - cx * (mu11 + cx * m01) - cy * mu20;
+    const double mu12 = m12 - cy * (mu11 + cy * m10) - cx * mu02;
+    const double mu03 = m03 - cy * (3.0 * mu02 + cy * m01);
+    const double root = sqrt(fabs(inverse));
+    const double s2 = inverse * inverse;
+    const double s3 = s2 * root;
+    const double n20 = mu20 * s2;
+    const double n11 = kept11 * s2;
+    const double n02 = mu02 * s2;
+    const double n30 = mu30 * s3;
+    const double n21 = mu21 * s3;
+    const double n12 = mu12 * s3;
+    const double n03 = mu03 * s3;
+
+    /* `hu_moments`. */
+    const double t0 = n30 + n12;
+    const double t1 = n21 + n03;
+    const double q0 = t0 * t0;
+    const double q1 = t1 * t1;
+    const double n4 = 4.0 * n11;
+    const double s = n20 + n02;
+    const double d = n20 - n02;
+    const double sum0 = q0 - 3.0 * q1;
+    const double sum1 = 3.0 * q0 - q1;
+    const double hu[7] = {
+        s,
+        d * d + n4 * n11,
+        (n30 - 3.0 * n12) * (n30 - 3.0 * n12) + (3.0 * n21 - n03) * (3.0 * n21 - n03),
+        q0 + q1,
+        (n30 - 3.0 * n12) * t0 * sum0 + (3.0 * n21 - n03) * t1 * sum1,
+        d * (q0 - q1) + n4 * t0 * t1,
+        (3.0 * n21 - n03) * t0 * sum0 - (n30 - 3.0 * n12) * t1 * sum1,
+    };
+    ObjList *made = jaiListNew(7);
+    if (made == NULL) return false;
+    jaiGCPushRoot(OBJ_VAL(made));
+    for (int i = 0; i < 7; i++) jaiListPush(made, FLOAT_VAL(hu[i]));
+    jaiGCPopRoot();
+    *out = OBJ_VAL(made);
+    return true;
+}
+
 void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_hull",    primPointsHull,   2, 2);
     jaiStrDefinePrim(ns, "points_min_box", primPointsMinBox, 2, 2);
@@ -1155,4 +1276,5 @@ void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_moments", primPointsMoments, 2, 2);
     jaiStrDefinePrim(ns, "points_fit_ellipse", primPointsFitEllipse, 2, 2);
     jaiStrDefinePrim(ns, "points_fit_line", primPointsFitLine, 3, 3);
+    jaiStrDefinePrim(ns, "points_hu", primPointsHu, 1, 1);
 }
