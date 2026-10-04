@@ -125,6 +125,22 @@ ifeq ($(UNAME_S),Darwin)
   else
     LIBS += $(APPLE_FRAMEWORKS)
   endif
+  # The executable binds its ~165 libSystem imports in a flat namespace.
+  # Two-level binds all name libSystem.B, which defines almost nothing itself,
+  # so dyld walks its ~40 re-exported libraries for every one of them at every
+  # launch: ~44K instructions a bind, 7.3M of the 18.8M a process retired
+  # before main, against ~12K for a bind into a library that defines the symbol
+  # (libz). A flat lookup walks the loaded images instead and costs 2.6M less;
+  # a cached hello world went from 23.85M instructions to 21.24M, -10.7% cycles.
+  # Every one of the 165 resolves to the same address either way -- compare
+  # DYLD_PRINT_BINDINGS=1 output of the two links to re-check after an OS
+  # update -- and only the executable is flat: the Apple images and every
+  # system library keep their two-level namespaces. FLAT_NAMESPACE=0 turns it
+  # off.
+  FLAT_NAMESPACE ?= 1
+  ifeq ($(FLAT_NAMESPACE),1)
+    CORE_LDFLAGS := -Wl,-flat_namespace
+  endif
 endif
 
 # --- readline probe ---------------------------------------------------------
@@ -417,7 +433,7 @@ $(BUILD)/src/vm/bytecode/serialize_write.o: $(BUILD_ID_H)
 # the right trade: no binary is honest, and the wrong binary is the bug.
 LINK_STAMP := $(BUILD_ROOT)/.link-id
 CC_STAMP   := $(BUILD)/.cc-id
-LINK_ID    := $(BUILD_NAME) | $(CC) | $(LDFLAGS) | $(EXTRA_LDFLAGS) | $(LIBS)
+LINK_ID    := $(BUILD_NAME) | $(CC) | $(LDFLAGS) | $(EXTRA_LDFLAGS) | $(LIBS) $(CORE_LDFLAGS)
 CC_ID      := $(CC) | $(CFLAGS) | $(EXTRA_CFLAGS)
 
 # Those checks throw away build products, so they stay out of goals that do not
@@ -467,7 +483,7 @@ $(CC_STAMP):
 # old identity recorded, so the next make retries instead of believing it.
 $(TARGET): $(OBJS)
 	@echo "  LINK    $@ ($(BUILD_NAME))"
-	@$(CC) $(LDFLAGS) $(EXTRA_LDFLAGS) -o $@ $(OBJS) $(LIBS)
+	@$(CC) $(LDFLAGS) $(EXTRA_LDFLAGS) $(CORE_LDFLAGS) -o $@ $(OBJS) $(LIBS)
 ifeq ($(NATIVE_SPLIT),1)
 # Beside the binary under their UUID names, which is where the loader looks. A
 # copy of the binary (./jaithon-base) keeps finding the images it was built
