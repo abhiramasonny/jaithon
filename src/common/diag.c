@@ -66,6 +66,25 @@ static void buildLineIndex(JaiSourceFile *f) {
     }
 }
 
+/* The line index is built on first use, not at registration. Every module a
+ * program imports registers its source -- 98 of them, 1.1MB, before `check`
+ * of a one-line file can start -- and almost none is ever asked for a line:
+ * that only happens when a diagnostic or a traceback points into it. Building
+ * them all up front was ~0.95ms of every front-end load, spent on a memchr
+ * call per line. JAITHON_EAGER_LINE_INDEX=1 restores the eager build. */
+static bool eagerLineIndex(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("JAITHON_EAGER_LINE_INDEX");
+        cached = (s != NULL && s[0] != '\0' && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static void ensureLineIndex(JaiSourceFile *f) {
+    if (f->lineStarts == NULL) buildLineIndex(f);
+}
+
 int jaiSourceAdd(const char *path, char *source, size_t length) {
     JaiSourceFile f;
     memset(&f, 0, sizeof f);
@@ -73,7 +92,7 @@ int jaiSourceAdd(const char *path, char *source, size_t length) {
     f.path = jaiStrdup(path != NULL ? path : "<unknown>");
     f.source = source;
     f.length = length;
-    buildLineIndex(&f);
+    if (eagerLineIndex()) buildLineIndex(&f);
     JAI_VEC_PUSH(JaiSourceFile, &gSources, f);
     return f.id;
 }
@@ -88,7 +107,8 @@ void jaiSourceFreeAll(void) {
         JaiSourceFile *f = &gSources.data[i];
         freeStr(f->path);
         if (f->source != NULL) (void)jaiRealloc(f->source, f->length + 1, 0);
-        JAI_FREE_ARRAY(uint32_t, f->lineStarts, f->lineCount);
+        if (f->lineStarts != NULL)
+            JAI_FREE_ARRAY(uint32_t, f->lineStarts, f->lineCount);
         f->path = NULL;
         f->source = NULL;
         f->lineStarts = NULL;
@@ -134,6 +154,7 @@ void jaiSourceLineCol(int fileId, uint32_t offset, int *line, int *col) {
 
     JaiSourceFile *f = jaiSourceGet(fileId);
     if (f == NULL) return;
+    ensureLineIndex(f);
     if (offset > f->length) offset = (uint32_t)f->length;
 
     int idx = lineIndexFor(f, offset);
@@ -149,6 +170,7 @@ const char *jaiSourceLineText(int fileId, uint32_t offset, size_t *outLen,
 
     JaiSourceFile *f = jaiSourceGet(fileId);
     if (f == NULL) return NULL;
+    ensureLineIndex(f);
     if (offset > f->length) offset = (uint32_t)f->length;
 
     int idx = lineIndexFor(f, offset);
