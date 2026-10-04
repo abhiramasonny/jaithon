@@ -56,8 +56,17 @@ enum {
     CELL_CLOSED = 3,    /* -nbd: the border ends at this pixel's eastern side */
 };
 
-/* Below this many cells the fill stays on one thread. */
-#define JAI_BORDER_FILL_CHUNK 32768
+/* Cells a fill thread is given at the least, so below twice this the fill
+ * stays on the calling thread.
+ *
+ * Set so that a 1080p frame -- two million cells, a tenth of a millisecond
+ * of reading on one core -- is filled on one thread. Spread over every core it
+ * was 0.144 ms a call against 0.2 on one with the machine quiet, but on a
+ * loaded one the call waited on whichever worker had been preempted
+ * mid-chunk: 0.38 ms at best and 0.56 typical against 0.20 and 0.26, nine
+ * runs each under a load of thirty. A frame this size does not have enough
+ * work to be worth that exposure; a 4K one still splits. */
+#define JAI_BORDER_FILL_CHUNK (4u << 20)
 
 /* A growable array of int64s, for the borders and points found. */
 typedef struct {
