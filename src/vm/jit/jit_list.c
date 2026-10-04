@@ -254,7 +254,7 @@ bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi) {
  * later loop that happens to name the same slot. */
 /* JAITHON_JIT_HOIST_STG: a hoisted list header also pins the list's storage
  * for the loop it was hoisted out of. See Emit::hoist. */
-bool jitHoistStg(void) {
+static bool jitHoistStg(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_HOIST_STG");
@@ -268,7 +268,7 @@ bool jitHoistStg(void) {
 /* JAITHON_JIT_HOIST_LEAN: a hoist takes one register for `items`, a list
  * stored into takes one for its bumped version, and counts get the rest. See
  * Emit::hoist. */
-bool jitHoistLean(void) {
+static bool jitHoistLean(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_HOIST_LEAN");

@@ -935,7 +935,6 @@ void fpReleaseHome(Emit *e, unsigned reg);
 void fpReleaseAll(Emit *e);
 void fpSyncAll(Emit *e);
 unsigned fpOperand(Emit *e, unsigned idx);
-bool jitFpReread(void);
 bool jitFTwo(void);
 void fpSrcNote(Emit *e, unsigned idx, unsigned slot);
 unsigned fpOperandReread(Emit *e, unsigned idx);
@@ -1022,12 +1021,9 @@ void emitElemStoreAt(Emit *e, uint8_t stg, unsigned rItems,
 void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount);
 int hoistFor(const Emit *e, int slot);
-bool jitHoistStg(void);
 bool jitIndexReg(void);
-bool jitHoistLean(void);
 void noteSlotStored(Emit *e, int slot);
 unsigned jitCarryLimit(void);
-unsigned jitHomeEarlyLimit(void);
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
                                 int32_t *offOut, uint8_t *baseOut);
 void emitHoistsAt(Emit *e, uint32_t off);

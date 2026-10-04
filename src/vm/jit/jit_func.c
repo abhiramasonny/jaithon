@@ -897,7 +897,7 @@ unsigned jitCarryLimit(void) {
     return jitWideCarry() ? JIT_MAX_CARRY : 64u;
 }
 
-unsigned jitHomeEarlyLimit(void) {
+static unsigned jitHomeEarlyLimit(void) {
     return jitWideCarry() ? JIT_MAX_HOME_EARLY : 32u;
 }
 
@@ -914,7 +914,7 @@ bool jitFTwo(void) {
     return cached != 0;
 }
 
-bool jitFpReread(void) {
+static bool jitFpReread(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_FP_REREAD");
