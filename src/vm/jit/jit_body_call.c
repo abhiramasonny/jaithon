@@ -1147,6 +1147,18 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
             Value oname = fn->chunk.constants.data[nameIdx];
             if (!IS_STRING(oname)) return false;
+            /* For an enum value a builtin is NOT a function of the object
+             * type and the name: the enum's own method of that name wins, and
+             * so does a variant's payload field (getPropertyInto), and the
+             * guard below proves only OBJ_ENUM_VAL. Compiled here, a site
+             * shared by `Color` and an enum declaring `ordinal` called the
+             * builtin for both. It used to be unreachable only because an
+             * enum receiver left no result kind to predict from. */
+            if (IS_ENUM_VAL(oseen)) {
+                return subWhy(e, "`.%s()` on an enum value, whose builtins its "
+                                 "own methods and fields can shadow",
+                              AS_STRING(oname)->chars);
+            }
             Value obound;
             /* Rooted across the lookup: resolving allocates the bound
              * wrapper, and a probe interned a moment ago is otherwise
