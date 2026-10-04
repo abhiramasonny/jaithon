@@ -86,6 +86,9 @@ JaiRunOptions jaiRunDefaults(void);
 
 void       jaiModulePathInit(const char *execDir);
 void       jaiModulePathAdd(const char *dir);
+/* The search path is completed lazily (module_path.c); call this before
+ * reading all of vm.modulePath. */
+void       jaiModulePathComplete(void);
 bool       jaiResolveModulePath(const char *dottedName, const char *fromDir,
                                 char *out, size_t outSize);
 bool       jaiResolveModulePathQuiet(const char *dottedName, const char *fromDir,

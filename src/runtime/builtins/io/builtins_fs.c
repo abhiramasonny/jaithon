@@ -179,6 +179,7 @@ static bool nOsArgv(int argc, Value *args, Value *out) {
 static bool nModulePath(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
+    jaiModulePathComplete();
     ObjList *result = jaiListNew(vm.modulePath.count);
     jaiGCPushRoot(OBJ_VAL(result));
     for (int i = 0; i < vm.modulePath.count; i++) {

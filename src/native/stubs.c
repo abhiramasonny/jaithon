@@ -1,7 +1,19 @@
 /* stubs.c — windowing/GPU surface for platforms with neither; gui.m and gpu.m
  * own these symbols on macOS. The four arithmetic kernels are duplicated here
  * from gpu.m rather than shared, since the two files never compile together
- * and a shared object would be dead weight on both. */
+ * and a shared object would be dead weight on both.
+ *
+ * Where the Apple code is a separate image (JAI_NATIVE_SPLIT, see
+ * native_image.h) this file is compiled on macOS too, under the names the
+ * generated rename header gives it -- jaiNativeStub_jaiGpuAvailable and so on
+ * -- and is what the core runs when that image is missing. The build also
+ * compiles it once with JAI_NATIVE_STUB_PROBE and nothing renamed, and reads
+ * the list of native functions off the result: every global jai* function
+ * defined below becomes a trampoline into the image. */
+
+#if defined(JAI_NATIVE_SPLIT) && !defined(JAI_NATIVE_STUB_PROBE)
+#include "gen/native_rename.h"
+#endif
 
 #include "native/native.h"
 
@@ -9,7 +21,7 @@
  * is compiled out. */
 typedef int JaiNativeStubsUnit;
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) || defined(JAI_NATIVE_SPLIT) || defined(JAI_NATIVE_STUB_PROBE)
 
 #include <math.h>
 
@@ -792,4 +804,4 @@ bool jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOff,
 }
 void jaiGraphPlanFree(JaiGraphPlan *plan) { (void)plan; }
 
-#endif /* !__APPLE__ */
+#endif /* !__APPLE__ || JAI_NATIVE_SPLIT */

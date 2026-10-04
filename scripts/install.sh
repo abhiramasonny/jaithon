@@ -27,6 +27,19 @@ fi
 
 $need_sudo install -d "$BIN_DIR" "$LIB_DIR"
 $need_sudo install -m 755 ./jaithon "$BIN_DIR/jaithon"
+
+# On an arm64 Mac the GPU, window and camera code is three images the binary
+# opens on first use (src/native/native_image.h). The binary names the ones it
+# was built with, so ask it rather than guessing among the copies a series of
+# builds leaves beside it.
+images="$(strings -a ./jaithon | grep -E '^jaithon-native-[a-z]+-[0-9a-f]+\.dylib$' || true)"
+if [[ -n "$images" ]]; then
+    $need_sudo install -d "$PREFIX/lib/jaithon"
+    for image in $images; do
+        $need_sudo install -m 755 "./$image" "$PREFIX/lib/jaithon/$image"
+    done
+fi
+
 $need_sudo rm -rf "$LIB_DIR/lib" "$LIB_DIR/packages"
 $need_sudo cp -R ./lib "$LIB_DIR/lib"
 $need_sudo cp -R ./packages "$LIB_DIR/packages"

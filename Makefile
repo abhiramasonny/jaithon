@@ -107,12 +107,58 @@ ifeq ($(UNAME_S),Darwin)
   ifeq ($(strip $(SDKROOT)),)
     export SDKROOT := $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
   endif
-  LIBS   += -framework Cocoa -framework Metal -framework QuartzCore \
+  APPLE_FRAMEWORKS := -framework Cocoa -framework Metal -framework QuartzCore \
             -framework MetalKit -framework Foundation \
             -framework MetalPerformanceShaders \
             -framework MetalPerformanceShadersGraph \
             -framework AVFoundation -framework CoreMedia -framework CoreVideo \
             -framework CoreML
+  # NATIVE_SPLIT=1 (the default on arm64) links src/native/apple into dylibs
+  # beside the binary, jaithon-native-<image>-<uuid>.dylib, which the core
+  # opens the first time a program touches a GPU, window, camera or CoreML.
+  # Loading those twelve frameworks at launch was 36% of a cached hello-world
+  # run, paid by every program whether it used them or not. The design is in
+  # src/native/native_image.h; NATIVE_SPLIT=0 links them statically as before.
+  NATIVE_SPLIT ?= $(if $(filter arm64,$(shell uname -m)),1,0)
+  ifeq ($(NATIVE_SPLIT),1)
+    ifneq ($(shell uname -m),arm64)
+      $(error NATIVE_SPLIT=1 needs arm64: the generated trampolines are arm64 assembly)
+    endif
+    BASE_CFLAGS += -DJAI_NATIVE_SPLIT
+  else
+    LIBS += $(APPLE_FRAMEWORKS)
+  endif
+  # The executable binds its ~165 libSystem imports in a flat namespace.
+  # Two-level binds all name libSystem.B, which defines almost nothing itself,
+  # so dyld walks its ~40 re-exported libraries for every one of them at every
+  # launch: ~44K instructions a bind, 7.3M of the 18.8M a process retired
+  # before main, against ~12K for a bind into a library that defines the symbol
+  # (libz). A flat lookup walks the loaded images instead and costs 2.6M less;
+  # a cached hello world went from 23.85M instructions to 21.24M, -10.7% cycles.
+  # Every one of the 165 resolves to the same address either way -- compare
+  # DYLD_PRINT_BINDINGS=1 output of the two links to re-check after an OS
+  # update -- and only the executable is flat: the Apple images and every
+  # system library keep their two-level namespaces. FLAT_NAMESPACE=0 turns it
+  # off.
+  #
+  # A flat lookup walks the images in load order, which is depth-first from the
+  # executable's first dylib. With libSystem.B first that order is its ~40
+  # re-exports alphabetically, and libsystem_c -- where 67 of the 165 live --
+  # is the fourteenth. Naming libsystem_c first puts it and its own
+  # dependencies (kernel, m, malloc, platform, pthread, dyld: 158 of the 165
+  # between them) at the head of the walk: a probe binding the same 165 symbols
+  # retired 12.98M instructions before main this way against 15.65M flat in the
+  # default order and 17.94M two-level, with 10.88M for an empty program. It is
+  # an order, not a promise about where a symbol lives -- the lookup is still
+  # flat, so a symbol a later macOS moves to another library is still found --
+  # and it is skipped when the SDK no longer ships the stub.
+  FLAT_NAMESPACE ?= 1
+  ifeq ($(FLAT_NAMESPACE),1)
+    CORE_LDFLAGS := -Wl,-flat_namespace
+    ifneq ($(wildcard $(SDKROOT)/usr/lib/system/libsystem_c.tbd),)
+      CORE_LDFLAGS += -L$(SDKROOT)/usr/lib/system -lsystem_c
+    endif
+  endif
 endif
 
 # --- readline probe ---------------------------------------------------------
@@ -270,6 +316,59 @@ OBJS := $(patsubst %.c,$(BUILD)/%.o,$(SRCS_C)) \
 # or a header change would relink it against stale knowledge of its own deps.
 DEPS := $(OBJS:.o=.d) $(BUILD)/verify_chunk.d
 
+# --- the split Apple images --------------------------------------------------
+#
+# With NATIVE_SPLIT=1 the Objective-C objects leave OBJS and become three
+# dylibs, one per group of frameworks, and the core gets a generated
+# trampoline per native function in their place. A program pays for the
+# frameworks of the images it touches and no others: a GPU program never loads
+# AppKit or AVFoundation, which measured as 28.5M instructions to dlopen the
+# GPU set against 36.8M for all twelve -- as cheap as the old static link of
+# everything (27.6M), where one image for all of it cost a GPU program 9M more.
+#
+#   gpu      every .m not named below, coreml.m included (it reads GPU buffers)
+#   gui      gui.m: AppKit, MetalKit and QuartzCore
+#   camera   camera.m: AVFoundation, CoreMedia and CoreVideo
+#
+# A new .m lands in gpu unless it is named here. Everything else is derived, so
+# adding a native function needs no list edited by hand:
+#
+#   gen/native.names    every native.h function stubs.c defines -- by
+#                       construction what the core may call -- read off the
+#                       symbol table of stubs.c compiled on its own
+#   gen/native_*.h|.S   the trampolines, slots and stub renames generated from
+#                       it (scripts/dev/gen_native_bridge.sh)
+#   native/*.dylib      the images, each linked against its own frameworks
+#   native/jai_native_images.h
+#                       each image's LC_UUID and file name, and which image
+#                       exports each name (scripts/dev/gen_native_images.sh),
+#                       compiled into the core so it opens exactly those images
+#
+# The gen/ files depend only on stubs.c, so both build types share them, as
+# they share jai_build_id.h.
+ifeq ($(NATIVE_SPLIT),1)
+  NATIVE_GEN        := $(BUILD_ROOT)/gen
+  NATIVE_DIR        := $(BUILD)/native
+  NATIVE_IMAGES     := gpu gui camera
+  NATIVE_SRCS_gui    := src/native/apple/gui.m
+  NATIVE_SRCS_camera := src/native/apple/camera.m
+  NATIVE_SRCS_gpu    := $(filter-out $(NATIVE_SRCS_gui) $(NATIVE_SRCS_camera) \
+                          src/native/apple/image.m,$(SRCS_M))
+  NATIVE_FW_gpu     := -framework Foundation -framework Metal \
+                       -framework MetalPerformanceShaders \
+                       -framework MetalPerformanceShadersGraph -framework CoreML
+  NATIVE_FW_gui     := -framework AppKit -framework Foundation -framework Metal \
+                       -framework MetalKit -framework QuartzCore
+  NATIVE_FW_camera  := -framework AVFoundation -framework CoreMedia \
+                       -framework CoreVideo -framework Foundation
+  NATIVE_DYLIBS     := $(foreach i,$(NATIVE_IMAGES),$(NATIVE_DIR)/$(i).dylib)
+  NATIVE_TABLE      := $(NATIVE_DIR)/jai_native_images.h
+  NATIVE_LIST       := $(NATIVE_DIR)/images.list
+  OBJS              := $(filter-out $(patsubst %.m,$(BUILD)/%.o,$(SRCS_M)),$(OBJS)) \
+                       $(NATIVE_DIR)/native_bridge.o
+  CFLAGS            += -I$(NATIVE_DIR)
+endif
+
 # --- automatic .jaic cache key ----------------------------------------------
 #
 # A .jaic is validated against JAI_COMPILER_VERSION, which is a hand-maintained
@@ -384,7 +483,7 @@ $(BUILD)/src/vm/bytecode/serialize_write.o: $(BUILD_ID_H)
 # the right trade: no binary is honest, and the wrong binary is the bug.
 LINK_STAMP := $(BUILD_ROOT)/.link-id
 CC_STAMP   := $(BUILD)/.cc-id
-LINK_ID    := $(BUILD_NAME) | $(CC) | $(LDFLAGS) | $(EXTRA_LDFLAGS) | $(LIBS)
+LINK_ID    := $(BUILD_NAME) | $(CC) | $(LDFLAGS) | $(EXTRA_LDFLAGS) | $(LIBS) $(CORE_LDFLAGS)
 CC_ID      := $(CC) | $(CFLAGS) | $(EXTRA_CFLAGS)
 
 # Those checks throw away build products, so they stay out of goals that do not
@@ -432,11 +531,88 @@ $(CC_STAMP):
 
 # The link stamp is written by the link itself: a failed link must leave the
 # old identity recorded, so the next make retries instead of believing it.
+# Beside the binary under their UUID names, which is where the loader looks. A
+# copy of the binary (./jaithon-base) keeps finding the images it was built
+# with even after a rebuild writes different ones. Renamed into place rather
+# than overwritten: a running process may have the old file mapped.
+define PLACE_NATIVE_IMAGES
+	@while read -r dylib file; do \
+	    dest="$(dir $(TARGET))$$file"; \
+	    cmp -s "$$dylib" "$$dest" || \
+	      { cp "$$dylib" "$$dest.tmp" && mv -f "$$dest.tmp" "$$dest"; } || exit 1; \
+	  done <$(NATIVE_LIST)
+endef
+
 $(TARGET): $(OBJS)
 	@echo "  LINK    $@ ($(BUILD_NAME))"
-	@$(CC) $(LDFLAGS) $(EXTRA_LDFLAGS) -o $@ $(OBJS) $(LIBS)
+	@$(CC) $(LDFLAGS) $(EXTRA_LDFLAGS) $(CORE_LDFLAGS) -o $@ $(OBJS) $(LIBS)
+ifeq ($(NATIVE_SPLIT),1)
+	$(PLACE_NATIVE_IMAGES)
+endif
 	@mkdir -p $(dir $(LINK_STAMP))
 	@printf '%s' '$(LINK_ID)' >$(LINK_STAMP)
+
+# And again on every `make`, binary current or not: an image deleted by hand
+# would otherwise stay gone, and GPU, GUI and camera with it, until something
+# relinked the core. Three cmp's when nothing is missing.
+ifeq ($(NATIVE_SPLIT),1)
+.PHONY: native-images
+all: native-images
+native-images: $(TARGET)
+	$(PLACE_NATIVE_IMAGES)
+endif
+
+ifeq ($(NATIVE_SPLIT),1)
+# stubs.c compiled alone, with its non-Apple half switched on and nothing
+# renamed, so its symbol table is the list of names. -flto would make the
+# object bitcode, which the system nm cannot be relied on to read.
+NATIVE_PROBE_CFLAGS := $(filter-out -MMD -MP -flto,$(CFLAGS))
+
+$(NATIVE_GEN)/native.names: src/native/stubs.c src/native/native.h \
+                            src/common/common.h scripts/dev/gen_native_bridge.sh
+	@mkdir -p $(NATIVE_GEN)
+	@echo "  GEN     $@"
+	@$(CC) $(NATIVE_PROBE_CFLAGS) -DJAI_NATIVE_STUB_PROBE -c src/native/stubs.c -o $@.o
+	@nm -gUj $@.o | sed -n 's/^_\(jai[A-Za-z0-9_]*\)$$/\1/p' >$@.tmp
+	@rm -f $@.o
+	@test -s $@.tmp || { echo "no native names in stubs.c" >&2; rm -f $@.tmp; exit 1; }
+	@mv $@.tmp $@
+	@sh scripts/dev/gen_native_bridge.sh $@ $(NATIVE_GEN)
+
+# Rewritten by the rule above only when their text changes, so a stubs.c edit
+# that adds no name recompiles nothing.
+$(NATIVE_GEN)/native_list.h $(NATIVE_GEN)/native_rename.h $(NATIVE_GEN)/native_bridge.S: \
+        $(NATIVE_GEN)/native.names
+	@:
+
+$(BUILD)/src/native/stubs.o: $(NATIVE_GEN)/native_rename.h
+$(BUILD)/src/native/native_loader.o: $(NATIVE_GEN)/native_rename.h \
+        $(NATIVE_GEN)/native_list.h $(NATIVE_TABLE)
+
+$(NATIVE_DIR)/native_bridge.o: $(NATIVE_GEN)/native_bridge.S | $(CC_STAMP)
+	@mkdir -p $(dir $@)
+	@echo "  AS      $<"
+	@$(CC) -c $< -o $@
+
+# One rule per image. Every jai* name is exported, which is what the loader
+# looks up; the rest of an image stays internal, so LTO may inline across its
+# .m files freely. image.m -- the forwarders back into the core -- goes into
+# each one.
+define NATIVE_IMAGE_RULE
+$$(NATIVE_DIR)/$(1).dylib: $$(patsubst %.m,$$(BUILD)/%.o,$$(NATIVE_SRCS_$(1)) src/native/apple/image.m)
+	@mkdir -p $$(dir $$@)
+	@echo "  LINK    $$@ ($$(BUILD_NAME))"
+	@$$(CC) $$(LDFLAGS) $$(EXTRA_LDFLAGS) -dynamiclib \
+	    -install_name @rpath/jaithon-native-$(1).dylib '-Wl,-exported_symbol,_jai*' \
+	    -o $$@ $$^ $$(NATIVE_FW_$(1)) -lm -lpthread
+endef
+$(foreach i,$(NATIVE_IMAGES),$(eval $(call NATIVE_IMAGE_RULE,$(i))))
+
+$(NATIVE_TABLE): $(NATIVE_DYLIBS) $(NATIVE_GEN)/native.names \
+                 scripts/dev/gen_native_images.sh
+	@sh scripts/dev/gen_native_images.sh $(NATIVE_GEN)/native.names $@ $(NATIVE_LIST) \
+	    $(foreach i,$(NATIVE_IMAGES),$(i)=$(NATIVE_DIR)/$(i).dylib)
+endif
 
 $(BUILD)/%.o: %.c | $(CC_STAMP)
 	@mkdir -p $(dir $@)
@@ -566,9 +742,17 @@ bench-smoke: $(TARGET)
 fmt-roundtrip: $(TARGET)
 	@JAITHON_PATH=$(CURDIR)/lib ./$(TARGET) run scripts/gate/fmt_roundtrip.jai
 
+# The Apple images go to lib/jaithon, the second place native_loader.c looks
+# (<bin>/../lib/jaithon), under the same UUID names they have beside the build.
 install: package-check $(TARGET)
 	@install -d $(DESTDIR)$(PREFIX)/bin
 	@install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+ifeq ($(NATIVE_SPLIT),1)
+	@install -d $(DESTDIR)$(PREFIX)/lib/jaithon
+	@while read -r dylib file; do \
+	    install -m 755 "$$dylib" "$(DESTDIR)$(PREFIX)/lib/jaithon/$$file" || exit 1; \
+	  done <$(NATIVE_LIST)
+endif
 	@install -d $(DESTDIR)$(PREFIX)/share/jaithon
 	@cp -R lib $(DESTDIR)$(PREFIX)/share/jaithon/
 	@cp -R packages $(DESTDIR)$(PREFIX)/share/jaithon/
@@ -576,12 +760,17 @@ install: package-check $(TARGET)
 
 uninstall:
 	@rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	@rm -rf $(DESTDIR)$(PREFIX)/lib/jaithon
 	@rm -rf $(DESTDIR)$(PREFIX)/share/jaithon
 
 # `build` holds both object trees, both stamps and verify_chunk, so removing it
 # is the whole build state. The debug link leaves a .dSYM behind once anything
 # has run dsymutil over it, and it is stale the moment the binary is relinked.
 clean:
+ifeq ($(NATIVE_SPLIT),1)
+	@if [ -s $(NATIVE_LIST) ]; then \
+	    while read -r dylib file; do rm -f "$(dir $(TARGET))$$file"; done <$(NATIVE_LIST); fi
+endif
 	@rm -rf $(BUILD_ROOT) $(TARGET) $(TARGET).dSYM
 	@find . -name '__jaicache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 

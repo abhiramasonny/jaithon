@@ -68,6 +68,17 @@ def generated(sym):
     return sym.startswith("___") or sym.startswith("_OBJC_") or sym == "_main"
 
 
+#: Reached by NAME at run time, through dlsym, so no object leaves it
+#: undefined. Each is checked against the header that spells the string, so an
+#: entry cannot outlive the lookup it excuses.
+DLSYM = {"_jaiNativeImageInit": "src/native/native_image.h"}
+
+
+def resolved_by_name(sym):
+    header = DLSYM.get(sym)
+    return header is not None and f'"{sym[1:]}"' in (ROOT / header).read_text()
+
+
 def strip_comments(text):
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
     return re.sub(r"//[^\n]*", " ", text)
@@ -78,6 +89,12 @@ SYMBOLS = {}
 
 def symbols(build):
     """{defined: {sym: [obj]}, referenced: {sym}} for every object under build.
+
+    An object with no source in the tree is generated -- the split Apple
+    image's trampolines, build/<type>/native/native_bridge.o, define a symbol
+    for every native function the image also defines. What such an object
+    REFERENCES still counts; what it defines is a forwarding stub, not the
+    function, and counting it would hide which natives nothing calls.
 
     One nm over all of them, not one per object: 116 separate calls take five
     seconds and the single call takes fifty milliseconds, which is the whole
@@ -100,7 +117,7 @@ def symbols(build):
         parts = line.split()
         if len(parts) == 2 and parts[0] == "U":
             referenced.add(parts[1])
-        elif len(parts) == 3:
+        elif len(parts) == 3 and source_of(here) is not None:
             defined.setdefault(parts[2], []).append(here)
             kind[parts[2]] = parts[1]
     SYMBOLS[build] = (defined, referenced, kind)
@@ -132,6 +149,8 @@ def unreferenced(build):
     found = []
     for sym, where in defined.items():
         if kind[sym] != "T" or len(where) != 1 or generated(sym):
+            continue
+        if resolved_by_name(sym):
             continue
         name = sym[1:]
         if sym in referenced or name in outside:

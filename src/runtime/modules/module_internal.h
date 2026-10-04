@@ -5,6 +5,7 @@
 #include "runtime/runtime.h"
 
 #define JAI_MODULE_EXT ".jai"
+#define JAI_PACKAGE_FILE "mod.jai"
 
 /* -- module.c, used by module_path.c --------------------------------- */
 
@@ -19,6 +20,8 @@ bool isRegularFile(const char *path);
 
 bool storeResolved(char *out, size_t outSize, const char *candidate);
 
+void resolveMemoForgetAll(void);
+
 const char *displayName(const char *dotted);
 
 /* -- module_cache.c, used by module.c ---------------------------------- */
@@ -32,6 +35,9 @@ uint32_t cacheFlagsFor(const CodegenOptions *opts, bool selfHosted);
 bool cacheFlagsMatch(const char *sourcePath, uint32_t flags);
 bool jaiCacheFlagsMatchBuffer(const uint8_t *head, size_t length,
                               uint32_t flags);
+
+/* The source hash an image's header records; false when it has no header. */
+bool jaicRecordedHash(const uint8_t *data, size_t size, uint64_t *out);
 
 const char *jaicRejectionReason(const uint8_t *data, size_t size,
                                 uint64_t expectedHash, char *buf,

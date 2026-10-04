@@ -262,6 +262,297 @@ static void warmFrontEnd(void) {
     jaiSnapshotAudit("warmFrontEnd");
 }
 
+/* A library module the seed carries -- std.math, std.str, std.json and the
+ * rest of the compiler's own imports -- is served from the seed when its cache
+ * misses, as long as the seed's image is exactly what a cache entry would
+ * have to be: compiled from this source (the hash its header records) with
+ * these flags. It is then a cache hit from a different store, and the
+ * compiler does not have to be built to produce it.
+ *
+ * Those modules never had cache files: the warm below loaded them from the
+ * seed inside the bootstrap window, so the ordinary door that compiles and
+ * caches a module was never reached for them. Every run of a program that
+ * imported std.math therefore built the whole front end -- 98 modules, 109.6M
+ * instructions for `import std.math; print(math.PI)` against 18.6M for a hello
+ * world -- to hand it std.math from the seed at the end. So did every run of
+ * every program on jaicv, jaitensor, jainum or jaiframe.
+ *
+ * Front-end modules (lib/jaithon) are excluded: they must arrive as one set
+ * with the compiler, see maybeWarmFor. When the seed does not match, the warm
+ * happens exactly as before. `--no-cache` is left alone, and so is the entry
+ * file, which is __main__ and not the module the seed compiled.
+ * JAITHON_SEED_SERVES_LIBRARY=0 restores the warm.
+ *
+ * Serving one must not start a warm part-way through it -- the cycle
+ * warmFrontEnd's comment describes, since the compiler imports these very
+ * modules. Every import of a seeded module is seeded (`make
+ * seed-closure-check`) and no lib/std module imports lib/jaithon, but an
+ * import goes where the search path sends it, not to the seed: with std.math
+ * edited and not yet reseeded, or std.str overridden on JAITHON_PATH, std.json
+ * still matched, was served, and its own import of the other one needed the
+ * compiler while std.json was half loaded. So the library is served as a
+ * unit or not at all: see seedLibraryIntact. */
+static bool seedServesLibrary(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_SEED_SERVES_LIBRARY");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+/* Whether a seed image whose header is `head` (at least 32 bytes) is what
+ * compiling a source hashing to `hash` with this run's flags would produce. */
+static bool seedHeaderMatches(const uint8_t *head, size_t length, uint64_t hash) {
+    uint64_t recorded = 0;
+    if (!jaicRecordedHash(head, length, &recorded) || recorded != hash)
+        return false;
+    uint32_t flags = cacheFlagsFor(&options()->codegen, true);
+    return jaiCacheFlagsMatchBuffer(head, length, flags);
+}
+
+static bool isFrontEndKey(const char *key) {
+    return strncmp(key, "jaithon/", 8) == 0;
+}
+
+/* The seed entry jaiSeedFind would answer `path` with, by index and without
+ * inflating it: the first key that is a trailing component run of the path.
+ * -1 when there is none. */
+static long seedIndexFor(const char *path) {
+    size_t pathLen = strlen(path);
+    for (size_t i = 0; i < jaiSeedCount(); i++) {
+        const char *key = jaiSeedModuleAt(i);
+        size_t keyLen = key != NULL ? strlen(key) : 0;
+        if (keyLen == 0 || keyLen > pathLen) continue;
+        const char *tail = path + (pathLen - keyLen);
+        if (strcmp(tail, key) != 0) continue;
+        if (tail != path && tail[-1] != '/') continue;
+        return (long)i;
+    }
+    return -1;
+}
+
+/* The dotted name a seed key is imported by: "std/math.jai" is std.math and
+ * "std/x/mod.jai" is std.x. */
+static bool seedKeyDottedName(const char *key, char *out, size_t size) {
+    size_t n = strlen(key);
+    size_t ext = strlen(JAI_MODULE_EXT);
+    size_t pkg = strlen("/" JAI_PACKAGE_FILE);
+    if (n > pkg && strcmp(key + n - pkg, "/" JAI_PACKAGE_FILE) == 0) n -= pkg;
+    else if (n > ext && strcmp(key + n - ext, JAI_MODULE_EXT) == 0) n -= ext;
+    else return false;
+    if (n + 1 > size) return false;
+    for (size_t i = 0; i < n; i++) out[i] = key[i] == '/' ? '.' : key[i];
+    out[n] = '\0';
+    return true;
+}
+
+/* Paths and directories already judged, for the life of the process. */
+typedef struct {
+    char *key;
+    bool  ok;
+} SeedVerdict;
+
+static JAI_VEC(SeedVerdict) sSeedFileVerdicts;
+static JAI_VEC(SeedVerdict) sSeedDirVerdicts;
+
+static const SeedVerdict *verdictFind(const SeedVerdict *v, int count,
+                                      const char *key) {
+    for (int i = 0; i < count; i++)
+        if (strcmp(v[i].key, key) == 0) return &v[i];
+    return NULL;
+}
+
+static void verdictNote(int which, const char *key, bool ok) {
+    SeedVerdict v = { jaiStrdup(key), ok };
+    if (which == 0) JAI_VEC_PUSH(SeedVerdict, &sSeedFileVerdicts, v);
+    else JAI_VEC_PUSH(SeedVerdict, &sSeedDirVerdicts, v);
+}
+
+/* Whether the file at `path` is, byte for byte, the source of seed entry
+ * `index`, and the entry the seed would serve it from. Reads the image's
+ * header only: a program that imports std.math alone should not inflate
+ * std.json to learn that it is current. */
+static bool seedFileIntact(const char *path, size_t index) {
+    if (seedIndexFor(path) != (long)index) return false;
+    const SeedVerdict *known = verdictFind(sSeedFileVerdicts.data,
+                                           sSeedFileVerdicts.count, path);
+    if (known != NULL) return known->ok;
+    bool ok = false;
+    uint8_t head[32];
+    if (jaiSeedPeekAt(index, head, sizeof head) == sizeof head) {
+        size_t length = 0;
+        char *text = jaiReadFile(path, &length);
+        if (text != NULL) {
+            ok = seedHeaderMatches(head, sizeof head, jaiSourceHash(text, length));
+            JAI_FREE_ARRAY(char, text, length + 1);
+        }
+    }
+    verdictNote(0, path, ok);
+    return ok;
+}
+
+/* Whether every seeded library module -- each seed entry outside
+ * lib/jaithon -- is, imported by its dotted name from `dir`, a file the seed
+ * carries unchanged, and the same holds from each directory those files are
+ * in. Then a module served from the seed imports only modules that are served
+ * from the seed too (or from a cache made of the same source), and nothing it
+ * pulls in can need the compiler. One stale or shadowed member turns the
+ * shortcut off for all of them, and the warm happens before the first one is
+ * published, as it always did.
+ *
+ * Checked once per directory, and only once some program reaches a seeded
+ * module that its cache does not have: three reads and three resolutions,
+ * which the imports that follow find already memoised. */
+static bool seedLibraryIntact(const char *dir) {
+    const SeedVerdict *known = verdictFind(sSeedDirVerdicts.data,
+                                           sSeedDirVerdicts.count, dir);
+    if (known != NULL) return known->ok;
+
+    JAI_VEC(char *) pending;
+    JAI_VEC_INIT(&pending);
+    JAI_VEC(char *) seen;
+    JAI_VEC_INIT(&seen);
+    JAI_VEC_PUSH(char *, &pending, jaiStrdup(dir));
+    JAI_VEC_PUSH(char *, &seen, jaiStrdup(dir));
+
+    bool ok = jaiSeedCount() > 0;
+    while (ok && pending.count > 0) {
+        char *from = JAI_VEC_POP(&pending);
+        for (size_t i = 0; ok && i < jaiSeedCount(); i++) {
+            const char *key = jaiSeedModuleAt(i);
+            if (key == NULL || isFrontEndKey(key)) continue;
+            char name[JAI_MAX_PATH];
+            char path[JAI_MAX_PATH];
+            if (!seedKeyDottedName(key, name, sizeof name) ||
+                !jaiResolveModulePathQuiet(name, from, path, sizeof path) ||
+                !seedFileIntact(path, i)) {
+                ok = false;
+                break;
+            }
+            char next[JAI_MAX_PATH];
+            jaiPathDirname(next, sizeof next, path);
+            bool visited = false;
+            for (int j = 0; j < seen.count && !visited; j++)
+                visited = strcmp(seen.data[j], next) == 0;
+            if (!visited) {
+                JAI_VEC_PUSH(char *, &pending, jaiStrdup(next));
+                JAI_VEC_PUSH(char *, &seen, jaiStrdup(next));
+            }
+        }
+        JAI_FREE_ARRAY(char, from, strlen(from) + 1);
+    }
+
+    /* Every directory reached answers for a subset of what `dir` answers
+     * for, so a success is theirs too; a failure is only `dir`'s. */
+    if (ok) {
+        for (int j = 0; j < seen.count; j++)
+            if (verdictFind(sSeedDirVerdicts.data, sSeedDirVerdicts.count,
+                            seen.data[j]) == NULL)
+                verdictNote(1, seen.data[j], true);
+    } else {
+        verdictNote(1, dir, false);
+    }
+    while (pending.count > 0) {
+        char *left = JAI_VEC_POP(&pending);
+        JAI_FREE_ARRAY(char, left, strlen(left) + 1);
+    }
+    for (int j = 0; j < seen.count; j++)
+        JAI_FREE_ARRAY(char, seen.data[j], strlen(seen.data[j]) + 1);
+    JAI_VEC_FREE(char *, &pending);
+    JAI_VEC_FREE(char *, &seen);
+    return ok;
+}
+
+/* The seed's image for `path` when it may stand in for a cache entry of a
+ * source hashing to `hash`, else NULL. */
+static const JaiSeedEntry *seedStandsInFor(const char *path, uint64_t hash) {
+    const JaiRunOptions *opts = options();
+    if (!opts->useCache || !seedServesLibrary() || seedDisabled()) return NULL;
+    const JaiSeedEntry *seeded = jaiSeedFind(path);
+    if (seeded == NULL || isFrontEndKey(seeded->module)) return NULL;
+    if (!seedHeaderMatches(seeded->image, seeded->length, hash)) return NULL;
+    /* Judged already: the closure below need not read this file again. */
+    if (verdictFind(sSeedFileVerdicts.data, sSeedFileVerdicts.count, path) == NULL)
+        verdictNote(0, path, true);
+    char dir[JAI_MAX_PATH];
+    jaiPathDirname(dir, sizeof dir, path);
+    if (!seedLibraryIntact(dir)) return NULL;
+    return seeded;
+}
+
+/* seedStandsInFor, for a caller that has not read the source yet. */
+static bool seedStandsInForFile(const char *path) {
+    if (!seedServesLibrary()) return false;
+    size_t length = 0;
+    char *text = jaiReadFile(path, &length);
+    if (text == NULL) return false;
+    uint64_t hash = jaiSourceHash(text, length);
+    JAI_FREE_ARRAY(char, text, length + 1);
+    return seedStandsInFor(path, hash) != NULL;
+}
+
+/* maybeWarmFor has to know whether a module's cache is loadable before the
+ * module exists, and loadModuleBody then reads the same file in full. On this
+ * machine an open() is ~150K instructions -- more than reading a 14KB image --
+ * so the probe reads the whole image once, keeps it here, and the next load
+ * of the same path takes it instead of opening the file again. It is one
+ * slot, consumed or dropped by the very next load; a warm in between cannot
+ * leave it behind for a later one, because every load clears it. 250 cached
+ * modules into a package import, that is 250 opens fewer.
+ * JAITHON_CACHE_PREFETCH=0 goes back to the 8-byte probe. */
+static struct {
+    char    *path;
+    uint8_t *data;
+    size_t   length;
+} sPrefetch;
+
+static bool cachePrefetchOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_CACHE_PREFETCH");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static void prefetchDrop(void) {
+    if (sPrefetch.data != NULL) jaiCacheReadFree(sPrefetch.data, sPrefetch.length);
+    if (sPrefetch.path != NULL)
+        JAI_FREE_ARRAY(char, sPrefetch.path, strlen(sPrefetch.path) + 1);
+    sPrefetch.path = NULL;
+    sPrefetch.data = NULL;
+    sPrefetch.length = 0;
+}
+
+/* Whether `path`'s cache carries `flags`, reading it whole for the load that
+ * follows. */
+static bool prefetchedFlagsMatch(const char *path, uint32_t flags) {
+    if (!cachePrefetchOn()) return cacheFlagsMatch(path, flags);
+    prefetchDrop();
+    size_t length = 0;
+    uint8_t *data = jaiCacheRead(path, &length);
+    if (data == NULL) return false;
+    sPrefetch.path = jaiStrdup(path);
+    sPrefetch.data = data;
+    sPrefetch.length = length;
+    return jaiCacheFlagsMatchBuffer(data, length, flags);
+}
+
+/* `path`'s cache image: the prefetched one when it is for this path, else
+ * read now. Either way the slot is empty afterwards. */
+static uint8_t *cacheReadForLoad(const char *path, size_t *length) {
+    if (sPrefetch.data != NULL && strcmp(sPrefetch.path, path) == 0) {
+        uint8_t *data = sPrefetch.data;
+        *length = sPrefetch.length;
+        sPrefetch.data = NULL;
+        prefetchDrop();
+        return data;
+    }
+    prefetchDrop();
+    return jaiCacheRead(path, length);
+}
+
 /* Warm the front end if loading `path` is about to need it.
  *
  * Two reasons to warm, and both are necessary.
@@ -283,8 +574,12 @@ static void warmFrontEnd(void) {
  * The test is the directory, not seed membership: the seed also carries
  * std.math, std.str and std.json, which the compiler imports but user code
  * owns just as much. Warming for those put the 12ms straight back, because
- * std.core is among them and every program loads it. */
-static bool maybeWarmFor(const char *path) {
+ * std.core is among them and every program loads it.
+ *
+ * `entry` is the file `run` was given. It becomes __main__, which the seed
+ * never compiled, so the seed cannot stand in for it: it is loaded by
+ * selfHostedModuleBody, which compiles. */
+static bool maybeWarmFor(const char *path, bool entry) {
     if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return false;
 
     /* The seed keys on the library-relative path ("jaithon/ast.jai"), which is
@@ -298,7 +593,8 @@ static bool maybeWarmFor(const char *path) {
     if (!ownedByFrontEnd) {
         const JaiRunOptions *opts = options();
         uint32_t flags = cacheFlagsFor(&opts->codegen, true);
-        if (opts->useCache && cacheFlagsMatch(path, flags)) return false;
+        if (opts->useCache && prefetchedFlagsMatch(path, flags)) return false;
+        if (!entry && seeded != NULL && seedStandsInForFile(path)) return false;
     }
     warmFrontEnd();
     return true;
@@ -332,7 +628,7 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
      * reading the whole 116 KB image. */
     if (opts->useCache) {
         size_t cacheLen = 0;
-        uint8_t *cacheData = jaiCacheRead(path, &cacheLen);
+        uint8_t *cacheData = cacheReadForLoad(path, &cacheLen);
         if (cacheData != NULL) {
             ObjFunction *cached = NULL;
             if (jaiCacheFlagsMatchBuffer(cacheData, cacheLen, flags)) {
@@ -345,6 +641,20 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
                 return cached;
             }
             /* Stale, corrupt, or from another compiler: recompile silently. */
+        }
+    }
+
+    /* A seeded library module, outside the window: see seedServesLibrary. */
+    if (!sLoadingFrontEnd && sOptions.selfHosted) {
+        const JaiSeedEntry *seeded = seedStandsInFor(path, hash);
+        if (seeded != NULL) {
+            ObjFunction *fromSeed = jaiDeserializeSeed(seeded->image,
+                                                       seeded->length,
+                                                       module, hash);
+            if (fromSeed != NULL) {
+                if (traceLoads()) fprintf(stderr, "load seed    %s\n", path);
+                return fromSeed;
+            }
         }
     }
 
@@ -556,7 +866,7 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
      * so without this it is freed underneath createModule -- a segfault that
      * appears only when the entry file is cached and an import is not. */
     jaiPushRoot(OBJ_VAL(pathKey));
-    bool warmed = maybeWarmFor(path);
+    bool warmed = maybeWarmFor(path, false);
     jaiPopRoot();
 
     /* The warm can load this very module: `jaithon fmt` imports the compiler
@@ -569,6 +879,7 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
     if (warmed &&
         jaiTableGetInterned(&vm.modules, pathKey, &existing) &&
         IS_MODULE(existing) && AS_MODULE(existing)->state == MOD_LOADED) {
+        prefetchDrop();
         return AS_MODULE(existing);
     }
 
@@ -590,6 +901,7 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
         /* Drop the registration so a later attempt reports the real error
          * again instead of "failed earlier". */
         forgetModule(pathKey);
+        resolveMemoForgetAll();
         if (!vm.hasException && vm.frameCount > 0) {
             (void)jaiThrow(vm.cImportError, "%s: module '%s' failed to load",
                            jaiDiagCodeString(E0800_MODULE_NOT_FOUND), name);
@@ -1001,7 +1313,7 @@ static ObjFunction *selfHostedModuleBody(ObjModule *module, const char *path) {
     /* One read, not two -- see the note at the other cache site. */
     if (opts->useCache) {
         size_t cacheLen = 0;
-        uint8_t *cacheData = jaiCacheRead(path, &cacheLen);
+        uint8_t *cacheData = cacheReadForLoad(path, &cacheLen);
         if (cacheData != NULL) {
             ObjFunction *cached = NULL;
             if (jaiCacheFlagsMatchBuffer(cacheData, cacheLen, flags)) {
@@ -1061,7 +1373,7 @@ int jaiRunFile(const char *path, const JaiRunOptions *opts, int argc,
     ObjList *args = installArgv(absolute, argc, argv);
     if (!preludeDisabled()) (void)jaiLoadPrelude();
 
-    maybeWarmFor(absolute);
+    maybeWarmFor(absolute, true);
 
     ObjString *pathKey = jaiStringIntern(absolute, strlen(absolute));
     ObjModule *module = createModule("__main__", pathKey);
