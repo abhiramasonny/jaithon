@@ -106,8 +106,7 @@ fn scan_any(v: any, c: str) -> int {
 pub fn test_ascii_scan_agrees_with_slicing() -> void {
     let text = make_text("abcdbadcabcd", REPEAT)
     for needle in ["abcd", "a", "dcab", "zz", "abcdbadcabcdabcd"] {
-        assert_eq(count_scan(text, needle), count_slices(text, needle),
-                  f"needle {needle}")
+        assert_eq(count_scan(text, needle), count_slices(text, needle), f"needle {needle}")
     }
 }
 

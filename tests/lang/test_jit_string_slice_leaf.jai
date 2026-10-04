@@ -5,20 +5,24 @@
 #: result, a string whose scalar count was never asked for. Its clamping must
 #: be the general path's exactly -- negative bounds, bounds past either end,
 #: a stop before the start -- so every case here is checked against the same
-#: slice taken in a body that has not compiled (`ref`, which runs once).
+#: slice taken in the test body itself, which runs once and stays interpreted.
 # jit-compiles: cut, cut_from, cut_to
 from std.test import assert_eq
 
 let CALLS = 300
 
 fn cut(s: str, a: int, b: int) -> str { return s[a:b] }
+
 fn cut_from(s: str, a: int) -> str { return s[a:] }
+
 fn cut_to(s: str, b: int) -> str { return s[:b] }
 
 pub fn test_bounds_match_the_general_path() -> void {
     let text = "hello, world"
     var warm = 0
-    for _i in 0..CALLS { warm += cut(text, 1, 4).len() + cut_from(text, 7).len() + cut_to(text, 5).len() }
+    for _i in 0..CALLS {
+        warm += cut(text, 1, 4).len() + cut_from(text, 7).len() + cut_to(text, 5).len()
+    }
     assert_eq(warm, CALLS * (3 + 5 + 5), "warm")
     let bounds = [-20, -13, -12, -5, -1, 0, 1, 3, 5, 11, 12, 13, 40]
     for a in bounds {

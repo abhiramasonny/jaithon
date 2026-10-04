@@ -12,14 +12,17 @@ let CALLS = 400
 class Point {
     pub var x: int
     pub var y: int
+
     fn init(self, x: int, y: int) {
         self.x = x
         self.y = y
     }
+
     pub fn to_str(self) -> str { return f"P({self.x}, {self.y})" }
 }
 
 fn fmt_two(a: int, b: str) -> str { return f"{a}-{b}!" }
+
 fn fmt_any(v: any) -> str { return f"<{v}>" }
 
 pub fn test_primitive_parts() -> void {

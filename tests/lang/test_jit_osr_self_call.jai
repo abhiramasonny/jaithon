@@ -14,6 +14,7 @@ from std.test import assert_eq, assert_throws
 class Box {
     pub var value: int
     pub var kids: list[Box]
+
     fn init(self, value: int) {
         self.value = value
         self.kids = []

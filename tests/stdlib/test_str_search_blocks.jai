@@ -103,7 +103,7 @@ pub fn test_multibyte_text_answers_in_characters() -> void {
     assert_eq(hay.find("中"), 4, "a three-byte scalar")
     assert_eq(hay.count("été"), 6, "count")
     assert_true("中文" in hay, "in")
-    assert_true(not ("文中" in hay), "not in")
+    assert_true(not "文中" in hay, "not in")
     assert_eq(hay.replace("é", "e").count("ete"), 6, "replace")
 }
 

@@ -13,12 +13,14 @@ let WARM = 300
 
 class Leaf {
     pub var v: int
+
     fn init(self, v: int) { self.v = v }
 }
 
 class Other {
     pub var w: int
     pub var v: int
+
     fn init(self, w: int) {
         self.w = w
         self.v = w * 100
