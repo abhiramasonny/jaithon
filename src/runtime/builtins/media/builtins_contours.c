@@ -468,30 +468,46 @@ static bool borderWriteList(ObjList *list, const int64_t *items, size_t count) {
  * steps between touching cells are the same step exactly when the two
  * differences in the padded numbering are equal, which is `compress` in
  * contours.jai. */
+/* One step of a walk, from a cell to the neighbour after it, as the x and y it
+ * moves by. The difference is one of the eight offsets `dy * stride + dx` with
+ * `dx` and `dy` in -1..1, and with a stride of at least three the row is
+ * whichever side of -1..1 the difference falls. */
+JAI_INLINE void borderStep(int64_t difference, int64_t stride, int64_t *x, int64_t *y) {
+    const int64_t down = difference > 1 ? 1 : (difference < -1 ? -1 : 0);
+    *x += difference - down * stride;
+    *y += down;
+}
+
 static bool borderEmit(BorderWork *work, int64_t stride, int64_t approx) {
     const size_t count = work->walk.count;
     const int64_t *cells = work->walk.items;
     I64Buf *points = &work->points;
     if (!i64Grow(points, count * 2)) return false;
+    /* The first cell's x and y by division, and every later one's from the
+     * step that reached it: a division a point was as much of a frame of
+     * blobs as the walk itself. */
+    const int64_t first = cells[0] / stride;
+    int64_t x = cells[0] - first * stride - 1;
+    int64_t y = first - 1;
     if (approx == 2 && count > 2) {
         int64_t previous = cells[count - 1];
         int64_t current = cells[0];
         for (size_t index = 0; index < count; index++) {
             const int64_t following = cells[index + 1 < count ? index + 1 : 0];
             if (current - previous != following - current) {
-                const int64_t at = current / stride;
-                i64PushUnchecked(points, current - at * stride - 1);
-                i64PushUnchecked(points, at - 1);
+                i64PushUnchecked(points, x);
+                i64PushUnchecked(points, y);
             }
+            borderStep(following - current, stride, &x, &y);
             previous = current;
             current = following;
         }
         return true;
     }
     for (size_t index = 0; index < count; index++) {
-        const int64_t at = cells[index] / stride;
-        i64PushUnchecked(points, cells[index] - at * stride - 1);
-        i64PushUnchecked(points, at - 1);
+        i64PushUnchecked(points, x);
+        i64PushUnchecked(points, y);
+        if (index + 1 < count) borderStep(cells[index + 1] - cells[index], stride, &x, &y);
     }
     return true;
 }
