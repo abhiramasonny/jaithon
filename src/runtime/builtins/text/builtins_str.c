@@ -585,4 +585,5 @@ void jaiRegisterStringPrimitives(void) {
 
     jaiBytesRegisterPrimitives(ns);
     jaiRasterRegisterPrimitives(ns);
+    jaiContoursRegisterPrimitives(ns);
 }
