@@ -457,6 +457,11 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             }
             e.clobberCount = probe.clobberCount;
             e.clobberSpill = probe.clobberSpill;
+            e.pushCount = probe.pushCount;
+            for (unsigned i = 0; i < probe.pushCount; i++) {
+                e.pushOff[i]  = probe.pushOff[i];
+                e.pushSlot[i] = probe.pushSlot[i];
+            }
             for (unsigned i = 0; i < probe.clobberCount; i++) {
                 e.clobberOff[i] = probe.clobberOff[i];
             }

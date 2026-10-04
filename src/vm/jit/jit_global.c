@@ -422,11 +422,17 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
         return subWhy(e, "pushing kind %d onto storage %u", (int)vk, pAcc.stg);
     }
 
-    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
-                       (unsigned)offsetof(ObjList, count)));
+    /* The loop's one push, with its count and bumped version held in
+     * registers (Emit::pushHoist): the count is compared where it is. */
+    int ph = e->inlining ? -1 : pushHoistFor(e, slot);
+    unsigned rCount = ph >= 0 ? e->pushHoist[ph].countReg : JIT_SCRATCH_A;
+    if (ph < 0) {
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                           (unsigned)offsetof(ObjList, count)));
+    }
     emit(e, jaiA64LdrW(JIT_SCRATCH_B, rList,
                        (unsigned)offsetof(ObjList, capacity)));
-    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+    emit(e, jaiA64SubsXReg(31, rCount, JIT_SCRATCH_B));
     if (e->growCount >= JIT_MAX_GROW) {
         e->whyNot = "more list pushes than the tier tracks";
         return false;
@@ -437,12 +443,17 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
 
     if (jitHoistPush()) noteGrowClobber(e);
     else noteScratchClobber(e);
+    if (e->measuring && e->pushCount < JIT_MAX_GROW) {
+        e->pushOff[e->pushCount]  = e->inlining ? e->inlIp : e->curOffset;
+        e->pushSlot[e->pushCount] = e->inlining ? -1 : slot;
+        e->pushCount++;
+    }
     unsigned gi = e->growCount++;
     e->grow[gi].at       = e->inlining ? e->inlIp : e->curOffset;
     e->grow[gi].listReg  = rList;
     e->grow[gi].valReg   = rVal;
     e->grow[gi].tag      = vtag;
-    e->grow[gi].countReg = JIT_SCRATCH_A;
+    e->grow[gi].countReg = rCount;
     e->grow[gi].stub     = -1;
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
@@ -455,6 +466,7 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
 
     emit(e, jaiA64LdrX(JIT_SCRATCH_C, rList,
                        (unsigned)offsetof(ObjList, items)));
+    if (ph >= 0) emit(e, jaiA64MovX(JIT_SCRATCH_A, rCount));
     /* JIT_SCRATCH_C is the items pointer and JIT_SCRATCH_A the index; every
      * arm below starts from those two, so the test costs a load, a compare and
      * two branches and touches nothing else. */
@@ -464,6 +476,18 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
         int pJoin = listDispatchElse(e, pSkip);
         emitListElemStore(e, pAcc.alt, vtag, rVal);
         listDispatchEnd(e, pJoin);
+    }
+    if (ph >= 0) {
+        /* Written back every time -- an interpreter after a deopt, an alias
+         * reading `len()`, anything else that looks reads memory -- but
+         * never read back. */
+        emit(e, jaiA64AddXImm(rCount, rCount, 1));
+        emit(e, jaiA64StrW(rCount, rList,
+                           (unsigned)offsetof(ObjList, count)));
+        emit(e, jaiA64StrW(e->pushHoist[ph].verReg, rList,
+                           (unsigned)offsetof(ObjList, version)));
+        e->wroteHeap = true;
+        return true;
     }
     emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
     emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,

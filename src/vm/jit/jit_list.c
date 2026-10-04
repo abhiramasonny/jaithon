@@ -403,6 +403,84 @@ unsigned hoistListRegFor(const Emit *e, unsigned slot) {
     return hoistListReg(e, slot);
 }
 
+/* JAITHON_JIT_PUSH_REG: a loop's one push keeps its list's count and bumped
+ * version in registers. See Emit::pushHoist. */
+static bool jitPushReg(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_PUSH_REG");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Each push costs a load-add-store of `count` and another of `version`, and
+ * the next push's load waits on this one's store: a dependency through memory
+ * on every iteration of a loop that builds a list. Kept in registers instead,
+ * over the outermost loop around the push that (a) calls nothing but list
+ * growth, (b) never rebinds the local, and (c) holds NO other push -- two
+ * pushes might name one list through two locals, and each would then count
+ * from its own copy. A store into the list through another local changes
+ * neither the count nor, as far as any iterator can tell, the version: it
+ * moves it past every snapshot either way (see Emit::hoist's version note). */
+static void planPushHoists(Emit *e, const Chunk *c, const SlotKind *kinds,
+                           uint32_t regionLo, uint32_t regionHi) {
+    e->pushHoistCount = 0;
+    if (!jitPushReg() || !jitHoistPush()) return;
+    for (unsigned p = 0; p < e->pushCount && e->pushHoistCount < 2u; p++) {
+        int s = e->pushSlot[p];
+        if (s < 0 || s > (int)JIT_MAX_SLOTS) continue;
+        if (kinds[s] != SLOT_LIST || hoistListReg(e, (unsigned)s) == 0) continue;
+        uint32_t at = e->pushOff[p];
+        uint32_t bestTop = 0, bestEnd = 0;
+        for (int off = (int)regionLo; off < (int)regionHi;) {
+            int len = instructionLength(c, off);
+            if (len <= 0) break;
+            uint32_t lt = (uint32_t)off;
+            uint32_t le = loopBodyEnd(c, lt);
+            off += len;
+            if (le == 0 || le <= lt || le > regionHi) continue;
+            if (at < lt || at >= le) continue;
+            if (e->slotWriteHi[s] >= lt && e->slotWriteLo[s] < le) continue;
+            if (regionCalls(e, lt, le)) continue;
+            if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            unsigned inside = 0;
+            for (unsigned q = 0; q < e->pushCount; q++) {
+                if (e->pushOff[q] >= lt && e->pushOff[q] < le) inside++;
+            }
+            if (inside != 1) continue;
+            if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
+                bestTop = lt; bestEnd = le;
+            }
+        }
+        if (bestEnd == 0) continue;
+        if (e->hoistPoolCount - e->hoistTaken < 2u) return;
+        unsigned rc = e->hoistPool[e->hoistTaken++];
+        unsigned rv = e->hoistPool[e->hoistTaken++];
+        if (rc < e->scratchRoom) e->scratchRoom = rc;
+        if (rv < e->scratchRoom) e->scratchRoom = rv;
+        unsigned k = e->pushHoistCount++;
+        e->pushHoist[k].top = bestTop;
+        e->pushHoist[k].end = bestEnd;
+        e->pushHoist[k].slot = (uint8_t)s;
+        e->pushHoist[k].countReg = (uint8_t)rc;
+        e->pushHoist[k].verReg = (uint8_t)rv;
+    }
+}
+
+/* The push hoist covering a push of `slot`'s list at the current offset, or
+ * -1. */
+int pushHoistFor(const Emit *e, int slot) {
+    if (slot < 0 || e->measuring) return -1;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    for (unsigned i = 0; i < e->pushHoistCount; i++) {
+        if (e->pushHoist[i].slot != (uint8_t)slot) continue;
+        if (at < e->pushHoist[i].top || at >= e->pushHoist[i].end) continue;
+        return (int)i;
+    }
+    return -1;
+}
+
 void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     if (e->measuring) return;
     const Chunk *c = &fn->chunk;
@@ -510,6 +588,7 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
         }
         e->hoistCount++;
     }
+    planPushHoists(e, c, kinds, regionLo, regionHi);
     if (!lean) return;
     /* Versions, for lists stored into inside their own region. */
     for (unsigned h = 0; h < e->hoistCount; h++) {
@@ -593,6 +672,16 @@ void emitHoistsAt(Emit *e, uint32_t off) {
      * instruction and a guard taken against it resumes somewhere whose operand
      * model has already been consumed. */
     if (e->inlining) return;
+    for (unsigned i = 0; i < e->pushHoistCount; i++) {
+        if (e->pushHoist[i].top != off) continue;
+        unsigned pl = hoistListReg(e, e->pushHoist[i].slot);
+        emit(e, jaiA64LdrW(e->pushHoist[i].countReg, pl,
+                           (unsigned)offsetof(ObjList, count)));
+        emit(e, jaiA64LdrW(e->pushHoist[i].verReg, pl,
+                           (unsigned)offsetof(ObjList, version)));
+        emit(e, jaiA64AddXImm(e->pushHoist[i].verReg,
+                              e->pushHoist[i].verReg, 1));
+    }
     for (unsigned i = 0; i < e->hoistCount; i++) {
         if (e->hoist[i].top != off) continue;
         unsigned hList = hoistListReg(e, e->hoist[i].slot);

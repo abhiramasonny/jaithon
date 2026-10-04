@@ -560,6 +560,22 @@ typedef struct {
         uint8_t  verReg;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
+    /* Every list push the measuring pass saw (emitListStore): where, and
+     * which local's list, or -1. A push is the one store that changes a
+     * list's count, so a loop with exactly one of them can keep that count --
+     * and the bumped version -- in registers. See pushHoist. */
+    uint32_t  pushOff[JIT_MAX_GROW];
+    int       pushSlot[JIT_MAX_GROW];
+    unsigned  pushCount;
+    /* The push whose list's count and version live in registers for a loop
+     * (JAITHON_JIT_PUSH_REG): loaded where the headers are, written back to
+     * the list after every push -- the stores stay, the loads that chained
+     * each push to the previous one through memory go. */
+    struct {
+        uint32_t top, end;
+        uint8_t  slot, countReg, verReg;
+    } pushHoist[2];
+    unsigned  pushHoistCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -931,6 +947,7 @@ Value seenLocal(Emit *e, unsigned slot);
 void noteScratchClobber(Emit *e);
 void noteGrowClobber(Emit *e);
 unsigned hoistListRegFor(const Emit *e, unsigned slot);
+int pushHoistFor(const Emit *e, int slot);
 bool jitHoistPush(void);
 unsigned valueXReg(const Emit *e, unsigned idx);
 unsigned pushReg(const Emit *e);

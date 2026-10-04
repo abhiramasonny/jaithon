@@ -787,6 +787,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         }
         e.clobberCount = body.clobberCount;
         e.clobberSpill = body.clobberSpill;
+        e.pushCount = body.pushCount;
+        for (unsigned i = 0; i < body.pushCount; i++) {
+            e.pushOff[i]  = body.pushOff[i];
+            e.pushSlot[i] = body.pushSlot[i];
+        }
         for (unsigned i = 0; i < body.clobberCount; i++) {
             e.clobberOff[i] = body.clobberOff[i];
         }
