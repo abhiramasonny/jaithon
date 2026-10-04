@@ -239,6 +239,34 @@ void emitGrowStubs(Emit *e) {
             e->fixups[e->fixupCount].depth        = -1;
             e->fixupCount++;
             emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_HS, 0));
+        } else if (e->cold[ci].kind == 2) {
+            /* The boxed arm of a dispatched element read: the storage must be
+             * BOXED (anything else is the third storage, which deopts), the
+             * element must carry the tag, and the address left behind is the
+             * payload's, as the inline arm left it. One record serves both
+             * guards: nothing between the dispatch and the tag check moves
+             * the model. */
+            bool always = jitDeoptStressOn();
+            unsigned dk = (unsigned)e->cold[ci].deoptK;
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, LIST_STORE_BOXED));
+            if (e->fixupCount + 2u > JIT_MAX_FIXUPS) { e->failed = true; return; }
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - dk;
+            e->fixups[e->fixupCount].conditional  = !always;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_NE, 0));
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, e->cold[ci].rItems,
+                                  JIT_SCRATCH_B, 4));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, e->cold[ci].tag));
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - dk;
+            e->fixups[e->fixupCount].conditional  = !always;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_NE, 0));
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 8));
         } else {
             emit(e, e->cold[ci].insn);
         }

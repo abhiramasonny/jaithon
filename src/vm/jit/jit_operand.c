@@ -120,6 +120,17 @@ bool jitBoundsColdOn(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_DISPATCH_COLD=0 keeps both arms of an element read's storage
+ * dispatch inline. On by default; see OP_GET_INDEX. */
+bool jitDispatchColdOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_DISPATCH_COLD");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 bool emitColdFixup(Emit *e, unsigned rrem, uint32_t insn) {
     if (!floorColdOn()) return false;
     if (e->coldCount >= JIT_MAX_COLD) return false;

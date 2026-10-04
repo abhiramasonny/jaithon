@@ -673,6 +673,10 @@ typedef struct {
         uint8_t  rOut, rCount;
         bool     countW;
         int      deoptK;
+        /* kind 2: an element read's BOXED arm (see OP_GET_INDEX): the items
+         * register and the tag the element must carry. */
+        uint8_t  rItems;
+        uint32_t tag;
     } cold[JIT_MAX_COLD];
     unsigned  coldCount;
     uint32_t  curOffset;
@@ -1141,6 +1145,7 @@ bool emitColdFixup(Emit *e, unsigned rrem, uint32_t insn);
 int deoptRecordNow(Emit *e);
 bool jitDeoptStressOn(void);
 bool jitBoundsColdOn(void);
+bool jitDispatchColdOn(void);
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg);
 bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,

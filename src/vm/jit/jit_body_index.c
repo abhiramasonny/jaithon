@@ -375,6 +375,41 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
          * on the element, which is what lets one load serve them: a boxed
          * element's payload is eight bytes into it, an unboxed element IS
          * its payload. */
+        /* The predicted (unboxed) arm falls through and the boxed one waits
+         * after the body (jitDispatchColdOn). Inline, one of the two always
+         * took a branch -- the `b.eq` to the unboxed arm, or the boxed arm's
+         * `b` over it -- and since an untyped list of ints is unboxed too
+         * (JAITHON_LIST_SHAPE_FIRST), the taken one was the common one. */
+        bool gColdDone = false;
+        if (gAcc.dynamic && gAcc.stg == LIST_STORE_BOXED &&
+            (kind == SLOT_INT || kind == SLOT_FLOAT || kind == SLOT_BOOL) &&
+            jitDispatchColdOn() && e->coldCount < JIT_MAX_COLD &&
+            e->fixupCount < JIT_MAX_FIXUPS) {
+            int dk = deoptRecordNow(e);
+            if (dk >= 0) {
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_D, rList,
+                                      (unsigned)offsetof(ObjList, stg)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, gAcc.alt));
+                unsigned ci = e->coldCount++;
+                e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                e->fixups[e->fixupCount].targetOffset = FIXUP_COLD - ci;
+                e->fixups[e->fixupCount].conditional  = true;
+                e->fixups[e->fixupCount].depth        = -1;
+                e->fixupCount++;
+                emit(e, jaiA64BCond(JAI_A64_NE, 0));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems, JIT_SCRATCH_B,
+                                      listStgShift(gAcc.alt)));
+                e->cold[ci].stub     = -1;
+                e->cold[ci].returnTo = (int)e->count;
+                e->cold[ci].insn     = 0;
+                e->cold[ci].kind     = 2;
+                e->cold[ci].deoptK   = dk;
+                e->cold[ci].rItems   = (uint8_t)gItems;
+                e->cold[ci].tag      = tag;
+                gColdDone = true;
+            }
+        }
+        if (!gColdDone) {
         int gSkip = listDispatchBegin(e, &gAcc, rList, JIT_SCRATCH_D);
 
         emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems,
@@ -426,6 +461,7 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems, JIT_SCRATCH_B,
                                   listStgShift(gAcc.alt)));
             listDispatchEnd(e, gJoin);
+        }
         }
 
         unsigned d1, d2;
