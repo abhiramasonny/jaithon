@@ -334,8 +334,15 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
          * so there is no tag to check and the stride is the access width.
          * One register-offset load does what the add, the copy into the
          * normalisation scratch and the load did (jitIndexedLoadOn). */
-        if (gHoisted && gh >= 0 && !gAcc.dynamic &&
-            gAcc.stg != LIST_STORE_BOXED && jitIndexedLoadOn()) {
+        if (!gAcc.dynamic && gAcc.stg != LIST_STORE_BOXED &&
+            jitIndexedLoadOn()) {
+            /* Not proved at the head: normalised and checked here as every
+             * subscript is, and then the same single load off the result. */
+            unsigned rI = rIdx;
+            if (!(gHoisted && gh >= 0)) {
+                emitBoundsNormalise(e, rIdx, gCount, JIT_SCRATCH_B, true);
+                rI = JIT_SCRATCH_B;
+            }
             unsigned dg1, dg2;
             if (!popValue(e, &dg1, NULL)) return false;
             if (!popValue(e, &dg2, NULL)) return false;
@@ -343,14 +350,14 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
                 return false;
             }
             if (kind == SLOT_BOOL) {
-                emit(e, jaiA64LdrByteIdx(pushReg(e) - 1, gItems, rIdx));
+                emit(e, jaiA64LdrByteIdx(pushReg(e) - 1, gItems, rI));
             } else if (kind == SLOT_FLOAT &&
                        fpWorthLoading(e, code, off + 1, stop)) {
                 unsigned idx = e->valueDepth - 1;
-                emit(e, jaiA64LdrDIdx(fpRegAt(e, idx), gItems, rIdx));
+                emit(e, jaiA64LdrDIdx(fpRegAt(e, idx), gItems, rI));
                 fpClaim(e, idx);
             } else {
-                emit(e, jaiA64LdrXIdx(pushReg(e) - 1, gItems, rIdx));
+                emit(e, jaiA64LdrXIdx(pushReg(e) - 1, gItems, rI));
             }
             off += 1;
             break;
