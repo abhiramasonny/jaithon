@@ -11,6 +11,13 @@
 #: This file keeps only the scanner: the `Lexer` state machine that walks
 #: `position`/`line`/the bracket stack and turns characters into tokens.
 #:
+#: The scanner walks the source's UTF-8 bytes, a `list[int]`, and every
+#: position it keeps is a byte offset -- which is also what a `Span` records,
+#: so a span needs no conversion. It used to walk a `list[str]` of one-character
+#: strings with a parallel table of byte offsets: one object per character
+#: before the first token, and a loop the JIT could not compile. Only a token's
+#: text goes back to `str`, through `_text`.
+#:
 #: ```
 #: let tokens = Lexer("x = 1").tokenize()
 #: tokens.len()                    # 4: `x`, `=`, `1`, end of file
@@ -35,15 +42,72 @@ const _BRK_F_SINGLE = 1
 const _BRK_F_TRIPLE = 2
 const _BRK_F_RAW = 4
 
+# The bytes the scanner compares against, by name.
+const _C_TAB = 9
+const _C_LF = 10
+const _C_VT = 11
+const _C_FF = 12
+const _C_CR = 13
+const _C_SPACE = 32
+const _C_BANG = 33
+const _C_DQUOTE = 34
+const _C_HASH = 35
+const _C_PERCENT = 37
+const _C_AMP = 38
+const _C_SQUOTE = 39
+const _C_LPAREN = 40
+const _C_RPAREN = 41
+const _C_STAR = 42
+const _C_PLUS = 43
+const _C_COMMA = 44
+const _C_MINUS = 45
+const _C_DOT = 46
+const _C_SLASH = 47
+const _C_ZERO = 48
+const _C_NINE = 57
+const _C_COLON = 58
+const _C_SEMICOLON = 59
+const _C_LT = 60
+const _C_EQ = 61
+const _C_GT = 62
+const _C_QUESTION = 63
+const _C_AT = 64
+const _C_UPPER_A = 65
+const _C_UPPER_B = 66
+const _C_UPPER_E = 69
+const _C_UPPER_F = 70
+const _C_UPPER_O = 79
+const _C_UPPER_X = 88
+const _C_UPPER_Z = 90
+const _C_LBRACKET = 91
+const _C_BACKSLASH = 92
+const _C_RBRACKET = 93
+const _C_CARET = 94
+const _C_UNDERSCORE = 95
+const _C_LOWER_A = 97
+const _C_LOWER_B = 98
+const _C_LOWER_E = 101
+const _C_LOWER_F = 102
+const _C_LOWER_O = 111
+const _C_LOWER_R = 114
+const _C_LOWER_U = 117
+const _C_LOWER_X = 120
+const _C_LOWER_Z = 122
+const _C_LBRACE = 123
+const _C_PIPE = 124
+const _C_RBRACE = 125
+const _C_TILDE = 126
+
 enum _ChunkStop { Closed, Interp, Broken }
 
 class _StrFlavor {
-    pub let quote: str
+    #: The quote byte, `"` or `'`.
+    pub let quote: int
     pub let triple: bool
     pub let raw: bool
     pub let interp: bool
 
-    pub fn init(self, quote: str, triple: bool, raw: bool, interp: bool) {
+    pub fn init(self, quote: int, triple: bool, raw: bool, interp: bool) {
         self.quote = quote
         self.triple = triple
         self.raw = raw
@@ -51,8 +115,9 @@ class _StrFlavor {
     }
 
     pub fn closer(self) -> str {
-        if self.triple { return self.quote + self.quote + self.quote }
-        return self.quote
+        let quote = chr(self.quote)
+        if self.triple { return quote + quote + quote }
+        return quote
     }
 }
 
@@ -70,8 +135,15 @@ pub class Lexer {
     #: True once a lexical error has been reported.
     pub var had_error: bool
 
-    let chars: list[str]
-    let offsets: list[int]
+    #: The source's UTF-8 bytes. Every position below indexes this.
+    let bytes: list[int]
+    #: Whether every byte is ASCII, so that a byte offset is also a `str` index.
+    let ascii: bool
+    #: When the source is not ASCII: the `str` index of each byte offset, and
+    #: of the end. Otherwise `[0]` and never read -- but not empty, because an
+    #: empty list gives the tier no element to learn from and it then refused
+    #: the whole of `_text`, which every token goes through.
+    let scalar_of: list[int]
     let length: int
     var tokens: list[Token]
     var pos: int
@@ -86,16 +158,12 @@ pub class Lexer {
         self.file_id = file_id
         self.diagnostics = diagnostics ?? DiagnosticBag()
         self.had_error = false
-        self.chars = [character for character in source]
-        var byte_offset = 0
-        var offsets: list[int] = []
-        for character in self.chars {
-            offsets.push(byte_offset)
-            byte_offset += _utf8_length(ord(character))
-        }
-        offsets.push(byte_offset)
-        self.offsets = offsets
-        self.length = self.chars.len()
+        _require_utf8(source)
+        let bytes = source.bytes()
+        self.bytes = bytes
+        self.length = bytes.len()
+        self.ascii = self.length == source.len()
+        self.scalar_of = if self.ascii { [0] } else { _scalar_offsets(bytes) }
         self.tokens = []
         self.pos = 0
         self.line = 1
@@ -118,7 +186,10 @@ pub class Lexer {
         self.pos = 0
         self.line = 1
         self.at_line_start = true
-        if self.length > 0 and self.chars[0] == "\u{FEFF}" { self.pos = 1 }
+        let bytes = self.bytes
+        if self.length >= 3 and bytes[0] == 0xEF and bytes[1] == 0xBB and bytes[2] == 0xBF {
+            self.pos = 3
+        }
 
         while self.pos < self.length { self._scan_token() }
 
@@ -145,41 +216,80 @@ pub class Lexer {
 
     #: The source text between two byte offsets, as `Span` records them.
     pub fn text_of(self, span: Span) -> str {
-        return self.source[self._scalar_index(span.start):self._scalar_index(span.end)]
+        return self._text(self._clamp(span.start), self._clamp(span.end))
     }
 
     # --- cursor ----------------------------------------------------------
-    fn _at(self, index: int) -> str {
-        if index < 0 or index >= self.length { return "" }
-        return self.chars[index]
+    fn _clamp(self, byte_offset: int) -> int {
+        if byte_offset < 0 { return 0 }
+        if byte_offset > self.length { return self.length }
+        return byte_offset
     }
 
-    fn _peek(self) -> str {
+    #: The source text between two byte offsets.
+    fn _text(self, start: int, end: int) -> str {
+        if self.ascii { return self.source[start:end] }
+        return self.source[self.scalar_of[start]:self.scalar_of[end]]
+    }
+
+    #: The byte at `index`, or -1 past either end.
+    fn _at(self, index: int) -> int {
+        if index < 0 or index >= self.length { return -1 }
+        return self.bytes[index]
+    }
+
+    fn _peek(self) -> int {
         return self._at(self.pos)
     }
 
-    fn _peek_at(self, offset: int) -> str {
+    fn _peek_at(self, offset: int) -> int {
         return self._at(self.pos + offset)
     }
 
-    fn _eat(self, character: str) -> bool {
+    fn _eat(self, character: int) -> bool {
         if self._peek() != character { return false }
         self.pos += 1
         return true
     }
 
-    fn _span(self, start: int, end: int) -> Span {
-        return Span(self.file_id, self.offsets[start], self.offsets[end])
+    #: How many bytes the character starting at `index` takes.
+    fn _width_at(self, index: int) -> int {
+        let lead = self.bytes[index]
+        var width = 1
+        if lead >= 0xF0 {
+            width = 4
+        } elif lead >= 0xE0 {
+            width = 3
+        } elif lead >= 0xC0 {
+            width = 2
+        }
+        let left = self.length - index
+        return if width > left { left } else { width }
     }
 
-    fn _scalar_index(self, byte_offset: int) -> int {
-        var low = 0
-        var high = self.offsets.len() - 1
-        while low < high {
-            let middle = (low + high) // 2
-            if self.offsets[middle] < byte_offset { low = middle + 1 } else { high = middle }
+    #: The code point of the character starting at `index`.
+    fn _code_at(self, index: int) -> int {
+        let lead = self.bytes[index]
+        let width = self._width_at(index)
+        if width == 1 { return lead }
+        var code = 0
+        if width == 2 {
+            code = lead & 0x1F
+        } elif width == 3 {
+            code = lead & 0x0F
+        } else {
+            code = lead & 0x07
         }
-        return low
+        var at = index + 1
+        while at < index + width {
+            code = code << 6 | self.bytes[at] & 0x3F
+            at += 1
+        }
+        return code
+    }
+
+    fn _span(self, start: int, end: int) -> Span {
+        return Span(self.file_id, start, end)
     }
 
     fn _error(
@@ -200,19 +310,30 @@ pub class Lexer {
         return self.tokens[self.tokens.len() - 1].kind
     }
 
-    fn _push(
-        self,
-        kind: TokenKind,
-        start: int,
-        end: int,
-        value: any = null,
-        flags: int = 0
-    ) -> void {
+    #: Record a token that carries no value: punctuation, a keyword, a name.
+    #:
+    #: Kept apart from `_push_value` because a parameter that is sometimes an
+    #: int, sometimes a string and usually null has no kind the tier can give
+    #: it, and that alone kept every token push interpreted.
+    fn _push(self, kind: TokenKind, start: int, end: int) -> void {
+        self._push_text(kind, start, end, self._text(start, end))
+    }
+
+    #: `_push` for a caller that already sliced the token's text.
+    fn _push_text(self, kind: TokenKind, start: int, end: int, text: str) -> void {
+        var flags = 0
+        if self.at_line_start { flags = TokenFlags.AFTER_NEWLINE }
+        self.tokens.push(Token(kind, Span(self.file_id, start, end), text, flags))
+        self.at_line_start = false
+    }
+
+    #: Record a literal token and its cooked value.
+    fn _push_value(self, kind: TokenKind, start: int, end: int, value: any, flags: int) -> void {
         var all_flags = flags
         if self.at_line_start { all_flags = all_flags | TokenFlags.AFTER_NEWLINE }
-        self.tokens.push(
-            Token(kind, self._span(start, end), self.source[start:end], value, all_flags)
-        )
+        let token = Token(kind, Span(self.file_id, start, end), self._text(start, end), all_flags)
+        token.value = value
+        self.tokens.push(token)
         self.at_line_start = false
     }
 
@@ -269,26 +390,31 @@ pub class Lexer {
     # --- comments --------------------------------------------------------
     fn _skip_comment(self) -> void {
         let start = self.pos
-        if self._peek_at(1) != "*" {
-            while self.pos < self.length and self._peek() != "\n" { self.pos += 1 }
+        let bytes = self.bytes
+        let length = self.length
+        if self._peek_at(1) != _C_STAR {
+            var at = start
+            while at < length and bytes[at] != _C_LF { at += 1 }
+            self.pos = at
             return
         }
 
         self.pos += 2
         var depth = 1
-        while self.pos < self.length {
-            if self._peek() == "#" and self._peek_at(1) == "*" {
+        while self.pos < length {
+            let character = bytes[self.pos]
+            if character == _C_HASH and self._peek_at(1) == _C_STAR {
                 depth += 1
                 self.pos += 2
                 continue
             }
-            if self._peek() == "*" and self._peek_at(1) == "#" {
+            if character == _C_STAR and self._peek_at(1) == _C_HASH {
                 self.pos += 2
                 depth -= 1
                 if depth == 0 { return }
                 continue
             }
-            if self._peek() == "\n" { self.line += 1 }
+            if character == _C_LF { self.line += 1 }
             self.pos += 1
         }
 
@@ -303,13 +429,16 @@ pub class Lexer {
     }
 
     # --- numbers (§1.6) --------------------------------------------------
+    #: The digits of a numeral, underscores removed; the text is only
+    #: meaningful when the flag is true.
     fn _scan_digits(self, base: int) -> tuple[bool, str] {
-        let digits = StringBuilder()
+        let start = self.pos
         var previous_underscore = false
         var any = false
+        var underscores = false
         loop {
             let character = self._peek()
-            if character == "_" {
+            if character == _C_UNDERSCORE {
                 if not any or previous_underscore {
                     var message = "numeric literal may not start with `_`"
                     if previous_underscore { message = "repeated `_` in numeric literal" }
@@ -320,17 +449,17 @@ pub class Lexer {
                         message,
                         help: "digit separators must sit between digits"
                     )
-                    while self._peek() == "_" or _digit_in_base(self._peek(), base) {
+                    while self._peek() == _C_UNDERSCORE or _digit_in_base(self._peek(), base) {
                         self.pos += 1
                     }
-                    return (false, digits.build())
+                    return (false, "")
                 }
                 previous_underscore = true
+                underscores = true
                 self.pos += 1
                 continue
             }
             if not _digit_in_base(character, base) { break }
-            digits.push(character)
             any = true
             previous_underscore = false
             self.pos += 1
@@ -343,9 +472,11 @@ pub class Lexer {
                 "numeric literal may not end with `_`",
                 help: "digit separators must sit between digits"
             )
-            return (false, digits.build())
+            return (false, "")
         }
-        return (true, digits.build())
+        let digits = self._text(start, self.pos)
+        if underscores { return (true, digits.replace("_", "")) }
+        return (true, digits)
     }
 
     fn _scan_number(self) -> void {
@@ -356,7 +487,7 @@ pub class Lexer {
         var text = ""
 
         let prefix = self._peek_at(1)
-        if self._peek() == "0" and _base_of(prefix) > 0 {
+        if self._peek() == _C_ZERO and _base_of(prefix) > 0 {
             base = _base_of(prefix)
             self.pos += 2
             let (digits_ok, digits) = self._scan_digits(base)
@@ -368,7 +499,7 @@ pub class Lexer {
                     Code.E0005_INVALID_NUMBER,
                     start,
                     self.pos,
-                    f"missing digits after `0{prefix}`",
+                    f"missing digits after `0{chr(prefix)}`",
                     help: f"write at least one base-{base} digit"
                 )
             }
@@ -377,22 +508,22 @@ pub class Lexer {
             ok = digits_ok
             text = digits
 
-            if ok and self._peek() == "." and _is_digit(self._peek_at(1)) {
+            if ok and self._peek() == _C_DOT and _is_digit(self._peek_at(1)) {
                 is_float = true
                 self.pos += 1
                 let (fraction_ok, fraction) = self._scan_digits(10)
                 ok = fraction_ok
                 text = text + "." + fraction
             }
-            if ok and (self._peek() == "e" or self._peek() == "E") {
+            if ok and (self._peek() == _C_LOWER_E or self._peek() == _C_UPPER_E) {
                 let sign = self._peek_at(1)
-                let digit_offset = sign == "+" or sign == "-" ? 2 : 1
+                let digit_offset = sign == _C_PLUS or sign == _C_MINUS ? 2 : 1
                 if _is_digit(self._peek_at(digit_offset)) {
                     is_float = true
                     self.pos += digit_offset
                     let (exponent_ok, exponent) = self._scan_digits(10)
                     ok = exponent_ok
-                    text = text + "e" + (digit_offset == 2 ? sign : "") + exponent
+                    text = text + "e" + (digit_offset == 2 ? chr(sign) : "") + exponent
                 }
             }
         }
@@ -401,7 +532,7 @@ pub class Lexer {
 
         if is_float {
             let value = ok ? float(text) : 0.0
-            self._push(TokenKind.Float, start, self.pos, value)
+            self._push_value(TokenKind.Float, start, self.pos, value, 0)
             return
         }
         var value = 0
@@ -412,7 +543,7 @@ pub class Lexer {
                 flags = TokenFlags.NEG_MAGNITUDE
             }
         }
-        self._push(TokenKind.Int, start, self.pos, value, flags)
+        self._push_value(TokenKind.Int, start, self.pos, value, flags)
     }
 
     # Decimal literals must fit signed `int` (except the smallest int's
@@ -436,7 +567,7 @@ pub class Lexer {
             return null
         }
         var value = 0
-        for character in significant {
+        for character in significant.bytes() {
             value = value *% base +% _hex_value(character)
         }
         return value
@@ -452,17 +583,17 @@ pub class Lexer {
 
     fn _reject_number_suffix(self, base: int, start: int) -> bool {
         let character = self._peek()
-        if character == "" { return true }
-        if not _is_ident_start(character) and not _is_digit(character) and ord(character) < 0x80 {
+        if character < 0 { return true }
+        if not _is_ident_start(character) and not _is_digit(character) and character < 0x80 {
             return true
         }
 
         let bad = self.pos
-        while self.pos < self.length and (_is_ident_cont(self._peek()) or ord(self._peek()) >= 0x80) {
+        while self.pos < self.length and (_is_ident_cont(self._peek()) or self._peek() >= 0x80) {
             self.pos += 1
         }
         var help = "Jaithon has no literal suffixes; separate the number from the name"
-        if _is_digit(character) { help = f"`{character}` is not a base-{base} digit" }
+        if _is_digit(character) { help = f"`{chr(character)}` is not a base-{base} digit" }
         let diag = self._error(
             Code.E0005_INVALID_NUMBER,
             start,
@@ -476,18 +607,20 @@ pub class Lexer {
 
     # --- strings (§1.6, §1.7) --------------------------------------------
     fn _flush(self, out: StringBuilder, from_index: int, to_index: int) -> void {
-        if to_index > from_index { out.push(self.source[from_index:to_index]) }
+        if to_index > from_index { out.push(self._text(from_index, to_index)) }
     }
 
     fn _scan_escape(self, out: StringBuilder) -> bool {
         let escape_start = self.pos
         self.pos += 1
         if self.pos >= self.length { return false }
-        let character = self.chars[self.pos]
-        self.pos += 1
+        let code = self.bytes[self.pos]
+        let width = self._width_at(self.pos)
+        let character = if width == 1 { chr(code) } else { self._text(self.pos, self.pos + width) }
+        self.pos += width
 
-        if character == "x" { return self._scan_hex_escape(out, escape_start) }
-        if character == "u" { return self._scan_unicode_escape(out, escape_start) }
+        if code == _C_LOWER_X { return self._scan_hex_escape(out, escape_start) }
+        if code == _C_LOWER_U { return self._scan_unicode_escape(out, escape_start) }
         if character in _SIMPLE_ESCAPES {
             out.push(_SIMPLE_ESCAPES[character])
             return true
@@ -525,7 +658,7 @@ pub class Lexer {
     }
 
     fn _scan_unicode_escape(self, out: StringBuilder, escape_start: int) -> bool {
-        if self._peek() != "{" {
+        if self._peek() != _C_LBRACE {
             self._error(
                 Code.E0004_INVALID_ESCAPE,
                 escape_start,
@@ -543,7 +676,7 @@ pub class Lexer {
             digits += 1
             self.pos += 1
         }
-        let closed = self._eat("}")
+        let closed = self._eat(_C_RBRACE)
         if digits == 0 or digits > 6 or not closed {
             self._error(
                 Code.E0004_INVALID_ESCAPE,
@@ -574,30 +707,45 @@ pub class Lexer {
         out: StringBuilder,
         open_start: int
     ) -> tuple[_ChunkStop, bool] {
+        let bytes = self.bytes
+        let length = self.length
+        let quote = flavor.quote
+        let triple = flavor.triple
+        let interp = flavor.interp
         var saw_escape = false
         var run_start = self.pos
         loop {
-            if self.pos >= self.length {
+            # Plain text runs up to the next byte that can mean something.
+            var at = self.pos
+            while at < length {
+                let byte = bytes[at]
+                if byte == quote or
+                    byte == _C_LF or
+                    byte == _C_CR or
+                    byte == _C_BACKSLASH or
+                    byte == _C_LBRACE or
+                    byte == _C_RBRACE {
+                    break
+                }
+                at += 1
+            }
+            self.pos = at
+
+            if self.pos >= length {
                 self._flush(out, run_start, self.pos)
-                self._error(
-                    _unterminated_code(flavor),
-                    open_start,
-                    self.pos,
-                    f"unterminated {_string_noun(flavor)}",
-                    help: f"add a closing {flavor.closer()}"
-                )
+                self._unterminated(flavor, open_start, false)
                 return (_ChunkStop.Broken, saw_escape)
             }
 
-            let character = self.chars[self.pos]
+            let character = bytes[self.pos]
 
-            if character == flavor.quote {
-                if not flavor.triple {
+            if character == quote {
+                if not triple {
                     self._flush(out, run_start, self.pos)
                     self.pos += 1
                     return (_ChunkStop.Closed, saw_escape)
                 }
-                if self._peek_at(1) == flavor.quote and self._peek_at(2) == flavor.quote {
+                if self._peek_at(1) == quote and self._peek_at(2) == quote {
                     self._flush(out, run_start, self.pos)
                     self.pos += 3
                     return (_ChunkStop.Closed, saw_escape)
@@ -606,23 +754,17 @@ pub class Lexer {
                 continue
             }
 
-            if character == "\r" and self._peek_at(1) == "\n" {
+            if character == _C_CR and self._peek_at(1) == _C_LF {
                 self._flush(out, run_start, self.pos)
                 self.pos += 1
                 run_start = self.pos
                 continue
             }
 
-            if character == "\n" {
-                if not flavor.triple {
+            if character == _C_LF {
+                if not triple {
                     self._flush(out, run_start, self.pos)
-                    self._error(
-                        _unterminated_code(flavor),
-                        open_start,
-                        self.pos,
-                        f"unterminated {_string_noun(flavor)} at end of line",
-                        help: "use a triple-quoted string to span lines"
-                    )
+                    self._unterminated(flavor, open_start, true)
                     return (_ChunkStop.Broken, saw_escape)
                 }
                 self.pos += 1
@@ -630,7 +772,7 @@ pub class Lexer {
                 continue
             }
 
-            if character == "\\" {
+            if character == _C_BACKSLASH {
                 if flavor.raw {
                     self.pos += 1
                     continue
@@ -641,25 +783,19 @@ pub class Lexer {
                 continue
             }
 
-            if flavor.interp and (character == "{" or character == "}") {
+            if interp and (character == _C_LBRACE or character == _C_RBRACE) {
                 self._flush(out, run_start, self.pos)
                 if self._peek_at(1) == character {
-                    out.push(character)
+                    out.push(if character == _C_LBRACE { "{" } else { "}" })
                     self.pos += 2
                     run_start = self.pos
                     continue
                 }
-                if character == "{" {
+                if character == _C_LBRACE {
                     self.pos += 1
                     return (_ChunkStop.Interp, saw_escape)
                 }
-                self._error(
-                    Code.E0003_INVALID_CHARACTER,
-                    self.pos,
-                    self.pos + 1,
-                    "single `}` in f-string text",
-                    help: "write `}}` for a literal brace"
-                )
+                self._single_close_brace()
                 out.push("}")
                 self.pos += 1
                 run_start = self.pos
@@ -668,6 +804,37 @@ pub class Lexer {
 
             self.pos += 1
         }
+    }
+
+    # The string scanner's error reports, out of its loop.
+    fn _unterminated(self, flavor: _StrFlavor, open_start: int, at_end_of_line: bool) -> void {
+        if at_end_of_line {
+            self._error(
+                _unterminated_code(flavor),
+                open_start,
+                self.pos,
+                f"unterminated {_string_noun(flavor)} at end of line",
+                help: "use a triple-quoted string to span lines"
+            )
+            return
+        }
+        self._error(
+            _unterminated_code(flavor),
+            open_start,
+            self.pos,
+            f"unterminated {_string_noun(flavor)}",
+            help: f"add a closing {flavor.closer()}"
+        )
+    }
+
+    fn _single_close_brace(self) -> void {
+        self._error(
+            Code.E0003_INVALID_CHARACTER,
+            self.pos,
+            self.pos + 1,
+            "single `}` in f-string text",
+            help: "write `}}` for a literal brace"
+        )
     }
 
     fn _open_interpolation(self, flavor: _StrFlavor) -> void {
@@ -682,26 +849,32 @@ pub class Lexer {
         }
         self.interp_depth += 1
         var marker = _BRK_INTERP
-        if flavor.quote == "'" { marker = marker | _BRK_F_SINGLE }
+        if flavor.quote == _C_SQUOTE { marker = marker | _BRK_F_SINGLE }
         if flavor.triple { marker = marker | _BRK_F_TRIPLE }
         if flavor.raw { marker = marker | _BRK_F_RAW }
         self.brackets.push(marker)
     }
 
     fn _push_empty_string(self, kind: TokenKind, at: int) -> void {
-        self._push(kind, at, at, "")
+        self._push_value(kind, at, at, "", 0)
     }
 
     fn _resume_fstring(self, flavor: _StrFlavor, token_start: int) -> void {
         let out = StringBuilder()
         let (stop, saw_escape) = self._scan_string_chunk(flavor, out, token_start)
         let kind = stop == _ChunkStop.Interp ? TokenKind.FStringMid : TokenKind.FStringEnd
-        self._push(kind, token_start, self.pos, out.build(), _string_flags(flavor, saw_escape))
+        self._push_value(
+            kind,
+            token_start,
+            self.pos,
+            out.build(),
+            _string_flags(flavor, saw_escape)
+        )
         if stop == _ChunkStop.Interp { self._open_interpolation(flavor) }
     }
 
     fn _scan_string_literal(self, token_start: int, raw: bool, interp: bool) -> void {
-        let quote = self.chars[self.pos]
+        let quote = self.bytes[self.pos]
         let triple = self._peek_at(1) == quote and self._peek_at(2) == quote
         let flavor = _StrFlavor(quote, triple, raw, interp)
         self.pos += triple ? 3 : 1
@@ -710,11 +883,11 @@ pub class Lexer {
         let (stop, saw_escape) = self._scan_string_chunk(flavor, out, token_start)
         let flags = _string_flags(flavor, saw_escape)
         if not interp {
-            self._push(TokenKind.Str, token_start, self.pos, out.build(), flags)
+            self._push_value(TokenKind.Str, token_start, self.pos, out.build(), flags)
             return
         }
 
-        self._push(TokenKind.FStringStart, token_start, self.pos, out.build(), flags)
+        self._push_value(TokenKind.FStringStart, token_start, self.pos, out.build(), flags)
         if stop == _ChunkStop.Interp {
             self._open_interpolation(flavor)
         } else {
@@ -724,33 +897,41 @@ pub class Lexer {
 
     fn _scan_format_spec(self) -> void {
         let start = self.pos
+        let bytes = self.bytes
         var depth = 0
         while self.pos < self.length {
-            let character = self.chars[self.pos]
-            if character == "\n" { break }
-            if character == "{" {
+            let character = bytes[self.pos]
+            if character == _C_LF { break }
+            if character == _C_LBRACE {
                 depth += 1
-            } elif character == "}" {
+            } elif character == _C_RBRACE {
                 if depth == 0 { break }
                 depth -= 1
             }
             self.pos += 1
         }
-        self._push(TokenKind.Str, start, self.pos, self.source[start:self.pos])
+        self._push_value(TokenKind.Str, start, self.pos, self._text(start, self.pos), 0)
     }
 
     # --- identifiers and labels ------------------------------------------
     fn _ident_run_end(self, start: int) -> int {
+        let bytes = self.bytes
+        let length = self.length
         var index = start
-        while index < self.length {
-            let character = self.chars[index]
-            let code = ord(character)
+        while index < length {
+            let code = bytes[index]
             if code < 0x80 {
-                if not _is_ident_cont(character) { break }
-            } elif not _is_unicode_ident(code) {
+                if code >= _C_LOWER_A and code <= _C_LOWER_Z or
+                    code >= _C_UPPER_A and code <= _C_UPPER_Z or
+                    code >= _C_ZERO and code <= _C_NINE or
+                    code == _C_UNDERSCORE {
+                    index += 1
+                    continue
+                }
                 break
             }
-            index += 1
+            if not _is_unicode_ident(self._code_at(index)) { break }
+            index += self._width_at(index)
         }
         return index
     }
@@ -758,21 +939,25 @@ pub class Lexer {
     fn _scan_identifier(self) -> void {
         let start = self.pos
         self.pos = self._ident_run_end(start)
-        let text = self.source[start:self.pos]
+        let text = self._text(start, self.pos)
 
-        if text.len() <= 2 and (self._peek() == "\"" or self._peek() == "'") {
+        let next = self._peek()
+        if self.pos - start <= 2 and (next == _C_DQUOTE or next == _C_SQUOTE) {
             var raw = false
             var interp = false
             var is_prefix = true
-            for character in text {
-                if character == "r" and not raw {
+            var index = start
+            while index < self.pos {
+                let character = self.bytes[index]
+                if character == _C_LOWER_R and not raw {
                     raw = true
-                } elif character == "f" and not interp {
+                } elif character == _C_LOWER_F and not interp {
                     interp = true
                 } else {
                     is_prefix = false
                     break
                 }
+                index += 1
             }
             if is_prefix and (raw or interp) {
                 self._scan_string_literal(start, raw, interp)
@@ -782,7 +967,7 @@ pub class Lexer {
 
         var kind = keyword_lookup(text)
         if kind == TokenKind.Ident and text == "_" { kind = TokenKind.Underscore }
-        self._push(kind, start, self.pos)
+        self._push_text(kind, start, self.pos, text)
     }
 
     fn _at_statement_start(self) -> bool {
@@ -798,17 +983,16 @@ pub class Lexer {
         let after = start + 1
         let first = self._at(after)
         var ident_start = false
-        if first.len() > 0 {
-            let code = ord(first)
-            ident_start = code < 0x80 ? _is_ident_start(first) : _is_unicode_ident(code)
+        if first >= 0 {
+            ident_start = first < 0x80 ? _is_ident_start(first) : _is_unicode_ident(self._code_at(after))
         }
 
         if ident_start {
             let end = self._ident_run_end(after)
-            let closed_by_quote = self._at(end) == "'"
+            let closed_by_quote = self._at(end) == _C_SQUOTE
             var probe = end
-            while self._at(probe) == " " or self._at(probe) == "\t" { probe += 1 }
-            let declaration = self._at(probe) == ":" and self._at_statement_start()
+            while self._at(probe) == _C_SPACE or self._at(probe) == _C_TAB { probe += 1 }
+            let declaration = self._at(probe) == _C_COLON and self._at_statement_start()
             let usage = self._last_kind() == TokenKind.KwBreak or
                 self._last_kind() == TokenKind.KwContinue
             if not closed_by_quote and (declaration or usage) {
@@ -861,20 +1045,20 @@ pub class Lexer {
 
     fn _scan_punct(self) -> void {
         let start = self.pos
-        let character = self.chars[self.pos]
+        let character = self.bytes[self.pos]
         self.pos += 1
 
-        if character == "}" {
+        if character == _C_RBRACE {
             self._close_brace(start)
             return
         }
-        if character == ":" {
+        if character == _C_COLON {
             self._push(TokenKind.Colon, start, self.pos)
             if self._bracket_top_is_interp() { self._scan_format_spec() }
             return
         }
-        if character == "!" {
-            if self._eat("=") {
+        if character == _C_BANG {
+            if self._eat(_C_EQ) {
                 self._push(TokenKind.BangEq, start, self.pos)
                 return
             }
@@ -890,8 +1074,8 @@ pub class Lexer {
 
         let kind = self._punct_kind(character)
         if kind == null {
-            let code = ord(character)
-            var message = f"unexpected character `{character}`"
+            let code = character
+            var message = f"unexpected character `{chr(character)}`"
             if code < 0x20 or code == 0x7F {
                 message = f"unexpected control character U+{code:04X}"
             }
@@ -901,81 +1085,87 @@ pub class Lexer {
         self._push(kind, start, self.pos)
     }
 
-    fn _punct_kind(self, character: str) -> TokenKind? {
-        if character == "(" {
+    fn _punct_kind(self, character: int) -> TokenKind? {
+        if character == _C_LPAREN {
             self.brackets.push(_BRK_PAREN)
             return TokenKind.LParen
         }
-        if character == "[" {
+        if character == _C_LBRACKET {
             self.brackets.push(_BRK_BRACKET)
             return TokenKind.LBracket
         }
-        if character == "{" {
+        if character == _C_LBRACE {
             self.brackets.push(self._brace_opens_expression() ? _BRK_BRACE_EXPR : _BRK_BRACE_BLOCK)
             return TokenKind.LBrace
         }
-        if character == ")" {
+        if character == _C_RPAREN {
             self._pop_bracket(_BRK_PAREN)
             return TokenKind.RParen
         }
-        if character == "]" {
+        if character == _C_RBRACKET {
             self._pop_bracket(_BRK_BRACKET)
             return TokenKind.RBracket
         }
-        if character == "," { return TokenKind.Comma }
-        if character == ";" { return TokenKind.Semicolon }
-        if character == "@" { return TokenKind.At }
-        if character == "~" { return TokenKind.Tilde }
-        if character == "." {
-            if not self._eat(".") { return TokenKind.Dot }
-            if self._eat(".") { return TokenKind.Ellipsis }
-            if self._eat("=") { return TokenKind.DotDotEq }
+        if character == _C_COMMA { return TokenKind.Comma }
+        if character == _C_SEMICOLON { return TokenKind.Semicolon }
+        if character == _C_AT { return TokenKind.At }
+        if character == _C_TILDE { return TokenKind.Tilde }
+        if character == _C_DOT {
+            if not self._eat(_C_DOT) { return TokenKind.Dot }
+            if self._eat(_C_DOT) { return TokenKind.Ellipsis }
+            if self._eat(_C_EQ) { return TokenKind.DotDotEq }
             return TokenKind.DotDot
         }
-        if character == "+" {
-            if self._eat("=") { return TokenKind.PlusEq }
-            if self._eat("%") { return TokenKind.PlusPercent }
+        if character == _C_PLUS {
+            if self._eat(_C_EQ) { return TokenKind.PlusEq }
+            if self._eat(_C_PERCENT) { return TokenKind.PlusPercent }
             return TokenKind.Plus
         }
-        if character == "-" {
-            if self._eat(">") { return TokenKind.Arrow }
-            if self._eat("=") { return TokenKind.MinusEq }
-            if self._eat("%") { return TokenKind.MinusPercent }
+        if character == _C_MINUS {
+            if self._eat(_C_GT) { return TokenKind.Arrow }
+            if self._eat(_C_EQ) { return TokenKind.MinusEq }
+            if self._eat(_C_PERCENT) { return TokenKind.MinusPercent }
             return TokenKind.Minus
         }
-        if character == "*" {
-            if self._eat("*") { return self._eat("=") ? TokenKind.StarStarEq : TokenKind.StarStar }
-            if self._eat("=") { return TokenKind.StarEq }
-            if self._eat("%") { return TokenKind.StarPercent }
+        if character == _C_STAR {
+            if self._eat(_C_STAR) {
+                return self._eat(_C_EQ) ? TokenKind.StarStarEq : TokenKind.StarStar
+            }
+            if self._eat(_C_EQ) { return TokenKind.StarEq }
+            if self._eat(_C_PERCENT) { return TokenKind.StarPercent }
             return TokenKind.Star
         }
-        if character == "/" {
-            if self._eat("/") {
-                return self._eat("=") ? TokenKind.SlashSlashEq : TokenKind.SlashSlash
+        if character == _C_SLASH {
+            if self._eat(_C_SLASH) {
+                return self._eat(_C_EQ) ? TokenKind.SlashSlashEq : TokenKind.SlashSlash
             }
-            if self._eat("=") { return TokenKind.SlashEq }
+            if self._eat(_C_EQ) { return TokenKind.SlashEq }
             return TokenKind.Slash
         }
-        if character == "%" { return self._eat("=") ? TokenKind.PercentEq : TokenKind.Percent }
-        if character == "&" { return self._eat("=") ? TokenKind.AmpEq : TokenKind.Amp }
-        if character == "|" { return self._eat("=") ? TokenKind.PipeEq : TokenKind.Pipe }
-        if character == "^" { return self._eat("=") ? TokenKind.CaretEq : TokenKind.Caret }
-        if character == "<" {
-            if self._eat("<") { return self._eat("=") ? TokenKind.ShlEq : TokenKind.Shl }
-            return self._eat("=") ? TokenKind.Le : TokenKind.Lt
+        if character == _C_PERCENT {
+            return self._eat(_C_EQ) ? TokenKind.PercentEq : TokenKind.Percent
         }
-        if character == ">" {
-            if self._eat(">") { return self._eat("=") ? TokenKind.ShrEq : TokenKind.Shr }
-            return self._eat("=") ? TokenKind.Ge : TokenKind.Gt
+        if character == _C_AMP { return self._eat(_C_EQ) ? TokenKind.AmpEq : TokenKind.Amp }
+        if character == _C_PIPE { return self._eat(_C_EQ) ? TokenKind.PipeEq : TokenKind.Pipe }
+        if character == _C_CARET {
+            return self._eat(_C_EQ) ? TokenKind.CaretEq : TokenKind.Caret
         }
-        if character == "=" {
-            if self._eat("=") { return TokenKind.EqEq }
-            if self._eat(">") { return TokenKind.FatArrow }
+        if character == _C_LT {
+            if self._eat(_C_LT) { return self._eat(_C_EQ) ? TokenKind.ShlEq : TokenKind.Shl }
+            return self._eat(_C_EQ) ? TokenKind.Le : TokenKind.Lt
+        }
+        if character == _C_GT {
+            if self._eat(_C_GT) { return self._eat(_C_EQ) ? TokenKind.ShrEq : TokenKind.Shr }
+            return self._eat(_C_EQ) ? TokenKind.Ge : TokenKind.Gt
+        }
+        if character == _C_EQ {
+            if self._eat(_C_EQ) { return TokenKind.EqEq }
+            if self._eat(_C_GT) { return TokenKind.FatArrow }
             return TokenKind.Eq
         }
-        if character == "?" {
-            if self._eat("?") { return TokenKind.QuestionQuestion }
-            if self._eat(".") { return TokenKind.QuestionDot }
+        if character == _C_QUESTION {
+            if self._eat(_C_QUESTION) { return TokenKind.QuestionQuestion }
+            if self._eat(_C_DOT) { return TokenKind.QuestionDot }
             return TokenKind.Question
         }
         return null
@@ -984,8 +1174,8 @@ pub class Lexer {
     fn _line_continuation(self) -> void {
         let start = self.pos
         var next = start + 1
-        if self._at(next) == "\r" { next += 1 }
-        if self._at(next) == "\n" {
+        if self._at(next) == _C_CR { next += 1 }
+        if self._at(next) == _C_LF {
             self.pos = next + 1
             self.line += 1
             return
@@ -1000,65 +1190,78 @@ pub class Lexer {
         )
     }
 
+    #: A character outside ASCII where a token may start. Kept out of
+    #: `_scan_token` so that the common path never calls a method whose
+    #: result it has not yet seen come back, which stops the tier compiling it.
+    fn _scan_non_ascii(self) -> void {
+        let code = self._code_at(self.pos)
+        let width = self._width_at(self.pos)
+        if _is_unicode_space(code) {
+            self.pos += width
+            return
+        }
+        if not _is_unicode_ident(code) {
+            self._error(
+                Code.E0003_INVALID_CHARACTER,
+                self.pos,
+                self.pos + width,
+                f"unexpected character U+{code:04X}",
+                help: "only ASCII punctuation is meaningful outside " + "strings and comments"
+            )
+            self.pos += width
+            return
+        }
+        self._scan_identifier()
+    }
+
     # --- the main loop ---------------------------------------------------
     fn _scan_token(self) -> void {
-        let character = self.chars[self.pos]
+        let character = self.bytes[self.pos]
 
-        if character == " " or
-            character == "\t" or
-            character == "\r" or
-            character == "\u{B}" or
-            character == "\u{C}" {
+        if character == _C_SPACE or
+            character == _C_TAB or
+            character == _C_CR or
+            character == _C_VT or
+            character == _C_FF {
             self.pos += 1
             return
         }
-        if character == "\n" {
+        if character == _C_LF {
             self._handle_newline()
             return
         }
-        if character == "#" {
+        if character == _C_HASH {
             self._skip_comment()
             return
         }
-        if character == "\\" {
+        if character == _C_BACKSLASH {
             self._line_continuation()
             return
         }
 
-        let code = ord(character)
-        if code >= 0x80 {
-            if _is_unicode_space(code) {
-                self.pos += 1
-                return
-            }
-            if not _is_unicode_ident(code) {
-                self._error(
-                    Code.E0003_INVALID_CHARACTER,
-                    self.pos,
-                    self.pos + 1,
-                    f"unexpected character U+{code:04X}",
-                    help: "only ASCII punctuation is meaningful outside " + "strings and comments"
-                )
-                self.pos += 1
-                return
-            }
-            self._scan_identifier()
+        if character >= 0x80 {
+            self._scan_non_ascii()
             return
         }
 
-        if _is_digit(character) {
+        # Spelled out rather than `_is_digit` and `_is_ident_start`: a call to a
+        # function that has not compiled yet ends the compiled walk of this
+        # body there, and which one compiles first depends on the file.
+        if character >= _C_ZERO and character <= _C_NINE {
             self._scan_number()
             return
         }
-        if _is_ident_start(character) {
+        if character >= _C_LOWER_A and character <= _C_LOWER_Z or
+            character >= _C_UPPER_A and character <= _C_UPPER_Z or
+            character == _C_UNDERSCORE {
             self._scan_identifier()
             return
         }
-        if character == "\"" {
+        if character == _C_DQUOTE {
             self._scan_string_literal(self.pos, false, false)
             return
         }
-        if character == "'" {
+        if character == _C_SQUOTE {
             self._scan_quote_or_label()
             return
         }
@@ -1079,38 +1282,65 @@ let _SIMPLE_ESCAPES: dict[str, str] = {
     "0": "\0",
 }
 
-fn _is_digit(character: str) -> bool {
-    return character >= "0" and character <= "9"
+#: Raise unless `source` is well-formed UTF-8, as the character list this
+#: lexer once built did. Every byte offset below assumes whole sequences, and a
+#: `str` may hold any bytes: a stray continuation byte would otherwise pass as
+#: part of a name, and a lone lead byte would make `ascii` true and `_text`
+#: slice through it. The copy is validated natively, a small cost per file.
+fn _require_utf8(source: str) -> void {
+    try {
+        source.to_bytes().decode()
+    } catch _invalid: ValueError {
+        throw ValueError("ord(): invalid UTF-8")
+    }
 }
 
-fn _is_alpha(character: str) -> bool {
-    return character >= "a" and character <= "z" or character >= "A" and character <= "Z"
+#: The `str` index of every byte offset of `bytes`, and of its end: the
+#: number of characters that start before it.
+fn _scalar_offsets(bytes: list[int]) -> list[int] {
+    var out: list[int] = []
+    var scalar = 0
+    for byte in bytes {
+        out.push(scalar)
+        if byte & 0xC0 != 0x80 { scalar += 1 }
+    }
+    out.push(scalar)
+    return out
 }
 
-fn _is_ident_start(character: str) -> bool {
-    return _is_alpha(character) or character == "_"
+fn _is_digit(character: int) -> bool {
+    return character >= _C_ZERO and character <= _C_NINE
 }
 
-fn _is_ident_cont(character: str) -> bool {
+fn _is_alpha(character: int) -> bool {
+    return character >= _C_LOWER_A and character <= _C_LOWER_Z or
+        character >= _C_UPPER_A and character <= _C_UPPER_Z
+}
+
+fn _is_ident_start(character: int) -> bool {
+    return _is_alpha(character) or character == _C_UNDERSCORE
+}
+
+fn _is_ident_cont(character: int) -> bool {
     return _is_ident_start(character) or _is_digit(character)
 }
 
-fn _hex_value(character: str) -> int {
-    if _is_digit(character) { return ord(character) - ord("0") }
-    if character >= "a" and character <= "f" { return ord(character) - ord("a") + 10 }
-    if character >= "A" and character <= "F" { return ord(character) - ord("A") + 10 }
+fn _hex_value(character: int) -> int {
+    if _is_digit(character) { return character - _C_ZERO }
+    if character >= _C_LOWER_A and character <= _C_LOWER_F { return character - _C_LOWER_A + 10 }
+    if character >= _C_UPPER_A and character <= _C_UPPER_F { return character - _C_UPPER_A + 10 }
     return -1
 }
 
-fn _digit_in_base(character: str, base: int) -> bool {
+fn _digit_in_base(character: int, base: int) -> bool {
     let value = _hex_value(character)
     return value >= 0 and value < base
 }
 
-fn _base_of(prefix: str) -> int {
-    if prefix == "x" or prefix == "X" { return 16 }
-    if prefix == "o" or prefix == "O" { return 8 }
-    if prefix == "b" or prefix == "B" { return 2 }
+fn _base_of(prefix: int) -> int {
+    if prefix == _C_LOWER_X or prefix == _C_UPPER_X { return 16 }
+    if prefix == _C_LOWER_O or prefix == _C_UPPER_O { return 8 }
+    if prefix == _C_LOWER_B or prefix == _C_UPPER_B { return 2 }
     return 0
 }
 
@@ -1123,13 +1353,6 @@ fn _fits_in_int(digits: str, base: int, negated: bool) -> bool {
     if count > 19 { return false }
     if digits <= "9223372036854775807" { return true }
     return negated and digits == "9223372036854775808"
-}
-
-fn _utf8_length(code: int) -> int {
-    if code < 0x80 { return 1 }
-    if code < 0x800 { return 2 }
-    if code < 0x10000 { return 3 }
-    return 4
 }
 
 fn _is_unicode_space(code: int) -> bool {
@@ -1208,7 +1431,7 @@ fn _ends_operand(kind: TokenKind) -> bool {
 }
 
 fn _flavor_from_marker(marker: int) -> _StrFlavor {
-    let quote = marker & _BRK_F_SINGLE != 0 ? "'" : "\""
+    let quote = marker & _BRK_F_SINGLE != 0 ? _C_SQUOTE : _C_DQUOTE
     return _StrFlavor(quote, marker & _BRK_F_TRIPLE != 0, marker & _BRK_F_RAW != 0, true)
 }
 
@@ -1241,26 +1464,20 @@ pub fn dump_tokens(source: str, file_id: int = 0) -> str {
     let lexer = Lexer(source, file_id, DiagnosticBag())
     let tokens = lexer.tokenize()
 
-    let chars = [character for character in source]
-    var offsets: list[int] = []
-    var byte_offset = 0
-    for character in chars {
-        offsets.push(byte_offset)
-        byte_offset += _dump_utf8_length(ord(character))
-    }
-    offsets.push(byte_offset)
-
+    # Lines and columns count characters, so a continuation byte moves neither.
+    let bytes = source.bytes()
     let out = StringBuilder()
     var index = 0
     var at = 0
     var line = 1
     var column = 1
     for token in tokens {
-        while at < chars.len() and offsets[at] < token.span.start {
-            if chars[at] == "\n" {
+        while at < bytes.len() and at < token.span.start {
+            let byte = bytes[at]
+            if byte == _C_LF {
                 line += 1
                 column = 1
-            } else {
+            } elif byte & 0xC0 != 0x80 {
                 column += 1
             }
             at += 1
@@ -1286,11 +1503,4 @@ pub fn dump_tokens(source: str, file_id: int = 0) -> str {
         index += 1
     }
     return out.build()
-}
-
-fn _dump_utf8_length(code_point: int) -> int {
-    if code_point < 0x80 { return 1 }
-    if code_point < 0x800 { return 2 }
-    if code_point < 0x10000 { return 3 }
-    return 4
 }

@@ -107,6 +107,36 @@ pub class ModuleSig {
     }
 }
 
+#: Whether loaders share the signatures they parse. `JAITHON_SIG_SHARE=0`
+#: gives every loader its own parse of every module, as before.
+#:
+#: A loader is built per search path, and the search path is the checked
+#: file's directory and every directory above it, so each directory of a tree
+#: got its own loader -- and each loader parsed the whole import closure of
+#: that directory again. Checking lib/jaithon (13 directories) lexed and parsed
+#: about 3.4 times as much source as the tree holds. A signature depends only
+#: on the file it was parsed from and the name it was loaded under, so any
+#: loader that resolves the same pair can take the same `ModuleSig`.
+let _SHARE_SIGS: bool = (__prim__.os_env("JAITHON_SIG_SHARE") ?? "1") != "0"
+
+#: Signatures parsed by any loader, keyed by `_shared_key(path, dotted)`.
+var _shared_sigs: dict[str, ModuleSig] = {}
+
+#: The next file id any loader hands out while signatures are shared. One
+#: counter for all of them: a loader that adopts another's signature adopts
+#: its file id too, and spans carry those ids, so no two loaders may ever hand
+#: out the same one.
+var _next_shared_file_id: int = 1
+
+fn _shared_key(path: str, dotted: str) -> str {
+    return path + "\n" + dotted
+}
+
+#: Forget every shared signature, so the next load re-reads from disk.
+pub fn clear_shared_signatures() -> void {
+    _shared_sigs = {}
+}
+
 #: Every module signature one checker loaded, not the C's file-static vector.
 pub class SigLoader {
     #: `jaiResolveModulePath`'s `sUserDirs` and `sLibDirs`, concatenated.
@@ -114,6 +144,7 @@ pub class SigLoader {
 
     var _cache: dict[str, ModuleSig]
     var _by_file: dict[int, ModuleSig]
+    var _resolved: dict[str, dict[str, str]]
     var _next_file_id: int
     var _visiting: list[str]
     var _partial: bool
@@ -123,6 +154,7 @@ pub class SigLoader {
         self.search = search
         self._cache = {}
         self._by_file = {}
+        self._resolved = {}
         self._next_file_id = first_file_id
         self._visiting = []
         self._partial = false
@@ -133,25 +165,65 @@ pub class SigLoader {
     #: cannot be found. A file that fails to parse is still cached, empty.
     pub fn load(self, dotted: str, from_dir: str = "") -> ModuleSig? {
         if dotted == "" { return null }
-        let resolved = resolve_module_path(dotted, from_dir, self.search)
+        let resolved = self._resolve(dotted, from_dir)
         if resolved is null { return null }
         if resolved in self._cache { return self._cache[resolved] }
+
+        let key = _shared_key(resolved, dotted)
+        if _SHARE_SIGS and key in _shared_sigs {
+            let shared = _shared_sigs[key]
+            self._cache[resolved] = shared
+            self._by_file[shared.file_id] = shared
+            return shared
+        }
 
         let text = read_source(resolved)
         if text is null { return null }
 
-        let sig = ModuleSig(resolved, dotted, self._next_file_id)
-        self._next_file_id += 1
+        let sig = ModuleSig(resolved, dotted, self._take_file_id())
 
         let program = parse(text, sig.file_id)
         sig.program = program
         if program != null and program.kind == NodeKind.Program {
             _collect(sig, program.child_list("stmts"))
+            if not _KEEP_SIG_BODIES { _strip_bodies(program.child_list("stmts")) }
         }
 
         self._cache[resolved] = sig
         self._by_file[sig.file_id] = sig
+        if _SHARE_SIGS { _shared_sigs[key] = sig }
         return sig
+    }
+
+    fn _take_file_id(self) -> int {
+        var taken = self._next_file_id
+        if _SHARE_SIGS {
+            if _next_shared_file_id > taken { taken = _next_shared_file_id }
+            _next_shared_file_id = taken + 1
+        }
+        self._next_file_id = taken + 1
+        return taken
+    }
+
+    #: `resolve_module_path` for this loader's search path, remembered. Every
+    #: `load` resolves before it can consult the cache, and resolving walks the
+    #: search path with two `stat` calls per directory: those calls were 5% of
+    #: a `check`. Only a hit is remembered, so a module that appears later is
+    #: still found.
+    #:
+    #: Keyed by directory and then by name, not by the two joined: `load` runs
+    #: for every edge of every import walk, and a joined key was a string built
+    #: and thrown away each time.
+    fn _resolve(self, dotted: str, from_dir: str) -> str? {
+        var known = self._resolved.get(from_dir, null)
+        if known is null {
+            known = {}
+            self._resolved[from_dir] = known
+        }
+        if dotted in known { return known[dotted] }
+        let found = resolve_module_path(dotted, from_dir, self.search)
+        if found is not null { known[dotted] = found }
+        return found
     }
 
     #: The declaration `name` denotes in `sig`, and the module that declares it —
@@ -297,6 +369,39 @@ pub fn default_search_path(exec_dir: str? = null) -> list[str] {
         _add_package_dirs(dirs, fixed)
     }
     return dirs
+}
+
+#: Whether a loaded signature keeps its functions' bodies. `JAITHON_SIG_BODIES=1`
+#: keeps them, as before.
+let _KEEP_SIG_BODIES: bool = (__prim__.os_env("JAITHON_SIG_BODIES") ?? "0") != "0"
+
+#: A signature is read for what its functions take and return, never for what
+#: they do -- the one question asked of a body is whether there is one, which
+#: is what makes a method abstract. So each top-level function's and method's
+#: block is emptied once the declarations are collected. The whole file was
+#: still parsed, so a file that does not parse answers exactly as before; what
+#: changes is that a loaded module no longer keeps every statement it holds
+#: alive for the rest of the run, for each collection to trace again. Peak
+#: memory of `check lib/jaithon` went from 237 MB to 138 MB.
+fn _strip_bodies(stmts: list[Node]) -> void {
+    for node in stmts {
+        if node.kind == NodeKind.FnDecl {
+            _strip_body(node)
+        } elif node.kind == NodeKind.ClassDecl {
+            for method in node.child_list("methods") { _strip_body(method) }
+            for method in node.child_list("getters") { _strip_body(method) }
+            for method in node.child_list("setters") { _strip_body(method) }
+        } elif node.kind == NodeKind.TraitDecl or node.kind == NodeKind.EnumDecl {
+            for method in node.child_list("methods") { _strip_body(method) }
+        }
+    }
+}
+
+fn _strip_body(fn_node: Node) -> void {
+    let body = fn_node.child("body")
+    if body is null or body.kind != NodeKind.Block { return }
+    let empty: list[Node] = []
+    body.set("stmts", empty)
 }
 
 fn _collect(sig: ModuleSig, stmts: list[Node]) -> void {

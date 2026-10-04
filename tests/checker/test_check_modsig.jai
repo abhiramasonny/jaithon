@@ -224,10 +224,35 @@ fn test_file_ids_are_handed_out_after_the_file_being_checked() -> void {
     let loader = SigLoader()
     let first = _require(loader.load("pkg.leaf", root), "pkg.leaf")
     let second = _require(loader.load("star", root), "star")
-    assert_eq(first.file_id, 1)
-    assert_eq(second.file_id, 2)
-    assert_eq(loader.for_file(2)?.path, second.path)
+    # Loaders share what they parse, and with it one id counter, so the exact
+    # numbers depend on what this process loaded before; zero never comes out.
+    assert_true(first.file_id >= 1, f"{first.file_id}")
+    assert_true(second.file_id >= 1, f"{second.file_id}")
+    assert_true(first.file_id != second.file_id)
+    assert_eq(loader.for_file(second.file_id)?.path, second.path)
     assert_true(loader.for_file(0) is null)
+}
+
+fn test_two_loaders_share_a_signature_but_never_an_id() -> void {
+    let root = _fixture()
+    let one = SigLoader([f"{root}/pkg"])
+    let two = SigLoader([f"{root}/shadow"])
+    let from_one = _require(one.load("star", root), "star")
+    let from_two = _require(two.load("star", root), "star")
+    assert_eq(two.for_file(from_two.file_id)?.path, from_two.path)
+
+    # Each resolves `leaf` through its own search path, to a different file.
+    let leaf_one = _require(one.load("leaf"), "leaf")
+    let leaf_two = _require(two.load("leaf"), "leaf")
+    assert_eq(leaf_one.path, f"{root}/pkg/leaf.jai")
+    assert_eq(leaf_two.path, f"{root}/shadow/leaf.jai")
+    assert_true(leaf_one.file_id != from_one.file_id)
+    assert_true(leaf_two.file_id != from_two.file_id)
+
+    if (__prim__.os_env("JAITHON_SIG_SHARE") ?? "1") != "0" {
+        assert_true(id(from_one) == id(from_two), "the second loader parsed again")
+        assert_true(leaf_one.file_id != leaf_two.file_id)
+    }
 }
 
 fn test_a_qualified_name_carries_the_module_it_came_from() -> void {
