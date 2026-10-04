@@ -402,8 +402,12 @@ static uint8_t *cacheReadForLoad(const char *path, size_t *length) {
  * The test is the directory, not seed membership: the seed also carries
  * std.math, std.str and std.json, which the compiler imports but user code
  * owns just as much. Warming for those put the 12ms straight back, because
- * std.core is among them and every program loads it. */
-static bool maybeWarmFor(const char *path) {
+ * std.core is among them and every program loads it.
+ *
+ * `entry` is the file `run` was given. It becomes __main__, which the seed
+ * never compiled, so the seed cannot stand in for it: it is loaded by
+ * selfHostedModuleBody, which compiles. */
+static bool maybeWarmFor(const char *path, bool entry) {
     if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return false;
 
     /* The seed keys on the library-relative path ("jaithon/ast.jai"), which is
@@ -418,7 +422,7 @@ static bool maybeWarmFor(const char *path) {
         const JaiRunOptions *opts = options();
         uint32_t flags = cacheFlagsFor(&opts->codegen, true);
         if (opts->useCache && prefetchedFlagsMatch(path, flags)) return false;
-        if (seeded != NULL && seedStandsInForFile(path)) return false;
+        if (!entry && seeded != NULL && seedStandsInForFile(path)) return false;
     }
     warmFrontEnd();
     return true;
@@ -690,7 +694,7 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
      * so without this it is freed underneath createModule -- a segfault that
      * appears only when the entry file is cached and an import is not. */
     jaiPushRoot(OBJ_VAL(pathKey));
-    bool warmed = maybeWarmFor(path);
+    bool warmed = maybeWarmFor(path, false);
     jaiPopRoot();
 
     /* The warm can load this very module: `jaithon fmt` imports the compiler
@@ -1196,7 +1200,7 @@ int jaiRunFile(const char *path, const JaiRunOptions *opts, int argc,
     ObjList *args = installArgv(absolute, argc, argv);
     if (!preludeDisabled()) (void)jaiLoadPrelude();
 
-    maybeWarmFor(absolute);
+    maybeWarmFor(absolute, true);
 
     ObjString *pathKey = jaiStringIntern(absolute, strlen(absolute));
     ObjModule *module = createModule("__main__", pathKey);
