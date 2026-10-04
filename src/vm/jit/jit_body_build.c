@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
@@ -246,6 +247,81 @@ unarmedOpcode:
     return JIT_ARM_UNARMED;
 }
 
+/* JAITHON_JIT_FMT_LEAF=0 sends every f-string back through its descriptor
+ * call, for a one-binary A/B of emitFormatLeaf. */
+static bool jitFormatLeaf(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FMT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The f-string through jaiValueFormatLeaf, in front of the descriptor call to
+ * jitFormat, which stays behind it as the slow path -- the same layout as the
+ * dict leaves (see emitDictLeafGet):
+ *
+ *        args <- the parts;  blr jaiValueFormatLeaf
+ *        NULL ---------------------------------------\
+ *        result <- x0;  b done                         |
+ *   slow: <the descriptor call, unchanged>  <---------/
+ *   done: <load the result out of the descriptor>
+ *
+ * The leaf never collects, so the parts are written as plain arguments and
+ * nothing is rooted: no root fill, no root-range push and pop, no wrapper.
+ * Emitted only when every part is something formatShort renders itself or may
+ * be (an int, a bool, an object that may be a string), since a part it cannot
+ * render would take the slow path every time and pay for both. */
+static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitFormatLeaf() || e->inlining) return;
+    if (parts > JIT_MAX_ARGS_OUT || e->valueDepth < parts) return;
+    unsigned first = e->depth - parts;
+    for (unsigned i = 0; i < parts; i++) {
+        SlotKind k = e->stack[first + i];
+        if (k != SLOT_INT && k != SLOT_BOOL && k != SLOT_OBJ &&
+            k != SLOT_MAYBE_OBJ) {
+            return;
+        }
+    }
+    unsigned vfirst = e->valueDepth - parts;
+    for (unsigned i = 0; i < parts; i++) {
+        if (!leafRegOk(valueXReg(e, vfirst + i))) return;
+    }
+    unsigned argsAt = e->descOffset + (unsigned)offsetof(JitCallDesc, args);
+    unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+    if (argsAt > 4095u) return;
+    fpSyncAll(e);
+    settleAll(e);
+
+    for (unsigned i = 0; i < parts; i++) {
+        unsigned reg = valueXReg(e, vfirst + i);
+        unsigned at = argsAt + i * (unsigned)sizeof(Value);
+        emitTagFor(e, e->stack[first + i], reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
+        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
+        emit(e, jaiA64StrX(reg, 31, at + 8));
+    }
+    emit(e, jaiA64AddXImm(0, 31, argsAt));
+    emit(e, jaiA64MovzX(1, parts, 0));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jaiValueFormatLeaf);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    fx->slow[0] = (int)e->count;
+    fx->cond[0] = JAI_A64_EQ;
+    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    /* The whole Value, as jitFormat writes it, though only the payload is
+     * read back below. */
+    emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+    emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
+    emit(e, jaiA64StrX(0, 31, rat + 8));
+    fx->done = (int)e->count;
+    emit(e, jaiA64B(0));
+    fx->on = true;
+}
+
 bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp) {
     int off = *offp;
     do {
@@ -269,10 +345,14 @@ bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp) {
                 return false;
             }
         }
+        LeafFix ffx;
+        emitFormatLeaf(e, parts, &ffx);
+        leafSlowHere(e, &ffx);
         if (!emitDescriptor(e, NULL_VAL, e->depth - parts, parts,
                             (void *)&jitFormat)) {
             return false;
         }
+        leafDoneHere(e, &ffx);
         for (unsigned i = 0; i < parts; i++) {
             unsigned drop;
             if (!popValue(e, &drop, NULL)) return false;

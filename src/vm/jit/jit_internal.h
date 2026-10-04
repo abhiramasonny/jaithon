@@ -800,16 +800,16 @@ int64_t jitDictGetStr(ObjDict *d, ObjString *key, Value *result,
 int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
                       int64_t payload);
 typedef struct {
-    int  slow[2];   /* the two branches to the descriptor path */
-    int  done;      /* the branch over it */
-    bool on;        /* a leaf was emitted at all */
-} DictLeafFix;
+    int      slow[2];   /* the branches to the descriptor path, or -1 */
+    unsigned cond[2];   /* the condition each of them branches on */
+    int      done;      /* the branch over it */
+    bool     on;        /* a leaf was emitted at all */
+} LeafFix;
 void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
-                     SlotKind defKind, bool absentSlow, DictLeafFix *fx);
-void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey, unsigned rVal,
-                     SlotKind vk, DictLeafFix *fx);
-void dictLeafSlowHere(Emit *e, DictLeafFix *fx);
-void dictLeafDoneHere(Emit *e, DictLeafFix *fx);
+                     SlotKind defKind, bool absentSlow, LeafFix *fx);
+bool leafRegOk(unsigned r);
+void leafSlowHere(Emit *e, LeafFix *fx);
+void leafDoneHere(Emit *e, LeafFix *fx);
 int jitCallOut(JitCallDesc *d);
 
 /* Defined in jit_osr.c. */

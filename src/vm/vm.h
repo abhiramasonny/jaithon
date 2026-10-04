@@ -148,6 +148,9 @@ bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver,
                                int count, Value *out);
 bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
                                  int count, Value *out);
+/* An f-string's result for compiled code, or NULL when only jaiValueFormat
+ * can make it. Never collects; see its definition in value.c. */
+ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count);
 /* The result kind an OP_INVOKE site has observed for a receiver of
  * `receiver`'s type, or JAI_FB_NONE. A PREDICTION, not a guarantee -- see
  * InlineCache::resultKind; every caller must guard what it emits. */

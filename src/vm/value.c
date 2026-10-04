@@ -4,6 +4,7 @@
 
 #include "vm/value.h"
 #include "vm/object/object.h"
+#include "vm/gc.h"
 #include "vm/table.h"
 #include "vm/vm.h"
 
@@ -1249,7 +1250,7 @@ static bool fmtShortOn(void) {
  * Only the kinds it renders itself, with no call out: ints, strings, bools and
  * null. Anything else, or a result past JAI_STR_SHORT_MAX, returns false having
  * produced nothing, and the caller starts the general path from the top. */
-static bool formatShort(const Value *parts, int count, ObjString **out) {
+JAI_INLINE bool formatShort(const Value *parts, int count, ObjString **out) {
     char   buf[JAI_STR_SHORT_MAX + JAI_INT_DIGITS];
     size_t o = 0;
 
@@ -1309,6 +1310,26 @@ static bool formatShort(const Value *parts, int count, ObjString **out) {
     }
     *out = o == 0 ? jaiStringIntern("", 0) : jaiStringNew(buf, o);
     return true;
+}
+
+/* formatShort for compiled code, called as a LEAF: no descriptor, no roots.
+ *
+ * That is sound only while nothing here can collect, and the one thing that
+ * can is the allocation a miss makes (jaiStringNew, then interning it). An
+ * allocation collects only when jaiGCWanted() is already true on the way in --
+ * allocObj tests exactly that, and nothing else starts a collection -- so a
+ * true answer at entry sends the call back to the descriptor path, which roots
+ * the operands, and a false one holds for the single allocation below. The
+ * same argument jitInstanceAlloc rests on.
+ *
+ * NULL means "not answered": a part formatShort does not render itself, a
+ * long result, or a collection due. The caller then makes the descriptor call
+ * it would have made anyway. */
+ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    if (count <= 0 || count > JAI_FMT_MAX_PARTS || !fmtShortOn()) return NULL;
+    ObjString *made;
+    return formatShort(parts, (int)count, &made) ? made : NULL;
 }
 
 ObjString *jaiValueFormat(const Value *parts, int count) {
