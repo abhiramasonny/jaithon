@@ -10,7 +10,7 @@ from jaithon.compile.check.expr import E0410_UNKNOWN_MEMBER
 from jaithon.compile.check.modsig import MODULE_EXT, ModuleSig, SigImport, SigLoader
 from jaithon.compile.check.modsig import absolute, default_search_path, dirname
 from jaithon.compile.check.modsig import resolve_module_path
-from jaithon.compile.check.modsig import read_source
+from jaithon.compile.check.modsig import read_source, clear_shared_signatures
 from jaithon.compile.check.ctx import Ctx
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type, TypeDecl
@@ -442,6 +442,7 @@ var _loaders: dict[str, SigLoader] = {}
 #: Forget every cached loader, so the next compilation re-reads from disk.
 pub fn clear_signature_cache() -> void {
     _loaders = {}
+    clear_shared_signatures()
 }
 
 fn _loader_for(roots: list[str]) -> SigLoader {
