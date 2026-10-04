@@ -472,7 +472,7 @@ this table complete in both directions.
 | `JAITHON_JIT_NULL_PAIR` | on | The null-compare pair fusion. |
 | `JAITHON_JIT_FUSED_DISCARD` | on | Fuse a call whose result is discarded. |
 | `JAITHON_JIT_MEMBERSHIP` | on | `in` against a container. |
-| `JAITHON_JIT_DICT_LEAF` | on | String-keyed `d.get(k)`, `d[k]` and `d[k] = v` through a leaf call in front of the descriptor call. |
+| `JAITHON_JIT_DICT_LEAF` | on | String-keyed `d.get(k)`, `d[k]`, `d[k] = v` and `k in d` through a leaf call in front of the descriptor call. |
 | `JAITHON_JIT_FMT_LEAF` | on | f-strings through a leaf call in front of the descriptor call. |
 | `JAITHON_JIT_NEGATE` | on | Arithmetic negation. |
 | `JAITHON_JIT_TUPLE` | on | Tuple construction and unpacking. |
@@ -1050,7 +1050,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_ITER_STG` | `jitIterStorage` | the storage dispatch at a NESTED `for x in <list>` (`emitForIterBind`'s shape-1 arm). Off, that arm emits `emitListBoxedGuard` alone, which is what it did until 2026-09-07: a `push`-built `list[int]` is `LIST_STORE_I64`, so the guard failed on every loop entry and the inner loop ran interpreted. Worth 3.6x on a nested-loop probe and 2x on `graph_bfs`. The switch exists to price it in one binary. |
 | `JAITHON_JIT_CONCAT_LOCALS` | `jitConcatLocals` | `a + b` on two `SLOT_OBJ` locals. |
 | `JAITHON_JIT_MEMBERSHIP` | `jitMembership` | `in`. |
-| `JAITHON_JIT_DICT_LEAF` | `jitDictLeaf` | the string-keyed dict leaves, `jitDictGetStr` and `jitDictSetStr`, placed in FRONT of the dict read, `dict.get` and dict store descriptor calls, which stay behind them as the slow path. A leaf runs no user code and cannot allocate, so it needs no descriptor, no roots and no native dispatch -- ~200 instructions around a ~20-instruction probe. Worth 1.47x in cycles on `dict_ops`, and 2.2x on a get-then-set loop. Anything the leaf cannot settle -- a key that is not a string, a miss under `d[k]`, a stored key of another kind whose hash matches, a value a typed dict refuses -- takes the descriptor call, which is not a deopt. |
+| `JAITHON_JIT_DICT_LEAF` | `jitDictLeaf` | the string-keyed dict leaves, `jitDictGetStr`, `jitDictSetStr` and `jitDictHasStr`, placed in FRONT of the dict read, `dict.get`, dict store and `in` descriptor calls, which stay behind them as the slow path. A leaf runs no user code and cannot allocate, so it needs no descriptor, no roots and no native dispatch -- ~200 instructions around a ~20-instruction probe. Worth 1.47x in cycles on `dict_ops`, and 2.2x on a get-then-set loop. Anything the leaf cannot settle -- a key that is not a string, a miss under `d[k]`, a stored key of another kind whose hash matches, a value a typed dict refuses -- takes the descriptor call, which is not a deopt. |
 | `JAITHON_JIT_FMT_LEAF` | `jitFormatLeaf` | `jaiValueFormatLeaf` (value.c) in front of the `OP_FORMAT` descriptor call to `jitFormat`, which stays behind it as the slow path. The leaf never collects -- it declines when `jaiGCWanted()` is already true, which is the only state in which its one possible allocation could collect -- so the parts go down as plain arguments with no root fill, no root-range push and pop and no wrapper. Emitted only when every part is an int, a bool or an object that may be a string; a float or a long result takes the slow path. Worth 1.15x in cycles on `dict_ops`. |
 | `JAITHON_JIT_TUPLE` | `jitTuple` | building and unpacking tuples. |
 | `JAITHON_JIT_NEGATE` | `jitNegate` | `OP_NEG`. |

@@ -7,7 +7,7 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times, so the
 #: whole-function tier compiles it on call count alone, and every answer is
 #: one the interpreter gives too -- `JAITHON_NO_JIT=1` runs the same file.
-# jit-compiles: leaf_bump_words, leaf_sum_present, leaf_total_get, leaf_read_floats, leaf_get_each, leaf_mixed_keys, leaf_bump_typed, leaf_store_any
+# jit-compiles: leaf_bump_words, leaf_sum_present, leaf_total_get, leaf_read_floats, leaf_get_each, leaf_mixed_keys, leaf_bump_typed, leaf_store_any, leaf_count_members
 from std.test import assert_eq, assert_throws, assert_true
 
 let CALLS = 100
@@ -299,6 +299,37 @@ pub fn test_a_store_during_iteration_is_still_seen() -> void {
     #: Whatever the interpreter says about storing into a dict mid-walk,
     #: compiled code says the same every time: every round raised, or none.
     assert_true(raised == 0 or raised == CALLS, "consistent across calls")
+}
+
+fn leaf_count_members(c: any, keys: list[str]) -> int {
+    var n = 0
+    for k in keys {
+        if k in c { n += 1 }
+        if k not in c { n += 100 }
+    }
+    return n
+}
+
+pub fn test_membership() -> void {
+    let d = {"a": 1, "bb": 2}
+    let long = "a-key-long-enough-to-skip-interning-" + "x"
+    var ld = {}
+    ld[long] = 1
+    let keys = ["a", "zz", "bb", f"{long}"]
+    var total = 0
+    var call = 0
+    while call < CALLS {
+        total += leaf_count_members(d, keys)
+        call += 1
+    }
+    #: a and bb present, zz and the long key absent.
+    assert_eq(total, (2 + 200) * CALLS)
+    #: A long key equal to the stored one but not the same object.
+    assert_eq(leaf_count_members(ld, [f"{long}", "a"]), 1 + 100)
+    #: The same compiled site, handed containers that are not dicts.
+    assert_eq(leaf_count_members(["a", "q"], ["a", "zz"]), 1 + 100)
+    assert_eq(leaf_count_members({"bb", "c"}, ["bb", "a"]), 1 + 100)
+    assert_eq(leaf_count_members("abc", ["b", "z"]), 1 + 100)
 }
 
 fn leaf_int_keys(d: dict[int, int], n: int) -> int {

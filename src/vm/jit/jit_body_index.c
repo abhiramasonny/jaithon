@@ -120,6 +120,27 @@ static void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey,
     dictLeafCall(e, (void *)&jitDictSetStr, fx);
 }
 
+/* `k in d`: the leaf checks the container and the key itself (see
+ * jitDictHasStr), so nothing is guarded here and a miss on either is the
+ * descriptor call, not a deopt. */
+void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, bool negate,
+                     LeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitDictLeaf() || e->inlining) return;
+    if (!leafRegOk(rDict) || !leafRegOk(rKey)) return;
+    if (e->descOffset + (unsigned)offsetof(JitCallDesc, result) > 4095u) return;
+    fpSyncAll(e);
+    settleAll(e);
+
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emit(e, jaiA64AddXImm(2, 31, e->descOffset +
+                                     (unsigned)offsetof(JitCallDesc, result)));
+    emit(e, jaiA64MovzX(3, negate ? 1u : 0u, 0));
+    dictLeafCall(e, (void *)&jitDictHasStr, fx);
+}
+
 /* Where the descriptor call begins: both "can't" branches land here. */
 void leafSlowHere(Emit *e, LeafFix *fx) {
     if (!fx->on || e->count > JIT_MAX_INSTS) return;

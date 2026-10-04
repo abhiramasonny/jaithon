@@ -535,6 +535,22 @@ int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
     return dictSetStrSlow(d, key, tag, payload);
 }
 
+/* `k in d` and `k not in d` with a string `k`, as a leaf for the reason
+ * jitDictGetStr gives. The container is only predicted to be a dict, so the
+ * leaf checks both kinds itself, and anything else -- a list, a set, a class
+ * with `__contains__`, a probe the quick form cannot settle -- goes back to
+ * jitContains, which is jaiContainsOp. Returns 0 with the answer written as
+ * BOOL_VAL, as jitContains writes it, or 1 having written nothing. */
+int64_t jitDictHasStr(Obj *container, Obj *needle, Value *result,
+                      int64_t negate) {
+    if (container->type != OBJ_DICT || needle->type != OBJ_STRING) return 1;
+    JaiEntry *e = jaiTableFindStrQuick(&((ObjDict *)container)->table,
+                                       (ObjString *)needle);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    *result = BOOL_VAL((e != NULL) != (negate != 0));
+    return 0;
+}
+
 int jitCallOut(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
