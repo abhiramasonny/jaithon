@@ -1319,11 +1319,11 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             if (OBJ_TYPE(oseen) == OBJ_DICT && (argc == 1 || argc == 2) &&
                 AS_STRING(oname)->length == 3 &&
                 memcmp(AS_STRING(oname)->chars, "get", 3) == 0 &&
-                e->stack[ridx + 1] == SLOT_OBJ &&
+                dictLeafKeyKind(e->stack[ridx + 1]) &&
                 holdsRegister(e->stack[ridx + argc])) {
                 unsigned vd = e->valueDepth;
                 emitDictLeafGet(e, valueXReg(e, vd - argc - 1),
-                                valueXReg(e, vd - argc),
+                                valueXReg(e, vd - argc), e->stack[ridx + 1],
                                 argc == 2 ? (int)(vd - 1) : -1,
                                 argc == 2 ? e->stack[ridx + 2] : SLOT_NULL,
                                 false, &ofx);

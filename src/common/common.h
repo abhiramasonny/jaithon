@@ -284,6 +284,16 @@ static inline uint64_t jaiHashBytesInline(const void *data, size_t len) {
     return hash;
 }
 uint64_t jaiHashU64(uint64_t x);                       /* splitmix64 finaliser */
+
+/* jaiHashU64 itself (memory.c returns this), for the int-keyed dict leaves. */
+static inline uint64_t jaiHashU64Inline(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return x;
+}
 uint32_t jaiCrc32(const void *data, size_t len);
 uint32_t jaiCrc32Table(const void *data, size_t len);
 

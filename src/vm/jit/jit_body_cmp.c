@@ -672,11 +672,12 @@ JitArmResult emitMembership(Emit *e, const uint8_t *code, int *offp) {
         LeafFix mfx;
         mfx.on = false;
         if (e->stack[e->depth - 1] == SLOT_OBJ &&
-            e->stack[e->depth - 2] == SLOT_OBJ &&
+            dictLeafKeyKind(e->stack[e->depth - 2]) &&
             IS_DICT(e->stackSeen[e->depth - 1])) {
             emitDictLeafHas(e, valueXReg(e, e->valueDepth - 1),
                             valueXReg(e, e->valueDepth - 2),
-                            code[off] == OP_NOT_IN, &mfx);
+                            e->stack[e->depth - 2], code[off] == OP_NOT_IN,
+                            &mfx);
         }
         leafSlowHere(e, &mfx);
         if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,

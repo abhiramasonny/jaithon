@@ -611,6 +611,122 @@ int64_t jitDictAddStr(Obj *dictObj, Obj *keyObj, int64_t defPayload,
     return dictAddStrSlow(d, key, defPayload, addend, absentSlow);
 }
 
+/* The int-keyed dict leaves: jitDictGetStr, jitDictSetStr, jitDictHasStr and
+ * jitDictAddStr for a key the compiled code holds as an int, with the same
+ * contracts. Every probe is jaiTableFindIntQuick, and whatever it cannot
+ * settle -- a hash-equal key of another kind, which only the general path's
+ * equality may judge -- is the descriptor call, never a guess. */
+int64_t jitDictGetInt(ObjDict *d, int64_t key, Value *result, uint64_t defTag,
+                      int64_t defPayload) {
+    JaiEntry *e = jaiTableFindIntQuick(&d->table, key,
+                                       jaiHashU64Inline((uint64_t)key));
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    return dictGetAnswer(e, result, defTag, defPayload);
+}
+
+static JAI_NOINLINE int64_t dictSetIntSlow(ObjDict *d, int64_t key,
+                                           uint64_t tag, int64_t payload) {
+    Value v;
+    v.type = (ValueType)tag;
+    v.as.integer = payload;
+    if (!jaiKindAccepts(d->keyKind, INT_VAL(key)) ||
+        !jaiKindAccepts(d->valKind, v)) {
+        return 1;
+    }
+    const uint64_t hash = jaiHashU64Inline((uint64_t)key);
+    JaiEntry *e = jaiTableFindIntQuick(&d->table, key, hash);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    if (e != NULL) {
+        e->value = v;
+        ++d->table.version;
+        return 0;
+    }
+    (void)jaiTableSetHashed(&d->table, INT_VAL(key), hash, v);
+    return 0;
+}
+
+int64_t jitDictSetInt(ObjDict *d, int64_t key, uint64_t tag, int64_t payload) {
+    if (JAI_UNLIKELY(d->keyKind != FIELD_KIND_ANY ||
+                     d->valKind != FIELD_KIND_ANY)) {
+        return dictSetIntSlow(d, key, tag, payload);
+    }
+    const uint64_t hash = jaiHashU64Inline((uint64_t)key);
+    JaiEntry *e = jaiTableFindIntQuick(&d->table, key, hash);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    Value v;
+    v.type = (ValueType)tag;
+    v.as.integer = payload;
+    if (e != NULL) {
+        e->value = v;
+        ++d->table.version;
+        return 0;
+    }
+    /* After a NULL from the quick probe the insert walks the same slots and
+     * meets no hash-equal key, so it compares nothing. */
+    (void)jaiTableSetHashed(&d->table, INT_VAL(key), hash, v);
+    return 0;
+}
+
+int64_t jitDictHasInt(Obj *container, int64_t key, Value *result,
+                      int64_t negate) {
+    if (container->type != OBJ_DICT) return 1;
+    JaiEntry *e = jaiTableFindIntQuick(&((ObjDict *)container)->table, key,
+                                       jaiHashU64Inline((uint64_t)key));
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    *result = BOOL_VAL((e != NULL) != (negate != 0));
+    return 0;
+}
+
+static JAI_NOINLINE int64_t dictAddIntSlow(ObjDict *d, int64_t key,
+                                           int64_t defPayload, int64_t addend,
+                                           int64_t absentSlow) {
+    if (!jaiKindAccepts(d->keyKind, INT_VAL(key)) ||
+        !jaiKindAccepts(d->valKind, INT_VAL(0))) {
+        return 1;
+    }
+    const uint64_t hash = jaiHashU64Inline((uint64_t)key);
+    JaiEntry *e = jaiTableFindIntQuick(&d->table, key, hash);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    int64_t base = defPayload;
+    if (e != NULL) {
+        if (e->value.type != VAL_INT) return 1;
+        base = e->value.as.integer;
+    } else if (absentSlow != 0) {
+        return 1;
+    }
+    int64_t sum;
+    if (__builtin_add_overflow(base, addend, &sum)) return 1;
+    if (e != NULL) {
+        e->value = INT_VAL(sum);
+        ++d->table.version;
+        return 0;
+    }
+    (void)jaiTableSetHashed(&d->table, INT_VAL(key), hash, INT_VAL(sum));
+    return 0;
+}
+
+int64_t jitDictAddInt(Obj *dictObj, int64_t key, int64_t defPayload,
+                      int64_t addend, int64_t absentSlow) {
+    if (JAI_UNLIKELY(dictObj->type != OBJ_DICT)) return 1;
+    ObjDict *d = (ObjDict *)dictObj;
+    if (JAI_LIKELY(d->keyKind == FIELD_KIND_ANY &&
+                   d->valKind == FIELD_KIND_ANY)) {
+        JaiEntry *e = jaiTableFindIntQuick(&d->table, key,
+                                           jaiHashU64Inline((uint64_t)key));
+        if (JAI_LIKELY(e != NULL && e != JAI_TABLE_SLOW &&
+                       e->value.type == VAL_INT)) {
+            int64_t sum;
+            if (__builtin_add_overflow(e->value.as.integer, addend, &sum)) {
+                return 1;
+            }
+            e->value.as.integer = sum;
+            ++d->table.version;
+            return 0;
+        }
+    }
+    return dictAddIntSlow(d, key, defPayload, addend, absentSlow);
+}
+
 /* `k in d` and `k not in d` with a string `k`, as a leaf for the reason
  * jitDictGetStr gives. The container is only predicted to be a dict, so the
  * leaf checks both kinds itself, and anything else -- a list, a set, a class

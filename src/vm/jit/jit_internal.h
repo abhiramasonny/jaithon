@@ -803,16 +803,26 @@ int64_t jitDictHasStr(Obj *container, Obj *needle, Value *result,
                       int64_t negate);
 int64_t jitDictAddStr(Obj *dictObj, Obj *keyObj, int64_t defPayload,
                       int64_t addend, int64_t absentSlow);
+int64_t jitDictGetInt(ObjDict *d, int64_t key, Value *result, uint64_t defTag,
+                      int64_t defPayload);
+int64_t jitDictSetInt(ObjDict *d, int64_t key, uint64_t tag, int64_t payload);
+int64_t jitDictHasInt(Obj *container, int64_t key, Value *result,
+                      int64_t negate);
+int64_t jitDictAddInt(Obj *dictObj, int64_t key, int64_t defPayload,
+                      int64_t addend, int64_t absentSlow);
 typedef struct {
     int      slow[2];   /* the branches to the descriptor path, or -1 */
     unsigned cond[2];   /* the condition each of them branches on */
     int      done;      /* the branch over it */
     bool     on;        /* a leaf was emitted at all */
 } LeafFix;
-void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
-                     SlotKind defKind, bool absentSlow, LeafFix *fx);
-void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, bool negate,
+void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
+                     int defIdx, SlotKind defKind, bool absentSlow,
                      LeafFix *fx);
+void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
+                     bool negate, LeafFix *fx);
+/* A key kind the dict leaves take: a string (as an object) or an int. */
+bool dictLeafKeyKind(SlotKind k);
 bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
                       unsigned ridx);
 bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count);

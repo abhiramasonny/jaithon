@@ -546,12 +546,7 @@ uint64_t jaiHashBytes(const void *data, size_t len) {
 }
 
 uint64_t jaiHashU64(uint64_t x) {
-    x ^= x >> 30;
-    x *= 0xBF58476D1CE4E5B9ULL;
-    x ^= x >> 27;
-    x *= 0x94D049BB133111EBULL;
-    x ^= x >> 31;
-    return x;
+    return jaiHashU64Inline(x);
 }
 
 static uint32_t gCrcTable[256];

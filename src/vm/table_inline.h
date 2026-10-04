@@ -56,6 +56,35 @@ JAI_INLINE JaiEntry *jaiTableFindStrQuick(JaiTable *t, ObjString *key) {
     }
 }
 
+/* jaiTableFindStrQuick for an int key, whose hash is jaiValueHash's for an
+ * int (jaiHashU64 of the value). The entry holding that int, NULL for absent,
+ * or JAI_TABLE_SLOW for a hash-equal slot holding anything else -- a float
+ * equal to the int hashes the same and compares equal, and that is the
+ * general path's question to answer. */
+JAI_INLINE JaiEntry *jaiTableFindIntQuick(JaiTable *t, int64_t key,
+                                          uint64_t hash) {
+    if (t->count == 0) return NULL;
+
+    const uint32_t mask = (uint32_t)t->capacity - 1;
+    uint32_t index = (uint32_t)hash & mask;
+    JaiEntry *const entries = t->entries;
+
+    for (;;) {
+        JaiEntry *const e = entries + index;
+        const int state = e->order;
+
+        if (state == JAI_ENTRY_EMPTY_ORDER) return NULL;
+        if (state >= 0 && e->hash == hash) {
+            const Value stored = e->key;
+            if (jaiValueType(stored) == VAL_INT && AS_INT(stored) == key)
+                return e;
+            return JAI_TABLE_SLOW;
+        }
+
+        index = (index + 1) & mask;
+    }
+}
+
 /* Equal bytes, without a call: the run-time strings interning sees are at
  * most JAI_INTERN_MAX bytes, and a memcmp anywhere in the probe loop made the
  * probe save six register pairs on every call, hit or miss, for a compare most

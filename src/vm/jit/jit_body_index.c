@@ -56,9 +56,16 @@ static bool dictLeafValueKind(SlotKind k) {
            k == SLOT_MAYBE_INST || k == SLOT_MAYBE_OBJ;
 }
 
+bool dictLeafKeyKind(SlotKind k) {
+    return k == SLOT_OBJ || k == SLOT_INT;
+}
+
 /* The key must really be a string; anything else takes the slow path, which
- * is not a deopt, so a dict keyed by ints at this site costs one compare. */
-static void dictLeafKeyGuard(Emit *e, unsigned rKey, LeafFix *fx) {
+ * is not a deopt, so a dict keyed by tuples at this site costs one compare.
+ * An int key needs no guard: its kind is the register's. */
+static void dictLeafKeyGuard(Emit *e, unsigned rKey, SlotKind keyKind,
+                             LeafFix *fx) {
+    if (keyKind == SLOT_INT) return;
     emit(e, jaiA64LdrW(JIT_SCRATCH_A, rKey, (unsigned)offsetof(Obj, type)));
     emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
     fx->slow[0] = (int)e->count;
@@ -79,8 +86,9 @@ static void dictLeafCall(Emit *e, void *helper, LeafFix *fx) {
     fx->on = true;
 }
 
-void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
-                     SlotKind defKind, bool absentSlow, LeafFix *fx) {
+void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
+                     int defIdx, SlotKind defKind, bool absentSlow,
+                     LeafFix *fx) {
     fx->on = false;
     fx->slow[0] = fx->slow[1] = fx->done = -1;
     if (!jitDictLeaf() || e->inlining) return;
@@ -95,7 +103,8 @@ void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
     fpSyncAll(e);
     settleAll(e);
 
-    dictLeafKeyGuard(e, rKey, fx);
+    if (!dictLeafKeyKind(keyKind)) return;
+    dictLeafKeyGuard(e, rKey, keyKind, fx);
     emit(e, jaiA64MovX(0, rDict));
     emit(e, jaiA64MovX(1, rKey));
     emit(e, jaiA64AddXImm(2, 31, e->descOffset +
@@ -110,37 +119,40 @@ void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
         emitTagFor(e, defKind, rDef, 3, JIT_SCRATCH_A);
         emit(e, jaiA64MovX(4, rDef));
     }
-    dictLeafCall(e, (void *)&jitDictGetStr, fx);
+    dictLeafCall(e, keyKind == SLOT_INT ? (void *)&jitDictGetInt
+                                        : (void *)&jitDictGetStr, fx);
 }
 
 static void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey,
-                            unsigned rVal, SlotKind vk, LeafFix *fx) {
+                            SlotKind keyKind, unsigned rVal, SlotKind vk,
+                            LeafFix *fx) {
     fx->on = false;
     fx->slow[0] = fx->slow[1] = fx->done = -1;
     if (!jitDictLeaf() || e->inlining) return;
-    if (!dictLeafValueKind(vk)) return;
+    if (!dictLeafValueKind(vk) || !dictLeafKeyKind(keyKind)) return;
     if (!leafRegOk(rDict) || !leafRegOk(rKey) || !leafRegOk(rVal)) {
         return;
     }
     fpSyncAll(e);
     settleAll(e);
 
-    dictLeafKeyGuard(e, rKey, fx);
+    dictLeafKeyGuard(e, rKey, keyKind, fx);
     emit(e, jaiA64MovX(0, rDict));
     emit(e, jaiA64MovX(1, rKey));
     emitTagFor(e, vk, rVal, 2, JIT_SCRATCH_A);
     emit(e, jaiA64MovX(3, rVal));
-    dictLeafCall(e, (void *)&jitDictSetStr, fx);
+    dictLeafCall(e, keyKind == SLOT_INT ? (void *)&jitDictSetInt
+                                        : (void *)&jitDictSetStr, fx);
 }
 
 /* `k in d`: the leaf checks the container and the key itself (see
  * jitDictHasStr), so nothing is guarded here and a miss on either is the
  * descriptor call, not a deopt. */
-void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, bool negate,
-                     LeafFix *fx) {
+void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
+                     bool negate, LeafFix *fx) {
     fx->on = false;
     fx->slow[0] = fx->slow[1] = fx->done = -1;
-    if (!jitDictLeaf() || e->inlining) return;
+    if (!jitDictLeaf() || e->inlining || !dictLeafKeyKind(keyKind)) return;
     if (!leafRegOk(rDict) || !leafRegOk(rKey)) return;
     if (e->descOffset + (unsigned)offsetof(JitCallDesc, result) > 4095u) return;
     fpSyncAll(e);
@@ -151,7 +163,8 @@ void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, bool negate,
     emit(e, jaiA64AddXImm(2, 31, e->descOffset +
                                      (unsigned)offsetof(JitCallDesc, result)));
     emit(e, jaiA64MovzX(3, negate ? 1u : 0u, 0));
-    dictLeafCall(e, (void *)&jitDictHasStr, fx);
+    dictLeafCall(e, keyKind == SLOT_INT ? (void *)&jitDictHasInt
+                                        : (void *)&jitDictHasStr, fx);
 }
 
 /* JAITHON_JIT_DICT_ADD=0 turns the fused counting arm below off, for a
@@ -184,8 +197,12 @@ bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
         return false;
     }
     if (ridx < 2 || e->depth != ridx + 3 || e->valueDepth < 5) return false;
-    for (unsigned i = ridx - 2; i < ridx + 2; i++) {
-        if (e->stack[i] != SLOT_OBJ) return false;
+    if (e->stack[ridx - 2] != SLOT_OBJ || e->stack[ridx] != SLOT_OBJ) {
+        return false;
+    }
+    SlotKind keyKind = e->stack[ridx + 1];
+    if (!dictLeafKeyKind(keyKind) || e->stack[ridx - 1] != keyKind) {
+        return false;
     }
     if (e->stack[ridx + 2] != SLOT_INT) return false;
     /* The same dict and the same key, read from the same locals: nothing
@@ -210,7 +227,9 @@ bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
     emit(e, jaiA64MovX(2, rDef));
     emitConst64(e, 3, (int64_t)jaiReadI16(code + off + 8));
     emit(e, jaiA64MovzX(4, 0, 0));
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitDictAddStr);
+    emitConst64(e, JIT_SCRATCH_A,
+                keyKind == SLOT_INT ? (int64_t)(uintptr_t)&jitDictAddInt
+                                    : (int64_t)(uintptr_t)&jitDictAddStr);
     noteScratchClobber(e);
     emit(e, jaiA64Blr(JIT_SCRATCH_A));
     emit(e, jaiA64SubsXImm(31, 0, 0));
@@ -239,8 +258,8 @@ bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
         return false;
     }
     if (e->depth < 2 || e->valueDepth < 2) return false;
-    if (e->stack[e->depth - 2] != SLOT_OBJ ||
-        e->stack[e->depth - 1] != SLOT_OBJ ||
+    SlotKind keyKind = e->stack[e->depth - 1];
+    if (e->stack[e->depth - 2] != SLOT_OBJ || !dictLeafKeyKind(keyKind) ||
         !IS_DICT(e->stackSeen[e->depth - 2])) {
         return false;
     }
@@ -254,7 +273,9 @@ bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
     emit(e, jaiA64MovzX(2, 0, 0));
     emitConst64(e, 3, (int64_t)jaiReadI16(code + off + 3));
     emit(e, jaiA64MovzX(4, 1, 0));
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitDictAddStr);
+    emitConst64(e, JIT_SCRATCH_A,
+                keyKind == SLOT_INT ? (int64_t)(uintptr_t)&jitDictAddInt
+                                    : (int64_t)(uintptr_t)&jitDictAddStr);
     noteScratchClobber(e);
     emit(e, jaiA64Blr(JIT_SCRATCH_A));
     emit(e, jaiA64SubsXImm(31, 0, 0));
@@ -433,10 +454,11 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
              * which raises the KeyError a miss is owed. */
             LeafFix gfx;
             gfx.on = false;
-            if (e->stack[e->depth - 1] == SLOT_OBJ) {
+            if (dictLeafKeyKind(e->stack[e->depth - 1])) {
                 emitDictLeafGet(e, valueXReg(e, e->valueDepth - 2),
-                                valueXReg(e, e->valueDepth - 1), -1,
-                                SLOT_NULL, true, &gfx);
+                                valueXReg(e, e->valueDepth - 1),
+                                e->stack[e->depth - 1], -1, SLOT_NULL, true,
+                                &gfx);
             }
             leafSlowHere(e, &gfx);
             if (!emitDescriptor(e, NULL_VAL, dsidx, 2,
@@ -728,10 +750,11 @@ bool emitSetIndex(Emit *e, int *offp) {
             branchOnDeopt(e, JAI_A64_NE);
             LeafFix sfx;
             sfx.on = false;
-            if (e->stack[e->depth - 2] == SLOT_OBJ &&
+            if (dictLeafKeyKind(e->stack[e->depth - 2]) &&
                 holdsRegister(e->stack[e->depth - 1])) {
                 emitDictLeafSet(e, valueXReg(e, e->valueDepth - 3),
                                 valueXReg(e, e->valueDepth - 2),
+                                e->stack[e->depth - 2],
                                 valueXReg(e, e->valueDepth - 1),
                                 e->stack[e->depth - 1], &sfx);
             }
