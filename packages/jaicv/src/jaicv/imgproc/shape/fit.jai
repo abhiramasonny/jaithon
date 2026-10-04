@@ -65,6 +65,12 @@ pub fn fit_line(
     let count = points.len()
     if count < 2 { throw ValueError("a line needs at least two points") }
     let _unused = reps + aeps
+    #: The same fits from `__prim__.points_fit_line`; false for points it
+    #: cannot read, which go on below.
+    if _native_fit and __prim__.points_fit_line(points, dist_type, _line_native) {
+        let got = _line_native
+        return [got[0], got[1], got[2], got[3]]
+    }
     var weights: list[float] = []
     for _index in 0..count { weights.push(1.0) }
 
@@ -137,6 +143,9 @@ let _native_fit = (env("JAICV_NATIVE_FIT") ?? "1") != "0"
 
 #: Where `points_fit_ellipse` leaves the ellipse: centre, axes and angle.
 var _ellipse_native: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
+
+#: Where `points_fit_line` leaves the line: direction and a point on it.
+var _line_native: list[float] = [0.0, 0.0, 0.0, 0.0]
 
 #: Fit an ellipse to a set of points.
 #:

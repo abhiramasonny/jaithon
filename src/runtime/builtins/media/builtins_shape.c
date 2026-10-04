@@ -32,6 +32,22 @@
  * by operation, and Jaithon never fuses a multiply into an add. */
 #pragma STDC FP_CONTRACT OFF
 
+/* The cosine and the sine as the two library calls Jaithon's `math.cos` and
+ * `math.sin` make. Written plainly, a cosine and a sine of the same angle are
+ * fused by the compiler into one `__sincos_stret`, and that does not always
+ * return the same bits as the two functions: a reweighted line fit came out
+ * one unit in the last place off. Calling through a volatile pointer keeps
+ * them two calls. */
+static double shapeCos(double x) {
+    double (*volatile f)(double) = cos;
+    return f(x);
+}
+
+static double shapeSin(double x) {
+    double (*volatile f)(double) = sin;
+    return f(x);
+}
+
 /* `HULL_COORD_LIMIT` in hull.jai: below it a difference fits 31 bits, a
  * product of two 62, and the turn test's difference of products 63. */
 #define JAI_HULL_COORD_LIMIT 1073741824LL
@@ -413,8 +429,8 @@ static bool primPointsMinBox(int argc, Value *args, Value *out) {
     free(hx);
 
     const double angle0 = atan2(found[5], found[4]);
-    const double ux = cos(angle0);
-    const double uy = sin(angle0);
+    const double ux = shapeCos(angle0);
+    const double uy = shapeSin(angle0);
     const double cu = (found[0] + found[1]) * 0.5;
     const double cv = (found[2] + found[3]) * 0.5;
     const double cx = cu * ux - cv * uy;
@@ -1025,6 +1041,111 @@ static bool primPointsFitEllipse(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* --- the line fit ---------------------------------------------------- */
+
+/* `weighted_fit` in shape/fit.jai: the weighted centroid and the principal
+ * direction of the weighted scatter about it. False when every weight came
+ * to nothing, which the Jaithon reports as an error. */
+static bool lineWeightedFit(const double *xy, const double *weights, int count, double result[4]) {
+    double total = 0.0, sx = 0.0, sy = 0.0;
+    for (int i = 0; i < count; i++) {
+        const double w = weights[i];
+        total += w;
+        sx += w * xy[i * 2];
+        sy += w * xy[i * 2 + 1];
+    }
+    if (total <= 1e-12) return false;
+    const double cx = sx / total;
+    const double cy = sy / total;
+    double sxx = 0.0, syy = 0.0, sxy = 0.0;
+    for (int i = 0; i < count; i++) {
+        const double w = weights[i];
+        const double dx = xy[i * 2] - cx;
+        const double dy = xy[i * 2 + 1] - cy;
+        sxx += w * dx * dx;
+        syy += w * dy * dy;
+        sxy += w * dx * dy;
+    }
+    const double difference = sxx - syy;
+    const double angle = 0.5 * atan2(2.0 * sxy, difference);
+    result[0] = shapeCos(angle);
+    result[1] = shapeSin(angle);
+    result[2] = cx;
+    result[3] = cy;
+    return true;
+}
+
+/* `loss_weight`: how much a point this far from the line counts next pass. */
+static double lineLossWeight(int64_t distType, double r) {
+    if (distType == 1) return 1.0 / (r >= 1e-6 ? r : 1e-6);
+    if (distType == 5) return 1.0 / (1.0 + r / 1.3998);
+    if (distType == 6) {
+        const double t = r / 2.9846;
+        return exp(-t * t);
+    }
+    if (distType == 7) {
+        if (r < 1.345) return 1.0;
+        return 1.345 / r;
+    }
+    return 1.0;
+}
+
+/* `points_fit_line(points, dist_type, out)` -- `fit_line` in shape/fit.jai
+ * for two or more points: the least-squares line, then for any loss but L2
+ * ten more fits each reweighted by how far every point fell from the last.
+ * The same sums in the same order, so the line is the same to the bit.
+ * Writes vx, vy, x0, y0 into `out` and returns true; false, writing nothing,
+ * when a point is not an object with integer `x` and `y`. */
+static bool primPointsFitLine(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *points, *line;
+    int64_t distType;
+    if (!jaiArgList(args[0], 1, "points_fit_line", &points)) return false;
+    if (!jaiStrWantInt(args[1], "points_fit_line", "the distance type", &distType)) return false;
+    if (!jaiArgList(args[2], 3, "points_fit_line", &line)) return false;
+    if (line->count < 4) {
+        return jaiThrow(vm.cValueError, "points_fit_line(): the out list holds %d of 4 values",
+                        line->count);
+    }
+    const int count = points->count;
+    *out = BOOL_VAL(false);
+    if (count < 2) return true;
+    double *xy = (double *)malloc((size_t)count * 3 * sizeof(double));
+    if (xy == NULL) return jaiThrow(vm.cRuntimeError, "points_fit_line(): out of memory");
+    double *weights = xy + count * 2;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    for (int i = 0; i < count; i++) {
+        int64_t x, y;
+        if (!jaiReadPoint(&reader, jaiListGet(points, i), &x, &y)) {
+            free(xy);
+            return true;
+        }
+        xy[i * 2] = (double)x;
+        xy[i * 2 + 1] = (double)y;
+        weights[i] = 1.0;
+    }
+    double result[4];
+    bool ok = lineWeightedFit(xy, weights, count, result);
+    if (ok && distType != 2) {
+        for (int pass = 0; pass < 10 && ok; pass++) {
+            for (int i = 0; i < count; i++) {
+                const double dx = xy[i * 2] - result[2];
+                const double dy = xy[i * 2 + 1] - result[3];
+                const double away = fabs(dx * -result[1] + dy * result[0]);
+                weights[i] = lineLossWeight(distType, away);
+            }
+            ok = lineWeightedFit(xy, weights, count, result);
+        }
+    }
+    free(xy);
+    if (!ok) return jaiThrow(vm.cValueError, "every point was weighted to nothing");
+    for (int i = 0; i < 4; i++) jaiListPut(line, i, FLOAT_VAL(result[i]));
+    jaiListTouch(line);
+    *out = BOOL_VAL(true);
+    return true;
+}
+
 void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_hull",    primPointsHull,   2, 2);
     jaiStrDefinePrim(ns, "points_min_box", primPointsMinBox, 2, 2);
@@ -1033,4 +1154,5 @@ void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_area", primPointsArea, 2, 2);
     jaiStrDefinePrim(ns, "points_moments", primPointsMoments, 2, 2);
     jaiStrDefinePrim(ns, "points_fit_ellipse", primPointsFitEllipse, 2, 2);
+    jaiStrDefinePrim(ns, "points_fit_line", primPointsFitLine, 3, 3);
 }
