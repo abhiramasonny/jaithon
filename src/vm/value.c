@@ -584,6 +584,10 @@ JAI_INLINE void sinkReserve(ValSink *s, size_t n) {
 
 #define JAI_INT_DIGITS 24
 #define JAI_FLOAT_CHARS 32
+/* The longest f-string result formatShort builds itself. Matches
+ * JAI_INTERN_MAX in object_string.c, the longest run-time string worth an
+ * intern probe: past it the general path builds the string in place. */
+#define JAI_STR_SHORT_MAX 32
 
 //magic sh*t
 static const char digitPairs[] =
@@ -1222,9 +1226,84 @@ static ObjString *formatViaBuffer(const Value *parts, int count) {
     return out;
 }
 
+/* JAITHON_FMT_SHORT=0 turns formatShort off, for a one-binary A/B. */
+static bool fmtShortOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_FMT_SHORT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The f-string whose result is short enough to take part in interning --
+ * `f"k{i}"`, a key built once per iteration -- written straight into one
+ * buffer and handed to jaiStringNew, which hashes it and probes the intern
+ * table before anything is allocated.
+ *
+ * The general path below renders every part into its own scratch slot, keeps a
+ * (pointer, length) run for each, and then jaiStringFromParts copies the runs a
+ * second time into a staging buffer for that same probe. For a five-byte key
+ * the bookkeeping was most of the work.
+ *
+ * Only the kinds it renders itself, with no call out: ints, strings, bools and
+ * null. Anything else, or a result past JAI_STR_SHORT_MAX, returns false having
+ * produced nothing, and the caller starts the general path from the top. */
+static bool formatShort(const Value *parts, int count, ObjString **out) {
+    char   buf[JAI_STR_SHORT_MAX + JAI_INT_DIGITS];
+    size_t o = 0;
+
+    for (int i = 0; i < count; i++) {
+        const Value v = parts[i];
+        switch (jaiValueType(v)) {
+        case VAL_INT:
+            /* writeInt64 writes at most twenty bytes, and o is still within
+             * the short limit here, so this cannot run off the buffer. */
+            o += (size_t)writeInt64(buf + o, AS_INT(v));
+            break;
+        case VAL_OBJ: {
+            if (!IS_STRING(v)) return false;
+            const ObjString *s = AS_STRING(v);
+            const uint32_t n = s->length;
+            if (n > JAI_STR_SHORT_MAX - o) return false;
+            /* A run here is one to a few bytes; memcpy's call costs more
+             * than the copy (see jaiStringFromParts). */
+            const char *src = s->chars;
+            for (uint32_t j = 0; j < n; ++j) buf[o + j] = src[j];
+            o += n;
+            break;
+        }
+        case VAL_BOOL:
+            if (o + 5 > JAI_STR_SHORT_MAX) return false;
+            if (AS_BOOL(v)) {
+                memcpy(buf + o, "true", 4);
+                o += 4;
+            } else {
+                memcpy(buf + o, "false", 5);
+                o += 5;
+            }
+            break;
+        case VAL_NULL:
+            memcpy(buf + o, "null", 4);
+            o += 4;
+            break;
+        default:
+            return false;
+        }
+        if (o > JAI_STR_SHORT_MAX) return false;
+    }
+    *out = o == 0 ? jaiStringIntern("", 0) : jaiStringNew(buf, o);
+    return true;
+}
+
 ObjString *jaiValueFormat(const Value *parts, int count) {
     if (count <= 0) return jaiStringIntern("", 0);
     if (count > JAI_FMT_MAX_PARTS) return formatViaBuffer(parts, count);
+
+    if (fmtShortOn()) {
+        ObjString *made;
+        if (formatShort(parts, count, &made)) return made;
+    }
 
     char        scratch[JAI_FMT_MAX_PARTS][JAI_FLOAT_CHARS];
     const char *runs[JAI_FMT_MAX_PARTS];
