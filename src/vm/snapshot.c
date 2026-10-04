@@ -40,16 +40,6 @@
 
 void jaiSnapshotAudit(const char *when);
 
-/* The bytes of an object's own HEADER, for every kind.
- *
- * jaiObjSoleBlock answers only for objects whose whole footprint is that block
- * and returns 0 for the nine kinds that own arrays -- the right answer to "can
- * this be freed with one call", the wrong one to "how many bytes is the
- * header". An image needs the second. Using the first meant the array-owning
- * kinds were never written AT ALL: every ObjClass was missing from the image,
- * so all 145 instances relocated their `klass` to nothing. Only the
- * reconstruction pass showed it -- the writer and the byte-comparison both
- * reported a clean round trip. */
 static size_t snapshotHeaderSize(const Obj *o) {
     size_t sole = jaiObjSoleBlock(o);
     if (sole != 0) return sole;
@@ -70,10 +60,9 @@ static size_t snapshotHeaderSize(const Obj *o) {
 
 void jaiSnapshotAudit(const char *when) {
     if (getenv("JAITHON_SNAPSHOT_AUDIT") == NULL) return;
+    if (getenv("JAI_SNAP_TRACE")) setvbuf(stderr, NULL, _IONBF, 0);
     if (vm.gc == NULL) return;
 
-    /* Survivors only: a sweep has just freed everything unreachable, so what is
-     * left on the list is precisely the set an image would have to carry. */
     jaiGCCollect();
 
     unsigned long long byType[OBJ_TYPE_COUNT];
@@ -175,17 +164,6 @@ void jaiSnapshotAudit(const char *when) {
             "[snapshot] strings: %llu own their bytes, %llu point into a "
             "shared buffer\n", ownStrings, sharedStrings);
 
-    /* Is the field table COMPLETE? An image relocates pointers field by field,
-     * so a field nobody listed is a pointer copied verbatim into the new
-     * address space. The way to find out is not to re-read the headers but to
-     * follow every pointer this code believes exists and check it lands on an
-     * object the collector agrees is live. A miss is either a field enumerated
-     * wrongly or a pointer into memory the image would not carry.
-     *
-     * Direct Obj* fields only. Table and list CONTENTS are Values the GC
-     * already traces and blackenObject is the authority on those; what has
-     * historically been missed here is the plain pointer hanging off a header
-     * (ObjString::owner, ObjFunction::module, ::jitBlockedOn). */
     {
         /* Open-addressed membership set over the live list. Power of two, and
          * generously sized so the probe stays short at this object count. */
@@ -272,13 +250,6 @@ void jaiSnapshotAudit(const char *when) {
         }
     }
 
-    /* The single most favourable fact the design rests on, checked rather than
-     * quoted: `ObjString::hash` is a CONTENT hash (jaiHashBytes over the bytes,
-     * cached lazily, 0 meaning "not computed yet"). If that holds, every hash
-     * table in the image stays valid when it is mapped at a different address,
-     * and no table has to be rebuilt on load. If it did NOT hold -- if any hash
-     * mixed in an address -- the whole technique would be impossible here, and
-     * that is the kind of thing worth finding before writing a byte. */
     {
         unsigned long long hashed = 0, unhashed = 0, wrong = 0;
         for (Obj *o = vm.gc->objects; o != NULL; o = o->next) {
@@ -293,11 +264,6 @@ void jaiSnapshotAudit(const char *when) {
                 "%llu DISAGREE with a recompute\n", hashed, unhashed, wrong);
     }
 
-    /* Exact image size. The headers are the small half -- what an image must
-     * actually carry is the arrays hanging off them, and until they are added
-     * up "11.4MB of live heap" is a GC number, not a plan. Sizes below are the
-     * ALLOCATED capacity, not the used count, because that is what a copy has
-     * to reproduce for the structure to keep working. */
     {
         unsigned long long arrayBytes = 0;
         unsigned long long chunkCode = 0, chunkConsts = 0, chunkLines = 0;
@@ -363,15 +329,6 @@ void jaiSnapshotAudit(const char *when) {
                 tableBytes, listBytes, upvalBytes);
     }
 
-    /* WRITER, SLICE ONE: assign every live object an index and rewrite the
-     * direct header pointers as indices, then check the result round-trips.
-     * Owned arrays are NOT carried yet -- this slice exists to prove the two
-     * things everything else rests on: that a stable numbering can be assigned
-     * over the collector's live list, and that every pointer an image would
-     * store resolves back to exactly the object it came from.
-     *
-     * Index 0 is reserved for NULL so a missing pointer is not confusable with
-     * the first object. */
     if (getenv("JAITHON_SNAPSHOT_WRITE") != NULL) {
         size_t icap = 1;
         while (icap < total * 4u) icap <<= 1;
@@ -638,7 +595,10 @@ void jaiSnapshotAudit(const char *when) {
 #define WRITE_TABLE_K(o, t, k) do {                                           \
         uint32_t _ix = IDX(o), _kind = (k);                                   \
         uint32_t _cap = (uint32_t)(t)->capacity;                              \
-        uint32_t _bl = _cap * 36u;   /* 4+8 key, 4+8 value, 8 hash, 4 order */                                            \
+        /* 4+8 key, 4+8 value, 8 hash, 4 order, then the table's own order
+         * array -- capacity int32s, allocated alongside `entries`
+         * (table.c:98) and needed for insertion order to survive. */          \
+        uint32_t _bl = _cap * 36u + _cap * 4u;                                            \
         fwrite(&_ix, sizeof _ix, 1, f);                                       \
         fwrite(&_kind, sizeof _kind, 1, f);                                   \
         fwrite(&_cap, sizeof _cap, 1, f);                                     \
@@ -650,6 +610,16 @@ void jaiSnapshotAudit(const char *when) {
             fwrite(&_en->hash, sizeof _en->hash, 1, f);                       \
             fwrite(&_en->order, sizeof _en->order, 1, f);                     \
             tblEntries++;                                                     \
+        }                                                                     \
+        if ((t)->order != NULL) {                                             \
+            fwrite((t)->order, sizeof(int32_t), _cap, f);                     \
+        } else {                                                              \
+            /* entries without an order array is a real state -- table.c
+             * allocates them together but a table can be left with one. Write
+             * zeros so the record keeps its declared length. */              \
+            int32_t _z = 0;                                                   \
+            for (uint32_t _q = 0; _q < _cap; _q++)                            \
+                fwrite(&_z, sizeof _z, 1, f);                                 \
         }                                                                     \
         tblRecs++;                                                            \
     } while (0)
@@ -788,6 +758,9 @@ void jaiSnapshotAudit(const char *when) {
                                     }
                                     if (fread(buf, 1, sz, g) != sz) { mismatch++; break; }
                                     read++;
+                                    if (getenv("JAI_SNAP_TRACE") && (read > 11085 || read < 3))
+                                        fprintf(stderr, "[o] read=%llu ix=%u ty=%u sz=%u\n",
+                                                read, ix, ty, sz);
                                     Obj *orig = ix < next ? byIndex[ix] : NULL;
                                     if (orig == NULL ||
                                         (uint32_t)orig->type != ty ||
@@ -849,6 +822,9 @@ void jaiSnapshotAudit(const char *when) {
                                         amis++; break;
                                     }
                                     ar++;
+                                    if (getenv("JAI_SNAP_TRACE"))
+                                        fprintf(stderr, "[v] ar=%llu ix=%u kind=%u n=%u len=%u\n",
+                                                ar, aix, akind, an, ablen);
                                     Obj *orig = aix < next ? byIndex[aix] : NULL;
                                     if (orig == NULL) { amis++; continue; }
                                     if (akind == 1) {
@@ -913,6 +889,13 @@ void jaiSnapshotAudit(const char *when) {
                                         else if (orig->type == OBJ_ENUM) {
                                             lt = &((ObjEnum *)orig)->methods;
                                         }
+                                        if (getenv("JAI_SNAP_TRACE"))
+                                            fprintf(stderr, "[tb] ix=%u kind=%u an=%u lt=%p cap=%d ent=%p ord=%p ty=%d\n",
+                                                    aix, akind, an, (void *)lt,
+                                                    lt ? lt->capacity : -1,
+                                                    lt ? (void *)lt->entries : NULL,
+                                                    lt ? (void *)lt->order : NULL,
+                                                    (int)orig->type);
                                         if (lt == NULL || (uint32_t)lt->capacity != an) {
                                             fprintf(stderr, "[snapshot]   table miss: kind=%u owner=%d an=%u cap=%d\n",
                                                     akind, (int)orig->type, an,
@@ -920,6 +903,17 @@ void jaiSnapshotAudit(const char *when) {
                                             amis++;
                                         } else {
                                             const unsigned char *q = buf;
+                                            const unsigned char *qo = buf + (size_t)an * 36u;
+                                            if (getenv("JAI_SNAP_TRACE"))
+                                                fprintf(stderr, "[tb2] buf=%p bufCap=%zu qo=%p need=%zu\n",
+                                                        (void *)buf, bufCap, (void *)qo,
+                                                        (size_t)an * 4u);
+                                            if (lt->order != NULL &&
+                                                memcmp(qo, lt->order,
+                                                       (size_t)an * sizeof(int32_t)) != 0)
+                                                amis++;
+                                            if (getenv("JAI_SNAP_TRACE"))
+                                                fprintf(stderr, "[tb3] order memcmp survived\n");
                                             for (uint32_t e = 0; e < an; e++) {
                                                 uint32_t kt, vt; uint64_t kp, vp, hh;
                                                 int32_t ord;
@@ -930,6 +924,11 @@ void jaiSnapshotAudit(const char *when) {
                                                 memcpy(&hh, q, 8); q += 8;
                                                 memcpy(&ord, q, 4); q += 4;
                                                 const JaiEntry *le = &lt->entries[e];
+                                                if (getenv("JAI_SNAP_TRACE") && aix == 8345 && e > 250)
+                                                    fprintf(stderr, "[e] e=%u kt=%u vt=%u kobj=%p vobj=%p\n",
+                                                            e, kt, vt,
+                                                            IS_OBJ(le->key) ? (void *)AS_OBJ(le->key) : NULL,
+                                                            IS_OBJ(le->value) ? (void *)AS_OBJ(le->value) : NULL);
                                                 if (kt != (uint32_t)le->key.type ||
                                                     vt != (uint32_t)le->value.type ||
                                                     hh != le->hash || ord != le->order) {
@@ -1009,6 +1008,91 @@ void jaiSnapshotAudit(const char *when) {
                                             made++;
                                         }
                                     }
+                                    /* ATTACH: the array records, allocated
+                                     * fresh and hung off the rebuilt objects.
+                                     * A pointer inside one is an index like any
+                                     * other and is resolved here. */
+                                    unsigned long long att = 0, attBad = 0;
+                                    {
+                                        uint32_t aix, akind, an, ablen;
+                                        unsigned char *ab = NULL;
+                                        size_t abCap = 0;
+                                        while (fread(&aix, 4, 1, h) == 1 &&
+                                               fread(&akind, 4, 1, h) == 1 &&
+                                               fread(&an, 4, 1, h) == 1 &&
+                                               fread(&ablen, 4, 1, h) == 1) {
+                                            if (ablen > abCap) {
+                                                unsigned char *nb2 = (unsigned char *)
+                                                    realloc(ab, ablen);
+                                                if (nb2 == NULL) { attBad++; break; }
+                                                ab = nb2; abCap = ablen;
+                                            }
+                                            if (ablen && fread(ab, 1, ablen, h) != ablen) {
+                                                attBad++; break;
+                                            }
+                                            Obj *r = aix < next ? rebuilt[aix] : NULL;
+                                            if (getenv("JAI_SNAP_TRACE"))
+                                                fprintf(stderr, "[a] ix=%u kind=%u n=%u len=%u r=%p ty=%d\n",
+                                                        aix, akind, an, ablen, (void *)r,
+                                                        r ? (int)r->type : -1);
+                                            if (r == NULL) { attBad++; continue; }
+                                            att++;
+                                            if (akind == 1 && r->type == OBJ_FUNCTION) {
+                                                ObjFunction *rf = (ObjFunction *)r;
+                                                rf->chunk.code = (uint8_t *)malloc(an ? an : 1);
+                                                if (an) memcpy(rf->chunk.code, ab, an);
+                                                rf->chunk.count = (int)an;
+                                                rf->chunk.capacity = (int)an;
+                                            } else if (akind == 2 && r->type == OBJ_FUNCTION) {
+                                                ObjFunction *rf = (ObjFunction *)r;
+                                                rf->chunk.lineStream = (uint8_t *)malloc(an ? an : 1);
+                                                if (an) memcpy(rf->chunk.lineStream, ab, an);
+                                                rf->chunk.lineStreamLen = (int)an;
+                                                rf->chunk.lineStreamCap = (int)an;
+                                            } else if (akind == 3 && r->type == OBJ_CLOSURE) {
+                                                ObjClosure *rc = (ObjClosure *)r;
+                                                rc->upvalues = (ObjUpvalue **)
+                                                    calloc(an ? an : 1, sizeof(ObjUpvalue *));
+                                                for (uint32_t u = 0; u < an; u++) {
+                                                    uint32_t ui;
+                                                    memcpy(&ui, ab + u * 4u, 4);
+                                                    if (ui && ui < next)
+                                                        rc->upvalues[u] =
+                                                            (ObjUpvalue *)rebuilt[ui];
+                                                    else if (ui) attBad++;
+                                                }
+                                            } else if (akind == 12 && r->type == OBJ_LIST) {
+                                                ObjList *rl = (ObjList *)r;
+                                                uint32_t stg2; memcpy(&stg2, ab, 4);
+                                                const unsigned char *q2 = ab + 4;
+                                                if (stg2 == LIST_STORE_BOXED) {
+                                                    Value *iv = (Value *)calloc(an ? an : 1, sizeof(Value));
+                                                    for (uint32_t e = 0; e < an; e++) {
+                                                        uint32_t vt; uint64_t vp;
+                                                        memcpy(&vt, q2, 4); q2 += 4;
+                                                        memcpy(&vp, q2, 8); q2 += 8;
+                                                        iv[e].type = (ValueType)vt;
+                                                        if (vt == VAL_OBJ) {
+                                                            if (vp && vp < next)
+                                                                iv[e].as.obj = rebuilt[vp];
+                                                            else { iv[e].as.obj = NULL; if (vp) attBad++; }
+                                                        } else {
+                                                            memcpy(&iv[e].as, &vp, sizeof vp);
+                                                        }
+                                                    }
+                                                    rl->items = iv;
+                                                } else {
+                                                    size_t w = stg2 == LIST_STORE_U8 ? 1u : 8u;
+                                                    void *iv = malloc(an * w ? an * w : 1);
+                                                    memcpy(iv, q2, an * w);
+                                                    rl->items = iv;
+                                                }
+                                                rl->count = (int)an;
+                                                rl->capacity = (int)an;
+                                            }
+                                        }
+                                        free(ab);
+                                    }
                                     fclose(h);
 
                                     /* Relocate: index -> pointer, offset ->
@@ -1068,6 +1152,10 @@ void jaiSnapshotAudit(const char *when) {
                                     unsigned long long topo = 0, topoBad = 0;
                                     for (uint32_t i = 1; i < next; i++) {
                                         Obj *r = rebuilt[i], *o2 = byIndex[i];
+                                        if (getenv("JAI_SNAP_TRACE"))
+                                            fprintf(stderr, "[t] %u r=%p o=%p ty=%d\n",
+                                                    i, (void *)r, (void *)o2,
+                                                    r ? (int)r->type : -1);
                                         if (r == NULL || o2 == NULL) continue;
                                         if (r->type != o2->type) { topoBad++; continue; }
                                         if (r->type == OBJ_STRING) {
@@ -1090,6 +1178,27 @@ void jaiSnapshotAudit(const char *when) {
                                                 topoBad++;
                                         } else if (r->type == OBJ_FUNCTION) {
                                             topo++;
+                                            /* The attached arrays, compared
+                                             * against the live ones: "no attach
+                                             * errors" only means nothing threw. */
+                                            ObjFunction *rfn = (ObjFunction *)r;
+                                            ObjFunction *ofn = (ObjFunction *)o2;
+                                            if (rfn->chunk.count != ofn->chunk.count) topoBad++;
+                                            else if (ofn->chunk.count) {
+                                                if (rfn->chunk.code == NULL ||
+                                                    ofn->chunk.code == NULL ||
+                                                    memcmp(rfn->chunk.code, ofn->chunk.code,
+                                                           (size_t)ofn->chunk.count) != 0)
+                                                    topoBad++;
+                                            }
+                                            if (rfn->chunk.lineStreamLen != ofn->chunk.lineStreamLen) topoBad++;
+                                            else if (ofn->chunk.lineStreamLen) {
+                                                if (rfn->chunk.lineStream == NULL ||
+                                                    ofn->chunk.lineStream == NULL ||
+                                                    memcmp(rfn->chunk.lineStream, ofn->chunk.lineStream,
+                                                           (size_t)ofn->chunk.lineStreamLen) != 0)
+                                                    topoBad++;
+                                            }
                                             ObjModule *rm2 = ((ObjFunction *)r)->module;
                                             ObjModule *om2 = ((ObjFunction *)o2)->module;
                                             if ((rm2 == NULL) != (om2 == NULL) ||
@@ -1112,6 +1221,18 @@ void jaiSnapshotAudit(const char *when) {
                                                 (os2 != NULL &&
                                                  rebuilt[IDX(os2)] != (Obj *)rs2))
                                                 topoBad++;
+                                        } else if (r->type == OBJ_LIST && getenv("JAI_SNAP_LIST")) {
+                                            topo++;
+                                            ObjList *rl2 = (ObjList *)r;
+                                            ObjList *ol2 = (ObjList *)o2;
+                                            if (rl2->count != ol2->count) topoBad++;
+                                            else if (ol2->count && ol2->stg != LIST_STORE_BOXED) {
+                                                size_t w = ol2->stg == LIST_STORE_U8 ? 1u : 8u;
+                                                if (rl2->items == NULL || ol2->items == NULL ||
+                                                    memcmp(rl2->items, ol2->items,
+                                                           w * (size_t)ol2->count) != 0)
+                                                    topoBad++;
+                                            }
                                         } else if (r->type == OBJ_NATIVE) {
                                             topo++;
                                             ObjString *rn = ((ObjNative *)r)->name;
@@ -1123,14 +1244,26 @@ void jaiSnapshotAudit(const char *when) {
                                         }
                                     }
                                     fprintf(stderr,
-                                            "[snapshot] rebuilt %llu objects in "
-                                            "%.3f ms, %llu bad relocations, "
+                                            "[snapshot] rebuilt %llu objects + "
+                                            "%llu arrays in %.3f ms, %llu bad "
+                                            "relocations, %llu attach errors, "
                                             "%llu topology checks, %llu WRONG\n",
-                                            made,
+                                            made, att,
                                             (jaiClockMonotonic() - lt0) * 1000.0,
-                                            relocBad, topo, topoBad);
-                                    for (uint32_t i = 1; i < next; i++)
-                                        free(rebuilt[i]);
+                                            relocBad, attBad, topo, topoBad);
+                                    for (uint32_t i = 1; i < next; i++) {
+                                        Obj *r = rebuilt[i];
+                                        if (r == NULL) continue;
+                                        if (r->type == OBJ_FUNCTION) {
+                                            free(((ObjFunction *)r)->chunk.code);
+                                            free(((ObjFunction *)r)->chunk.lineStream);
+                                        } else if (r->type == OBJ_CLOSURE) {
+                                            free(((ObjClosure *)r)->upvalues);
+                                        } else if (r->type == OBJ_LIST) {
+                                            free(((ObjList *)r)->items);
+                                        }
+                                        free(r);
+                                    }
                                 }
                                 free(rebuilt);
                             }
