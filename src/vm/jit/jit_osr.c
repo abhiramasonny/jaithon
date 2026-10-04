@@ -1098,6 +1098,12 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     if (fn->osrForms == NULL)
         fn->osrForms = JAI_ALLOC_ZEROED(JaiOsrForm, JAI_OSR_MAX);
     JaiOsrForm *form = &fn->osrForms[fn->osrCount];
+    /* Start from a clean record. The in-place re-compile in jaiJitEnterOsr
+     * compiles into a slot another head's form just vacated, and a field left
+     * over from it -- `declines` at JAI_OSR_GIVE_UP above all -- made the new
+     * form one the back edge would never enter again: poly_dispatch's inner
+     * loop ran interpreted for the rest of the run once it was "replaced". */
+    *form = (JaiOsrForm){0};
     form->code  = entry;
     form->top   = top;
     form->slots = (uint8_t)e.locals;
