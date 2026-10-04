@@ -995,6 +995,7 @@ ObjDict *jitDictExemplar(void);
 bool jitFieldDict(void);
 bool jitIterSoft(void);
 bool jitIterEmptySkip(void);
+bool jitPairInstance(void);
 void planStrFacts(Emit *e, ObjFunction *fn);
 bool strFactAscii(const Emit *e, int slot);
 bool strFactInterned(const Emit *e, int slot);

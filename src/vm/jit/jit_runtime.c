@@ -75,6 +75,18 @@ bool jitIterEmptySkip(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_PAIR_INST=0 binds a dict-items loop's instance components as
+ * bare SLOT_OBJ again, so a loop variable already held as an instance clashes
+ * with them. */
+bool jitPairInstance(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_PAIR_INST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 void jaiJitMarkFrames(void) {
     for (JitCallDesc *f = gJitFrames; f != NULL; f = f->link) {
         for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);

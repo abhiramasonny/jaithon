@@ -1201,6 +1201,8 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
         SlotKind pk[2];
         unsigned ptag[2];
         Value pseen[2];
+        ObjClass *pcls[2] = {NULL, NULL};
+        uint32_t pshape[2] = {0, 0};
         if (pairIsDict) {
             /* Shape 4 carries the dict itself, so the sample is its first
              * live entry -- the one the loop is about to yield. */
@@ -1226,6 +1228,18 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
             if (IS_INT(v))        { pk[i] = SLOT_INT;   ptag[i] = VAL_INT; }
             else if (IS_FLOAT(v)) { pk[i] = SLOT_FLOAT; ptag[i] = VAL_FLOAT; }
             else if (IS_BOOL(v))  { pk[i] = SLOT_BOOL;  ptag[i] = VAL_BOOL; }
+            else if (pairIsDict && jitPairInstance() && IS_INSTANCE(v) &&
+                     AS_INSTANCE(v)->klass != NULL) {
+                /* An instance, by class: `for (name, node) in d.items()`
+                 * then reads `node`'s fields, and a loop variable a frame
+                 * already holds as that class -- which is what an OSR head
+                 * finds -- no longer clashes with a bare SLOT_OBJ. The tag
+                 * says only "a heap object", so the dict step below also
+                 * proves OBJ_INSTANCE and the shape before binding. */
+                pk[i] = SLOT_INST; ptag[i] = VAL_OBJ;
+                pcls[i] = AS_INSTANCE(v)->klass;
+                pshape[i] = pcls[i]->shapeId;
+            }
             else if (IS_OBJ(v) && AS_OBJ(v) != NULL) {
                 /* Held raw, like any other SLOT_OBJ: the tag guard is the
                  * whole of what this promises, and an arm that wants to
@@ -1236,8 +1250,10 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
                 return false;
             }
         }
-        if (!adoptLocalKindSeen(e, pslotA, pk[0], 0, NULL, pseen[0]) ||
-            !adoptLocalKindSeen(e, pslotB, pk[1], 0, NULL, pseen[1])) {
+        if (!adoptLocalKindSeen(e, pslotA, pk[0], pshape[0], pcls[0],
+                                pseen[0]) ||
+            !adoptLocalKindSeen(e, pslotB, pk[1], pshape[1], pcls[1],
+                                pseen[1])) {
             return subWhy(e, "a pair's loop variables (locals %u and %u) "
                              "have kinds %s and %s", pslotA, pslotB,
                           slotKindName(e->localKind[pslotA]),
@@ -1339,6 +1355,24 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ptag[i]));
                 branchOnDeopt(e, JAI_A64_NE);
+                if (pk[i] == SLOT_INST) {
+                    /* Object type first: reading `klass` off a string lands
+                     * in its length and dereferences it. JIT_SCRATCH_C holds
+                     * the scan index and JIT_SCRATCH_B the entry; A and D are
+                     * free until the bind below. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B, at + 8u));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_A,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_A,
+                                       (unsigned)offsetof(ObjInstance, klass)));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(ObjClass, shapeId)));
+                    emitConst64(e, JIT_SCRATCH_A, (int64_t)pshape[i]);
+                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
             }
 
             /* Past the last guard. The index goes first because localOut
