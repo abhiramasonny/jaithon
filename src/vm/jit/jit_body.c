@@ -969,6 +969,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                 if (!holdsRegister(e->stack[first + i])) regs = false;
             }
             if (!regs) goto unarmedOpcode;
+            /* `d[k] += c` on a dict as one leaf; the copies below stay as its
+             * fallback. See emitDictAugAddFused. */
+            if (n == 2) (void)emitDictAugAddFused(e, code, off, stop);
             fpSyncAll(e);
             settleAll(e);
             for (unsigned i = 0; i < n; i++) {

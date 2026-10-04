@@ -540,7 +540,8 @@ int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
  * but the first for each key -- is a leaf with no frame. */
 static JAI_NOINLINE int64_t dictAddStrSlow(ObjDict *d, ObjString *key,
                                            int64_t defPayload,
-                                           int64_t addend) {
+                                           int64_t addend,
+                                           int64_t absentSlow) {
     if (d->keyKind != FIELD_KIND_ANY || d->valKind != FIELD_KIND_ANY) {
         if (!jaiKindAccepts(d->keyKind, OBJ_VAL(key)) ||
             !jaiKindAccepts(d->valKind, INT_VAL(0))) {
@@ -553,6 +554,8 @@ static JAI_NOINLINE int64_t dictAddStrSlow(ObjDict *d, ObjString *key,
     if (e != NULL) {
         if (e->value.type != VAL_INT) return 1;
         base = e->value.as.integer;
+    } else if (absentSlow != 0) {
+        return 1;
     }
     int64_t sum;
     if (__builtin_add_overflow(base, addend, &sum)) return 1;
@@ -573,15 +576,23 @@ static JAI_NOINLINE int64_t dictAddStrSlow(ObjDict *d, ObjString *key,
  * one call where it makes two, with the read, the add and the store between
  * them done here.
  *
+ * `d[k] += c` is the same leaf with `absentSlow` set: there is no default, and
+ * an absent key is the KeyError the unfused read raises.
+ *
  * Returns 0 done, and 1 having written nothing whenever the unfused sequence
- * would do something else: a key that is not a string, a value that is not an
- * int, an add that overflows (which raises), a typed dict that refuses, a
- * probe the quick form cannot settle. The caller then runs that sequence.
+ * would do something else: a container that is not a dict, a key that is not
+ * a string, a value that is not an int, an add that overflows (which raises),
+ * a typed dict that refuses, a probe the quick form cannot settle. The caller
+ * then runs that sequence.
  * Leaf-safe for the reasons jitDictSetStr gives: nothing here runs user code,
  * raises, or allocates an object. */
-int64_t jitDictAddStr(ObjDict *d, Obj *keyObj, int64_t defPayload,
-                      int64_t addend) {
-    if (JAI_UNLIKELY(keyObj->type != OBJ_STRING)) return 1;
+int64_t jitDictAddStr(Obj *dictObj, Obj *keyObj, int64_t defPayload,
+                      int64_t addend, int64_t absentSlow) {
+    if (JAI_UNLIKELY(dictObj->type != OBJ_DICT ||
+                     keyObj->type != OBJ_STRING)) {
+        return 1;
+    }
+    ObjDict *d = (ObjDict *)dictObj;
     ObjString *key = (ObjString *)keyObj;
     if (JAI_LIKELY(d->keyKind == FIELD_KIND_ANY &&
                    d->valKind == FIELD_KIND_ANY)) {
@@ -597,7 +608,7 @@ int64_t jitDictAddStr(ObjDict *d, Obj *keyObj, int64_t defPayload,
             return 0;
         }
     }
-    return dictAddStrSlow(d, key, defPayload, addend);
+    return dictAddStrSlow(d, key, defPayload, addend, absentSlow);
 }
 
 /* `k in d` and `k not in d` with a string `k`, as a leaf for the reason

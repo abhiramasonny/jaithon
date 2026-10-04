@@ -209,6 +209,7 @@ bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
     emit(e, jaiA64MovX(1, rKey));
     emit(e, jaiA64MovX(2, rDef));
     emitConst64(e, 3, (int64_t)jaiReadI16(code + off + 8));
+    emit(e, jaiA64MovzX(4, 0, 0));
     emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitDictAddStr);
     noteScratchClobber(e);
     emit(e, jaiA64Blr(JIT_SCRATCH_A));
@@ -217,6 +218,50 @@ bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
      * entries shallower than it is here. */
     branchToDepth(e, (uint32_t)(off + 12), JAI_A64_EQ,
                   stackSignatureAt(e, e->depth - 5));
+    e->wroteHeap = true;
+    return true;
+}
+
+/* `d[k] += c`, at its OP_DUP2: the bytecode is
+ *
+ *     <d>, <k>, DUP2, GET_INDEX, INT c, ADD, SET_INDEX
+ *
+ * and when `d` was a dict and `k` an object when this compiled, the whole
+ * statement is jitDictAddStr with no default -- an absent key is the read's
+ * KeyError, so the leaf hands it back. The leaf checks both kinds itself, as
+ * nothing here has guarded `d`. Same layout as emitDictAddFused: in front of
+ * the unfused code, branching past the SET_INDEX on success. */
+bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
+    if (!jitDictAddFuse() || !jitDictLeaf() || e->inlining) return false;
+    if (off + 7 > count || code[off + 1] != OP_GET_INDEX ||
+        code[off + 2] != OP_INT || code[off + 5] != OP_ADD ||
+        code[off + 6] != OP_SET_INDEX) {
+        return false;
+    }
+    if (e->depth < 2 || e->valueDepth < 2) return false;
+    if (e->stack[e->depth - 2] != SLOT_OBJ ||
+        e->stack[e->depth - 1] != SLOT_OBJ ||
+        !IS_DICT(e->stackSeen[e->depth - 2])) {
+        return false;
+    }
+    unsigned rDict = valueXReg(e, e->valueDepth - 2);
+    unsigned rKey = valueXReg(e, e->valueDepth - 1);
+    if (!leafRegOk(rDict) || !leafRegOk(rKey)) return false;
+    fpSyncAll(e);
+    settleAll(e);
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emit(e, jaiA64MovzX(2, 0, 0));
+    emitConst64(e, 3, (int64_t)jaiReadI16(code + off + 3));
+    emit(e, jaiA64MovzX(4, 1, 0));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitDictAddStr);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    /* Done: past the SET_INDEX, which leaves the container and the key
+     * consumed. */
+    branchToDepth(e, (uint32_t)(off + 7), JAI_A64_EQ,
+                  stackSignatureAt(e, e->depth - 2));
     e->wroteHeap = true;
     return true;
 }

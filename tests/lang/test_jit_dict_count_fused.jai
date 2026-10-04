@@ -7,7 +7,7 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it on call count alone; `JAITHON_NO_JIT=1`
 #: runs the same file, and every answer is the interpreter's.
-# jit-compiles: count_into, count_by, count_any, count_typed, count_two_dicts
+# jit-compiles: count_into, count_by, count_any, count_typed, count_two_dicts, bump_aug
 from std.test import assert_eq, assert_throws, assert_true
 
 let CALLS = 100
@@ -150,6 +150,43 @@ pub fn test_two_different_dicts_are_not_fused() -> void {
     assert_eq(a["z"], 1)
     assert_true("w" not in a or b["w"] == 5, "b is untouched")
     assert_eq(b.len(), 1)
+}
+
+fn bump_aug(c: any, keys: list[any]) -> void {
+    for k in keys {
+        c[k] += 5
+    }
+}
+
+pub fn test_augmented_add() -> void {
+    #: `d[k] += c`: the same leaf with no default.
+    var counts: dict[any, any] = {"a": 0, "b": 1}
+    var call = 0
+    while call < CALLS {
+        bump_aug(counts, ["a", "b", "a"])
+        call += 1
+    }
+    assert_eq(counts["a"], 10 * CALLS)
+    assert_eq(counts["b"], 1 + 5 * CALLS)
+    #: An absent key is the read's KeyError, and nothing is inserted.
+    assert_throws(KeyError, fn() -> void {
+        bump_aug(counts, ["nope"])
+    }, "`+=` on a missing key")
+    assert_true("nope" not in counts, "nothing inserted")
+    #: A float value, a non-string key and a list all take the unfused code.
+    counts["f"] = 0.5
+    counts[3] = 1
+    bump_aug(counts, ["f", 3])
+    assert_eq(counts["f"], 5.5)
+    assert_eq(counts[3], 6)
+    var xs = [1, 2, 3]
+    bump_aug(xs, [0, 2])
+    assert_eq(xs, [6, 2, 8])
+    counts["big"] = 9223372036854775805
+    assert_throws(OverflowError, fn() -> void {
+        bump_aug(counts, ["big"])
+    }, "`+=` past the largest int")
+    assert_eq(counts["big"], 9223372036854775805)
 }
 
 fn count_while_walking(counts: dict[str, int]) -> void {
