@@ -114,6 +114,55 @@ static bool pushCopyOfEntry(Emit *e, unsigned idx) {
     return true;
 }
 
+/* A field read inside an inlined body. OP_GET_FIELD_LOCAL names a callee
+ * slot, which is a CALLER entry here (inlSlot), so it becomes a copy of that
+ * entry plus an OP_GET_FIELD -- the arm written for a receiver on the operand
+ * stack, fed a synthetic instruction with the same name and the callee's code
+ * after it, so its look-ahead (fpWorthLoading) still sees what follows.
+ * inlineFieldsReadable proved every read resolvable before the inline began;
+ * the refusals below are its backstop. */
+static bool inlineFieldRead(Emit *e, ObjFunction *fn, const uint8_t *code,
+                            int off, int stop) {
+    uint8_t synth[160];
+    int len = instructionLength(&fn->chunk, off);
+    if (len <= 0) return false;
+    int rest = stop - (off + len);
+    if (rest < 0 || 6 + rest > (int)sizeof synth) {
+        e->whyNot = "an inlined field read in a body too long to re-read";
+        return false;
+    }
+    synth[0] = OP_GET_FIELD;
+    if (code[off] == OP_GET_FIELD_LOCAL) {
+        unsigned a = jaiReadU16(code + off + 1);
+        if (a > JIT_MAX_SLOTS || e->inlSlot[a] < 0) {
+            e->whyNot = "an inlined body reading a local it never bound";
+            return false;
+        }
+        if (!pushCopyOfEntry(e, (unsigned)e->inlSlot[a])) return false;
+        memcpy(synth + 1, code + off + 3, 5);   /* u24 name, u16 cache */
+    } else {
+        memcpy(synth + 1, code + off + 1, 5);
+    }
+    memcpy(synth + 6, code + off + len, (size_t)rest);
+    unsigned top = e->depth - 1;
+    if (e->depth == 0 || e->stack[top] != SLOT_INST ||
+        e->stackClass[top] == NULL) {
+        e->whyNot = "an inlined field read off something not a pinned instance";
+        return false;
+    }
+    /* The arm classifies the field off the entry's sample. A sample of some
+     * other class -- what a polymorphic site's receiver carries into each of
+     * its ways -- would describe a different field, so the declaration speaks
+     * instead. */
+    Value seen = e->stackSeen[top];
+    if (IS_INSTANCE(seen) && AS_INSTANCE(seen)->klass != e->stackClass[top]) {
+        e->stackSeen[top] = NULL_VAL;
+    }
+    int soff = 0;
+    if (!emitGetField(e, fn, synth, &soff, 6 + rest)) return false;
+    return soff == 6;
+}
+
 /* Answered against the inlined body's own frame -- the CALLER's operand stack: a parameter is the
  * argument entry already sitting there, a bind pins whatever's on top. Reading these through the main switch would read the CALLER's local of the same number, a different variable entirely. */
 static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
@@ -635,6 +684,11 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         if (e->inlining && (op == OP_GET_LOCAL || op == OP_GET_LOCAL2 ||
                             op == OP_ADD_LOCALS || op == OP_BIND)) {
             if (!inlineLocalOp(e, code, off)) return false;
+            off += instructionLength(&fn->chunk, off);
+            continue;
+        }
+        if (e->inlining && (op == OP_GET_FIELD_LOCAL || op == OP_GET_FIELD)) {
+            if (!inlineFieldRead(e, fn, code, off, stop)) return false;
             off += instructionLength(&fn->chunk, off);
             continue;
         }

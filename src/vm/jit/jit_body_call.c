@@ -871,6 +871,16 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                 return false;
             }
             if (!IS_CLOSURE(method)) return false;
+            /* The wider inliner, for a body inlineMethod's own walker does
+             * not speak -- a constant, a modulo, a field read off a copy of
+             * `self`. Same licence as the direct call below: the receiver's
+             * class is pinned, so the method is known. */
+            if (inlineMethodCall(e, fn, AS_CLOSURE(method), argc,
+                                 (uint32_t)off)) {
+                off += 7;
+                break;
+            }
+            if (e->failed) return false;
             ObjFunction *mfn = AS_CLOSURE(method)->fn;
             /* The callee's own compiled form states its return kind exactly; without one the
              * interpreter's record of what it has been returning stands in. That case is not exotic --

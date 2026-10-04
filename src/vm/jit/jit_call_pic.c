@@ -279,7 +279,26 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
         e->stackShape[ridx] = wayShape[w];
         e->stackClass[ridx] = wayCls[w];
 
-        if (!emitDirectCall(e, fn, wayFn[w], wayVal[w], -1, ridx, argc,
+        /* Cheapest first, as at a pinned site: the way's body where the
+         * call is. The merge after the ways reads one X register at one
+         * depth, so a float result the inline left in the FP bank, and
+         * anything it deferred, is settled before the branch out. */
+        unsigned inlCount = e->count;
+        if (inlineMethodCall(e, fn, AS_CLOSURE(wayVal[w]), argc, callOff)) {
+            if (e->depth == 0 || e->stack[e->depth - 1] != rkind) {
+                gInlineFailed = true;
+                e->failed = true;
+                return false;
+            }
+            fpSyncAll(e);
+            settleAll(e);
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] pic way %u inlined (%u instructions)\n",
+                        w, e->count - inlCount);
+            }
+        } else if (e->failed) {
+            return false;
+        } else if (!emitDirectCall(e, fn, wayFn[w], wayVal[w], -1, ridx, argc,
                             callOff, after, true)) {
             /* jitPic1Admissible said it would take this and it did not: the
              * branch into it is already emitted, so there is nowhere left to

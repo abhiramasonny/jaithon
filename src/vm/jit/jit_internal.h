@@ -1063,6 +1063,8 @@ bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
 void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
                            bool signKnown, int64_t divisor, uint32_t fixup);
 bool powerOfTwoShift(int64_t k, unsigned *shift);
+bool inlineMethodCall(Emit *e, ObjFunction *caller, ObjClosure *method,
+                      unsigned argc, uint32_t callOff);
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg);
 bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
