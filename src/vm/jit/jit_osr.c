@@ -482,10 +482,15 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             /* A storage pin is proved once, at entry, so the region must hold
              * nothing that could change a list's `stg` after it: a call out
              * (anything may box a list), or an OP_ELEM_KIND stamping an empty
-             * one. An append is neither -- a compiled append stores at the
-             * storage it finds or deoptimises, and jitListGrow reserves at
-             * the width the list already has -- which is why a keeping grow
-             * stub no longer costs a loop its pins. */
+             * one. An append is neither for a list that is past
+             * JAI_LIST_SHAPE_AT or already unboxed -- a compiled append stores
+             * at the storage it finds or deoptimises, and jitListGrow keeps
+             * the width such a list has -- which is why a keeping grow stub
+             * no longer costs a loop its pins. A small boxed one is the
+             * exception: a dispatching append through another name can
+             * unbox it at its next growth (jaiListShapeOnGrow), so it is not
+             * pinned here, and osrFormStorageFits turns away an entry that
+             * brings one to a form that pinned it BOXED. */
             bool bodyCallsOut = regionCalls(&e, top, end) ||
                                 (jitGrowKeeps() && regionStamps(&e, top, end));
             for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
@@ -973,6 +978,12 @@ static bool osrFormStorageFits(const JaiOsrForm *form, const Value *slots,
         if ((SlotKind)(form->kinds[i] & 0x0Fu) != SLOT_LIST) continue;
         if (!IS_LIST(slots[i])) return false;
         if (AS_LIST(slots[i])->stg != want) return false;
+        /* A form compiled over a long boxed list, entered with a short one:
+         * the region's appends through an alias could unbox it under the
+         * pin (see compileOsrOnce). */
+        if (want == LIST_STORE_BOXED && jitListShapeable(slots[i])) {
+            return false;
+        }
     }
     return true;
 }
