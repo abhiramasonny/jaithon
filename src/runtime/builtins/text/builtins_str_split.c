@@ -4,6 +4,7 @@
 
 #include "vm/gc.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -351,13 +352,59 @@ static inline bool joinItem(JaiBuf *buf, Value item, int index) {
     return true;
 }
 
+/* JAITHON_JOIN_FAST=0 restores the plain join loops below: no prefetch, and
+ * a memcpy call per item however short. Read once. */
+static bool joinFast(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JOIN_FAST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* How far ahead the join loops touch the next items. Each item is its own
+ * small heap object, so a long list of them is a pointer chase: two million
+ * ten-byte strings joined are four million likely cache misses, once to read
+ * every length and once to copy every body. Asking for the line a few items
+ * early overlaps those misses instead of taking them one at a time. */
+enum { JOIN_AHEAD = 8 };
+
+/* Short copies without the call: a joined list of words is millions of
+ * memcpy calls of a few bytes each, and at that size the call costs more than
+ * the copy. Overlapping word moves cover every length up to sixteen while
+ * reading and writing only the bytes in [0, n). */
+static inline void copyShort(char *dst, const char *src, size_t n) {
+    if (n >= 8) {
+        uint64_t a, b;
+        memcpy(&a, src, 8);
+        memcpy(&b, src + n - 8, 8);
+        memcpy(dst, &a, 8);
+        memcpy(dst + n - 8, &b, 8);
+    } else if (n >= 4) {
+        uint32_t a, b;
+        memcpy(&a, src, 4);
+        memcpy(&b, src + n - 4, 4);
+        memcpy(dst, &a, 4);
+        memcpy(dst + n - 4, &b, 4);
+    } else if (n > 0) {
+        dst[0] = src[0];
+        dst[n / 2] = src[n / 2];
+        dst[n - 1] = src[n - 1];
+    }
+}
+
 static bool joinSized(ObjString *sep, const Value *items, int count,
                       Value *out) {
     const size_t sepLength = (size_t)sep->length;
     size_t total = 0;
+    const bool fast = joinFast();
 
     for (int i = 0; i < count; ++i) {
         const Value itemValue = items[i];
+        if (fast && i + JOIN_AHEAD < count && IS_OBJ(items[i + JOIN_AHEAD])) {
+            __builtin_prefetch(AS_OBJ(items[i + JOIN_AHEAD]));
+        }
 
         if (!IS_STRING(itemValue)) {
             return jaiThrow(vm.cTypeError,
@@ -391,6 +438,26 @@ static bool joinSized(ObjString *sep, const Value *items, int count,
     if (result == NULL) return false;
 
     char *p = result->chars;
+
+    if (fast) {
+        for (int i = 0; i < count; ++i) {
+            if (i + JOIN_AHEAD < count) {
+                __builtin_prefetch(AS_STRING(items[i + JOIN_AHEAD])->chars);
+            }
+            if (i > 0 && sepLength != 0) {
+                if (sepLength <= 16) copyShort(p, sep->chars, sepLength);
+                else memcpy(p, sep->chars, sepLength);
+                p += sepLength;
+            }
+            ObjString *const item = AS_STRING(items[i]);
+            const size_t n = item->length;
+            if (n <= 16) copyShort(p, item->chars, n);
+            else memcpy(p, item->chars, n);
+            p += n;
+        }
+        *out = OBJ_VAL(jaiStringSeal(result));
+        return true;
+    }
 
     for (int i = 0; i < count; ++i) {
         if (i > 0 && sepLength != 0) {
