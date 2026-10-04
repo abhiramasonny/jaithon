@@ -828,8 +828,13 @@ static ObjBytes *bytesFromByteList(ObjList *list, const char *path) {
     return bytes;
 }
 
+/* `wantImage` false asks the front end for diagnostics alone -- `check`, which
+ * has no use for the bytecode. A clean compile then comes back with no image,
+ * and `*clean` says so: NULL with `*clean` true is success, not a failure. */
 static ObjBytes *selfHostedImage(const char *source, size_t length,
-                                 const char *path, int optLevel, int fileId) {
+                                 const char *path, int optLevel, int fileId,
+                                 bool wantImage, bool *clean) {
+    if (clean != NULL) *clean = false;
     /* The compiler's own closure is compiled by C (later, served by the seed):
      * compiling it with itself is the recursion this guard exists to stop. */
     bool wasLoading = sLoadingFrontEnd;
@@ -873,7 +878,7 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
      * with no line numbers and its tracebacks could not name a line. Every
      * caller therefore has to have registered its source and set
      * `module->sourceFileId` first. */
-    Value args[6];
+    Value args[7];
     args[0] = OBJ_VAL(jaiStringNew(source, length));
     jaiPushRoot(args[0]);
     args[1] = OBJ_VAL(jaiStringInternC(path));
@@ -883,9 +888,12 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
     args[4] = INT_VAL(optLevel);
     /* `optimise_body`. See jaiSkipBodyOptimise. */
     args[5] = BOOL_VAL(!jaiSkipBodyOptimise);
+    /* `want_image`. Passed only when it is false, so that every other caller
+     * keeps the six-argument call a seed without the parameter accepts. */
+    args[6] = BOOL_VAL(wantImage);
 
     Value produced = NULL_VAL;
-    bool called = jaiCallValue(entry, 6, args, &produced);
+    bool called = jaiCallValue(entry, wantImage ? 6 : 7, args, &produced);
     jaiPopRoots(2);
 
     if (!called) {
@@ -909,7 +917,16 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
     if (IS_BYTES(produced)) {
         image = AS_BYTES(produced);
     } else if (instanceField(produced, "image", &field) && IS_LIST(field)) {
-        if (AS_LIST(field)->count == 0) {
+        Value bag, errors;
+        if (AS_LIST(field)->count == 0 && !wantImage &&
+            instanceField(produced, "diagnostics", &bag) &&
+            instanceField(bag, "error_count", &errors) && IS_INT(errors) &&
+            AS_INT(errors) == 0) {
+            /* Asked for no image and no error was found: a clean check. Its
+             * warnings stay unreported, exactly as they were when the image
+             * was built and loaded instead. */
+            if (clean != NULL) *clean = true;
+        } else if (AS_LIST(field)->count == 0) {
             /* The front end's own diagnostics say why, in the bag the driver
              * flushes, rendered the same way the C's are. E0902 is only for
              * the case where it produced neither an image nor a reason, which
@@ -938,7 +955,8 @@ ObjFunction *jaiSelfHostedCompileInto(const char *source, size_t length,
                                       const char *path, ObjModule *module,
                                       uint64_t hash, int optLevel) {
     ObjBytes *image = selfHostedImage(source, length, path, optLevel,
-                                      module != NULL ? module->sourceFileId : 0);
+                                      module != NULL ? module->sourceFileId : 0,
+                                      true, NULL);
     if (image == NULL) return NULL;
 
     /* The image stays rooted across the diagnostic: rendering one allocates,
@@ -960,6 +978,46 @@ ObjFunction *jaiSelfHostedCompileInto(const char *source, size_t length,
     }
     jaiPopRoot();
     return body;
+}
+
+/* `check`'s compile: every diagnostic, and no bytecode. The driver used to take
+ * the image `compile_source` serialised, load it into a function and drop the
+ * function -- 3% of a `check` spent building something nothing reads.
+ * JAITHON_CHECK_IMAGE=1 builds and loads it, as before. */
+static bool checkWantsImage(void) {
+    static int state = -1;
+    if (state < 0) {
+        const char *v = getenv("JAITHON_CHECK_IMAGE");
+        state = (v != NULL && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+    }
+    return state == 1;
+}
+
+static bool selfHostedCheck(const char *source, size_t length, const char *path,
+                            ObjModule *module, uint64_t hash, int optLevel) {
+    if (checkWantsImage()) {
+        return jaiSelfHostedCompileInto(source, length, path, module, hash,
+                                        optLevel) != NULL;
+    }
+    bool clean = false;
+    ObjBytes *image = selfHostedImage(source, length, path, optLevel,
+                                      module != NULL ? module->sourceFileId : 0,
+                                      false, &clean);
+    /* The front end built an image anyway: load it, so that one this build
+     * cannot read is still reported. */
+    if (image != NULL) {
+        jaiPushRoot(OBJ_VAL(image));
+        ObjFunction *body = jaiDeserializeModule(image->data, image->length,
+                                                 module, hash);
+        jaiPopRoot();
+        if (body == NULL) {
+            (void)jaiDiagError(E0902_INTERNAL_ERROR, JAI_SPAN_NONE,
+                               "%s: the self-hosted front end produced a "
+                               ".jaic image this build cannot load", path);
+        }
+        return body != NULL;
+    }
+    return clean;
 }
 
 /* The --front=jai counterpart of loadModuleBody: same source registration, same
@@ -1247,15 +1305,13 @@ int jaiCheckFile(const char *path, const JaiRunOptions *opts) {
      * See tests/errors/import_star.jai, added to give that path one live
      * example. */
     const JaiSourceFile *entryFile = jaiSourceGet(fileId);
-    ObjFunction *checked = entryFile == NULL
-                             ? NULL
-                             : jaiSelfHostedCompileInto(
-                                   entryFile->source, entryFile->length,
+    bool checked = entryFile != NULL &&
+                   selfHostedCheck(entryFile->source, entryFile->length,
                                    absolute, module,
                                    jaiSourceHash(entryFile->source,
                                                  entryFile->length),
                                    sOptions.codegen.optLevel);
-    ok = checked != NULL && !jaiDiagHasErrors(&gDiags);
+    ok = checked && !jaiDiagHasErrors(&gDiags);
     (void)jaiDiagFlush(&gDiags, stderr);
     jaiPopRoots(3);
 
