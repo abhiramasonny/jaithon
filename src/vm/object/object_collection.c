@@ -388,7 +388,11 @@ ObjList *jaiListConcat(ObjList *a, ObjList *b) {
     }
     ObjList *out = jaiListNew(0);
     if (stg != LIST_STORE_BOXED) {
-        out->elemKind = a->elemKind;
+        /* The element kind is a promise, not a storage: an untyped list can
+         * hold unboxed storage too (see shapeAtGrowthOn), and `list[int] +
+         * untyped` promised nothing about the result before that existed. */
+        out->elemKind = a->elemKind == b->elemKind ? a->elemKind
+                                                   : (uint8_t)FIELD_KIND_ANY;
         out->stg = stg;
     }
     jaiGCPushRoot(OBJ_VAL(out));
