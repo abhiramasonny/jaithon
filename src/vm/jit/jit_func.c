@@ -726,6 +726,40 @@ unsigned valueBankRoom(const Emit *e) {
  * measuring pass records it so the real pass can choose a bank; the real pass
  * declines if it happens anyway, so a missed site costs a decline and never a
  * value read out of a register a helper overwrote. */
+/* JAITHON_JIT_HOIST_PUSH: a list push's grow stub keeps the hoisted headers
+ * alive across its call, so a loop that pushes can still hoist. */
+bool jitHoistPush(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_PUSH");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* noteScratchClobber for the one call out that runs no user code and whose
+ * stub (emitGrowStubs) puts x13..x17 back and reloads every header hoisted
+ * over it: a list growing. Everything a call means for the operand bank is
+ * still recorded -- the helper does destroy x0..x8 -- but the site is not a
+ * clobber for the hoist planner, which is what kept every loop that builds
+ * its output with `push` from hoisting the lists it reads. */
+void noteGrowClobber(Emit *e) {
+    e->clobbersScratch = true;
+    forgetFieldKinds(e);
+    e->dynGuarded = 0;
+    if (e->measuring && e->valueDepth > e->clobberDepth) {
+        e->clobberDepth = e->valueDepth;
+    }
+    if (e->scratchValues) {
+        e->whyNot = "a call reached a body whose values are in scratch";
+        e->failed = true;
+    }
+    if (!e->measuring && e->splitAt != 0 && e->valueDepth > e->splitAt) {
+        e->whyNot = "a call stood deeper than the split bank allows";
+        e->failed = true;
+    }
+}
+
 void noteScratchClobber(Emit *e) {
     e->clobbersScratch = true;
     /* The one place every call out passes through, which makes it the one

@@ -435,8 +435,10 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
      * (see emitGrowStubs). */
     if (!raiseExitAllowed(e, "a list growth inside a try")) return false;
 
-    noteScratchClobber(e);
+    if (jitHoistPush()) noteGrowClobber(e);
+    else noteScratchClobber(e);
     unsigned gi = e->growCount++;
+    e->grow[gi].at       = e->inlining ? e->inlIp : e->curOffset;
     e->grow[gi].listReg  = rList;
     e->grow[gi].valReg   = rVal;
     e->grow[gi].tag      = vtag;

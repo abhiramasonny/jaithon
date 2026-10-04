@@ -134,16 +134,55 @@ void emitSelfSlowStubs(Emit *e, ObjClosure *closure) {
 /* Cold half of `xs.push(v)`: reserve, refill the count the fast path already loaded, branch back in.
  * No descriptor/roots (see jitListGrow). This is a continuation, not an exit -- an OSR form must NOT sync its iterator or locals here, since the loop carries on with them where they are. */
 void emitGrowStubs(Emit *e) {
+    bool keep = jitHoistPush();
     for (unsigned gi = 0; gi < e->growCount; gi++) {
         e->grow[gi].stub = (int)e->count;
+        /* x13..x17 across the call: a header hoisted over this push lives
+         * there (noteGrowClobber kept the planner from seeing the push as a
+         * call). 48 bytes for five, so sp stays 16-aligned; popped before the
+         * exception test, so the exit leaves with sp where the frame put it. */
+        if (keep) {
+            emit(e, jaiA64StpPre(13, 14, 31, -48));
+            emit(e, jaiA64StpOff(15, 16, 31, 16));
+            emit(e, jaiA64StrX(17, 31, 32));
+        }
         emit(e, jaiA64MovX(0, e->grow[gi].listReg));
         emit(e, jaiA64MovzX(1, e->grow[gi].tag, 0));
         emit(e, jaiA64MovX(2, e->grow[gi].valReg));
         emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jitListGrow);
         emit(e, jaiA64Blr(JIT_SCRATCH_D));
+        if (keep) {
+            emit(e, jaiA64LdpOff(15, 16, 31, 16));
+            /* Not `ldp x17, x17`: a load pair naming one register twice is
+             * CONSTRAINED UNPREDICTABLE, and this core raises SIGILL. */
+            emit(e, jaiA64LdrX(17, 31, 32));
+            emit(e, jaiA64LdpPost(13, 14, 31, 48));
+        }
         emit(e, jaiA64SubsXImm(31, 0, 0));
         emit(e, jaiA64BCond(JAI_A64_NE,
                             (int32_t)(e->exceptionExit - (int)e->count)));
+        /* The list that grew may be one whose header is hoisted here -- two
+         * locals can name one list -- and growing moved its items. Reloaded
+         * for every hoist live at this push; the count can only have risen,
+         * so a bounds guard proved at the head still holds. Its storage did
+         * not move: growing reserves at the width it already has. */
+        if (keep) {
+            for (unsigned h = 0; h < e->hoistCount; h++) {
+                if (e->grow[gi].at < e->hoist[h].top ||
+                    e->grow[gi].at >= e->hoist[h].end) {
+                    continue;
+                }
+                unsigned hl = hoistListRegFor(e, e->hoist[h].slot);
+                if (hl == 0) continue;
+                if (e->hoist[h].hasCount) {
+                    emitListHeader(e, hl, e->hoist[h].itemsReg,
+                                   e->hoist[h].countReg);
+                } else {
+                    emit(e, jaiA64LdrX(e->hoist[h].itemsReg, hl,
+                                       (unsigned)offsetof(ObjList, items)));
+                }
+            }
+        }
         emit(e, jaiA64LdrW(e->grow[gi].countReg, e->grow[gi].listReg,
                            (unsigned)offsetof(ObjList, count)));
         emit(e, jaiA64B((int32_t)(e->grow[gi].returnTo - (int)e->count)));

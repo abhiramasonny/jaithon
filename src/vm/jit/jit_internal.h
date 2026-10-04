@@ -639,6 +639,9 @@ typedef struct {
         unsigned valReg;
         unsigned tag;
         unsigned countReg;
+        /* The bytecode offset of the push, so the stub can tell which hoisted
+         * headers are live there (JAITHON_JIT_HOIST_PUSH). */
+        uint32_t at;
     } grow[JIT_MAX_GROW];
     unsigned  growCount;
     uint32_t  curOffset;
@@ -926,6 +929,9 @@ void localOutFp(Emit *e, unsigned slot, unsigned src);
 bool localInRange(Emit *e, unsigned slot);
 Value seenLocal(Emit *e, unsigned slot);
 void noteScratchClobber(Emit *e);
+void noteGrowClobber(Emit *e);
+unsigned hoistListRegFor(const Emit *e, unsigned slot);
+bool jitHoistPush(void);
 unsigned valueXReg(const Emit *e, unsigned idx);
 unsigned pushReg(const Emit *e);
 unsigned valueBankRoom(const Emit *e);

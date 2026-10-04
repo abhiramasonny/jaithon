@@ -399,6 +399,10 @@ static unsigned hoistListReg(const Emit *e, unsigned slot) {
     return localHomeX(e, slot);
 }
 
+unsigned hoistListRegFor(const Emit *e, unsigned slot) {
+    return hoistListReg(e, slot);
+}
+
 void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     if (e->measuring) return;
     const Chunk *c = &fn->chunk;
