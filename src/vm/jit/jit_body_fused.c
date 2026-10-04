@@ -472,8 +472,11 @@ bool emitModIntConst(Emit *e, const uint8_t *code, int *offp) {
         emitConst64(e, JIT_SCRATCH_A, imm);
         emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, JIT_SCRATCH_A));
         emit(e, jaiA64MsubX(rx, JIT_SCRATCH_B, JIT_SCRATCH_A, rx));
-        emitFloorFixup(e, rx, JIT_SCRATCH_A, true, imm,
-                       jaiA64AddX(rx, rx, JIT_SCRATCH_A));
+        if (imm < 0 ||
+            !emitFloorModFixupFast(e, rx, JIT_SCRATCH_A, JIT_SCRATCH_B)) {
+            emitFloorFixup(e, rx, JIT_SCRATCH_A, true, imm,
+                           jaiA64AddX(rx, rx, JIT_SCRATCH_A));
+        }
         off += 3;
         break;
     } while (0);

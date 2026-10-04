@@ -81,6 +81,42 @@ void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
     emit(e, fixup);
 }
 
+/* JAITHON_JIT_FLOOR_SELECT=0 puts the branch back into the floor correction
+ * of `x % k` and `x // k` for a literal k > 0. On by default. */
+static bool floorSelectOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_FLOOR_SELECT");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* The floor correction for a divisor known positive, with no branch: the
+ * remainder's sign bit, smeared across the register by `asr #63`, is all-ones
+ * exactly when the correction applies. emitFloorFixup's `tbz` over one
+ * instruction is TAKEN for every non-negative dividend -- the common case --
+ * which puts a second taken branch in every loop that takes a remainder, and
+ * a core retires one taken branch a cycle. `i % 7` in a counted loop is the
+ * shape: loop_sum's compiled body had two taken branches against the peer's
+ * one.
+ *
+ * rrem += (rrem < 0 ? rd : 0); rtmp is clobbered. */
+bool emitFloorModFixupFast(Emit *e, unsigned rrem, unsigned rd,
+                           unsigned rtmp) {
+    if (!floorSelectOn()) return false;
+    emit(e, jaiA64AndXAsr(rtmp, rd, rrem, 63));
+    emit(e, jaiA64AddX(rrem, rrem, rtmp));
+    return true;
+}
+
+/* rq -= (rrem < 0 ? 1 : 0): the smeared sign is -1 or 0, so it is added. */
+bool emitFloorDivFixupFast(Emit *e, unsigned rq, unsigned rrem) {
+    if (!floorSelectOn()) return false;
+    emit(e, jaiA64AddXAsr(rq, rq, rrem, 63));
+    return true;
+}
+
 bool powerOfTwoShift(int64_t k, unsigned *shift) {
     if (k <= 0) return false;
     uint64_t u = (uint64_t)k;

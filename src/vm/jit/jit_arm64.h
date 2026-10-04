@@ -93,6 +93,9 @@ uint32_t jaiA64StrByte(unsigned rt, unsigned rn, unsigned offset);
  * word, so reading it four bytes wide returns the neighbour in the high bits. */
 uint32_t jaiA64LdrHalf(unsigned rd, unsigned rn, unsigned offset);
 uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm);
+/* and Xd, Xn, Xm, asr #shift / add Xd, Xn, Xm, asr #shift */
+uint32_t jaiA64AndXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift);
+uint32_t jaiA64AddXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift);
 uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm);
 /* and Xd, Xn, #((1 << ones) - 1) -- `ones` is 1..63, a low run of set bits */
 uint32_t jaiA64AndXOnes(unsigned rd, unsigned rn, unsigned ones);

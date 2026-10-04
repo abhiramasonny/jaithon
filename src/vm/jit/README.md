@@ -459,6 +459,7 @@ this table complete in both directions.
 | `JAITHON_JIT_STRCMP` | on | String ordering comparisons. |
 | `JAITHON_JIT_STRCMP_EQ` | on | String equality. |
 | `JAITHON_JIT_STR_ITER` | on | Iterating a string. |
+| `JAITHON_JIT_FLOOR_SELECT` | on | The floor correction of `x % k` / `x // k` for a literal `k > 0` is branch-free (`and tmp, k, r, asr #63; add r, r, tmp`, or one `add q, q, r, asr #63`) instead of a `tbz` over one instruction -- a branch TAKEN for every non-negative dividend, which put a second taken branch in every loop taking a remainder. Off restores the `tbz`. |
 | `JAITHON_JIT_ITER_STG` | on | Dispatch on list storage at a nested `for-in`. |
 | `JAITHON_MAP_RUN` | on | (`jit_entry.c`, driven by `list.map`) Map a flat int-to-int compiled callee over a whole run of the list in one call (`jaiMapPreparedFn1Ints`): the stack window, the staleness test and the two storage switches hoisted out of the per-element loop. Off sends every element back through `jaiCallPreparedFn1`. 1.25x on `list_ops`. |
 | `JAITHON_JIT_STR_HEAD` | on | `for c in <string>` as an OSR loop head. |
