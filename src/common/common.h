@@ -288,6 +288,8 @@ void  jaiPathJoin(char *out, size_t outSize, const char *a, const char *b);
 void  jaiPathDirname(char *out, size_t outSize, const char *path);
 void  jaiPathBasename(char *out, size_t outSize, const char *path);
 bool  jaiPathAbsolute(char *out, size_t outSize, const char *path);
+/* Whether `path` can be opened for reading, without reading it. */
+bool  jaiPathReadable(const char *path);
 
 double jaiClockMonotonic(void);
 

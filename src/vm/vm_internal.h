@@ -48,9 +48,14 @@ static inline CallFrame *topFrame(void) {
 static inline Chunk *frameChunk(CallFrame *frame) { return &frame->closure->fn->chunk; }
 
 /* One cache line, or NULL when the operand is out of range (a chunk that came
- * from a corrupt cache file must degrade to the slow path, never crash). */
+ * from a corrupt cache file must degrade to the slow path, never crash). A
+ * deserialised chunk's array is allocated here, the first time the function
+ * executes a cached instruction -- see jaiChunkReserveCaches. */
+InlineCache *jaiCacheAtSlow(Chunk *chunk, uint16_t index);
+
 static inline InlineCache *cacheAt(Chunk *chunk, uint16_t index) {
-    if (chunk->caches == NULL || (int)index >= chunk->cacheCount) return NULL;
+    if (JAI_UNLIKELY(chunk->caches == NULL)) return jaiCacheAtSlow(chunk, index);
+    if ((int)index >= chunk->cacheCount) return NULL;
     return &chunk->caches[index];
 }
 

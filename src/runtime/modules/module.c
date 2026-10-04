@@ -58,6 +58,7 @@
 #include "boot/seed.h"
 #include "runtime/modules/frontend.h"
 #include "vm/jit/jit.h"
+#include "vm/gc.h"
 #include "runtime/modules/module_internal.h"
 
 #include "common/diag.h"
@@ -249,11 +250,73 @@ static bool selfHosting(void) {
  * So the warm happens at the first module that is going to need compiling,
  * BEFORE that module is published as MOD_LOADING -- see maybeWarmFor. Then
  * the compiler's own imports find std.math untouched and load it normally. */
+/* Loading the front end builds ~10MB of objects that live for the rest of
+ * the process, and it used to trigger one collection partway through: a full
+ * mark of everything built so far that freed ~53KB, ~5% of an edit-then-run.
+ * So collection is paused while the front end loads, and the bytes built under
+ * the pause are then credited to the collector as permanent (jaiGCCredit):
+ * they never count toward the next collection, and the budget is at least what
+ * a collection at the end would have given them. Measured together with the
+ * intern sizing below, as an env A/B in one binary (cycles.py -n 7): -3.9%
+ * cycles on a one-line `check` (floor 2.1%), -1.2% on edit-then-run (floor
+ * 0.4%). --gc-stress keeps collecting, since finding what a collection breaks
+ * is its whole job.
+ *
+ * The credit is the bytes allocated DURING the pause, never the heap as it
+ * stands. Every eval, REPL line, test case and `check` file comes through here
+ * again with the front end already loaded; when the credit was "4x the whole
+ * heap", garbage included, each of those calls pushed the next collection
+ * further out and the collector stopped (check lib: 0 collections, 3.3GB). A
+ * call that finds the front end loaded now allocates ~nothing under the pause
+ * and credits ~nothing, and a load that fails credits nothing at all, since
+ * what it built is garbage.
+ *
+ * The intern table is sized for the front end's ~5,000 strings up front too:
+ * it otherwise doubles its way from 8 slots to 16K, rehashing every string
+ * interned so far at each step.
+ *
+ * JAITHON_FRONTEND_LOAD_TUNE=0 does neither. */
+#define JAI_FRONTEND_INTERNED 6000
+
+static bool frontEndTuneOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("JAITHON_FRONTEND_LOAD_TUNE");
+        cached = (s != NULL && strcmp(s, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+typedef struct {
+    bool paused;
+    size_t heapBefore;
+} FrontEndPause;
+
+static FrontEndPause frontEndLoadBegin(void) {
+    FrontEndPause p = {false, 0};
+    if (!frontEndTuneOn()) return p;
+    jaiTableReserve(jaiInternTable(), JAI_FRONTEND_INTERNED);
+    if (vm.gcStress || vm.gc == NULL || !vm.gc->enabled) return p;
+    jaiGCEnable(false);
+    p.paused = true;
+    p.heapBefore = jaiHeapBytes;
+    return p;
+}
+
+static void frontEndLoadEnd(FrontEndPause p, bool loaded) {
+    if (!p.paused) return;
+    jaiGCEnable(true);
+    size_t now = jaiHeapBytes;
+    if (loaded && now > p.heapBefore) jaiGCCredit(now - p.heapBefore);
+}
+
 static void warmFrontEnd(void) {
     if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return;
     sFrontEndWarmed = true;
     sLoadingFrontEnd = true;
-    (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+    FrontEndPause pause = frontEndLoadBegin();
+    ObjModule *loaded = jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+    frontEndLoadEnd(pause, loaded != NULL);
     sLoadingFrontEnd = false;
     jaiClearException();
     /* The candidate snapshot point: the front end is built and no user code has
@@ -600,21 +663,59 @@ static bool maybeWarmFor(const char *path, bool entry) {
     return true;
 }
 
-static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
-    size_t length = 0;
-    char *text = jaiReadFile(path, &length);
-    if (text == NULL) {
-        (void)importFailure(E0800_MODULE_NOT_FOUND, vm.cIOError,
-                            "cannot read module file '%s'", path);
-        return NULL;
+/* Whether a seeded module's source is read only when something needs it.
+ *
+ * In the bootstrap window a module comes from the seed, and the seed does not
+ * look at the source beside it at all (serialize_read.c: "The seed is allowed
+ * to be out of date with the source beside it"). The text was nonetheless read
+ * and FNV-hashed up front for every one of the 98 modules -- 1.1MB, ~3-4ms of
+ * every `check` and edit-then-run -- because the hash is what a __jaicache__
+ * entry is validated against, and the cache is probed first. In practice the
+ * front end's modules have no cache entries, so the hash went unused.
+ *
+ * Now the source is registered lazily (jaiSourceAddLazy) and hashed only if a
+ * cache entry turns up; a diagnostic or traceback that points into the file
+ * reads it then. Readability is still checked up front, so a file that cannot
+ * be read fails the import exactly as before. JAITHON_DEFER_SEED_SOURCE=0
+ * restores the eager read. */
+static bool deferSeedSourceOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("JAITHON_DEFER_SEED_SOURCE");
+        cached = (s != NULL && strcmp(s, "0") == 0) ? 0 : 1;
     }
+    return cached != 0;
+}
 
-    uint64_t hash = jaiSourceHash(text, length);
-    int fileId = jaiSourceAdd(path, text, length);   /* takes ownership of text */
+static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
+    const JaiSeedEntry *seeded =
+        (sLoadingFrontEnd && !seedDisabled()) ? jaiSeedFind(path) : NULL;
+
+    uint64_t hash = 0;
+    bool haveHash = false;
+    int fileId;
+    if (seeded != NULL && deferSeedSourceOn()) {
+        if (!jaiPathReadable(path)) {
+            (void)importFailure(E0800_MODULE_NOT_FOUND, vm.cIOError,
+                                "cannot read module file '%s'", path);
+            return NULL;
+        }
+        fileId = jaiSourceAddLazy(path, 0);
+    } else {
+        size_t length = 0;
+        char *text = jaiReadFile(path, &length);
+        if (text == NULL) {
+            (void)importFailure(E0800_MODULE_NOT_FOUND, vm.cIOError,
+                                "cannot read module file '%s'", path);
+            return NULL;
+        }
+        hash = jaiSourceHash(text, length);
+        haveHash = true;
+        fileId = jaiSourceAdd(path, text, length);   /* takes ownership of text */
+    }
     module->sourceFileId = fileId;
 
-    const JaiSourceFile *file = jaiSourceGet(fileId);
-    if (file == NULL) {
+    if (fileId < 0) {
         (void)importFailure(E0902_INTERNAL_ERROR, vm.cImportError,
                             "cannot register source for '%s'", path);
         return NULL;
@@ -632,6 +733,11 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
         if (cacheData != NULL) {
             ObjFunction *cached = NULL;
             if (jaiCacheFlagsMatchBuffer(cacheData, cacheLen, flags)) {
+                if (!haveHash) {
+                    const JaiSourceFile *src = jaiSourceGet(fileId);
+                    hash = jaiSourceHash(src->source, src->length);
+                    haveHash = true;
+                }
                 cached = jaiDeserializeCached(cacheData, cacheLen, module, hash,
                                               path);
             }
@@ -664,7 +770,6 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
      * running stale bytecode, because jaiDeserializeModule checks the source
      * hash. */
     if (sLoadingFrontEnd && !seedDisabled()) {
-        const JaiSeedEntry *seeded = jaiSeedFind(path);
         if (seeded != NULL) {
             double dt0 = gFeTiming ? jaiClockMonotonic() : 0.0;
             ObjFunction *fromSeed = jaiDeserializeSeed(seeded->image,
@@ -680,8 +785,13 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
 
     ObjFunction *body = NULL;
     if (selfHosting()) {
-        body = jaiSelfHostedCompileInto(file->source, length, path, module,
-                                        hash, opts->codegen.optLevel);
+        const JaiSourceFile *file = jaiSourceGet(fileId);
+        if (!haveHash) {
+            hash = jaiSourceHash(file->source, file->length);
+            haveHash = true;
+        }
+        body = jaiSelfHostedCompileInto(file->source, file->length, path,
+                                        module, hash, opts->codegen.optLevel);
         if (body == NULL) return NULL;
         /* The self-hosted front end is handed a path, not a module name, so it
          * names the module body from the file's stem: `b` where the C front end
@@ -921,7 +1031,10 @@ ObjModule *jaiImportFrontEndModule(const char *dottedName) {
         t0 = jaiClockMonotonic();
     }
     sLoadingFrontEnd = true;
+    FrontEndPause pause = {false, 0};
+    if (!wasLoading) pause = frontEndLoadBegin();
     ObjModule *module = jaiImportModule(dottedName, NULL);
+    frontEndLoadEnd(pause, module != NULL);
     sLoadingFrontEnd = wasLoading;
     if (t0 != 0.0)
     {
@@ -1146,7 +1259,10 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
      * compiling it with itself is the recursion this guard exists to stop. */
     bool wasLoading = sLoadingFrontEnd;
     sLoadingFrontEnd = true;
+    FrontEndPause pause = {false, 0};
+    if (!wasLoading) pause = frontEndLoadBegin();
     ObjModule *compiler = jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+    frontEndLoadEnd(pause, compiler != NULL);
     sLoadingFrontEnd = wasLoading;
     if (compiler == NULL) {
         jaiClearException();

@@ -2,155 +2,140 @@
  *
  * The index over boot/seed.bin, which holds the .jaic images the
  * self-hosted front end needs before it can compile anything --
- * including itself. The images are deflated one per module and
- * inflated on first use, so a program pays for what it imports.
+ * including itself. The images are stored raw, each on a 16-byte
+ * boundary, and served in place from the binary's read-only data:
+ * nothing is copied or inflated at run time.
  *
- * 99 modules, 863798 bytes of images, 467503 bytes packed.
+ * 99 modules, 863798 bytes of images, 864592 bytes with padding.
  * Regenerate with `make reseed`.
  */
 
 #include "boot/seed.h"
 
-#include <stdlib.h>
 #include <string.h>
-#include <zlib.h>
 
 /* Defined by boot/seed_blob.S. */
 extern const unsigned char jaiSeedBlob[];
 
 typedef struct {
     const char *module;
+    size_t      keyLen;   /* strlen(module) */
     size_t      offset;   /* into jaiSeedBlob */
-    size_t      packed;   /* deflated size */
-    size_t      raw;      /* size once inflated */
+    size_t      length;   /* the image's size */
 } SeedSource;
 
 static const SeedSource kSources[] = {
-    {"jaithon/ast.jai", 0, 1085, 1735},
-    {"jaithon/ast/kinds.jai", 1085, 3306, 5958},
-    {"jaithon/ast/node.jai", 4391, 5996, 11948},
-    {"jaithon/ast/operators.jai", 10387, 1936, 3346},
-    {"jaithon/ast/schema.jai", 12323, 5772, 11306},
-    {"jaithon/ast/span.jai", 18095, 1712, 2774},
-    {"jaithon/ast/tree.jai", 19807, 2951, 5449},
-    {"jaithon/ast/types.jai", 22758, 1991, 3431},
-    {"jaithon/ast_encode.jai", 24749, 13647, 28419},
-    {"jaithon/ast_unparse.jai", 38396, 16555, 33529},
-    {"jaithon/compile/check/assign.jai", 54951, 3094, 6164},
-    {"jaithon/compile/check/checker.jai", 58045, 13204, 23298},
-    {"jaithon/compile/check/ctx.jai", 71249, 13707, 26753},
-    {"jaithon/compile/check/decl.jai", 84956, 18584, 33791},
-    {"jaithon/compile/check/expr.jai", 103540, 24114, 44374},
-    {"jaithon/compile/check/fold.jai", 127654, 8664, 18709},
-    {"jaithon/compile/check/kinds.jai", 136318, 1119, 1795},
-    {"jaithon/compile/check/modsig.jai", 137437, 7395, 13282},
-    {"jaithon/compile/check/nominal.jai", 144832, 2222, 4353},
-    {"jaithon/compile/check/operator.jai", 147054, 3382, 7237},
-    {"jaithon/compile/check/predicate.jai", 150436, 1667, 3388},
-    {"jaithon/compile/check/relate.jai", 152103, 1320, 2177},
-    {"jaithon/compile/check/render.jai", 153423, 2198, 3863},
-    {"jaithon/compile/check/stmt.jai", 155621, 997, 1568},
-    {"jaithon/compile/check/substitute.jai", 156618, 1619, 2740},
-    {"jaithon/compile/check/suggest.jai", 158237, 1570, 2527},
-    {"jaithon/compile/check/ty.jai", 159807, 1845, 3375},
-    {"jaithon/compile/check/union.jai", 161652, 1574, 2529},
-    {"jaithon/compile/check/universe.jai", 163226, 2329, 4007},
-    {"jaithon/compile/diag.jai", 165555, 2540, 4434},
-    {"jaithon/compile/emit.jai", 168095, 983, 1568},
-    {"jaithon/compile/emit/chunk.jai", 169078, 3028, 5236},
-    {"jaithon/compile/emit/emitter.jai", 172106, 195, 274},
-    {"jaithon/compile/emit/opcode.jai", 172301, 5981, 13787},
-    {"jaithon/compile/emit/spec.jai", 178282, 1366, 2496},
-    {"jaithon/compile/jaic.jai", 179648, 971, 1585},
-    {"jaithon/compile/lexer.jai", 180619, 18684, 36771},
-    {"jaithon/compile/mod.jai", 199303, 5941, 9623},
-    {"jaithon/compile/opt/chunk.jai", 205244, 11588, 20876},
-    {"jaithon/compile/opt/coalesce.jai", 216832, 3156, 5119},
-    {"jaithon/compile/opt/dead.jai", 219988, 390, 508},
-    {"jaithon/compile/opt/fuse.jai", 220378, 5391, 11927},
-    {"jaithon/compile/opt/hoist.jai", 225769, 4653, 7524},
-    {"jaithon/compile/opt/mod.jai", 230422, 1399, 2105},
-    {"jaithon/compile/opt/peephole.jai", 231821, 5375, 10228},
-    {"jaithon/compile/parse/decl.jai", 237196, 10873, 21007},
-    {"jaithon/compile/parse/expr.jai", 248069, 6447, 12456},
-    {"jaithon/compile/parse/node_build.jai", 254516, 2464, 4943},
-    {"jaithon/compile/parse/pattern.jai", 256980, 4301, 7183},
-    {"jaithon/compile/parse/predicate.jai", 261281, 1795, 4793},
-    {"jaithon/compile/parse/primary.jai", 263076, 7931, 14312},
-    {"jaithon/compile/parse/state.jai", 271007, 7949, 15262},
-    {"jaithon/compile/parse/stmt.jai", 278956, 8135, 14619},
-    {"jaithon/compile/parse/token_class.jai", 287091, 1702, 3067},
-    {"jaithon/compile/parse/type_expr.jai", 288793, 2973, 5184},
-    {"jaithon/compile/parse/wire.jai", 291766, 723, 1134},
-    {"jaithon/compile/parser.jai", 292489, 221, 306},
-    {"jaithon/compile/repl.jai", 292710, 3865, 6486},
-    {"jaithon/compile/resolve.jai", 296575, 229, 348},
-    {"jaithon/compile/symbol.jai", 296804, 3716, 6448},
-    {"jaithon/compile/token.jai", 300520, 7210, 15680},
-    {"std/json.jai", 307730, 13803, 25646},
-    {"std/math.jai", 321533, 9516, 20028},
-    {"std/str.jai", 331049, 12606, 23249},
-    {"jaithon/compile/jaic/bits.jai", 343655, 1972, 3054},
-    {"jaithon/compile/jaic/code.jai", 345627, 1230, 1977},
-    {"jaithon/compile/jaic/disassemble.jai", 346857, 3535, 5801},
-    {"jaithon/compile/jaic/format.jai", 350392, 796, 1162},
-    {"jaithon/compile/jaic/linetable.jai", 351188, 1167, 1843},
-    {"jaithon/compile/jaic/model.jai", 352355, 1112, 1745},
-    {"jaithon/compile/jaic/read.jai", 353467, 5773, 10190},
-    {"jaithon/compile/jaic/stream.jai", 359240, 2178, 3886},
-    {"jaithon/compile/jaic/write.jai", 361418, 4785, 7921},
-    {"jaithon/compile/check/stmt/codes.jai", 366203, 647, 966},
-    {"jaithon/compile/check/stmt/fields.jai", 366850, 643, 915},
-    {"jaithon/compile/check/stmt/flow.jai", 367493, 4401, 7734},
-    {"jaithon/compile/check/stmt/function.jai", 371894, 4357, 7093},
-    {"jaithon/compile/check/stmt/matching.jai", 376251, 5039, 8390},
-    {"jaithon/compile/check/stmt/pattern.jai", 381290, 5829, 9747},
-    {"jaithon/compile/check/stmt/store.jai", 387119, 6292, 10557},
-    {"jaithon/compile/resolve/decl.jai", 393411, 7668, 13555},
-    {"jaithon/compile/resolve/predicate.jai", 401079, 1050, 1630},
-    {"jaithon/compile/resolve/resolver.jai", 402129, 8599, 14898},
-    {"jaithon/compile/resolve/scope.jai", 410728, 813, 1282},
-    {"jaithon/compile/resolve/walk.jai", 411541, 7241, 13588},
-    {"jaithon/compile/resolve/wire.jai", 418782, 521, 783},
-    {"jaithon/compile/emit/assert_text.jai", 419303, 977, 1317},
-    {"jaithon/compile/emit/decl.jai", 420280, 4037, 6770},
-    {"jaithon/compile/emit/exception.jai", 424317, 3460, 5628},
-    {"jaithon/compile/emit/expr.jai", 427777, 10242, 18944},
-    {"jaithon/compile/emit/field_kind.jai", 438019, 893, 1633},
-    {"jaithon/compile/emit/function.jai", 438912, 3054, 4659},
-    {"jaithon/compile/emit/iteration.jai", 441966, 2753, 4531},
-    {"jaithon/compile/emit/operator.jai", 444719, 897, 2129},
-    {"jaithon/compile/emit/pattern.jai", 445616, 5074, 8878},
-    {"jaithon/compile/emit/shape.jai", 450690, 1299, 2191},
-    {"jaithon/compile/emit/state.jai", 451989, 9397, 17610},
-    {"jaithon/compile/emit/stmt.jai", 461386, 5394, 9656},
-    {"jaithon/compile/emit/wire.jai", 466780, 723, 1098},
+    {"jaithon/ast.jai", 15, 0, 1735},
+    {"jaithon/ast/kinds.jai", 21, 1744, 5958},
+    {"jaithon/ast/node.jai", 20, 7712, 11948},
+    {"jaithon/ast/operators.jai", 25, 19664, 3346},
+    {"jaithon/ast/schema.jai", 22, 23024, 11306},
+    {"jaithon/ast/span.jai", 20, 34336, 2774},
+    {"jaithon/ast/tree.jai", 20, 37120, 5449},
+    {"jaithon/ast/types.jai", 21, 42576, 3431},
+    {"jaithon/ast_encode.jai", 22, 46016, 28419},
+    {"jaithon/ast_unparse.jai", 23, 74448, 33529},
+    {"jaithon/compile/check/assign.jai", 32, 107984, 6164},
+    {"jaithon/compile/check/checker.jai", 33, 114160, 23298},
+    {"jaithon/compile/check/ctx.jai", 29, 137472, 26753},
+    {"jaithon/compile/check/decl.jai", 30, 164240, 33791},
+    {"jaithon/compile/check/expr.jai", 30, 198032, 44374},
+    {"jaithon/compile/check/fold.jai", 30, 242416, 18709},
+    {"jaithon/compile/check/kinds.jai", 31, 261136, 1795},
+    {"jaithon/compile/check/modsig.jai", 32, 262944, 13282},
+    {"jaithon/compile/check/nominal.jai", 33, 276240, 4353},
+    {"jaithon/compile/check/operator.jai", 34, 280608, 7237},
+    {"jaithon/compile/check/predicate.jai", 35, 287856, 3388},
+    {"jaithon/compile/check/relate.jai", 32, 291248, 2177},
+    {"jaithon/compile/check/render.jai", 32, 293440, 3863},
+    {"jaithon/compile/check/stmt.jai", 30, 297312, 1568},
+    {"jaithon/compile/check/substitute.jai", 36, 298880, 2740},
+    {"jaithon/compile/check/suggest.jai", 33, 301632, 2527},
+    {"jaithon/compile/check/ty.jai", 28, 304160, 3375},
+    {"jaithon/compile/check/union.jai", 31, 307536, 2529},
+    {"jaithon/compile/check/universe.jai", 34, 310080, 4007},
+    {"jaithon/compile/diag.jai", 24, 314096, 4434},
+    {"jaithon/compile/emit.jai", 24, 318544, 1568},
+    {"jaithon/compile/emit/chunk.jai", 30, 320112, 5236},
+    {"jaithon/compile/emit/emitter.jai", 32, 325360, 274},
+    {"jaithon/compile/emit/opcode.jai", 31, 325648, 13787},
+    {"jaithon/compile/emit/spec.jai", 29, 339440, 2496},
+    {"jaithon/compile/jaic.jai", 24, 341936, 1585},
+    {"jaithon/compile/lexer.jai", 25, 343536, 36771},
+    {"jaithon/compile/mod.jai", 23, 380320, 9623},
+    {"jaithon/compile/opt/chunk.jai", 29, 389952, 20876},
+    {"jaithon/compile/opt/coalesce.jai", 32, 410832, 5119},
+    {"jaithon/compile/opt/dead.jai", 28, 415952, 508},
+    {"jaithon/compile/opt/fuse.jai", 28, 416464, 11927},
+    {"jaithon/compile/opt/hoist.jai", 29, 428400, 7524},
+    {"jaithon/compile/opt/mod.jai", 27, 435936, 2105},
+    {"jaithon/compile/opt/peephole.jai", 32, 438048, 10228},
+    {"jaithon/compile/parse/decl.jai", 30, 448288, 21007},
+    {"jaithon/compile/parse/expr.jai", 30, 469296, 12456},
+    {"jaithon/compile/parse/node_build.jai", 36, 481760, 4943},
+    {"jaithon/compile/parse/pattern.jai", 33, 486704, 7183},
+    {"jaithon/compile/parse/predicate.jai", 35, 493888, 4793},
+    {"jaithon/compile/parse/primary.jai", 33, 498688, 14312},
+    {"jaithon/compile/parse/state.jai", 31, 513008, 15262},
+    {"jaithon/compile/parse/stmt.jai", 30, 528272, 14619},
+    {"jaithon/compile/parse/token_class.jai", 37, 542896, 3067},
+    {"jaithon/compile/parse/type_expr.jai", 35, 545968, 5184},
+    {"jaithon/compile/parse/wire.jai", 30, 551152, 1134},
+    {"jaithon/compile/parser.jai", 26, 552288, 306},
+    {"jaithon/compile/repl.jai", 24, 552608, 6486},
+    {"jaithon/compile/resolve.jai", 27, 559104, 348},
+    {"jaithon/compile/symbol.jai", 26, 559456, 6448},
+    {"jaithon/compile/token.jai", 25, 565904, 15680},
+    {"std/json.jai", 12, 581584, 25646},
+    {"std/math.jai", 12, 607232, 20028},
+    {"std/str.jai", 11, 627264, 23249},
+    {"jaithon/compile/jaic/bits.jai", 29, 650528, 3054},
+    {"jaithon/compile/jaic/code.jai", 29, 653584, 1977},
+    {"jaithon/compile/jaic/disassemble.jai", 36, 655568, 5801},
+    {"jaithon/compile/jaic/format.jai", 31, 661376, 1162},
+    {"jaithon/compile/jaic/linetable.jai", 34, 662544, 1843},
+    {"jaithon/compile/jaic/model.jai", 30, 664400, 1745},
+    {"jaithon/compile/jaic/read.jai", 29, 666160, 10190},
+    {"jaithon/compile/jaic/stream.jai", 31, 676352, 3886},
+    {"jaithon/compile/jaic/write.jai", 30, 680240, 7921},
+    {"jaithon/compile/check/stmt/codes.jai", 36, 688176, 966},
+    {"jaithon/compile/check/stmt/fields.jai", 37, 689152, 915},
+    {"jaithon/compile/check/stmt/flow.jai", 35, 690080, 7734},
+    {"jaithon/compile/check/stmt/function.jai", 39, 697824, 7093},
+    {"jaithon/compile/check/stmt/matching.jai", 39, 704928, 8390},
+    {"jaithon/compile/check/stmt/pattern.jai", 38, 713328, 9747},
+    {"jaithon/compile/check/stmt/store.jai", 36, 723088, 10557},
+    {"jaithon/compile/resolve/decl.jai", 32, 733648, 13555},
+    {"jaithon/compile/resolve/predicate.jai", 37, 747216, 1630},
+    {"jaithon/compile/resolve/resolver.jai", 36, 748848, 14898},
+    {"jaithon/compile/resolve/scope.jai", 33, 763760, 1282},
+    {"jaithon/compile/resolve/walk.jai", 32, 765056, 13588},
+    {"jaithon/compile/resolve/wire.jai", 32, 778656, 783},
+    {"jaithon/compile/emit/assert_text.jai", 36, 779440, 1317},
+    {"jaithon/compile/emit/decl.jai", 29, 780768, 6770},
+    {"jaithon/compile/emit/exception.jai", 34, 787552, 5628},
+    {"jaithon/compile/emit/expr.jai", 29, 793184, 18944},
+    {"jaithon/compile/emit/field_kind.jai", 35, 812128, 1633},
+    {"jaithon/compile/emit/function.jai", 33, 813776, 4659},
+    {"jaithon/compile/emit/iteration.jai", 34, 818448, 4531},
+    {"jaithon/compile/emit/operator.jai", 33, 822992, 2129},
+    {"jaithon/compile/emit/pattern.jai", 32, 825136, 8878},
+    {"jaithon/compile/emit/shape.jai", 30, 834016, 2191},
+    {"jaithon/compile/emit/state.jai", 30, 836208, 17610},
+    {"jaithon/compile/emit/stmt.jai", 29, 853824, 9656},
+    {"jaithon/compile/emit/wire.jai", 29, 863488, 1098},
 };
 
 #define JAI_SEED_N (sizeof kSources / sizeof kSources[0])
 
-/* Inflated on demand and kept. Never freed: the images outlive
- * every caller and the process is the only thing that ends. */
 static JaiSeedEntry kEntries[JAI_SEED_N];
 
 static const JaiSeedEntry *unpack(size_t i) {
-    if (kEntries[i].image != NULL) return &kEntries[i];
-    size_t raw = kSources[i].raw;
-    unsigned char *out = malloc(raw ? raw : 1);
-    if (out == NULL) return NULL;
-    uLongf got = (uLongf)raw;
-    if (uncompress(out, &got, jaiSeedBlob + kSources[i].offset,
-                   (uLong)kSources[i].packed) != Z_OK ||
-        got != raw) {
-        /* A corrupt seed must fail to load rather than load
-         * something nearly right; the caller answers a NULL by
-         * compiling from source. */
-        free(out);
-        return NULL;
+    if (kEntries[i].image == NULL) {
+        kEntries[i].module = kSources[i].module;
+        kEntries[i].image  = jaiSeedBlob + kSources[i].offset;
+        kEntries[i].length = kSources[i].length;
     }
-    kEntries[i].module = kSources[i].module;
-    kEntries[i].image  = out;
-    kEntries[i].length = raw;
     return &kEntries[i];
 }
 
@@ -163,10 +148,10 @@ const JaiSeedEntry *jaiSeedFind(const char *sourcePath) {
     if (sourcePath == NULL) return NULL;
     size_t pathLen = strlen(sourcePath);
     for (size_t i = 0; i < JAI_SEED_N; i++) {
-        size_t keyLen = strlen(kSources[i].module);
+        size_t keyLen = kSources[i].keyLen;
         if (keyLen > pathLen) continue;
         const char *tail = sourcePath + (pathLen - keyLen);
-        if (strcmp(tail, kSources[i].module) != 0) continue;
+        if (memcmp(tail, kSources[i].module, keyLen) != 0) continue;
         if (tail != sourcePath && tail[-1] != '/') continue;
         return unpack(i);
     }
@@ -181,20 +166,7 @@ const char *jaiSeedModuleAt(size_t i) {
 
 size_t jaiSeedPeekAt(size_t i, unsigned char *out, size_t n) {
     if (i >= JAI_SEED_N || out == NULL || n == 0) return 0;
-    if (n > kSources[i].raw) n = kSources[i].raw;
-    if (kEntries[i].image != NULL) {
-        memcpy(out, kEntries[i].image, n);
-        return n;
-    }
-    z_stream zs;
-    memset(&zs, 0, sizeof zs);
-    if (inflateInit(&zs) != Z_OK) return 0;
-    zs.next_in = (Bytef *)(jaiSeedBlob + kSources[i].offset);
-    zs.avail_in = (uInt)kSources[i].packed;
-    zs.next_out = out;
-    zs.avail_out = (uInt)n;
-    int rc = inflate(&zs, Z_SYNC_FLUSH);
-    size_t got = n - zs.avail_out;
-    inflateEnd(&zs);
-    return (rc == Z_OK || rc == Z_STREAM_END) && got == n ? n : 0;
+    if (n > kSources[i].length) n = kSources[i].length;
+    memcpy(out, jaiSeedBlob + kSources[i].offset, n);
+    return n;
 }

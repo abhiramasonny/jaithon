@@ -420,7 +420,11 @@ void jaiChunkFree(Chunk *chunk) {
     jaiChunkInit(chunk, sourceFileId);
 }
 
+bool jaiChunkCachesNow(Chunk *chunk);
+
 uint16_t jaiChunkAddCache(Chunk *chunk) {
+    if (chunk != NULL && chunk->caches == NULL && chunk->cacheCount > 0)
+        (void)jaiChunkCachesNow(chunk);
     if (chunk == NULL) return 0;
     if (chunk->cacheCount >= UINT16_MAX + 1) {
         jaiDiagError(E0902_INTERNAL_ERROR,
@@ -444,26 +448,64 @@ uint16_t jaiChunkAddCache(Chunk *chunk) {
     return (uint16_t)chunk->cacheCount++;
 }
 
-bool jaiChunkReserveCaches(Chunk *chunk, int count) {
-    if (chunk == NULL || count < 0 || count > UINT16_MAX + 1) return false;
-    if (chunk->caches != NULL || chunk->cacheCount != 0) return false;
-    if (count == 0) return true;
+/* Deserialised caches are PENDING until first use.
+ *
+ * A loaded function knows exactly how many inline caches it needs, and the
+ * loader used to allocate and initialise all of them up front -- 4.3MB across
+ * the front end's 1,700 functions, most of which a given `check` or edit-run
+ * never calls, and ~13% of a one-line `check`. Now a reservation only records
+ * the count: `cacheCount` is N while `caches` stays NULL (and `cacheCapacity`
+ * 0, so a free has nothing to release). Every reader already treats a NULL
+ * array as "nothing cached yet", which is exactly what a fresh one would say,
+ * and the interpreter's one lookup, cacheAt, materialises the array the first
+ * time the function actually executes a cached instruction (jaiChunkCachesNow).
+ * JAITHON_LAZY_CACHES=0 allocates them at load, as before. */
+static bool lazyCachesOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_LAZY_CACHES");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
 
-    chunk->caches = JAI_ALLOC(InlineCache, count);
+static void initCacheSlots(InlineCache *caches, int count) {
     /* Initialised exactly as jaiChunkAddCache does, rather than assuming a
      * zeroed slot is an empty one: IC_EMPTY and NULL_VAL both happen to be
      * zero today, and a slot that silently stopped being empty would read as a
      * stale hit on the first execution. */
     for (int i = 0; i < count; i++) {
-        InlineCache *ic = &chunk->caches[i];
+        InlineCache *ic = &caches[i];
         memset(ic, 0, sizeof *ic);
         ic->state = IC_EMPTY;
         ic->obsBudget = JAI_IC_OBS_BUDGET;
         for (int w = 0; w < JAI_IC_WAYS; w++) ic->cached[w] = NULL_VAL;
     }
+}
+
+/* Allocate a pending reservation's array. True when the chunk has its array
+ * afterwards (including when it already had one); false for a chunk with no
+ * caches at all. Allocation goes through jaiRealloc, which only accounts and
+ * never collects, so this is safe in the middle of an instruction. */
+bool jaiChunkCachesNow(Chunk *chunk) {
+    if (chunk->caches != NULL) return true;
+    if (chunk->cacheCount <= 0) return false;
+    int count = chunk->cacheCount;
+    chunk->caches = JAI_ALLOC(InlineCache, count);
+    initCacheSlots(chunk->caches, count);
     chunk->cacheCapacity = count;
-    chunk->cacheCount = count;
     return true;
+}
+
+bool jaiChunkReserveCaches(Chunk *chunk, int count) {
+    if (chunk == NULL || count < 0 || count > UINT16_MAX + 1) return false;
+    if (chunk->caches != NULL || chunk->cacheCount != 0) return false;
+    if (count == 0) return true;
+
+    chunk->cacheCount = count;
+    chunk->cacheCapacity = 0;
+    if (lazyCachesOn()) return true;
+    return jaiChunkCachesNow(chunk);
 }
 
 /* ------------------------------------------------------------------ */

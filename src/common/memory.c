@@ -1008,6 +1008,10 @@ bool jaiWriteFile(const char *path, const void *data, size_t len) {
     return ok;
 }
 
+bool jaiPathReadable(const char *path) {
+    return path != NULL && access(path, R_OK) == 0;
+}
+
 bool jaiPathIsDir(const char *path) {
     struct stat st;
     if (path == NULL) return false;

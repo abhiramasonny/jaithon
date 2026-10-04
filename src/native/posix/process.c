@@ -27,6 +27,7 @@
 
 #if defined(__APPLE__)
 #  include <mach-o/dyld.h>
+#  include <spawn.h>
 #endif
 
 #define JAI_PROC_READ_BLOCK 4096u
@@ -194,6 +195,64 @@ bool jaiProcessSignal(int pid, int sig) {
     return kill((pid_t)pid, sig) == 0;
 }
 
+#if defined(__APPLE__)
+/* fork() is the expensive way to start a child on macOS: the allocator's
+ * atfork handlers lock and unlock every zone around it, and that was 24% of
+ * the parent's cycles in `jaithon test`, which starts a worker per file.
+ * posix_spawn starts the child without copying the parent at all and runs no
+ * atfork handlers. It is used for the requests it expresses exactly -- no
+ * replacement environment and no working directory, because execvp in the
+ * forked child searched PATH after both had changed, while posix_spawnp
+ * searches it in the parent -- and everything else takes the fork path below.
+ * The child sees what the forked child set up: the three pipe ends as stdio,
+ * every pipe descriptor closed, SIGPIPE back at its default, and every other
+ * inherited descriptor exactly as fork would have left it.
+ * JAITHON_POSIX_SPAWN=0 always forks. */
+static bool posixSpawnOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_POSIX_SPAWN");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* 0 with *child set, or the errno that stopped it. */
+static int posixSpawnChild(const char *const *argv, const int inPipe[2],
+                           const int outPipe[2], const int errPipe[2],
+                           pid_t *child) {
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) return rc;
+    rc = posix_spawnattr_init(&attr);
+    if (rc != 0) {
+        (void)posix_spawn_file_actions_destroy(&actions);
+        return rc;
+    }
+    const int pipes[6] = { inPipe[0], inPipe[1], outPipe[0], outPipe[1],
+                           errPipe[0], errPipe[1] };
+    if (rc == 0) rc = posix_spawn_file_actions_adddup2(&actions, inPipe[0], STDIN_FILENO);
+    if (rc == 0) rc = posix_spawn_file_actions_adddup2(&actions, outPipe[1], STDOUT_FILENO);
+    if (rc == 0) rc = posix_spawn_file_actions_adddup2(&actions, errPipe[1], STDERR_FILENO);
+    for (int i = 0; rc == 0 && i < 6; i++)
+        rc = posix_spawn_file_actions_addclose(&actions, pipes[i]);
+    sigset_t defaults;
+    sigemptyset(&defaults);
+    sigaddset(&defaults, SIGPIPE);
+    if (rc == 0) rc = posix_spawnattr_setsigdefault(&attr, &defaults);
+    if (rc == 0) rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
+    if (rc == 0) {
+        extern char **environ;
+        rc = posix_spawnp(child, argv[0], &actions, &attr,
+                          (char *const *)(uintptr_t)(const void *)argv, environ);
+    }
+    (void)posix_spawnattr_destroy(&attr);
+    (void)posix_spawn_file_actions_destroy(&actions);
+    return rc;
+}
+#endif
+
 JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
                                const char *const *envp,
                                const char *stdinText, size_t stdinLen,
@@ -216,8 +275,37 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
     int errPipe[2] = { -1, -1 };
     int report[2]  = { -1, -1 };
 
-    if (pipe(inPipe) != 0 || pipe(outPipe) != 0 || pipe(errPipe) != 0 ||
-        pipe(report) != 0) {
+    if (pipe(inPipe) != 0 || pipe(outPipe) != 0 || pipe(errPipe) != 0) {
+        if (outErrno != NULL) *outErrno = errno;
+        goto setupFailed;
+    }
+
+    pid_t child = -1;
+#if defined(__APPLE__)
+    if (posixSpawnOn() && cwd == NULL && envp == NULL) {
+        int rc = posixSpawnChild(argv, inPipe, outPipe, errPipe, &child);
+        if (rc != 0) {
+            /* No child is left to reap. Running out of processes, memory or
+             * descriptors is what fork() failing in the parent reported
+             * (SETUP); anything else is what the forked child would have
+             * reported through `report`: the exec itself failed. */
+            if (outErrno != NULL) *outErrno = rc;
+            if (rc == EAGAIN || rc == ENOMEM || rc == EMFILE ||
+                rc == ENFILE || rc == EBADF)
+                goto setupFailed;
+            closeFd(&inPipe[0]);  closeFd(&inPipe[1]);
+            closeFd(&outPipe[0]); closeFd(&outPipe[1]);
+            closeFd(&errPipe[0]); closeFd(&errPipe[1]);
+            return JAI_SPAWN_EXEC;
+        }
+        closeFd(&inPipe[0]);
+        closeFd(&outPipe[1]);
+        closeFd(&errPipe[1]);
+        goto spawned;
+    }
+#endif
+
+    if (pipe(report) != 0) {
         if (outErrno != NULL) *outErrno = errno;
         goto setupFailed;
     }
@@ -227,7 +315,7 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
         goto setupFailed;
     }
 
-    pid_t child = fork();
+    child = fork();
     if (child < 0) {
         if (outErrno != NULL) *outErrno = errno;
         goto setupFailed;
@@ -291,6 +379,9 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
         return JAI_SPAWN_EXEC;
     }
 
+#if defined(__APPLE__)
+spawned:
+#endif
     result->pid = (int)child;
 
     if (stream) {

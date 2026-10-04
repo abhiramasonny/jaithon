@@ -28,7 +28,6 @@ the populate step set out to build, not whatever was found afterwards.
 
 import os
 import sys
-import zlib
 
 
 def module_name_for(jaic_path, root):
@@ -152,15 +151,25 @@ def main():
 
     total = sum(len(v) for v in images.values())
 
+    # The images are stored RAW, each padded to a 16-byte boundary, and the
+    # binary serves them straight out of its own read-only data. They used to
+    # be deflated one stream per module and inflated on first use; every
+    # `check`, `fmt` and edit-then-run inflates all ~99 of them, and zlib spent
+    # ~2ms of a ~20ms front-end load doing it. Raw costs ~400KB of binary and
+    # nothing at run time: the pages fault in from the file as they are read.
+    # git compresses the blob in the object store either way.
     bin_path = os.path.join(os.path.dirname(out_path) or ".", "seed.bin")
-    packed = []
+    placed = []
     offset = 0
     with open(bin_path, "wb") as bf:
         for module, blob in images.items():
-            z = zlib.compress(blob, 9)
-            bf.write(z)
-            packed.append((module, offset, len(z), len(blob)))
-            offset += len(z)
+            bf.write(blob)
+            placed.append((module, offset, len(blob)))
+            offset += len(blob)
+            pad = (-offset) % 16
+            if pad:
+                bf.write(b"\0" * pad)
+                offset += pad
 
     with open(out_path, "w") as f:
         f.write(
@@ -168,52 +177,37 @@ def main():
             " *\n"
             " * The index over boot/seed.bin, which holds the .jaic images the\n"
             " * self-hosted front end needs before it can compile anything --\n"
-            " * including itself. The images are deflated one per module and\n"
-            " * inflated on first use, so a program pays for what it imports.\n"
+            " * including itself. The images are stored raw, each on a 16-byte\n"
+            " * boundary, and served in place from the binary's read-only data:\n"
+            " * nothing is copied or inflated at run time.\n"
             " *\n"
-            " * %d modules, %d bytes of images, %d bytes packed.\n"
+            " * %d modules, %d bytes of images, %d bytes with padding.\n"
             " * Regenerate with `make reseed`.\n"
             " */\n\n"
             '#include "boot/seed.h"\n\n'
-            "#include <stdlib.h>\n"
-            "#include <string.h>\n"
-            "#include <zlib.h>\n\n"
+            "#include <string.h>\n\n"
             "/* Defined by boot/seed_blob.S. */\n"
             "extern const unsigned char jaiSeedBlob[];\n\n"
             "typedef struct {\n"
             "    const char *module;\n"
+            "    size_t      keyLen;   /* strlen(module) */\n"
             "    size_t      offset;   /* into jaiSeedBlob */\n"
-            "    size_t      packed;   /* deflated size */\n"
-            "    size_t      raw;      /* size once inflated */\n"
+            "    size_t      length;   /* the image's size */\n"
             "} SeedSource;\n\n" % (len(images), total, offset)
         )
         f.write("static const SeedSource kSources[] = {\n")
-        for module, off, pk, rw in packed:
-            f.write('    {"%s", %d, %d, %d},\n' % (module, off, pk, rw))
+        for module, off, ln in placed:
+            f.write('    {"%s", %d, %d, %d},\n' % (module, len(module), off, ln))
         f.write("};\n\n")
         f.write(
             "#define JAI_SEED_N (sizeof kSources / sizeof kSources[0])\n\n"
-            "/* Inflated on demand and kept. Never freed: the images outlive\n"
-            " * every caller and the process is the only thing that ends. */\n"
             "static JaiSeedEntry kEntries[JAI_SEED_N];\n\n"
             "static const JaiSeedEntry *unpack(size_t i) {\n"
-            "    if (kEntries[i].image != NULL) return &kEntries[i];\n"
-            "    size_t raw = kSources[i].raw;\n"
-            "    unsigned char *out = malloc(raw ? raw : 1);\n"
-            "    if (out == NULL) return NULL;\n"
-            "    uLongf got = (uLongf)raw;\n"
-            "    if (uncompress(out, &got, jaiSeedBlob + kSources[i].offset,\n"
-            "                   (uLong)kSources[i].packed) != Z_OK ||\n"
-            "        got != raw) {\n"
-            "        /* A corrupt seed must fail to load rather than load\n"
-            "         * something nearly right; the caller answers a NULL by\n"
-            "         * compiling from source. */\n"
-            "        free(out);\n"
-            "        return NULL;\n"
+            "    if (kEntries[i].image == NULL) {\n"
+            "        kEntries[i].module = kSources[i].module;\n"
+            "        kEntries[i].image  = jaiSeedBlob + kSources[i].offset;\n"
+            "        kEntries[i].length = kSources[i].length;\n"
             "    }\n"
-            "    kEntries[i].module = kSources[i].module;\n"
-            "    kEntries[i].image  = out;\n"
-            "    kEntries[i].length = raw;\n"
             "    return &kEntries[i];\n"
             "}\n\n"
             "/* The caller has an absolute path and the table holds paths\n"
@@ -225,10 +219,10 @@ def main():
             "    if (sourcePath == NULL) return NULL;\n"
             "    size_t pathLen = strlen(sourcePath);\n"
             "    for (size_t i = 0; i < JAI_SEED_N; i++) {\n"
-            "        size_t keyLen = strlen(kSources[i].module);\n"
+            "        size_t keyLen = kSources[i].keyLen;\n"
             "        if (keyLen > pathLen) continue;\n"
             "        const char *tail = sourcePath + (pathLen - keyLen);\n"
-            "        if (strcmp(tail, kSources[i].module) != 0) continue;\n"
+            "        if (memcmp(tail, kSources[i].module, keyLen) != 0) continue;\n"
             "        if (tail != sourcePath && tail[-1] != '/') continue;\n"
             "        return unpack(i);\n"
             "    }\n"
@@ -240,22 +234,9 @@ def main():
             "}\n\n"
             "size_t jaiSeedPeekAt(size_t i, unsigned char *out, size_t n) {\n"
             "    if (i >= JAI_SEED_N || out == NULL || n == 0) return 0;\n"
-            "    if (n > kSources[i].raw) n = kSources[i].raw;\n"
-            "    if (kEntries[i].image != NULL) {\n"
-            "        memcpy(out, kEntries[i].image, n);\n"
-            "        return n;\n"
-            "    }\n"
-            "    z_stream zs;\n"
-            "    memset(&zs, 0, sizeof zs);\n"
-            "    if (inflateInit(&zs) != Z_OK) return 0;\n"
-            "    zs.next_in = (Bytef *)(jaiSeedBlob + kSources[i].offset);\n"
-            "    zs.avail_in = (uInt)kSources[i].packed;\n"
-            "    zs.next_out = out;\n"
-            "    zs.avail_out = (uInt)n;\n"
-            "    int rc = inflate(&zs, Z_SYNC_FLUSH);\n"
-            "    size_t got = n - zs.avail_out;\n"
-            "    inflateEnd(&zs);\n"
-            "    return (rc == Z_OK || rc == Z_STREAM_END) && got == n ? n : 0;\n"
+            "    if (n > kSources[i].length) n = kSources[i].length;\n"
+            "    memcpy(out, jaiSeedBlob + kSources[i].offset, n);\n"
+            "    return n;\n"
             "}\n"
         )
 

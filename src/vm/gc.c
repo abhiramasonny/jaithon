@@ -175,6 +175,21 @@ void jaiGCEnable(bool enabled) {
     jaiGCSyncLimit();
 }
 
+void jaiGCCredit(size_t permanentBytes) {
+    GCState *g = activeGC();
+    if (g == NULL || permanentBytes == 0) return;
+    /* Shift the threshold past the new bytes, so they never count toward the
+     * next collection: what was left of the budget before is left after. */
+    size_t next = g->nextGC > SIZE_MAX - permanentBytes
+                      ? SIZE_MAX : g->nextGC + permanentBytes;
+    /* And at least what a collection right now would have budgeted for them
+     * alone. Only the credited bytes are scaled, never the heap as it
+     * stands: that holds garbage, and scaling it is a ratchet. */
+    size_t floor = gcNextThreshold(g, permanentBytes);
+    g->nextGC = next > floor ? next : floor;
+    jaiGCSyncLimit();
+}
+
 //marking
 
 /* The collector half of the allocation census (see object.c); same build.
@@ -251,6 +266,8 @@ static void markStrings(ObjString *const *names, int count) {
 static void markChunk(Chunk *chunk) {
     jaiGCMarkArray(&chunk->constants);
 
+    /* A pending reservation has a count and no array yet; see chunk.c. */
+    if (chunk->caches == NULL) return;
     for (int i = 0; i < chunk->cacheCount; i++) {
         InlineCache *ic = &chunk->caches[i];
         for (int w = 0; w < JAI_IC_WAYS; w++) jaiGCMarkVal(ic->cached[w]);
