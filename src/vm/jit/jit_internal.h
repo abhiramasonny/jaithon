@@ -248,6 +248,12 @@ typedef struct {
      * SLOT_OBJ rather than taking a SlotKind of its own: the kind is 4 bits
      * and full. */
     bool      stackPinned[JIT_MAX_STACK];
+    /* On a list iterator (SLOT_ITER shape 1) only, written by OP_GET_ITER's
+     * list arm and read by OP_FOR_ITER_BIND's: the live list holds instances
+     * of more than one class, so the loop variable is bound unpinned and its
+     * calls dispatch through the site's cache. Meaningless on any other
+     * entry, and nothing else reads it. */
+    bool      stackMixed[JIT_MAX_STACK];
     bool      stackNullLit[JIT_MAX_STACK];
     struct { int local; uint16_t field; SlotKind kind; } known[16];
     unsigned  knownCount;
@@ -1082,6 +1088,10 @@ void jitOsrPicShort(int siteCache, unsigned ways, SlotKind rkind);
  * it the slow way for the rest of the run (jit_osr.c). */
 bool jitOsrColdWait(Emit *e, const ObjFunction *cfn);
 bool jitPicUpgradeOn(void);
+/* JAITHON_JIT_POLY_LOOP: a non-head `for x in xs` over a list of several
+ * classes binds `x` unpinned rather than pinning the first element's class
+ * and deoptimising on every other. */
+bool jitPolyLoopOn(void);
 bool offsetIsBranchTarget(const Chunk *c, uint32_t off);
 bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
                               int64_t *out);

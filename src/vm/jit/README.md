@@ -443,6 +443,7 @@ this table complete in both directions.
 | `JAITHON_JIT_RANGE_FACTS` | on | Drop the overflow check on `i += k`, `n + k` and `n - k` of an int local when a comparison every path to it made already rules the overflow out (`jit_range.c`): `while i < n { ...; i += 1 }`, and both subtractions after `if n < 2 { return n }`. Read off the bytecode's own control-flow graph, never the emitter's model. 2.8% on `closure_calls` (its loop is decode-bound, so one instruction is ~4%); nothing on `fib_recursive`, where a not-taken `b.vs` was free. |
 | `JAITHON_JIT_INLINE_METHODS` | on | Inline a straight-line method body at a call whose receiver class is known -- a pinned invoke, or one way of a polymorphic cache -- through the same walker a global function is inlined with (`inlineMethodCall`), field reads off the receiver included. Off restores the narrow `inlineMethodWalk` alone. 2.15x on a getter-per-iteration probe; `poly_dispatch` loses 31% of its instructions and almost none of its cycles (mispredicts and `sdiv` latency). |
 | `JAITHON_JIT_OSR_COLD_WAIT` | on | An OSR compile that meets a call to a callee still on its way to the function tier's threshold (called, not refused, no compiled form yet) declines and looks again on a later tick, at most 24 times a head and never charged to its compile attempts (`jitOsrColdWait`). Otherwise a tick landing in a loop's first iterations built a form that called the callee the slow way for the rest of the run: `object_dispatch` 918M cycles against ~440M under `JAITHON_JIT_TICK_US=50`, and the slow outcome in about one default run in ten. |
+| `JAITHON_JIT_POLY_LOOP` | on | A `for x in xs` the walk meets away from an OSR head, over a live list whose first elements are instances of more than one class, binds `x` unpinned (the first binding of that local only) so calls on it dispatch through `emitInvokePic1`, instead of pinning element 0's class and deoptimising on every other -- once per call, for a function that walks the list. 1.87x on a 12-shape `area()` loop called 400k times. Makes the polymorphic cache reachable from the whole-function tier, which before this it was not (see "The gate is one NULL"). |
 | `JAITHON_JIT_PIC_UPGRADE` | on | Re-compile a loop form whose polymorphic site came up short of ways because the timer tick beat its callees' compiles (`jitOsrPicShort`), and let that form's miss path keep teaching the site's cache (`jitInvokeByNameLearn`). On `poly_dispatch` the form was 0-, 1- or 8-way by the race, 400-490M cycles against 120M; under `JAITHON_JIT_TICK_US=50` it was always short, and this is worth 3.48x there. |
 | `JAITHON_JIT_CLASS_CALLS` | on | Direct calls to a class constructor. |
 | `JAITHON_JIT_MODULE_CALLS` | on | Calls through a module member. |
@@ -674,9 +675,13 @@ sampled element's. The head arm then discards the shape and class it would
 have pinned, clears `localTyped` for the loop variable, and the slot becomes
 "an instance, of no class in particular". Nothing else here does that.
 
-**The arm is therefore OSR-only, and loop-head-only.** The whole-function tier
-cannot reach it at all, and neither can a list loop sitting *inside* an OSR
-body -- that one takes the ordinary arm and pins.
+**The arm was therefore OSR-only, and loop-head-only.** It no longer is:
+`JAITHON_JIT_POLY_LOOP` lets the ordinary (non-head) arm bind a loop
+variable unpinned too, when OP_GET_ITER's live list holds several classes
+(`Emit::stackMixed`) and this is that local's first binding -- so a function
+the whole-function tier compiles reaches the cache as well. A list loop inside
+an OSR body still usually pins, because its loop variable was already typed
+from the frame when the form was entered.
 
 ### The shape
 
