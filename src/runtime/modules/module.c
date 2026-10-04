@@ -320,6 +320,67 @@ static bool seedStandsInForFile(const char *path) {
     return seedStandsInFor(path, hash) != NULL;
 }
 
+/* maybeWarmFor has to know whether a module's cache is loadable before the
+ * module exists, and loadModuleBody then reads the same file in full. On this
+ * machine an open() is ~150K instructions -- more than reading a 14KB image --
+ * so the probe reads the whole image once, keeps it here, and the next load
+ * of the same path takes it instead of opening the file again. It is one
+ * slot, consumed or dropped by the very next load; a warm in between cannot
+ * leave it behind for a later one, because every load clears it. 250 cached
+ * modules into a package import, that is 250 opens fewer.
+ * JAITHON_CACHE_PREFETCH=0 goes back to the 8-byte probe. */
+static struct {
+    char    *path;
+    uint8_t *data;
+    size_t   length;
+} sPrefetch;
+
+static bool cachePrefetchOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_CACHE_PREFETCH");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static void prefetchDrop(void) {
+    if (sPrefetch.data != NULL) jaiCacheReadFree(sPrefetch.data, sPrefetch.length);
+    if (sPrefetch.path != NULL)
+        JAI_FREE_ARRAY(char, sPrefetch.path, strlen(sPrefetch.path) + 1);
+    sPrefetch.path = NULL;
+    sPrefetch.data = NULL;
+    sPrefetch.length = 0;
+}
+
+/* Whether `path`'s cache carries `flags`, reading it whole for the load that
+ * follows. */
+static bool prefetchedFlagsMatch(const char *path, uint32_t flags) {
+    if (!cachePrefetchOn()) return cacheFlagsMatch(path, flags);
+    prefetchDrop();
+    size_t length = 0;
+    uint8_t *data = jaiCacheRead(path, &length);
+    if (data == NULL) return false;
+    sPrefetch.path = jaiStrdup(path);
+    sPrefetch.data = data;
+    sPrefetch.length = length;
+    return jaiCacheFlagsMatchBuffer(data, length, flags);
+}
+
+/* `path`'s cache image: the prefetched one when it is for this path, else
+ * read now. Either way the slot is empty afterwards. */
+static uint8_t *cacheReadForLoad(const char *path, size_t *length) {
+    if (sPrefetch.data != NULL && strcmp(sPrefetch.path, path) == 0) {
+        uint8_t *data = sPrefetch.data;
+        *length = sPrefetch.length;
+        sPrefetch.data = NULL;
+        prefetchDrop();
+        return data;
+    }
+    prefetchDrop();
+    return jaiCacheRead(path, length);
+}
+
 /* Warm the front end if loading `path` is about to need it.
  *
  * Two reasons to warm, and both are necessary.
@@ -356,7 +417,7 @@ static bool maybeWarmFor(const char *path) {
     if (!ownedByFrontEnd) {
         const JaiRunOptions *opts = options();
         uint32_t flags = cacheFlagsFor(&opts->codegen, true);
-        if (opts->useCache && cacheFlagsMatch(path, flags)) return false;
+        if (opts->useCache && prefetchedFlagsMatch(path, flags)) return false;
         if (seeded != NULL && seedStandsInForFile(path)) return false;
     }
     warmFrontEnd();
@@ -391,7 +452,7 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
      * reading the whole 116 KB image. */
     if (opts->useCache) {
         size_t cacheLen = 0;
-        uint8_t *cacheData = jaiCacheRead(path, &cacheLen);
+        uint8_t *cacheData = cacheReadForLoad(path, &cacheLen);
         if (cacheData != NULL) {
             ObjFunction *cached = NULL;
             if (jaiCacheFlagsMatchBuffer(cacheData, cacheLen, flags)) {
@@ -642,6 +703,7 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
     if (warmed &&
         jaiTableGetInterned(&vm.modules, pathKey, &existing) &&
         IS_MODULE(existing) && AS_MODULE(existing)->state == MOD_LOADED) {
+        prefetchDrop();
         return AS_MODULE(existing);
     }
 
@@ -1074,7 +1136,7 @@ static ObjFunction *selfHostedModuleBody(ObjModule *module, const char *path) {
     /* One read, not two -- see the note at the other cache site. */
     if (opts->useCache) {
         size_t cacheLen = 0;
-        uint8_t *cacheData = jaiCacheRead(path, &cacheLen);
+        uint8_t *cacheData = cacheReadForLoad(path, &cacheLen);
         if (cacheData != NULL) {
             ObjFunction *cached = NULL;
             if (jaiCacheFlagsMatchBuffer(cacheData, cacheLen, flags)) {
