@@ -724,6 +724,15 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
 
     e.savedCount = saved;
     e.callsOut   = body.callsOut;
+    /* The real pass must ask growKeepsHere the measuring pass's question: a
+     * push inside a loop keeps its registers there, so a body planned with a
+     * header hoisted over that push saw no call -- and a real pass without the
+     * table reads the same push as a call and refuses the compile at the
+     * hoist ratchet. That turned every function that pushes in a loop into a
+     * refusal once the function tier planned hoists (2.6x slower). OSR sets
+     * both passes the same way. */
+    e.loopDepth      = body.loopDepth;
+    e.loopDepthCount = body.loopDepthCount;
     unsigned frame = 16u + 8u * saved;
     if (e.spilled) {
         e.localsFrameOffset = frame;
