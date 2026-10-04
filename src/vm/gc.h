@@ -107,6 +107,14 @@ JAI_INLINE void jaiGCMark(Obj *obj) {
  * lib/jaithon`. Everything rarer that owns something (functions, classes,
  * modules, enums, traits, files) stays on the list and is swept as before.
  *
+ * What it costs: a page's header (three bitmaps, 1.5 KiB) is 2.4% of the
+ * page, so a heap that is nearly all live and all small pays for it in memory.
+ * string_build (4M short strings, nothing freed) peaks 3% higher (419 ->
+ * 432MB), takes ~780 more page faults and measures +3.8% cycles with the page
+ * space on; there is no sweep saving there to pay it back. Dropping `inuse`
+ * from plain pages and marking straight into `live` would take the header to
+ * a third of that; not done.
+ *
  * JAITHON_GC_PAGES=0 sends every object down the list path again, and
  * JAITHON_GC_FIN_PAGES=0 just the finalizing kinds. */
 #define JAI_PAGE_SHIFT  16u
