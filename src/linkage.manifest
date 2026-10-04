@@ -41,7 +41,6 @@ file-local globalClass                 src/vm/jit/jit_global.c
 file-local globalIsSelf                src/vm/jit/jit_global.c
 file-local globalNamespace             src/vm/jit/jit_global.c
 file-local globalSlot                  src/vm/jit/jit_global.c
-dead       jaiTableReserve             src/vm/table.c
 dead       jaiTraceOpCount             src/vm/trace/trace.c
 file-local enumMember                  src/vm/vm_class.c
 file-local jaiVMPrintStack             src/vm/vm_lifecycle.c
