@@ -158,6 +158,7 @@ pub class Lexer {
         self.file_id = file_id
         self.diagnostics = diagnostics ?? DiagnosticBag()
         self.had_error = false
+        _require_utf8(source)
         let bytes = source.bytes()
         self.bytes = bytes
         self.length = bytes.len()
@@ -1279,6 +1280,19 @@ let _SIMPLE_ESCAPES: dict[str, str] = {
     "\"": "\"",
     "'": "'",
     "0": "\0",
+}
+
+#: Raise unless `source` is well-formed UTF-8, as the character list this
+#: lexer once built did. Every byte offset below assumes whole sequences, and a
+#: `str` may hold any bytes: a stray continuation byte would otherwise pass as
+#: part of a name, and a lone lead byte would make `ascii` true and `_text`
+#: slice through it. The copy is validated natively, a small cost per file.
+fn _require_utf8(source: str) -> void {
+    try {
+        source.to_bytes().decode()
+    } catch _invalid: ValueError {
+        throw ValueError("ord(): invalid UTF-8")
+    }
 }
 
 #: The `str` index of every byte offset of `bytes`, and of its end: the
