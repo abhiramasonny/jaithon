@@ -499,22 +499,36 @@ $(CC_STAMP):
 
 # The link stamp is written by the link itself: a failed link must leave the
 # old identity recorded, so the next make retries instead of believing it.
-$(TARGET): $(OBJS)
-	@echo "  LINK    $@ ($(BUILD_NAME))"
-	@$(CC) $(LDFLAGS) $(EXTRA_LDFLAGS) $(CORE_LDFLAGS) -o $@ $(OBJS) $(LIBS)
-ifeq ($(NATIVE_SPLIT),1)
 # Beside the binary under their UUID names, which is where the loader looks. A
 # copy of the binary (./jaithon-base) keeps finding the images it was built
 # with even after a rebuild writes different ones. Renamed into place rather
 # than overwritten: a running process may have the old file mapped.
+define PLACE_NATIVE_IMAGES
 	@while read -r dylib file; do \
-	    dest="$(dir $@)$$file"; \
+	    dest="$(dir $(TARGET))$$file"; \
 	    cmp -s "$$dylib" "$$dest" || \
 	      { cp "$$dylib" "$$dest.tmp" && mv -f "$$dest.tmp" "$$dest"; } || exit 1; \
 	  done <$(NATIVE_LIST)
+endef
+
+$(TARGET): $(OBJS)
+	@echo "  LINK    $@ ($(BUILD_NAME))"
+	@$(CC) $(LDFLAGS) $(EXTRA_LDFLAGS) $(CORE_LDFLAGS) -o $@ $(OBJS) $(LIBS)
+ifeq ($(NATIVE_SPLIT),1)
+	$(PLACE_NATIVE_IMAGES)
 endif
 	@mkdir -p $(dir $(LINK_STAMP))
 	@printf '%s' '$(LINK_ID)' >$(LINK_STAMP)
+
+# And again on every `make`, binary current or not: an image deleted by hand
+# would otherwise stay gone, and GPU, GUI and camera with it, until something
+# relinked the core. Three cmp's when nothing is missing.
+ifeq ($(NATIVE_SPLIT),1)
+.PHONY: native-images
+all: native-images
+native-images: $(TARGET)
+	$(PLACE_NATIVE_IMAGES)
+endif
 
 ifeq ($(NATIVE_SPLIT),1)
 # stubs.c compiled alone, with its non-Apple half switched on and nothing
