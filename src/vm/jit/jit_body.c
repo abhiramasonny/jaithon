@@ -163,6 +163,48 @@ static bool inlineFieldRead(Emit *e, ObjFunction *fn, const uint8_t *code,
     return soff == 6;
 }
 
+/* `x + k`, `x - k` and `x * k` fused with the read of local `x`, inside an
+ * inlined body: a copy of the slot's entry, then the operation on that copy
+ * in place, with the same overflow test the out-of-line arms make. */
+static bool inlineIntConstOp(Emit *e, const uint8_t *code, int off) {
+    uint8_t op = code[off];
+    unsigned a = jaiReadU16(code + off + 1);
+    int16_t k = jaiReadI16(code + off + 3);
+    if (a > JIT_MAX_SLOTS || e->inlSlot[a] < 0) {
+        e->whyNot = "an inlined body reading a local it never bound";
+        return false;
+    }
+    unsigned src = (unsigned)e->inlSlot[a];
+    if (src >= e->depth || e->stack[src] != SLOT_INT) {
+        e->whyNot = "an inlined fused constant op on a local that is not an int";
+        return false;
+    }
+    if (!pushCopyOfEntry(e, src)) return false;
+    unsigned rd = pushReg(e) - 1;
+    e->stackSeen[e->depth - 1] = NULL_VAL;   /* no longer the local's value */
+    if (op == OP_MUL_INT_CONST) {
+        emitConst64(e, JIT_SCRATCH_D, k);
+        emit(e, jaiA64SmulhX(JIT_SCRATCH_A, rd, JIT_SCRATCH_D));
+        emit(e, jaiA64MulX(rd, rd, JIT_SCRATCH_D));
+        emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
+        branchOnOverflow(e, 2u, JAI_A64_NE);
+        return true;
+    }
+    /* `x - k` is `x + (-k)` in value; the operator is kept so the overflow
+     * stub names the right one. */
+    int64_t addend = op == OP_SUB_INT_CONST ? -(int64_t)k : (int64_t)k;
+    if (addend >= 0 && addend <= 4095) {
+        emit(e, jaiA64AddsXImm(rd, rd, (unsigned)addend));
+    } else if (addend < 0 && addend >= -4095) {
+        emit(e, jaiA64SubsXImm(rd, rd, (unsigned)(-addend)));
+    } else {
+        emitConst64(e, JIT_SCRATCH_A, addend);
+        emit(e, jaiA64AddsX(rd, rd, JIT_SCRATCH_A));
+    }
+    branchOnOverflow(e, op == OP_SUB_INT_CONST ? 1u : 0u, JAI_A64_VS);
+    return true;
+}
+
 /* Answered against the inlined body's own frame -- the CALLER's operand stack: a parameter is the
  * argument entry already sitting there, a bind pins whatever's on top. Reading these through the main switch would read the CALLER's local of the same number, a different variable entirely. */
 static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
@@ -689,6 +731,12 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         }
         if (e->inlining && (op == OP_GET_FIELD_LOCAL || op == OP_GET_FIELD)) {
             if (!inlineFieldRead(e, fn, code, off, stop)) return false;
+            off += instructionLength(&fn->chunk, off);
+            continue;
+        }
+        if (e->inlining && (op == OP_ADD_INT_CONST || op == OP_SUB_INT_CONST ||
+                            op == OP_MUL_INT_CONST)) {
+            if (!inlineIntConstOp(e, code, off)) return false;
             off += instructionLength(&fn->chunk, off);
             continue;
         }

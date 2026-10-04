@@ -235,3 +235,46 @@ fn test_overflow_in_an_inlined_body_raises() {
     assert_throws(OverflowError, || run_times(b, 1 << 30, 100))
     assert_true(true)
 }
+
+#: `x * 2`, `x + 3`, `x - 4`: the fused local-constant forms, inlined.
+class Lin {
+    pub var b: int
+
+    fn init(self, b: int) { self.b = b }
+
+    pub fn dbl(self, x: int) -> int { return x * 2 + self.b }
+
+    pub fn up(self, x: int) -> int { return x + 3 }
+
+    pub fn down(self, x: int) -> int { return x - 4 }
+}
+
+fn run_lin(l: Lin, n: int) -> int {
+    var t = 0
+    var i = 0
+    while i < n {
+        t = (t + l.dbl(i) + l.up(i) + l.down(i)) % 1000003
+        i += 1
+    }
+    return t
+}
+
+fn run_lin_ref(b: int, n: int) -> int {
+    var t = 0
+    var i = 0
+    while i < n {
+        t = (t + (i * 2 + b) + (i + 3) + (i - 4)) % 1000003
+        i += 1
+    }
+    return t
+}
+
+fn test_fused_constant_ops_inline() {
+    let l = Lin(5)
+    for _r in 0..80 {
+        assert_eq(run_lin(l, 500), run_lin_ref(5, 500))
+    }
+    let big = 4611686018427387904
+    assert_throws(OverflowError, || l.dbl(big))
+    assert_throws(OverflowError, || run_lin(Lin(0), 1) + l.dbl(big))
+}

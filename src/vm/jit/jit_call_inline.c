@@ -112,6 +112,18 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
         case OP_MOD_INT_CONST:
             if (!jitInlineMethodsOn()) return false;
             break;
+        /* `x + k`, `x - k`, `x * k` fused with the read of `x`: the slot is
+         * a parameter or a bound local of this body, read through inlSlot
+         * like any other (inlineIntConstOp), and refused up front unless it
+         * is an int (inlineFieldsReadable). `return n - 1` is the commonest
+         * body there is, and this is what it compiles to. */
+        case OP_ADD_INT_CONST:
+        case OP_SUB_INT_CONST:
+        case OP_MUL_INT_CONST:
+            if (!jitInlineMethodsOn()) return false;
+            slot = jaiReadU16(c->code + off + 1);
+            if (slot > maxSlot) maxSlot = slot;
+            break;
         case OP_CONST: case OP_INT: case OP_TRUE: case OP_FALSE:
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
         case OP_FLOORDIV: case OP_MOD: case OP_POW: case OP_NEG:
@@ -205,6 +217,20 @@ static bool inlineFieldsReadable(const Emit *e, ObjClosure *callee) {
                 return false;
             }
             break;
+        case OP_ADD_INT_CONST:
+        case OP_SUB_INT_CONST:
+        case OP_MUL_INT_CONST: {
+            /* A bound local's entry does not exist yet, and the arm checks
+             * it again when it does; a parameter's is checked here. */
+            unsigned slot = jaiReadU16(c->code + off + 1);
+            if (slot > JIT_MAX_SLOTS) return false;
+            int idx = e->inlSlot[slot];
+            if (idx >= 0 && ((unsigned)idx >= e->depth ||
+                             e->stack[idx] != SLOT_INT)) {
+                return false;
+            }
+            break;
+        }
         default:
             break;
         }
