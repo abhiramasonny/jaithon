@@ -1,6 +1,7 @@
 // table.c is the hash table and string intern table for Jaithon
 
 #include "vm/table.h"
+#include "vm/table_inline.h"
 
 #include "vm/gc.h"
 #include "vm/object/object.h"
@@ -13,6 +14,8 @@ const Value JAI_TOMBSTONE = {VAL_OBJ, {.obj = NULL}};
 #define TABLE_MAX_CAPACITY ((int64_t)1 << 30)
 
 #define ENTRY_EMPTY_ORDER     (-2)
+_Static_assert(ENTRY_EMPTY_ORDER == JAI_ENTRY_EMPTY_ORDER,
+               "table_inline.h probes for the same empty marker");
 #define ENTRY_TOMBSTONE_ORDER (-1)
 
 JAI_INLINE JAI_UNUSED bool entryIsEmpty(const JaiEntry *e) {
@@ -613,78 +616,24 @@ JaiTable *jaiInternTable(void) {
     return &internTable;
 }
 
-/* Equal bytes, without a call: the run-time strings interning sees are at
- * most JAI_INTERN_MAX bytes, and a memcmp anywhere in the probe loop made
- * jaiInternTableFindFp save six register pairs on every probe, hit or miss,
- * for a compare most probes never reach. */
-static inline bool internBytesEqual(const char *a, const char *b, size_t n) {
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        uint64_t x, y;
-        memcpy(&x, a + i, 8);
-        memcpy(&y, b + i, 8);
-        if (x != y) return false;
-    }
-    for (; i < n; ++i) {
-        if (a[i] != b[i]) return false;
-    }
-    return true;
-}
-
 #define INTERN_SHORT_COMPARE 64
-
-/* The probe. `viaMemcmp` is a constant at both call sites below, so each gets
- * its own copy: the short one with no call in it at all. */
-JAI_INLINE ObjString *internProbe(const char *chars, size_t length,
-                                  uint64_t hash, uint64_t fp, bool viaMemcmp) {
-    JaiTable *const t = &internTable;
-    if (t->count == 0) return NULL;
-
-    const uint32_t mask = (uint32_t)t->capacity - 1;
-    uint32_t index = (uint32_t)hash & mask;
-    JaiEntry *const entries = t->entries;
-
-    for (;;) {
-        JaiEntry *const e = entries + index;
-        const int state = e->order;
-
-        if (state == ENTRY_EMPTY_ORDER) return NULL;
-
-        if (state >= 0 && e->hash == hash &&
-            (uint64_t)AS_INT(e->value) == fp) {
-            JAI_ASSERT(IS_STRING(e->key), "intern table holds only strings");
-            ObjString *const s = (ObjString *)AS_OBJ(e->key);
-
-            /* The fingerprint holds the length and every byte of a string
-             * this short, and the hash agrees: nothing left to compare. */
-            if (length <= 7) return s;
-
-            if ((size_t)s->length == length &&
-                (viaMemcmp ? memcmp(s->chars, chars, length) == 0
-                           : internBytesEqual(s->chars, chars, length)))
-                return s;
-        }
-
-        index = (index + 1) & mask;
-    }
-}
 
 /* Names and other long strings, out of line so that the short probe stays a
  * leaf. */
 static JAI_NOINLINE ObjString *internFindLong(const char *chars, size_t length,
                                               uint64_t hash, uint64_t fp) {
-    return internProbe(chars, length, hash, fp, true);
+    return jaiInternProbeInline(chars, length, hash, fp, true);
 }
 
-ObjString *jaiInternTableFindFp(const char *chars, size_t length,
-                                uint64_t hash, uint64_t fp) {
+static ObjString *internTableFindFp(const char *chars, size_t length,
+                                    uint64_t hash, uint64_t fp) {
     if (length > INTERN_SHORT_COMPARE)
         return internFindLong(chars, length, hash, fp);
-    return internProbe(chars, length, hash, fp, false);
+    return jaiInternProbeInline(chars, length, hash, fp, false);
 }
 
 ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
-    return jaiInternTableFindFp(chars, length, hash,
+    return internTableFindFp(chars, length, hash,
                                 jaiInternFingerprint(chars, length));
 }
 

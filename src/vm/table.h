@@ -83,9 +83,6 @@ static inline uint64_t jaiInternFingerprintPadded(const char *chars,
     return ((uint64_t)length << 56) | (w & ((UINT64_C(1) << (n * 8)) - 1));
 }
 
-/* jaiInternTableFind with the fingerprint already in hand. */
-ObjString *jaiInternTableFindFp(const char *chars, size_t length,
-                                uint64_t hash, uint64_t fp);
 void       jaiInternTableAdd(ObjString *s);
 void       jaiInternTableInit(void);
 void       jaiInternTableFree(void);

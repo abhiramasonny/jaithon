@@ -6,6 +6,7 @@
 #include "vm/object/object.h"
 #include "vm/gc.h"
 #include "vm/table.h"
+#include "vm/table_inline.h"
 #include "vm/vm.h"
 
 #define JAI_I64_MIN_D (-9223372036854775808.0)
@@ -603,36 +604,44 @@ static const char digitPairs[] =
     "80818283848586878889"
     "90919293949596979899";
 
+static const uint64_t pow10Table[20] = {
+    1ULL,
+    10ULL,
+    100ULL,
+    1000ULL,
+    10000ULL,
+    100000ULL,
+    1000000ULL,
+    10000000ULL,
+    100000000ULL,
+    1000000000ULL,
+    10000000000ULL,
+    100000000000ULL,
+    1000000000000ULL,
+    10000000000000ULL,
+    100000000000000ULL,
+    1000000000000000ULL,
+    10000000000000000ULL,
+    100000000000000000ULL,
+    1000000000000000000ULL,
+    10000000000000000000ULL,
+};
+
+/* Digits in `u`: the bit length times log10(2) (1233/4096) is the digit
+ * count or one short of it, and one table compare settles which. It used to
+ * be a tree of compares against twenty 64-bit constants, and inside a loop --
+ * the f-string formatter's, over its parts -- the compiler hoisted every one
+ * of those constants into a register ahead of the loop: forty-five
+ * instructions on every call before the first digit was written. `| 1` makes
+ * zero one digit, and changes no other answer, since every power of ten above
+ * one is even. */
 JAI_INLINE int decimalLength(uint64_t u) {
-    if (u < 10000000000ULL) {
-        if (u < 100000ULL) {
-            if (u < 100ULL) return u < 10ULL ? 1 : 2;
-            if (u < 1000ULL) return 3;
-            if (u < 10000ULL) return 4;
-            return 5;
-        }
-        if (u < 100000000ULL) {
-            if (u < 1000000ULL) return 6;
-            if (u < 10000000ULL) return 7;
-            return 8;
-        }
-        return u < 1000000000ULL ? 9 : 10;
-    }
-    if (u < 1000000000000000ULL) {
-        if (u < 1000000000000ULL)
-            return u < 100000000000ULL ? 11 : 12;
-        if (u < 10000000000000ULL) return 13;
-        if (u < 100000000000000ULL) return 14;
-        return 15;
-    }
-    if (u < 100000000000000000ULL)
-        return u < 10000000000000000ULL ? 16 : 17;
-    if (u < 10000000000000000000ULL)
-        return u < 1000000000000000000ULL ? 18 : 19;
-    return 20;
+    const uint64_t v = u | 1u;
+    const int t = ((64 - __builtin_clzll(v)) * 1233) >> 12;
+    return t + (v >= pow10Table[t]);
 }
 
-static int writeInt64(char *out, int64_t value) {
+JAI_INLINE int writeInt64Inline(char *out, int64_t value) {
     uint64_t u = value < 0 ? (uint64_t)(-(value + 1)) + 1u : (uint64_t)value;
     int negative = value < 0;
     int len = negative + decimalLength(u);
@@ -656,6 +665,13 @@ static int writeInt64(char *out, int64_t value) {
     }
     if (negative) out[0] = '-';
     return len;
+}
+
+/* Out of line for the many callers that format one number; formatShortInto
+ * takes the inline body, being one of the few that runs once per iteration of
+ * a hot loop. */
+static int writeInt64(char *out, int64_t value) {
+    return writeInt64Inline(out, value);
 }
 
 JAI_INLINE void sinkInt(ValSink *s, int64_t value) {
@@ -1250,65 +1266,72 @@ static bool fmtShortOn(void) {
  * Only the kinds it renders itself, with no call out: ints, strings, bools and
  * null. Anything else, or a result past JAI_STR_SHORT_MAX, returns false having
  * produced nothing, and the caller starts the general path from the top. */
-JAI_INLINE bool formatShort(const Value *parts, int count, ObjString **out) {
-    char   buf[JAI_STR_SHORT_MAX + JAI_INT_DIGITS];
+/* The bytes of a short f-string, written into `buf`: the length, or -1 for a
+ * part it does not render itself or a result past JAI_STR_SHORT_MAX. `buf`
+ * must hold FMT_SHORT_BUF bytes -- the limit, the widest int and eight to
+ * spare for the fingerprint's one load. The literal parts are copied out of
+ * one table rather than spelled at each case, which kept the compiler from
+ * materialising "true", "false" and "null" as immediates on every call. */
+#define FMT_SHORT_BUF (JAI_STR_SHORT_MAX + JAI_INT_DIGITS + 8)
+
+static const char fmtWords[3][8] = {"null", "true", "false"};
+
+JAI_INLINE int64_t formatShortInto(const Value *parts, int count, char *buf) {
     size_t o = 0;
 
     for (int i = 0; i < count; i++) {
         const Value v = parts[i];
-        switch (jaiValueType(v)) {
-        case VAL_INT:
-            /* writeInt64 writes at most twenty bytes, and o is still within
-             * the short limit here, so this cannot run off the buffer. */
-            o += (size_t)writeInt64(buf + o, AS_INT(v));
-            break;
-        case VAL_OBJ: {
-            if (!IS_STRING(v)) return false;
-            const ObjString *s = AS_STRING(v);
-            const uint32_t n = s->length;
-            if (n > JAI_STR_SHORT_MAX - o) return false;
+        const ValueType t = jaiValueType(v);
+        if (JAI_LIKELY(t == VAL_INT)) {
+            /* At most twenty bytes, and o is still within the short limit
+             * here, so this cannot run off the buffer. */
+            o += (size_t)writeInt64Inline(buf + o, AS_INT(v));
+        } else if (t == VAL_OBJ) {
+            if (!IS_STRING(v)) return -1;
+            const ObjString *str = AS_STRING(v);
+            const uint32_t n = str->length;
+            if (n > JAI_STR_SHORT_MAX - o) return -1;
             /* A run here is one to a few bytes; memcpy's call costs more
              * than the copy (see jaiStringFromParts). */
-            const char *src = s->chars;
+            const char *src = str->chars;
             for (uint32_t j = 0; j < n; ++j) buf[o + j] = src[j];
             o += n;
-            break;
+        } else if (t == VAL_BOOL || t == VAL_NULL) {
+            const unsigned w = t == VAL_NULL ? 0u : AS_BOOL(v) ? 1u : 2u;
+            memcpy(buf + o, fmtWords[w], 8);
+            o += w == 2u ? 5u : 4u;
+        } else {
+            return -1;
         }
-        case VAL_BOOL:
-            if (o + 5 > JAI_STR_SHORT_MAX) return false;
-            if (AS_BOOL(v)) {
-                memcpy(buf + o, "true", 4);
-                o += 4;
-            } else {
-                memcpy(buf + o, "false", 5);
-                o += 5;
-            }
-            break;
-        case VAL_NULL:
-            memcpy(buf + o, "null", 4);
-            o += 4;
-            break;
-        default:
-            return false;
-        }
-        if (o > JAI_STR_SHORT_MAX) return false;
+        if (o > JAI_STR_SHORT_MAX) return -1;
     }
-    /* jaiStringNew's own probe, minus what this buffer makes free: the eight
-     * bytes past the result are ours to zero, so the fingerprint is one load
-     * rather than a byte loop, and the probe comes back without a single
-     * call. A miss -- once per distinct string -- goes through jaiStringNew,
-     * which probes again and then allocates and interns. */
-    if (o >= 2 && jaiInternTableCount() < JAI_INTERN_SOFT_CAP) {
-        memset(buf + o, 0, 8);
-        const uint64_t hash = jaiHashBytesInline(buf, o);
-        ObjString *found = jaiInternTableFindFp(
-            buf, o, hash, jaiInternFingerprintPadded(buf, o));
-        if (found != NULL) {
-            *out = found;
-            return true;
-        }
+    return (int64_t)o;
+}
+
+/* jaiStringNew's own probe, minus what this buffer makes free: the eight bytes
+ * past the result are ours to zero, so the fingerprint is one load rather than
+ * a byte loop, and the probe comes back without a single call. NULL for a
+ * miss, a string too short to be worth it, or a table past its soft cap. */
+JAI_INLINE ObjString *formatShortProbe(char *buf, size_t o) {
+    if (o < 2 || jaiInternTableCount() >= JAI_INTERN_SOFT_CAP) return NULL;
+    memset(buf + o, 0, 8);
+    const uint64_t hash = jaiHashBytesInline(buf, o);
+    return jaiInternProbeInline(buf, o, hash,
+                                jaiInternFingerprintPadded(buf, o), false);
+}
+
+JAI_INLINE bool formatShort(const Value *parts, int count, ObjString **out) {
+    char buf[FMT_SHORT_BUF];
+    const int64_t o = formatShortInto(parts, count, buf);
+    if (o < 0) return false;
+    ObjString *found = formatShortProbe(buf, (size_t)o);
+    if (found != NULL) {
+        *out = found;
+        return true;
     }
-    *out = o == 0 ? jaiStringIntern("", 0) : jaiStringNew(buf, o);
+    /* A miss -- once per distinct string -- goes through jaiStringNew, which
+     * probes again and then allocates and interns. */
+    *out = o == 0 ? jaiStringIntern("", 0) : jaiStringNew(buf, (size_t)o);
     return true;
 }
 
@@ -1325,11 +1348,27 @@ JAI_INLINE bool formatShort(const Value *parts, int count, ObjString **out) {
  * NULL means "not answered": a part formatShort does not render itself, a
  * long result, or a collection due. The caller then makes the descriptor call
  * it would have made anyway. */
-ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
+static JAI_NOINLINE ObjString *formatLeafMiss(const Value *parts,
+                                              int64_t count) {
     if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
-    if (count <= 0 || count > JAI_FMT_MAX_PARTS || !fmtShortOn()) return NULL;
     ObjString *made;
     return formatShort(parts, (int)count, &made) ? made : NULL;
+}
+
+ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
+    if (count <= 0 || count > JAI_FMT_MAX_PARTS || !fmtShortOn()) return NULL;
+    /* An intern hit allocates nothing, so it needs no collection test; only
+     * the miss, which may allocate, goes through formatLeafMiss -- by a tail
+     * call, so this path keeps no frame of its own. Words rather than chars
+     * so that the buffer does not cost a stack-protector check per call. */
+    uint64_t words[(FMT_SHORT_BUF + 7) / 8];
+    char *buf = (char *)words;
+    const int64_t o = formatShortInto(parts, (int)count, buf);
+    if (JAI_LIKELY(o >= 0)) {
+        ObjString *found = formatShortProbe(buf, (size_t)o);
+        if (JAI_LIKELY(found != NULL)) return found;
+    }
+    return formatLeafMiss(parts, count);
 }
 
 ObjString *jaiValueFormat(const Value *parts, int count) {
