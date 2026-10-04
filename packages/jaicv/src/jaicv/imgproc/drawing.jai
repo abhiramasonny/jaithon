@@ -90,6 +90,11 @@ fn from_fixed(point: Point) -> Point {
     return Point(point.x + (XY_ONE >> 1) >> XY_SHIFT, point.y + (XY_ONE >> 1) >> XY_SHIFT)
 }
 
+#: Whether `polylines` hands whole-pixel, hard-edged runs to the stroke
+#: primitives `draw_contours` uses. Read once; `JAICV_NATIVE_LINES=0` keeps
+#: drawing them a segment at a time.
+let _native_lines = (env("JAICV_NATIVE_LINES") ?? "1") != "0"
+
 #: Whether `fill_poly` hands its polygons to `__prim__.fill_polygons`. Read
 #: once; `JAICV_NATIVE_FILL=0` keeps the Jaithon scanline fill, which the
 #: primitive is checked against.
@@ -296,7 +301,8 @@ pub class Painter {
         contours: list[list[Point]],
         offset_x: int,
         offset_y: int,
-        thickness: int
+        thickness: int,
+        closed: bool = true
     ) -> bool {
         return __prim__.fill_strokes(
             self.target,
@@ -309,7 +315,8 @@ pub class Painter {
             contours,
             offset_x,
             offset_y,
-            thickness
+            thickness,
+            closed
         )
     }
 
@@ -322,7 +329,8 @@ pub class Painter {
         contours: list[list[Point]],
         offset_x: int,
         offset_y: int,
-        connectivity: int
+        connectivity: int,
+        closed: bool = true
     ) -> bool {
         return __prim__.draw_outlines(
             self.target,
@@ -335,7 +343,8 @@ pub class Painter {
             contours,
             offset_x,
             offset_y,
-            connectivity
+            connectivity,
+            closed
         )
     }
 
@@ -1251,6 +1260,22 @@ pub fn polylines(
 ) -> Mat {
     if thickness > MAX_THICKNESS { throw ValueError(f"a thickness of {thickness} is too large") }
     let painter = Painter(img, colour)
+    #: Whole points and hard edges go over in one call: the strokes
+    #: `draw_contours` draws, which are these segment for segment. A call a
+    #: segment, a quadrilateral and a disc each, was 6.8 ms for 800 small
+    #: contours at a width of two, against OpenCV's 0.65.
+    if _native_lines and shift == 0 and line_type != LINE_AA {
+        let connectivity = if line_type == LINE_4 { 4 } else { 8 }
+        let drawn = if thickness > 1 {
+            painter.thick_outlines(polygons, 0, 0, thickness, closed)
+        } else {
+            painter.thin_outlines(polygons, 0, 0, connectivity, closed)
+        }
+        if drawn {
+            painter.finish()
+            return img
+        }
+    }
     for polygon in polygons { poly_line(painter, polygon, closed, thickness, line_type, shift) }
     painter.finish()
     return img

@@ -560,8 +560,11 @@ static int64_t roundHalfEven(double value) {
 }
 
 /* `fill_strokes(target, colour, cn, origin, stride, cols, rows, contours,
- *  offset_x, offset_y, thickness)` -- every contour outlined with a stroke
- *  `thickness` pixels wide, each closed back to its first point.
+ *  offset_x, offset_y, thickness, closed)` -- every contour outlined with a
+ *  stroke `thickness` pixels wide, closed back to its first point or not.
+ *
+ * Open, a run is `polylines`' open one: no closing segment, and the first
+ * segment capped at its start as well as its end.
  *
  * jaicv's `thick_contours`, moved here whole: for each segment the
  * quadrilateral a pen of that width sweeps, then the round cap at each one's
@@ -586,6 +589,8 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
     if (!jaiStrWantInt(args[8], "fill_strokes", "the x offset", &offsetX)) return false;
     if (!jaiStrWantInt(args[9], "fill_strokes", "the y offset", &offsetY)) return false;
     if (!jaiStrWantInt(args[10], "fill_strokes", "the thickness", &thickness)) return false;
+    if (!IS_BOOL(args[11])) return jaiThrow(vm.cTypeError, "fill_strokes(): closed must be a bool");
+    const bool closed = AS_BOOL(args[11]);
     if (thickness < 2 || thickness > 32767) {
         return jaiThrow(vm.cValueError, "fill_strokes(): a thickness of %lld is out of range",
                         (long long)thickness);
@@ -607,12 +612,17 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
     }
     int64_t *ends = (int64_t *)malloc((total > 0 ? total : 1) * 4 * sizeof(int64_t));
     double *reach = (double *)malloc((total > 0 ? total : 1) * sizeof(double));
-    if (ends == NULL || reach == NULL) {
+    /* The extra cap an open run has at its first point, one a contour. */
+    int64_t *starts = (int64_t *)malloc((size_t)(contours->count > 0 ? contours->count : 1) * 2 *
+                                        sizeof(int64_t));
+    if (ends == NULL || reach == NULL || starts == NULL) {
         free(ends);
         free(reach);
+        free(starts);
         return jaiThrow(vm.cRuntimeError, "fill_strokes(): out of memory");
     }
     size_t segments = 0;
+    size_t opened = 0;
     bool readable = true;
     bool overflow = false;
     for (int c = 0; c < contours->count && readable && !overflow; c++) {
@@ -620,11 +630,23 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
         const int count = contour->count;
         if (count == 0) continue;
         int64_t px, py;
-        if (!jaiReadPoint(&reader, jaiListGet(contour, count - 1), &px, &py)) {
+        /* Closed, the first segment runs from the last point; open, from the
+         * first, and the walk below starts at the second -- except a lone
+         * point, which is its own segment either way. */
+        const int from = (closed || count == 1) ? count - 1 : 0;
+        if (!jaiReadPoint(&reader, jaiListGet(contour, from), &px, &py)) {
             readable = false;
             break;
         }
-        for (int i = 0; i < count; i++) {
+        if (!closed) {
+            if (__builtin_add_overflow(px, offsetX, &starts[opened * 2]) ||
+                __builtin_add_overflow(py, offsetY, &starts[opened * 2 + 1])) {
+                overflow = true;
+                break;
+            }
+            opened++;
+        }
+        for (int i = (closed || count == 1) ? 0 : 1; i < count; i++) {
             int64_t cx, cy;
             if (!jaiReadPoint(&reader, jaiListGet(contour, i), &cx, &cy)) {
                 readable = false;
@@ -651,12 +673,14 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
     if (!readable) {
         free(ends);
         free(reach);
+        free(starts);
         *out = BOOL_VAL(false);
         return true;
     }
     if (overflow) {
         free(ends);
         free(reach);
+        free(starts);
         return rasterOverflow();
     }
 
@@ -678,6 +702,7 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
     if (widest == NULL) {
         free(ends);
         free(reach);
+        free(starts);
         return jaiThrow(vm.cRuntimeError, "fill_strokes(): out of memory");
     }
     for (int64_t i = 0; i < radius * 2 + 1; i++) widest[i] = -1;
@@ -704,6 +729,7 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
         free(ends);
         free(reach);
         free(widest);
+        free(starts);
         return false;
     }
 
@@ -738,9 +764,10 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
         }
         convexFill(&surface, xs, ys, 4, JAI_XY_SHIFT, rounding, rounding);
     }
-    for (size_t i = 0; i < segments && ok; i++) {
-        const int64_t toX = ends[i * 4 + 2];
-        const int64_t toY = ends[i * 4 + 3];
+    /* Every segment's far end, then each open run's first point. */
+    for (size_t i = 0; i < segments + opened && ok; i++) {
+        const int64_t toX = i < segments ? ends[i * 4 + 2] : starts[(i - segments) * 2];
+        const int64_t toY = i < segments ? ends[i * 4 + 3] : starts[(i - segments) * 2 + 1];
         for (int64_t row = 0; row < radius * 2 + 1; row++) {
             const int64_t extent = widest[row];
             if (extent < 0) continue;
@@ -762,14 +789,15 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
     free(ends);
     free(reach);
     free(widest);
+    free(starts);
     if (!ok) return rasterOverflow();
     *out = BOOL_VAL(true);
     return true;
 }
 
 /* `draw_outlines(target, colour, cn, origin, stride, cols, rows, contours,
- *  offset_x, offset_y, connectivity)` -- every contour outlined one pixel
- *  wide, each closed back to its first point, moved by the offset.
+ *  offset_x, offset_y, connectivity, closed)` -- every contour outlined one
+ *  pixel wide, closed back to its first point or not, moved by the offset.
  *
  * `draw_contours` with a hairline, which is its default: `polylines`, a
  * `Painter.strokes` a contour building that contour's segments and handing
@@ -793,6 +821,8 @@ static bool primDrawOutlines(int argc, Value *args, Value *out) {
     if (!jaiStrWantInt(args[8], "draw_outlines", "the x offset", &offsetX)) return false;
     if (!jaiStrWantInt(args[9], "draw_outlines", "the y offset", &offsetY)) return false;
     if (!jaiStrWantInt(args[10], "draw_outlines", "the connectivity", &connectivity)) return false;
+    if (!IS_BOOL(args[11])) return jaiThrow(vm.cTypeError, "draw_outlines(): closed must be a bool");
+    const bool closed = AS_BOOL(args[11]);
     if (connectivity != 4 && connectivity != 8) {
         return jaiThrow(vm.cValueError, "draw_outlines(): connectivity must be 4 or 8, got %lld",
                         (long long)connectivity);
@@ -857,8 +887,10 @@ static bool primDrawOutlines(int argc, Value *args, Value *out) {
             segments++;
             continue;
         }
-        int64_t px = moved[(count - 1) * 2], py = moved[(count - 1) * 2 + 1];
-        for (int i = 0; i < count; i++) {
+        /* Closed, from the last point round; open, from the first. */
+        const int from = closed ? count - 1 : 0;
+        int64_t px = moved[from * 2], py = moved[from * 2 + 1];
+        for (int i = closed ? 0 : 1; i < count; i++) {
             int64_t *at = ends + segments * 4;
             at[0] = px;
             at[1] = py;
@@ -1186,7 +1218,7 @@ void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "draw_line",     primDrawLine,     12, 12);
     jaiStrDefinePrim(ns, "draw_lines",    primDrawLines,     9, 9);
     jaiStrDefinePrim(ns, "fill_convex",   primFillConvex,   11, 11);
-    jaiStrDefinePrim(ns, "fill_strokes",  primFillStrokes,  11, 11);
-    jaiStrDefinePrim(ns, "draw_outlines", primDrawOutlines, 11, 11);
+    jaiStrDefinePrim(ns, "fill_strokes",  primFillStrokes,  12, 12);
+    jaiStrDefinePrim(ns, "draw_outlines", primDrawOutlines, 12, 12);
     jaiStrDefinePrim(ns, "fill_polygons", primFillPolygons, 12, 12);
 }
