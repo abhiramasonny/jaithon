@@ -584,10 +584,10 @@ JAI_INLINE void sinkReserve(ValSink *s, size_t n) {
 
 #define JAI_INT_DIGITS 24
 #define JAI_FLOAT_CHARS 32
-/* The longest f-string result formatShort builds itself. Matches
- * JAI_INTERN_MAX in object_string.c, the longest run-time string worth an
- * intern probe: past it the general path builds the string in place. */
-#define JAI_STR_SHORT_MAX 32
+/* The longest f-string result formatShort builds itself: the longest
+ * run-time string worth an intern probe. Past it the general path builds the
+ * string in place. */
+#define JAI_STR_SHORT_MAX JAI_INTERN_MAX
 
 //magic sh*t
 static const char digitPairs[] =
@@ -1291,6 +1291,21 @@ static bool formatShort(const Value *parts, int count, ObjString **out) {
             return false;
         }
         if (o > JAI_STR_SHORT_MAX) return false;
+    }
+    /* jaiStringNew's own probe, minus what this buffer makes free: the eight
+     * bytes past the result are ours to zero, so the fingerprint is one load
+     * rather than a byte loop, and the probe comes back without a single
+     * call. A miss -- once per distinct string -- goes through jaiStringNew,
+     * which probes again and then allocates and interns. */
+    if (o >= 2 && jaiInternTableCount() < JAI_INTERN_SOFT_CAP) {
+        memset(buf + o, 0, 8);
+        const uint64_t hash = jaiHashBytesInline(buf, o);
+        ObjString *found = jaiInternTableFindFp(
+            buf, o, hash, jaiInternFingerprintPadded(buf, o));
+        if (found != NULL) {
+            *out = found;
+            return true;
+        }
     }
     *out = o == 0 ? jaiStringIntern("", 0) : jaiStringNew(buf, o);
     return true;
