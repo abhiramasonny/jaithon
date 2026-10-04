@@ -1,5 +1,6 @@
 #: The convex hull of a set of points, by column buckets over a sort.
 from std.algo.sort import natural_order, sort_by
+from std.os import env
 from ...core.types import Point
 
 fn cross_sign(o: Point, a: Point, b: Point) -> int {
@@ -514,6 +515,15 @@ fn hull_reverse(ring: list[Point]) -> list[Point] {
 pub fn convex_hull(points: list[Point], clockwise: bool = false) -> list[Point] {
     let count = points.len()
     if count < 3 { return degenerate_hull(points, clockwise) }
+    #: The same ring from `__prim__.points_hull`, which reads the points where
+    #: they are and sorts them in C. Null for what it does not take -- fewer
+    #: than three distinct points, a coordinate past `HULL_COORD_LIMIT`, a
+    #: point that is not an object with integer `x` and `y` -- and those go on
+    #: below.
+    if _native_hull {
+        let ring = __prim__.points_hull(points, clockwise)
+        if ring is not null { return ring }
+    }
     var ready = hull_columns(points, _hull_cells, _hull_blocks, _hull_low_chain, _hull_span)
     if ready < -1 {
         hull_reserve(
@@ -534,6 +544,16 @@ pub fn convex_hull(points: list[Point], clockwise: bool = false) -> list[Point] 
     }
     return hull_ring_of(points, _hull_low_chain, _hull_high_chain, packed)
 }
+
+#: Whether `convex_hull` asks `__prim__.points_hull` first. Read once;
+#: `JAICV_NATIVE_HULL=0` keeps the column walk above, which it is checked
+#: against.
+#:
+#: The walk is at the compiled tier's mercy and the tier's buffer is smaller
+#: than `hull_walk`, which then runs interpreted: a 74-point frame contour took
+#: 3.6 microseconds a hull against OpenCV's 1.5, and `min_area_rect` pays it
+#: again inside.
+let _native_hull = (env("JAICV_NATIVE_HULL") ?? "1") != "0"
 
 #: The indices, into `points`, of the hull points.
 pub fn convex_hull_indices(points: list[Point], clockwise: bool = false) -> list[int] {

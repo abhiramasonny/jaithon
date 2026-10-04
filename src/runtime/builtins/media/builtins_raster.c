@@ -27,6 +27,7 @@
 #endif
 
 #include "runtime/builtins/text/builtins_str.h"
+#include "runtime/builtins/media/points.h"
 #include "runtime/runtime.h"
 
 #include "native/native.h"
@@ -539,34 +540,6 @@ static bool rasterOverflow(void) {
     return jaiThrow(vm.cOverflowError, "fill_strokes(): integer overflow");
 }
 
-/* The `x` and `y` of a point object, as integers. False when `v` is not an
- * instance with integer fields of those names, which sends the caller back to
- * its own loops: this reads points, it does not decide what one is. The slots
- * are looked up once a class. */
-typedef struct {
-    ObjClass  *klass;
-    int        slotX, slotY;
-    ObjString *nameX, *nameY;
-} PointReader;
-
-static bool readPoint(PointReader *r, Value v, int64_t *x, int64_t *y) {
-    if (!IS_INSTANCE(v)) return false;
-    ObjInstance *point = AS_INSTANCE(v);
-    if (point->klass != r->klass) {
-        r->klass = point->klass;
-        r->slotX = jaiClassFieldSlot(point->klass, r->nameX);
-        r->slotY = jaiClassFieldSlot(point->klass, r->nameY);
-    }
-    if (r->slotX < 0 || r->slotY < 0) return false;
-    if (r->slotX >= point->fieldCount || r->slotY >= point->fieldCount) return false;
-    const Value vx = point->fields[r->slotX];
-    const Value vy = point->fields[r->slotY];
-    if (!IS_INT(vx) || !IS_INT(vy)) return false;
-    *x = AS_INT(vx);
-    *y = AS_INT(vy);
-    return true;
-}
-
 /* OpenCV's cvRound as `thick_contours` spells it out: the floor, then up when
  * the remainder is over a half, and to even when it is exactly one. */
 static int64_t roundHalfEven(double value) {
@@ -617,7 +590,8 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
     /* Pass one, as `thick_contours`' first loop: every segment's two ends,
      * from the previous point to the current one, closing each contour, and
      * its squared length. */
-    PointReader reader = {NULL, -1, -1, jaiStringInternC("x"), jaiStringInternC("y")};
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
     size_t total = 0;
     for (int c = 0; c < contours->count; c++) {
         const Value item = jaiListGet(contours, c);
@@ -642,13 +616,13 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
         const int count = contour->count;
         if (count == 0) continue;
         int64_t px, py;
-        if (!readPoint(&reader, jaiListGet(contour, count - 1), &px, &py)) {
+        if (!jaiReadPoint(&reader, jaiListGet(contour, count - 1), &px, &py)) {
             readable = false;
             break;
         }
         for (int i = 0; i < count; i++) {
             int64_t cx, cy;
-            if (!readPoint(&reader, jaiListGet(contour, i), &cx, &cy)) {
+            if (!jaiReadPoint(&reader, jaiListGet(contour, i), &cx, &cy)) {
                 readable = false;
                 break;
             }
