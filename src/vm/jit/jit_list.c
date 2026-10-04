@@ -285,7 +285,9 @@ static bool hoistHoldsObjects(const Emit *e, unsigned slot) {
     if (e->observed == NULL || slot > JIT_MAX_SLOTS) return false;
     if (e->localKind[slot] != SLOT_LIST) return false;
     Value v = e->observed[slot];
-    if (!IS_LIST(v)) return false;
+    /* A slot the program has not reached yet can hold a VAL_OBJ tag over a
+     * null payload (see localStgOf), and IS_LIST reads through it. */
+    if (!IS_OBJ(v) || AS_OBJ(v) == NULL || !IS_LIST(v)) return false;
     ObjList *l = AS_LIST(v);
     if (l->stg != LIST_STORE_BOXED || l->count <= 0) return false;
     Value first = jaiListGet(l, 0);
