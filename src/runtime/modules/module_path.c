@@ -196,6 +196,14 @@ typedef struct {
 
 /* (fromDir NUL dottedName NUL) -> resolved path. */
 static Memo sResolved;
+/* dottedName -> where the search path, without the importer's own directory,
+ * finds it. An absolute import looks in the importer's directory first and
+ * then along a search path every importer shares, so once the shared part has
+ * answered for a name, a new importer only has to rule out its own directory:
+ * two stats, where the search was ~6 stats and a canonicalisation. `import
+ * jaicv` has 932 distinct (importer, name) pairs over 332 names.
+ * JAITHON_RESOLVE_SHARED=0 turns this part off. */
+static Memo sSearched;
 /* A candidate path -> what realpath made of it. Different importers name the
  * same file through different (fromDir, name) keys, so this second table is
  * what keeps the 932 realpaths `import jaicv` still made with only the first
@@ -410,6 +418,7 @@ static void completePath(void);
 
 void jaiModulePathInit(const char *execDir) {
     memoClear(&sResolved);
+    memoClear(&sSearched);
     memoClear(&sCanonical);
     dirListClear(&sLibDirs);
     sPathReady = true;
@@ -493,6 +502,7 @@ void jaiModulePathComplete(void) {
 void jaiModulePathAdd(const char *dir) {
     if (dir == NULL || dir[0] == '\0') return;
     memoClear(&sResolved);
+    memoClear(&sSearched);
     dirListAdd(&sUserDirs, dir);
     syncModulePathMirror();
 }
@@ -645,6 +655,7 @@ static bool relativeBase(const char *fromDir, int dots, char *out,
 
 static bool resolveUncached(const char *dottedName, const char *fromDir,
                             char *out, size_t outSize);
+static bool plainAbsoluteName(const char *dotted, char *relative, size_t size);
 
 bool jaiResolveModulePath(const char *dottedName, const char *fromDir,
                           char *out, size_t outSize) {
@@ -666,8 +677,59 @@ bool jaiResolveModulePath(const char *dottedName, const char *fromDir,
             return true;
         }
     }
+
+    static int shared = -1;
+    if (shared < 0) shared = envOn("JAITHON_RESOLVE_SHARED", true);
+    char relative[JAI_MAX_PATH];
+    if (shared && plainAbsoluteName(dottedName, relative, sizeof relative)) {
+        if (fromDir != NULL && fromDir[0] != '\0' &&
+            tryDirectory(fromDir, relative, out, outSize)) {
+            memoInsert(&sResolved, key, len, hash, out);
+            return true;
+        }
+        size_t nameLen = strlen(dottedName);
+        uint32_t nameHash = memoHash(dottedName, nameLen);
+        const char *searched = memoFind(&sSearched, dottedName, nameLen, nameHash);
+        if (searched != NULL && strlen(searched) + 1 <= outSize) {
+            memcpy(out, searched, strlen(searched) + 1);
+            memoInsert(&sResolved, key, len, hash, out);
+            return true;
+        }
+        out[0] = '\0';
+        if (!resolveUncached(dottedName, fromDir, out, outSize)) return false;
+        if (out[0] != '\0') {
+            memoInsert(&sResolved, key, len, hash, out);
+            memoInsert(&sSearched, dottedName, nameLen, nameHash, out);
+        }
+        return true;
+    }
+
     if (!resolveUncached(dottedName, fromDir, out, outSize)) return false;
     if (out[0] != '\0') memoInsert(&sResolved, key, len, hash, out);
+    return true;
+}
+
+/* `dotted` as the relative path splitModuleName would make of it, when it is
+ * an absolute name that cannot fail to split -- checked here, quietly, because
+ * splitModuleName reports what it rejects and the slow path must be the one to
+ * do that, exactly once. */
+static bool plainAbsoluteName(const char *dotted, char *relative, size_t size) {
+    size_t n = 0;
+    bool componentStart = true;
+    for (const char *p = dotted; *p != '\0'; p++, n++) {
+        if (n + 1 >= size) return false;
+        if (*p == '.') {
+            if (componentStart) return false;   /* leading dot or empty component */
+            relative[n] = '/';
+            componentStart = true;
+            continue;
+        }
+        if (!isNameByte(*p)) return false;
+        relative[n] = *p;
+        componentStart = false;
+    }
+    if (n == 0 || componentStart) return false;
+    relative[n] = '\0';
     return true;
 }
 
