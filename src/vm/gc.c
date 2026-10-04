@@ -251,6 +251,8 @@ static void markStrings(ObjString *const *names, int count) {
 static void markChunk(Chunk *chunk) {
     jaiGCMarkArray(&chunk->constants);
 
+    /* A pending reservation has a count and no array yet; see chunk.c. */
+    if (chunk->caches == NULL) return;
     for (int i = 0; i < chunk->cacheCount; i++) {
         InlineCache *ic = &chunk->caches[i];
         for (int w = 0; w < JAI_IC_WAYS; w++) jaiGCMarkVal(ic->cached[w]);

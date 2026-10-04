@@ -2,6 +2,7 @@
  * inline-cache key, the shared megamorphic method table, the per-site record
  * of an INVOKE's result kind, and the shape-id table the compiled tier reads.
  */
+#include <stddef.h>
 #include <stdlib.h>
 
 #include "vm/vm_internal.h"
@@ -27,6 +28,25 @@ uint32_t builtinShapeTag(Value v) {
 }
 
 MegaEntry sMegaCache[JAI_MEGA_WAYS];
+
+bool jaiChunkCachesNow(Chunk *chunk);
+
+/* cacheAt's cold half: the array is missing, either because the chunk has no
+ * caches at all or because its reservation is still pending. Every chunk that
+ * reaches here is a frame's &fn->chunk, so the function is at hand to give a
+ * traced body its own observation budget, which the loader used to set when
+ * it allocated the array (serialize_read.c, FN_TRACE). */
+InlineCache *jaiCacheAtSlow(Chunk *chunk, uint16_t index) {
+    if (!jaiChunkCachesNow(chunk)) return NULL;
+    ObjFunction *fn = (ObjFunction *)(void *)((char *)chunk -
+                                              offsetof(ObjFunction, chunk));
+    if (fn->flags & FN_TRACE) {
+        for (int i = 0; i < chunk->cacheCount; i++)
+            chunk->caches[i].obsBudget = JAI_IC_OBS_BUDGET_TRACE;
+    }
+    if ((int)index >= chunk->cacheCount) return NULL;
+    return &chunk->caches[index];
+}
 
 /* JAITHON_MEGA_STRESS=1 collapses the table to a single entry, so every
  * megamorphic (class, name) pair collides with every other and the key is the
