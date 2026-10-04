@@ -175,11 +175,18 @@ void jaiGCEnable(bool enabled) {
     jaiGCSyncLimit();
 }
 
-void jaiGCRebase(void) {
+void jaiGCCredit(size_t permanentBytes) {
     GCState *g = activeGC();
-    if (g == NULL) return;
-    size_t next = gcNextThreshold(g, gcLiveBytes(g));
-    if (next > g->nextGC) g->nextGC = next;
+    if (g == NULL || permanentBytes == 0) return;
+    /* Shift the threshold past the new bytes, so they never count toward the
+     * next collection: what was left of the budget before is left after. */
+    size_t next = g->nextGC > SIZE_MAX - permanentBytes
+                      ? SIZE_MAX : g->nextGC + permanentBytes;
+    /* And at least what a collection right now would have budgeted for them
+     * alone. Only the credited bytes are scaled, never the heap as it
+     * stands: that holds garbage, and scaling it is a ratchet. */
+    size_t floor = gcNextThreshold(g, permanentBytes);
+    g->nextGC = next > floor ? next : floor;
     jaiGCSyncLimit();
 }
 

@@ -50,11 +50,14 @@ void jaiGCFree(GCState *gc);
 void jaiGCMaybeCollect(void);
 void jaiGCCollect(void);
 void jaiGCEnable(bool enabled);
-/* Budget the next collection from the heap as it stands now, as a collection
- * at this point would have, without collecting. Only ever raises the
- * threshold. For a phase that has just built data that will live for the
- * rest of the process (the self-hosted front end). */
-void jaiGCRebase(void);
+/* Tell the collector that `permanentBytes` were just allocated with collection
+ * paused and will live for the rest of the process (the self-hosted front
+ * end). They are added past the threshold, so they never bring the next
+ * collection closer, and the threshold is at least what a collection would
+ * budget for them alone. Only ever raises the threshold, and only by an amount
+ * proportional to the bytes credited: pass the bytes the paused phase built,
+ * never the heap as it stands, which holds garbage. */
+void jaiGCCredit(size_t permanentBytes);
 
 extern GCState *jaiGCActive;
 extern bool     jaiGCInCollect;

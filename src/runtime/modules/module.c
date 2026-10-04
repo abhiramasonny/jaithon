@@ -253,11 +253,22 @@ static bool selfHosting(void) {
 /* Loading the front end builds ~10MB of objects that live for the rest of
  * the process, and it used to trigger one collection partway through: a full
  * mark of everything built so far that freed ~53KB, ~5% of an edit-then-run.
- * So collection is paused while the front end loads and the next one is then
- * budgeted from the heap as it stands, which is what a collection at the end
- * would have done (jaiGCRebase). Measured together with the intern sizing
- * below: -2.3% cycles on a one-line `check`, -4.7% on edit-then-run. --gc-stress keeps collecting, since finding
- * what a collection breaks is its whole job.
+ * So collection is paused while the front end loads, and the bytes built under
+ * the pause are then credited to the collector as permanent (jaiGCCredit):
+ * they never count toward the next collection, and the budget is at least what
+ * a collection at the end would have given them. Measured together with the
+ * intern sizing below: -2.3% cycles on a one-line `check`, -4.7% on
+ * edit-then-run. --gc-stress keeps collecting, since finding what a collection
+ * breaks is its whole job.
+ *
+ * The credit is the bytes allocated DURING the pause, never the heap as it
+ * stands. Every eval, REPL line, test case and `check` file comes through here
+ * again with the front end already loaded; when the credit was "4x the whole
+ * heap", garbage included, each of those calls pushed the next collection
+ * further out and the collector stopped (check lib: 0 collections, 3.3GB). A
+ * call that finds the front end loaded now allocates ~nothing under the pause
+ * and credits ~nothing, and a load that fails credits nothing at all, since
+ * what it built is garbage.
  *
  * The intern table is sized for the front end's ~5,000 strings up front too:
  * it otherwise doubles its way from 8 slots to 16K, rehashing every string
@@ -275,27 +286,36 @@ static bool frontEndTuneOn(void) {
     return cached != 0;
 }
 
-static bool frontEndLoadBegin(void) {
-    if (!frontEndTuneOn()) return false;
+typedef struct {
+    bool paused;
+    size_t heapBefore;
+} FrontEndPause;
+
+static FrontEndPause frontEndLoadBegin(void) {
+    FrontEndPause p = {false, 0};
+    if (!frontEndTuneOn()) return p;
     jaiTableReserve(jaiInternTable(), JAI_FRONTEND_INTERNED);
-    if (vm.gcStress || vm.gc == NULL || !vm.gc->enabled) return false;
+    if (vm.gcStress || vm.gc == NULL || !vm.gc->enabled) return p;
     jaiGCEnable(false);
-    return true;
+    p.paused = true;
+    p.heapBefore = jaiHeapBytes;
+    return p;
 }
 
-static void frontEndLoadEnd(bool paused) {
-    if (!paused) return;
+static void frontEndLoadEnd(FrontEndPause p, bool loaded) {
+    if (!p.paused) return;
     jaiGCEnable(true);
-    jaiGCRebase();
+    size_t now = jaiHeapBytes;
+    if (loaded && now > p.heapBefore) jaiGCCredit(now - p.heapBefore);
 }
 
 static void warmFrontEnd(void) {
     if (!sOptions.selfHosted || sLoadingFrontEnd || sFrontEndWarmed) return;
     sFrontEndWarmed = true;
     sLoadingFrontEnd = true;
-    bool paused = frontEndLoadBegin();
-    (void)jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
-    frontEndLoadEnd(paused);
+    FrontEndPause pause = frontEndLoadBegin();
+    ObjModule *loaded = jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
+    frontEndLoadEnd(pause, loaded != NULL);
     sLoadingFrontEnd = false;
     jaiClearException();
     /* The candidate snapshot point: the front end is built and no user code has
@@ -1010,9 +1030,10 @@ ObjModule *jaiImportFrontEndModule(const char *dottedName) {
         t0 = jaiClockMonotonic();
     }
     sLoadingFrontEnd = true;
-    bool paused = !wasLoading && frontEndLoadBegin();
+    FrontEndPause pause = {false, 0};
+    if (!wasLoading) pause = frontEndLoadBegin();
     ObjModule *module = jaiImportModule(dottedName, NULL);
-    frontEndLoadEnd(paused);
+    frontEndLoadEnd(pause, module != NULL);
     sLoadingFrontEnd = wasLoading;
     if (t0 != 0.0)
     {
@@ -1237,9 +1258,10 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
      * compiling it with itself is the recursion this guard exists to stop. */
     bool wasLoading = sLoadingFrontEnd;
     sLoadingFrontEnd = true;
-    bool paused = !wasLoading && frontEndLoadBegin();
+    FrontEndPause pause = {false, 0};
+    if (!wasLoading) pause = frontEndLoadBegin();
     ObjModule *compiler = jaiImportModule(JAI_SELF_HOSTED_MODULE, NULL);
-    frontEndLoadEnd(paused);
+    frontEndLoadEnd(pause, compiler != NULL);
     sLoadingFrontEnd = wasLoading;
     if (compiler == NULL) {
         jaiClearException();
