@@ -280,6 +280,38 @@ pub class Painter {
         )
     }
 
+    #: A batch of thick segments in one call: the quadrilateral each sweeps,
+    #: then the cap at each one's far end. `ends` is four integers a segment,
+    #: `offsets` two -- how far its quadrilateral stands off it, across and
+    #: along, in fixed point with `shift` fractional bits -- and `cap_dy` and
+    #: `cap_reach` are the cap disc's rows. Exactly a `fill` a segment and then
+    #: a `span` a cap row, in that order.
+    pub fn segments(
+        self,
+        ends: list[int],
+        offsets: list[int],
+        cap_dy: list[int],
+        cap_reach: list[int],
+        shift: int,
+        rounding: int
+    ) -> void {
+        __prim__.fill_segments(
+            self.target,
+            self.colour,
+            self.cn,
+            self.origin,
+            self.stride,
+            self.cols,
+            self.rows,
+            ends,
+            offsets,
+            cap_dy,
+            cap_reach,
+            shift,
+            rounding
+        )
+    }
+
     #: Fill `[x1, x2]` on row `y`, inclusive at both ends.
     #:
     #: One call rather than a `plot` a pixel. Every filled shape is made of

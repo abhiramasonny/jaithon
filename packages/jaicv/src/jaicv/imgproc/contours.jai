@@ -722,6 +722,10 @@ pub fn find_contours(
     return (contours, relate(parents_of(chosen, mode)))
 }
 
+#: Whether `thick_contours` hands its segments to `__prim__.fill_segments` in
+#: one batch rather than drawing them a primitive call at a time. Read once.
+let _batch_segments = (env("JAICV_BATCH_SEGMENTS") ?? "1") != "0"
+
 #: The disc a thick stroke caps a segment with, as one span a row.
 #:
 #: `draw_circle` walks one octant of the midpoint circle and mirrors it eight
@@ -866,6 +870,16 @@ fn thick_contours(
         }
         offsets.push(offset_across)
         offsets.push(offset_along)
+    }
+
+    #: The two passes below as one primitive call. They are a `fill_convex` a
+    #: segment and a `fill_span` a cap row, and the calls were most of what
+    #: drawing cost -- each maps the picture and waits on it again whatever
+    #: it draws -- so `fill_segments` takes the whole batch and does the same
+    #: fills in the same order. `JAICV_BATCH_SEGMENTS=0` puts the calls back.
+    if _batch_segments {
+        painter.segments(ends, offsets, cap_dy, cap_reach, XY_SHIFT, rounding)
+        return
     }
 
     #: One corner list, refilled rather than rebuilt: the primitive reads it

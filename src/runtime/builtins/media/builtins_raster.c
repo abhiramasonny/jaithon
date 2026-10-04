@@ -484,9 +484,120 @@ static bool primFillConvex(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* Integer element `i` of a list the caller promised holds only integers. */
+static bool rasterInt(ObjList *list, int i, const char *what, int64_t *out) {
+    const Value v = jaiListGet(list, i);
+    if (!IS_INT(v)) {
+        return jaiThrow(vm.cTypeError, "fill_segments(): %s holds a non-integer", what);
+    }
+    *out = AS_INT(v);
+    return true;
+}
+
+static bool rasterOverflow(void) {
+    return jaiThrow(vm.cOverflowError, "fill_segments(): integer overflow");
+}
+
+/* `fill_segments(target, colour, cn, origin, stride, cols, rows, ends, offsets,
+ *  cap_dy, cap_reach, shift, rounding)` -- a batch of thick segments, the
+ *  quadrilateral each sweeps and then the round cap at each one's far end.
+ *
+ * `ends` is four integers a segment, its two ends in pixels; `offsets` two, how
+ * far its quadrilateral stands off it across and along, in fixed point with
+ * `shift` fractional bits; `cap_dy` and `cap_reach` the rows of the cap disc,
+ * as row offsets and how far each row reaches either side. This is the last
+ * two passes of jaicv's `thick_contours`, a `fill_convex` a segment and then a
+ * `fill_span` a cap row, moved here whole -- same corners, same order, same
+ * clipping -- because those calls were the whole of what it cost: a
+ * primitive call is a fraction of a microsecond however little it draws, a
+ * frame contour is hundreds of segments, and each call mapped the device
+ * buffer and waited on it again. One call maps it once.
+ *
+ * Integer arithmetic that would overflow in Jaithon throws here, at the same
+ * segment, so a picture is never drawn differently, only faster. */
+static bool primFillSegments(int argc, Value *args, Value *out) {
+    (void)argc;
+    JaiSurface surface;
+    ObjList *ends, *offsets, *capDy, *capReach;
+    int64_t shift, rounding;
+    if (!jaiArgList(args[7], 8, "fill_segments", &ends)) return false;
+    if (!jaiArgList(args[8], 9, "fill_segments", &offsets)) return false;
+    if (!jaiArgList(args[9], 10, "fill_segments", &capDy)) return false;
+    if (!jaiArgList(args[10], 11, "fill_segments", &capReach)) return false;
+    if (!jaiStrWantInt(args[11], "fill_segments", "the shift", &shift)) return false;
+    if (!jaiStrWantInt(args[12], "fill_segments", "the rounding", &rounding)) return false;
+    if (shift < 0 || shift > JAI_XY_SHIFT) {
+        return jaiThrow(vm.cValueError, "fill_segments(): a shift of %lld is out of range",
+                        (long long)shift);
+    }
+    if (ends->count % 4 != 0 || offsets->count != ends->count / 2) {
+        return jaiThrow(vm.cValueError,
+                        "fill_segments(): %d ends and %d offsets are not four and two a segment",
+                        ends->count, offsets->count);
+    }
+    if (capDy->count != capReach->count) {
+        return jaiThrow(vm.cValueError, "fill_segments(): %d cap rows against %d reaches",
+                        capDy->count, capReach->count);
+    }
+    if (!readSurface(args, 0, "fill_segments", &surface)) return false;
+
+    const int segments = ends->count / 4;
+    for (int i = 0; i < segments; i++) {
+        int64_t at[4], across, along;
+        for (int k = 0; k < 4; k++) {
+            if (!rasterInt(ends, i * 4 + k, "a segment", &at[k])) return false;
+        }
+        if (!rasterInt(offsets, i * 2, "an offset", &across)) return false;
+        if (!rasterInt(offsets, i * 2 + 1, "an offset", &along)) return false;
+        /* `<<` wraps in Jaithon and `+` and `-` are checked; both kept. */
+        int64_t fromX = (int64_t)((uint64_t)at[0] << shift);
+        int64_t fromY = (int64_t)((uint64_t)at[1] << shift);
+        int64_t toX = (int64_t)((uint64_t)at[2] << shift);
+        int64_t toY = (int64_t)((uint64_t)at[3] << shift);
+        int64_t xs[4], ys[4];
+        if (__builtin_add_overflow(fromX, across, &xs[0]) ||
+            __builtin_add_overflow(fromY, along, &ys[0]) ||
+            __builtin_sub_overflow(fromX, across, &xs[1]) ||
+            __builtin_sub_overflow(fromY, along, &ys[1]) ||
+            __builtin_sub_overflow(toX, across, &xs[2]) ||
+            __builtin_sub_overflow(toY, along, &ys[2]) ||
+            __builtin_add_overflow(toX, across, &xs[3]) ||
+            __builtin_add_overflow(toY, along, &ys[3])) {
+            return rasterOverflow();
+        }
+        convexFill(&surface, xs, ys, 4, (int)shift, rounding, rounding);
+    }
+
+    const int capRows = capDy->count;
+    for (int i = 0; i < segments; i++) {
+        int64_t toX, toY;
+        if (!rasterInt(ends, i * 4 + 2, "a segment", &toX)) return false;
+        if (!rasterInt(ends, i * 4 + 3, "a segment", &toY)) return false;
+        for (int row = 0; row < capRows; row++) {
+            int64_t extent, dy, x1, x2, y;
+            if (!rasterInt(capReach, row, "a cap reach", &extent)) return false;
+            if (!rasterInt(capDy, row, "a cap row", &dy)) return false;
+            if (__builtin_sub_overflow(toX, extent, &x1) ||
+                __builtin_add_overflow(toX, extent, &x2) ||
+                __builtin_add_overflow(toY, dy, &y)) {
+                return rasterOverflow();
+            }
+            /* `Painter.span`: clipped to the picture's columns, and nothing
+             * when the clipped run is empty. */
+            const int64_t start = x1 > 0 ? x1 : 0;
+            const int64_t end = x2 < surface.cols - 1 ? x2 : surface.cols - 1;
+            if (start > end) continue;
+            surfaceRun(&surface, start, y, end - start + 1);
+        }
+    }
+    *out = NULL_VAL;
+    return true;
+}
+
 void jaiRasterRegisterPrimitives(ObjModule *ns) {
-    jaiStrDefinePrim(ns, "fill_span",   primFillSpan,   10, 10);
-    jaiStrDefinePrim(ns, "draw_line",   primDrawLine,   12, 12);
-    jaiStrDefinePrim(ns, "draw_lines",  primDrawLines,   9, 9);
-    jaiStrDefinePrim(ns, "fill_convex", primFillConvex, 11, 11);
+    jaiStrDefinePrim(ns, "fill_span",     primFillSpan,     10, 10);
+    jaiStrDefinePrim(ns, "draw_line",     primDrawLine,     12, 12);
+    jaiStrDefinePrim(ns, "draw_lines",    primDrawLines,     9, 9);
+    jaiStrDefinePrim(ns, "fill_convex",   primFillConvex,   11, 11);
+    jaiStrDefinePrim(ns, "fill_segments", primFillSegments, 13, 13);
 }
