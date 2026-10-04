@@ -124,9 +124,50 @@ pub class Moments: Printable {
     fn __str__(self) -> str { return self.to_str() }
 }
 
+#: Whether `moments` and `contour_area` ask their primitives
+#: first. Read once; `JAICV_NATIVE_MEASURES=0` keeps the loops below, which
+#: they are checked against. A blob detector asks each of a few thousand
+#: contours for its area and its moments, and `moments` built a list of
+#: `Point2f` for every one before it began: 3600 blob contours took 22.5 ms of
+#: moments against OpenCV's 8.8.
+let _native_measures = (env("JAICV_NATIVE_MEASURES") ?? "1") != "0"
+
+#: Where `points_moments` leaves its ten sums, kept between calls.
+var _moment_sums: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
 #: The moments of a polygon.
 pub fn moments(contour: list[Point]) -> Moments {
+    #: The ten sums `moments_f` accumulates, from `__prim__.points_moments`
+    #: over the points as they are; false for points it cannot read.
+    if _native_measures and contour.len() > 0 and __prim__.points_moments(contour, _moment_sums) {
+        return moments_of_sums(_moment_sums)
+    }
     return moments_f([Point2f(float(point.x), float(point.y)) for point in contour])
+}
+
+#: The moments from the ten sums Green's theorem gives over a polygon.
+fn moments_of_sums(a: list[float]) -> Moments {
+    let a00 = a[0]
+    if math.fabs(a00) <= EPSILON {
+        return Moments([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    }
+    #: The sign of the enclosed area carries through every weight, so a contour
+    #: wound the other way still reports a positive `m00`.
+    let sign = if a00 > 0.0 { 1.0 } else { -1.0 }
+    return Moments(
+        [
+            a00 * sign / 2.0,
+            a[1] * sign / 6.0,
+            a[2] * sign / 6.0,
+            a[3] * sign / 12.0,
+            a[4] * sign / 24.0,
+            a[5] * sign / 12.0,
+            a[6] * sign / 20.0,
+            a[7] * sign / 60.0,
+            a[8] * sign / 60.0,
+            a[9] * sign / 20.0,
+        ]
+    )
 }
 
 #: The moments of a polygon whose corners are not on whole pixels.
@@ -276,6 +317,18 @@ pub fn hu_moments(source: Moments) -> list[float] {
 pub fn contour_area(contour: list[Point], oriented: bool = false) -> float {
     let count = contour.len()
     if count < 2 { return 0.0 }
+    #: The same sum from `__prim__.points_area`; null for points it cannot
+    #: read. The loop is a function of its own so that the primitive's result,
+    #: which the tier knows only as an object, never shares a slot with the
+    #: points the loop reads -- sharing one cost the loop the compiled tier.
+    if _native_measures {
+        let area = __prim__.points_area(contour, oriented)
+        if area is not null { return area }
+    }
+    return area_by_loop(contour, count, oriented)
+}
+
+fn area_by_loop(contour: list[Point], count: int, oriented: bool) -> float {
     var total = 0.0
     var previous = contour[count - 1]
     for index in 0..count {

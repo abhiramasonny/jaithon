@@ -813,10 +813,103 @@ static bool primPointsMinCircle(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* --- measures over a contour ---------------------------------------- */
+
+/* `points_area(contour, oriented)` -- `contour_area` for two or more points:
+ * the shoelace sum in doubles, halved, its magnitude unless `oriented`. Null
+ * when a point is not an object with integer `x` and `y`. */
+static bool primPointsArea(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *contour;
+    if (!jaiArgList(args[0], 1, "points_area", &contour)) return false;
+    if (!IS_BOOL(args[1])) return jaiThrow(vm.cTypeError, "points_area(): oriented must be a bool");
+    const int count = contour->count;
+    *out = NULL_VAL;
+    if (count < 2) return true;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    int64_t px, py;
+    if (!jaiReadPoint(&reader, jaiListGet(contour, count - 1), &px, &py)) return true;
+    double total = 0.0;
+    for (int i = 0; i < count; i++) {
+        int64_t x, y;
+        if (!jaiReadPoint(&reader, jaiListGet(contour, i), &x, &y)) return true;
+        total += (double)px * (double)y - (double)x * (double)py;
+        px = x;
+        py = y;
+    }
+    total *= 0.5;
+    *out = FLOAT_VAL(AS_BOOL(args[1]) ? total : fabs(total));
+    return true;
+}
+
+/* `points_moments(contour, out)` -- the ten sums `moments_f` accumulates over
+ * a polygon by Green's theorem, for a contour of one or more points, written
+ * to `out` in its order: a00, a10, a01, a20, a11, a02, a30, a21, a12, a03.
+ * Every product and sum is the one `moments_f` forms, in its order, over
+ * `float(point.x)` and `float(point.y)`, so `moments` makes the same Moments
+ * from them to the bit -- without the list of `Point2f` it used to build
+ * first. False, writing nothing, when a point is not an object with integer
+ * `x` and `y`. */
+static bool primPointsMoments(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *contour, *sums;
+    if (!jaiArgList(args[0], 1, "points_moments", &contour)) return false;
+    if (!jaiArgList(args[1], 2, "points_moments", &sums)) return false;
+    if (sums->count < 10) {
+        return jaiThrow(vm.cValueError, "points_moments(): the sums list holds %d of 10 values",
+                        sums->count);
+    }
+    *out = BOOL_VAL(false);
+    const int count = contour->count;
+    if (count == 0) return true;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    int64_t ix, iy;
+    if (!jaiReadPoint(&reader, jaiListGet(contour, count - 1), &ix, &iy)) return true;
+    double a00 = 0.0, a10 = 0.0, a01 = 0.0, a20 = 0.0, a11 = 0.0;
+    double a02 = 0.0, a30 = 0.0, a21 = 0.0, a12 = 0.0, a03 = 0.0;
+    double px = (double)ix;
+    double py = (double)iy;
+    double px2 = px * px;
+    double py2 = py * py;
+    for (int index = 0; index < count; index++) {
+        if (!jaiReadPoint(&reader, jaiListGet(contour, index), &ix, &iy)) return true;
+        const double x = (double)ix;
+        const double y = (double)iy;
+        const double x2 = x * x;
+        const double y2 = y * y;
+        const double cross = px * y - x * py;
+        const double sx = px + x;
+        const double sy = py + y;
+        a00 += cross;
+        a10 += cross * sx;
+        a01 += cross * sy;
+        a20 += cross * (px * sx + x2);
+        a11 += cross * (px * (sy + py) + x * (sy + y));
+        a02 += cross * (py * sy + y2);
+        a30 += cross * sx * (px2 + x2);
+        a03 += cross * sy * (py2 + y2);
+        a21 += cross * (px2 * (3.0 * py + y) + 2.0 * px * x * sy + x2 * (py + 3.0 * y));
+        a12 += cross * (py2 * (3.0 * px + x) + 2.0 * py * y * sx + y2 * (px + 3.0 * x));
+        px = x;
+        py = y;
+        px2 = x2;
+        py2 = y2;
+    }
+    const double values[10] = {a00, a10, a01, a20, a11, a02, a30, a21, a12, a03};
+    for (int i = 0; i < 10; i++) jaiListPut(sums, i, FLOAT_VAL(values[i]));
+    jaiListTouch(sums);
+    *out = BOOL_VAL(true);
+    return true;
+}
+
 void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_hull",    primPointsHull,   2, 2);
     jaiStrDefinePrim(ns, "points_min_box", primPointsMinBox, 2, 2);
     jaiStrDefinePrim(ns, "points_approx", primPointsApprox, 3, 3);
     jaiStrDefinePrim(ns, "points_arc_length", primPointsArcLength, 2, 2);
     jaiStrDefinePrim(ns, "points_min_circle", primPointsMinCircle, 2, 2);
+    jaiStrDefinePrim(ns, "points_area", primPointsArea, 2, 2);
+    jaiStrDefinePrim(ns, "points_moments", primPointsMoments, 2, 2);
 }
