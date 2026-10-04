@@ -262,6 +262,64 @@ static void warmFrontEnd(void) {
     jaiSnapshotAudit("warmFrontEnd");
 }
 
+/* A library module the seed carries -- std.math, std.str, std.json and the
+ * rest of the compiler's own imports -- is served from the seed when its cache
+ * misses, as long as the seed's image is exactly what a cache entry would
+ * have to be: compiled from this source (the hash its header records) with
+ * these flags. It is then a cache hit from a different store, and the
+ * compiler does not have to be built to produce it.
+ *
+ * Those modules never had cache files: the warm below loaded them from the
+ * seed inside the bootstrap window, so the ordinary door that compiles and
+ * caches a module was never reached for them. Every run of a program that
+ * imported std.math therefore built the whole front end -- 98 modules, 109.6M
+ * instructions for `import std.math; print(math.PI)` against 18.6M for a hello
+ * world -- to hand it std.math from the seed at the end. So did every run of
+ * every program on jaicv, jaitensor, jainum or jaiframe.
+ *
+ * Front-end modules (lib/jaithon) are excluded: they must arrive as one set
+ * with the compiler, see maybeWarmFor. Serving one cannot start a warm
+ * part-way through itself -- the cycle warmFrontEnd's comment describes --
+ * because every import of a seeded module is seeded (`make
+ * seed-closure-check`) and no lib/std module imports lib/jaithon; and when the
+ * seed does not match, the warm happens exactly as before. `--no-cache` is
+ * left alone. JAITHON_SEED_SERVES_LIBRARY=0 restores the warm. */
+static bool seedServesLibrary(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_SEED_SERVES_LIBRARY");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+/* The seed's image for `path` when it may stand in for a cache entry of a
+ * source hashing to `hash`, else NULL. */
+static const JaiSeedEntry *seedStandsInFor(const char *path, uint64_t hash) {
+    const JaiRunOptions *opts = options();
+    if (!opts->useCache || !seedServesLibrary() || seedDisabled()) return NULL;
+    const JaiSeedEntry *seeded = jaiSeedFind(path);
+    if (seeded == NULL || strncmp(seeded->module, "jaithon/", 8) == 0) return NULL;
+    uint64_t recorded = 0;
+    if (!jaicRecordedHash(seeded->image, seeded->length, &recorded) ||
+        recorded != hash)
+        return NULL;
+    uint32_t flags = cacheFlagsFor(&opts->codegen, true);
+    if (!jaiCacheFlagsMatchBuffer(seeded->image, seeded->length, flags)) return NULL;
+    return seeded;
+}
+
+/* seedStandsInFor, for a caller that has not read the source yet. */
+static bool seedStandsInForFile(const char *path) {
+    if (!seedServesLibrary()) return false;
+    size_t length = 0;
+    char *text = jaiReadFile(path, &length);
+    if (text == NULL) return false;
+    uint64_t hash = jaiSourceHash(text, length);
+    JAI_FREE_ARRAY(char, text, length + 1);
+    return seedStandsInFor(path, hash) != NULL;
+}
+
 /* Warm the front end if loading `path` is about to need it.
  *
  * Two reasons to warm, and both are necessary.
@@ -299,6 +357,7 @@ static bool maybeWarmFor(const char *path) {
         const JaiRunOptions *opts = options();
         uint32_t flags = cacheFlagsFor(&opts->codegen, true);
         if (opts->useCache && cacheFlagsMatch(path, flags)) return false;
+        if (seeded != NULL && seedStandsInForFile(path)) return false;
     }
     warmFrontEnd();
     return true;
@@ -345,6 +404,20 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
                 return cached;
             }
             /* Stale, corrupt, or from another compiler: recompile silently. */
+        }
+    }
+
+    /* A seeded library module, outside the window: see seedServesLibrary. */
+    if (!sLoadingFrontEnd && sOptions.selfHosted) {
+        const JaiSeedEntry *seeded = seedStandsInFor(path, hash);
+        if (seeded != NULL) {
+            ObjFunction *fromSeed = jaiDeserializeSeed(seeded->image,
+                                                       seeded->length,
+                                                       module, hash);
+            if (fromSeed != NULL) {
+                if (traceLoads()) fprintf(stderr, "load seed    %s\n", path);
+                return fromSeed;
+            }
         }
     }
 

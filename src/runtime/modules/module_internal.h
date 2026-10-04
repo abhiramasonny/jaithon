@@ -33,6 +33,9 @@ bool cacheFlagsMatch(const char *sourcePath, uint32_t flags);
 bool jaiCacheFlagsMatchBuffer(const uint8_t *head, size_t length,
                               uint32_t flags);
 
+/* The source hash an image's header records; false when it has no header. */
+bool jaicRecordedHash(const uint8_t *data, size_t size, uint64_t *out);
+
 const char *jaicRejectionReason(const uint8_t *data, size_t size,
                                 uint64_t expectedHash, char *buf,
                                 size_t bufSize);

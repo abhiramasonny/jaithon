@@ -70,6 +70,12 @@ static uint64_t readLE64(const uint8_t *p) {
     return (uint64_t)readLE32(p) | ((uint64_t)readLE32(p + 4) << 32);
 }
 
+bool jaicRecordedHash(const uint8_t *data, size_t size, uint64_t *out) {
+    if (data == NULL || size < 32 || memcmp(data, JAIC_MAGIC, 4) != 0) return false;
+    *out = readLE64(data + 16);
+    return true;
+}
+
 const char *jaicRejectionReason(const uint8_t *data, size_t size,
                                 uint64_t expectedHash, char *buf,
                                 size_t bufSize) {
