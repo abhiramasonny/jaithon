@@ -36,6 +36,7 @@ SECTION = "## Every switch this tier reads"
 ELSEWHERE = {
     "JAITHON_MEGA_STRESS": "src/vm/vm_cache.c",
     "JAITHON_LAZY_ENUMERATE": "src/vm/vm.c",
+    "JAITHON_LIST_SHAPE_GROWN": "src/vm/object/object_collection.c",
 }
 
 
