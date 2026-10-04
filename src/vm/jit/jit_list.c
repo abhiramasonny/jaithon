@@ -391,7 +391,7 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
 /* The register a hoisted list's local lives in, or 0. The loop tier's homes
  * are slotXReg; the function tier's are its fixed x19.. registers unless the
  * frame was planned, when they are slotXReg too. A dynamic slot has none. */
-unsigned hoistListReg(const Emit *e, unsigned slot) {
+static unsigned hoistListReg(const Emit *e, unsigned slot) {
     if (slot > JIT_MAX_SLOTS || e->dynamicLocal[slot]) return 0;
     if (e->osr || e->spilled) return e->slotXReg[slot];
     return localHomeX(e, slot);
