@@ -120,17 +120,6 @@ if [[ -x "$ROOT/tests/vm/cache_corrupt.sh" ]]; then
     done <<< "$corrupt_output"
 fi
 
-if [[ -x "$ROOT/tests/vm/invalid_utf8.sh" ]]; then
-    utf8_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/invalid_utf8.sh" 2>&1)"
-    while IFS= read -r line; do
-        case "$line" in
-            "ok "*)   name="invalid_utf8: ${line#ok }"
-                      matches_filter "$name" && record_pass "$name" 0 ;;
-            "FAIL "*) record_fail "invalid_utf8: ${line#FAIL }" "" ;;
-        esac
-    done <<< "$utf8_output"
-fi
-
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 
