@@ -180,6 +180,16 @@ static void exportEnvironmentFlags(const JaiCliOptions *opts)
         (void)setenv("JAITHON_NO_PRELUDE", "1", 1);
 }
 
+static bool freeAtExit(void)
+{
+#ifdef JAI_DEBUG
+    return true;
+#else
+    const char *flag = getenv("JAITHON_FREE_AT_EXIT");
+    return flag != NULL && flag[0] != '\0' && strcmp(flag, "0") != 0;
+#endif
+}
+
 int main(int argc, char **argv)
 {
     initLocale();
@@ -247,7 +257,15 @@ int main(int argc, char **argv)
         jaiVMPrintStats(stderr);
 
     cliFreeOptions(&opts);
-    jaiVMFree();
+    /* Freeing every live object one call at a time is pure cost when the
+     * process is about to hand the whole address space back: 5.1ms of
+     * binary_trees' 53ms, 3.1ms of `check parser.jai`, 1.2ms of json_parse.
+     * Nothing observable depends on it -- an unclosed ObjFile is a stdio
+     * stream, and exit() flushes those. Debug builds keep the teardown so a
+     * leak or a bad free still shows, and JAITHON_FREE_AT_EXIT=1 asks for it
+     * in release. */
+    if (freeAtExit())
+        jaiVMFree();
     jaiDiagFree(&gDiags);
     jaiSourceFreeAll();
 

@@ -65,12 +65,15 @@ def summarise(rows, label):
     ins = [r["instr"] for r in rows]
     peak = [r["peak"] for r in rows if r["peak"]]
     rc = sorted({r["rc"] for r in rows})
+    if rc != [0]:
+        print(f"WARNING {label}: exit status {rc} -- a failing command measures"
+              " nothing (a shell that did not split the command into words?)")
     med = statistics.median(cyc)
     spread = (max(cyc) - min(cyc)) / med * 100 if med else 0.0
     print(f"{label:>10}: cycles median {med/1e6:10.2f}M  min {min(cyc)/1e6:10.2f}M"
           f"  spread {spread:5.2f}%  instr {statistics.median(ins)/1e6:10.2f}M"
           f"  peak {max(peak)/1e6 if peak else 0:7.1f}MB  rc {rc}")
-    return med
+    return med, min(cyc)
 
 
 def main():
@@ -110,13 +113,19 @@ def main():
             A.append(run_once(*side(0)))
             B.append(run_once(*side(1)))
             A2.append(run_once(*side(0)))
-    ma = summarise(A, "A")
-    mb = summarise(B, "B")
-    ma2 = summarise(A2, "A again")
+    ma, na = summarise(A, "A")
+    mb, nb = summarise(B, "B")
+    ma2, na2 = summarise(A2, "A again")
     floor = abs(ma2 - ma) / ma * 100
     eff = (mb - ma) / ma * 100
     print(f"B vs A: {eff:+.2f}% cycles (A vs A floor {floor:.2f}%)"
           f"  speedup {ma / mb:.3f}x")
+    # The minimum is the run that saw the least interference -- on a loaded
+    # M2 a process can land on an efficiency core, which moves cycles far more
+    # than any change being measured, so on a busy machine trust this line.
+    fa = min(na, na2)
+    print(f"by min: speedup {fa / nb:.3f}x  (A mins {na/1e6:.2f}M / {na2/1e6:.2f}M,"
+          f" B min {nb/1e6:.2f}M)")
 
 
 if __name__ == "__main__":
