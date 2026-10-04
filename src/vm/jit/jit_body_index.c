@@ -19,7 +19,32 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             IS_STRING(e->stackSeen[e->depth - 2])) {
             unsigned rIdx = pushReg(e) - 1;
             unsigned rStr = valueXReg(e, e->valueDepth - 2);
+            int sSlot = e->stackLocal[e->depth - 2];
+            noteSlotIndexed(e, sSlot);
+            int sh = hoistForStr(e, sSlot);
 
+            if (sh >= 0) {
+                /* The loop head proved both facts below and loaded the
+                 * header; see emitHoistsAt. Only the bounds and the byte
+                 * itself are per character. */
+                emitBoundsNormalise(e, rIdx, e->hoist[sh].countReg,
+                                    JIT_SCRATCH_B, false);
+                emit(e, jaiA64AddX(JIT_SCRATCH_C, e->hoist[sh].itemsReg,
+                                   JIT_SCRATCH_B));
+                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            } else if (strFactAscii(e, sSlot)) {
+            /* The loop head proved the two facts the guards below would
+             * (see planStrFacts); the header itself is reloaded, because
+             * a loop that calls has no register to keep it in. */
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rStr,
+                               (unsigned)offsetof(ObjString, length)));
+            emitBoundsNormalise(e, rIdx, JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                false);
+            emit(e, jaiA64LdrX(JIT_SCRATCH_C, rStr,
+                               (unsigned)offsetof(ObjString, chars)));
+            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_B));
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            } else {
             /* Really a string, and not something else this object slot
              * happened to hold when the loop was compiled. */
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rStr,
@@ -47,6 +72,7 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
                                (unsigned)offsetof(ObjString, chars)));
             emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_B));
             emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            }
             /* 128 is an imm12, so the compare needs no register: a
              * materialised constant on a body this hot is not free the way
              * a register copy is. */

@@ -461,6 +461,9 @@ this table complete in both directions.
 | `JAITHON_JIT_STR_ITER` | on | Iterating a string. |
 | `JAITHON_JIT_ITER_STG` | on | Dispatch on list storage at a nested `for-in`. |
 | `JAITHON_JIT_STR_HEAD` | on | `for c in <string>` as an OSR loop head. |
+| `JAITHON_JIT_CONST_ASCII` | on | Mark a one-character ASCII string literal as the ASCII table's own singleton at `OP_CONST`, so `==` and the one-byte ordering arm stop guarding the literal at run time. |
+| `JAITHON_JIT_STR_FACTS` | on | Prove once at an OSR loop head, with no register, that a loop-invariant string local is a string, all one-byte (for `s[i]`) and/or interned (for `==`), so the per-iteration guards go even in a loop that calls. Off restores them. |
+| `JAITHON_JIT_STR_HOIST` | on | Hoist a loop-invariant string local's header (`chars`, `length`) and its string and all-one-byte proofs to the loop head, so `s[i]` inside a call-free OSR loop is a bounds check and a byte load. Off restores the per-character guards. |
 | `JAITHON_JIT_COMP_ACC` | on | A list comprehension's append, through the frame. |
 | `JAITHON_JIT_BUILTIN_CLASS` | on | Resolve a builtin class (every exception type). |
 | `JAITHON_JIT_INVOKE_SOFT` | on | Master switch for emitInvoke's dead-path softening. |
@@ -494,10 +497,10 @@ this table complete in both directions.
 | `JAI_JIT_RECON` | Deopt reconstructions, one line each. A body entered and abandoned every call shows up here and nowhere else. |
 | `JAI_JIT_TRACE` | A body going hot. |
 | `JAI_JIT_DUMP` | Disassembly of the named function (exact name match). |
+| `JAI_JIT_PERFMAP` | Appends `start size name` for every installed body (OSR forms as `name@osrN`) to `/tmp/jaithon-perf-<pid>.map`, so a sampling profile (`xctrace record --template 'Time Profiler'`) can attribute compiled code to functions. |
 | `JAITHON_JIT_COLLECT_CLASHES` | Kind clashes gathered during a walk. |
 
 `JAI_JIT_ATTRIB=1` with `--stats` gives exact per-function attribution of
-| `JAI_JIT_PERFMAP` | Appends `start size name` for every installed body (OSR forms as `name@osrN`) to `/tmp/jaithon-perf-<pid>.map`, so a sampling profile (`xctrace record --template 'Time Profiler'`) can attribute compiled code to functions. |
 interpreted work (`sum(attrib) == vm.instructionCount`);
 `scripts/dev/jit_report.py` drives it. Rank refusals by **distinct sites**, not
 events -- the two orderings are nearly opposite.

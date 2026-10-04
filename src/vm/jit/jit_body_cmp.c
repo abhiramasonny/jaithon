@@ -145,10 +145,15 @@ bool emitCompare(Emit *e, uint8_t op, int *offp) {
              * this: one-character strings are shared singletons). Anything not interned, or not a string, deopts and the interpreter compares properly. */
             for (unsigned side = 0; side < 2; side++) {
                 unsigned r = side == 0 ? ra : rb;
+                unsigned at = e->depth - (side == 0 ? 2u : 1u);
                 /* Already known to be an interned string: `s[i] == t[j]`
                  * would otherwise guard twelve instructions to reach one
                  * compare. */
-                if (e->stackAscii[e->depth - (side == 0 ? 2u : 1u)]) continue;
+                if (e->stackAscii[at]) continue;
+                /* Or proved so once at the loop head: a loop-invariant
+                 * local, `text[i] == first`. See planStrFacts. */
+                noteSlotStrEq(e, e->stackLocal[at]);
+                if (strFactInterned(e, e->stackLocal[at])) continue;
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
                                    (unsigned)offsetof(Obj, type)));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
@@ -410,8 +415,11 @@ bool emitJumpIfCmpFalse(Emit *e, const uint8_t *code, int *offp) {
             unsigned ra = valueXReg(e, e->valueDepth - 2);
             for (unsigned side = 0; side < 2; side++) {
                 unsigned r = side == 0 ? ra : rb;
-                /* See the same skip in OP_EQ. */
-                if (e->stackAscii[e->depth - (side == 0 ? 2u : 1u)]) continue;
+                unsigned at = e->depth - (side == 0 ? 2u : 1u);
+                /* See the same two skips in OP_EQ. */
+                if (e->stackAscii[at]) continue;
+                noteSlotStrEq(e, e->stackLocal[at]);
+                if (strFactInterned(e, e->stackLocal[at])) continue;
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, r,
                                    (unsigned)offsetof(Obj, type)));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
@@ -524,6 +532,8 @@ bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
             if (slot == 0) e->usesSlot0 = true;
             settleAll(e);          /* this path guards */
             unsigned rs = localIn(e, slot, JIT_SCRATCH_C);
+            noteSlotStrEq(e, (int)slot);
+            if (!strFactInterned(e, (int)slot)) {
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rs,
                                (unsigned)offsetof(Obj, type)));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
@@ -534,6 +544,7 @@ bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
                                   (unsigned)offsetof(Obj, subFlag)));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
             branchOnDeopt(e, JAI_A64_EQ);
+            }
             emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(k));
             emit(e, jaiA64SubsXReg(31, rs, JIT_SCRATCH_B));
             branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);

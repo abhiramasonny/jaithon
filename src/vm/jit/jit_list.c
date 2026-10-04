@@ -241,12 +241,173 @@ bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi) {
 int hoistFor(const Emit *e, int slot) {
     if (slot < 0 || e->inlining) return -1;
     for (unsigned i = 0; i < e->hoistCount; i++) {
+        if (e->hoist[i].str) continue;
         if (e->hoist[i].slot != (uint8_t)slot) continue;
         if (e->curOffset < e->hoist[i].top) continue;
         if (e->curOffset >= e->hoist[i].end) continue;
         return (int)i;
     }
     return -1;
+}
+
+/* The same lookup for a hoisted STRING header. Separate so that no list arm
+ * can ever pick up a `chars`/`length` pair and read it as `items`/`count`. */
+int hoistForStr(const Emit *e, int slot) {
+    if (slot < 0 || e->inlining) return -1;
+    for (unsigned i = 0; i < e->hoistCount; i++) {
+        if (!e->hoist[i].str) continue;
+        if (e->hoist[i].slot != (uint8_t)slot) continue;
+        if (e->curOffset < e->hoist[i].top) continue;
+        if (e->curOffset >= e->hoist[i].end) continue;
+        return (int)i;
+    }
+    return -1;
+}
+
+/* JAITHON_JIT_STR_FACTS=0 stops planStrFacts proving anything at a loop head,
+ * so each `s[i]` and each identity compare on a loop-invariant string local
+ * guards its own operand again, every iteration. Default on. */
+bool jitStrFacts(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_STR_FACTS");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Measuring pass only: `slot` was read as one side of a string identity
+ * compare here. Weighted as noteSlotIndexed is. */
+void noteSlotStrEq(Emit *e, int slot) {
+    if (!e->measuring || e->inlining || slot < 0 || slot > (int)JIT_MAX_SLOTS) {
+        return;
+    }
+    unsigned w = 1u;
+    if (e->loopDepth != NULL && e->curOffset < e->loopDepthCount) {
+        unsigned d = e->loopDepth[e->curOffset];
+        if (d > 6u) d = 6u;
+        w = 1u << (2u * d);
+    }
+    e->slotEqUse[slot] += w;
+    if (e->curOffset < e->slotEqLo[slot]) e->slotEqLo[slot] = e->curOffset;
+    if (e->curOffset > e->slotEqHi[slot]) e->slotEqHi[slot] = e->curOffset;
+}
+
+static int strFactFor(const Emit *e, int slot) {
+    if (slot < 0 || e->inlining || e->measuring) return -1;
+    for (unsigned i = 0; i < e->strFactCount; i++) {
+        if (e->strFact[i].slot != (uint8_t)slot) continue;
+        if (e->curOffset < e->strFact[i].top) continue;
+        if (e->curOffset >= e->strFact[i].end) continue;
+        return (int)i;
+    }
+    return -1;
+}
+
+/* Whether a loop head has already proved that local `slot` holds a string
+ * whose every scalar is one byte -- the two guards `s[i]` opens with. */
+bool strFactAscii(const Emit *e, int slot) {
+    int f = strFactFor(e, slot);
+    return f >= 0 && e->strFact[f].ascii;
+}
+
+/* Whether a loop head has already proved that local `slot` holds an interned
+ * string -- the two guards each side of a string identity compare opens with. */
+bool strFactInterned(const Emit *e, int slot) {
+    int f = strFactFor(e, slot);
+    return f >= 0 && e->strFact[f].interned;
+}
+
+static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end);
+
+/* Register-free string facts, proved once at a loop head.
+ *
+ * A string local the loop never writes is the same string on every iteration,
+ * and a string never changes: not its type, not its bytes, not its scalar
+ * count once counted, and interning is never undone. So the guards `s[i]` and
+ * `c == first` open with -- "is a string", "every scalar is one byte", "is
+ * interned" -- are loop invariants, and need proving once per entry to the
+ * loop rather than once per character.
+ *
+ * Unlike planHoists' headers these need no register, so a call inside the loop
+ * does not disqualify them. What a call could do is write the local, and the
+ * only way it can is through a by-reference capture; those slots are never
+ * given a register (chunkByRefCaptures), which is why one is required here.
+ *
+ * Offered only where the sample already passes, so a loop whose string is not
+ * ASCII, or whose comparand is not interned, keeps its per-site guards and
+ * deopts exactly where it always did. A slot whose header was hoisted over the
+ * same stretch needs no ascii fact; the header's own guards already are one. */
+void planStrFacts(Emit *e, ObjFunction *fn) {
+    if (e->measuring || !e->osr || !jitStrFacts()) return;
+    const Chunk *c = &fn->chunk;
+    for (unsigned s = 0; s < e->locals && s <= JIT_MAX_SLOTS; s++) {
+        if (e->strFactCount >= JIT_MAX_STR_FACTS) break;
+        if (e->localKind[s] != SLOT_OBJ) continue;
+        if (e->slotXReg[s] == 0) continue;
+        Value sv = seenLocal(e, s);
+        if (!IS_STRING(sv)) continue;
+        ObjString *ss = AS_STRING(sv);
+        bool wantAscii = e->slotIndexUse[s] != 0 &&
+                         ss->scalars == ss->length;
+        bool wantInterned = e->slotEqUse[s] != 0 && JAI_STR_INTERNED(ss);
+        if (!wantAscii && !wantInterned) continue;
+        uint32_t lo = UINT32_MAX, hi = 0;
+        if (wantAscii) {
+            if (e->slotIndexLo[s] < lo) lo = e->slotIndexLo[s];
+            if (e->slotIndexHi[s] > hi) hi = e->slotIndexHi[s];
+        }
+        if (wantInterned) {
+            if (e->slotEqLo[s] < lo) lo = e->slotEqLo[s];
+            if (e->slotEqHi[s] > hi) hi = e->slotEqHi[s];
+        }
+        uint32_t bestTop = 0, bestEnd = 0;
+        for (int at = (int)e->osrTop; at < (int)e->osrEnd;) {
+            int len = instructionLength(c, at);
+            if (len <= 0) break;
+            uint32_t lt = (uint32_t)at;
+            uint32_t le = loopBodyEnd(c, lt);
+            at += len;
+            if (le == 0 || le <= lt || le > e->osrEnd) continue;
+            if (lo < lt || hi >= le) continue;
+            if (e->slotWriteHi[s] >= lt && e->slotWriteLo[s] < le) continue;
+            if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
+                bestTop = lt; bestEnd = le;
+            }
+        }
+        if (bestEnd == 0) continue;
+        /* The header, where there is one over this stretch, already proves
+         * both of the ascii fact's halves. */
+        if (wantAscii) {
+            for (unsigned h = 0; h < e->hoistCount; h++) {
+                if (e->hoist[h].str && e->hoist[h].slot == (uint8_t)s &&
+                    e->hoist[h].top <= bestTop && e->hoist[h].end >= bestEnd) {
+                    wantAscii = false;
+                }
+            }
+        }
+        if (!wantAscii && !wantInterned) continue;
+        unsigned k = e->strFactCount++;
+        e->strFact[k].top      = bestTop;
+        e->strFact[k].end      = bestEnd;
+        e->strFact[k].slot     = (uint8_t)s;
+        e->strFact[k].ascii    = wantAscii;
+        e->strFact[k].interned = wantInterned;
+    }
+}
+
+/* JAITHON_JIT_STR_HOIST=0 stops planHoists offering string locals, so every
+ * `s[i]` in a loop goes back to proving, per character, that `s` is a string
+ * and that it is all one-byte scalars, and to reloading `chars` and `length`.
+ * Default on. */
+bool jitStrHoist(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_STR_HOIST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
 }
 
 /* Nothing outside [top, end) may branch INTO it. The hoisted loads sit just
@@ -317,11 +478,34 @@ void planHoists(Emit *e, ObjFunction *fn) {
     if (e->measuring || !e->osr) return;
     const Chunk *c = &fn->chunk;
 
-    struct { uint32_t top, end, use; uint8_t slot; } cand[JIT_MAX_SLOTS + 1];
+    struct { uint32_t top, end, use; uint8_t slot; bool str; }
+        cand[JIT_MAX_SLOTS + 1];
     unsigned ncand = 0;
 
     for (unsigned s = 0; s < e->locals && s <= JIT_MAX_SLOTS; s++) {
-        if (e->localKind[s] != SLOT_LIST) continue;
+        /* A string local hoists for the same reasons a list does, and for one
+         * more: a string never changes at all, so the only thing that can
+         * make its header stale is a write to the LOCAL -- the same range
+         * test below. What the head proves for it is that the local holds a
+         * string and that every scalar in it is one byte, which is what
+         * each `s[i]` would otherwise prove per character.
+         *
+         * Offered only when the sample already passes both, so a loop over a
+         * string that is not ASCII is left exactly as it was: its per-site
+         * guards deopt where they always did, rather than the head deopting
+         * every entry. `scalars` is UINT32_MAX until something asks, and an
+         * unknown count is not a pass -- the per-site path is what fills it
+         * in. */
+        bool str = false;
+        if (e->localKind[s] == SLOT_OBJ) {
+            Value sv = seenLocal(e, s);
+            if (!jitStrHoist() || !IS_STRING(sv)) continue;
+            ObjString *ss = AS_STRING(sv);
+            if (ss->scalars != ss->length) continue;
+            str = true;
+        } else if (e->localKind[s] != SLOT_LIST) {
+            continue;
+        }
         if (e->slotXReg[s] == 0) continue;   /* no register to load from */
         if (e->slotIndexUse[s] == 0) continue;
         uint32_t bestTop = 0, bestEnd = 0;
@@ -349,6 +533,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
         cand[ncand].end  = bestEnd;
         cand[ncand].use  = e->slotIndexUse[s];
         cand[ncand].slot = (uint8_t)s;
+        cand[ncand].str  = str;
         ncand++;
     }
 
@@ -370,6 +555,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
         e->hoist[e->hoistCount].itemsReg = (uint8_t)rI;
         e->hoist[e->hoistCount].countReg = (uint8_t)rC;
         e->hoist[e->hoistCount].rangeOk  = false;
+        e->hoist[e->hoistCount].str      = cand[pick].str;
         uint32_t ht = cand[pick].top;
         if (ht + 9u <= (uint32_t)c->count && c->code[ht] == OP_FOR_RANGE_BIND) {
             e->hoist[e->hoistCount].rangeOk = true;
@@ -434,8 +620,57 @@ void emitHoistsAt(Emit *e, uint32_t off) {
      * instruction and a guard taken against it resumes somewhere whose operand
      * model has already been consumed. */
     if (e->inlining) return;
+    for (unsigned i = 0; i < e->strFactCount; i++) {
+        if (e->strFact[i].top != off) continue;
+        /* See planStrFacts. A miss resumes the interpreter at the head with
+         * nothing run, which is where the per-site guard would have sent it
+         * the first time through. */
+        unsigned rs = e->slotXReg[e->strFact[i].slot];
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rs, (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+        branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        if (e->strFact[i].ascii) {
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rs,
+                               (unsigned)offsetof(ObjString, length)));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_B, rs,
+                               (unsigned)offsetof(ObjString, scalars)));
+            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        }
+        if (e->strFact[i].interned) {
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_A, rs,
+                                  (unsigned)offsetof(Obj, subFlag)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+            branchOnDeoptAt(e, JAI_A64_EQ, off, false);
+        }
+    }
     for (unsigned i = 0; i < e->hoistCount; i++) {
         if (e->hoist[i].top != off) continue;
+        if (e->hoist[i].str) {
+            /* The two facts every `s[i]` in the loop would otherwise prove
+             * for itself, proved once: the local holds a string, and its
+             * scalar count equals its byte count. Strings are immutable and
+             * the collector does not move them, so neither fact -- nor
+             * `chars` or `length` -- can change while the local is not
+             * written, which planHoists has already established for this
+             * range. A miss resumes the interpreter at the head with nothing
+             * run, exactly where the per-site guard would have sent it on
+             * the first character. */
+            unsigned rs = e->slotXReg[e->hoist[i].slot];
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rs,
+                               (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
+            emit(e, jaiA64LdrW(e->hoist[i].countReg, rs,
+                               (unsigned)offsetof(ObjString, length)));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_B, rs,
+                               (unsigned)offsetof(ObjString, scalars)));
+            emit(e, jaiA64SubsXReg(31, e->hoist[i].countReg, JIT_SCRATCH_B));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
+            emit(e, jaiA64LdrX(e->hoist[i].itemsReg, rs,
+                               (unsigned)offsetof(ObjString, chars)));
+            continue;
+        }
         /* Outside the loop, so the function tier pays its two instructions
          * once per entry rather than per element. */
         if (!e->osr) {

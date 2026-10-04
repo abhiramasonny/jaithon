@@ -48,6 +48,9 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 /* Two registers each; four list headers is every stencil seen so far. */
 #define JIT_MAX_PIC_EXITS JAI_IC_WAYS
 #define JIT_MAX_HOIST    4u
+/* Register-free string facts (see Emit::strFact). Each costs a guard or two
+ * at its loop head and nothing inside the loop. */
+#define JIT_MAX_STR_FACTS 8u
 /* How many distinct clobber SITES the measuring pass will remember, so that
  * "does x0..x8 survive across this bytecode range" can be asked of a range
  * rather than of the whole body. Past this the body answers yes everywhere,
@@ -511,6 +514,12 @@ typedef struct {
     uint32_t  slotIndexLo[JIT_MAX_SLOTS + 1];
     uint32_t  slotIndexHi[JIT_MAX_SLOTS + 1];
     unsigned  slotIndexUse[JIT_MAX_SLOTS + 1];
+    /* Where the measuring pass saw each slot read as one side of a string
+     * identity compare -- the arm that guards "a string, and interned" on
+     * each side. Same bounds-not-a-set form as slotIndexLo/Hi. */
+    uint32_t  slotEqLo[JIT_MAX_SLOTS + 1];
+    uint32_t  slotEqHi[JIT_MAX_SLOTS + 1];
+    unsigned  slotEqUse[JIT_MAX_SLOTS + 1];
     /* Loop-invariant list headers. See planHoists. */
     struct {
         uint32_t top, end;
@@ -522,8 +531,25 @@ typedef struct {
          * where every subscript actually happens. */
         bool     rangeOk;
         uint16_t rVar, rCur, rEnd;
+        /* A STRING's header rather than a list's: itemsReg holds `chars` and
+         * countReg `length`, and the head has already proved the local is a
+         * string whose every scalar is one byte. See planHoists. */
+        bool     str;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
+    /* Loop-invariant FACTS about a string local, proved once at a loop head
+     * and spending no register: that it is a string whose scalars are all one
+     * byte (`ascii`, for `s[i]`), or an interned string (`interned`, for the
+     * identity compare). Unlike a header these survive a call -- a string
+     * never changes, the collector never moves it, interning is never undone,
+     * and the local is one the loop does not write and nothing else can. See
+     * planStrFacts. */
+    struct {
+        uint32_t top, end;
+        uint8_t  slot;
+        bool     ascii, interned;
+    } strFact[JIT_MAX_STR_FACTS];
+    unsigned  strFactCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -940,6 +966,7 @@ bool oneBytePair(const Emit *e, unsigned a, unsigned b);
 void emitOneByteString(Emit *e, unsigned at, unsigned reg, unsigned dst);
 bool jitStrCmpOn(void);
 bool jitStrCmpEqOn(void);
+bool jitConstAscii(void);
 bool preferLeafEquality(const Emit *e, unsigned da, unsigned db);
 void emitStringOrder(Emit *e);
 void emitListBoxedGuard(Emit *e, unsigned rList, unsigned scratch);
@@ -957,6 +984,13 @@ void emitElemStoreAt(Emit *e, uint8_t stg, unsigned rItems,
 void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount);
 int hoistFor(const Emit *e, int slot);
+int hoistForStr(const Emit *e, int slot);
+bool jitStrHoist(void);
+bool jitStrFacts(void);
+void planStrFacts(Emit *e, ObjFunction *fn);
+bool strFactAscii(const Emit *e, int slot);
+bool strFactInterned(const Emit *e, int slot);
+void noteSlotStrEq(Emit *e, int slot);
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
                                 int32_t *offOut, uint8_t *baseOut);
 void emitHoistsAt(Emit *e, uint32_t off);

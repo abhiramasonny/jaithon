@@ -391,6 +391,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             probe.slotWriteLo[i] = UINT32_MAX;
             probe.slotIndexLo[i] = UINT32_MAX;
+            probe.slotEqLo[i] = UINT32_MAX;
             probe.spanLo[i]   = INT32_MAX;
             probe.spanHi[i]   = INT32_MIN;
             probe.spanOk[i]   = true;
@@ -446,6 +447,9 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 e.slotIndexLo[i]  = probe.slotIndexLo[i];
                 e.slotIndexHi[i]  = probe.slotIndexHi[i];
                 e.slotIndexUse[i] = probe.slotIndexUse[i];
+                e.slotEqLo[i]     = probe.slotEqLo[i];
+                e.slotEqHi[i]     = probe.slotEqHi[i];
+                e.slotEqUse[i]    = probe.slotEqUse[i];
                 e.spanLo[i]       = probe.spanLo[i];
                 e.spanHi[i]       = probe.spanHi[i];
                 e.spanOk[i]       = probe.spanOk[i];
@@ -530,6 +534,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     }
 
     planHoists(&e, fn);
+    planStrFacts(&e, fn);
     if (getenv("JAI_JIT_WHY")) {
         if (probeRan) fprintf(stderr,
                 "[jit] osr %s at %u registers: %u reserved, %u stack "
@@ -547,6 +552,14 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                     "into x%u/x%u\n",
                     top, e.hoist[i].slot, e.hoist[i].top, e.hoist[i].end,
                     e.hoist[i].itemsReg, e.hoist[i].countReg);
+        }
+        for (unsigned i = 0; i < e.strFactCount; i++) {
+            fprintf(stderr,
+                    "[jit] osr at %u proves slot %u a%s%s string over %u..%u\n",
+                    top, e.strFact[i].slot,
+                    e.strFact[i].ascii ? " one-byte" : "",
+                    e.strFact[i].interned ? " interned" : "",
+                    e.strFact[i].top, e.strFact[i].end);
         }
     }
 
@@ -805,6 +818,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     /* Same 32-alignment as the function tier above, for the same two reasons. */
     uint8_t *entry = arenaEmit(arena, e.code, e.count);
     if (entry == NULL) return false;
+    jitPerfMapNote(entry, e.count, fn, (long)top);
 
     if (fn->osrCount >= osrFormCap()) return false;
     /* First form this function has ever recorded: fewer than 2% of functions
@@ -818,7 +832,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     form->code  = entry;
     form->top   = top;
     form->slots = (uint8_t)e.locals;
-    jitPerfMapNote(entry, e.count, fn, (long)top);
     form->iterKind = iterKind;
     /* Kind in the low nibble, ListStore in the high one. See JaiOsrForm::kinds:
      * a list slot's storage was pinned when its element loads were emitted, so
