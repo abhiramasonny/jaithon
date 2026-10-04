@@ -174,3 +174,27 @@ const JaiSeedEntry *jaiSeedFind(const char *sourcePath) {
 }
 
 size_t jaiSeedCount(void) { return JAI_SEED_N; }
+
+const char *jaiSeedModuleAt(size_t i) {
+    return i < JAI_SEED_N ? kSources[i].module : NULL;
+}
+
+size_t jaiSeedPeekAt(size_t i, unsigned char *out, size_t n) {
+    if (i >= JAI_SEED_N || out == NULL || n == 0) return 0;
+    if (n > kSources[i].raw) n = kSources[i].raw;
+    if (kEntries[i].image != NULL) {
+        memcpy(out, kEntries[i].image, n);
+        return n;
+    }
+    z_stream zs;
+    memset(&zs, 0, sizeof zs);
+    if (inflateInit(&zs) != Z_OK) return 0;
+    zs.next_in = (Bytef *)(jaiSeedBlob + kSources[i].offset);
+    zs.avail_in = (uInt)kSources[i].packed;
+    zs.next_out = out;
+    zs.avail_out = (uInt)n;
+    int rc = inflate(&zs, Z_SYNC_FLUSH);
+    size_t got = n - zs.avail_out;
+    inflateEnd(&zs);
+    return (rc == Z_OK || rc == Z_STREAM_END) && got == n ? n : 0;
+}
