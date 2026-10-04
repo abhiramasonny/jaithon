@@ -590,42 +590,6 @@ static bool primPointsApprox(int argc, Value *args, Value *out) {
     return true;
 }
 
-/* `points_arc_length(curve, closed)` -- `arc_length` for a curve of two or
- * more points: each step's length, `float` of the integer differences, summed
- * in order. Null when a point is not one, or when a difference overflows,
- * which Jaithon reports itself. */
-static bool primPointsArcLength(int argc, Value *args, Value *out) {
-    (void)argc;
-    ObjList *curve;
-    if (!jaiArgList(args[0], 1, "points_arc_length", &curve)) return false;
-    if (!IS_BOOL(args[1])) {
-        return jaiThrow(vm.cTypeError, "points_arc_length(): closed must be a bool");
-    }
-    const bool closed = AS_BOOL(args[1]);
-    const int count = curve->count;
-    *out = NULL_VAL;
-    if (count <= 1) return true;
-    JaiPointReader reader;
-    jaiPointReaderInit(&reader);
-    int64_t px, py;
-    if (!jaiReadPoint(&reader, jaiListGet(curve, closed ? count - 1 : 0), &px, &py)) return true;
-    double total = 0.0;
-    for (int index = closed ? 0 : 1; index < count; index++) {
-        int64_t x, y, dx, dy;
-        if (!jaiReadPoint(&reader, jaiListGet(curve, index), &x, &y) ||
-            __builtin_sub_overflow(x, px, &dx) || __builtin_sub_overflow(y, py, &dy)) {
-            return true;
-        }
-        const double fx = (double)dx;
-        const double fy = (double)dy;
-        total += sqrt(fx * fx + fy * fy);
-        px = x;
-        py = y;
-    }
-    *out = FLOAT_VAL(total);
-    return true;
-}
-
 /* --- the enclosing circle ------------------------------------------- */
 
 /* `points_min_circle(points, out)` -- `min_enclosing_circle` in
@@ -908,7 +872,6 @@ void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_hull",    primPointsHull,   2, 2);
     jaiStrDefinePrim(ns, "points_min_box", primPointsMinBox, 2, 2);
     jaiStrDefinePrim(ns, "points_approx", primPointsApprox, 3, 3);
-    jaiStrDefinePrim(ns, "points_arc_length", primPointsArcLength, 2, 2);
     jaiStrDefinePrim(ns, "points_min_circle", primPointsMinCircle, 2, 2);
     jaiStrDefinePrim(ns, "points_area", primPointsArea, 2, 2);
     jaiStrDefinePrim(ns, "points_moments", primPointsMoments, 2, 2);

@@ -375,21 +375,10 @@ fn walk_length(curve: list[Point], count: int, first: int, opening: int) -> floa
     return total
 }
 
-#: Whether `arc_length` asks `__prim__.points_arc_length` first. Read once.
-let _native_length = (env("JAICV_NATIVE_APPROX") ?? "1") != "0"
-
 #: The length of a curve, closed or open.
 pub fn arc_length(curve: list[Point], closed: bool) -> float {
     let count = curve.len()
     if count <= 1 { return 0.0 }
-    #: `__prim__.points_arc_length` sums the same steps in the same order;
-    #: null for points it cannot read or a difference that overflows, both of
-    #: which the walk below then meets for itself. `JAICV_NATIVE_APPROX=0`
-    #: turns it off with `approx_poly_dp`, whose tolerance it usually sets.
-    if _native_length {
-        let length = __prim__.points_arc_length(curve, closed)
-        if length is not null { return length }
-    }
     let opening = if closed { count - 1 } else { 0 }
     let first = if closed { 0 } else { 1 }
     return walk_length(curve, count, first, opening)
