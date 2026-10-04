@@ -21,10 +21,89 @@
  * registers are invisible to a collection inside the callee -- the tier refuses allocate-then-self-call for exactly this reason. */
 JitCallDesc *gJitFrames;
 
+/* An empty dict the tier hands out as the SAMPLE for a value it knows is a
+ * dict but cannot see -- a declared `dict[K, V]` field read off a receiver
+ * the body built itself. Arms ask the sample which arm to emit and guard
+ * OBJ_DICT at run time regardless; nothing compiled ever holds this pointer.
+ * Kept here, and marked below, because a compile may allocate and so collect
+ * while an entry still names it. */
+static ObjDict *gDictExemplar;
+
+ObjDict *jitDictExemplar(void) {
+    if (gDictExemplar == NULL) gDictExemplar = jaiDictNew();
+    return gDictExemplar;
+}
+
+/* After a VM teardown's sweep the exemplar is freed memory. */
+void jaiJitExemplarsReset(void) { gDictExemplar = NULL; }
+
+/* JAITHON_JIT_FIELD_DICT=0 stops a declared `dict` field being predicted when
+ * there is no live receiver to read it off, which is the decline it was. */
+bool jitFieldDict(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FIELD_DICT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_ITER_SOFT=0 makes a list or dict loop whose container had no
+ * element to sample decline the whole function again, rather than leave the
+ * loop to the interpreter and compile the rest. The sampled container is
+ * whatever the call that crossed the threshold happened to pass: a tree walk
+ * that recurses through leaves samples an empty child list nearly every time,
+ * and declined five attempts out of five for it. */
+bool jitIterSoft(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_SOFT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_ITER_EMPTY_SKIP=0 drops the empty-list exit in front of a soft
+ * iterate refusal (see OP_GET_ITER), so every entry to such a loop deopts,
+ * empty or not. */
+bool jitIterEmptySkip(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_EMPTY_SKIP");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_PAIR_INST=0 binds a dict-items loop's instance components as
+ * bare SLOT_OBJ again, so a loop variable already held as an instance clashes
+ * with them. */
+bool jitPairInstance(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_PAIR_INST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_OSR_SELF_GLOBAL=0 sends a compiled loop's call to its own
+ * function back down the self-call arm, which cannot serve a loop form and
+ * refuses it. */
+bool jitOsrSelfGlobal(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_OSR_SELF_GLOBAL");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 void jaiJitMarkFrames(void) {
     for (JitCallDesc *f = gJitFrames; f != NULL; f = f->link) {
         for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);
     }
+    if (gDictExemplar != NULL) jaiGCMarkObject((Obj *)gDictExemplar);
 }
 
 /* Roots go in as a RANGE (jaiGCPushRootRange/Pop), not copied one at a time -- copying individually
@@ -310,6 +389,43 @@ int jitMakeEnumIter(JitCallDesc *d) {
     return 0;
 }
 
+/* JAITHON_JIT_FORMAT_LEAF=0 formats every f-string through the rooted
+ * jitFormat descriptor again. */
+bool jitFormatLeafOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FORMAT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* jitFormat without the roots: 0 with d->result set, or 2 to decline. It
+ * declines when a collection is wanted, and for any part that is not a
+ * string, an int, a float, a bool or null -- every other part is rendered by
+ * code that may call into the program. What is left is jaiValueFormat's own
+ * fast path, which makes at most the one result string: with no collection
+ * wanted that allocation cannot collect, so nothing the body holds needs
+ * rooting. The rooted descriptor stores one word per live object in the body
+ * and pushes them, per f-string. */
+int jitFormatLeaf(JitCallDesc *d) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return 2;
+    const int count = (int)d->argc;
+    if (count <= 0 || count > JAI_FMT_MAX_PARTS) return 2;
+    for (int i = 0; i < count; i++) {
+        const Value v = d->args[i];
+        if (IS_OBJ(v) ? !IS_STRING(v)
+                      : !(IS_INT(v) || IS_FLOAT(v) || IS_BOOL(v) ||
+                          IS_NULL(v))) {
+            return 2;
+        }
+    }
+    ObjString *formatted = jaiValueFormat(d->args, count);
+    if (formatted == NULL) return 2;
+    d->result = OBJ_VAL(formatted);
+    return 0;
+}
+
 /* f-string: the interpreter's parts, read off the operand stack, land here contiguously in args[].
  * Builtin path only -- compiler checks at compile time that the module hasn't rebound `str`; a rebind retires this form. */
 int jitFormat(JitCallDesc *d) {
@@ -374,6 +490,105 @@ ObjInstance *jitInstanceAlloc(ObjClass *cls) {
     return inst;
 }
 
+/* JAITHON_JIT_ITER_ALLOC=0 builds every loop iterator through the jitMakeIter
+ * descriptor again. */
+bool jitIterAllocOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_ALLOC");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The iterator `for x in xs` / `for c in text` opens with, made the way
+ * jitInstanceAlloc makes an instance: a leaf that cannot collect, declining
+ * (NULL) whenever a collection is wanted, so the caller falls back to the
+ * jitMakeIter descriptor and its roots. Every field is the one jaiIterNew
+ * writes for ITER_LIST and ITER_STRING -- kind, source, the limit sampled
+ * now, the list's version -- and the index starts at zero. A loop entered
+ * per call over a short word or a three-element list paid the descriptor's
+ * stores and root push for 40 bytes; that was most of what such a call cost
+ * over the same loop written with an index. */
+ObjIter *jitIterAlloc(Obj *source) {
+#ifdef JAI_ALLOC_CENSUS
+    (void)source;
+    return NULL;   /* keep the census counting every iterator */
+#else
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    GCState *g = jaiGCActive;
+    if (JAI_UNLIKELY(g == NULL || source == NULL)) return NULL;
+    if (JAI_UNLIKELY(!jaiSmallServes(sizeof(ObjIter)))) return NULL;
+
+    IterKind kind;
+    int64_t limit;
+    uint32_t version = 0;
+    if (source->type == OBJ_LIST) {
+        kind = ITER_LIST;
+        limit = ((ObjList *)source)->count;
+        version = ((ObjList *)source)->version;
+    } else if (source->type == OBJ_STRING) {
+        kind = ITER_STRING;
+        limit = (int64_t)((ObjString *)source)->length;
+    } else {
+        return NULL;
+    }
+
+    ObjIter *it = (ObjIter *)jaiSmallNew(sizeof(ObjIter));
+    memset(it, 0, sizeof *it);
+    Obj *obj = (Obj *)it;
+    obj->type = OBJ_ITER;
+    it->kind = kind;
+    it->source = OBJ_VAL(source);
+    it->index = 0;
+    it->limit = limit;
+    it->version = version;
+    obj->next = g->objects;
+    g->objects = obj;
+    vm.allocCount++;
+    return it;
+#endif
+}
+
+/* JAITHON_JIT_SLICE_LEAF=0 cuts every string slice through the jitGetSlice
+ * descriptor again. */
+bool jitSliceLeafOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SLICE_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* `s[a:b]`, `s[a:]` and `s[:b]` on a string whose every scalar is one byte,
+ * as a leaf: NULL whenever the general path is needed -- a collection is
+ * wanted (so nothing here may allocate through one), the scalar count is not
+ * known to equal the byte count, or the slice is empty. The bounds are
+ * clamped exactly as jaiSliceGet's sliceBounds and sliceCount do for step 1,
+ * and the result is what jaiStringSlice returns for the same ASCII case: the
+ * table singleton for one character, jaiStringNew otherwise -- which, with no
+ * collection wanted, allocates without collecting. A token cut out of a line
+ * paid the descriptor's stores, a root push and three Value unpackings for a
+ * few bytes of copy. */
+ObjString *jitStrSliceLeaf(ObjString *s, int64_t start, int64_t stop,
+                           int64_t flags) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    if (s == NULL || s->scalars != s->length) return NULL;
+    const int64_t n = (int64_t)s->length;
+    if ((flags & 1) == 0) start = 0;
+    if ((flags & 2) == 0) stop = n;
+    if (n <= 0) return NULL;
+    if (start < 0) start = start < -n ? 0 : start + n;
+    else if (start > n) start = n;
+    if (stop < 0) stop = stop < -n ? 0 : stop + n;
+    else if (stop > n) stop = n;
+    if (stop <= start) return NULL;
+    const int64_t count = stop - start;
+    if (count == 1) return jaiStringChar((unsigned char)s->chars[start]);
+    return jaiStringNew(s->chars + start, (size_t)count);
+}
+
 int jitNewInstance(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));
@@ -433,6 +648,9 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return false;
 }
 void jaiJitMarkFrames(void) {
+}
+
+void jaiJitExemplarsReset(void) {
 }
 
 #endif

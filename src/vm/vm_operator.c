@@ -390,15 +390,11 @@ bool jaiContainsOp(Value container, Value element, bool *out) {
                             jaiTypeNameStatic(element));
         }
         ObjString *hay = AS_STRING(container), *needle = AS_STRING(element);
-        if (needle->length == 0) { *out = true; return true; }
-        if (needle->length > hay->length) { *out = false; return true; }
-        for (uint32_t i = 0; i + needle->length <= hay->length; i++) {
-            if (memcmp(hay->chars + i, needle->chars, needle->length) == 0) {
-                *out = true;
-                return true;
-            }
-        }
-        *out = false;
+        /* A memcmp CALL per byte position was 63x Python's `in` on a
+         * megabyte of text; the shared search is the one `find`, `count`,
+         * `split` and `replace` already use. */
+        *out = jaiMemFind(hay->chars, hay->length, needle->chars,
+                          needle->length) != NULL;
         return true;
     }
     if (IS_LIST(container)) {

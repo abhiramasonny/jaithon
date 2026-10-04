@@ -356,6 +356,38 @@ static void xHomeWritten(Emit *e, unsigned reg) {
  * field of any object it can reach, so there is nothing narrower to say. */
 void forgetFieldKinds(Emit *e) { e->knownCount = 0; }
 
+/* JAITHON_JIT_LEAN_RESET=0 zeroes the whole Emit again before every walk. */
+static bool jitLeanReset(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_LEAN_RESET");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* An Emit is 280KB, and every compile zeroed two of them -- the measuring
+ * pass's and the real one's, per attempt -- which was 4% of a `check` run in
+ * __bzero alone. 224KB of it is the instruction buffer and the fixup list,
+ * and both are only ever read below their counts (`count`, `fixupCount`),
+ * which the zeroing of everything else resets: every index into them is one
+ * this walk wrote first. So those two are left as they are and the rest --
+ * every flag, table and record the walk reads before writing -- is cleared
+ * exactly as before. */
+void jitEmitReset(Emit *e) {
+    _Static_assert(offsetof(Emit, code) == 0,
+                   "jitEmitReset skips the instruction buffer at offset 0");
+    if (!jitLeanReset()) {
+        memset(e, 0, sizeof *e);
+        return;
+    }
+    const size_t codeEnd = sizeof e->code;
+    const size_t fixStart = offsetof(Emit, fixups);
+    const size_t fixEnd = fixStart + sizeof e->fixups;
+    memset((char *)e + codeEnd, 0, fixStart - codeEnd);
+    memset((char *)e + fixEnd, 0, sizeof *e - fixEnd);
+}
+
 /* The narrower one: an entry names a LOCAL, so writing that local retires it.
  * The slot may now hold a different object entirely -- `b.v = 7; b = c; b.v`
  * read c's field at b's recorded kind before this existed. */

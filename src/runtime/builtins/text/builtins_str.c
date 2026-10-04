@@ -100,32 +100,7 @@ void resolveWindow(ObjString *s, int64_t start, int64_t end,
 
 const char *jaiStrFindBytes(const char *hay, size_t hayLen,
                             const char *needle, size_t needleLen) {
-    if (needleLen == 0) return hay;
-    if (needleLen > hayLen) return NULL;
-
-    if (needleLen == 1)
-        return (const char *)memchr(hay, (unsigned char)needle[0], hayLen);
-
-    const unsigned char first = (unsigned char)needle[0];
-    const unsigned char last = (unsigned char)needle[needleLen - 1];
-    const char *p = hay;
-    size_t remaining = hayLen - needleLen + 1;
-
-    while (remaining) {
-        const char *hit = (const char *)memchr(p, first, remaining);
-        if (hit == NULL) return NULL;
-
-        if ((unsigned char)hit[needleLen - 1] == last &&
-            (needleLen == 2 ||
-             memcmp(hit + 1, needle + 1, needleLen - 2) == 0))
-            return hit;
-
-        const size_t consumed = (size_t)(hit - p) + 1;
-        p += consumed;
-        remaining -= consumed;
-    }
-
-    return NULL;
+    return jaiMemFind(hay, hayLen, needle, needleLen);
 }
 
 const char *rfindBytes(const char *hay, size_t hayLen,

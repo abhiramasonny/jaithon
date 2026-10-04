@@ -330,6 +330,19 @@ uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset) {
     return 0x39400000u | ((offset & 0xfffu) << 10) | (rn << 5) | rd;
 }
 
+/* ldrb w<rd>, [x<rn>, x<rm>] -- a byte at a register offset, so `s[i]` needs
+ * no `add` to form the address. Checked against the assembler:
+ * `ldrb w9, [x13, x10]` is 0x386a69a9. */
+uint32_t jaiA64LdrByteReg(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x38606800u | (rm << 16) | (rn << 5) | rd;
+}
+
+/* ldr x<rt>, [x<rn>, x<rm>, lsl #3] -- the eight-byte entry `rm` of a table
+ * at `rn`. `ldr x11, [x11, x9, lsl #3]` is 0xf869796b. */
+uint32_t jaiA64LdrXRegLsl3(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xf8607800u | (rm << 16) | (rn << 5) | rt;
+}
+
 /* STRB Wt, [Xn, #imm12] -- the store twin of jaiA64LdrByte, same unscaled
  * 12-bit immediate. Used to stamp a container's declared element kind, which is
  * a single byte in the object header region. */

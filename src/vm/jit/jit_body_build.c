@@ -269,9 +269,27 @@ bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp) {
                 return false;
             }
         }
+        /* The leaf first (see jitFormatLeaf), the rooted descriptor only
+         * when it declines; both leave the string in the descriptor's
+         * result. */
+        unsigned skipSlow = 0;
+        bool leaf = jitFormatLeafOn() && !e->inlining;
+        if (leaf) {
+            if (!emitDescriptorFull(e, NULL_VAL, e->depth - parts, parts,
+                                    (void *)&jitFormatLeaf, true, -1, true)) {
+                return false;
+            }
+            emit(e, jaiA64SubsXImm(31, 0, 0));
+            skipSlow = e->count;
+            emit(e, jaiA64BCond(JAI_A64_EQ, 0));   /* patched below */
+        }
         if (!emitDescriptor(e, NULL_VAL, e->depth - parts, parts,
                             (void *)&jitFormat)) {
             return false;
+        }
+        if (leaf && skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
+            e->code[skipSlow] =
+                jaiA64BCond(JAI_A64_EQ, (int32_t)(e->count - skipSlow));
         }
         for (unsigned i = 0; i < parts; i++) {
             unsigned drop;

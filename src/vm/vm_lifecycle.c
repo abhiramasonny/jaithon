@@ -8,6 +8,7 @@
 
 #include "vm/vm_internal.h"
 #include "vm/trace/trace.h"
+#include "vm/jit/jit.h"
 #include "runtime/runtime.h"
 
 static bool sSignalInstalled;
@@ -225,6 +226,7 @@ void jaiVMFree(void) {
     vm.gc = NULL;
     /* After the sweep the 128 slots point at freed objects. */
     jaiAsciiCharsReset();
+    jaiJitExemplarsReset();
     jaiInternTableFree();
 
     JAI_FREE_ARRAY(Value, vm.stack, JAI_STACK_MAX);

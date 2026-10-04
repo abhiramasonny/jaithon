@@ -75,11 +75,41 @@ bool emitGetIter(Emit *e, int *offp) {
             if (IS_NULL(sample)) sample = e->stackElem[e->depth - 1];
             if (IS_NULL(sample)) {
                 e->whyNot = "iterating a list with nothing to look at";
+                /* Nothing has been emitted for this instruction, so it can
+                 * be handed to the interpreter instead -- see iterSoft. */
+                if (jitIterSoft() && !e->osr && !e->inlining) {
+                    e->iterUnarmed = true;
+                }
                 return false;
+            }
+            /* The leaf first, as emitCallOut does for an instance: it hands
+             * back the iterator in x0, or NULL when only the descriptor path
+             * (which may collect) can make one. Both paths leave it in
+             * JIT_SCRATCH_C. */
+            unsigned skipSlow = 0;
+            bool fastIter = jitIterAllocOn() && !e->inlining;
+            if (fastIter) {
+                unsigned rsrc = xHeldIn(e, e->valueDepth - 1);
+                if (rsrc != 0) emit(e, jaiA64MovX(0, rsrc));
+                emitConst64(e, JIT_SCRATCH_A,
+                            (int64_t)(uintptr_t)&jitIterAlloc);
+                noteScratchClobber(e);
+                emit(e, jaiA64Blr(JIT_SCRATCH_A));
+                emit(e, jaiA64MovX(JIT_SCRATCH_C, 0));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
+                skipSlow = e->count;
+                emit(e, jaiA64BCond(JAI_A64_NE, 0));   /* patched below */
             }
             if (!emitDescriptor(e, NULL_VAL, e->depth - 1, 1,
                                 (void *)&jitMakeIter)) {
                 return false;
+            }
+            emit(e, jaiA64LdrX(JIT_SCRATCH_C, 31,
+                               e->descOffset +
+                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            if (fastIter && skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
+                e->code[skipSlow] =
+                    jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
             }
             unsigned rdrop;
             if (!popValue(e, &rdrop, NULL)) return false;
@@ -93,9 +123,7 @@ bool emitGetIter(Emit *e, int *offp) {
              * head on every call and ran interpreted. */
             if (!pushValue3(e, SLOT_ITER, strIter ? 5u : 1u, NULL, sample, -1))
                 return false;
-            emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                               e->descOffset +
-                                   (unsigned)offsetof(JitCallDesc, result) + 8));
+            emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
             e->wroteHeap = true;
             off += 1;
             break;
@@ -400,9 +428,8 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
 
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C,
                                    (unsigned)offsetof(ObjString, chars)));
-                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                      JIT_SCRATCH_A, 0));
-                emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
+                emit(e, jaiA64LdrByteReg(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                         JIT_SCRATCH_A));
                 /* 128 is an imm12, so the compare needs no register. */
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 128));
                 branchOnDeopt(e, JAI_A64_HS);
@@ -415,9 +442,8 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                  * is a load and not a load plus a null test. */
                 emitConst64(e, JIT_SCRATCH_C,
                             (int64_t)(uintptr_t)jaiAsciiCharTable());
-                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                      JIT_SCRATCH_B, 3));
-                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+                emit(e, jaiA64LdrXRegLsl3(JIT_SCRATCH_A, JIT_SCRATCH_C,
+                                          JIT_SCRATCH_B));
                 localOut(e, fslot, JIT_SCRATCH_A);
                 /* The index store is a heap write, as the call-out this
                  * replaced was. */
@@ -728,9 +754,8 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
 
             emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_START_REG,
                                (unsigned)offsetof(ObjString, chars)));
-            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                  JIT_IDX_REG, 0));
-            emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64LdrByteReg(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                     JIT_IDX_REG));
             /* 128 is an imm12, so the compare needs no register. */
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 128));
             branchOnDeopt(e, JAI_A64_HS);
@@ -740,9 +765,8 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
              * interned by construction. */
             emitConst64(e, JIT_SCRATCH_C,
                         (int64_t)(uintptr_t)jaiAsciiCharTable());
-            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                  JIT_SCRATCH_B, 3));
-            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64LdrXRegLsl3(JIT_SCRATCH_A, JIT_SCRATCH_C,
+                                      JIT_SCRATCH_B));
             localOut(e, slot, JIT_SCRATCH_A);
             emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
             off += 5;
@@ -1200,6 +1224,8 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
         SlotKind pk[2];
         unsigned ptag[2];
         Value pseen[2];
+        ObjClass *pcls[2] = {NULL, NULL};
+        uint32_t pshape[2] = {0, 0};
         if (pairIsDict) {
             /* Shape 4 carries the dict itself, so the sample is its first
              * live entry -- the one the loop is about to yield. */
@@ -1207,6 +1233,9 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
                 !firstLiveEntry(&AS_DICT(psample)->table,
                                 &pseen[0], &pseen[1])) {
                 e->whyNot = "iterating a dict with nothing to look at";
+                if (jitIterSoft() && !e->osr && !e->inlining) {
+                    e->iterUnarmed = true;
+                }
                 return false;
             }
         } else {
@@ -1222,6 +1251,18 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
             if (IS_INT(v))        { pk[i] = SLOT_INT;   ptag[i] = VAL_INT; }
             else if (IS_FLOAT(v)) { pk[i] = SLOT_FLOAT; ptag[i] = VAL_FLOAT; }
             else if (IS_BOOL(v))  { pk[i] = SLOT_BOOL;  ptag[i] = VAL_BOOL; }
+            else if (pairIsDict && jitPairInstance() && IS_INSTANCE(v) &&
+                     AS_INSTANCE(v)->klass != NULL) {
+                /* An instance, by class: `for (name, node) in d.items()`
+                 * then reads `node`'s fields, and a loop variable a frame
+                 * already holds as that class -- which is what an OSR head
+                 * finds -- no longer clashes with a bare SLOT_OBJ. The tag
+                 * says only "a heap object", so the dict step below also
+                 * proves OBJ_INSTANCE and the shape before binding. */
+                pk[i] = SLOT_INST; ptag[i] = VAL_OBJ;
+                pcls[i] = AS_INSTANCE(v)->klass;
+                pshape[i] = pcls[i]->shapeId;
+            }
             else if (IS_OBJ(v) && AS_OBJ(v) != NULL) {
                 /* Held raw, like any other SLOT_OBJ: the tag guard is the
                  * whole of what this promises, and an arm that wants to
@@ -1232,8 +1273,10 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
                 return false;
             }
         }
-        if (!adoptLocalKindSeen(e, pslotA, pk[0], 0, NULL, pseen[0]) ||
-            !adoptLocalKindSeen(e, pslotB, pk[1], 0, NULL, pseen[1])) {
+        if (!adoptLocalKindSeen(e, pslotA, pk[0], pshape[0], pcls[0],
+                                pseen[0]) ||
+            !adoptLocalKindSeen(e, pslotB, pk[1], pshape[1], pcls[1],
+                                pseen[1])) {
             return subWhy(e, "a pair's loop variables (locals %u and %u) "
                              "have kinds %s and %s", pslotA, pslotB,
                           slotKindName(e->localKind[pslotA]),
@@ -1335,6 +1378,24 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B, at));
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ptag[i]));
                 branchOnDeopt(e, JAI_A64_NE);
+                if (pk[i] == SLOT_INST) {
+                    /* Object type first: reading `klass` off a string lands
+                     * in its length and dereferences it. JIT_SCRATCH_C holds
+                     * the scan index and JIT_SCRATCH_B the entry; A and D are
+                     * free until the bind below. */
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B, at + 8u));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_A,
+                                       (unsigned)offsetof(Obj, type)));
+                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
+                    branchOnDeopt(e, JAI_A64_NE);
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_A,
+                                       (unsigned)offsetof(ObjInstance, klass)));
+                    emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(ObjClass, shapeId)));
+                    emitConst64(e, JIT_SCRATCH_A, (int64_t)pshape[i]);
+                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_D, JIT_SCRATCH_A));
+                    branchOnDeopt(e, JAI_A64_NE);
+                }
             }
 
             /* Past the last guard. The index goes first because localOut

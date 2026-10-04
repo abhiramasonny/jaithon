@@ -672,6 +672,15 @@ bool declaredScalarFieldKind(uint32_t typeId, SlotKind *k, unsigned *tag) {
      * declared `Foo` is null only before its init assigns it, and a field never
      * assigned at all would deopt on every read rather than answer wrongly. */
     case FIELD_KIND_DECLARED: *k = SLOT_OBJ; *tag = VAL_OBJ;   return true;
+    /* A declared `dict[K, V]`. Two guards, as for `list` and `str`: the tag,
+     * then OBJ_DICT, since VAL_OBJ is every heap object and the index arms
+     * read ObjDict's table. The callers hand the entry jitDictExemplar() as
+     * its sample, which is what `d[k] = v` and the dict methods ask for.
+     * `node.fields[key] = value` on a node the body built itself -- every
+     * hand-written parser's object case -- declined the whole function. */
+    case FIELD_KIND_DICT:
+        if (!jitFieldDict()) return false;
+        *k = SLOT_OBJ; *tag = VAL_OBJ;   return true;
     default: return false;
     }
 }
@@ -683,7 +692,17 @@ bool emitGetGlobal(Emit *e, ObjFunction *fn, ObjClosure *closure,
         /* Two resolution paths with different obligations. BY VALUE (globalIsSelf/globalClass/globalFunction/
          * globalNative): resolved and baked at compile time, nothing rechecked at run time, so ObjModule::version must retire the whole form whenever such a binding could change (jaiModuleSet's jaiValueIsInertGlobal decides that) -- teaching any of the four a new value kind, or constant-folding a module int here, means updating jaiValueIsInertGlobal too. BY ADDRESS (the value case below): bakes the JaiEntry*, not the value, and re-loads it behind a tag guard (+ Obj.type/class-shape guards where needed) on EVERY access -- depends on JaiTable::keyVersion, not on ObjModule::version. */
         uint32_t nameIdx = jaiReadU24(code + off + 1);
-        if (globalIsSelf(closure, nameIdx)) {
+        /* In a compiled LOOP, the function's own name is not "self" in the
+         * sense pushSelf means it. A self-call `bl`s to instruction 0 of the
+         * body being compiled, and an OSR form's instruction 0 is a loop
+         * prologue that takes the interpreter's frame, not arguments -- so
+         * the self arm cannot be used there, and it refused silently: a tree
+         * walk's `for kid in node.kids { total += walk(kid) }` never compiled
+         * as a loop. When the function has a whole-body form of its own,
+         * calling that is an ordinary call to a compiled global, which the
+         * arm below already makes. */
+        if (globalIsSelf(closure, nameIdx) &&
+            !(e->osr && fn->jitFunc != NULL && jitOsrSelfGlobal())) {
             if (!pushSelf(e)) return false;
             off += 6;
             break;

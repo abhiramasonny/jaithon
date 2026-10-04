@@ -4,7 +4,13 @@
 
 #include "vm/gc.h"
 
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 bool pushSlice(ObjList *list, const char *chars, size_t length) {
     ObjString *piece = jaiStringNew(chars, length);
@@ -153,6 +159,51 @@ static bool splitWhitespace(ObjString *s, int64_t maxsplit, bool fromRight,
     return true;
 }
 
+/* JAITHON_SPLIT_SIMD=0 sends a one-byte separator back through the general
+ * search, one memchr call per piece. Read once. */
+static bool splitSimd(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_SPLIT_SIMD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* `s.split(",")`: every piece of a one-byte split, found sixteen bytes at a
+ * time. The general loop calls memchr once per piece, and for the short
+ * fields a CSV line or a joined list is made of, the call and its set-up cost
+ * more than the scan -- `string_build` splits two million ten-byte fields.
+ * Here one compare per block yields every separator in it at once. Pieces come
+ * out in order and the last one is whatever follows the last separator,
+ * exactly as the general loop leaves them. */
+static bool splitOneByte(const char *base, size_t total, unsigned char c,
+                         ObjList *list) {
+    size_t pos = 0;
+    size_t i = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    const uint8x16_t vc = vdupq_n_u8(c);
+    for (; i + 16 <= total; i += 16) {
+        uint8x16_t eq = vceqq_u8(vld1q_u8((const uint8_t *)base + i), vc);
+        uint64_t mask = vget_lane_u64(
+            vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+        while (mask != 0) {
+            unsigned lane = (unsigned)__builtin_ctzll(mask) >> 2;
+            size_t at = i + lane;
+            if (!pushSlice(list, base + pos, at - pos)) return false;
+            pos = at + 1;
+            mask &= ~((uint64_t)0xF << (lane * 4u));
+        }
+    }
+#endif
+    for (; i < total; i++) {
+        if ((unsigned char)base[i] != c) continue;
+        if (!pushSlice(list, base + pos, i - pos)) return false;
+        pos = i + 1;
+    }
+    return pushSlice(list, base + pos, total - pos);
+}
+
 static bool splitSeparator(ObjString *s, ObjString *sep, int64_t maxsplit,
                            bool fromRight, Value *out) {
     ObjList *list = jaiListNew(0);
@@ -161,7 +212,9 @@ static bool splitSeparator(ObjString *s, ObjString *sep, int64_t maxsplit,
     const char *base = s->chars;
     size_t total = s->length;
 
-    if (!fromRight) {
+    if (!fromRight && maxsplit < 0 && sep->length == 1 && splitSimd()) {
+        ok = splitOneByte(base, total, (unsigned char)sep->chars[0], list);
+    } else if (!fromRight) {
         size_t pos = 0;
         int64_t splits = 0;
         while (ok && (maxsplit < 0 || splits < maxsplit)) {
@@ -299,13 +352,59 @@ static inline bool joinItem(JaiBuf *buf, Value item, int index) {
     return true;
 }
 
+/* JAITHON_JOIN_FAST=0 restores the plain join loops below: no prefetch, and
+ * a memcpy call per item however short. Read once. */
+static bool joinFast(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JOIN_FAST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* How far ahead the join loops touch the next items. Each item is its own
+ * small heap object, so a long list of them is a pointer chase: two million
+ * ten-byte strings joined are four million likely cache misses, once to read
+ * every length and once to copy every body. Asking for the line a few items
+ * early overlaps those misses instead of taking them one at a time. */
+enum { JOIN_AHEAD = 8 };
+
+/* Short copies without the call: a joined list of words is millions of
+ * memcpy calls of a few bytes each, and at that size the call costs more than
+ * the copy. Overlapping word moves cover every length up to sixteen while
+ * reading and writing only the bytes in [0, n). */
+static inline void copyShort(char *dst, const char *src, size_t n) {
+    if (n >= 8) {
+        uint64_t a, b;
+        memcpy(&a, src, 8);
+        memcpy(&b, src + n - 8, 8);
+        memcpy(dst, &a, 8);
+        memcpy(dst + n - 8, &b, 8);
+    } else if (n >= 4) {
+        uint32_t a, b;
+        memcpy(&a, src, 4);
+        memcpy(&b, src + n - 4, 4);
+        memcpy(dst, &a, 4);
+        memcpy(dst + n - 4, &b, 4);
+    } else if (n > 0) {
+        dst[0] = src[0];
+        dst[n / 2] = src[n / 2];
+        dst[n - 1] = src[n - 1];
+    }
+}
+
 static bool joinSized(ObjString *sep, const Value *items, int count,
                       Value *out) {
     const size_t sepLength = (size_t)sep->length;
     size_t total = 0;
+    const bool fast = joinFast();
 
     for (int i = 0; i < count; ++i) {
         const Value itemValue = items[i];
+        if (fast && i + JOIN_AHEAD < count && IS_OBJ(items[i + JOIN_AHEAD])) {
+            __builtin_prefetch(AS_OBJ(items[i + JOIN_AHEAD]));
+        }
 
         if (!IS_STRING(itemValue)) {
             return jaiThrow(vm.cTypeError,
@@ -339,6 +438,26 @@ static bool joinSized(ObjString *sep, const Value *items, int count,
     if (result == NULL) return false;
 
     char *p = result->chars;
+
+    if (fast) {
+        for (int i = 0; i < count; ++i) {
+            if (i + JOIN_AHEAD < count) {
+                __builtin_prefetch(AS_STRING(items[i + JOIN_AHEAD])->chars);
+            }
+            if (i > 0 && sepLength != 0) {
+                if (sepLength <= 16) copyShort(p, sep->chars, sepLength);
+                else memcpy(p, sep->chars, sepLength);
+                p += sepLength;
+            }
+            ObjString *const item = AS_STRING(items[i]);
+            const size_t n = item->length;
+            if (n <= 16) copyShort(p, item->chars, n);
+            else memcpy(p, item->chars, n);
+            p += n;
+        }
+        *out = OBJ_VAL(jaiStringSeal(result));
+        return true;
+    }
 
     for (int i = 0; i < count; ++i) {
         if (i > 0 && sepLength != 0) {

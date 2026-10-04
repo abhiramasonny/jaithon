@@ -333,6 +333,10 @@ bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop) {
      * without it the reader has a bytecode offset and no idea why. */
     e->unarmedOp = e->lastOp;
     e->unarmedAt = e->curOffset;
+    if (!e->haveFirstUnarmed && !e->inlining) {
+        e->haveFirstUnarmed = true;
+        e->firstUnarmedAt = e->curOffset;
+    }
     if (e->inlining) {
         /* Half an inlined body cannot be taken back, and the caller reads the
          * result out of the model -- past a deopt there is none. */
@@ -886,6 +890,20 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                  * are: the pool belongs to the chunk, the chunk to the function, and the caller holds the closure for the whole call. Was the commonest reason this tier declined a body -- thirty refusals across the benchmark suite. */
                 if (!pushValue3(e, SLOT_OBJ, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, (int64_t)(uintptr_t)AS_OBJ(k));
+                /* A one-character ASCII literal is, by interning, the very
+                 * object the ASCII table holds for its byte -- checked here
+                 * against the table itself rather than assumed. That is the
+                 * whole of what stackAscii claims, and it is a FACT about a
+                 * pointer the emitter is baking in, not a prediction: so
+                 * `c == " "`, `c < "0"` and `s[i] != "\""` stop proving at
+                 * run time, on every iteration, that a literal is a string,
+                 * interned and one byte long. */
+                ObjString *ks = AS_STRING(k);
+                if (jitConstAscii() && ks->length == 1 &&
+                    (unsigned char)ks->chars[0] < 128 &&
+                    jaiAsciiCharTable()[(unsigned char)ks->chars[0]] == ks) {
+                    e->stackAscii[e->depth - 1] = true;
+                }
             } else {
                 return subWhy(e, "a constant of a kind the tier cannot hold");
             }
@@ -1153,7 +1171,36 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
 
         case OP_GET_ITER:
-            if (!emitGetIter(e, &off)) return false;
+            if (!emitGetIter(e, &off)) {
+                if (e->iterUnarmed) {
+                    e->iterUnarmed = false;
+                    e->whyNot = NULL;
+                    /* A list that is EMPTY at run time runs no iteration at
+                     * all, so it can skip straight to the loop's exit in
+                     * compiled code: building the iterator and finding it
+                     * exhausted has no effect the program can see. Only a
+                     * list with something in it is handed to the
+                     * interpreter. Without this a function that usually
+                     * loops over nothing -- `for g in generics` -- would pay
+                     * a deopt on every call for a loop it never runs, which
+                     * measured slower than not compiling it at all. */
+                    if (jitIterEmptySkip() && e->depth >= 1 &&
+                        e->stack[e->depth - 1] == SLOT_LIST &&
+                        off + 6 <= stop && code[off + 1] == OP_FOR_ITER_BIND) {
+                        int16_t fj = jaiReadI16(code + off + 2);
+                        uint32_t exitAt = (uint32_t)((int32_t)(off + 1 + 5) + fj);
+                        settleAll(e);
+                        unsigned rl = xHeldIn(e, e->valueDepth - 1);
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rl,
+                                           (unsigned)offsetof(ObjList, count)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                        branchToDepth(e, exitAt, JAI_A64_EQ,
+                                      stackSignatureAt(e, e->depth - 1));
+                    }
+                    goto unarmedOpcode;
+                }
+                return false;
+            }
             break;
 
         case OP_ITER_RANGE:
@@ -1173,7 +1220,14 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
 
         case OP_FOR_ITER_PAIR:
-            if (!emitForIterPair(e, code, &off)) return false;
+            if (!emitForIterPair(e, code, &off)) {
+                if (e->iterUnarmed) {
+                    e->iterUnarmed = false;
+                    e->whyNot = NULL;
+                    goto unarmedOpcode;
+                }
+                return false;
+            }
             break;
 
         case OP_GET_INDEX:

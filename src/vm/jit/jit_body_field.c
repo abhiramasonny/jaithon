@@ -238,9 +238,12 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ltag));
             branchOnDeopt(e, JAI_A64_NE);
             Value lprobe = NULL_VAL;
-            if (lkind == SLOT_LIST || info->typeId == FIELD_KIND_STR) {
+            if (lkind == SLOT_LIST || info->typeId == FIELD_KIND_STR ||
+                info->typeId == FIELD_KIND_DICT) {
                 unsigned want = lkind == SLOT_LIST ? (unsigned)OBJ_LIST
-                                                   : (unsigned)OBJ_STRING;
+                              : info->typeId == FIELD_KIND_DICT
+                                    ? (unsigned)OBJ_DICT
+                                    : (unsigned)OBJ_STRING;
                 emit(e, jaiA64LdrX(JIT_SCRATCH_B, lrr, lbase + 8));
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
                                    (unsigned)offsetof(Obj, type)));
@@ -250,11 +253,16 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
                     ObjString *empty = jaiStringIntern("", 0);
                     if (empty == NULL) return false;
                     lprobe = OBJ_VAL((Obj *)empty);
+                } else if (want == (unsigned)OBJ_DICT) {
+                    ObjDict *probe = jitDictExemplar();
+                    if (probe == NULL) return false;
+                    lprobe = OBJ_VAL((Obj *)probe);
                 }
             }
             if (!pushValue3(e, lkind, 0, NULL, lprobe, -1)) return false;
             if (!IS_NULL(lprobe)) {
-                e->stackObjType[e->depth - 1] = (uint8_t)(OBJ_STRING + 1);
+                e->stackObjType[e->depth - 1] =
+                    (uint8_t)(OBJ_TYPE(lprobe) + 1);
             }
             if (lkind == SLOT_BOOL) {
                 /* One byte: BOOL_VAL writes only the union's bool member. */
@@ -822,14 +830,17 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, dtag));
             branchOnDeopt(e, JAI_A64_NE);
             Value dprobe = NULL_VAL;
-            if (dkind == SLOT_LIST || info->typeId == FIELD_KIND_STR) {
+            if (dkind == SLOT_LIST || info->typeId == FIELD_KIND_STR ||
+                info->typeId == FIELD_KIND_DICT) {
                 /* VAL_OBJ said "a heap object" and no more. Prove the
                  * actual type before the entry claims to be one, or the
                  * next arm reads ObjList's count out of a string's header
                  * -- the hole that segfaulted the VM through the
                  * dict-index arm. */
                 unsigned want = dkind == SLOT_LIST ? (unsigned)OBJ_LIST
-                                                   : (unsigned)OBJ_STRING;
+                              : info->typeId == FIELD_KIND_DICT
+                                    ? (unsigned)OBJ_DICT
+                                    : (unsigned)OBJ_STRING;
                 emit(e, jaiA64LdrX(JIT_SCRATCH_B, drr, dbase + 8));
                 emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
                                    (unsigned)offsetof(Obj, type)));
@@ -846,6 +857,10 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                     ObjString *empty = jaiStringIntern("", 0);
                     if (empty == NULL) return false;
                     dprobe = OBJ_VAL((Obj *)empty);
+                } else if (want == (unsigned)OBJ_DICT) {
+                    ObjDict *probe = jitDictExemplar();
+                    if (probe == NULL) return false;
+                    dprobe = OBJ_VAL((Obj *)probe);
                 }
             }
             unsigned dpopped;
@@ -854,7 +869,7 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
             if (!pushValue3(e, dkind, 0, NULL, dprobe, -1)) return false;
             if (!IS_NULL(dprobe)) {
                 e->stackObjType[e->depth - 1] =
-                    (uint8_t)(OBJ_STRING + 1);
+                    (uint8_t)(OBJ_TYPE(dprobe) + 1);
             }
             if (dkind == SLOT_FLOAT &&
                 fpWorthLoading(e, code, off + 6, stop)) {

@@ -461,6 +461,21 @@ this table complete in both directions.
 | `JAITHON_JIT_STR_ITER` | on | Iterating a string. |
 | `JAITHON_JIT_ITER_STG` | on | Dispatch on list storage at a nested `for-in`. |
 | `JAITHON_JIT_STR_HEAD` | on | `for c in <string>` as an OSR loop head. |
+| `JAITHON_JIT_CONST_ASCII` | on | Mark a one-character ASCII string literal as the ASCII table's own singleton at `OP_CONST`, so `==` and the one-byte ordering arm stop guarding the literal at run time. |
+| `JAITHON_JIT_STR_FACTS` | on | Prove once at an OSR loop head, with no register, that a loop-invariant string local is a string, all one-byte (for `s[i]`) and/or interned (for `==`), so the per-iteration guards go even in a loop that calls. Off restores them. |
+| `JAITHON_JIT_FIELD_DICT` | on | Predict a declared `dict[K, V]` field read off a receiver with no live sample (an instance the body built itself): tag and `OBJ_DICT` guarded, sampled by an empty exemplar dict so `d[k] = v` and the dict methods can compile. Off restores the decline. |
+| `JAITHON_JIT_ITER_SOFT` | on | Function tier: a list or dict loop whose sampled container is empty ("iterating a list/dict with nothing to look at") is left to the interpreter from that instruction instead of declining the whole body. Off restores the decline. |
+| `JAITHON_JIT_ITER_EMPTY_SKIP` | on | In front of a soft iterate refusal on a list, branch straight to the loop exit when the list is empty at run time, so only a non-empty list deopts. |
+| `JAITHON_JIT_PAIR_INST` | on | A dict-items pair loop binds an instance component as `SLOT_INST` of its sampled class (object type and shape guarded per step) rather than a bare `SLOT_OBJ`, so a loop variable the frame already holds as that class no longer clashes. |
+| `JAITHON_JIT_BRANCH_MAP` | on | Compile time only: `offsetIsBranchTarget` decodes each chunk once per compile into a bitmap instead of rescanning the whole chunk on every query. Off restores the scan. |
+| `JAITHON_JIT_OSR_SELF_GLOBAL` | on | Inside an OSR loop form, a call to the function's own name goes through the ordinary compiled-global call to its whole-body form (when it has one) instead of the self-call arm, which branches to instruction 0 and so cannot serve a loop form. Off restores the silent `OP_CALL` refusal. |
+| `JAITHON_JIT_LEAN_RESET` | on | Compile time only: resetting an Emit between walks leaves the instruction buffer and the fixup list (224KB of its 280KB) unzeroed, since both are read only below their counts. Off zeroes the whole struct. |
+| `JAITHON_JIT_EARLY_UNARMED` | on | Decline a whole-body compile whose walk stops (an unarmed opcode) on the straight-line path from the entry, within 24 instructions -- every call would deopt there, which costs more than interpreting the prefix. A stop at a call to a not-yet-compiled function declines as cold, so it is retried. Off installs such bodies. |
+| `JAITHON_JIT_ONE_BYTE_LOCAL_K` | on | `OP_JUMP_IF_CMP_LOCAL_K` against a one-byte string literal (`if c == "{"`, `if c < "0"`): the local is guarded a string and compared by its length and its one byte against an immediate, instead of the jaiStringOrder leaf call (which every `==` took when the local's sample was not interned -- a character read with `s[i]` samples the whole subject). |
+| `JAITHON_JIT_ITER_ALLOC` | on | `OP_GET_ITER` over a list or a string tries a leaf allocator (`jitIterAlloc`, which declines when a collection is wanted) before the `jitMakeIter` descriptor. Off always takes the descriptor. |
+| `JAITHON_JIT_SLICE_LEAF` | on | `s[a:b]` (and `s[a:]`, `s[:b]`) on a string with int bounds tries the `jitStrSliceLeaf` leaf -- ASCII only, declining when a collection is wanted or the slice is empty -- before the `jitGetSlice` descriptor. Off always takes the descriptor. |
+| `JAITHON_JIT_FORMAT_LEAF` | on | An f-string tries `jitFormatLeaf` -- no root fill, declining when a collection is wanted or a part is not a str/int/float/bool/null -- before the rooted `jitFormat` descriptor. Off always takes the descriptor. |
+| `JAITHON_JIT_STR_HOIST` | on | Hoist a loop-invariant string local's header (`chars`, `length`) and its string and all-one-byte proofs to the loop head, so `s[i]` inside a call-free OSR loop is a bounds check and a byte load. Off restores the per-character guards. |
 | `JAITHON_JIT_COMP_ACC` | on | A list comprehension's append, through the frame. |
 | `JAITHON_JIT_BUILTIN_CLASS` | on | Resolve a builtin class (every exception type). |
 | `JAITHON_JIT_INVOKE_SOFT` | on | Master switch for emitInvoke's dead-path softening. |
@@ -494,6 +509,7 @@ this table complete in both directions.
 | `JAI_JIT_RECON` | Deopt reconstructions, one line each. A body entered and abandoned every call shows up here and nowhere else. |
 | `JAI_JIT_TRACE` | A body going hot. |
 | `JAI_JIT_DUMP` | Disassembly of the named function (exact name match). |
+| `JAI_JIT_PERFMAP` | Appends `start size name` for every installed body (OSR forms as `name@osrN`) to `/tmp/jaithon-perf-<pid>.map`, so a sampling profile (`xctrace record --template 'Time Profiler'`) can attribute compiled code to functions. |
 | `JAITHON_JIT_COLLECT_CLASHES` | Kind clashes gathered during a walk. |
 
 `JAI_JIT_ATTRIB=1` with `--stats` gives exact per-function attribution of

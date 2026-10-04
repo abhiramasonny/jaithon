@@ -191,26 +191,29 @@ bool isSpaceCp(int32_t c) {
 static bool mapCase(ObjString *s, bool up, Value *out) {
     const size_t length = (size_t)s->length;
 
-    bool ascii = true;
-    for (size_t i = 0; i < length; ++i) {
-        if ((unsigned char)s->chars[i] & 0x80u) {
-            ascii = false;
-            break;
-        }
-    }
+    /* Both loops read through locals rather than `s->chars`: a store through
+     * a `char *` may alias anything, including the ObjString header, so the
+     * compiler reloaded the pointer every byte and could vectorise neither.
+     * The test ORs every byte instead of stopping at the first high one, which
+     * is what lets it run sixteen bytes a step; text that is not ASCII is the
+     * slow path anyway. */
+    const unsigned char *const src = (const unsigned char *)s->chars;
+    unsigned char high = 0;
+    for (size_t i = 0; i < length; ++i) high |= src[i];
+    bool ascii = (high & 0x80u) == 0;
 
     if (ascii && length != 0) {
         ObjString *result = jaiStringReserve(length);
         if (result == NULL) return false;
 
+        /* The reserve may have collected; `s` is rooted by the caller and
+         * does not move, so `src` is still its bytes. */
+        unsigned char *const dst = (unsigned char *)result->chars;
+        const unsigned char lo = up ? 'a' : 'A';
+        const unsigned char flip = 0x20u;
         for (size_t i = 0; i < length; ++i) {
-            unsigned char c = (unsigned char)s->chars[i];
-            if (up) {
-                if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
-            } else {
-                if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
-            }
-            result->chars[i] = (char)c;
+            const unsigned char c = src[i];
+            dst[i] = (unsigned char)((unsigned char)(c - lo) < 26u ? c ^ flip : c);
         }
 
         *out = OBJ_VAL(jaiStringSeal(result));

@@ -258,6 +258,15 @@ uint32_t jaiCrc32(const void *data, size_t len);
 uint32_t jaiCrc32Table(const void *data, size_t len);
 
 /* ------------------------------------------------------------------ */
+/* Substring search                                                    */
+/* ------------------------------------------------------------------ */
+
+/* The first occurrence of needle[0..needleLen) in hay[0..hayLen), byte for
+ * byte, or NULL. An empty needle is found at `hay`. */
+const char *jaiMemFind(const char *hay, size_t hayLen,
+                       const char *needle, size_t needleLen);
+
+/* ------------------------------------------------------------------ */
 /* UTF-8                                                               */
 /* ------------------------------------------------------------------ */
 

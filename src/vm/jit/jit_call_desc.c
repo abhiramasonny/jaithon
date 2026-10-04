@@ -89,6 +89,16 @@ bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
 bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
                                  unsigned nargs, void *helper, bool ownStatus,
                                  int calleeReg) {
+    return emitDescriptorFull(e, calleeVal, first, nargs, helper, ownStatus,
+                              calleeReg, false);
+}
+
+/* `noRoots`: a LEAF helper that never collects (it declines instead), so the
+ * root fill -- a store per live object the body holds -- is skipped and the
+ * descriptor carries none. */
+bool emitDescriptorFull(Emit *e, Value calleeVal, unsigned first,
+                        unsigned nargs, void *helper, bool ownStatus,
+                        int calleeReg, bool noRoots) {
     if (nargs > JIT_MAX_ARGS_OUT) { e->whyNot = "call argc"; return false; }
     if (!e->callsOut) { e->whyNot = "callsOut off"; return false; }
 
@@ -159,7 +169,7 @@ bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
     }
 
     unsigned nroots = 0;
-    if (!emitRootFill(e, d, &nroots)) return false;
+    if (!noRoots && !emitRootFill(e, d, &nroots)) return false;
     emit(e, jaiA64MovzX(JIT_SCRATCH_A, nargs, 0));
     emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
                        d + (unsigned)offsetof(JitCallDesc, argc)));

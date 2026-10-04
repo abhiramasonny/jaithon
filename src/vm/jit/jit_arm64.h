@@ -87,6 +87,8 @@ uint32_t jaiA64Nop(void);
 uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm);
 uint32_t jaiA64CselX(unsigned rd, unsigned rn, unsigned rm, unsigned cond);
 uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset);
+uint32_t jaiA64LdrByteReg(unsigned rd, unsigned rn, unsigned rm);
+uint32_t jaiA64LdrXRegLsl3(unsigned rt, unsigned rn, unsigned rm);
 uint32_t jaiA64StrByte(unsigned rt, unsigned rn, unsigned offset);
 /* ldrh Wt, [Xn, #offset] -- 2-aligned, 0..8190; zero-extends. The narrow load
  * matters: an enum value's tag is a uint16_t with its `count` byte in the same
