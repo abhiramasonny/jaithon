@@ -400,9 +400,8 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
 
                 emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C,
                                    (unsigned)offsetof(ObjString, chars)));
-                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                      JIT_SCRATCH_A, 0));
-                emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
+                emit(e, jaiA64LdrByteReg(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                         JIT_SCRATCH_A));
                 /* 128 is an imm12, so the compare needs no register. */
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 128));
                 branchOnDeopt(e, JAI_A64_HS);
@@ -415,9 +414,8 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                  * is a load and not a load plus a null test. */
                 emitConst64(e, JIT_SCRATCH_C,
                             (int64_t)(uintptr_t)jaiAsciiCharTable());
-                emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                      JIT_SCRATCH_B, 3));
-                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+                emit(e, jaiA64LdrXRegLsl3(JIT_SCRATCH_A, JIT_SCRATCH_C,
+                                          JIT_SCRATCH_B));
                 localOut(e, fslot, JIT_SCRATCH_A);
                 /* The index store is a heap write, as the call-out this
                  * replaced was. */
@@ -728,9 +726,8 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
 
             emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_START_REG,
                                (unsigned)offsetof(ObjString, chars)));
-            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                  JIT_IDX_REG, 0));
-            emit(e, jaiA64LdrByte(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64LdrByteReg(JIT_SCRATCH_B, JIT_SCRATCH_C,
+                                     JIT_IDX_REG));
             /* 128 is an imm12, so the compare needs no register. */
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 128));
             branchOnDeopt(e, JAI_A64_HS);
@@ -740,9 +737,8 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
              * interned by construction. */
             emitConst64(e, JIT_SCRATCH_C,
                         (int64_t)(uintptr_t)jaiAsciiCharTable());
-            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                  JIT_SCRATCH_B, 3));
-            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64LdrXRegLsl3(JIT_SCRATCH_A, JIT_SCRATCH_C,
+                                      JIT_SCRATCH_B));
             localOut(e, slot, JIT_SCRATCH_A);
             emit(e, jaiA64AddXImm(JIT_IDX_REG, JIT_IDX_REG, 1));
             off += 5;
