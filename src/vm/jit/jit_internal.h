@@ -995,6 +995,7 @@ bool jitIterSoft(void);
 bool jitIterEmptySkip(void);
 bool jitPairInstance(void);
 void jitBranchTargetsReset(void);
+bool jitOsrSelfGlobal(void);
 void planStrFacts(Emit *e, ObjFunction *fn);
 bool strFactAscii(const Emit *e, int slot);
 bool strFactInterned(const Emit *e, int slot);

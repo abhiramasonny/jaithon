@@ -87,6 +87,18 @@ bool jitPairInstance(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_OSR_SELF_GLOBAL=0 sends a compiled loop's call to its own
+ * function back down the self-call arm, which cannot serve a loop form and
+ * refuses it. */
+bool jitOsrSelfGlobal(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_OSR_SELF_GLOBAL");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 void jaiJitMarkFrames(void) {
     for (JitCallDesc *f = gJitFrames; f != NULL; f = f->link) {
         for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);
