@@ -1171,9 +1171,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                  * frame slot holds it (findComprehensionAcc) and reserved a
                  * callee-saved register, because emitListStore needs the
                  * container somewhere that survives its four loads and the grow
-                 * stub's call -- every scratch is spoken for inside it, and a
-                 * hoist register can never be placed in a loop that appends,
-                 * since an append IS a call as far as regionCalls is concerned.
+                 * stub's call -- every scratch is spoken for inside it. (The
+                 * hoist registers, x13..x17, are another bank: the grow stub
+                 * puts those back itself, see JAITHON_JIT_HOIST_PUSH.)
                  *
                  * Reloaded from the frame at every append rather than hoisted
                  * once: the register is then a pure cache of a slot the
