@@ -392,6 +392,16 @@ bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
 /* Inside a `try`: an entry of the function's own static exception table covers
  * this offset. Linear over the table because a function has one or two entries,
  * never a table worth indexing. */
+/* JAITHON_JIT_BREAK_ITER: see OP_POP's `break` arm. */
+static bool jitBreakIter(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_BREAK_ITER");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static bool offsetIsProtected(const ObjFunction *fn, uint32_t off) {
     for (uint16_t i = 0; i < fn->exceptionCount; i++) {
         const ExceptionEntry *x = &fn->exceptions[i];
@@ -676,6 +686,14 @@ bool compileBody(Emit *e, ObjClosure *closure) {
              popSkipTarget(e, (uint32_t)off))) {
             clearStackProofs(e);
         }
+        /* "Still equals its local" is a claim about one edge, the same as a
+         * stack proof: a join may arrive from a path that wrote the local. */
+        if ((e->fpSrc != 0 || e->dynGuarded != 0) &&
+            (!fellIn || offsetIsBranchTarget(&fn->chunk, (uint32_t)off) ||
+             popSkipTarget(e, (uint32_t)off))) {
+            e->fpSrc = 0;
+            e->dynGuarded = 0;
+        }
         /* A field-kind memo is good along the same one edge, and goes for the
          * same reason -- see forgetFieldKinds. `fn` is whichever body is being
          * walked, so an inlined one is measured against its own chunk. */
@@ -702,7 +720,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
              * opcode already takes, and it costs `mov`s that §5 prices at zero.
              */
             if (joinsHere || e->inProtected || !deferSurvives(op) ||
-                e->deferCarryCount >= 64) {
+                e->deferCarryCount >= jitCarryLimit()) {
                 settleAll(e);
             } else {
                 e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
@@ -755,7 +773,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                 /* handled below */
             } else if (!fpFastOp(op) || e->inProtected) {
                 fpSyncAll(e);
-            } else if (e->fpCarryCount < 64) {
+            } else if (e->fpCarryCount < jitCarryLimit()) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
             } else {
                 fpSyncAll(e);
@@ -971,6 +989,65 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                 e->kPend   &= ~(1u << idx);
                 e->xBorrow &= ~(1u << idx);
             }
+            /* `break` out of a for-in: drop the iterator, jump to the exit.
+             * The jump is unconditional, so the walk goes on at the offset
+             * after it -- which only the loop body's own branches reach, and
+             * they arrive WITH the iterator. Restating the model from the
+             * entry just popped (same index, so the same register, which
+             * nothing on that path wrote) is what lets the walk continue
+             * there; without it the walk stopped, the loop's exit was never
+             * emitted, and every function holding such a loop declined
+             * outright. Only when a branch already recorded for that offset
+             * names exactly the restored stack. */
+            /* The same `break` out of the loop an OSR region is compiled for:
+             * that iterator lives below the model (depth 0 here is the head's
+             * depth), and the exit stub for the iterator's own exit already
+             * tells the interpreter to drop it -- so a jump to exactly that
+             * exit is the whole of the `break`. Any other target keeps the
+             * old stop. */
+            if (jitBreakIter() && e->osr && e->hasIter && !e->inlining &&
+                e->depth == 0 && off + 4 <= stop && code[off + 1] == OP_JUMP) {
+                int16_t jump = jaiReadI16(code + off + 2);
+                uint32_t target = (uint32_t)((int32_t)(off + 4) + jump);
+                if (target == e->iterExit) {
+                    branchTo(e, target, false, 0);
+                    off += 4;
+                    break;
+                }
+            }
+            if (jitBreakIter() && !e->inlining && e->depth > 0 &&
+                e->stack[e->depth - 1] == SLOT_ITER && off + 4 <= stop &&
+                code[off + 1] == OP_JUMP) {
+                uint32_t after = (uint32_t)(off + 4);
+                int64_t want = stackSignatureAt(e, e->depth);
+                bool reached = false;
+                for (unsigned f = 0; f < e->fixupCount && !reached; f++) {
+                    reached = e->fixups[f].targetOffset == after &&
+                              e->fixups[f].depth == want;
+                }
+                if (reached) {
+                    unsigned t = e->depth - 1;
+                    SlotKind k = e->stack[t];
+                    uint32_t shape = e->stackShape[t];
+                    ObjClass *cls = e->stackClass[t];
+                    Value seen = e->stackSeen[t];
+                    int fromLocal = e->stackLocal[t];
+                    uint8_t objType = e->stackObjType[t];
+                    Value elem = e->stackElem[t];
+                    uint8_t elemDecl = e->stackElemDecl[t];
+                    if (!popValue(e, &r, NULL)) return false;
+                    int16_t jump = jaiReadI16(code + off + 2);
+                    branchTo(e, (uint32_t)((int32_t)(off + 4) + jump), false, 0);
+                    if (!pushValue3(e, k, shape, cls, seen, fromLocal)) {
+                        return false;
+                    }
+                    e->stackObjType[e->depth - 1] = objType;
+                    e->stackElem[e->depth - 1] = elem;
+                    e->stackElemDecl[e->depth - 1] = elemDecl;
+                    off += 4;
+                    break;
+                }
+            }
             if (!popValue(e, &r, NULL)) return false;
             off += 1;
             break;
@@ -1020,6 +1097,10 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                     fpClaim(e, at);
                 } else {
                     emitConst64(e, pushReg(e) - 1, bits);
+                }
+                /* After the claim, which clears it: the entry IS 2.0. */
+                if (d == 2.0 && jitFTwo()) {
+                    e->fTwo |= 1u << (e->valueDepth - 1);
                 }
             } else if (IS_BOOL(k)) {
                 if (!pushValue3(e, SLOT_BOOL, 0, NULL, k, -1)) return false;
@@ -1277,9 +1358,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                  * frame slot holds it (findComprehensionAcc) and reserved a
                  * callee-saved register, because emitListStore needs the
                  * container somewhere that survives its four loads and the grow
-                 * stub's call -- every scratch is spoken for inside it, and a
-                 * hoist register can never be placed in a loop that appends,
-                 * since an append IS a call as far as regionCalls is concerned.
+                 * stub's call -- every scratch is spoken for inside it. (The
+                 * hoist registers, x13..x17, are another bank: the grow stub
+                 * keeps those itself, see JAITHON_JIT_GROW_KEEPS.)
                  *
                  * Reloaded from the frame at every append rather than hoisted
                  * once: the register is then a pure cache of a slot the
@@ -1466,18 +1547,36 @@ bool compileBody(Emit *e, ObjClosure *closure) {
     }
     fpSyncAll(e);
     settleAll(e);
+    /* The three checks below ask one question -- does any branch land on
+     * this offset -- of up to JIT_MAX_CARRY offsets each, so the fixups'
+     * targets are marked once rather than rescanned per offset. Only targets
+     * inside this chunk: deopt and overflow fixups carry sentinel targets far
+     * above any offset, and never match a carried one either way. */
+    uint8_t *landed = NULL;
+    unsigned landedCount = (unsigned)fn->chunk.count + 1u;
+    if (e->fpCarryCount + e->homeEarlyCount + e->deferCarryCount > 0) {
+        landed = (uint8_t *)calloc(landedCount, 1);
+        if (landed == NULL) {
+            e->whyNot = "out of memory checking branch targets";
+            return false;
+        }
+        for (unsigned f = 0; f < e->fixupCount; f++) {
+            uint32_t t = e->fixups[f].targetOffset;
+            if (t < landedCount) landed[t] = 1;
+        }
+    }
     /* Nothing may branch to an offset this walk carried a float into (see fpCarry) -- declines, and the caller retries with the FP bank off. */
     for (unsigned i = 0; i < e->fpCarryCount; i++) {
-        for (unsigned f = 0; f < e->fixupCount; f++) {
-            if (e->fixups[f].targetOffset != e->fpCarry[i]) continue;
+        if (e->fpCarry[i] < landedCount && landed[e->fpCarry[i]]) {
+            free(landed);
             e->whyNot = "a branch lands inside a float expression";
             return false;
         }
     }
     /* Mirror image for homeEarly (see fpBindLookahead): a back edge to such a bind is only visible here, after the whole walk. */
     for (unsigned i = 0; i < e->homeEarlyCount; i++) {
-        for (unsigned f = 0; f < e->fixupCount; f++) {
-            if (e->fixups[f].targetOffset != e->homeEarly[i]) continue;
+        if (e->homeEarly[i] < landedCount && landed[e->homeEarly[i]]) {
+            free(landed);
             e->whyNot = "a branch lands on a bind whose local was written early";
             return false;
         }
@@ -1485,12 +1584,13 @@ bool compileBody(Emit *e, ObjClosure *closure) {
     /* Same for a deferred X entry: forward branches were settled during the walk, this catches a
      * backward one (a loop head sitting between an OP_INT and the operator consuming it). Nothing in the suite reaches it -- the point is that it costs a decline, not a register nothing wrote. */
     for (unsigned i = 0; i < e->deferCarryCount; i++) {
-        for (unsigned f = 0; f < e->fixupCount; f++) {
-            if (e->fixups[f].targetOffset != e->deferCarry[i]) continue;
+        if (e->deferCarry[i] < landedCount && landed[e->deferCarry[i]]) {
+            free(landed);
             e->whyNot = "a branch lands where a value was deferred";
             return false;
         }
     }
+    free(landed);
     return !e->failed;
 }
 

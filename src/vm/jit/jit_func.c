@@ -175,8 +175,26 @@ unsigned localTagFor(const Emit *e, unsigned slot) {
  * read was compiled for is a speculation until that tag confirms it. Both
  * tiers guard; only the address of the frame home differs, so it is passed
  * in rather than recomputed here. */
+/* JAITHON_JIT_DYN_MEMO: guard a dynamic local once per straight line rather
+ * than at every read. See Emit::dynGuarded. */
+static bool jitDynMemo(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DYN_MEMO");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static void localGuardDynamic(Emit *e, unsigned slot, unsigned scratch,
                               unsigned base, unsigned off) {
+    /* Already proved on this edge, and nothing since could have changed what
+     * the frame home holds: a write would have retired the bit (noteSlotWrite),
+     * and so would a call out (noteScratchClobber) -- the one way code that is
+     * not this body could reach an interpreter slot, through an upvalue -- and a
+     * join (compileBody), where another edge arrives with no proof at all. An
+     * object's class never changes, so its shape is as proved as its tag. */
+    if (slot < 64u && (e->dynGuarded & (1ull << slot)) != 0) return;
     /* Every exit below is a deopt, and a deopt record describes each stack entry
      * by its own register -- so nothing may still be a pending constant or a
      * borrow of a local's, and settling is what makes the guard legal at all.
@@ -258,6 +276,9 @@ static void localGuardDynamic(Emit *e, unsigned slot, unsigned scratch,
         emitConst64(e, JIT_SCRATCH_D, (int64_t)e->localShape[slot]);
         emit(e, jaiA64SubsXReg(31, scratch, JIT_SCRATCH_D));
         branchOnDeopt(e, JAI_A64_NE);
+    }
+    if (slot < 64u && !e->failed && jitDynMemo()) {
+        e->dynGuarded |= 1ull << slot;
     }
 }
 
@@ -404,6 +425,11 @@ static void forgetFieldKindsOfLocal(Emit *e, unsigned slot) {
  * in those two places is what makes "this slot does not change inside that
  * loop" a fact about the emitter rather than a re-reading of the bytecode. */
 static void noteSlotWrite(Emit *e, unsigned slot) {
+    /* Any local written retires every fpSrc entry's claim to still equal its
+     * local -- see fpOperandReread. Coarser than per slot, and that is the
+     * point: nothing has to prove which home a write reached. */
+    e->localEpoch++;
+    if (slot < 64u) e->dynGuarded &= ~(1ull << slot);
     /* Above the range check on purpose: the memo is keyed on the same slot
      * numbers, so a slot too high to record is still one to retire. */
     if (e->knownCount != 0) forgetFieldKindsOfLocal(e, slot);
@@ -466,6 +492,14 @@ void noteSlotIndexed(Emit *e, int slot) {
     e->slotIndexUse[slot] += w;
     if (e->curOffset < e->slotIndexLo[slot]) e->slotIndexLo[slot] = e->curOffset;
     if (e->curOffset > e->slotIndexHi[slot]) e->slotIndexHi[slot] = e->curOffset;
+}
+
+void noteSlotStored(Emit *e, int slot) {
+    if (!e->measuring || e->inlining || slot < 0 || slot > (int)JIT_MAX_SLOTS) {
+        return;
+    }
+    if (e->curOffset < e->slotStoreLo[slot]) e->slotStoreLo[slot] = e->curOffset;
+    if (e->curOffset > e->slotStoreHi[slot]) e->slotStoreHi[slot] = e->curOffset;
 }
 
 void localOut(Emit *e, unsigned slot, unsigned src) {
@@ -833,6 +867,7 @@ bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi) {
  * measuring pass records it so the real pass can choose a bank; the real pass
  * declines if it happens anyway, so a missed site costs a decline and never a
  * value read out of a register a helper overwrote. */
+
 void noteScratchClobber(Emit *e) {
     e->clobbersScratch = true;
     /* The one place every call out passes through, which makes it the one
@@ -841,6 +876,7 @@ void noteScratchClobber(Emit *e) {
      * (a list grow, an instance allocation) only over-retire, which costs the
      * tag guard the read would have emitted anyway. */
     forgetFieldKinds(e);
+    e->dynGuarded = 0;
     if (e->measuring) {
         /* An inlined body's offsets are the CALLEE's, so they say nothing
          * about where in the caller this sits; `inlIp` is the caller's own
@@ -950,6 +986,7 @@ void fpSyncOne(Emit *e, unsigned idx) {
 /* A local's d register is about to be written, so every entry borrowing it
  * takes a copy of its own first. */
 void fpReleaseHome(Emit *e, unsigned reg) {
+    e->localEpoch++;        /* a home is about to change: see fpOperandReread */
     if (e->fpBorrow == 0 || reg == 0) return;
     for (unsigned i = 0; i < 32u; i++) {
         if ((e->fpBorrow & (1u << i)) == 0) continue;
@@ -987,11 +1024,107 @@ unsigned fpOperand(Emit *e, unsigned idx) {
     return d;
 }
 
+/* JAITHON_JIT_FN_BIND_EARLY: the function tier's planned (spilled) frame has
+ * d homes too, so a float operator feeding OP_BIND may write the home
+ * directly there as well -- `dx = bi.x - bj.x` was an `fsub` into the bank
+ * and an `fmov` out of it, five times an nbody pair. */
+static bool earlyBindTier(const Emit *e) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FN_BIND_EARLY");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return e->osr || (e->spilled && cached != 0);
+}
+
+/* JAITHON_JIT_WIDE_CARRY: the per-walk limits on carried and early-written
+ * offsets (see JIT_MAX_CARRY), or the sixty-four and thirty-two they were. */
+static bool jitWideCarry(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_WIDE_CARRY");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+unsigned jitCarryLimit(void) {
+    return jitWideCarry() ? JIT_MAX_CARRY : 64u;
+}
+
+static unsigned jitHomeEarlyLimit(void) {
+    return jitWideCarry() ? JIT_MAX_HOME_EARLY : 32u;
+}
+
+/* JAITHON_JIT_FP_REREAD: a float operator reads a still-current float local
+ * from its d home rather than through the X copy OP_GET_LOCAL took. See
+ * Emit::fpSrc. */
+/* JAITHON_JIT_FTWO: `2.0 * x` as `x + x`. See Emit::fTwo. */
+bool jitFTwo(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FTWO");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool jitFpReread(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FP_REREAD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Entry `idx` was just pushed as an X copy of float local `slot`. */
+void fpSrcNote(Emit *e, unsigned idx, unsigned slot) {
+    if (idx >= 32u || slot > JIT_MAX_SLOTS || !jitFpReread()) return;
+    e->fpSrc |= 1u << idx;
+    e->fpSrcSlot[idx]  = (uint8_t)slot;
+    e->fpSrcEpoch[idx] = e->localEpoch;
+}
+
+/* fpOperand for a float operator's operand. An entry that is still an
+ * untouched copy of a float local is answered with the local's d home, so the
+ * operator never waits on an `fmov d,x` of a value the home already holds.
+ *
+ * Why it is worth an arm: the copy is taken when the local is PUSHED, which for
+ * an accumulator is before everything on the right-hand side -- `sum += f(i) *
+ * v[j]` pushes `sum`, then the call, then the subscript. Anything there outside
+ * the FP whitelist moves the bank to X, so the add read `sum` back through
+ * `fmov d,x` and wrote it out through `fmov x,d`: two cross-register-file moves
+ * on the loop-carried chain, about ten cycles against the add's three on this
+ * machine. Reading the home here makes the chain the add alone.
+ *
+ * Sound because nothing but localOut/localOutFp (via noteSlotWrite) and
+ * fpReleaseHome writes a d home, and each bumps localEpoch; a join clears
+ * fpSrc outright (compileBody), and so does anything that rewrites an entry in
+ * place. In the measuring pass the read is credited to the FP ledger -- the
+ * bank this saves in -- so the plan gives the local a d home at all. */
+unsigned fpOperandReread(Emit *e, unsigned idx) {
+    if (idx < 32u && (e->fpSrc & (1u << idx)) != 0 &&
+        (e->fpLive & (1u << idx)) == 0 && !e->fpOff &&
+        e->fpSrcEpoch[idx] == e->localEpoch) {
+        unsigned slot = e->fpSrcSlot[idx];
+        if (slot <= JIT_MAX_SLOTS && e->localKind[slot] == SLOT_FLOAT &&
+            !e->dynamicLocal[slot]) {
+            noteSlotCost(e, slot, 0u, 3u);
+            unsigned home = (e->osr || e->spilled) ? e->slotFpReg[slot] : 0u;
+            if (home != 0) return home;
+        }
+    }
+    return fpOperand(e, idx);
+}
+
 /* Entry `idx` has just been computed into v(16 + idx); its X register is now
  * stale until something asks for it. */
 void fpClaim(Emit *e, unsigned idx) {
     e->fpLive |= 1u << idx;
     e->fpBorrow &= ~(1u << idx);
+    e->fpSrc &= ~(1u << idx);
+    e->fTwo &= ~(1u << idx);
 }
 
 void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
@@ -1003,7 +1136,7 @@ void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
 /* Float op writing straight to a local's home instead of the bank + fmov (saves the trailing `fmov`
  * on every `*_BIND`). Safe only because the borrow release happens HERE, before the operator, not after in localOutFp -- a borrower wants the pre-operator value, and since arm64 reads sources before writing its destination, `sum += x` naming the home among its own sources is fine once the borrow is already released. No FP register on the local: bank returned unchanged, so callers see one shape either way. */
 unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank) {
-    if (!e->osr || e->slotFpReg[slot] == 0) return bank;
+    if (!earlyBindTier(e) || e->slotFpReg[slot] == 0) return bank;
     fpReleaseHome(e, e->slotFpReg[slot]);
     return e->slotFpReg[slot];
 }
@@ -1013,8 +1146,8 @@ unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank) {
 unsigned fpBindLookahead(Emit *e, const uint8_t *code, int next,
                                 int stop, const ObjFunction *fn,
                                 uint32_t *bindOffOut) {
-    if (!e->osr || e->fpOff || e->inlining) return 0;
-    if (e->homeEarlyCount >= 32) return 0;
+    if (!earlyBindTier(e) || e->fpOff || e->inlining) return 0;
+    if (e->homeEarlyCount >= jitHomeEarlyLimit()) return 0;
     if (next < stop && code[next] == OP_TYPE_GUARD) {
         /* Only the settled form: a guard that widens an int emits `scvtf` (making the entry an int, so this
          * arm is never reached); a guard naming any other type declines below. */
@@ -1079,6 +1212,21 @@ unsigned localHomeX(const Emit *e, unsigned slot) {
     if (e->osr) return e->slotXReg[slot];
     if (e->spilled) return 0u;
     return localReg(e, slot);
+}
+
+/* JAITHON_JIT_BORROW_CREDIT: a read of a local that is satisfied by
+ * borrowing its register still counts towards the register it borrowed. The
+ * function tier's measuring pass runs with every local in a fixed register,
+ * so every read there is a borrow -- and none of them was credited: a list
+ * subscripted every iteration ranked at zero and was planned into the frame,
+ * one `ldr` per access (nbody's `bodies`), and a loop could never hoist it. */
+void noteLocalBorrowed(Emit *e, unsigned slot) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_BORROW_CREDIT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    if (cached) noteSlotCost(e, slot, 1u, 0u);
 }
 
 void xBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
@@ -1160,6 +1308,7 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackClass[e->depth] = klass;
     e->stackSeen[e->depth]  = seen;
     e->stackLocal[e->depth] = fromLocal;
+    e->stackLocalEpoch[e->depth] = e->localEpoch;
     e->stackAscii[e->depth] = false;
     e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
@@ -1176,8 +1325,10 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
+    e->fpSrc    &= ~(1u << e->valueDepth);
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
+    e->fTwo     &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
     e->idxKnown &= ~(1u << e->valueDepth);
     e->valueDepth++;
@@ -1231,6 +1382,51 @@ void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind) {
     e->knownCount++;
 }
 
+/* JAITHON_JIT_FIELD_READ_MEMO: a field read whose tag guard passed is
+ * remembered like a store, so the next read of it through the same local
+ * along the same edge skips the guard -- and a store of the same kind there
+ * skips writing a tag the field already has. */
+bool jitFieldReadMemoOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FIELD_READ_MEMO");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Entry `depthIdx` was read from a local that has not been written since, so
+ * the object in its register is the one the local holds. A memo keyed on the
+ * local is only true of that object: `b.x += (if c { b = o; 1.0 } else {..})`
+ * stores through the OLD `b`, and remembering the store against `b` would let
+ * a later `b.x` skip the guard on `o`. */
+bool stackLocalCurrent(const Emit *e, unsigned depthIdx) {
+    if (depthIdx >= e->depth || e->stackLocal[depthIdx] < 0) return false;
+    return e->stackLocalEpoch[depthIdx] == e->localEpoch;
+}
+
+/* A read is a fact about the object, not a change to it, so unlike a store it
+ * retires nothing another receiver claimed: an alias read the same memory and
+ * saw the same tag. Scalars only -- the kinds a later read can replay with no
+ * sample behind them (see recordFieldStore's caller for why OBJ is not). The
+ * retirement rules are the store's: a store of this field through anything,
+ * a write of the local, a call out, a join. */
+void recordFieldRead(Emit *e, int local, uint16_t field, SlotKind kind) {
+    if (local < 0 || !jitFieldReadMemoOn()) return;
+    if (kind != SLOT_INT && kind != SLOT_FLOAT && kind != SLOT_BOOL) return;
+    for (unsigned i = 0; i < e->knownCount; i++) {
+        if (e->known[i].local == local && e->known[i].field == field) {
+            e->known[i].kind = kind;
+            return;
+        }
+    }
+    if (e->knownCount >= 16) return;
+    e->known[e->knownCount].local = local;
+    e->known[e->knownCount].field = field;
+    e->known[e->knownCount].kind  = kind;
+    e->knownCount++;
+}
+
 bool pushSelf(Emit *e) {
     if (e->depth >= JIT_MAX_STACK) return false;
     e->stackAscii[e->depth] = false;
@@ -1274,8 +1470,10 @@ bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     e->valueDepth--;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
+    e->fpSrc    &= ~(1u << e->valueDepth);
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
+    e->fTwo     &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
     e->idxKnown &= ~(1u << e->valueDepth);
     if (kind != NULL) *kind = e->stack[e->depth];
@@ -1298,6 +1496,12 @@ bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
  * no register, so copying the result's entry down over it and shortening the
  * stack leaves the result on top, still in the register it was computed into. */
 void dropCalleeEntry(Emit *e) {
+    /* Every caller has just rewritten the top entry in place (a builtin's
+     * result in its argument's register), so it no longer copies a local. */
+    if (e->valueDepth > 0) {
+        e->fpSrc &= ~(1u << (e->valueDepth - 1));
+        e->fTwo  &= ~(1u << (e->valueDepth - 1));
+    }
     e->stack[e->depth - 2]      = e->stack[e->depth - 1];
     e->stackShape[e->depth - 2] = 0;
     e->stackClass[e->depth - 2] = NULL;

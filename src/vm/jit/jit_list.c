@@ -248,6 +248,18 @@ bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi) {
     return false;
 }
 
+/* JAITHON_JIT_HOIST_LEAN: a hoist takes one register for `items`, a list
+ * stored into takes one for its bumped version, and counts get the rest. See
+ * Emit::hoist. */
+static bool jitHoistLean(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_LEAN");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* The hoisted header for a subscript whose base is a plain read of local
  * `slot`, or -1. `curOffset` is checked against the loop the entry was made
  * for, so an entry the walk has already left cannot be picked up again by a
@@ -452,7 +464,8 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
  * local the loop reassigns (its value at the hoist is not the one appended
  * to). A comprehension's accumulator needs no proof -- no local can hold it
  * while its loop runs. Duplicate targets are listed once. */
-static bool hoistAliasSet(const Emit *e, unsigned slot, uint32_t lt,
+static bool hoistAliasSet(const Emit *e, const SlotKind *kinds,
+                          unsigned slot, uint32_t lt,
                           uint32_t le, uint8_t *out, uint8_t *nOut) {
     unsigned n = 0;
     if (e->pushSpill) return false;
@@ -463,7 +476,7 @@ static bool hoistAliasSet(const Emit *e, unsigned slot, uint32_t lt,
         if (p < 0 || p > (int)JIT_MAX_SLOTS) return false;
         if ((unsigned)p == slot) return false;
         if (e->slotWriteHi[p] >= lt && e->slotWriteLo[p] < le) return false;
-        if (e->localKind[p] != SLOT_LIST) return false;
+        if (kinds[p] != SLOT_LIST) return false;
         bool seen = false;
         for (unsigned k = 0; k < n; k++) {
             if (out[k] == (uint8_t)p) { seen = true; break; }
@@ -519,9 +532,21 @@ static bool hoistAliasSet(const Emit *e, unsigned slot, uint32_t lt,
  *
  * The loop chosen is the OUTERMOST one the slot is invariant across, so the
  * load runs as rarely as the proof allows. */
-void planHoists(Emit *e, ObjFunction *fn) {
-    if (e->measuring || !e->osr) return;
+/* The register a hoisted list's local lives in, or 0. The loop tier's homes
+ * are slotXReg; the function tier's are its fixed x19.. registers unless the
+ * frame was planned, when they are slotXReg too. A dynamic slot has none. */
+static unsigned hoistListReg(const Emit *e, unsigned slot) {
+    if (slot > JIT_MAX_SLOTS || e->dynamicLocal[slot]) return 0;
+    if (e->osr || e->spilled) return e->slotXReg[slot];
+    return localHomeX(e, slot);
+}
+
+void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
+    if (e->measuring) return;
     const Chunk *c = &fn->chunk;
+    /* The function tier walks the whole chunk; the loop tier its own loop. */
+    uint32_t regionLo = e->osr ? e->osrTop : 0u;
+    uint32_t regionHi = e->osr ? e->osrEnd : (uint32_t)c->count;
 
     struct {
         uint32_t top, end, use; uint8_t slot; bool str;
@@ -530,7 +555,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
     } cand[JIT_MAX_SLOTS + 1];
     unsigned ncand = 0;
 
-    for (unsigned s = 0; s < e->locals && s <= JIT_MAX_SLOTS; s++) {
+    for (unsigned s = 0; s < e->base + e->locals && s <= JIT_MAX_SLOTS; s++) {
         /* A string local hoists for the same reasons a list does, and for one
          * more: a string never changes at all, so the only thing that can
          * make its header stale is a write to the LOCAL -- the same range
@@ -543,31 +568,32 @@ void planHoists(Emit *e, ObjFunction *fn) {
          * guards deopt where they always did, rather than the head deopting
          * every entry. `scalars` is UINT32_MAX until something asks, and an
          * unknown count is not a pass -- the per-site path is what fills it
-         * in. */
+         * in. The loop tier only: the string header is read off slotXReg. */
         bool str = false;
-        if (e->localKind[s] == SLOT_OBJ) {
+        if (kinds[s] == SLOT_OBJ) {
+            if (!e->osr) continue;
             Value sv = seenLocal(e, s);
             if (!jitStrHoist() || !IS_STRING(sv)) continue;
             ObjString *ss = AS_STRING(sv);
             if (ss->scalars != ss->length) continue;
             str = true;
-        } else if (e->localKind[s] != SLOT_LIST) {
+        } else if (kinds[s] != SLOT_LIST) {
             continue;
         }
-        if (e->slotXReg[s] == 0) continue;   /* no register to load from */
+        if (hoistListReg(e, s) == 0) continue;   /* no register to load from */
         if (e->slotIndexUse[s] == 0) continue;
         uint32_t bestTop = 0, bestEnd = 0;
         uint8_t bestAlias[JIT_MAX_HOIST_ALIAS];
         uint8_t bestAliasCount = 0;
         bool bestCovers = false;
         bool bestInside = false;
-        for (int at = (int)e->osrTop; at < (int)e->osrEnd;) {
+        for (int at = (int)regionLo; at < (int)regionHi;) {
             int len = instructionLength(c, at);
             if (len <= 0) break;
             uint32_t lt = (uint32_t)at;
             uint32_t le = loopBodyEnd(c, lt);
             at += len;
-            if (le == 0 || le <= lt || le > e->osrEnd) continue;
+            if (le == 0 || le <= lt || le > regionHi) continue;
             /* Every subscript of this slot inside the loop -- or, with
              * jitHoistPartialOn, at least some: a site outside the hoist's
              * range never asks for it (hoistFor checks the range) and reloads
@@ -592,7 +618,9 @@ void planHoists(Emit *e, ObjFunction *fn) {
              * list only if the hoist can prove at run time it is another. */
             uint8_t alias[JIT_MAX_HOIST_ALIAS];
             uint8_t aliasCount = 0;
-            if (!hoistAliasSet(e, s, lt, le, alias, &aliasCount)) continue;
+            if (!hoistAliasSet(e, kinds, s, lt, le, alias, &aliasCount)) {
+                continue;
+            }
             if (!onlyBackEdgesEnter(c, lt, le)) continue;
             /* Outermost is not the whole preference. emitHoistsAt proves a
              * slot's bounds at the head of the loop it hoists out of, and only
@@ -628,18 +656,35 @@ void planHoists(Emit *e, ObjFunction *fn) {
         ncand++;
     }
 
+    /* Lean: every candidate gets its items register first, then a list that
+     * the loop stores into gets its version register, and only what is left
+     * goes to counts -- busiest first each time. A stencil's four rows need
+     * eight registers the old way and the pool has seven, so the row being
+     * WRITTEN went without, which is the one whose per-element load-add-store
+     * of `version` became the loop's critical path once everything else was
+     * hoisted. */
+    bool lean = jitHoistLean();
+    unsigned need = lean ? 1u : 2u;
     while (e->hoistCount < JIT_MAX_HOIST &&
-           e->hoistPoolCount - e->hoistTaken >= 2u) {
+           e->hoistPoolCount - e->hoistTaken >= need) {
         unsigned pick = ncand, bestUse = 0;
         for (unsigned i = 0; i < ncand; i++) {
             if (cand[i].use > bestUse) { bestUse = cand[i].use; pick = i; }
         }
         if (pick == ncand) break;
         cand[pick].use = 0;                  /* taken */
+        /* A string header is `chars` and `length` together, always: the
+         * string arms read the length out of countReg (see hoistForStr). */
+        bool wantCount = !lean || cand[pick].str;
+        if (wantCount && e->hoistPoolCount - e->hoistTaken < 2u) continue;
         unsigned rI = e->hoistPool[e->hoistTaken++];
-        unsigned rC = e->hoistPool[e->hoistTaken++];
+        unsigned rC = 0;
+        if (wantCount) rC = e->hoistPool[e->hoistTaken++];
         if (rI < e->scratchRoom) e->scratchRoom = rI;
-        if (rC < e->scratchRoom) e->scratchRoom = rC;
+        if (wantCount && rC < e->scratchRoom) e->scratchRoom = rC;
+        e->hoist[e->hoistCount].hasCount = wantCount;
+        e->hoist[e->hoistCount].hasVer   = false;
+        e->hoist[e->hoistCount].verReg   = 0;
         e->hoist[e->hoistCount].top      = cand[pick].top;
         e->hoist[e->hoistCount].end      = cand[pick].end;
         e->hoist[e->hoistCount].slot     = cand[pick].slot;
@@ -658,7 +703,10 @@ void planHoists(Emit *e, ObjFunction *fn) {
          * OP_ELEM_KIND stamping an empty list. */
         e->hoist[e->hoistCount].stgPin = false;
         e->hoist[e->hoistCount].stg = (uint8_t)LIST_STORE_BOXED;
-        {
+        /* The loop tier only: the function tier's sample is the FIRST call's
+         * arguments, and a later call with another storage would deoptimise
+         * at this head every time. Its accesses keep their own dispatch. */
+        if (e->osr && !cand[pick].str) {
             unsigned hs = cand[pick].slot;
             if (jitHoistPinOn() && !e->localStgPin[hs] &&
                 e->observed != NULL && IS_LIST(e->observed[hs]) &&
@@ -675,6 +723,36 @@ void planHoists(Emit *e, ObjFunction *fn) {
             e->hoist[e->hoistCount].rEnd = jaiReadU16(c->code + ht + 7);
         }
         e->hoistCount++;
+    }
+    if (!lean) return;
+    /* Versions, for lists stored into inside their own region. */
+    for (unsigned h = 0; h < e->hoistCount; h++) {
+        if (e->hoistPoolCount - e->hoistTaken < 1u) break;
+        unsigned sl = e->hoist[h].slot;
+        if (e->hoist[h].str) continue;
+        if (e->slotStoreLo[sl] > e->slotStoreHi[sl]) continue;
+        if (e->slotStoreLo[sl] < e->hoist[h].top) continue;
+        if (e->slotStoreHi[sl] >= e->hoist[h].end) continue;
+        unsigned rV = e->hoistPool[e->hoistTaken++];
+        if (rV < e->scratchRoom) e->scratchRoom = rV;
+        e->hoist[h].hasVer = true;
+        e->hoist[h].verReg = (uint8_t)rV;
+    }
+    /* Counts, busiest first, with whatever is left. */
+    for (;;) {
+        if (e->hoistPoolCount - e->hoistTaken < 1u) break;
+        int pick = -1;
+        unsigned bestUse = 0;
+        for (unsigned h = 0; h < e->hoistCount; h++) {
+            if (e->hoist[h].hasCount) continue;
+            unsigned use = e->slotIndexUse[e->hoist[h].slot];
+            if (pick < 0 || use > bestUse) { pick = (int)h; bestUse = use; }
+        }
+        if (pick < 0) break;
+        unsigned rC = e->hoistPool[e->hoistTaken++];
+        if (rC < e->scratchRoom) e->scratchRoom = rC;
+        e->hoist[pick].countReg = (uint8_t)rC;
+        e->hoist[pick].hasCount = true;
     }
 }
 
@@ -694,7 +772,6 @@ void planHoists(Emit *e, ObjFunction *fn) {
  * has its own counter and those registers describe the outer. */
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
                                 int32_t *offOut, uint8_t *baseOut) {
-    if (!e->osr) return false;
     if (slot < 0 || slot > (int)JIT_MAX_SLOTS) return false;
     if ((e->idxKnown & (1u << vidx)) == 0) return false;
     unsigned base = e->idxBase[vidx];
@@ -782,11 +859,7 @@ void emitHoistsAt(Emit *e, uint32_t off) {
                                (unsigned)offsetof(ObjString, chars)));
             continue;
         }
-        /* Outside the loop, so the function tier pays its two instructions
-         * once per entry rather than per element. */
-        if (!e->osr) {
-            emitListBoxedGuard(e, e->slotXReg[e->hoist[i].slot], JIT_SCRATCH_A);
-        }
+        unsigned hList = hoistListReg(e, e->hoist[i].slot);
         /* The loop appends to these lists, and a header that is one of them
          * goes stale at the first append. planHoists ruled out the same
          * LOCAL; the same LIST under another name is settled here, once per
@@ -796,17 +869,25 @@ void emitHoistsAt(Emit *e, uint32_t off) {
         for (unsigned a = 0; a < e->hoist[i].aliasCount; a++) {
             unsigned other = localIn(e, e->hoist[i].aliasSlot[a],
                                      JIT_SCRATCH_B);
-            emit(e, jaiA64SubsXReg(31, e->slotXReg[e->hoist[i].slot], other));
+            emit(e, jaiA64SubsXReg(31, hList, other));
             branchOnDeoptAt(e, JAI_A64_EQ, off, false);
         }
         if (e->hoist[i].stgPin) {
-            emit(e, jaiA64LdrByte(JIT_SCRATCH_A, e->slotXReg[e->hoist[i].slot],
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_A, hList,
                                   (unsigned)offsetof(ObjList, stg)));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, e->hoist[i].stg));
             branchOnDeoptAt(e, JAI_A64_NE, off, false);
         }
-        emitListHeader(e, e->slotXReg[e->hoist[i].slot],
-                       e->hoist[i].itemsReg, e->hoist[i].countReg);
+        /* The count for the bounds guard below: its own register when it has
+         * one, otherwise a scratch that is dead once the guard is past. */
+        unsigned hCount = e->hoist[i].hasCount ? e->hoist[i].countReg
+                                               : JIT_SCRATCH_D;
+        emitListHeader(e, hList, e->hoist[i].itemsReg, hCount);
+        if (e->hoist[i].hasVer) {
+            unsigned rv = e->hoist[i].verReg;
+            emit(e, jaiA64LdrW(rv, hList, (unsigned)offsetof(ObjList, version)));
+            emit(e, jaiA64AddXImm(rv, rv, 1));
+        }
 
         /* And, once, the bounds every subscript of this slot inside the loop
          * would otherwise check for itself. The counter runs [IDX, LIM), so
@@ -819,7 +900,7 @@ void emitHoistsAt(Emit *e, uint32_t off) {
          * loop would hand the whole rest of the function to the interpreter
          * for no reason. */
         unsigned sl = e->hoist[i].slot;
-        if (!e->osr || !e->hoist[i].rangeOk || !e->hoist[i].inside) continue;
+        if (!e->hoist[i].rangeOk || !e->hoist[i].inside) continue;
         if (!e->spanOk[sl] || e->spanLo[sl] > e->spanHi[sl]) continue;
         if (!e->spanSeen[sl] || e->spanBase[sl] != e->hoist[i].rVar) continue;
         /* localIn, not localHomeX: the counter and the end are temporaries the
@@ -848,7 +929,7 @@ void emitHoistsAt(Emit *e, uint32_t off) {
 
         emitAddSubImm(e, JIT_SCRATCH_A, rEnd, (int64_t)e->spanHi[sl] - 1,
                       false);
-        emit(e, jaiA64SubsXUxtw(31, JIT_SCRATCH_A, e->hoist[i].countReg));
+        emit(e, jaiA64SubsXUxtw(31, JIT_SCRATCH_A, hCount));
         branchOnDeoptAt(e, JAI_A64_HS, off, false);
 
         if (empty < e->count && e->count <= JIT_MAX_INSTS) {

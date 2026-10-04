@@ -444,6 +444,7 @@ bool pushLocalAsValue(Emit *e, unsigned slot) {
     unsigned home = localHomeX(e, slot);
     if (home != 0) {
         xBorrowLocal(e, e->valueDepth - 1, home);
+        noteLocalBorrowed(e, slot);
     } else {
         unsigned dst = pushReg(e) - 1;
         unsigned src = localIn(e, slot, dst);

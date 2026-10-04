@@ -55,6 +55,13 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 /* Register-free string facts (see Emit::strFact). Each costs a guard or two
  * at its loop head and nothing inside the loop. */
 #define JIT_MAX_STR_FACTS 8u
+/* How many offsets one walk may carry an FP-resident or deferred value into,
+ * and how many float operators may write a local's home early. Past the
+ * limit every instruction settles instead, so a large float body ran its
+ * first sixty-four expressions in the FP bank and the rest through X. See
+ * jitCarryLimit and JAITHON_JIT_WIDE_CARRY. */
+#define JIT_MAX_CARRY      1024u
+#define JIT_MAX_HOME_EARLY  256u
 /* How many distinct clobber SITES the measuring pass will remember, so that
  * "does x0..x8 survive across this bytecode range" can be asked of a range
  * rather than of the whole body. Past this the body answers yes everywhere,
@@ -257,6 +264,11 @@ typedef struct {
     Value     stackElem[JIT_MAX_STACK];
     uint8_t   stackElemDecl[JIT_MAX_STACK];
     int       stackLocal[JIT_MAX_STACK];
+    /* localEpoch when the entry was pushed from its local. stackLocal says
+     * which local an entry was READ from; this says whether that local still
+     * holds it, which is what a memo keyed on the local needs (see
+     * stackLocalCurrent). */
+    uint32_t  stackLocalEpoch[JIT_MAX_STACK];
     bool      stackAscii[JIT_MAX_STACK];
     bool      stackUnit[JIT_MAX_STACK];
     /* This entry is a compile-time constant resolved out of the module, not a
@@ -562,6 +574,10 @@ typedef struct {
     uint32_t  slotWriteHi[JIT_MAX_SLOTS + 1];
     uint32_t  slotIndexLo[JIT_MAX_SLOTS + 1];
     uint32_t  slotIndexHi[JIT_MAX_SLOTS + 1];
+    /* The same bounds for the subscripts that STORE into the slot's list --
+     * the ones a hoist could give a version register. */
+    uint32_t  slotStoreLo[JIT_MAX_SLOTS + 1];
+    uint32_t  slotStoreHi[JIT_MAX_SLOTS + 1];
     unsigned  slotIndexUse[JIT_MAX_SLOTS + 1];
     /* Where the measuring pass saw each slot read as one side of a string
      * identity compare -- the arm that guards "a string, and interned" on
@@ -596,6 +612,18 @@ typedef struct {
          * the loop is emitted at it with no test (see jitHoistPinOn). */
         bool     stgPin;
         uint8_t  stg;
+        /* Whether countReg holds the count. A lean hoist (JAITHON_JIT_HOIST_LEAN)
+         * keeps only `items`: every subscript the head's guard covers needs no
+         * count, and one it does not cover loads its own header. */
+        bool     hasCount;
+        /* The version the list's stores in [top, end) write, already bumped:
+         * loaded once where the header is, so a store is one `str` instead of
+         * a load-add-store whose load waits on the previous iteration's store.
+         * Sound because the region is call-free -- no iterator can be made in
+         * it, so every snapshot was taken before the load, and any store moves
+         * the version past all of them, which is all an iterator asks. */
+        bool     hasVer;
+        uint8_t  verReg;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
     /* Loop-invariant FACTS about a string local, proved once at a loop head
@@ -777,11 +805,11 @@ typedef struct {
     bool      fpOff;
     /* Offsets this walk carried an FP-resident value INTO: a branch landing on one would arrive with the
      * value only in X, so the compile declines and retries with fpOff. Safety net, not a real path -- straight-line float expressions are never branch targets; JAI_JIT_WHY reports it when it fires. */
-    uint32_t  fpCarry[64];
+    uint32_t  fpCarry[JIT_MAX_CARRY];
     unsigned  fpCarryCount;
     /* Offsets of an OP_BIND whose local's d register was written EARLY by the float operator just above it,
      * so the bind itself emits nothing -- nothing may branch here, since an arriving path skipped the operator. Checked against fixups at the end of the walk, since a back-edge isn't in the list yet mid-walk (same reason as fpCarry). */
-    uint32_t  homeEarly[32];
+    uint32_t  homeEarly[JIT_MAX_HOME_EARLY];
     unsigned  homeEarlyCount;
     /* Value entries that are a plain read of a float local, held in that LOCAL's own d register instead of
      * copied into the bank (`x * x` becomes one multiply instead of two fmovs + a multiply). Read-only borrow: only localOut/localOutFp ever write a local's d home, and both release the borrow first. Cleared on push/pop/claim/before any deopt record. */
@@ -800,8 +828,30 @@ typedef struct {
      * push and pop, so it cannot outlive the entry it describes. */
     uint32_t  kKnown;
     int64_t   kKnownVal[32];
+    /* Entries that are the float literal 2.0, pushed by OP_CONST. `2.0 * x`
+     * is then `x + x` -- bit for bit the same double for every x, NaN, the
+     * infinities and -0.0 included, and an add is a cycle shorter than a
+     * multiply on a dependency chain. See JAITHON_JIT_FTWO. */
+    uint32_t  fTwo;
     uint32_t  xBorrow;
     uint8_t   xBorrowReg[32];
+    /* Dynamic locals (slots 0..63) whose tag -- and class, for an instance --
+     * this edge has already guarded since the slot was last written: a second
+     * read of the same value along the same straight line needs no second
+     * guard. Retired exactly where a field-kind memo is (a join, a call out, a
+     * write of the slot). See JAITHON_JIT_DYN_MEMO. */
+    uint64_t  dynGuarded;
+    /* Entries that are an X-side copy of a float LOCAL, taken by OP_GET_LOCAL when no float consumer was
+     * in reach (`sum += f(i) * v[j]` pushes `sum` before the call). While no local has been written and no
+     * join crossed since the read (localEpoch unchanged), the local's own d home still holds exactly those
+     * bits, so the float operator that finally consumes the entry reads the home instead of moving the copy
+     * back across register files -- which is what took the loop-carried `fmov d,x; fadd; fmov x,d` off the
+     * accumulator's chain. See fpOperandReread and JAITHON_JIT_FP_REREAD. Cleared with every other
+     * per-entry mask on push and pop, and by fpClaim and the in-place rewrites. */
+    uint32_t  fpSrc;
+    uint8_t   fpSrcSlot[32];
+    uint32_t  fpSrcEpoch[32];
+    uint32_t  localEpoch;
     /* Which entries are known to be a LOCAL plus a constant, and which local
      * and what constant. Not a value like kKnown -- a shape. It exists so a
      * subscript can say "this index is the loop counter, minus one" and have
@@ -845,7 +895,7 @@ typedef struct {
     uint16_t  rangeVar, rangeCur, rangeEnd;
     /* Offsets this walk carried a deferred entry into (same reason as fpCarry): a BACKWARD branch there
      * would arrive with the value in-register while the instruction reads the borrow. Forward branches are caught during the walk; this catches the rest. */
-    uint32_t  deferCarry[64];
+    uint32_t  deferCarry[JIT_MAX_CARRY];
     unsigned  deferCarryCount;
 } Emit;
 
@@ -1018,7 +1068,7 @@ void notePushTarget(Emit *e, int slot);
 void noteStorageStamp(Emit *e);
 bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi);
 bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi);
-void planHoists(Emit *e, ObjFunction *fn);
+void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds);
 const char *declineReason(Emit *e);
 unsigned jitShapeLimit(void);
 const char *unarmedDetail(const ObjFunction *fn, uint8_t op,
@@ -1079,6 +1129,9 @@ void fpReleaseHome(Emit *e, unsigned reg);
 void fpReleaseAll(Emit *e);
 void fpSyncAll(Emit *e);
 unsigned fpOperand(Emit *e, unsigned idx);
+bool jitFTwo(void);
+void fpSrcNote(Emit *e, unsigned idx, unsigned slot);
+unsigned fpOperandReread(Emit *e, unsigned idx);
 void fpClaim(Emit *e, unsigned idx);
 void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg);
 unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank);
@@ -1091,6 +1144,7 @@ void settleAll(Emit *e);
  * untouched -- the two copies now agree, and marking the X copy stale when it isn't would cost a needless sync. */
 unsigned xHeldIn(Emit *e, unsigned idx);
 unsigned localHomeX(const Emit *e, unsigned slot);
+void noteLocalBorrowed(Emit *e, unsigned slot);
 void xBorrowLocal(Emit *e, unsigned idx, unsigned reg);
 void kPendLocal(Emit *e, unsigned idx, int64_t k);
 bool pendingImm12(const Emit *e, unsigned idx, int64_t *out);
@@ -1102,6 +1156,9 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
 bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass);
 SlotKind knownFieldKind(const Emit *e, int local, uint16_t field);
 void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind);
+void recordFieldRead(Emit *e, int local, uint16_t field, SlotKind kind);
+bool stackLocalCurrent(const Emit *e, unsigned depthIdx);
+bool jitFieldReadMemoOn(void);
 bool pushSelf(Emit *e);
 void clearStackProofs(Emit *e);
 bool anyStackProof(const Emit *e);
@@ -1173,6 +1230,10 @@ void planStrFacts(Emit *e, ObjFunction *fn);
 bool strFactAscii(const Emit *e, int slot);
 bool strFactInterned(const Emit *e, int slot);
 void noteSlotStrEq(Emit *e, int slot);
+bool jitIterRecycle(void);
+extern ObjIter *gJitIterSpare;
+void noteSlotStored(Emit *e, int slot);
+unsigned jitCarryLimit(void);
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
                                 int32_t *offOut, uint8_t *baseOut);
 void emitHoistsAt(Emit *e, uint32_t off);

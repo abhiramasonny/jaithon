@@ -66,6 +66,7 @@ bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
                 unsigned r = pushReg(e) - 1;
                 emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, r));
                 emit(e, jaiA64FmovXD(r, JIT_FSCRATCH_A));
+                e->fpSrc &= ~(1u << (e->valueDepth - 1));
                 e->stack[e->depth - 1]      = SLOT_FLOAT;
                 e->stackShape[e->depth - 1] = 0;
                 e->stackClass[e->depth - 1] = NULL;
@@ -419,6 +420,7 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, recv, base));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchOnDeopt(e, JAI_A64_NE);
+            recordFieldRead(e, (int)slot, info->slot, kind);
             /* "an object" is not "a list": every SLOT_LIST consumer reads the header with no check of
              * its own, so the object type is confirmed here, once, before the kind is handed out.
              * `already` is never SLOT_LIST (see recordFieldStore's caller), so this arm sees them all. */
@@ -994,7 +996,10 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
         unsigned fbase = (unsigned)offsetof(ObjInstance, fields) +
                          (unsigned)info->slot * (unsigned)sizeof(Value);
         unsigned rr = valueXReg(e, e->valueDepth - 1);
-        SlotKind already = knownFieldKind(e, fromLocal, info->slot);
+        SlotKind already = knownFieldKind(
+            e, (stackLocalCurrent(e, e->depth - 1) || !jitFieldReadMemoOn())
+                   ? fromLocal : -1,
+            info->slot);
         if (kind == SLOT_MAYBE_INST) {
             /* The same three guards the local arm emits, branch-free by the
              * same trick: a null payload redirects the loads at the receiver,
@@ -1040,6 +1045,9 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, rr, fbase));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchOnDeopt(e, JAI_A64_NE);
+            if (stackLocalCurrent(e, e->depth - 1)) {
+                recordFieldRead(e, fromLocal, info->slot, kind);
+            }
             /* And that it is a list, not merely an object -- same reason as
              * in OP_GET_FIELD_LOCAL, and likewise while the receiver is
              * still on the model, since this guard resumes here too. */
@@ -1098,6 +1106,12 @@ bool emitSetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
         if (e->depth < 2) return false;
         ObjClass *klass = e->stackClass[e->depth - 2];
         int recvLocal = e->stackLocal[e->depth - 2];
+        /* Asked before the pops: the memo below is keyed on the local, and is
+         * only about this object while the local still holds it. */
+        if (!stackLocalCurrent(e, e->depth - 2) &&
+            jitFieldReadMemoOn()) {
+            recvLocal = -1;
+        }
 
         unsigned rv, rr;
         SlotKind kv, kr;
@@ -1136,9 +1150,17 @@ bool emitSetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
         unsigned base = (unsigned)offsetof(ObjInstance, fields) +
                         (unsigned)info->slot * (unsigned)sizeof(Value);
         /* Not a constant tag any more: a maybe-instance's is null-or-object,
-         * read off the payload, which is exactly what emitTagFor does. */
-        emitTagFor(e, kv, rv, JIT_SCRATCH_A, JIT_SCRATCH_B);
-        emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
+         * read off the payload, which is exactly what emitTagFor does.
+         * Skipped when this edge already proved the field holds this kind
+         * through the same local (a read's guard or an earlier store): the
+         * tag in memory is the one it would write. */
+        bool tagHeld = (kv == SLOT_INT || kv == SLOT_FLOAT ||
+                        kv == SLOT_BOOL) &&
+                       knownFieldKind(e, recvLocal, info->slot) == kv;
+        if (!tagHeld) {
+            emitTagFor(e, kv, rv, JIT_SCRATCH_A, JIT_SCRATCH_B);
+            emit(e, jaiA64StrW(JIT_SCRATCH_A, rr, base));
+        }
         if (vIsFp) emit(e, jaiA64StrD(dv, rr, base + 8));
         else       emit(e, jaiA64StrX(rv, rr, base + 8));
         /* Only a kind a later read can replay EXACTLY is remembered; the rest merely retire what was

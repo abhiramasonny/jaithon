@@ -176,6 +176,7 @@ static void swapPopEntry(Emit *e) {
     e->stackClass[u]    = e->stackClass[t];
     e->stackSeen[u]     = e->stackSeen[t];
     e->stackLocal[u]    = e->stackLocal[t];
+    e->stackLocalEpoch[u] = e->stackLocalEpoch[t];
     e->stackAscii[u]    = e->stackAscii[t];
     e->stackUnit[u]     = e->stackUnit[t];
     e->stackNullLit[u]  = e->stackNullLit[t];
@@ -186,8 +187,11 @@ static void swapPopEntry(Emit *e) {
     e->valueDepth--;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
+    /* Both: the entry that moved down is no longer where its claim was made. */
+    e->fpSrc    &= ~(3u << (e->valueDepth > 0 ? e->valueDepth - 1 : 0));
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
+    e->fTwo     &= ~(3u << (e->valueDepth > 0 ? e->valueDepth - 1 : 0));
     e->xBorrow  &= ~(1u << e->valueDepth);
     e->idxKnown &= ~(1u << e->valueDepth);
 }

@@ -321,6 +321,42 @@ void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
     }
 }
 
+/* JAITHON_JIT_FN_FP_HOMES: let a function-tier body whose locals all fit in
+ * x19.. still plan its registers, when that gives a float local a d home. */
+static bool jitFnFpHomes(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FN_FP_HOMES");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Some float local the measuring pass `m` scored as saving more in a d
+ * register than in an X one. Only those: an int, a bool or an object has no
+ * reason to leave the one-register-per-slot layout. */
+static bool fpHomeWanted(const Emit *m, unsigned base, unsigned locals) {
+    unsigned top = base + locals;
+    if (top > JIT_MAX_SLOTS + 1u) top = JIT_MAX_SLOTS + 1u;
+    for (unsigned slot = base; slot < top; slot++) {
+        if (m->dynamicLocal[slot]) continue;
+        if (m->localKind[slot] != SLOT_FLOAT) continue;
+        if (m->slotSaveFp[slot] > m->slotSaveX[slot]) return true;
+    }
+    return false;
+}
+
+/* JAITHON_JIT_FN_HOIST: hoist loop-invariant list headers in the
+ * function tier as well as the loop tier. */
+static bool jitFnHoist(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FN_HOIST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* Writes a body into the arena and seals it again, or seals and reports
  * failure.
  *
@@ -552,6 +588,19 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * nested the site is. Without it every site in the function counts the
      * same and `n`, read once to set the loop up, outranks nothing. */
     body.loopDepth = loopDepthFor(&fn->chunk, &body.loopDepthCount);
+    /* "Never" for every range the hoist planner reads; a zeroed Emit would
+     * claim every slot was written and subscripted at offset 0. OSR's probe
+     * starts the same way. */
+    for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+        body.slotWriteLo[i] = UINT32_MAX;
+        body.slotIndexLo[i] = UINT32_MAX;
+        body.slotStoreLo[i] = UINT32_MAX;
+        body.slotEqLo[i]    = UINT32_MAX;
+        body.spanLo[i]   = INT32_MAX;
+        body.spanHi[i]   = INT32_MIN;
+        body.spanOk[i]   = true;
+        body.spanSeen[i] = false;
+    }
     if (!seedLocals(&body, slotBase, jitPolyParamMask(fn))) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
@@ -641,7 +690,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
          * because the plan below is per slot. */
         if (e.dynamicLocal[i]) { saved = JIT_MAX_SAVED + 1; break; }
     }
-    if (saved > JIT_MAX_SAVED) {
+    /* Everything fits in x19.., but a float local that the measuring pass
+     * says is cheaper in a d register would pay a cross-register-file `fmov`
+     * on every read and write there -- and for a loop-carried value both sit
+     * on the dependency chain, so `p = p * x` costs fmov+fmul+fmov instead of
+     * one fmul. The plan below is the only mode with d homes, so take it. */
+    bool fpPlan = saved <= JIT_MAX_SAVED && jitFnFpHomes() &&
+                  fpHomeWanted(&body, e.base, e.locals);
+    if (saved > JIT_MAX_SAVED || fpPlan) {
         /* Too many to keep in registers, so the operand stack takes the
          * registers first -- that is expression depth, not the number of
          * variables a function happens to declare -- and whatever is left over
@@ -787,6 +843,54 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         }
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
+    }
+    /* Loop-invariant list headers, as the loop tier hoists them -- see
+     * planHoists. What the planner reads is what the measuring pass recorded,
+     * carried over the way compileOsr carries its probe's; the pool is
+     * x13..x17 alone, since this tier never lends the operand bank out. */
+    if (jitFnHoist()) {
+        for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+            e.slotWriteLo[i]  = body.slotWriteLo[i];
+            e.slotWriteHi[i]  = body.slotWriteHi[i];
+            e.slotIndexLo[i]  = body.slotIndexLo[i];
+            e.slotIndexHi[i]  = body.slotIndexHi[i];
+            e.slotIndexUse[i] = body.slotIndexUse[i];
+            e.slotStoreLo[i]  = body.slotStoreLo[i];
+            e.slotStoreHi[i]  = body.slotStoreHi[i];
+            e.spanLo[i]       = body.spanLo[i];
+            e.spanHi[i]       = body.spanHi[i];
+            e.spanOk[i]       = body.spanOk[i];
+            e.spanBase[i]     = body.spanBase[i];
+            e.spanSeen[i]     = body.spanSeen[i];
+        }
+        e.clobberCount = body.clobberCount;
+        e.clobberSpill = body.clobberSpill;
+        e.pushCount = body.pushCount;
+        e.pushSpill = body.pushSpill;
+        for (unsigned i = 0; i < body.pushCount; i++) {
+            e.pushOff[i]  = body.pushOff[i];
+            e.pushSlot[i] = body.pushSlot[i];
+        }
+        for (unsigned i = 0; i < body.clobberCount; i++) {
+            e.clobberOff[i] = body.clobberOff[i];
+        }
+        e.hoistPoolCount = 0;
+        for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {
+            e.hoistPool[e.hoistPoolCount++] = (uint8_t)(JIT_FREE_FIRST + r);
+        }
+        e.scratchRoom = JIT_SCRATCH_BANK_COUNT;
+        planHoists(&e, fn, body.localKind);
+        if (getenv("JAI_JIT_WHY")) {
+            for (unsigned i = 0; i < e.hoistCount; i++) {
+                fprintf(stderr,
+                        "[jit] %s hoists slot %u's header out of %u..%u into "
+                        "x%u%s%s\n",
+                        jitFnLabel(fn), e.hoist[i].slot, e.hoist[i].top,
+                        e.hoist[i].end, e.hoist[i].itemsReg,
+                        e.hoist[i].hasCount ? " with a count" : "",
+                        e.hoist[i].hasVer ? " and a version" : "");
+            }
+        }
     }
     /* declineReason, not e.whyNot: an arm that noted only a whySub used to
      * print "an unsupported operand form", which is how math.sqrt's own body

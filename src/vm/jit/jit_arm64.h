@@ -177,6 +177,8 @@ uint32_t jaiA64ScvtfDX(unsigned rd, unsigned rn);
 uint32_t jaiA64FcvtzsXD(unsigned rd, unsigned rn);
 /* ldr Dt, [Xn, #offset] -- byte offset, must be 8-aligned, 0..32760 */
 uint32_t jaiA64LdrD(unsigned rt, unsigned rn, unsigned offset);
+/* str Dt, [Xn, Xm, lsl #3] -- the store half of jaiA64LdrDIdx. */
+uint32_t jaiA64StrDIdx(unsigned rt, unsigned rn, unsigned rm);
 /* str Dt, [Xn, #offset] -- same constraints */
 uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset);
 

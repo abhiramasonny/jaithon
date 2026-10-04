@@ -742,9 +742,40 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                 /* The exhausted arm drops the iterator, so the target is
                  * reached one entry shallower than this branch leaves
                  * from. */
-                branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
-                              JAI_A64_GE,
-                              (int)stackSignatureAt(e, e->depth - 1));
+                if (jitIterRecycle()) {
+                    /* ...and nothing else holds it: OP_GET_ITER built it
+                     * for this loop alone, and the drop is the last word
+                     * on it. So it goes back for the next OP_GET_ITER to
+                     * reuse (jitMakeIter) instead of becoming garbage --
+                     * a loop over a short list in a hot function allocated
+                     * one per execution, which was a fifth of nbody. Its
+                     * source is cleared so the spare keeps no list alive. */
+                    /* Settled on BOTH edges first, as branchToDepth would
+                     * have done above its branch: what it settles below
+                     * would otherwise run on the exhausted edge alone while
+                     * the model said it had happened on both. */
+                    settleAll(e);
+                    unsigned live = e->count;
+                    emit(e, jaiA64BCond(JAI_A64_LT, 0));
+                    emitConst64(e, JIT_SCRATCH_B,
+                                (int64_t)(uintptr_t)&gJitIterSpare);
+                    emit(e, jaiA64StrX(rIt, JIT_SCRATCH_B, 0));
+                    emit(e, jaiA64StrW(31, rIt,
+                                       (unsigned)offsetof(ObjIter, source)));
+                    emit(e, jaiA64StrX(31, rIt,
+                                       (unsigned)offsetof(ObjIter, source) + 8));
+                    branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
+                                  14u /* al */,
+                                  (int)stackSignatureAt(e, e->depth - 1));
+                    if (live < e->count && e->count <= JIT_MAX_INSTS) {
+                        e->code[live] = jaiA64BCond(JAI_A64_LT,
+                                                    (int32_t)(e->count - live));
+                    }
+                } else {
+                    branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
+                                  JAI_A64_GE,
+                                  (int)stackSignatureAt(e, e->depth - 1));
+                }
 
                 /* The predicted unboxed arm falls through and the boxed one
                  * waits after the body (jitDispatchColdOn), as OP_GET_INDEX's

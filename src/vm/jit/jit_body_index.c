@@ -8,6 +8,20 @@
 #include <stdlib.h>
 #include "vm/jit/jit_internal.h"
 
+/* JAITHON_JIT_HOIST_FRESH_COUNT: a subscript of a hoisted list whose count is
+ * not in a register (the lean pool ran out -- see planHoists)
+ * and that the head's guard does not cover keeps the hoisted `items` and reads
+ * only `count` fresh. The count feeds the bounds branch and nothing else, so
+ * the element's address no longer waits on a header load. */
+static bool jitHoistFreshCount(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_FRESH_COUNT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 #if (defined(__aarch64__) || defined(__arm64__))
 
 /* ------------------------------------------------------------------ */
@@ -755,11 +769,20 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
         }
         unsigned gItems = JIT_SCRATCH_C, gCount = JIT_SCRATCH_A;
         int gh = hoistFor(e, e->stackLocal[e->depth - 2]);
-        if (gh >= 0) {
+        /* A lean hoist has no count: a site the head's guard covers never
+         * reads one, and one it does not cover loads its own header. */
+        if (gh >= 0 && (e->hoist[gh].hasCount || gHoisted)) {
             gItems = e->hoist[gh].itemsReg;
-            gCount = e->hoist[gh].countReg;
+            gCount = e->hoist[gh].hasCount ? e->hoist[gh].countReg
+                                           : JIT_SCRATCH_A;
+        } else if (gh >= 0 && jitHoistFreshCount()) {
+            gItems = e->hoist[gh].itemsReg;
+            emit(e, jaiA64LdrW(gCount, rList,
+                               (unsigned)offsetof(ObjList, count)));
+            gh = -1;
         } else {
             emitListHeader(e, rList, gItems, gCount);
+            gh = -1;
         }
         /* Everything about this element is settled before a word of it is
          * read: the head proved the index in bounds and non-negative, the
@@ -982,6 +1005,7 @@ bool emitSetIndex(Emit *e, int *offp) {
         unsigned rList = valueXReg(e, e->valueDepth - 3);
 
         noteSlotIndexed(e, e->stackLocal[e->depth - 3]);
+        noteSlotStored(e, e->stackLocal[e->depth - 3]);
         bool sHoisted;
         {
             int32_t sOff = 0;
@@ -1006,11 +1030,18 @@ bool emitSetIndex(Emit *e, int *offp) {
         }
         unsigned sItems = JIT_SCRATCH_C, sCount = JIT_SCRATCH_A;
         int sh = hoistFor(e, e->stackLocal[e->depth - 3]);
-        if (sh >= 0) {
+        if (sh >= 0 && (e->hoist[sh].hasCount || sHoisted)) {
             sItems = e->hoist[sh].itemsReg;
-            sCount = e->hoist[sh].countReg;
+            sCount = e->hoist[sh].hasCount ? e->hoist[sh].countReg
+                                           : JIT_SCRATCH_A;
+        } else if (sh >= 0 && jitHoistFreshCount()) {
+            sItems = e->hoist[sh].itemsReg;
+            emit(e, jaiA64LdrW(sCount, rList,
+                               (unsigned)offsetof(ObjList, count)));
+            sh = -1;
         } else {
             emitListHeader(e, rList, sItems, sCount);
+            sh = -1;
         }
         if (!sAcc.dynamic && sAcc.stg != LIST_STORE_BOXED &&
             jitIndexedLoadOn()) {
@@ -1044,12 +1075,18 @@ bool emitSetIndex(Emit *e, int *offp) {
         }
         }
         /* jaiListTouch: the count has not changed, so only the version
-         * tells an iterator that the list moved under it. */
-        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
-                           (unsigned)offsetof(ObjList, version)));
-        emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
-        emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
-                           (unsigned)offsetof(ObjList, version)));
+         * tells an iterator that the list moved under it. A hoist that holds
+         * the bumped version writes it with no load -- see Emit::hoist. */
+        if (sh >= 0 && e->hoist[sh].hasVer) {
+            emit(e, jaiA64StrW(e->hoist[sh].verReg, rList,
+                               (unsigned)offsetof(ObjList, version)));
+        } else {
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                               (unsigned)offsetof(ObjList, version)));
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
+            emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
+                               (unsigned)offsetof(ObjList, version)));
+        }
         e->wroteHeap = true;
 
         unsigned d1, d2, d3;

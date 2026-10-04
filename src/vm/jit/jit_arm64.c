@@ -344,6 +344,11 @@ uint32_t jaiA64LdrD(unsigned rt, unsigned rn, unsigned offset) {
     return 0xfd400000u | ((offset / 8u) << 10) | (rn << 5) | rt;
 }
 
+/* str Dt, [Xn, Xm, lsl #3] -- the SIMD&FP form of jaiA64StrXIdx. */
+uint32_t jaiA64StrDIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xfc207800u | (rm << 16) | (rn << 5) | rt;
+}
+
 /* str Dt, [Xn, #offset] */
 uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset) {
     return 0xfd000000u | ((offset / 8u) << 10) | (rn << 5) | rt;

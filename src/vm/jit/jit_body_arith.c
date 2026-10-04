@@ -18,7 +18,20 @@ bool emitMul(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
         if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_FLOAT &&
             e->stack[e->depth - 2] == SLOT_FLOAT) {
             unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
-            unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+            /* `2.0 * x` or `x * 2.0`: the other operand added to itself.
+             * The literal's own register is never read, so its value is
+             * never asked for either. */
+            bool twoA = (e->fTwo & (1u << ia)) != 0;
+            bool twoB = !twoA && (e->fTwo & (1u << ib)) != 0;
+            unsigned db = 0, da = 0;
+            if (twoA) {
+                db = fpOperandReread(e, ib);
+            } else if (twoB) {
+                da = fpOperandReread(e, ia);
+            } else {
+                db = fpOperandReread(e, ib);
+                da = fpOperandReread(e, ia);
+            }
             if (!popValueRaw(e, &rb, &kb)) return false;
             if (!popValueRaw(e, &ra, &ka)) return false;
             if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
@@ -30,7 +43,13 @@ bool emitMul(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                 fpReleaseHome(e, homeM);
                 dm = homeM;
             }
-            emit(e, jaiA64FmulD(dm, da, db));
+            if (twoA) {
+                emit(e, jaiA64FaddD(dm, db, db));
+            } else if (twoB) {
+                emit(e, jaiA64FaddD(dm, da, da));
+            } else {
+                emit(e, jaiA64FmulD(dm, da, db));
+            }
             if (homeM != 0) {
                 fpBorrowLocal(e, ia, homeM);
                 e->homeEarly[e->homeEarlyCount++] = bindOffM;
@@ -176,7 +195,7 @@ bool emitAddSubDiv(Emit *e, ObjFunction *fn, uint8_t op, const uint8_t *code,
                 emit(e, jaiA64FcmpDZero(fpOperand(e, ib)));
                 branchOnDeopt(e, JAI_A64_EQ);
             }
-            unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+            unsigned db = fpOperandReread(e, ib), da = fpOperandReread(e, ia);
             if (!popValueRaw(e, &rb, &kb)) return false;
             if (!popValueRaw(e, &ra, &ka)) return false;
             if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
