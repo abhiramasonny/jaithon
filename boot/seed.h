@@ -35,4 +35,13 @@ const JaiSeedEntry *jaiSeedFind(const char *sourcePath);
  * build that still needs a working front end on disk to start. */
 size_t jaiSeedCount(void);
 
+/* The library-relative path of entry `i` ("std/json.jai"), or NULL when `i` is
+ * not below jaiSeedCount(). Does not inflate the image. */
+const char *jaiSeedModuleAt(size_t i);
+
+/* The first `n` bytes of entry `i`'s image -- its header, say -- inflated
+ * into `out` without inflating the rest. Returns `n`, or fewer when the image
+ * is shorter; 0 when `i` is out of range or the image will not inflate. */
+size_t jaiSeedPeekAt(size_t i, unsigned char *out, size_t n);
+
 #endif /* JAI_BOOT_SEED_H */
