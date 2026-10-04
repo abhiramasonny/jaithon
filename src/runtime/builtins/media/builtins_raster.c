@@ -889,6 +889,298 @@ static bool primDrawOutlines(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* --- filled polygons ------------------------------------------------- */
+
+/* One edge of a polygon in the active list the scanline fill walks: `PolyEdge`
+ * in drawing.jai, with `next` an index into the edge array, -1 for none. */
+typedef struct {
+    int64_t y0, y1, x, dx;
+    int32_t next;
+} RasterEdge;
+
+/* `edge_precedes`: by the row it starts on, then by x, then by slope. */
+JAI_INLINE bool rasterEdgeBefore(const RasterEdge *a, const RasterEdge *b) {
+    if (a->y0 != b->y0) return a->y0 < b->y0;
+    if (a->x != b->x) return a->x < b->x;
+    return a->dx < b->dx;
+}
+
+/* A stable merge sort -- an edge that ties stays after the ones it tied with,
+ * which is the order `sort_edges`' insertion sort leaves -- in n log n where
+ * that one was quadratic: a frame of 8239 contours is 33 thousand edges, and
+ * inserting each into a list in order took seconds. */
+static void rasterSortEdges(RasterEdge *edges, RasterEdge *spare, size_t count) {
+    for (size_t width = 1; width < count; width *= 2) {
+        for (size_t left = 0; left < count; left += 2 * width) {
+            const size_t mid = left + width < count ? left + width : count;
+            const size_t right = left + 2 * width < count ? left + 2 * width : count;
+            size_t i = left, j = mid, k = left;
+            while (i < mid && j < right) {
+                spare[k++] = rasterEdgeBefore(&edges[j], &edges[i]) ? edges[j++] : edges[i++];
+            }
+            while (i < mid) spare[k++] = edges[i++];
+            while (j < right) spare[k++] = edges[j++];
+        }
+        memcpy(edges, spare, count * sizeof(RasterEdge));
+    }
+}
+
+/* `resort_active`: bubble passes over the active list until it is in x order,
+ * swapping only where one is strictly greater, so ties keep their order. */
+static void rasterResortActive(RasterEdge *edges, int32_t head) {
+    bool swapped = true;
+    while (swapped) {
+        swapped = false;
+        int32_t previous = head;
+        int32_t current = edges[head].next;
+        while (current >= 0) {
+            const int32_t node = current;
+            const int32_t following = edges[node].next;
+            if (following < 0) break;
+            if (edges[node].x > edges[following].x) {
+                edges[previous].next = following;
+                edges[node].next = edges[following].next;
+                edges[following].next = node;
+                previous = following;
+                swapped = true;
+            } else {
+                previous = node;
+                current = following;
+            }
+        }
+    }
+}
+
+/* `fill_polygons(target, colour, cn, origin, stride, cols, rows, polygons,
+ *  offset_x, offset_y, shift, line_type)` -- jaicv's `fill_poly`: every
+ *  polygon moved by the offset, its outline drawn one pixel wide unless the
+ *  line is anti-aliased, and the whole set filled by one scanline pass with
+ *  the even-odd rule. The edges, their fixed point, the slopes, the active
+ *  list and the spans are `collect_edges` and `fill_edges` step for step,
+ *  over the same arithmetic.
+ *
+ * What made it worth moving is the edge sort, an insertion into a list kept
+ * in order: quadratic, and a frame of contours drawn filled is tens of
+ * thousands of edges -- 8239 contours took 4.6 seconds against OpenCV's 4.5
+ * milliseconds. The per-edge outline call and the per-span fill call were
+ * the rest.
+ *
+ * Returns false, having drawn nothing, when a point is not an object with
+ * integer `x` and `y`. Arithmetic Jaithon checks is checked here, in the same
+ * order, and throws at the same polygon. */
+static bool primFillPolygons(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *polygons;
+    int64_t offsetX, offsetY, shift, lineType;
+    if (!jaiArgList(args[7], 8, "fill_polygons", &polygons)) return false;
+    if (!jaiStrWantInt(args[8], "fill_polygons", "the x offset", &offsetX)) return false;
+    if (!jaiStrWantInt(args[9], "fill_polygons", "the y offset", &offsetY)) return false;
+    if (!jaiStrWantInt(args[10], "fill_polygons", "the shift", &shift)) return false;
+    if (!jaiStrWantInt(args[11], "fill_polygons", "the line type", &lineType)) return false;
+    if (shift < 0 || shift > JAI_XY_SHIFT) {
+        return jaiThrow(vm.cValueError, "fill_polygons(): a shift of %lld is out of range",
+                        (long long)shift);
+    }
+
+    /* Every point readable, or nothing is drawn and the caller goes its own
+     * way. */
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    size_t total = 0;
+    for (int p = 0; p < polygons->count; p++) {
+        const Value item = jaiListGet(polygons, p);
+        if (!IS_LIST(item)) {
+            *out = BOOL_VAL(false);
+            return true;
+        }
+        ObjList *polygon = AS_LIST(item);
+        for (int i = 0; i < polygon->count; i++) {
+            int64_t x, y;
+            if (!jaiReadPoint(&reader, jaiListGet(polygon, i), &x, &y)) {
+                *out = BOOL_VAL(false);
+                return true;
+            }
+        }
+        total += (size_t)polygon->count;
+    }
+
+    JaiSurface surface;
+    if (!readSurface(args, 0, "fill_polygons", &surface)) return false;
+    /* The edges, the sort's spare and the sentinel head, and the moved points
+     * of the polygon at hand. */
+    RasterEdge *edges = (RasterEdge *)malloc((total * 2 + 1) * sizeof(RasterEdge));
+    int64_t *moved = (int64_t *)malloc((total > 0 ? total : 1) * 2 * sizeof(int64_t));
+    if (edges == NULL || moved == NULL) {
+        free(edges);
+        free(moved);
+        return jaiThrow(vm.cRuntimeError, "fill_polygons(): out of memory");
+    }
+    RasterEdge *spare = edges + total + 1;
+    size_t count = 0;
+    const int connectivity = lineType == 4 ? 4 : 8;
+    const bool outline = lineType != 16;   /* LINE_AA */
+    const int64_t delta = ((int64_t)1 << shift) >> 1;
+    const int up = (int)(JAI_XY_SHIFT - shift);
+    bool overflow = false;
+
+    for (int p = 0; p < polygons->count && !overflow; p++) {
+        ObjList *polygon = AS_LIST(jaiListGet(polygons, p));
+        const int n = polygon->count;
+        if (n == 0) continue;
+        /* The moved copy first, whole, as `fill_poly` builds it. */
+        for (int i = 0; i < n; i++) {
+            int64_t x, y;
+            jaiReadPoint(&reader, jaiListGet(polygon, i), &x, &y);
+            if (__builtin_add_overflow(x, offsetX, &moved[i * 2]) ||
+                __builtin_add_overflow(y, offsetY, &moved[i * 2 + 1])) {
+                overflow = true;
+                break;
+            }
+        }
+        if (overflow) break;
+        /* `collect_edges`. */
+        int64_t previousX = (int64_t)((uint64_t)moved[(n - 1) * 2] << up);
+        int64_t previousY;
+        if (__builtin_add_overflow(moved[(n - 1) * 2 + 1], delta, &previousY)) {
+            overflow = true;
+            break;
+        }
+        previousY >>= shift;
+        for (int i = 0; i < n; i++) {
+            const int64_t currentX = (int64_t)((uint64_t)moved[i * 2] << up);
+            int64_t currentY;
+            if (__builtin_add_overflow(moved[i * 2 + 1], delta, &currentY)) {
+                overflow = true;
+                break;
+            }
+            currentY >>= shift;
+            if (outline) {
+                int64_t ax, bx;
+                if (__builtin_add_overflow(previousX, (int64_t)(JAI_XY_ONE >> 1), &ax) ||
+                    __builtin_add_overflow(currentX, (int64_t)(JAI_XY_ONE >> 1), &bx)) {
+                    overflow = true;
+                    break;
+                }
+                JaiLineWalk walk;
+                if (clipAndOrient(surface.cols, surface.rows, ax >> JAI_XY_SHIFT, previousY,
+                                  bx >> JAI_XY_SHIFT, currentY, connectivity, &walk)) {
+                    lineWalk(&walk, &surface);
+                }
+            }
+            if (previousY != currentY) {
+                int64_t run, rise;
+                if (__builtin_sub_overflow(currentX, previousX, &run) ||
+                    __builtin_sub_overflow(currentY, previousY, &rise) ||
+                    (run == INT64_MIN && rise == -1)) {
+                    overflow = true;
+                    break;
+                }
+                const int64_t slope = truncDiv(run, rise);
+                RasterEdge *edge = &edges[count++];
+                if (previousY < currentY) {
+                    edge->y0 = previousY;
+                    edge->y1 = currentY;
+                    edge->x = previousX;
+                } else {
+                    edge->y0 = currentY;
+                    edge->y1 = previousY;
+                    edge->x = currentX;
+                }
+                edge->dx = slope;
+                edge->next = -1;
+            }
+            previousX = currentX;
+            previousY = currentY;
+        }
+    }
+    free(moved);
+    if (overflow) {
+        free(edges);
+        return jaiThrow(vm.cOverflowError, "fill_polygons(): integer overflow");
+    }
+
+    /* `fill_edges`. */
+    bool ok = true;
+    if (count >= 2) {
+        rasterSortEdges(edges, spare, count);
+        int64_t yMin = edges[0].y0, yMax = edges[0].y1;
+        for (size_t i = 0; i < count; i++) {
+            if (edges[i].y0 < yMin) yMin = edges[i].y0;
+            if (edges[i].y1 > yMax) yMax = edges[i].y1;
+        }
+        if (!(yMax < 0 || yMin >= surface.rows)) {
+            if (yMax > surface.rows) yMax = surface.rows;
+            const int32_t head = (int32_t)count;
+            edges[head].next = -1;
+            edges[head].x = 0;
+            size_t nextEdge = 0;
+            for (int64_t y = edges[0].y0; ok && y < yMax; y++) {
+                int32_t previous = head;
+                int32_t current = edges[head].next;
+                bool draw = false;
+                for (;;) {
+                    const bool waiting = nextEdge < count && edges[nextEdge].y0 == y;
+                    if (current < 0 && !waiting) break;
+                    const int32_t live = current;
+                    if (live >= 0 && edges[live].y1 == y) {
+                        edges[previous].next = edges[live].next;
+                        current = edges[live].next;
+                        continue;
+                    }
+                    const int32_t keep = previous;
+                    const bool entering = nextEdge < count;
+                    const bool takeLive = live >= 0 &&
+                        (!entering || edges[nextEdge].y0 > y || edges[live].x < edges[nextEdge].x);
+                    if (takeLive) {
+                        previous = live;
+                        current = edges[live].next;
+                    } else if (entering) {
+                        const int32_t arrival = (int32_t)nextEdge;
+                        edges[previous].next = arrival;
+                        edges[arrival].next = live;
+                        previous = arrival;
+                        nextEdge++;
+                    } else {
+                        break;
+                    }
+                    if (draw) {
+                        if (y >= 0) {
+                            int64_t x1, x2, sum;
+                            const int64_t kx = edges[keep].x, px = edges[previous].x;
+                            const int64_t low = kx > px ? px : kx;
+                            const int64_t high = kx > px ? kx : px;
+                            /* `low + XY_ONE - 1`, the two steps Jaithon takes. */
+                            if (__builtin_add_overflow(low, (int64_t)JAI_XY_ONE, &sum) ||
+                                __builtin_sub_overflow(sum, (int64_t)1, &sum)) {
+                                ok = false;
+                                break;
+                            }
+                            x1 = sum >> JAI_XY_SHIFT;
+                            x2 = high >> JAI_XY_SHIFT;
+                            /* `Painter.span`. */
+                            const int64_t start = x1 > 0 ? x1 : 0;
+                            const int64_t end = x2 < surface.cols - 1 ? x2 : surface.cols - 1;
+                            if (start <= end) surfaceRun(&surface, start, y, end - start + 1);
+                        }
+                        if (__builtin_add_overflow(edges[keep].x, edges[keep].dx, &edges[keep].x) ||
+                            __builtin_add_overflow(edges[previous].x, edges[previous].dx,
+                                                   &edges[previous].x)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    draw = !draw;
+                }
+                if (ok) rasterResortActive(edges, head);
+            }
+        }
+    }
+    free(edges);
+    if (!ok) return jaiThrow(vm.cOverflowError, "fill_polygons(): integer overflow");
+    *out = BOOL_VAL(true);
+    return true;
+}
+
 void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "fill_span",     primFillSpan,     10, 10);
     jaiStrDefinePrim(ns, "draw_line",     primDrawLine,     12, 12);
@@ -896,4 +1188,5 @@ void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "fill_convex",   primFillConvex,   11, 11);
     jaiStrDefinePrim(ns, "fill_strokes",  primFillStrokes,  11, 11);
     jaiStrDefinePrim(ns, "draw_outlines", primDrawOutlines, 11, 11);
+    jaiStrDefinePrim(ns, "fill_polygons", primFillPolygons, 12, 12);
 }

@@ -32,6 +32,7 @@
 #: ```
 import std.gpu as gpu
 import std.math
+from std.os import env
 from ..core.mat import Mat
 from ..core.types import depth_is_integer, depth_max, depth_min
 from ..core.types import LINE_4, LINE_8, LINE_AA, Point, Point2f, Rect, RotatedRect, Scalar, Size
@@ -88,6 +89,11 @@ fn to_fixed(point: Point, shift: int) -> Point {
 fn from_fixed(point: Point) -> Point {
     return Point(point.x + (XY_ONE >> 1) >> XY_SHIFT, point.y + (XY_ONE >> 1) >> XY_SHIFT)
 }
+
+#: Whether `fill_poly` hands its polygons to `__prim__.fill_polygons`. Read
+#: once; `JAICV_NATIVE_FILL=0` keeps the Jaithon scanline fill, which the
+#: primitive is checked against.
+let _native_fill = (env("JAICV_NATIVE_FILL") ?? "1") != "0"
 
 #: The surface a shape draws onto: a picture, one colour already saturated
 #: into its depth, and wherever its pixels happen to live.
@@ -330,6 +336,34 @@ pub class Painter {
             offset_x,
             offset_y,
             connectivity
+        )
+    }
+
+    #: Every polygon moved by the offset, outlined unless anti-aliased, and
+    #: filled even-odd, in one call: `fill_poly`'s edges and spans. False,
+    #: with nothing drawn, when a point is not something with integer `x` and
+    #: `y`.
+    pub fn fill_polygons(
+        self,
+        polygons: list[list[Point]],
+        offset_x: int,
+        offset_y: int,
+        shift: int,
+        line_type: int
+    ) -> bool {
+        return __prim__.fill_polygons(
+            self.target,
+            self.colour,
+            self.cn,
+            self.origin,
+            self.stride,
+            self.cols,
+            self.rows,
+            polygons,
+            offset_x,
+            offset_y,
+            shift,
+            line_type
         )
     }
 
@@ -1246,6 +1280,14 @@ pub fn fill_poly(
     offset: Point = Point(0, 0)
 ) -> Mat {
     let painter = Painter(img, colour)
+    #: All of the below in one primitive call when every point is a plain
+    #: one. The edge sort below is an insertion into a list kept in order,
+    #: which is quadratic: 8239 contours drawn filled took 4.6 seconds against
+    #: OpenCV's 4.5 milliseconds. `JAICV_NATIVE_FILL=0` keeps this path.
+    if _native_fill and painter.fill_polygons(polygons, offset.x, offset.y, shift, line_type) {
+        painter.finish()
+        return img
+    }
     var edges: list[PolyEdge] = []
     for polygon in polygons {
         if polygon.len() == 0 { continue }
