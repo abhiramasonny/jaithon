@@ -52,8 +52,16 @@ fn test_a_payload_field_wins_at_a_shared_site() -> void {
 }
 
 fn test_a_megamorphic_site_still_answers() -> void {
-    let values: list[any] = [Color.Red, Size.Large, Shadow.A, Color.Blue,
-                             Holder.Empty, Size.Small, Shadow.B, Color.Green]
+    let values: list[any] = [
+        Color.Red,
+        Size.Large,
+        Shadow.A,
+        Color.Blue,
+        Holder.Empty,
+        Size.Small,
+        Shadow.B,
+        Color.Green,
+    ]
     var sum = 0
     for round in 0..50 {
         for v in values {
