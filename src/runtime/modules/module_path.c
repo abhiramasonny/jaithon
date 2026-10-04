@@ -39,6 +39,21 @@ static DirList sUserDirs;
 static DirList sLibDirs;
 static bool    sPathReady;
 
+/* Everything on the path after the binary's own lib/ -- every package's src/
+ * and the system-wide defaults -- is added the first time something has to
+ * look past what is already there: a module the earlier directories do not
+ * hold, or a caller that wants the whole list. A program that imports only the
+ * standard library never needs it, and building it cost every `run` 13
+ * realpath calls, ~45 stats and two directory listings: 3.3M of the 26.5M
+ * instructions a cached hello world retired. realpath alone is ~160K
+ * instructions on macOS, one getattrlist per path component, and a package's
+ * src/ is a dozen components deep. The order is unchanged -- the deferred
+ * directories are appended exactly where they used to stand -- so a lookup
+ * finds what it found before. JAITHON_LAZY_MODULE_PATH=0 builds it eagerly. */
+static bool    sPathComplete = true;
+static char    sDeferredExecDir[JAI_MAX_PATH];
+static bool    sDeferredDefaults;
+
 static bool dirListHas(const DirList *list, const char *dir) {
     for (int i = 0; i < list->count; i++) {
         if (strcmp(list->data[i], dir) == 0) return true;
@@ -136,6 +151,9 @@ static void addPackageDirsRelative(const char *base, const char *suffix) {
     addPackageSourceDirs(candidate);
 }
 
+static bool lazyModulePath(void);
+static void completePath(void);
+
 void jaiModulePathInit(const char *execDir) {
     dirListClear(&sLibDirs);
     sPathReady = true;
@@ -165,17 +183,41 @@ void jaiModulePathInit(const char *execDir) {
             execDir = derived;
         }
     }
+    sDeferredExecDir[0] = '\0';
     if (execDir != NULL && execDir[0] != '\0') {
         addLibDirRelative(execDir, "lib");
         addLibDirRelative(execDir, "../lib");
         addLibDirRelative(execDir, "../share/jaithon/lib");
         addLibDirRelative(execDir, "../share/jaithon");
-        addPackageDirsRelative(execDir, "packages");
-        addPackageDirsRelative(execDir, "../packages");
-        addPackageDirsRelative(execDir, "../share/jaithon/packages");
+        snprintf(sDeferredExecDir, sizeof sDeferredExecDir, "%s", execDir);
+    }
+    sDeferredDefaults = getenv("JAITHON_NO_DEFAULT_PATH") == NULL;
+    sPathComplete = false;
+
+    if (!lazyModulePath()) completePath();
+    else syncModulePathMirror();
+}
+
+static bool lazyModulePath(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_LAZY_MODULE_PATH");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static void completePath(void) {
+    if (sPathComplete) return;
+    sPathComplete = true;
+
+    if (sDeferredExecDir[0] != '\0') {
+        addPackageDirsRelative(sDeferredExecDir, "packages");
+        addPackageDirsRelative(sDeferredExecDir, "../packages");
+        addPackageDirsRelative(sDeferredExecDir, "../share/jaithon/packages");
     }
 
-    if (getenv("JAITHON_NO_DEFAULT_PATH") == NULL) {
+    if (sDeferredDefaults) {
         addLibDir("/usr/local/share/jaithon/lib");
         addLibDir("/usr/local/share/jaithon");
         addLibDir("/opt/homebrew/share/jaithon/lib");
@@ -185,6 +227,11 @@ void jaiModulePathInit(const char *execDir) {
     }
 
     syncModulePathMirror();
+}
+
+void jaiModulePathComplete(void) {
+    ensurePathReady();
+    completePath();
 }
 
 void jaiModulePathAdd(const char *dir) {
@@ -353,7 +400,12 @@ bool jaiResolveModulePath(const char *dottedName, const char *fromDir,
             found = tryDirectory(sUserDirs.data[i], relative, out, outSize);
             if (!found) noteSearched(&searched, &searchedCount, sUserDirs.data[i]);
         }
-        for (int i = 0; !found && i < sLibDirs.count; i++) {
+        for (int i = 0; !found; i++) {
+            if (i == sLibDirs.count) {
+                if (sPathComplete) break;
+                completePath();   /* appends; entries before i are unchanged */
+                if (i == sLibDirs.count) break;
+            }
             found = tryDirectory(sLibDirs.data[i], relative, out, outSize);
             if (!found) noteSearched(&searched, &searchedCount, sLibDirs.data[i]);
         }
