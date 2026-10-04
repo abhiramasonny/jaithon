@@ -380,6 +380,27 @@ pub class Painter {
     #: one call: what `blend` does four times a step along each segment. False,
     #: with nothing drawn, when a point is not something with integer `x` and
     #: `y`.
+    #: Every run as an anti-aliased stroke `thickness` wide, blended into the
+    #: host mirror in one call: `draw_thick` a segment, quadrilateral and then
+    #: caps, in order. False, with nothing drawn, when a point is not something
+    #: with integer `x` and `y`.
+    pub fn blend_strokes(self, contours: list[list[Point]], closed: bool, thickness: int) -> bool {
+        let values = self.on_host()
+        return __prim__.blend_strokes(
+            values,
+            self.colour,
+            self.cn,
+            self.cols,
+            self.rows,
+            contours,
+            closed,
+            self.integral,
+            self.low,
+            self.high,
+            thickness
+        )
+    }
+
     pub fn blend_outlines(self, contours: list[list[Point]], closed: bool) -> bool {
         let values = self.on_host()
         return __prim__.blend_outlines(
@@ -1299,8 +1320,12 @@ pub fn polylines(
     #: An anti-aliased hairline blends into the host mirror, which the first
     #: partial blend below would bring over anyway; the primitive blends every
     #: run there in one call, four reads, mixes and roundings a step.
-    if _native_lines and shift == 0 and line_type == LINE_AA and thickness <= 1 {
-        let drawn = painter.blend_outlines(polygons, closed)
+    if _native_lines and shift == 0 and line_type == LINE_AA {
+        let drawn = if thickness > 1 {
+            painter.blend_strokes(polygons, closed, thickness)
+        } else {
+            painter.blend_outlines(polygons, closed)
+        }
         if drawn {
             painter.finish()
             return img

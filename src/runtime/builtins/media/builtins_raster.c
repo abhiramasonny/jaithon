@@ -1403,6 +1403,166 @@ static bool primBlendOutlines(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `draw_circle_aa` filled: every pixel within reach blended by how much of
+ * it the disc covers. */
+static void blendDisc(BlendTarget *t, int64_t cx, int64_t cy, int64_t radius) {
+    if (radius < 0) return;
+    const double r = (double)radius;
+    const int64_t reach = radius + 2;
+    for (int64_t oy = -reach; oy < reach + 1 && !t->bad; oy++) {
+        for (int64_t ox = -reach; ox < reach + 1 && !t->bad; ox++) {
+            const double distance = sqrt((double)(ox * ox + oy * oy));
+            double coverage = r + 0.5 - distance;
+            if (coverage < 0.0) coverage = 0.0;
+            if (coverage > 1.0) coverage = 1.0;
+            if (coverage > 0.0) blendPixel(t, cx + ox, cy + oy, coverage);
+        }
+    }
+}
+
+/* `blend_strokes(values, colour, cn, cols, rows, contours, closed, integral,
+ *  low, high, thickness)` -- every run drawn as an anti-aliased stroke
+ *  `thickness` wide into the host mirror: what `polylines` draws with
+ *  LINE_AA wider than a pixel, `draw_thick` a segment. Each segment is its
+ *  quadrilateral filled with the anti-aliased roundings and then a blended
+ *  disc at whichever ends it caps, in that order and segment by segment,
+ *  because a blend reads what is already there. A lone point is its two caps,
+ *  both at the one place, as `draw_thick` gives it. At 800 small contours this
+ *  was 40 ms against OpenCV's 2.1.
+ *
+ * Returns false, having drawn nothing, when a point is not an object with
+ * integer `x` and `y` or lies too far out to shift into fixed point. */
+static bool primBlendStrokes(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *values, *colour, *contours;
+    int64_t cn, cols, rows, thickness;
+    if (!jaiArgList(args[0], 1, "blend_strokes", &values)) return false;
+    if (!jaiArgList(args[1], 2, "blend_strokes", &colour)) return false;
+    if (!jaiStrWantInt(args[2], "blend_strokes", "the channel count", &cn)) return false;
+    if (!jaiStrWantInt(args[3], "blend_strokes", "the width", &cols)) return false;
+    if (!jaiStrWantInt(args[4], "blend_strokes", "the height", &rows)) return false;
+    if (!jaiArgList(args[5], 6, "blend_strokes", &contours)) return false;
+    if (!IS_BOOL(args[6]) || !IS_BOOL(args[7])) {
+        return jaiThrow(vm.cTypeError, "blend_strokes(): closed and integral must be bools");
+    }
+    if (!jaiStrWantInt(args[10], "blend_strokes", "the thickness", &thickness)) return false;
+    if (cn < 1 || cn > 4 || cn != colour->count || cols < 0 || rows < 0) {
+        return jaiThrow(vm.cValueError, "blend_strokes(): %lld channels against a colour of %d",
+                        (long long)cn, colour->count);
+    }
+    if (thickness < 2 || thickness > 32767) {
+        return jaiThrow(vm.cValueError, "blend_strokes(): a thickness of %lld is out of range",
+                        (long long)thickness);
+    }
+    BlendTarget t;
+    memset(&t, 0, sizeof t);
+    t.values = values;
+    t.cn = (int)cn;
+    t.cols = cols;
+    t.rows = rows;
+    t.integral = AS_BOOL(args[7]);
+    const bool closed = AS_BOOL(args[6]);
+    for (int i = 0; i < 2; i++) {
+        if (!IS_FLOAT(args[8 + i]) && !IS_INT(args[8 + i])) {
+            return jaiThrow(vm.cTypeError, "blend_strokes(): the depth's range must be numbers");
+        }
+    }
+    t.low = IS_FLOAT(args[8]) ? AS_FLOAT(args[8]) : (double)AS_INT(args[8]);
+    t.high = IS_FLOAT(args[9]) ? AS_FLOAT(args[9]) : (double)AS_INT(args[9]);
+    for (int c = 0; c < t.cn; c++) {
+        const Value v = jaiListGet(colour, c);
+        if (!IS_FLOAT(v) && !IS_INT(v)) {
+            return jaiThrow(vm.cTypeError, "blend_strokes(): the colour holds a non-number");
+        }
+        t.colour[c] = v;
+        t.colourF[c] = IS_FLOAT(v) ? AS_FLOAT(v) : (double)AS_INT(v);
+    }
+
+    /* Points small enough that shifting them into fixed point and every sum
+     * after it stays exact, read before anything is drawn. */
+    const int64_t limit = (int64_t)1 << 40;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    for (int c = 0; c < contours->count; c++) {
+        const Value item = jaiListGet(contours, c);
+        if (!IS_LIST(item)) {
+            *out = BOOL_VAL(false);
+            return true;
+        }
+        ObjList *contour = AS_LIST(item);
+        for (int i = 0; i < contour->count; i++) {
+            int64_t x, y;
+            if (!jaiReadPoint(&reader, jaiListGet(contour, i), &x, &y) ||
+                x <= -limit || x >= limit || y <= -limit || y >= limit) {
+                *out = BOOL_VAL(false);
+                return true;
+            }
+        }
+    }
+
+    /* The quadrilaterals go through the same scanline fill as every other
+     * shape, onto the mirror as a surface of its own. */
+    JaiSurface surface;
+    memset(&surface, 0, sizeof surface);
+    surface.cn = t.cn;
+    surface.origin = 0;
+    surface.stride = cols * cn;
+    surface.cols = cols;
+    surface.rows = rows;
+    for (int c = 0; c < t.cn; c++) surface.colour[c] = t.colour[c];
+    surface.boxed = jaiListBox(values);
+    surface.capacity = values->count;
+    values->version++;
+
+    const int64_t odd = thickness & 1;
+    const int64_t halfWidth = thickness << (JAI_XY_SHIFT - 1);
+    const double bias = (double)halfWidth + (double)odd * (double)JAI_XY_ONE * 0.5;
+    const int64_t radius = (halfWidth + (JAI_XY_ONE >> 1)) >> JAI_XY_SHIFT;
+    enum { CAP_START = 1, CAP_END = 2 };
+
+    for (int c = 0; c < contours->count && !t.bad; c++) {
+        ObjList *contour = AS_LIST(jaiListGet(contours, c));
+        const int count = contour->count;
+        if (count == 0) continue;
+        int64_t px, py;
+        if (count == 1) {
+            jaiReadPoint(&reader, jaiListGet(contour, 0), &px, &py);
+            blendDisc(&t, px, py, radius);
+            blendDisc(&t, px, py, radius);
+            continue;
+        }
+        int caps = closed ? CAP_END : (CAP_START | CAP_END);
+        jaiReadPoint(&reader, jaiListGet(contour, closed ? count - 1 : 0), &px, &py);
+        for (int i = closed ? 0 : 1; i < count && !t.bad; i++) {
+            int64_t cx, cy;
+            jaiReadPoint(&reader, jaiListGet(contour, i), &cx, &cy);
+            /* `draw_thick` in fixed point. */
+            const int64_t x0 = px << JAI_XY_SHIFT, y0 = py << JAI_XY_SHIFT;
+            const int64_t x1 = cx << JAI_XY_SHIFT, y1 = cy << JAI_XY_SHIFT;
+            const double dx = (double)(x0 - x1) / (double)JAI_XY_ONE;
+            const double dy = (double)(y1 - y0) / (double)JAI_XY_ONE;
+            const double squared = dx * dx + dy * dy;
+            if (squared > 1e-12) {
+                const double reach = bias / sqrt(squared);
+                const int64_t ox = roundHalfEven(dy * reach);
+                const int64_t oy = roundHalfEven(dx * reach);
+                const int64_t xs[4] = {x0 + ox, x0 - ox, x1 - ox, x1 + ox};
+                const int64_t ys[4] = {y0 + oy, y0 - oy, y1 - oy, y1 + oy};
+                convexFill(&surface, xs, ys, 4, JAI_XY_SHIFT, JAI_XY_ONE - 1, 0);
+            }
+            if (caps & CAP_START) blendDisc(&t, px, py, radius);
+            if (caps & CAP_END) blendDisc(&t, cx, cy, radius);
+            px = cx;
+            py = cy;
+            caps = CAP_END;
+        }
+    }
+    jaiListTouch(values);
+    if (t.bad) return jaiThrow(vm.cValueError, "cannot convert float NaN to int");
+    *out = BOOL_VAL(true);
+    return true;
+}
+
 void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "fill_span",     primFillSpan,     10, 10);
     jaiStrDefinePrim(ns, "draw_line",     primDrawLine,     12, 12);
@@ -1412,4 +1572,5 @@ void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "draw_outlines", primDrawOutlines, 12, 12);
     jaiStrDefinePrim(ns, "fill_polygons", primFillPolygons, 12, 12);
     jaiStrDefinePrim(ns, "blend_outlines", primBlendOutlines, 10, 10);
+    jaiStrDefinePrim(ns, "blend_strokes", primBlendStrokes, 11, 11);
 }

@@ -28,7 +28,7 @@ let SPECIFIED = [
     "list_remove", "list_len", "list_slice", "list_concat", "list_filled",
     "list_pack_argb", "grid_nonzero", "grid_borders", "grid_border_points", "points_hull", "points_min_box", "points_approx",
     "points_min_circle", "points_area", "points_moments",
-    "fill_span", "draw_line", "draw_lines", "fill_convex", "fill_strokes", "draw_outlines", "fill_polygons", "blend_outlines",
+    "fill_span", "draw_line", "draw_lines", "fill_convex", "fill_strokes", "draw_outlines", "fill_polygons", "blend_outlines", "blend_strokes",
     "dict_new", "dict_get", "dict_set", "dict_del", "dict_has", "dict_len",
     "dict_keys", "dict_values",
     "set_new", "set_add", "set_del", "set_has", "set_len",
