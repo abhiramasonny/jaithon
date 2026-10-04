@@ -579,8 +579,17 @@ static int64_t roundHalfEven(double value) {
  * `contours` is a list of lists of points, where a point is anything with
  * integer fields `x` and `y`. Returns false, having drawn nothing, if one is
  * not, so the caller can take its own path; every check is made before the
- * first pixel. Arithmetic that overflows in Jaithon throws here too, before
- * anything is drawn, as it would have there. */
+ * first pixel. It also declines a point beyond `STROKE_COORD_LIMIT` or a
+ * segment longer than `STROKE_RUN_LIMIT` in x or y, which is where the two
+ * Jaithon paths stop agreeing with it and with each other: `thick_contours`
+ * squares a length in integers and throws when that overflows, `polylines`'
+ * `draw_thick` squares it in floats, rounding past 2^53, and wraps a cap's
+ * centre through fixed point past 2^47. Each caller's own path then decides. */
+#define STROKE_COORD_LIMIT ((int64_t)1 << 30)
+#define STROKE_RUN_LIMIT ((int64_t)1 << 26)
+
+static bool strokeOutOfReach(int64_t v, int64_t limit) { return v <= -limit || v >= limit; }
+
 static bool primFillStrokes(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *contours;
@@ -640,7 +649,9 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
         }
         if (!closed) {
             if (__builtin_add_overflow(px, offsetX, &starts[opened * 2]) ||
-                __builtin_add_overflow(py, offsetY, &starts[opened * 2 + 1])) {
+                __builtin_add_overflow(py, offsetY, &starts[opened * 2 + 1]) ||
+                strokeOutOfReach(starts[opened * 2], STROKE_COORD_LIMIT) ||
+                strokeOutOfReach(starts[opened * 2 + 1], STROKE_COORD_LIMIT)) {
                 overflow = true;
                 break;
             }
@@ -660,7 +671,12 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
                 __builtin_add_overflow(px, offsetX, &at[0]) ||
                 __builtin_add_overflow(py, offsetY, &at[1]) ||
                 __builtin_add_overflow(cx, offsetX, &at[2]) ||
-                __builtin_add_overflow(cy, offsetY, &at[3])) {
+                __builtin_add_overflow(cy, offsetY, &at[3]) ||
+                strokeOutOfReach(runX, STROKE_RUN_LIMIT) || strokeOutOfReach(runY, STROKE_RUN_LIMIT) ||
+                strokeOutOfReach(at[0], STROKE_COORD_LIMIT) ||
+                strokeOutOfReach(at[1], STROKE_COORD_LIMIT) ||
+                strokeOutOfReach(at[2], STROKE_COORD_LIMIT) ||
+                strokeOutOfReach(at[3], STROKE_COORD_LIMIT)) {
                 overflow = true;
                 break;
             }
@@ -670,18 +686,12 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
             py = cy;
         }
     }
-    if (!readable) {
+    if (!readable || overflow) {
         free(ends);
         free(reach);
         free(starts);
         *out = BOOL_VAL(false);
         return true;
-    }
-    if (overflow) {
-        free(ends);
-        free(reach);
-        free(starts);
-        return rasterOverflow();
     }
 
     /* Pass two: how far the quadrilateral stands off the segment, per unit of

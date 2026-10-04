@@ -294,8 +294,9 @@ pub class Painter {
     #: Every contour outlined `thickness` wide, in one call: the quadrilateral
     #: each segment sweeps and the round cap at its far end, which is what
     #: `draw_contours` draws for a stroke wider than a pixel. False, with
-    #: nothing drawn, when a point is not something with integer `x` and `y`,
-    #: and the caller then draws it the long way.
+    #: nothing drawn, when a point is not something with integer `x` and `y`
+    #: or lies past 2^30, or a segment runs past 2^26, where the long ways
+    #: start to disagree; the caller then draws it its own long way.
     pub fn thick_outlines(
         self,
         contours: list[list[Point]],
