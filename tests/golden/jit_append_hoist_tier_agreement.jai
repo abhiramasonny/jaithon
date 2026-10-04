@@ -21,7 +21,6 @@
 #:
 #: Every loop runs long enough for the sampler to give it a compiled form, and
 #: every function is called more than the function tier's threshold.
-
 fn row_ints(n: int, seed: int) -> list[int] {
     var row: list[int] = []
     var s = seed
@@ -48,8 +47,14 @@ fn stencil(rows: list[list[int]], w: int) -> int {
         let down = rows[r + 1]
         var out: list[int] = []
         for c in 1..w - 1 {
-            let n = up[c - 1] + up[c] + up[c + 1] + mid[c - 1] + mid[c + 1] +
-                down[c - 1] + down[c] + down[c + 1]
+            let n = up[c - 1] +
+                up[c] +
+                up[c + 1] +
+                mid[c - 1] +
+                mid[c + 1] +
+                down[c - 1] +
+                down[c] +
+                down[c + 1]
             out.push(n % 5 + mid[c])
         }
         for v in out { total += v }
