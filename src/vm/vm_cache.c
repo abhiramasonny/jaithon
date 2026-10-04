@@ -6,6 +6,17 @@
 
 #include "vm/vm_internal.h"
 
+/* JAITHON_ENUM_INVOKE_IC=0 leaves enum values out of the builtin key space
+ * below, so `kind.ordinal()` resolves and binds on every call again. */
+static bool enumInvokeIcOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_ENUM_INVOKE_IC");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 uint32_t builtinShapeTag(Value v) {
     switch (jaiValueType(v)) {
     case VAL_INT:   return IC_BUILTIN_TAG | 1u;
@@ -22,6 +33,21 @@ uint32_t builtinShapeTag(Value v) {
     case OBJ_RANGE:  return IC_BUILTIN_TAG | 8u;
     case OBJ_BYTES:  return IC_BUILTIN_TAG | 9u;
     case OBJ_ITER:   return IC_BUILTIN_TAG | 10u;
+    case OBJ_ENUM_VAL: {
+        /* An enum value's builtin methods (`ordinal`) are the same native for
+         * every value of every enum -- but an enum's OWN method of that name
+         * wins, so the key is the enum's shape, not one tag for all enums. Bit
+         * 30 keeps it clear of the fixed tags above; an enum whose shape
+         * needs bit 30 itself simply is not cached. Without this every
+         * interpreted `kind.ordinal()` looked the name up and allocated a
+         * bound method to call: 142k of them in `fmt --check lib/jaithon`.
+         * The fill in OP_INVOKE also refuses a name some variant uses for a
+         * payload field, which getPropertyInto would find first. */
+        const ObjEnum *type = AS_ENUM_VAL(v)->type;
+        if (type == NULL || type->shapeId >= 0x40000000u || !enumInvokeIcOn())
+            return 0;
+        return IC_BUILTIN_TAG | 0x40000000u | type->shapeId;
+    }
     default:         return 0;
     }
 }
