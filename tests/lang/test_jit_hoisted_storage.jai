@@ -104,8 +104,10 @@ fn test_a_stencil_whose_rows_change_storage() -> void {
         while i < n - 1 {
             var j = 1
             while j < width - 1 {
-                wantA[i][j] = 0.25 * (plain[i - 1][j] + plain[i + 1][j] + plain[i][j - 1] + plain[i][j + 1])
-                wantB[i][j] = 0.25 * (mixed[i - 1][j] + mixed[i + 1][j] + mixed[i][j - 1] + mixed[i][j + 1])
+                wantA[i][j] = 0.25 *
+                    (plain[i - 1][j] + plain[i + 1][j] + plain[i][j - 1] + plain[i][j + 1])
+                wantB[i][j] = 0.25 *
+                    (mixed[i - 1][j] + mixed[i + 1][j] + mixed[i][j - 1] + mixed[i][j + 1])
                 j += 1
             }
             i += 1

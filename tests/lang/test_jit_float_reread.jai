@@ -197,7 +197,9 @@ fn writes_inside_the_expression(n: int, flag: bool) -> float {
         s = s + (if flag {
             s = 100.0
             2.0
-        } else { float(j) })
+        } else {
+            float(j)
+        })
     }
     return s
 }

@@ -185,7 +185,7 @@ fn test_an_uncovered_subscript_checks_its_own_bounds() -> void {
         var bad: list[int] = []
         for k in 0..200000 {
             xs.push(float(k))
-            ks.push((k * 7) % 200000)
+            ks.push(k * 7 % 200000)
             bad.push(if k == 150000 { 200000 } else { k })
         }
         assert_true(uncovered(xs, ks, 200000) > 0.0, "long: ran")
@@ -202,7 +202,7 @@ fn test_an_uncovered_subscript_checks_its_own_bounds() -> void {
         var ks: list[int] = []
         for k in 0..100 {
             xs.push(float(k))
-            ks.push((k * 7) % 100)
+            ks.push(k * 7 % 100)
         }
         let got = uncovered(xs, ks, 100)
         assert_true(got > 0.0, "ran")

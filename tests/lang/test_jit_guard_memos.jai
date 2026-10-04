@@ -109,10 +109,12 @@ fn test_a_store_through_an_alias_retires_the_memo() -> void {
 #: nothing may be remembered about the new one.
 fn rebind_mid_store(a: Q, b: Q, flag: bool) -> float {
     var p = a
-    p.y += (if flag {
+    p.y += if flag {
         p = b
         1.0
-    } else { 2.0 })
+    } else {
+        2.0
+    }
     return p.x + a.x + p.y
 }
 
@@ -150,6 +152,10 @@ fn test_a_closure_rebinding_a_captured_local() -> void {
     let items = [P(1.0, 1.0, 1.0), P(2.0, 2.0, 2.0)]
     for _round in 0..200 {
         # Per item: its own x, then the call, then the OTHER object's x.
-        assert_eq(closure_rebinds(items, 10), 45.0 + (1.0 + 1.0 + 100.0) + (2.0 + 1.0 + 100.0), "closure write seen")
+        assert_eq(
+            closure_rebinds(items, 10),
+            45.0 + (1.0 + 1.0 + 100.0) + (2.0 + 1.0 + 100.0),
+            "closure write seen"
+        )
     }
 }

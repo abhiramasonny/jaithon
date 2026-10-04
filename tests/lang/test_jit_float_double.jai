@@ -52,6 +52,6 @@ fn test_a_doubling_on_a_loop_carried_chain() -> void {
         assert_eq(chain(1.0, 1000), chain(1.0, 1000), "deterministic")
     }
     var y = 1.0
-    for _i in 0..1000 { y = (y + y) - (y + y) + y * 0.5 + 0.5 }
+    for _i in 0..1000 { y = y + y - (y + y) + y * 0.5 + 0.5 }
     assert_eq(chain(1.0, 1000), y, "matches the spelled-out adds")
 }
