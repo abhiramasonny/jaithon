@@ -848,6 +848,16 @@ configurations after the change -- 300 at the default seeds and 1,500 more from
 seed 5000 -- report no disagreements. The arm is covered now; it is not yet
 known to be wrong anywhere.
 
+Four later changes moved the same census, seeds 1..60: 77% default, 85% under
+`JAITHON_JIT_TICK_US=50` (was 43% and 26% on the first hundred). A way whose
+callee cannot be called directly is inlined instead (`JAITHON_JIT_PIC_INLINE_ONLY`),
+a form compiled short of ways is compiled again once the stragglers arrive
+(`JAITHON_JIT_PIC_UPGRADE` -- which is what the tick configuration was losing
+to), and the whole-function tier reaches the arm through a mixed list
+(`JAITHON_JIT_POLY_LOOP`) and through a parameter several classes pass
+(`JAITHON_JIT_POLY_PARAM`). The ways themselves are mostly inlined now
+(`JAITHON_JIT_INLINE_METHODS`): poly_dispatch's eight all are.
+
 ### One gap, recorded rather than fixed
 
 `jitPic1Admissible` says it "mirrors every decision `emitDirectCall` makes
