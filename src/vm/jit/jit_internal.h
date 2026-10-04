@@ -812,6 +812,7 @@ void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
 void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, bool negate,
                      LeafFix *fx);
 bool leafRegOk(unsigned r);
+bool jitLeafInReg(void);
 void leafSlowHere(Emit *e, LeafFix *fx);
 void leafDoneHere(Emit *e, LeafFix *fx);
 int jitCallOut(JitCallDesc *d);

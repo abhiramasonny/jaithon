@@ -356,11 +356,19 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
     fx->slow[0] = (int)e->count;
     fx->cond[0] = JAI_A64_EQ;
     emit(e, jaiA64BCond(JAI_A64_EQ, 0));
-    /* The whole Value, as jitFormat writes it, though only the payload is
-     * read back below. */
-    emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
-    emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
-    emit(e, jaiA64StrX(0, 31, rat + 8));
+    /* Straight into the register the result will occupy -- the first part's,
+     * once the parts are popped and the string pushed -- and past the load
+     * the descriptor path ends with (emitFormat places the join after it).
+     * Through the descriptor it was two stores and a load on the way from
+     * the leaf to whatever consumes the string, a store-forwarding round
+     * trip on the path that runs on into the dict probe. */
+    if (jitLeafInReg()) {
+        emit(e, jaiA64MovX(valueXReg(e, vfirst), 0));
+    } else {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
+        emit(e, jaiA64StrX(0, 31, rat + 8));
+    }
     fx->done = (int)e->count;
     emit(e, jaiA64B(0));
     fx->on = true;
@@ -396,7 +404,7 @@ bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp) {
                             (void *)&jitFormat)) {
             return false;
         }
-        leafDoneHere(e, &ffx);
+        if (!jitLeafInReg()) leafDoneHere(e, &ffx);
         for (unsigned i = 0; i < parts; i++) {
             unsigned drop;
             if (!popValue(e, &drop, NULL)) return false;
@@ -410,6 +418,8 @@ bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp) {
         emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                            e->descOffset +
                                (unsigned)offsetof(JitCallDesc, result) + 8));
+        /* After the load: the leaf put its answer in this register itself. */
+        if (jitLeafInReg()) leafDoneHere(e, &ffx);
         e->wroteHeap = true;
         /* count u8, litmask u24, name u24, cache u16 -- nine after the
          * opcode. */

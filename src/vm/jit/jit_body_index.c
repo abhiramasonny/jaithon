@@ -34,6 +34,18 @@
  * calls is planned that way already (noteScratchClobber); an operand anywhere
  * else -- an inlined body's own bank -- emits no leaf at all, which leaves the
  * site exactly as it was. */
+/* JAITHON_JIT_LEAF_IN_REG=0 hands a string leaf's answer back through the
+ * descriptor's result slot, as the descriptor call does, instead of moving it
+ * into the result's register and joining after the load. A one-binary A/B. */
+bool jitLeafInReg(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_LEAF_IN_REG");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool leafRegOk(unsigned r) {
     return r >= JIT_FIRST_SAVED && r < JIT_FIRST_SAVED + JIT_MAX_SAVED;
 }
@@ -757,9 +769,16 @@ static void emitStringSliceLeaf(Emit *e, unsigned flags, unsigned nargs,
     fx->slow[0] = (int)e->count;
     fx->cond[0] = JAI_A64_EQ;
     emit(e, jaiA64BCond(JAI_A64_EQ, 0));
-    emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
-    emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
-    emit(e, jaiA64StrX(0, 31, rat + 8));
+    /* Into the register the slice will occupy -- the container's, once the
+     * operands are popped -- and past the descriptor path's load, as the
+     * f-string leaf does it (see emitFormatLeaf). */
+    if (jitLeafInReg()) {
+        emit(e, jaiA64MovX(valueXReg(e, vfirst), 0));
+    } else {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
+        emit(e, jaiA64StrX(0, 31, rat + 8));
+    }
     fx->done = (int)e->count;
     emit(e, jaiA64B(0));
     fx->on = true;
@@ -822,7 +841,7 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
                                   (void *)&jitGetSlice, false, -1)) {
             return false;
         }
-        leafDoneHere(e, &lfx);
+        if (!jitLeafInReg()) leafDoneHere(e, &lfx);
         for (unsigned i = 0; i < nargs; i++) {
             unsigned r;
             if (!popValue(e, &r, NULL)) return false;
@@ -835,6 +854,8 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
         emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                            e->descOffset +
                                (unsigned)offsetof(JitCallDesc, result) + 8));
+        /* After the load: the leaf put its answer in this register itself. */
+        if (jitLeafInReg()) leafDoneHere(e, &lfx);
         /* Deliberately not e->wroteHeap: the only effect is a fresh object
          * and an interpreted re-run would make another. Setting it would
          * decline the next self-call, which is the shape `sort` has. */
