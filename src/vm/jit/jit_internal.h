@@ -651,6 +651,9 @@ typedef struct {
          * jitGrowKeeps). Decided per site, at the site, so the stub can never
          * disagree with what the walk assumed. */
         bool     keeps;
+        /* The site dispatches on storage after the grow, so jitListGrow may
+         * give an untyped empty list its first element's storage. */
+        bool     shape;
     } grow[JIT_MAX_GROW];
     unsigned  growCount;
     uint32_t  curOffset;
@@ -833,7 +836,9 @@ int jitMakeEnumIter(JitCallDesc *d);
  * function tier's enumerate arm, so all three refuse on the same data. */
 bool jitListHeadSample(const ObjList *src, int at, Value *sample, bool *mixed);
 int jitFormat(JitCallDesc *d);
-int jitListGrow(ObjList *list, uint64_t tag, int64_t payload);
+int jitListGrow(ObjList *list, uint64_t tag, int64_t payload,
+                int64_t mayShape);
+bool jitListShapeable(Value v);
 ObjInstance *jitInstanceAlloc(ObjClass *cls);
 int jitNewInstance(JitCallDesc *d);
 int jitGetSlice(JitCallDesc *d);

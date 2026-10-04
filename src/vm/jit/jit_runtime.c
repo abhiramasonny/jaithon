@@ -323,10 +323,43 @@ int jitFormat(JitCallDesc *d) {
 
 /* No descriptor/roots: growing a list cannot collect -- jaiListReserve->jaiRealloc never triggers the
  * marker (gc.c: collections only happen at jaiGCMaybeCollect safepoints). Returns 1 if it raised (list past INT32_MAX). */
-int jitListGrow(ObjList *list, uint64_t tag, int64_t payload) {
+/* The compiled half of jaiListPush's first-element shaping (see
+ * shapeOnFirstOn there): the same test on the same list, so an untyped list
+ * comes out the same width whichever tier pushed its first element. Only for
+ * a site that dispatches on storage after the grow -- a site emitted at one
+ * pinned storage would go on storing at that width. */
+static bool growShapesFirst(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_LIST_SHAPE_FIRST");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* A list whose storage is not settled yet: its first push may still shape
+ * it (jaiListPush / jitListGrow), so a loop form must not pin the BOXED it
+ * has now. */
+bool jitListShapeable(Value v) {
+    if (!IS_LIST(v)) return false;
+    ObjList *l = AS_LIST(v);
+    return l->capacity == 0 && l->count == 0 &&
+           l->stg == LIST_STORE_BOXED && l->elemKind == FIELD_KIND_ANY &&
+           growShapesFirst();
+}
+
+int jitListGrow(ObjList *list, uint64_t tag, int64_t payload,
+                int64_t mayShape) {
     Value pending;
     pending.type = (ValueType)tag;
     pending.as.integer = payload;
+    if (mayShape != 0 && list->capacity == 0 && list->count == 0 &&
+        list->stg == LIST_STORE_BOXED && list->elemKind == FIELD_KIND_ANY &&
+        growShapesFirst()) {
+        if (tag == VAL_INT)        jaiListSpecialise(list, FIELD_KIND_INT);
+        else if (tag == VAL_FLOAT) jaiListSpecialise(list, FIELD_KIND_FLOAT);
+        else if (tag == VAL_BOOL)  jaiListSpecialise(list, FIELD_KIND_BOOL);
+    }
     jaiGCPushRoot(OBJ_VAL(list));
     jaiGCPushRoot(pending);
     if (list->capacity > INT32_MAX / 2) {

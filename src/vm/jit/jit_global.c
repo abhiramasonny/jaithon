@@ -451,6 +451,7 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
     e->grow[gi].countReg = JIT_SCRATCH_A;
     e->grow[gi].stub     = -1;
     e->grow[gi].keeps    = keeps;
+    e->grow[gi].shape    = pAcc.dynamic;
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_GROW - gi;

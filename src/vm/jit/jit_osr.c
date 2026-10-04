@@ -491,7 +491,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
                 e.localStgPin[i] =
                     !bodyCallsOut &&
-                    !(e.slotWriteHi[i] >= top && e.slotWriteLo[i] < end);
+                    !(e.slotWriteHi[i] >= top && e.slotWriteLo[i] < end) &&
+                    !(i < e.locals && jitListShapeable(slots[i]));
             }
             e.elemStgPin = !bodyCallsOut;
             for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {

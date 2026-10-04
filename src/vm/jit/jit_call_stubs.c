@@ -191,6 +191,7 @@ void emitGrowStubs(Emit *e) {
             growKeepArg(e, 0, e->grow[gi].listReg);
             growKeepArg(e, 2, e->grow[gi].valReg);
             emit(e, jaiA64MovzX(1, e->grow[gi].tag, 0));
+            emit(e, jaiA64MovzX(3, e->grow[gi].shape ? 1u : 0u, 0));
             emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jitListGrow);
             emit(e, jaiA64Blr(JIT_SCRATCH_D));
             /* x10 is not in the save area, so the verdict survives the
@@ -209,6 +210,7 @@ void emitGrowStubs(Emit *e) {
         emit(e, jaiA64MovX(0, e->grow[gi].listReg));
         emit(e, jaiA64MovzX(1, e->grow[gi].tag, 0));
         emit(e, jaiA64MovX(2, e->grow[gi].valReg));
+        emit(e, jaiA64MovzX(3, e->grow[gi].shape ? 1u : 0u, 0));
         emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jitListGrow);
         emit(e, jaiA64Blr(JIT_SCRATCH_D));
         emit(e, jaiA64SubsXImm(31, 0, 0));

@@ -205,6 +205,40 @@ void jaiListTouch(ObjList *list) {
     list->version++;
 }
 
+/* JAITHON_LIST_SHAPE_FIRST=0 leaves an untyped list boxed whatever it is
+ * first given. On by default.
+ *
+ * `var xs = []` promises nothing, so it has always been built boxed: sixteen
+ * bytes an element for a list that, overwhelmingly, is then filled with ints
+ * -- twice the memory to write, to copy on every growth, and to read back.
+ * A list that has never held anything and never reserved anything has no
+ * storage to convert, so it takes the unboxed one its FIRST push asks for,
+ * exactly as `var xs: list[int] = []` would have been built. It promises no
+ * more than before -- elemKind stays FIELD_KIND_ANY, and a later element of
+ * another kind de-specialises it the way any unboxed list is, once. Both tiers
+ * shape here or in jitListGrow, on the same test, so they build the same
+ * storage; the one compiled push that does not (a site whose storage was
+ * pinned at entry) can never see such a list -- compileOsr does not pin one. */
+static bool shapeOnFirstOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *s = getenv("JAITHON_LIST_SHAPE_FIRST");
+        on = (s != NULL && s[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static inline void listShapeForFirst(ObjList *list, Value v) {
+    if (JAI_LIKELY(list->capacity != 0) || list->count != 0 ||
+        list->stg != LIST_STORE_BOXED || list->elemKind != FIELD_KIND_ANY) {
+        return;
+    }
+    if (!shapeOnFirstOn()) return;
+    if (IS_INT(v))        jaiListSpecialise(list, FIELD_KIND_INT);
+    else if (IS_FLOAT(v)) jaiListSpecialise(list, FIELD_KIND_FLOAT);
+    else if (IS_BOOL(v))  jaiListSpecialise(list, FIELD_KIND_BOOL);
+}
+
 void jaiListPush(ObjList *list, Value v) {
     /* The guard belongs HERE, not in the `list.push` builtin: a typed receiver
      * and an `any` one reach the list through different entry points, and
@@ -218,9 +252,10 @@ void jaiListPush(ObjList *list, Value v) {
         !jaiCheckKind(list->elemKind, v, "an element")) {
         return;
     }
-    if (JAI_UNLIKELY(list->count >= list->capacity) &&
-        !listGrowFor(list, v))
-        return;
+    if (JAI_UNLIKELY(list->count >= list->capacity)) {
+        listShapeForFirst(list, v);
+        if (!listGrowFor(list, v)) return;
+    }
 
     if (JAI_UNLIKELY(!jaiListStoreAccepts(list, v))) (void)jaiListBox(list);
     jaiListSetRaw(list, list->count++, v);
