@@ -886,6 +886,20 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                  * are: the pool belongs to the chunk, the chunk to the function, and the caller holds the closure for the whole call. Was the commonest reason this tier declined a body -- thirty refusals across the benchmark suite. */
                 if (!pushValue3(e, SLOT_OBJ, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, (int64_t)(uintptr_t)AS_OBJ(k));
+                /* A one-character ASCII literal is, by interning, the very
+                 * object the ASCII table holds for its byte -- checked here
+                 * against the table itself rather than assumed. That is the
+                 * whole of what stackAscii claims, and it is a FACT about a
+                 * pointer the emitter is baking in, not a prediction: so
+                 * `c == " "`, `c < "0"` and `s[i] != "\""` stop proving at
+                 * run time, on every iteration, that a literal is a string,
+                 * interned and one byte long. */
+                ObjString *ks = AS_STRING(k);
+                if (jitConstAscii() && ks->length == 1 &&
+                    (unsigned char)ks->chars[0] < 128 &&
+                    jaiAsciiCharTable()[(unsigned char)ks->chars[0]] == ks) {
+                    e->stackAscii[e->depth - 1] = true;
+                }
             } else {
                 return subWhy(e, "a constant of a kind the tier cannot hold");
             }
