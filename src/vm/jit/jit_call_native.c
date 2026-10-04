@@ -177,6 +177,16 @@ static bool jitStrIntLeaf(void) {
     return cached != 0;
 }
 
+/* The callee is the builtin `str` itself, by identity: kNativeResults keys
+ * on the native's NAME, and only this one native is `f"{n}"` on an int. */
+static bool isBuiltinStr(Value cv) {
+    if (vm.builtins == NULL || !IS_OBJ(cv)) return false;
+    ObjString *name = jaiStringIntern("str", 3);
+    Value bound;
+    return name != NULL && jaiModuleGet(vm.builtins, name, &bound) &&
+           IS_OBJ(bound) && AS_OBJ(bound) == AS_OBJ(cv);
+}
+
 /* 1 emitted, 0 no row for this builtin, -1 the emit failed. */
 int emitNativeResultCall(Emit *e, Value cv, const char *nm,
                                 unsigned argc, uint32_t afterIp) {
@@ -219,8 +229,8 @@ int emitNativeResultCall(Emit *e, Value cv, const char *nm,
      * declines the whole body. */
     bool strOfInt = argc == 1 && strcmp(nm, "str") == 0 &&
                     e->stack[e->depth - 1] == SLOT_INT;
-    if (strOfInt && jitStrIntLeaf() &&
-        leafRegOk(valueXReg(e, e->valueDepth - 1)) &&
+    if (strOfInt && jitStrIntLeaf() && jaiValueFormatShortOn() &&
+        isBuiltinStr(cv) && leafRegOk(valueXReg(e, e->valueDepth - 1)) &&
         e->descOffset + (unsigned)offsetof(JitCallDesc, result) <= 4095u) {
         unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
         fpSyncAll(e);
