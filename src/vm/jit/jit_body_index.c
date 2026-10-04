@@ -56,7 +56,7 @@ static bool dictLeafValueKind(SlotKind k) {
            k == SLOT_MAYBE_INST || k == SLOT_MAYBE_OBJ;
 }
 
-bool dictLeafKeyKind(SlotKind k) {
+static bool dictLeafKeyKind(SlotKind k) {
     return k == SLOT_OBJ || k == SLOT_INT;
 }
 
