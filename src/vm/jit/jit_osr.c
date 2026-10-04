@@ -274,6 +274,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            const bool *dynamic, bool *needDynamic) {
     bool hasIter = iterKind != 0;
     ObjFunction *fn = closure->fn;
+    jitBranchTargetsReset();
     if (!isInstructionStart(&fn->chunk, top))
         return osrNoB(fn, top, "the loop head is not an instruction boundary");
     uint32_t end = findLoopEnd(&fn->chunk, top, wholeBody);

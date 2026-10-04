@@ -467,6 +467,7 @@ this table complete in both directions.
 | `JAITHON_JIT_ITER_SOFT` | on | Function tier: a list or dict loop whose sampled container is empty ("iterating a list/dict with nothing to look at") is left to the interpreter from that instruction instead of declining the whole body. Off restores the decline. |
 | `JAITHON_JIT_ITER_EMPTY_SKIP` | on | In front of a soft iterate refusal on a list, branch straight to the loop exit when the list is empty at run time, so only a non-empty list deopts. |
 | `JAITHON_JIT_PAIR_INST` | on | A dict-items pair loop binds an instance component as `SLOT_INST` of its sampled class (object type and shape guarded per step) rather than a bare `SLOT_OBJ`, so a loop variable the frame already holds as that class no longer clashes. |
+| `JAITHON_JIT_BRANCH_MAP` | on | Compile time only: `offsetIsBranchTarget` decodes each chunk once per compile into a bitmap instead of rescanning the whole chunk on every query. Off restores the scan. |
 | `JAITHON_JIT_STR_HOIST` | on | Hoist a loop-invariant string local's header (`chars`, `length`) and its string and all-one-byte proofs to the loop head, so `s[i]` inside a call-free OSR loop is a bounds check and a byte load. Off restores the per-character guards. |
 | `JAITHON_JIT_COMP_ACC` | on | A list comprehension's append, through the frame. |
 | `JAITHON_JIT_BUILTIN_CLASS` | on | Resolve a builtin class (every exception type). |

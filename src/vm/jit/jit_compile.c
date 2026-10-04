@@ -415,6 +415,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *nullable, bool *needNullable,
                             bool noInline) {
     ObjFunction *fn = closure->fn;
+    jitBranchTargetsReset();
     gInlineFailed   = false;
     gMatchUsed      = false;
     gNullableFbUsed = false;
