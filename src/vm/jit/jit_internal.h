@@ -702,6 +702,11 @@ typedef struct {
      * push and pop, so it cannot outlive the entry it describes. */
     uint32_t  kKnown;
     int64_t   kKnownVal[32];
+    /* Entries that are the float literal 2.0, pushed by OP_CONST. `2.0 * x`
+     * is then `x + x` -- bit for bit the same double for every x, NaN, the
+     * infinities and -0.0 included, and an add is a cycle shorter than a
+     * multiply on a dependency chain. See JAITHON_JIT_FTWO. */
+    uint32_t  fTwo;
     uint32_t  xBorrow;
     uint8_t   xBorrowReg[32];
     /* Entries that are an X-side copy of a float LOCAL, taken by OP_GET_LOCAL when no float consumer was
@@ -931,6 +936,7 @@ void fpReleaseAll(Emit *e);
 void fpSyncAll(Emit *e);
 unsigned fpOperand(Emit *e, unsigned idx);
 bool jitFpReread(void);
+bool jitFTwo(void);
 void fpSrcNote(Emit *e, unsigned idx, unsigned slot);
 unsigned fpOperandReread(Emit *e, unsigned idx);
 void fpClaim(Emit *e, unsigned idx);

@@ -886,6 +886,10 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                 } else {
                     emitConst64(e, pushReg(e) - 1, bits);
                 }
+                /* After the claim, which clears it: the entry IS 2.0. */
+                if (d == 2.0 && jitFTwo()) {
+                    e->fTwo |= 1u << (e->valueDepth - 1);
+                }
             } else if (IS_BOOL(k)) {
                 if (!pushValue3(e, SLOT_BOOL, 0, NULL, k, -1)) return false;
                 emitConst64(e, pushReg(e) - 1, AS_BOOL(k) ? 1 : 0);

@@ -191,6 +191,7 @@ static void swapPopEntry(Emit *e) {
     e->fpSrc    &= ~(3u << (e->valueDepth > 0 ? e->valueDepth - 1 : 0));
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
+    e->fTwo     &= ~(3u << (e->valueDepth > 0 ? e->valueDepth - 1 : 0));
     e->xBorrow  &= ~(1u << e->valueDepth);
     e->idxKnown &= ~(1u << e->valueDepth);
 }

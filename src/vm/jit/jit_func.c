@@ -904,6 +904,16 @@ unsigned jitHomeEarlyLimit(void) {
 /* JAITHON_JIT_FP_REREAD: a float operator reads a still-current float local
  * from its d home rather than through the X copy OP_GET_LOCAL took. See
  * Emit::fpSrc. */
+/* JAITHON_JIT_FTWO: `2.0 * x` as `x + x`. See Emit::fTwo. */
+bool jitFTwo(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FTWO");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool jitFpReread(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -959,6 +969,7 @@ void fpClaim(Emit *e, unsigned idx) {
     e->fpLive |= 1u << idx;
     e->fpBorrow &= ~(1u << idx);
     e->fpSrc &= ~(1u << idx);
+    e->fTwo &= ~(1u << idx);
 }
 
 void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
@@ -1146,6 +1157,7 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->fpSrc    &= ~(1u << e->valueDepth);
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
+    e->fTwo     &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
     e->idxKnown &= ~(1u << e->valueDepth);
     e->valueDepth++;
@@ -1289,6 +1301,7 @@ bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     e->fpSrc    &= ~(1u << e->valueDepth);
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
+    e->fTwo     &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
     e->idxKnown &= ~(1u << e->valueDepth);
     if (kind != NULL) *kind = e->stack[e->depth];
@@ -1313,7 +1326,10 @@ bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
 void dropCalleeEntry(Emit *e) {
     /* Every caller has just rewritten the top entry in place (a builtin's
      * result in its argument's register), so it no longer copies a local. */
-    if (e->valueDepth > 0) e->fpSrc &= ~(1u << (e->valueDepth - 1));
+    if (e->valueDepth > 0) {
+        e->fpSrc &= ~(1u << (e->valueDepth - 1));
+        e->fTwo  &= ~(1u << (e->valueDepth - 1));
+    }
     e->stack[e->depth - 2]      = e->stack[e->depth - 1];
     e->stackShape[e->depth - 2] = 0;
     e->stackClass[e->depth - 2] = NULL;
