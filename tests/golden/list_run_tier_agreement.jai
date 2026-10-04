@@ -10,11 +10,10 @@
 #: one that shrinks the very list being mapped -- for int, float and bool
 #: results.
 #:
-#: An untyped `[]` takes the unboxed storage its first push asks for
-#: (JAITHON_LIST_SHAPE_FIRST), in the interpreter's push and in the compiled
-#: one alike; a later element of another kind de-specialises it. None of that
-#: may be visible.
-
+#: An untyped `[]` takes unboxed storage when a push grows it past eight
+#: elements of one kind (JAITHON_LIST_SHAPE_GROWN), in the interpreter's push
+#: and in the compiled one alike; a later element of another kind
+#: de-specialises it. None of that may be visible.
 var SRC: list = []
 
 fn shrink(x: int) -> int {

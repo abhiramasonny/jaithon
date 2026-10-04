@@ -84,8 +84,11 @@ uint8_t listAltFor(SlotKind vk) {
  * unboxing, and it is where the 1.3-1.5x lives.
  *
  * PROVED. Nothing pinned it, and no unboxed storage could hold a `vk` anyway
- * (a list of instances). Two instructions say BOXED or deoptimise, and BOXED
- * is a fact that stays true -- `stg` only ever moves towards boxed.
+ * (a list of instances). Two instructions say BOXED or deoptimise. BOXED is
+ * nearly a fact that stays true -- `stg` moves towards boxed, except for an
+ * untyped list of one scalar kind growing past its first eight
+ * (jaiListShapeOnGrow), and a list that long being handed an object is rare
+ * enough to leave to the deopt.
  *
  * DISPATCHED. Nothing pinned it and two storages are possible. Emitting the
  * boxed arm behind a deopt guard is what the first version did, and it is

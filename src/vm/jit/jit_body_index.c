@@ -379,7 +379,8 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
          * after the body (jitDispatchColdOn). Inline, one of the two always
          * took a branch -- the `b.eq` to the unboxed arm, or the boxed arm's
          * `b` over it -- and since an untyped list of ints is unboxed too
-         * (JAITHON_LIST_SHAPE_FIRST), the taken one was the common one. */
+         * once it is longer than eight (JAITHON_LIST_SHAPE_GROWN), the taken
+         * one was the common one. */
         bool gColdDone = false;
         if (gAcc.dynamic && gAcc.stg == LIST_STORE_BOXED &&
             (kind == SLOT_INT || kind == SLOT_FLOAT || kind == SLOT_BOOL) &&

@@ -244,6 +244,15 @@ void jaiPrepareFn1(Value callee, JaiPreparedFn1 *prepared);
  * including every fallback it makes. */
 bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out);
 
+/* The length at which an untyped boxed list that has held only one of int,
+ * float or bool takes that kind's unboxed storage, on the push that grows it
+ * past this many (object_collection.c, jaiListShapeOnGrow). Returns true when
+ * it did, with room made for that push; false leaves the list untouched for
+ * the ordinary growth. JAITHON_LIST_SHAPE_GROWN=0 turns it off. */
+#define JAI_LIST_SHAPE_AT 8
+bool jaiListShapeOnGrow(ObjList *list, Value v);
+bool jaiListShapeGrownOn(void);
+
 /* A run of jaiCallPreparedFn1 over `src` from element `from`, appending each
  * result to `dst` -- for a flat callee that takes an int or a float and
  * returns an int, a float or a bool, with every per-callee check and the stack
