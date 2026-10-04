@@ -1371,6 +1371,47 @@ ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
     return formatLeafMiss(parts, count);
 }
 
+/* The commonest f-string there is -- one int hole with at most a string run
+ * on either side: `f"k{i}"`, `f"{name}{i}"`, `f"item-{i},"` -- as a leaf of
+ * its own, because what jaiValueFormatLeaf spends on top of the work here is
+ * generality: the parts written out to memory and read back, a dispatch on
+ * each one's tag, and a loop whose constants the compiler keeps in registers
+ * across the whole call. `pre` and `post` are the runs, or NULL where the
+ * f-string has none; anything other than a string there, or a result past the
+ * short limit, is NULL back and the general path. The same no-collection
+ * argument as jaiValueFormatLeaf: a hit allocates nothing, and a miss goes
+ * through formatLeafMiss, which declines when a collection is due. */
+JAI_INLINE bool fmtRun(char *buf, size_t *o, const Obj *run) {
+    if (run == NULL) return true;
+    if (run->type != OBJ_STRING) return false;
+    const ObjString *str = (const ObjString *)run;
+    const uint32_t n = str->length;
+    if (n > JAI_STR_SHORT_MAX - *o) return false;
+    const char *src = str->chars;
+    for (uint32_t j = 0; j < n; ++j) buf[*o + j] = src[j];
+    *o += n;
+    return true;
+}
+
+ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
+    uint64_t words[(FMT_SHORT_BUF + 7) / 8];
+    char *buf = (char *)words;
+    size_t o = 0;
+    if (JAI_LIKELY(fmtRun(buf, &o, pre))) {
+        o += (size_t)writeInt64Inline(buf + o, n);
+        if (JAI_LIKELY(o <= JAI_STR_SHORT_MAX && fmtRun(buf, &o, post))) {
+            ObjString *found = formatShortProbe(buf, o);
+            if (JAI_LIKELY(found != NULL)) return found;
+        }
+    }
+    Value parts[3];
+    int count = 0;
+    if (pre != NULL) parts[count++] = OBJ_VAL(pre);
+    parts[count++] = INT_VAL(n);
+    if (post != NULL) parts[count++] = OBJ_VAL(post);
+    return formatLeafMiss(parts, count);
+}
+
 ObjString *jaiValueFormat(const Value *parts, int count) {
     if (count <= 0) return jaiStringIntern("", 0);
     if (count > JAI_FMT_MAX_PARTS) return formatViaBuffer(parts, count);

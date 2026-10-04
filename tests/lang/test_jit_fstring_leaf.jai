@@ -6,7 +6,7 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it on call count alone; `JAITHON_NO_JIT=1` runs
 #: the same file, and every answer is the interpreter's.
-# jit-compiles: fmt_key, fmt_mixed, fmt_long, fmt_float, fmt_maybe, fmt_many
+# jit-compiles: fmt_key, fmt_mixed, fmt_long, fmt_float, fmt_maybe, fmt_many, fmt_hole_shapes
 from std.test import assert_eq, assert_true
 
 let CALLS = 100
@@ -101,6 +101,33 @@ pub fn test_a_nullable_part() -> void {
         assert_eq(fmt_maybe(b), if call % 2 == 0 { "<false>" } else { "<true>" })
         call += 1
     }
+}
+
+fn fmt_hole_shapes(n: int, s: str, o: any) -> list[str] {
+    return [f"{n}", f"{n}px", f"k{n}", f"<{n}>", f"{s}{n}", f"{n}{s}", f"{o}{n}"]
+}
+
+pub fn test_one_int_hole_shapes() -> void {
+    #: The one-int-hole leaf: an int with at most a string run on each side.
+    #: A run that is not a string at run time (`o` is sometimes a list) and a
+    #: result past the intern limit both take the general path.
+    let long = "a run long enough that the result passes the limit"
+    var call = 0
+    while call < CALLS {
+        let n = call * 7919 - 300000
+        let o: any = if call % 3 == 0 { [1, 2] } else { "o" }
+        let ns = str(n)
+        assert_eq(fmt_hole_shapes(n, "ab", o),
+                  [ns, ns + "px", "k" + ns, "<" + ns + ">", "ab" + ns,
+                   ns + "ab", str(o) + ns])
+        assert_eq(fmt_hole_shapes(n, long, "o"),
+                  [ns, ns + "px", "k" + ns, "<" + ns + ">", long + ns,
+                   ns + long, "o" + ns])
+        call += 1
+    }
+    let m = "-9223372036854775808"
+    assert_eq(fmt_hole_shapes(-9223372036854775807 - 1, "", "o"),
+              [m, m + "px", "k" + m, "<" + m + ">", m, m, "o" + m])
 }
 
 pub fn test_many_distinct_strings_across_collections() -> void {

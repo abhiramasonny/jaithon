@@ -258,6 +258,17 @@ static bool jitFormatLeaf(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_FMT_INT_LEAF=0 sends the one-int-hole shape to the general
+ * f-string leaf too, for a one-binary A/B of jaiValueFormatIntLeaf. */
+static bool jitFormatIntLeaf(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FMT_INT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* The f-string through jaiValueFormatLeaf, in front of the descriptor call to
  * jitFormat, which stays behind it as the slow path -- the same layout as the
  * dict leaves (see emitDictLeafGet):
@@ -296,16 +307,49 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
     fpSyncAll(e);
     settleAll(e);
 
-    for (unsigned i = 0; i < parts; i++) {
-        unsigned reg = valueXReg(e, vfirst + i);
-        unsigned at = argsAt + i * (unsigned)sizeof(Value);
-        emitTagFor(e, e->stack[first + i], reg, JIT_SCRATCH_B, JIT_SCRATCH_A);
-        emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
-        emit(e, jaiA64StrX(reg, 31, at + 8));
+    /* One int hole between at most one object on either side -- `f"k{i}"`
+     * and its kin -- goes to jaiValueFormatIntLeaf in three registers; the
+     * leaf checks that the objects are strings. Everything else writes its
+     * parts out for the general leaf. */
+    int hole = -1;
+    bool oneIntHole = parts <= 3 && jitFormatIntLeaf();
+    for (unsigned i = 0; i < parts && oneIntHole; i++) {
+        SlotKind k = e->stack[first + i];
+        if (k == SLOT_INT) {
+            if (hole >= 0) oneIntHole = false;
+            hole = (int)i;
+        } else if (k != SLOT_OBJ) {
+            oneIntHole = false;
+        }
     }
-    emit(e, jaiA64AddXImm(0, 31, argsAt));
-    emit(e, jaiA64MovzX(1, parts, 0));
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jaiValueFormatLeaf);
+    if (oneIntHole && hole >= 0 && (parts - (unsigned)hole) <= 2u &&
+        hole <= 1) {
+        unsigned rPre = hole == 1 ? valueXReg(e, vfirst) : 31u;
+        unsigned rN = valueXReg(e, vfirst + (unsigned)hole);
+        unsigned rPost = (unsigned)hole + 1 < parts
+                             ? valueXReg(e, vfirst + (unsigned)hole + 1)
+                             : 31u;
+        /* `mov x, xzr` is the NULL for an absent run; register 31 here is
+         * the zero register, which jaiA64MovX encodes as `orr x, xzr, xzr`. */
+        emit(e, jaiA64MovX(0, rPre));
+        emit(e, jaiA64MovX(1, rN));
+        emit(e, jaiA64MovX(2, rPost));
+        emitConst64(e, JIT_SCRATCH_A,
+                    (int64_t)(uintptr_t)&jaiValueFormatIntLeaf);
+    } else {
+        for (unsigned i = 0; i < parts; i++) {
+            unsigned reg = valueXReg(e, vfirst + i);
+            unsigned at = argsAt + i * (unsigned)sizeof(Value);
+            emitTagFor(e, e->stack[first + i], reg, JIT_SCRATCH_B,
+                       JIT_SCRATCH_A);
+            emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
+            emit(e, jaiA64StrX(reg, 31, at + 8));
+        }
+        emit(e, jaiA64AddXImm(0, 31, argsAt));
+        emit(e, jaiA64MovzX(1, parts, 0));
+        emitConst64(e, JIT_SCRATCH_A,
+                    (int64_t)(uintptr_t)&jaiValueFormatLeaf);
+    }
     noteScratchClobber(e);
     emit(e, jaiA64Blr(JIT_SCRATCH_A));
     emit(e, jaiA64SubsXImm(31, 0, 0));
