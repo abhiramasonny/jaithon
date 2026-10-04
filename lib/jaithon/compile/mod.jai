@@ -114,13 +114,21 @@ fn _skip_optimize(proto: FuncProto, level: int) -> void { }
 #: Deliberately separate from `opt_level`, which ALSO decides the checker's
 #: `fold_constants` below. Folding is semantics and stays on; only the
 #: bytecode rewriting goes away.
+#:
+#: `want_image` is false only for `check`, whose driver used to load the
+#: `.jaic` it was handed and then drop it. Serialising the module and loading
+#: it back was 3% of a `check`, and `optimise_body` cannot stand in for it:
+#: a module that `check` itself must import is compiled with the optimiser off
+#: and does need its image. The diagnostics are the same either way, because
+#: they are all reported before the image is written.
 pub fn compile_source(
     text: str,
     path: str,
     release: bool = false,
     file_id: int = 0,
     opt_level: int = 2,
-    optimise_body: bool = true
+    optimise_body: bool = true,
+    want_image: bool = true
 ) -> Compiled {
     let bag = DiagnosticBag()
     let result = Compiled(path, source_hash(text), bag)
@@ -148,7 +156,7 @@ pub fn compile_source(
         checked.enum_decls()
     )
     result.body = body
-    if not result.ok() { return result }
+    if not result.ok() or not want_image { return result }
 
     let mod = Module(path, result.hash, body, flags_for(release, opt_level))
     for name in _exported_names(body) { mod.exports.push(name) }
