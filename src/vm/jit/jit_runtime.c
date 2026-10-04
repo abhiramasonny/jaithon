@@ -21,10 +21,27 @@
  * registers are invisible to a collection inside the callee -- the tier refuses allocate-then-self-call for exactly this reason. */
 JitCallDesc *gJitFrames;
 
+/* A list iterator a compiled loop finished with, kept for the next
+ * OP_GET_ITER (see jitMakeIter and the exhausted arm of emitForIterBind).
+ * Rooted here, so a collection never frees it under the pointer. */
+ObjIter *gJitIterSpare;
+
 void jaiJitMarkFrames(void) {
     for (JitCallDesc *f = gJitFrames; f != NULL; f = f->link) {
         for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);
     }
+    if (gJitIterSpare != NULL) jaiGCMarkValue(OBJ_VAL((Obj *)gJitIterSpare));
+}
+
+/* JAITHON_JIT_ITER_RECYCLE: a compiled for-in over a list hands its iterator
+ * back on exhaustion and the next one reuses it. */
+bool jitIterRecycle(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_RECYCLE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
 }
 
 /* Roots go in as a RANGE (jaiGCPushRootRange/Pop), not copied one at a time -- copying individually
@@ -269,7 +286,20 @@ int jitMakeIter(JitCallDesc *d) {
                        jaiTypeNameStatic(src));
         return 1;
     }
-    ObjIter *it = jaiIterNew(k, src);
+    ObjIter *it = NULL;
+    if (k == ITER_LIST && gJitIterSpare != NULL) {
+        /* jaiIterNew's ITER_LIST arm, on an object nothing else holds. */
+        ObjList *list = AS_LIST(src);
+        it = gJitIterSpare;
+        gJitIterSpare = NULL;
+        it->kind    = ITER_LIST;
+        it->source  = src;
+        it->index   = 0;
+        it->limit   = list->count;
+        it->version = list->version;
+    } else {
+        it = jaiIterNew(k, src);
+    }
     d->result = OBJ_VAL(it);
     jaiGCPopRootRange();
     return 0;

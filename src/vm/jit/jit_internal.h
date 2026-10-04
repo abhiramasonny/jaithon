@@ -1023,6 +1023,8 @@ void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount);
 int hoistFor(const Emit *e, int slot);
 bool jitIndexReg(void);
+bool jitIterRecycle(void);
+extern ObjIter *gJitIterSpare;
 void noteSlotStored(Emit *e, int slot);
 unsigned jitCarryLimit(void);
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
