@@ -114,6 +114,43 @@ static bool pushCopyOfEntry(Emit *e, unsigned idx) {
     return true;
 }
 
+/* JAITHON_JIT_DUP=0 leaves OP_DUP and OP_DUP2 unarmed, for a one-binary A/B. */
+static bool jitDupOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DUP");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* OP_DUP's and OP_DUP2's copy of an entry: the same kind and the same facts
+ * about it, in the next register. The facts travel because they are facts
+ * about the VALUE, which both entries hold -- the predicted object type, the
+ * ASCII-table string, the element exemplar, the pinned constant -- and the
+ * local it was read from goes too, since the copy is that local's value as
+ * much as the original is. The caller has settled every deferred entry and
+ * synced the FP bank, so the value is in its own X register. */
+static bool pushDupOfEntry(Emit *e, unsigned idx) {
+    if (idx >= e->depth || !holdsRegister(e->stack[idx])) return false;
+    unsigned src = valueXReg(e, valueIndexOf(e, idx));
+    if (!pushValue3(e, e->stack[idx], e->stackShape[idx], e->stackClass[idx],
+                    e->stackSeen[idx], e->stackLocal[idx])) {
+        return false;
+    }
+    unsigned top = e->depth - 1;
+    e->stackObjType[top]  = e->stackObjType[idx];
+    e->stackElem[top]     = e->stackElem[idx];
+    e->stackElemDecl[top] = e->stackElemDecl[idx];
+    e->stackAscii[top]    = e->stackAscii[idx];
+    e->stackUnit[top]     = e->stackUnit[idx];
+    e->stackPinned[top]   = e->stackPinned[idx];
+    e->stackNullLit[top]  = e->stackNullLit[idx];
+    unsigned dst = pushReg(e) - 1;
+    if (dst != src) emit(e, jaiA64MovX(dst, src));
+    return true;
+}
+
 /* Answered against the inlined body's own frame -- the CALLER's operand stack: a parameter is the
  * argument entry already sitting there, a bind pins whatever's on top. Reading these through the main switch would read the CALLER's local of the same number, a different variable entirely. */
 static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
@@ -911,6 +948,33 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             JitArmResult r = emitEnumTag(e, &off);
             if (r == JIT_ARM_REFUSED) return false;
             if (r == JIT_ARM_UNARMED) goto unarmedOpcode;
+            break;
+        }
+
+        /* `xs[i] += v` and `d[k] += v` are DUP2, GET_INDEX, <v>, ADD,
+         * SET_INDEX: the container and the subscript are read once and used
+         * twice. Unarmed, every augmented subscript assignment stopped the
+         * walk, and the loop around it -- every histogram and every
+         * `counts[w] += 1` -- ran interpreted from there on. A copy is a
+         * register move per entry; an entry with no register (a class, a
+         * function) is left to the unarmed path, before anything is
+         * emitted. */
+        case OP_DUP:
+        case OP_DUP2: {
+            unsigned n = op == OP_DUP ? 1u : 2u;
+            if (!jitDupOn() || e->depth < n) goto unarmedOpcode;
+            unsigned first = e->depth - n;
+            bool regs = true;
+            for (unsigned i = 0; i < n; i++) {
+                if (!holdsRegister(e->stack[first + i])) regs = false;
+            }
+            if (!regs) goto unarmedOpcode;
+            fpSyncAll(e);
+            settleAll(e);
+            for (unsigned i = 0; i < n; i++) {
+                if (!pushDupOfEntry(e, first + i)) return false;
+            }
+            off += 1;
             break;
         }
 

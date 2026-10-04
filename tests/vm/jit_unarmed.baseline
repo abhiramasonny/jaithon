@@ -37,8 +37,6 @@
 # the hot loops that most want compiling.
 OP_NOP
 OP_POPN
-OP_DUP
-OP_DUP2
 OP_SWAP
 OP_ROT3
 OP_SET_UPVALUE
