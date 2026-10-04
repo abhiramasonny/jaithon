@@ -285,13 +285,17 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
     if (posixSpawnOn() && cwd == NULL && envp == NULL) {
         int rc = posixSpawnChild(argv, inPipe, outPipe, errPipe, &child);
         if (rc != 0) {
-            /* What the forked child would have reported through `report`:
-             * the exec (or a descriptor action) failed, and there is no child
-             * left to reap. */
+            /* No child is left to reap. Running out of processes, memory or
+             * descriptors is what fork() failing in the parent reported
+             * (SETUP); anything else is what the forked child would have
+             * reported through `report`: the exec itself failed. */
+            if (outErrno != NULL) *outErrno = rc;
+            if (rc == EAGAIN || rc == ENOMEM || rc == EMFILE ||
+                rc == ENFILE || rc == EBADF)
+                goto setupFailed;
             closeFd(&inPipe[0]);  closeFd(&inPipe[1]);
             closeFd(&outPipe[0]); closeFd(&outPipe[1]);
             closeFd(&errPipe[0]); closeFd(&errPipe[1]);
-            if (outErrno != NULL) *outErrno = rc;
             return JAI_SPAWN_EXEC;
         }
         closeFd(&inPipe[0]);
