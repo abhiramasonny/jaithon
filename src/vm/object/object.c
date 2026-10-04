@@ -90,14 +90,32 @@ static inline Obj *allocObj(size_t size, ObjType type) {
      * that stopped being true. */
     if (JAI_UNLIKELY(jaiGCWanted())) jaiGCMaybeCollect();
 
-    /* jaiSmallNew is the bins-and-slab half of jaiRealloc with the size class
-     * already known, so this is the same block from the same place minus the
-     * call and five branches sorting resize/free/unserved classes. Measured
-     * 10% of alloc_churn for two calls per object. */
-    Obj *obj = (Obj *)(JAI_LIKELY(jaiSmallServes(size)) ? jaiSmallNew(size)
-                                                        : jaiRealloc(NULL, 0, size));
+    Obj *obj;
+    if (JAI_LIKELY(jaiSmallServes(size))) {
+        /* A kind that owns nothing but its block goes to the page space, where
+         * the collector frees it without visiting it and nothing links it into
+         * GCState.objects (gc.h). */
+        unsigned cls = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
+        const uint8_t kind = jaiPageKind[type];
+        if (JAI_LIKELY(kind != 0) &&
+            JAI_LIKELY((obj = (Obj *)jaiPageNewAt(
+                            kind == JAI_PAGE_FIN ? &jaiPageCursorFin[cls]
+                                                 : &jaiPageCursor[cls])) != NULL)) {
+            obj->type = type;
+            obj->isMarked = jaiGCEpoch;
+            obj->subFlag = false;
+            obj->subFlag2 = false;
+            return obj;   /* counted in vm.allocCount by the refill */
+        }
+        /* jaiSmallNew is the bins-and-slab half of jaiRealloc with the size
+         * class already known, so this is the same block from the same place
+         * minus the call and five branches sorting resize/free/unserved
+         * classes. Measured 10% of alloc_churn for two calls per object. */
+        obj = (Obj *)jaiSmallNew(size);
+    } else {
+        obj = (Obj *)jaiRealloc(NULL, 0, size);
+    }
     obj->type = type;
-    obj->isMarked = false;
     obj->next = NULL;
     jaiGCTrackObject(obj);
     vm.allocCount++;
@@ -119,6 +137,35 @@ Obj *jaiAllocateObject(size_t size, ObjType type) {
      * mention a field leaves it NULL or 0 rather than garbage. */
     memset((char *)obj + sizeof(Obj), 0, size - sizeof(Obj));
     return obj;
+}
+
+/* What a finalizing page's sweep calls on a dead object: frees what it owns,
+ * and not the block, which belongs to the page. Exactly the kinds
+ * jaiPageSpaceInit marks JAI_PAGE_FIN, freed exactly as jaiFreeObject frees
+ * them. */
+void jaiObjFinalize(Obj *obj) {
+    switch (obj->type) {
+    case OBJ_LIST: {
+        ObjList *l = (ObjList *)obj;
+        JAI_FREE_ARRAY(char, l->items,
+                       (size_t)l->capacity * jaiListStoreWidth(l->stg));
+        return;
+    }
+    case OBJ_DICT:
+        jaiTableFree(&((ObjDict *)obj)->table);
+        return;
+    case OBJ_SET:
+        jaiTableFree(&((ObjSet *)obj)->table);
+        return;
+    case OBJ_CLOSURE: {
+        ObjClosure *c = (ObjClosure *)obj;
+        JAI_FREE_ARRAY(ObjUpvalue *, c->upvalues, c->upvalueCount);
+        return;
+    }
+    default:
+        JAI_PANIC("jaiObjFinalize: a %s in a finalizing page",
+                  jaiObjTypeName(obj->type));
+    }
 }
 
 void jaiFreeObject(Obj *obj) {

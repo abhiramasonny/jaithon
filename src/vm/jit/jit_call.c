@@ -7,6 +7,7 @@
 /* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
 /* For jaiOpBranchOperandAt: says which opcodes carry a branch target. */
 #include "vm/vm.h"
+#include "vm/gc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +65,26 @@ static bool simpleInitFields(ObjClass *cls, unsigned argc, uint16_t *slots) {
         off += 6;
     }
     return off < n && c[off] == OP_RETURN_NULL;
+}
+
+/* JAITHON_JIT_INLINE_ALLOC=0 puts the call to jitInstanceAlloc back in place
+ * of the inline page-space pop. */
+static bool jitInlineAllocOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_INLINE_ALLOC");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool jitBareAllocOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_BARE_ALLOC");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
 }
 
 bool isClassCallee(const Emit *e, unsigned argc) {
@@ -529,11 +550,76 @@ bool emitCallOut(Emit *e, unsigned argc) {
             sizeof(ObjInstance) + sizeof(Value) * (size_t)cls->fieldCount;
         unsigned skipSlow = 0;
         bool haveFast = jaiSmallServes(instBytes);
+        /* Whole-Value field stores, and -- when the arguments cover every
+         * field -- an allocation that does not zero what they are about to
+         * overwrite. JAITHON_JIT_BARE_ALLOC=0 puts both back. */
+        const bool whole = jitBareAllocOn();
+        bool bare = whole && haveFast && argc == cls->fieldCount && argc <= 64u;
+        if (bare) {
+            uint64_t seen = 0;
+            for (unsigned i = 0; i < argc; i++) {
+                if (fslots[i] >= 64u || (seen & ((uint64_t)1 << fslots[i]))) {
+                    bare = false;
+                    break;
+                }
+                seen |= (uint64_t)1 << fslots[i];
+            }
+        }
+        /* The page-space pop itself, inline (gc.h jaiPageNew): load the
+         * class's free mask, take its lowest bit, and build the header from
+         * the cursor's epoch word -- no call, no frame, no GC test, which the
+         * refill that handed this word out already made. An empty mask falls
+         * through to the call below, which refills, and past it to the
+         * descriptor, which may collect. Both land in SCRATCH_C. */
+        const unsigned grains = 2u + (unsigned)cls->fieldCount;
+        const bool inl = haveFast && jitInlineAllocOn() &&
+                         jaiPageKind[OBJ_INSTANCE] != 0 &&
+                         grains <= JAI_SMALL_CLASSES && cls->fieldCount <= 0xffffu &&
+                         jaiA64PairOffFits((int32_t)(16u * grains) - 16);
+        unsigned skipInline = 0;
+        if (haveFast) {
+            /* Before any of x0..x8 is written: it is what proves they hold
+             * nothing here (a body with values in scratch fails right here). */
+            noteScratchClobber(e);
+        }
+        if (inl) {
+            JaiPageCursor *pc = &jaiPageCursor[grains];
+            emitConst64(e, 1, (int64_t)(uintptr_t)pc);
+            emit(e, jaiA64LdrX(2, 1, (unsigned)offsetof(JaiPageCursor, freeMask)));
+            emit(e, jaiA64SubsXImm(31, 2, 0));
+            unsigned miss = e->count;
+            emit(e, jaiA64BCond(JAI_A64_EQ, 0));   /* patched below */
+            emit(e, jaiA64SubXImm(3, 2, 1));
+            emit(e, jaiA64AndX(3, 3, 2));
+            emit(e, jaiA64StrX(3, 1, (unsigned)offsetof(JaiPageCursor, freeMask)));
+            emit(e, jaiA64LdrX(4, 1, (unsigned)offsetof(JaiPageCursor, wordBase)));
+            emit(e, jaiA64RbitX(2, 2));
+            emit(e, jaiA64ClzX(2, 2));
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, 4, 2, 4));
+            emit(e, jaiA64LdrX(5, 1, (unsigned)offsetof(JaiPageCursor, epochHi)));
+            emit(e, jaiA64MovzX(6, OBJ_INSTANCE, 0));
+            emit(e, jaiA64OrrX(5, 5, 6));
+            /* Header word, then `next` as zero; klass and fieldCount. Every
+             * byte of all four words is written (see jitInstanceAlloc). */
+            emit(e, jaiA64StpOff(5, 31, JIT_SCRATCH_C, 0));
+            emitConst64(e, 7, (int64_t)(uintptr_t)cls);
+            emit(e, jaiA64MovzX(8, cls->fieldCount, 0));
+            emit(e, jaiA64StpOff(7, 8, JIT_SCRATCH_C, 16));
+            if (!bare) {
+                for (unsigned f = 0; f < cls->fieldCount; f++)
+                    emit(e, jaiA64StpOff(31, 31, JIT_SCRATCH_C,
+                                         (int32_t)(32u + 16u * f)));
+            }
+            skipInline = e->count;
+            emit(e, jaiA64B(0));                   /* patched below */
+            if (miss < e->count && e->count <= JIT_MAX_INSTS)
+                e->code[miss] = jaiA64BCond(JAI_A64_EQ, (int32_t)(e->count - miss));
+        }
         if (haveFast) {
             emitConst64(e, 0, (int64_t)(uintptr_t)cls);
             emitConst64(e, JIT_SCRATCH_A,
-                        (int64_t)(uintptr_t)&jitInstanceAlloc);
-            noteScratchClobber(e);
+                        bare ? (int64_t)(uintptr_t)&jitInstanceAllocBare
+                             : (int64_t)(uintptr_t)&jitInstanceAlloc);
             emit(e, jaiA64Blr(JIT_SCRATCH_A));
             emit(e, jaiA64MovX(JIT_SCRATCH_C, 0));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
@@ -554,6 +640,8 @@ bool emitCallOut(Emit *e, unsigned argc) {
             e->code[skipSlow] =
                 jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
         }
+        if (inl && skipInline < e->count && e->count <= JIT_MAX_INSTS)
+            e->code[skipInline] = jaiA64B((int32_t)(e->count - skipInline));
         for (unsigned i = 0; i < argc; i++) {
             unsigned r;
             if (!popValue(e, &r, NULL)) return false;
@@ -570,8 +658,17 @@ bool emitCallOut(Emit *e, unsigned argc) {
             /* SCRATCH_C holds the instance, so the dynamic tag needs two
              * other scratches. */
             emitTagFor(e, kinds[i], regs[i], JIT_SCRATCH_A, JIT_SCRATCH_B);
-            emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, at));
-            emit(e, jaiA64StrX(regs[i], JIT_SCRATCH_C, at + 8));
+            if (whole && jaiA64PairOffFits((int32_t)at)) {
+                /* emitTagFor builds the tag with movz, so its high half is
+                 * zero: one pair store writes the whole Value, padding too.
+                 * Only to slot 29: a pair's offset tops out at 504, and a
+                 * wider class (never `bare`: it is too big for the fast
+                 * path, so the descriptor zeroed it) takes the two stores. */
+                emit(e, jaiA64StpOff(JIT_SCRATCH_A, regs[i], JIT_SCRATCH_C, (int32_t)at));
+            } else {
+                emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, at));
+                emit(e, jaiA64StrX(regs[i], JIT_SCRATCH_C, at + 8));
+            }
         }
         emit(e, jaiA64MovX(rinst, JIT_SCRATCH_C));
         e->wroteHeap = true;

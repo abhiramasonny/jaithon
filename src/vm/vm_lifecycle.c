@@ -384,7 +384,8 @@ void jaiVMPrintStats(FILE *out) {
     }
     fprintf(out, "vm: %" PRIu64 " instructions, %" PRIu64 " calls, %" PRIu64
                  " allocations\n",
-            vm.instructionCount, vm.callCount, vm.allocCount);
+            vm.instructionCount, vm.callCount,
+            vm.allocCount - jaiPageUnpopped());
     fprintf(out, "inline caches: %" PRIu64 " hits, %" PRIu64 " misses (%.1f%%)\n",
             vm.icHits, vm.icMisses, hitRate);
     uint64_t picTries = vm.jitPicAdmits + vm.jitPicRefusals;

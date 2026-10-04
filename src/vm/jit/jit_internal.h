@@ -926,6 +926,7 @@ bool jitListShapeable(Value v);
 ObjInstance *jitInstanceAlloc(ObjClass *cls);
 ObjIter *jitIterAlloc(Obj *source);
 bool jitIterAllocOn(void);
+ObjInstance *jitInstanceAllocBare(ObjClass *cls);
 int jitNewInstance(JitCallDesc *d);
 int jitGetSlice(JitCallDesc *d);
 int jitGetIndexDict(JitCallDesc *d);

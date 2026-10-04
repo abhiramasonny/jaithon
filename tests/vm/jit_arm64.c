@@ -237,6 +237,16 @@ int main(void) {
       check("stp offset wrote", scratch[2], 3);
       check("stp offset wrote 2", scratch[3], 4); }
 
+    /* The range a pair offset can name, and what lies past it: 512 encodes as
+     * -512, which is why a field at instance+512 must not be a pair store. */
+    check("pair offset 504 fits", jaiA64PairOffFits(504), 1);
+    check("pair offset 512 does not", jaiA64PairOffFits(512), 0);
+    check("pair offset -512 fits", jaiA64PairOffFits(-512), 1);
+    check("pair offset 12 does not", jaiA64PairOffFits(12), 0);
+    check("stp offset wraps at 512",
+          (int64_t)jaiA64StpOff(1, 2, 0, 512),
+          (int64_t)jaiA64StpOff(1, 2, 0, -512));
+
     /* The uxtw extended-register forms, which is how one `ldp` can stand in for
      * an `ldr x items` plus an `ldr w count`: the pair's second half arrives as
      * `count | capacity << 32` and every use has to see only the low half.
@@ -644,6 +654,14 @@ int main(void) {
     { const uint32_t w[] = { jaiA64MovzX(1, 0xf0, 0), jaiA64MovzX(2, 0x3c, 0),
                              jaiA64AndX(0, 1, 2), jaiA64Ret() };
       check("and", runWith(w, 4, cell), 0xf0 & 0x3c); }
+    { /* rbit then clz counts trailing zeros: 0x28 has three */
+      const uint32_t w[] = { jaiA64MovzX(1, 0x28, 0), jaiA64RbitX(1, 1),
+                             jaiA64ClzX(0, 1), jaiA64Ret() };
+      check("rbit+clz", runWith(w, 4, cell), 3); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 0, 0), jaiA64ClzX(0, 1), jaiA64Ret() };
+      check("clz of zero", runWith(w, 3, cell), 64); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 1, 3), jaiA64ClzX(0, 1), jaiA64Ret() };
+      check("clz of bit 48", runWith(w, 3, cell), 15); }
     { /* the cell holds 0x0123456789abcdef; byte 0 is little-endian lowest */
       const uint32_t w[] = { jaiA64LdrByte(0, 0, 0), jaiA64Ret() };
       check("ldrb", runWith(w, 2, cell), cell[0] & 0xffu); }

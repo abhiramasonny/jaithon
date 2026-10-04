@@ -72,6 +72,7 @@ void jaiPopRoots(int n)     { jaiGCPopRoots(n); }
  * body; the rest of every outer iteration then runs interpreted. */
 #include <stdlib.h>
 typedef struct { const char *fn; uint32_t top; uint32_t resume; uint64_t n; int outcome; } OsrTallyRow;
+
 static OsrTallyRow jaiOsrRows[64];
 static unsigned jaiOsrRowCount;
 static void jaiOsrTallyReport(void) {
@@ -98,6 +99,26 @@ static void jaiOsrTally(const char *fn, uint32_t top, int outcome, uint32_t resu
     }
 }
 #endif
+
+/* True when `receiver` is an enum value and some variant of its enum has a
+ * payload field called `name`. getPropertyInto finds such a field before any
+ * method, so a builtin-method way cached under the enum's key would be wrong
+ * for a value of that variant. */
+static bool enumPayloadNamed(Value receiver, ObjString *name) {
+    if (!IS_ENUM_VAL(receiver)) return false;
+    const ObjEnum *type = AS_ENUM_VAL(receiver)->type;
+    if (type == NULL || type->variants == NULL) return true;
+    for (uint16_t v = 0; v < type->variantCount; v++) {
+        const EnumVariant *var = &type->variants[v];
+        if (var->fieldNames == NULL) continue;
+        for (uint8_t i = 0; i < var->arity; i++) {
+            if (var->fieldNames[i] == name ||
+                jaiStringEquals(var->fieldNames[i], name))
+                return true;
+        }
+    }
+    return false;
+}
 
 static bool safepoint(void) {
     if (JAI_UNLIKELY(jaiInterrupted == 2)) {
@@ -2012,7 +2033,8 @@ static JaiRunResult runLoop(int baseFrameCount) {
                 }
             }
         } else if (builtinTag != 0 && IS_BOUND(method) &&
-                   IS_NATIVE(AS_BOUND(method)->method)) {
+                   IS_NATIVE(AS_BOUND(method)->method) &&
+                   !enumPayloadNamed(receiver, name)) {
             /* jaiBuiltinMethod hands back a bound native whose receiver is the
              * one we passed; cache the native and drop the wrapper. Anything
              * shaped differently (a module member, a __format__ on a value the

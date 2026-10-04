@@ -113,6 +113,7 @@ cat at 171 stopped: OP_GET_GLOBAL: `ValueError` is not a compiled global functio
 cat at 700 stopped: more live values than there are callee-saved registers
 chunk._build_branch_at at 186 stopped: OP_GET_GLOBAL: `opcode` is not a compiled global function
 column.combine.concat_columns at 60 stopped: OP_GET_GLOBAL: `TypeError` is not a compiled global function
+column.combine.concat_columns at 60 stopped: OP_INVOKE: `.name()` on an enum value, whose builtins its own methods and fields can shado
 column.combine.concat_columns at 60 stopped: a list loop already past its last element
 column.combine.stack_lanes at 170 stopped: a list loop already past its last element
 column.combine.stack_lanes at 170 stopped: a local of no known kind
@@ -481,10 +482,15 @@ stopped : OP_GET_INDEX: the live list is empty, so there is no exemplar
 stopped : OP_GET_ITER: iterating a int, not a list or a range
 stopped : OP_GET_ITER: iterating a object, not a list or a range
 stopped : OP_INVOKE
+stopped : OP_INVOKE: `.counts_rows()` on an enum value, whose builtins its own methods and fields ca
 stopped : OP_INVOKE: `.fill_zero()` on an object with no sample and no known type
 stopped : OP_INVOKE: `.get()` on a predicted dict with no sample to probe
 stopped : OP_INVOKE: `.get()` on an object with no sample and no known type
+stopped : OP_INVOKE: `.is_dictionary()` on an enum value, whose builtins its own methods and fields 
+stopped : OP_INVOKE: `.is_numeric()` on an enum value, whose builtins its own methods and fields can
+stopped : OP_INVOKE: `.is_wide()` on an enum value, whose builtins its own methods and fields can sh
 stopped : OP_INVOKE: `.len()` on an object with no sample and no known type
+stopped : OP_INVOKE: `.name()` on an enum value, whose builtins its own methods and fields can shado
 stopped : OP_INVOKE: `.upload()` on an object with no sample and no known type
 stopped : OP_INVOKE: `Agg.counts_rows` is not a builtin of the observed receiver's type
 stopped : OP_INVOKE: `Dtype.is_dictionary` is not a builtin of the observed receiver's type

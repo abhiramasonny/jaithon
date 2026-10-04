@@ -422,6 +422,14 @@ uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm) {
     return 0x8a000000u | (rm << 16) | (rn << 5) | rd;
 }
 
+uint32_t jaiA64RbitX(unsigned rd, unsigned rn) {
+    return 0xdac00000u | (rn << 5) | rd;
+}
+
+uint32_t jaiA64ClzX(unsigned rd, unsigned rn) {
+    return 0xdac01000u | (rn << 5) | rd;
+}
+
 uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm) {
     return 0xaa000000u | (rm << 16) | (rn << 5) | rd;
 }
