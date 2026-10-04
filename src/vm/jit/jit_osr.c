@@ -417,6 +417,16 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             if (jitSplitStress()) e.scratchValues = false;
             unsigned wantSplit = probe.clobberDepth;
             if (jitSplitStress() && wantSplit == 0) wantSplit = 1;
+            /* Every call sits at depth zero: no value is ever live across one,
+             * so all of them could go in x0..x8 -- but a split at zero is
+             * "no split", which sends them ALL to the callee-saved bank. One
+             * entry there is the nearest the encoding can say. Reached far
+             * more often once an append stops counting as a call, since a
+             * loop's remaining call is then often a `[]` built at depth zero
+             * (matrix_mul's outer loop lost two local homes to this). */
+            if (jitGrowKeeps() && wantSplit == 0 && probe.clobbersScratch) {
+                wantSplit = 1;
+            }
             if (!e.scratchValues && !probe.inlined &&
                 (probe.clobbersScratch || jitSplitStress()) &&
                 probe.maxValue > wantSplit &&
@@ -457,8 +467,27 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             for (unsigned i = 0; i < probe.clobberCount; i++) {
                 e.clobberOff[i] = probe.clobberOff[i];
             }
+            e.pushCount = probe.pushCount;
+            e.pushSpill = probe.pushSpill;
+            for (unsigned i = 0; i < probe.pushCount; i++) {
+                e.pushOff[i]  = probe.pushOff[i];
+                e.pushSlot[i] = probe.pushSlot[i];
+            }
+            e.stampCount = probe.stampCount;
+            e.stampSpill = probe.stampSpill;
+            for (unsigned i = 0; i < probe.stampCount; i++) {
+                e.stampOff[i] = probe.stampOff[i];
+            }
 
-            bool bodyCallsOut = regionCalls(&e, top, end);
+            /* A storage pin is proved once, at entry, so the region must hold
+             * nothing that could change a list's `stg` after it: a call out
+             * (anything may box a list), or an OP_ELEM_KIND stamping an empty
+             * one. An append is neither -- a compiled append stores at the
+             * storage it finds or deoptimises, and jitListGrow reserves at
+             * the width the list already has -- which is why a keeping grow
+             * stub no longer costs a loop its pins. */
+            bool bodyCallsOut = regionCalls(&e, top, end) ||
+                                (jitGrowKeeps() && regionStamps(&e, top, end));
             for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
                 e.localStgPin[i] =
                     !bodyCallsOut &&

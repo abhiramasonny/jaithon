@@ -271,6 +271,36 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
     return true;
 }
 
+/* The appends in [lt, le) that a header of `slot` hoisted over that loop
+ * would have to be proved distinct from, or false when no proof is possible:
+ * an append to `slot` itself, to a list with no local behind it, or to a
+ * local the loop reassigns (its value at the hoist is not the one appended
+ * to). A comprehension's accumulator needs no proof -- no local can hold it
+ * while its loop runs. Duplicate targets are listed once. */
+static bool hoistAliasSet(const Emit *e, unsigned slot, uint32_t lt,
+                          uint32_t le, uint8_t *out, uint8_t *nOut) {
+    unsigned n = 0;
+    if (e->pushSpill) return false;
+    for (unsigned i = 0; i < e->pushCount; i++) {
+        if (e->pushOff[i] < lt || e->pushOff[i] >= le) continue;
+        int p = e->pushSlot[i];
+        if (p == JIT_PUSH_FRESH) continue;
+        if (p < 0 || p > (int)JIT_MAX_SLOTS) return false;
+        if ((unsigned)p == slot) return false;
+        if (e->slotWriteHi[p] >= lt && e->slotWriteLo[p] < le) return false;
+        if (e->localKind[p] != SLOT_LIST) return false;
+        bool seen = false;
+        for (unsigned k = 0; k < n; k++) {
+            if (out[k] == (uint8_t)p) { seen = true; break; }
+        }
+        if (seen) continue;
+        if (n >= JIT_MAX_HOIST_ALIAS) return false;
+        out[n++] = (uint8_t)p;
+    }
+    *nOut = (uint8_t)n;
+    return true;
+}
+
 /* Loop-invariant list headers, hoisted above the loop head.
  *
  * Every `xs[i]` reloads `items` and `count` off the ObjList, and in a stencil
@@ -280,8 +310,9 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
  * the guard back -- unless the stretch of code the load is hoisted over can be
  * shown to contain nothing that could move a list at all. Every way a list is
  * resized (push, insert, remove, clear, slice, anything through a descriptor)
- * is a call out, and so is every collection; an in-place `xs[i] = v` moves
- * neither `items` nor `count`. So across a call-free stretch a header is
+ * is a call out, and so is every collection -- all but an inlined append whose
+ * grow stub keeps the registers (jitGrowKeeps), which hoistAliasSet answers
+ * for instead; an in-place `xs[i] = v` moves neither `items` nor `count`. So across a call-free stretch a header is
  * invariant for as long as the LOCAL is, and that is a fact the measuring pass
  * already recorded (noteSlotWrite).
  *
@@ -317,7 +348,10 @@ void planHoists(Emit *e, ObjFunction *fn) {
     if (e->measuring || !e->osr) return;
     const Chunk *c = &fn->chunk;
 
-    struct { uint32_t top, end, use; uint8_t slot; } cand[JIT_MAX_SLOTS + 1];
+    struct {
+        uint32_t top, end, use; uint8_t slot;
+        uint8_t aliasCount; uint8_t alias[JIT_MAX_HOIST_ALIAS];
+    } cand[JIT_MAX_SLOTS + 1];
     unsigned ncand = 0;
 
     for (unsigned s = 0; s < e->locals && s <= JIT_MAX_SLOTS; s++) {
@@ -325,6 +359,9 @@ void planHoists(Emit *e, ObjFunction *fn) {
         if (e->slotXReg[s] == 0) continue;   /* no register to load from */
         if (e->slotIndexUse[s] == 0) continue;
         uint32_t bestTop = 0, bestEnd = 0;
+        uint8_t bestAlias[JIT_MAX_HOIST_ALIAS];
+        uint8_t bestAliasCount = 0;
+        bool bestCovers = false;
         for (int at = (int)e->osrTop; at < (int)e->osrEnd;) {
             int len = instructionLength(c, at);
             if (len <= 0) break;
@@ -339,9 +376,33 @@ void planHoists(Emit *e, ObjFunction *fn) {
             /* ...and nothing in the loop that could resize the list or take
              * back the registers the header is being put in. */
             if (regionCalls(e, lt, le)) continue;
+            /* ...and no append that could be to this same list. An append is
+             * the one resize that is not a call (see jitGrowKeeps), so it is
+             * asked about separately: never to this slot, and to any other
+             * list only if the hoist can prove at run time it is another. */
+            uint8_t alias[JIT_MAX_HOIST_ALIAS];
+            uint8_t aliasCount = 0;
+            if (!hoistAliasSet(e, s, lt, le, alias, &aliasCount)) continue;
             if (!onlyBackEdgesEnter(c, lt, le)) continue;
-            if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
+            /* Outermost is not the whole preference. emitHoistsAt proves a
+             * slot's bounds at the head of the loop it hoists out of, and only
+             * when that head's counter is the variable the subscripts are
+             * shaped on -- so hoisting `b` out of matrix_mul's `j` loop
+             * rather than its `k` loop saves one header load per `j` and
+             * puts a compare and branch back on every `b[k]`. A loop whose
+             * head can prove the bounds outranks any that cannot. */
+            bool covers = jitGrowKeeps() &&
+                          lt + 9u <= (uint32_t)c->count &&
+                          c->code[lt] == OP_FOR_RANGE_BIND &&
+                          e->spanSeen[s] && e->spanOk[s] &&
+                          e->spanLo[s] <= e->spanHi[s] &&
+                          e->spanBase[s] == jaiReadU16(c->code + lt + 3);
+            if (bestEnd == 0 || (covers && !bestCovers) ||
+                (covers == bestCovers && le - lt > bestEnd - bestTop)) {
                 bestTop = lt; bestEnd = le;
+                bestCovers = covers;
+                bestAliasCount = aliasCount;
+                memcpy(bestAlias, alias, sizeof alias);
             }
         }
         if (bestEnd == 0) continue;
@@ -349,6 +410,8 @@ void planHoists(Emit *e, ObjFunction *fn) {
         cand[ncand].end  = bestEnd;
         cand[ncand].use  = e->slotIndexUse[s];
         cand[ncand].slot = (uint8_t)s;
+        cand[ncand].aliasCount = bestAliasCount;
+        memcpy(cand[ncand].alias, bestAlias, sizeof bestAlias);
         ncand++;
     }
 
@@ -370,6 +433,9 @@ void planHoists(Emit *e, ObjFunction *fn) {
         e->hoist[e->hoistCount].itemsReg = (uint8_t)rI;
         e->hoist[e->hoistCount].countReg = (uint8_t)rC;
         e->hoist[e->hoistCount].rangeOk  = false;
+        e->hoist[e->hoistCount].aliasCount = cand[pick].aliasCount;
+        memcpy(e->hoist[e->hoistCount].aliasSlot, cand[pick].alias,
+               sizeof cand[pick].alias);
         uint32_t ht = cand[pick].top;
         if (ht + 9u <= (uint32_t)c->count && c->code[ht] == OP_FOR_RANGE_BIND) {
             e->hoist[e->hoistCount].rangeOk = true;
@@ -440,6 +506,18 @@ void emitHoistsAt(Emit *e, uint32_t off) {
          * once per entry rather than per element. */
         if (!e->osr) {
             emitListBoxedGuard(e, e->slotXReg[e->hoist[i].slot], JIT_SCRATCH_A);
+        }
+        /* The loop appends to these lists, and a header that is one of them
+         * goes stale at the first append. planHoists ruled out the same
+         * LOCAL; the same LIST under another name is settled here, once per
+         * entry, by pointer. Equal deoptimises to the loop head, so the
+         * interpreter runs a loop that aliases -- correct, and rare enough
+         * that its price is no concern. */
+        for (unsigned a = 0; a < e->hoist[i].aliasCount; a++) {
+            unsigned other = localIn(e, e->hoist[i].aliasSlot[a],
+                                     JIT_SCRATCH_B);
+            emit(e, jaiA64SubsXReg(31, e->slotXReg[e->hoist[i].slot], other));
+            branchOnDeoptAt(e, JAI_A64_EQ, off, false);
         }
         emitListHeader(e, e->slotXReg[e->hoist[i].slot],
                        e->hoist[i].itemsReg, e->hoist[i].countReg);

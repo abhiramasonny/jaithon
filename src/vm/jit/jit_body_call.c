@@ -643,7 +643,9 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
              * more than the work itself (list_ops spent all its time on the call). A full list goes out to the `grow` stubs' realloc helper and comes straight back; see there for why this used to be a deopt and what that cost. */
             if (!emitListStore(e, e->stack[e->depth - 1],
                                valueXReg(e, e->valueDepth - 2),
-                               pushReg(e) - 1, e->stackLocal[ridx])) {
+                               pushReg(e) - 1, e->stackLocal[ridx],
+                               e->stackLocal[ridx] >= 0 ? e->stackLocal[ridx]
+                                                        : JIT_PUSH_UNKNOWN)) {
                 return false;
             }
             /* push returns the list, which is the receiver entry already

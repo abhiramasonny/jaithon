@@ -155,6 +155,18 @@ uint32_t jaiA64AddXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
     return 0x8b800000u | (rm << 16) | ((shift & 63u) << 10) | (rn << 5) | rd;
 }
 
+/* stp Dt1, Dt2, [Xn, #imm] -- opc 01 of the SIMD&FP pair, signed offset. */
+uint32_t jaiA64StpDOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
+    uint32_t imm7 = (uint32_t)((imm / 8) & 0x7f);
+    return 0x6d000000u | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt;
+}
+
+/* ldp Dt1, Dt2, [Xn, #imm] */
+uint32_t jaiA64LdpDOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
+    uint32_t imm7 = (uint32_t)((imm / 8) & 0x7f);
+    return 0x6d400000u | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt;
+}
+
 /* ldr Xt, <label> -- PC-relative literal load: one instruction for a full
  * 64-bit constant vs four for movz/movk, why the stack limit is a literal
  * after the body rather than materialised at every entry. */

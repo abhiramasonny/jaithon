@@ -1115,7 +1115,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                 emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
                 branchOnDeopt(e, JAI_A64_NE);
                 if (!emitListStore(e, e->stack[e->depth - 1], rAcc,
-                                   pushReg(e) - 1, -1)) {
+                                   pushReg(e) - 1, -1, JIT_PUSH_FRESH)) {
                     return false;
                 }
                 unsigned dropAcc;
@@ -1130,7 +1130,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             }
             if (!emitListStore(e, e->stack[e->depth - 1],
                                valueXReg(e, valueIndexOf(e, lidx)),
-                               pushReg(e) - 1, e->stackLocal[lidx])) {
+                               pushReg(e) - 1, e->stackLocal[lidx],
+                               e->stackLocal[lidx] >= 0 ? e->stackLocal[lidx]
+                                                        : JIT_PUSH_UNKNOWN)) {
                 return false;
             }
             /* The value is consumed; the target stays where it was. */

@@ -73,6 +73,10 @@ uint32_t jaiA64LdpPost(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
 uint32_t jaiA64StpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
 /* ldp Xt1, Xt2, [Xn, #imm]   (signed offset) */
 uint32_t jaiA64LdpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
+/* stp Dt1, Dt2, [Xn, #imm] / ldp Dt1, Dt2, [Xn, #imm] -- the 64-bit FP pair
+ * forms, signed offset, 8-aligned, -512..504 */
+uint32_t jaiA64StpDOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
+uint32_t jaiA64LdpDOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
 /* ldr Xt, <label> -- PC-relative literal load, offset in instructions */
 uint32_t jaiA64LdrLit(unsigned rt, int32_t instructions);
 /* mul Xd, Xn, Xm -- low 64 bits of the product */

@@ -687,6 +687,58 @@ unsigned valueBankRoom(const Emit *e) {
     return saved;
 }
 
+/* JAITHON_JIT_GROW_KEEPS=0 puts the list-grow stub back to an ordinary call
+ * out. On by default.
+ *
+ * An append whose list is full branches to a stub that calls jitListGrow and
+ * comes back. That call made every loop holding a `push` a CALLING loop to the
+ * rest of the tier: no hoisted header (regionCalls), no pinned storage, and an
+ * operand stack pushed out of x0..x8 -- so a loop that reads three rows and
+ * builds a fourth paid the full dispatching price on every read, for the sake
+ * of a call that runs a few dozen times in a million appends. With the switch
+ * on the stub saves every caller-saved register a body can hold a value in
+ * around the call, and the append stops being a clobber; what it still does --
+ * move ONE list's items and count -- is recorded separately (notePushTarget)
+ * and is the only thing a hoist over it has to answer to. */
+bool jitGrowKeeps(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_GROW_KEEPS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* An append to the list held in local `slot` (or JIT_PUSH_UNKNOWN /
+ * JIT_PUSH_FRESH) is about to be emitted. See Emit::pushOff. */
+void notePushTarget(Emit *e, int slot) {
+    if (!e->measuring) return;
+    if (e->pushCount >= JIT_MAX_PUSHREC) { e->pushSpill = true; return; }
+    /* An inlined body's offsets are the callee's; the caller's own call site
+     * is the offset every loop range here is measured in. And its locals are
+     * the callee's too, so a slot number means nothing to the caller. */
+    if (e->inlining) slot = JIT_PUSH_UNKNOWN;
+    e->pushOff[e->pushCount]  = e->inlining ? e->inlIp : e->curOffset;
+    e->pushSlot[e->pushCount] = (int16_t)slot;
+    e->pushCount++;
+}
+
+/* An OP_ELEM_KIND that may change an empty list's storage. See
+ * Emit::stampOff. */
+void noteStorageStamp(Emit *e) {
+    if (!e->measuring) return;
+    if (e->stampCount >= JIT_MAX_PUSHREC) { e->stampSpill = true; return; }
+    e->stampOff[e->stampCount++] = e->inlining ? e->inlIp : e->curOffset;
+}
+
+bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi) {
+    if (e->stampSpill) return true;
+    for (unsigned i = 0; i < e->stampCount; i++) {
+        if (e->stampOff[i] >= lo && e->stampOff[i] < hi) return true;
+    }
+    return false;
+}
+
 /* Something about to be emitted can destroy x0..x8 with the body still live:
  * a call out, or one of the two stubs that call and then branch back in. The
  * measuring pass records it so the real pass can choose a bank; the real pass

@@ -133,9 +133,79 @@ void emitSelfSlowStubs(Emit *e, ObjClosure *closure) {
 
 /* Cold half of `xs.push(v)`: reserve, refill the count the fast path already loaded, branch back in.
  * No descriptor/roots (see jitListGrow). This is a continuation, not an exit -- an OSR form must NOT sync its iterator or locals here, since the loop carries on with them where they are. */
+/* Where a keeping stub parks each caller-saved register. x0..x8 are the
+ * operand stack's scratch bank and an inlined body's; x13..x17 hold hoisted
+ * headers. x9..x12 are the emitter's own scratches: the fast path has nothing
+ * live in them at the branch but the count, which the stub reloads anyway.
+ * d0..d7 and d16..d27 are every FP register the tier names outside the
+ * callee-saved locals (JIT_FP_BANK, JIT_INL_FP_BANK, the local-add temp just
+ * past the bank, and the arithmetic scratches). x30 is restored by the
+ * epilogue on every path, as for every call this tier makes. */
+#define GROW_KEEP_BYTES 288u
+static int growKeepOffset(unsigned reg) {
+    if (reg <= 8u) return (int)(reg * 8u);
+    if (reg >= 13u && reg <= 17u) return (int)((reg - 4u) * 8u);
+    return -1;
+}
+
+static void growKeepSave(Emit *e, bool save) {
+    static const unsigned gp[14] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17};
+    for (unsigned i = 0; i < 14; i += 2) {
+        int at = growKeepOffset(gp[i]);
+        emit(e, save ? jaiA64StpOff(gp[i], gp[i + 1], 31, at)
+                     : jaiA64LdpOff(gp[i], gp[i + 1], 31, at));
+    }
+    unsigned at = 112u;
+    for (unsigned d = 0; d < 8; d += 2, at += 16u) {
+        emit(e, save ? jaiA64StpDOff(d, d + 1, 31, (int32_t)at)
+                     : jaiA64LdpDOff(d, d + 1, 31, (int32_t)at));
+    }
+    for (unsigned d = 16; d < 28; d += 2, at += 16u) {
+        emit(e, save ? jaiA64StpDOff(d, d + 1, 31, (int32_t)at)
+                     : jaiA64LdpDOff(d, d + 1, 31, (int32_t)at));
+    }
+}
+
+/* An argument out of the register it lives in, or -- if that register is one
+ * the save area holds -- out of the save area, so no argument can be read
+ * after another argument's move has overwritten it. */
+static void growKeepArg(Emit *e, unsigned dst, unsigned src) {
+    int at = growKeepOffset(src);
+    if (at >= 0) {
+        emit(e, jaiA64LdrX(dst, 31, (unsigned)at));
+    } else {
+        emit(e, jaiA64MovX(dst, src));
+    }
+}
+
 void emitGrowStubs(Emit *e) {
     for (unsigned gi = 0; gi < e->growCount; gi++) {
         e->grow[gi].stub = (int)e->count;
+        if (e->grow[gi].keeps) {
+            _Static_assert(GROW_KEEP_BYTES >= 112u + 20u * 8u,
+                           "the keep area holds 14 X and 20 D registers");
+            _Static_assert(GROW_KEEP_BYTES % 16u == 0u,
+                           "sp stays 16-aligned across the call");
+            emit(e, jaiA64SubXImm(31, 31, GROW_KEEP_BYTES));
+            growKeepSave(e, true);
+            growKeepArg(e, 0, e->grow[gi].listReg);
+            growKeepArg(e, 2, e->grow[gi].valReg);
+            emit(e, jaiA64MovzX(1, e->grow[gi].tag, 0));
+            emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jitListGrow);
+            emit(e, jaiA64Blr(JIT_SCRATCH_D));
+            /* x10 is not in the save area, so the verdict survives the
+             * restore. */
+            emit(e, jaiA64MovX(JIT_SCRATCH_B, 0));
+            growKeepSave(e, false);
+            emit(e, jaiA64AddXImm(31, 31, GROW_KEEP_BYTES));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
+            emit(e, jaiA64BCond(JAI_A64_NE,
+                                (int32_t)(e->exceptionExit - (int)e->count)));
+            emit(e, jaiA64LdrW(e->grow[gi].countReg, e->grow[gi].listReg,
+                               (unsigned)offsetof(ObjList, count)));
+            emit(e, jaiA64B((int32_t)(e->grow[gi].returnTo - (int)e->count)));
+            continue;
+        }
         emit(e, jaiA64MovX(0, e->grow[gi].listReg));
         emit(e, jaiA64MovzX(1, e->grow[gi].tag, 0));
         emit(e, jaiA64MovX(2, e->grow[gi].valReg));

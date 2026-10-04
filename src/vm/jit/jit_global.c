@@ -398,7 +398,7 @@ bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag,
  * call). A full list goes out to the `grow` stubs' realloc helper and comes
  * straight back; see there for why this used to be a deopt and what it cost. */
 bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
-                          int slot) {
+                          int slot, int target) {
     unsigned vtag = vk == SLOT_INT   ? VAL_INT
                   : vk == SLOT_FLOAT ? VAL_FLOAT
                   : vk == SLOT_BOOL  ? VAL_BOOL
@@ -435,13 +435,22 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
      * (see emitGrowStubs). */
     if (!raiseExitAllowed(e, "a list growth inside a try")) return false;
 
-    noteScratchClobber(e);
+    /* With the grow stub keeping the registers the append is not a clobber:
+     * it is recorded as what it is -- a write to one list's header -- so a
+     * hoist over it can prove it is not that list. See jitGrowKeeps. */
+    bool keeps = jitGrowKeeps();
+    if (keeps) {
+        notePushTarget(e, target);
+    } else {
+        noteScratchClobber(e);
+    }
     unsigned gi = e->growCount++;
     e->grow[gi].listReg  = rList;
     e->grow[gi].valReg   = rVal;
     e->grow[gi].tag      = vtag;
     e->grow[gi].countReg = JIT_SCRATCH_A;
     e->grow[gi].stub     = -1;
+    e->grow[gi].keeps    = keeps;
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = FIXUP_GROW - gi;

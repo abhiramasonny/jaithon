@@ -213,6 +213,7 @@ JitArmResult emitElemKind(Emit *e, const uint8_t *code, int *offp) {
           : (packed & 0xFu) == FIELD_KIND_BOOL  ? SLOT_BOOL
                                                 : SLOT_OPAQUE);
         if (kStg != LIST_STORE_BOXED && jaiListUnboxOn()) {
+            noteStorageStamp(e);
             /* JIT_SCRATCH_A only: this arm has always used one scratch,
              * and e->scratchRoom is what says how many the body actually
              * reserved -- reaching for a second clobbered a live value
