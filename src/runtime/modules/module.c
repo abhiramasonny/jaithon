@@ -600,21 +600,59 @@ static bool maybeWarmFor(const char *path, bool entry) {
     return true;
 }
 
-static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
-    size_t length = 0;
-    char *text = jaiReadFile(path, &length);
-    if (text == NULL) {
-        (void)importFailure(E0800_MODULE_NOT_FOUND, vm.cIOError,
-                            "cannot read module file '%s'", path);
-        return NULL;
+/* Whether a seeded module's source is read only when something needs it.
+ *
+ * In the bootstrap window a module comes from the seed, and the seed does not
+ * look at the source beside it at all (serialize_read.c: "The seed is allowed
+ * to be out of date with the source beside it"). The text was nonetheless read
+ * and FNV-hashed up front for every one of the 98 modules -- 1.1MB, ~3-4ms of
+ * every `check` and edit-then-run -- because the hash is what a __jaicache__
+ * entry is validated against, and the cache is probed first. In practice the
+ * front end's modules have no cache entries, so the hash went unused.
+ *
+ * Now the source is registered lazily (jaiSourceAddLazy) and hashed only if a
+ * cache entry turns up; a diagnostic or traceback that points into the file
+ * reads it then. Readability is still checked up front, so a file that cannot
+ * be read fails the import exactly as before. JAITHON_DEFER_SEED_SOURCE=0
+ * restores the eager read. */
+static bool deferSeedSourceOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *s = getenv("JAITHON_DEFER_SEED_SOURCE");
+        cached = (s != NULL && strcmp(s, "0") == 0) ? 0 : 1;
     }
+    return cached != 0;
+}
 
-    uint64_t hash = jaiSourceHash(text, length);
-    int fileId = jaiSourceAdd(path, text, length);   /* takes ownership of text */
+static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
+    const JaiSeedEntry *seeded =
+        (sLoadingFrontEnd && !seedDisabled()) ? jaiSeedFind(path) : NULL;
+
+    uint64_t hash = 0;
+    bool haveHash = false;
+    int fileId;
+    if (seeded != NULL && deferSeedSourceOn()) {
+        if (!jaiPathReadable(path)) {
+            (void)importFailure(E0800_MODULE_NOT_FOUND, vm.cIOError,
+                                "cannot read module file '%s'", path);
+            return NULL;
+        }
+        fileId = jaiSourceAddLazy(path, 0);
+    } else {
+        size_t length = 0;
+        char *text = jaiReadFile(path, &length);
+        if (text == NULL) {
+            (void)importFailure(E0800_MODULE_NOT_FOUND, vm.cIOError,
+                                "cannot read module file '%s'", path);
+            return NULL;
+        }
+        hash = jaiSourceHash(text, length);
+        haveHash = true;
+        fileId = jaiSourceAdd(path, text, length);   /* takes ownership of text */
+    }
     module->sourceFileId = fileId;
 
-    const JaiSourceFile *file = jaiSourceGet(fileId);
-    if (file == NULL) {
+    if (fileId < 0) {
         (void)importFailure(E0902_INTERNAL_ERROR, vm.cImportError,
                             "cannot register source for '%s'", path);
         return NULL;
@@ -632,6 +670,11 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
         if (cacheData != NULL) {
             ObjFunction *cached = NULL;
             if (jaiCacheFlagsMatchBuffer(cacheData, cacheLen, flags)) {
+                if (!haveHash) {
+                    const JaiSourceFile *src = jaiSourceGet(fileId);
+                    hash = jaiSourceHash(src->source, src->length);
+                    haveHash = true;
+                }
                 cached = jaiDeserializeCached(cacheData, cacheLen, module, hash,
                                               path);
             }
@@ -664,7 +707,6 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
      * running stale bytecode, because jaiDeserializeModule checks the source
      * hash. */
     if (sLoadingFrontEnd && !seedDisabled()) {
-        const JaiSeedEntry *seeded = jaiSeedFind(path);
         if (seeded != NULL) {
             double dt0 = gFeTiming ? jaiClockMonotonic() : 0.0;
             ObjFunction *fromSeed = jaiDeserializeSeed(seeded->image,
@@ -680,8 +722,13 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
 
     ObjFunction *body = NULL;
     if (selfHosting()) {
-        body = jaiSelfHostedCompileInto(file->source, length, path, module,
-                                        hash, opts->codegen.optLevel);
+        const JaiSourceFile *file = jaiSourceGet(fileId);
+        if (!haveHash) {
+            hash = jaiSourceHash(file->source, file->length);
+            haveHash = true;
+        }
+        body = jaiSelfHostedCompileInto(file->source, file->length, path,
+                                        module, hash, opts->codegen.optLevel);
         if (body == NULL) return NULL;
         /* The self-hosted front end is handed a path, not a module name, so it
          * names the module body from the file's stem: `b` where the C front end

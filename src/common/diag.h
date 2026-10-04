@@ -10,6 +10,9 @@ typedef struct {
     size_t      length;
     uint32_t   *lineStarts;
     int         lineCount;
+    /* Registered without its text (jaiSourceAddLazy): `source` is NULL until
+     * the first jaiSourceGet reads the file. */
+    bool        lazy;
 } JaiSourceFile;
 
 typedef struct {
@@ -24,6 +27,9 @@ JAI_INLINE bool jaiSpanValid(JaiSpan s) { return s.file >= 0 && s.end >= s.start
 JaiSpan jaiSpanJoin(JaiSpan a, JaiSpan b);
 
 int             jaiSourceAdd(const char *path, char *source, size_t length);
+/* Register `path` without reading it; jaiSourceGet reads it on first use.
+ * For a file whose contents are already known not to be needed now. */
+int             jaiSourceAddLazy(const char *path, size_t length);
 JaiSourceFile  *jaiSourceGet(int id);
 void            jaiSourceFreeAll(void);
 void            jaiSourceLineCol(int fileId, uint32_t offset, int *line, int *col);

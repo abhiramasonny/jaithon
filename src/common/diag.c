@@ -97,9 +97,39 @@ int jaiSourceAdd(const char *path, char *source, size_t length) {
     return f.id;
 }
 
+int jaiSourceAddLazy(const char *path, size_t length) {
+    JaiSourceFile f;
+    memset(&f, 0, sizeof f);
+    f.id = gSources.count;
+    f.path = jaiStrdup(path != NULL ? path : "<unknown>");
+    f.source = NULL;
+    f.length = length;
+    f.lazy = true;
+    JAI_VEC_PUSH(JaiSourceFile, &gSources, f);
+    return f.id;
+}
+
+/* The text of a lazily registered file, read now. A file that has gone away
+ * reads as empty -- the same as a diagnostic that has no text to quote --
+ * rather than failing the caller, which only wanted to point into it. */
+static void loadLazySource(JaiSourceFile *f) {
+    size_t length = 0;
+    char *text = jaiReadFile(f->path, &length);
+    if (text == NULL) {
+        text = JAI_ALLOC(char, 1);
+        text[0] = '\0';
+        length = 0;
+    }
+    f->source = text;
+    f->length = length;
+    f->lazy = false;
+}
+
 JaiSourceFile *jaiSourceGet(int id) {
     if (id < 0 || id >= gSources.count) return NULL;
-    return &gSources.data[id];
+    JaiSourceFile *f = &gSources.data[id];
+    if (JAI_UNLIKELY(f->lazy)) loadLazySource(f);
+    return f;
 }
 
 void jaiSourceFreeAll(void) {
