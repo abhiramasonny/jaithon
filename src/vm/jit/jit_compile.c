@@ -314,6 +314,31 @@ void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
     }
 }
 
+/* JAITHON_JIT_FN_FP_HOMES: let a function-tier body whose locals all fit in
+ * x19.. still plan its registers, when that gives a float local a d home. */
+static bool jitFnFpHomes(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FN_FP_HOMES");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Some float local the measuring pass `m` scored as saving more in a d
+ * register than in an X one. Only those: an int, a bool or an object has no
+ * reason to leave the one-register-per-slot layout. */
+static bool fpHomeWanted(const Emit *m, unsigned base, unsigned locals) {
+    unsigned top = base + locals;
+    if (top > JIT_MAX_SLOTS + 1u) top = JIT_MAX_SLOTS + 1u;
+    for (unsigned slot = base; slot < top; slot++) {
+        if (m->dynamicLocal[slot]) continue;
+        if (m->localKind[slot] != SLOT_FLOAT) continue;
+        if (m->slotSaveFp[slot] > m->slotSaveX[slot]) return true;
+    }
+    return false;
+}
+
 /* Writes a body into the arena and seals it again, or seals and reports
  * failure.
  *
@@ -563,7 +588,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
          * because the plan below is per slot. */
         if (e.dynamicLocal[i]) { saved = JIT_MAX_SAVED + 1; break; }
     }
-    if (saved > JIT_MAX_SAVED) {
+    /* Everything fits in x19.., but a float local that the measuring pass
+     * says is cheaper in a d register would pay a cross-register-file `fmov`
+     * on every read and write there -- and for a loop-carried value both sit
+     * on the dependency chain, so `p = p * x` costs fmov+fmul+fmov instead of
+     * one fmul. The plan below is the only mode with d homes, so take it. */
+    bool fpPlan = saved <= JIT_MAX_SAVED && jitFnFpHomes() &&
+                  fpHomeWanted(&body, e.base, e.locals);
+    if (saved > JIT_MAX_SAVED || fpPlan) {
         /* Too many to keep in registers, so the operand stack takes the
          * registers first -- that is expression depth, not the number of
          * variables a function happens to declare -- and whatever is left over
