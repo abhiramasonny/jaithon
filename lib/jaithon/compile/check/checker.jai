@@ -530,10 +530,27 @@ fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
 #: graph. Deliberately not part of `check_program`: a cycle is a property of a
 #: program, not a translation unit, and folding it in made the self-hosted
 #: compiler reject two files the C compiles.
-pub fn check_import_cycles(bag: DiagnosticBag, path: str, program: Node? = null) -> void {
+#:
+#: `edge_file`, when given, is the file id the import edges' spans are reported
+#: under -- so a caller that parsed `path` under its own id can still say
+#: exactly what parsing it here, under file id zero, would have said.
+pub fn check_import_cycles(
+    bag: DiagnosticBag,
+    path: str,
+    program: Node? = null,
+    edge_file: int? = null
+) -> void {
     if path == "" { return }
     let tree = program ?? _parse_quietly(path)
     if tree is null { return }
+    var edges = _own_imports(tree)
+    if edge_file is not null {
+        var moved: list[SigImport] = []
+        for edge in edges {
+            moved.push(SigImport(edge.dotted, Span(edge_file, edge.span.start, edge.span.end)))
+        }
+        edges = moved
+    }
 
     let c = Ctx(Universe(), bag)
     let loader = _loader_for(_search_roots(path))
@@ -541,16 +558,7 @@ pub fn check_import_cycles(bag: DiagnosticBag, path: str, program: Node? = null)
     var stack: list[str] = [absolute(path)]
     var names: list[str] = [_stem_of(path)]
     var entered: list[Span] = [Span.none()]
-    let _complete = _walk_imports(
-        c,
-        loader,
-        _own_imports(tree),
-        _dir_of(path),
-        stack,
-        names,
-        entered,
-        visited
-    )
+    let _complete = _walk_imports(c, loader, edges, _dir_of(path), stack, names, entered, visited)
 }
 
 fn _parse_quietly(path: str) -> Node? {

@@ -16,6 +16,7 @@ from jaithon.compile.jaic import flags_for
 from jaithon.compile.jaic import disassemble_instruction
 from jaithon.compile.jaic import source_hash, write_module
 from jaithon.compile.check.checker import check_import_cycles, check_program
+from jaithon.compile.check.modsig import read_source
 from jaithon.compile.check.ctx import Ctx
 from jaithon.compile.check.kinds import TyKind
 from jaithon.compile.check.ty import Type
@@ -124,7 +125,7 @@ pub fn compile_source(
     let bag = DiagnosticBag()
     let result = Compiled(path, source_hash(text), bag)
 
-    let program = parse(text, file_id, bag)
+    let program = _take_entry_parse(path, file_id, text) ?? parse(text, file_id, bag)
     if program == null { return result }
     result.program = program
 
@@ -353,10 +354,62 @@ pub fn dump_ast(text: str, file_id: int = 0, json: bool = false) -> str {
 #: found.items[0].code                                 # "E0801"
 #: import_cycles("no/such/entry.jai").has_errors()     # false
 #: ```
-pub fn import_cycles(path: str, bag: DiagnosticBag? = null) -> DiagnosticBag {
+#:
+#: `file_id`, when the driver passes it, is the id it will hand
+#: `compile_source` for the same file next. The tree parsed here is then
+#: parsed under that id and kept, and `compile_source` takes it instead of
+#: parsing the file a second time -- which was a fifth of `check`. The edges
+#: are still reported under file id zero, as they always were.
+pub fn import_cycles(path: str, bag: DiagnosticBag? = null, file_id: int = 0) -> DiagnosticBag {
     let into = bag ?? DiagnosticBag()
-    check_import_cycles(into, path)
+    _entry_parse = null
+    if file_id == 0 or not _REUSE_ENTRY_PARSE or path == "" {
+        check_import_cycles(into, path)
+        return into
+    }
+
+    # What `check_import_cycles` would do with no tree, under `file_id`.
+    let text = read_source(path)
+    if text is null { return into }
+    let quiet = DiagnosticBag()
+    let tree = parse(text, file_id, quiet)
+    if tree is null or tree.kind != NodeKind.Program { return into }
+    # Only a parse that said nothing at all may stand in for the next one: the
+    # compile's parse reports into its own bag, and a reused tree reports none.
+    if quiet.items.len() == 0 { _entry_parse = _EntryParse(path, file_id, text, tree) }
+    check_import_cycles(into, path, tree, 0)
     return into
+}
+
+#: Whether `import_cycles` keeps its parse for `compile_source`.
+#: `JAITHON_REUSE_ENTRY_PARSE=0` parses the entry file twice, as before.
+let _REUSE_ENTRY_PARSE: bool = (__prim__.os_env("JAITHON_REUSE_ENTRY_PARSE") ?? "1") != "0"
+
+#: A parse of the entry file `import_cycles` made and `compile_source` may take.
+class _EntryParse {
+    pub let path: str
+    pub let file_id: int
+    pub let text: str
+    pub let tree: Node
+
+    pub fn init(self, path: str, file_id: int, text: str, tree: Node) {
+        self.path = path
+        self.file_id = file_id
+        self.text = text
+        self.tree = tree
+    }
+}
+
+var _entry_parse: _EntryParse? = null
+
+#: The kept parse, if it is of exactly this text under this id; forgotten
+#: either way, so a tree is never handed out twice or held past its compile.
+fn _take_entry_parse(path: str, file_id: int, text: str) -> Node? {
+    let kept = _entry_parse
+    _entry_parse = null
+    if kept is null { return null }
+    if kept.path != path or kept.file_id != file_id or kept.text != text { return null }
+    return kept.tree
 }
 
 #: The name the module body carries, derived from `path`.
