@@ -151,6 +151,10 @@ bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
 /* An f-string's result for compiled code, or NULL when only jaiValueFormat
  * can make it. Never collects; see its definition in value.c. */
 ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count);
+/* `s[a:b]` for compiled code, or NULL when only jaiSliceGet can make it.
+ * Never allocates; see its definition in object_string.c. */
+ObjString *jaiStringSliceLeaf(ObjString *s, int64_t start, int64_t stop,
+                              int64_t flags);
 /* The result kind an OP_INVOKE site has observed for a receiver of
  * `receiver`'s type, or JAI_FB_NONE. A PREDICTION, not a guarantee -- see
  * InlineCache::resultKind; every caller must guard what it emits. */
