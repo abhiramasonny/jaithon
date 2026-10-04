@@ -377,18 +377,49 @@ fn _foreign_function_type(c: Ctx, origin: ModuleSig?, fn_node: Node) -> Type {
     return signature
 }
 
-#: Register every class, trait and enum this file declares, before anything is
-#: checked: a declaration may mention a sibling declared later in the file.
-fn _register_all(c: Ctx, node: any) -> void {
+#: The nodes the four declaration passes act on, each list in the order its
+#: pass used to meet them walking the tree.
+#:
+#: Each pass was its own walk of the whole tree, testing every field of every
+#: node for `Node`, `list` and `dict` -- four walks that were 11% of the
+#: interpreted work of `check lib/jaithon`. Nothing between the passes changes
+#: the tree, so one walk can collect what all four look at.
+class _DeclSites {
+    #: Classes, traits and enums, but only those reached without passing
+    #: through a record: the registration walk never entered a `dict`.
+    pub let types: list[Node]
+    #: `import` and `from ... import` statements, anywhere.
+    pub let imports: list[Node]
+    #: Type aliases, anywhere.
+    pub let aliases: list[Node]
+    #: Function declarations, anywhere.
+    pub let functions: list[Node]
+
+    pub fn init(self) {
+        self.types = []
+        self.imports = []
+        self.aliases = []
+        self.functions = []
+    }
+}
+
+fn _collect_sites(sites: _DeclSites, node: any, in_record: bool) -> void {
     if node is Node {
-        if node.kind == NodeKind.ClassDecl or
-            node.kind == NodeKind.TraitDecl or
-            node.kind == NodeKind.EnumDecl {
-            let _ = register_decl(c, node)
+        let kind = node.kind
+        if kind == NodeKind.ClassDecl or kind == NodeKind.TraitDecl or kind == NodeKind.EnumDecl {
+            if not in_record { sites.types.push(node) }
+        } elif kind == NodeKind.Import or kind == NodeKind.FromImport {
+            sites.imports.push(node)
+        } elif kind == NodeKind.TypeDecl {
+            sites.aliases.push(node)
+        } elif kind == NodeKind.FnDecl {
+            sites.functions.push(node)
         }
-        for value in node.fields { _register_all(c, value) }
+        for value in node.fields { _collect_sites(sites, value, in_record) }
     } elif node is list {
-        for item in node { _register_all(c, item) }
+        for item in node { _collect_sites(sites, item, in_record) }
+    } elif node is dict {
+        for key in node.keys() { _collect_sites(sites, node[key], true) }
     }
 }
 
@@ -414,18 +445,24 @@ pub fn check_program(
     for (name, ty) in outer_type_names { c.push_type_name(name, ty) }
     if program == null { return c }
 
-    _register_all(c, program)
+    let sites = _DeclSites()
+    _collect_sites(sites, program, false)
+
+    # Register every class, trait and enum this file declares before anything
+    # is checked: a declaration may mention a sibling declared later.
+    for node in sites.types { let _ = register_decl(c, node) }
     let loader = _loader_for(_search_roots(path))
     c.sig_loader = loader
     c.source_dir = _dir_of(path)
-    _import_pass(c, program, loader, _dir_of(path))
-    _alias_pass(c, program)
+    let from_dir = _dir_of(path)
+    for node in sites.imports { _import_one(c, node, loader, from_dir) }
+    for node in sites.aliases { _alias_one(c, node) }
     var at = 0
     while at < c.all_decls().len() {
         c.layout_decl(c, c.all_decls()[at])
         at += 1
     }
-    _signature_pass(c, program)
+    for node in sites.functions { _signature_one(c, node) }
     c.check_block(c, program)
     c.set_type(program, universe.t_void)
     return c
@@ -485,42 +522,36 @@ fn _runtime_module_path() -> list[str] {
     return default_search_path()
 }
 
-fn _import_pass(c: Ctx, node: any, loader: SigLoader, from_dir: str) -> void {
-    if node is Node {
-        if node.kind == NodeKind.Import {
-            let dotted = node.opt_text("path")
-            if dotted is not null {
-                c.imported_names.add(node.opt_text("alias") ?? _tail_of(dotted))
-                let sig = _load_sig_for(c, loader, dotted, from_dir)
-                if sig is not null {
-                    let symbol = c.resolution.symbol_of(node)
-                    if symbol is not null and c.symbol_type(symbol) is null {
-                        c.set_symbol_type(symbol, named(c.universe, TyKind.Module, dotted))
-                    }
-                }
-            }
-        } elif node.kind == NodeKind.FromImport {
-            if not node.flag("isWildcard") {
-                for item in node.records("items") {
-                    let remote: any? = item.get("name", null)
-                    if remote is not str { continue }
-                    let alias: any? = item.get("alias", null)
-                    c.imported_names.add(if alias is str { alias } else { remote })
-                }
-                let dotted = node.opt_text("path")
-                if dotted is not null {
-                    let sig = _load_sig_for(c, loader, dotted, from_dir)
-                    if sig is not null {
-                        for item in node.records("items") { _bind_imported(c, loader, sig, item) }
-                    }
+#: Bind what one `import` or `from ... import` names.
+fn _import_one(c: Ctx, node: Node, loader: SigLoader, from_dir: str) -> void {
+    if node.kind == NodeKind.Import {
+        let dotted = node.opt_text("path")
+        if dotted is not null {
+            c.imported_names.add(node.opt_text("alias") ?? _tail_of(dotted))
+            let sig = _load_sig_for(c, loader, dotted, from_dir)
+            if sig is not null {
+                let symbol = c.resolution.symbol_of(node)
+                if symbol is not null and c.symbol_type(symbol) is null {
+                    c.set_symbol_type(symbol, named(c.universe, TyKind.Module, dotted))
                 }
             }
         }
-        for value in node.fields { _import_pass(c, value, loader, from_dir) }
-    } elif node is list {
-        for item in node { _import_pass(c, item, loader, from_dir) }
-    } elif node is dict {
-        for key in node.keys() { _import_pass(c, node[key], loader, from_dir) }
+    } elif node.kind == NodeKind.FromImport {
+        if not node.flag("isWildcard") {
+            for item in node.records("items") {
+                let remote: any? = item.get("name", null)
+                if remote is not str { continue }
+                let alias: any? = item.get("alias", null)
+                c.imported_names.add(if alias is str { alias } else { remote })
+            }
+            let dotted = node.opt_text("path")
+            if dotted is not null {
+                let sig = _load_sig_for(c, loader, dotted, from_dir)
+                if sig is not null {
+                    for item in node.records("items") { _bind_imported(c, loader, sig, item) }
+                }
+            }
+        }
     }
 }
 
@@ -789,41 +820,24 @@ fn _bind_imported(c: Ctx, loader: SigLoader, sig: ModuleSig, item: dict[str, any
     }
 }
 
-fn _alias_pass(c: Ctx, node: any) -> void {
-    if node is Node {
-        if node.kind == NodeKind.TypeDecl {
-            let name = node.opt_text("name")
-            if name is not null {
-                let mark = c.type_name_mark()
-                push_generics(c, node.records("generics"))
-                let target = resolve_ast_type(c, node.type_field("aliased"))
-                c.type_name_restore(mark)
-                if target is not null {
-                    c.push_type_name(name, target)
-                    c.set_symbol_type(c.resolution.symbol_of(node), target)
-                }
-            }
-        }
-        for value in node.fields { _alias_pass(c, value) }
-    } elif node is list {
-        for item in node { _alias_pass(c, item) }
-    } elif node is dict {
-        for key in node.keys() { _alias_pass(c, node[key]) }
+#: Name the type one `type` alias declares.
+fn _alias_one(c: Ctx, node: Node) -> void {
+    let name = node.opt_text("name")
+    if name is null { return }
+    let mark = c.type_name_mark()
+    push_generics(c, node.records("generics"))
+    let target = resolve_ast_type(c, node.type_field("aliased"))
+    c.type_name_restore(mark)
+    if target is not null {
+        c.push_type_name(name, target)
+        c.set_symbol_type(c.resolution.symbol_of(node), target)
     }
 }
 
-fn _signature_pass(c: Ctx, node: any) -> void {
-    if node is Node {
-        if node.kind == NodeKind.FnDecl {
-            let symbol = c.resolution.symbol_of(node)
-            if symbol is not null and c.symbol_type(symbol) is null {
-                c.set_symbol_type(symbol, signature_of(c, node, false))
-            }
-        }
-        for value in node.fields { _signature_pass(c, value) }
-    } elif node is list {
-        for item in node { _signature_pass(c, item) }
-    } elif node is dict {
-        for key in node.keys() { _signature_pass(c, node[key]) }
+#: Give one function declaration's symbol its signature.
+fn _signature_one(c: Ctx, node: Node) -> void {
+    let symbol = c.resolution.symbol_of(node)
+    if symbol is not null and c.symbol_type(symbol) is null {
+        c.set_symbol_type(symbol, signature_of(c, node, false))
     }
 }
