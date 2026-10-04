@@ -145,6 +145,21 @@ uint32_t jaiA64LdpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
     return 0xa9400000u | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt;
 }
 
+/* ldr Xt, [Xn, Xm, lsl #3] -- load (register), option 011 (LSL), S=1. */
+uint32_t jaiA64LdrXIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xf8607800u | (rm << 16) | (rn << 5) | rt;
+}
+
+/* ldr Dt, [Xn, Xm, lsl #3] -- the SIMD&FP form of the same. */
+uint32_t jaiA64LdrDIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xfc607800u | (rm << 16) | (rn << 5) | rt;
+}
+
+/* ldrb Wt, [Xn, Xm] -- option 011, S=0: no shift for a one-byte stride. */
+uint32_t jaiA64LdrByteIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0x38606800u | (rm << 16) | (rn << 5) | rt;
+}
+
 /* stp Dt1, Dt2, [Xn, #imm] -- opc 01 of the SIMD&FP pair, signed offset. */
 uint32_t jaiA64StpDOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
     uint32_t imm7 = (uint32_t)((imm / 8) & 0x7f);

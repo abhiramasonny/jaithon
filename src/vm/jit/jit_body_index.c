@@ -328,6 +328,33 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
         } else {
             emitListHeader(e, rList, gItems, gCount);
         }
+        /* Everything about this element is settled before a word of it is
+         * read: the head proved the index in bounds and non-negative, the
+         * header is in registers, and the storage is static and unboxed,
+         * so there is no tag to check and the stride is the access width.
+         * One register-offset load does what the add, the copy into the
+         * normalisation scratch and the load did (jitIndexedLoadOn). */
+        if (gHoisted && gh >= 0 && !gAcc.dynamic &&
+            gAcc.stg != LIST_STORE_BOXED && jitIndexedLoadOn()) {
+            unsigned dg1, dg2;
+            if (!popValue(e, &dg1, NULL)) return false;
+            if (!popValue(e, &dg2, NULL)) return false;
+            if (!pushValue3(e, kind, elemShape, elemClass, elem, -1)) {
+                return false;
+            }
+            if (kind == SLOT_BOOL) {
+                emit(e, jaiA64LdrByteIdx(pushReg(e) - 1, gItems, rIdx));
+            } else if (kind == SLOT_FLOAT &&
+                       fpWorthLoading(e, code, off + 1, stop)) {
+                unsigned idx = e->valueDepth - 1;
+                emit(e, jaiA64LdrDIdx(fpRegAt(e, idx), gItems, rIdx));
+                fpClaim(e, idx);
+            } else {
+                emit(e, jaiA64LdrXIdx(pushReg(e) - 1, gItems, rIdx));
+            }
+            off += 1;
+            break;
+        }
         if (gHoisted) {
             /* The head proved it. Only the normalisation copy is left, and
              * a shaped index is non-negative by that same proof, so even

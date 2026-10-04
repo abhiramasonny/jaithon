@@ -886,6 +886,7 @@ bool jitHoistPinOn(void);
 bool jitSplitHoistsOn(void);
 bool jitHoistPartialOn(void);
 bool jitFastIterOn(void);
+bool jitIndexedLoadOn(void);
 ObjIter *jitListIterAlloc(ObjList *list);
 void notePushTarget(Emit *e, int slot);
 void noteStorageStamp(Emit *e);

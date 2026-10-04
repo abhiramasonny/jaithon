@@ -723,6 +723,17 @@ bool jitFastIterOn(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_INDEXED_LOAD=0 reads a bounds-proved unboxed element with the
+ * add-then-load pair. On by default; see OP_GET_INDEX. */
+bool jitIndexedLoadOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_INDEXED_LOAD");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 /* JAITHON_JIT_GROW_KEEPS=0 puts the list-grow stub back to an ordinary call
  * out. On by default.
  *
