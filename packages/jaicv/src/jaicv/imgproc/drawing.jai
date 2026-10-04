@@ -376,6 +376,26 @@ pub class Painter {
         )
     }
 
+    #: Every run as an anti-aliased hairline, blended into the host mirror in
+    #: one call: what `blend` does four times a step along each segment. False,
+    #: with nothing drawn, when a point is not something with integer `x` and
+    #: `y`.
+    pub fn blend_outlines(self, contours: list[list[Point]], closed: bool) -> bool {
+        let values = self.on_host()
+        return __prim__.blend_outlines(
+            values,
+            self.colour,
+            self.cn,
+            self.cols,
+            self.rows,
+            contours,
+            closed,
+            self.integral,
+            self.low,
+            self.high
+        )
+    }
+
     #: Fill `[x1, x2]` on row `y`, inclusive at both ends.
     #:
     #: One call rather than a `plot` a pixel. Every filled shape is made of
@@ -1271,6 +1291,16 @@ pub fn polylines(
         } else {
             painter.thin_outlines(polygons, 0, 0, connectivity, closed)
         }
+        if drawn {
+            painter.finish()
+            return img
+        }
+    }
+    #: An anti-aliased hairline blends into the host mirror, which the first
+    #: partial blend below would bring over anyway; the primitive blends every
+    #: run there in one call, four reads, mixes and roundings a step.
+    if _native_lines and shift == 0 and line_type == LINE_AA and thickness <= 1 {
+        let drawn = painter.blend_outlines(polygons, closed)
         if drawn {
             painter.finish()
             return img

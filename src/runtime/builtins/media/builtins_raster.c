@@ -1213,6 +1213,196 @@ static bool primFillPolygons(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* --- anti-aliased hairlines ------------------------------------------ */
+
+/* What anti-aliased drawing blends into: the host mirror as a list, the
+ * colour already saturated, and how a mixed value is brought back into the
+ * picture's depth. */
+typedef struct {
+    ObjList *values;
+    Value    colour[4];
+    double   colourF[4];
+    int      cn;
+    int64_t  cols, rows;
+    bool     integral;
+    double   low, high;
+    bool     bad;       /* a mixed value that cannot be rounded to an int */
+} BlendTarget;
+
+/* `cv_round` in drawing.jai: the floor, then up past a half, and to even on
+ * exactly one. */
+static double blendRound(double value, bool *bad) {
+    const double down = floor(value);
+    if (!(down > -9.0e18 && down < 9.0e18)) {
+        *bad = true;
+        return 0.0;
+    }
+    const double fraction = value - down;
+    int64_t lower = (int64_t)down;
+    if (fraction > 0.5) lower += 1;
+    else if (!(fraction < 0.5) && lower % 2 != 0) lower += 1;
+    return (double)lower;
+}
+
+/* `Painter.blend`: `alpha` of the colour over the pixel at (x, y), a plain
+ * write when it is all colour, nothing when it is none or off the picture. */
+static void blendPixel(BlendTarget *t, int64_t x, int64_t y, double alpha) {
+    if (x < 0 || y < 0 || x >= t->cols || y >= t->rows) return;
+    if (alpha <= 0.0) return;
+    const int64_t base = (y * t->cols + x) * t->cn;
+    if (base < 0 || base + t->cn > t->values->count) return;
+    if (alpha >= 1.0) {
+        for (int c = 0; c < t->cn; c++) jaiListPut(t->values, (int)(base + c), t->colour[c]);
+        return;
+    }
+    for (int c = 0; c < t->cn; c++) {
+        const Value held = jaiListGet(t->values, (int)(base + c));
+        const double v = IS_FLOAT(held) ? AS_FLOAT(held) : (double)AS_INT(held);
+        double mixed = v * (1.0 - alpha) + t->colourF[c] * alpha;
+        if (t->integral) {
+            mixed = blendRound(mixed, &t->bad);
+            /* Jaithon's `int` refuses a NaN or an infinity where `cv_round`
+             * takes it, before the channel is written; so does this. */
+            if (t->bad) return;
+            if (mixed < t->low) mixed = t->low;
+            if (mixed > t->high) mixed = t->high;
+        }
+        jaiListPut(t->values, (int)(base + c), FLOAT_VAL(mixed));
+    }
+}
+
+/* `draw_line_aa`: a step a pixel along the longer axis, each landing spread
+ * over the four pixels around it by how near it falls to each. */
+static void blendLine(BlendTarget *t, int64_t x1, int64_t y1, int64_t x2, int64_t y2) {
+    const double dx = (double)(x2 - x1);
+    const double dy = (double)(y2 - y1);
+    const int64_t across = (int64_t)fabs(dx);
+    const int64_t down = (int64_t)fabs(dy);
+    const int64_t steps = across > down ? across : down;
+    if (steps == 0) {
+        blendPixel(t, x1, y1, 1.0);
+        return;
+    }
+    const double stepX = dx / (double)steps;
+    const double stepY = dy / (double)steps;
+    double x = (double)x1;
+    double y = (double)y1;
+    for (int64_t i = 0; i < steps + 1 && !t->bad; i++) {
+        const int64_t ix = (int64_t)floor(x);
+        const int64_t iy = (int64_t)floor(y);
+        const double fx = x - (double)ix;
+        const double fy = y - (double)iy;
+        blendPixel(t, ix, iy, (1.0 - fx) * (1.0 - fy));
+        if (t->bad) return;
+        blendPixel(t, ix + 1, iy, fx * (1.0 - fy));
+        if (t->bad) return;
+        blendPixel(t, ix, iy + 1, (1.0 - fx) * fy);
+        if (t->bad) return;
+        blendPixel(t, ix + 1, iy + 1, fx * fy);
+        x += stepX;
+        y += stepY;
+    }
+}
+
+/* `blend_outlines(values, colour, cn, cols, rows, contours, closed, integral,
+ *  low, high)` -- every run drawn as an anti-aliased hairline into the host
+ *  mirror `values`: what `polylines` draws with LINE_AA one pixel wide, a
+ *  `draw_line_aa` a segment and four `Painter.blend`s a step. A blend is a
+ *  read, a mix and a rounding per channel, and as Jaithon method calls it was
+ *  12.2 ms for 800 small contours against OpenCV's 0.24.
+ *
+ * Returns false, having drawn nothing, when a point is not an object with
+ * integer `x` and `y` or lies too far out for the walk's floating point to be
+ * exact, so the caller takes its own path. */
+static bool primBlendOutlines(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *values, *colour, *contours;
+    int64_t cn, cols, rows;
+    if (!jaiArgList(args[0], 1, "blend_outlines", &values)) return false;
+    if (!jaiArgList(args[1], 2, "blend_outlines", &colour)) return false;
+    if (!jaiStrWantInt(args[2], "blend_outlines", "the channel count", &cn)) return false;
+    if (!jaiStrWantInt(args[3], "blend_outlines", "the width", &cols)) return false;
+    if (!jaiStrWantInt(args[4], "blend_outlines", "the height", &rows)) return false;
+    if (!jaiArgList(args[5], 6, "blend_outlines", &contours)) return false;
+    if (!IS_BOOL(args[6]) || !IS_BOOL(args[7])) {
+        return jaiThrow(vm.cTypeError, "blend_outlines(): closed and integral must be bools");
+    }
+    if (cn < 1 || cn > 4 || cn != colour->count || cols < 0 || rows < 0) {
+        return jaiThrow(vm.cValueError, "blend_outlines(): %lld channels against a colour of %d",
+                        (long long)cn, colour->count);
+    }
+    BlendTarget t;
+    memset(&t, 0, sizeof t);
+    t.values = values;
+    t.cn = (int)cn;
+    t.cols = cols;
+    t.rows = rows;
+    t.integral = AS_BOOL(args[7]);
+    const bool closed = AS_BOOL(args[6]);
+    for (int i = 0; i < 2; i++) {
+        const Value v = args[8 + i];
+        if (!IS_FLOAT(v) && !IS_INT(v)) {
+            return jaiThrow(vm.cTypeError, "blend_outlines(): the depth's range must be numbers");
+        }
+    }
+    t.low = IS_FLOAT(args[8]) ? AS_FLOAT(args[8]) : (double)AS_INT(args[8]);
+    t.high = IS_FLOAT(args[9]) ? AS_FLOAT(args[9]) : (double)AS_INT(args[9]);
+    for (int c = 0; c < t.cn; c++) {
+        const Value v = jaiListGet(colour, c);
+        if (!IS_FLOAT(v) && !IS_INT(v)) {
+            return jaiThrow(vm.cTypeError, "blend_outlines(): the colour holds a non-number");
+        }
+        t.colour[c] = v;
+        t.colourF[c] = IS_FLOAT(v) ? AS_FLOAT(v) : (double)AS_INT(v);
+    }
+
+    /* Every point readable and small enough that a float holds it and every
+     * step along a segment exactly enough to floor, before a pixel moves. */
+    const int64_t limit = (int64_t)1 << 40;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    for (int c = 0; c < contours->count; c++) {
+        const Value item = jaiListGet(contours, c);
+        if (!IS_LIST(item)) {
+            *out = BOOL_VAL(false);
+            return true;
+        }
+        ObjList *contour = AS_LIST(item);
+        for (int i = 0; i < contour->count; i++) {
+            int64_t x, y;
+            if (!jaiReadPoint(&reader, jaiListGet(contour, i), &x, &y) ||
+                x <= -limit || x >= limit || y <= -limit || y >= limit) {
+                *out = BOOL_VAL(false);
+                return true;
+            }
+        }
+    }
+
+    for (int c = 0; c < contours->count && !t.bad; c++) {
+        ObjList *contour = AS_LIST(jaiListGet(contours, c));
+        const int count = contour->count;
+        if (count == 0) continue;
+        int64_t px, py;
+        if (count == 1) {
+            jaiReadPoint(&reader, jaiListGet(contour, 0), &px, &py);
+            blendLine(&t, px, py, px, py);
+            continue;
+        }
+        jaiReadPoint(&reader, jaiListGet(contour, closed ? count - 1 : 0), &px, &py);
+        for (int i = closed ? 0 : 1; i < count && !t.bad; i++) {
+            int64_t cx, cy;
+            jaiReadPoint(&reader, jaiListGet(contour, i), &cx, &cy);
+            blendLine(&t, px, py, cx, cy);
+            px = cx;
+            py = cy;
+        }
+    }
+    jaiListTouch(values);
+    if (t.bad) return jaiThrow(vm.cValueError, "cannot convert float NaN to int");
+    *out = BOOL_VAL(true);
+    return true;
+}
+
 void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "fill_span",     primFillSpan,     10, 10);
     jaiStrDefinePrim(ns, "draw_line",     primDrawLine,     12, 12);
@@ -1221,4 +1411,5 @@ void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "fill_strokes",  primFillStrokes,  12, 12);
     jaiStrDefinePrim(ns, "draw_outlines", primDrawOutlines, 12, 12);
     jaiStrDefinePrim(ns, "fill_polygons", primFillPolygons, 12, 12);
+    jaiStrDefinePrim(ns, "blend_outlines", primBlendOutlines, 10, 10);
 }
