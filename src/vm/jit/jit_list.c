@@ -356,9 +356,12 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
  * also what makes the read SOUND without a version guard, so hoisting it needs
  * the guard back -- unless the stretch of code the load is hoisted over can be
  * shown to contain nothing that could move a list at all. Every way a list is
- * resized (push, insert, remove, clear, slice, anything through a descriptor)
- * is a call out, and so is every collection; an in-place `xs[i] = v` moves
- * neither `items` nor `count`. So across a call-free stretch a header is
+ * resized (insert, remove, clear, slice, anything through a descriptor) is a
+ * call out, and so is every collection; an in-place `xs[i] = v` moves neither
+ * `items` nor `count`. A push is the one exception (JAITHON_JIT_HOIST_PUSH):
+ * its grow stub reloads every hoisted `items`, and a region with a push in it
+ * hoists no count at all (regionPushes), since a push that fits raises
+ * `count` without reaching the stub. So across a call-free stretch a header is
  * invariant for as long as the LOCAL is, and that is a fact the measuring pass
  * already recorded (noteSlotWrite).
  *
@@ -532,6 +535,20 @@ int pushHoistFor(const Emit *e, int slot) {
     return -1;
 }
 
+/* Whether a push lies inside [top, end). Such a region may still hoist a
+ * header -- the grow stub reloads it when the items move -- but never its
+ * count: a push that fits raises ObjList::count without going through the
+ * stub, so a count register would fall behind, and `xs[-1]` would normalise
+ * against it to an earlier element. Any push counts, not just this slot's,
+ * since two locals can name one list. The head's bounds guard is unaffected:
+ * it reads the count fresh, and a count only rises past it. */
+static bool regionPushes(const Emit *e, uint32_t top, uint32_t end) {
+    for (unsigned p = 0; p < e->pushCount; p++) {
+        if (e->pushOff[p] >= top && e->pushOff[p] < end) return true;
+    }
+    return false;
+}
+
 void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     if (e->measuring) return;
     const Chunk *c = &fn->chunk;
@@ -597,7 +614,8 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
         if (!lean) rC = e->hoistPool[e->hoistTaken++];
         if (rI < e->scratchRoom) e->scratchRoom = rI;
         if (!lean && rC < e->scratchRoom) e->scratchRoom = rC;
-        e->hoist[e->hoistCount].hasCount = !lean;
+        e->hoist[e->hoistCount].hasCount =
+            !lean && !regionPushes(e, cand[pick].top, cand[pick].end);
         e->hoist[e->hoistCount].hasVer   = false;
         e->hoist[e->hoistCount].verReg   = 0;
         (void)pickUse;
@@ -661,6 +679,7 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
         unsigned bestUse = 0;
         for (unsigned h = 0; h < e->hoistCount; h++) {
             if (e->hoist[h].hasCount) continue;
+            if (regionPushes(e, e->hoist[h].top, e->hoist[h].end)) continue;
             unsigned use = e->slotIndexUse[e->hoist[h].slot];
             if (pick < 0 || use > bestUse) { pick = (int)h; bestUse = use; }
         }

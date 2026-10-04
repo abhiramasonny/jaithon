@@ -443,6 +443,18 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
 
     if (jitHoistPush()) noteGrowClobber(e);
     else noteScratchClobber(e);
+    /* planHoists keeps a count register out of every region with a push in
+     * it; a push it did not see would leave one stale (see regionPushes). */
+    if (!e->measuring) {
+        uint32_t here = e->inlining ? e->inlIp : e->curOffset;
+        for (unsigned h = 0; h < e->hoistCount; h++) {
+            if (!e->hoist[h].hasCount) continue;
+            if (here < e->hoist[h].top || here >= e->hoist[h].end) continue;
+            e->whyNot = "a push inside a region whose count is hoisted";
+            e->failed = true;
+            return false;
+        }
+    }
     if (e->measuring && e->pushCount < JIT_MAX_GROW) {
         e->pushOff[e->pushCount]  = e->inlining ? e->inlIp : e->curOffset;
         e->pushSlot[e->pushCount] = e->inlining ? -1 : slot;
