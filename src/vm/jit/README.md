@@ -454,6 +454,7 @@ this table complete in both directions.
 | `JAITHON_JIT_RET_OBJTYPE` | on | Record the object type a callee returns. |
 | `JAITHON_JIT_RETURN_KNOWN` | on | Require a direct callee's walk to have reached a return. |
 | `JAITHON_JIT_ANY_GUARD` | on | Guard an `any`-typed value rather than refusing it. |
+| `JAITHON_JIT_STR_GUARD` | on | Guard a declared `str` boundary on an object rather than refusing it. |
 | `JAITHON_JIT_FDIV_GUARD` | on | Raise on float `/` by zero, as the interpreter does. |
 | `JAITHON_JIT_CONCAT_LOCALS` | on | String concatenation into locals. |
 | `JAITHON_JIT_STRCMP` | on | String ordering comparisons. |
@@ -475,6 +476,7 @@ this table complete in both directions.
 | `JAITHON_JIT_DICT_LEAF` | on | String-keyed `d.get(k)`, `d[k]`, `d[k] = v` and `k in d` through a leaf call in front of the descriptor call. |
 | `JAITHON_JIT_FMT_LEAF` | on | f-strings through a leaf call in front of the descriptor call. |
 | `JAITHON_JIT_FMT_INT_LEAF` | on | An f-string of one int hole between optional string runs through its own leaf. |
+| `JAITHON_JIT_STR_INT_LEAF` | on | `str(n)` on an int through the f-string's int leaf. |
 | `JAITHON_JIT_SLICE_LEAF` | on | `s[a:b]` on a string through a leaf call in front of the descriptor call. |
 | `JAITHON_JIT_NEGATE` | on | Arithmetic negation. |
 | `JAITHON_JIT_TUPLE` | on | Tuple construction and unpacking. |
@@ -1036,6 +1038,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_LIST_SCALAR` | `jitListScalarResult` | predicting `sum`/`min`/`max`. |
 | `JAITHON_JIT_RETURN_KNOWN` | `jitReturnKnownOn` | refusing a direct callee whose walk never reached a return. `jitReturnKind` is written even then, so without this the arm trusts a value nothing established. |
 | `JAITHON_JIT_ANY_GUARD` | `jitAnyGuard` | the `list` / instance / `any` type-guard arms -- `any` is satisfied by every value, so its guard is genuinely nothing. |
+| `JAITHON_JIT_STR_GUARD` | `jitStrGuard` | the `str` arm of `OP_TYPE_GUARD` on a `SLOT_OBJ`: one `Obj.type` check and a deopt, after which the entry carries the fact (`stackObjType`), or nothing at all for an entry already known to be a string. Before it, "a `str` guard on a object" declined the whole body around any function returning `str(n)` or a value read out of a container. |
 | `JAITHON_JIT_FDIV_GUARD` | `jitFdivGuard` | the float divide-by-zero guard in `emitAddSubDiv`. This one is a CORRECTNESS fix, not an optimisation: without it compiled `x / 0.0` yields inf where the interpreter raises `DivisionByZeroError`. The switch exists only to price the guard (one `fcmp`, one not-taken branch per compiled float division) inside one binary. Never ship with it off. |
 | `JAITHON_JIT_PIC` | `jitPicEnabled` | the one-way inline cache at an unpinned `OP_INVOKE`. |
 | `JAITHON_JIT_NULL_PAIR` | `jitNullPair` | `x == null` on a `SLOT_OBJ`. Equality only, and object kinds only: a `SLOT_INT` is also never null, but zero is a perfectly good int. |
@@ -1055,6 +1058,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_DICT_LEAF` | `jitDictLeaf` | the string-keyed dict leaves, `jitDictGetStr`, `jitDictSetStr` and `jitDictHasStr`, placed in FRONT of the dict read, `dict.get`, dict store and `in` descriptor calls, which stay behind them as the slow path. A leaf runs no user code and cannot allocate, so it needs no descriptor, no roots and no native dispatch -- ~200 instructions around a ~20-instruction probe. Worth 1.47x in cycles on `dict_ops`, and 2.2x on a get-then-set loop. Anything the leaf cannot settle -- a key that is not a string, a miss under `d[k]`, a stored key of another kind whose hash matches, a value a typed dict refuses -- takes the descriptor call, which is not a deopt. |
 | `JAITHON_JIT_FMT_LEAF` | `jitFormatLeaf` | `jaiValueFormatLeaf` (value.c) in front of the `OP_FORMAT` descriptor call to `jitFormat`, which stays behind it as the slow path. The leaf never collects -- it declines when `jaiGCWanted()` is already true, which is the only state in which its one possible allocation could collect -- so the parts go down as plain arguments with no root fill, no root-range push and pop and no wrapper. Emitted only when every part is an int, a bool or an object that may be a string; a float or a long result takes the slow path. Worth 1.15x in cycles on `dict_ops`. |
 | `JAITHON_JIT_FMT_INT_LEAF` | `jitFormatIntLeaf` | `jaiValueFormatIntLeaf` (value.c) in place of the general f-string leaf for the commonest shape there is: one int hole with at most one string run on either side -- `f"k{i}"`, `f"{name}{i}"`, `f"item-{i},"`. Three registers instead of the parts written to memory and read back, no dispatch on each part's tag, and no loop whose constants the compiler keeps live across the call: 45 fewer instructions an f-string, worth 1.10x in cycles on `dict_ops`. The leaf checks that the runs are strings; anything else is the general path. |
+| `JAITHON_JIT_STR_INT_LEAF` | `jitStrIntLeaf` | `str(n)` with an int argument through `jaiValueFormatIntLeaf` -- it is `f"{n}"` -- in front of the call to the native, which stays behind it as the slow path. |
 | `JAITHON_JIT_SLICE_LEAF` | `jitSliceLeaf` | `jaiStringSliceLeaf` (object_string.c) in front of the string arm of `OP_GET_SLICE`'s descriptor call to `jitGetSlice`, which stays behind it as the slow path. It answers only the slices that allocate nothing -- one byte, from the shared ASCII table, and a short slice the intern table already holds -- from a source already known to be ASCII, and with int bounds and no step; everything else is the descriptor call. A scanner cutting the same words out of a text is the shape: worth 1.19x in cycles on `word_freq`. |
 | `JAITHON_JIT_TUPLE` | `jitTuple` | building and unpacking tuples. |
 | `JAITHON_JIT_NEGATE` | `jitNegate` | `OP_NEG`. |

@@ -6,7 +6,7 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it on call count alone; `JAITHON_NO_JIT=1` runs
 #: the same file, and every answer is the interpreter's.
-# jit-compiles: fmt_key, fmt_mixed, fmt_long, fmt_float, fmt_maybe, fmt_many, fmt_hole_shapes
+# jit-compiles: fmt_key, fmt_mixed, fmt_long, fmt_float, fmt_maybe, fmt_many, fmt_hole_shapes, str_of_int
 from std.test import assert_eq, assert_true
 
 let CALLS = 100
@@ -128,6 +128,25 @@ pub fn test_one_int_hole_shapes() -> void {
     let m = "-9223372036854775808"
     assert_eq(fmt_hole_shapes(-9223372036854775807 - 1, "", "o"),
               [m, m + "px", "k" + m, "<" + m + ">", m, m, "o" + m])
+}
+
+fn str_of_int(n: int) -> str {
+    return str(n)
+}
+
+pub fn test_str_of_an_int() -> void {
+    #: `str(n)` takes the same int leaf as `f"{n}"`.
+    var call = 0
+    while call < CALLS {
+        let n = call * 104729 - 5000000
+        assert_eq(str_of_int(n), f"{n}")
+        assert_eq(str_of_int(call), f"{call}")
+        call += 1
+    }
+    assert_eq(str_of_int(0), "0")
+    assert_eq(str_of_int(-9223372036854775807 - 1), "-9223372036854775808")
+    assert_eq(str_of_int(9223372036854775807), "9223372036854775807")
+    assert_true(str_of_int(7) is str_of_int(7), "a short result is interned")
 }
 
 pub fn test_many_distinct_strings_across_collections() -> void {

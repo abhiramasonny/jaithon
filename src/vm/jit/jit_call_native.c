@@ -166,6 +166,17 @@ static bool listScalarResult(const Emit *e, const char *nm, unsigned argc,
     return false;
 }
 
+/* JAITHON_JIT_STR_INT_LEAF=0 sends `str(n)` back to the native every time,
+ * for a one-binary A/B of its leaf below. */
+static bool jitStrIntLeaf(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_STR_INT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* 1 emitted, 0 no row for this builtin, -1 the emit failed. */
 int emitNativeResultCall(Emit *e, Value cv, const char *nm,
                                 unsigned argc, uint32_t afterIp) {
@@ -195,9 +206,48 @@ int emitNativeResultCall(Emit *e, Value cv, const char *nm,
         nr = &derived;
     }
 
+    /* `str(n)` on an int is `f"{n}"`, so it takes the f-string's int leaf in
+     * front of the call to the native, which stays behind it as the slow
+     * path. The result is written whole into the descriptor, where the guard
+     * below reads it either way. */
+    LeafFix sfx;
+    sfx.on = false;
+    sfx.slow[0] = sfx.slow[1] = sfx.done = -1;
+    /* `str` of an int is a string whichever path answers it -- the leaf, or
+     * the native on an int -- so the result can say so, as an f-string's
+     * does. Without it a `-> str` return guard has nothing to go on and
+     * declines the whole body. */
+    bool strOfInt = argc == 1 && strcmp(nm, "str") == 0 &&
+                    e->stack[e->depth - 1] == SLOT_INT;
+    if (strOfInt && jitStrIntLeaf() &&
+        leafRegOk(valueXReg(e, e->valueDepth - 1)) &&
+        e->descOffset + (unsigned)offsetof(JitCallDesc, result) <= 4095u) {
+        unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+        fpSyncAll(e);
+        settleAll(e);
+        emit(e, jaiA64MovzX(0, 0, 0));
+        emit(e, jaiA64MovX(1, valueXReg(e, e->valueDepth - 1)));
+        emit(e, jaiA64MovzX(2, 0, 0));
+        emitConst64(e, JIT_SCRATCH_A,
+                    (int64_t)(uintptr_t)&jaiValueFormatIntLeaf);
+        noteScratchClobber(e);
+        emit(e, jaiA64Blr(JIT_SCRATCH_A));
+        emit(e, jaiA64SubsXImm(31, 0, 0));
+        sfx.slow[0] = (int)e->count;
+        sfx.cond[0] = JAI_A64_EQ;
+        emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
+        emit(e, jaiA64StrX(0, 31, rat + 8));
+        sfx.done = (int)e->count;
+        emit(e, jaiA64B(0));
+        sfx.on = true;
+    }
+    leafSlowHere(e, &sfx);
     if (!emitDescriptor(e, cv, e->depth - argc, argc, (void *)&jitCallOut)) {
         return -1;
     }
+    leafDoneHere(e, &sfx);
     for (unsigned i = 0; i < argc; i++) {
         /* A class argument occupies no register, so there is nothing to pop --
          * only the entry to drop. */
@@ -214,6 +264,7 @@ int emitNativeResultCall(Emit *e, Value cv, const char *nm,
     }
     e->depth--;
     if (!pushValue(e, nr->kind, 0, NULL)) return -1;
+    if (strOfInt) e->stackObjType[e->depth - 1] = (uint8_t)(OBJ_STRING + 1);
 
     unsigned at = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
     emit(e, jaiA64LdrW(JIT_SCRATCH_A, 31, at));

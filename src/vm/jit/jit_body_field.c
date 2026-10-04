@@ -5,10 +5,22 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
+
+/* JAITHON_JIT_STR_GUARD=0 puts back the refusal "a `str` guard on a object",
+ * for a one-binary A/B of the arm below. */
+static bool jitStrGuard(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_STR_GUARD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
 
 bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
 {
@@ -107,6 +119,27 @@ bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
              * turn up are `Tensor`, `Mat` and `NDArray` -- the ML packages
              * annotate their boundaries, so one of these sat in the middle
              * of a hot body and declined all of it. */
+        } else if (jitStrGuard() && strcmp(tn, "str") == 0 &&
+                   k == SLOT_OBJ) {
+            /* A declared `str` boundary on "some heap object" -- a function
+             * returning what `str(n)` or a dict read gave it. The `list` arm
+             * above is the model: one Obj.type check, a deopt that resumes
+             * here with the operand still on the interpreter's stack, and
+             * the entry then carries the fact, so a second guard on it
+             * costs nothing. Already known to be a string -- an f-string's
+             * result, a character from the ASCII table -- it emits nothing.
+             * Same name-based contract as `list`: a module that rebinds
+             * `str` to a class changes what the interpreter does here. */
+            unsigned sd = e->depth - 1;
+            if (e->stackObjType[sd] != (uint8_t)(OBJ_STRING + 1) &&
+                !e->stackAscii[sd]) {
+                unsigned gr = valueXReg(e, e->valueDepth - 1);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, gr,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+                branchOnDeopt(e, JAI_A64_NE);
+                e->stackObjType[sd] = (uint8_t)(OBJ_STRING + 1);
+            }
         } else if (jitAnyGuard() && strcmp(tn, "any") == 0) {
             /* `any` is satisfied by every value, so this guard is a no-op
              * for every kind -- not a narrowing the tier is guessing at.
