@@ -52,6 +52,7 @@ static double shapeSin(double x) {
  * product of two 62, and the turn test's difference of products 63. */
 #define JAI_HULL_COORD_LIMIT 1073741824LL
 
+
 typedef struct {
     int64_t x, y;
     int32_t index;
@@ -501,50 +502,89 @@ static int curveFurthest(const double *xy, int count, int origin) {
     return far;
 }
 
+/* One entry of `curveSimplify`'s walk: a stretch of the curve still to
+ * simplify, from `first` to `last`, or, when `first` is negative, the point
+ * at position `last` in `curve`, to keep. */
+typedef struct {
+    int first;
+    int last;
+} CurveSpan;
+
 /* `douglas_peucker` in approx.jai, appending the kept points' positions in
  * `curve` to `kept`. The recursion is the same and so is the order of the
- * points it keeps. */
-static void curveSimplify(const double *xy, int count, int start, int first, int last,
+ * points it keeps: the stretch before the worst point, the worst point, the
+ * stretch after it. Its stack is a heap array rather than C frames, since a
+ * curve such as a spiral nests as deep as it has points and the C stack ran
+ * out where the Jaithon raised a RecursionError. False when that array cannot
+ * grow. */
+static bool curveSimplify(const double *xy, int count, int start, int first, int last,
                           int32_t *kept, int *keptCount, double epsilon) {
-    if (last <= first + 1) return;
-    int here = start + first;
-    if (here >= count) here -= count;
-    const double ax = xy[here * 2];
-    const double ay = xy[here * 2 + 1];
-    here = start + last;
-    if (here >= count) here -= count;
-    const double dx = xy[here * 2] - ax;
-    const double dy = xy[here * 2 + 1] - ay;
-    const double squared = dx * dx + dy * dy;
-    double worst = 0.0;
-    int worstAt = first;
-    for (int index = first + 1; index < last; index++) {
-        here = start + index;
+    size_t capacity = 64;
+    size_t depth = 0;
+    CurveSpan *stack = (CurveSpan *)malloc(capacity * sizeof(CurveSpan));
+    if (stack == NULL) return false;
+    stack[depth++] = (CurveSpan){first, last};
+    while (depth > 0) {
+        const CurveSpan span = stack[--depth];
+        if (span.first < 0) {
+            kept[(*keptCount)++] = span.last;
+            continue;
+        }
+        first = span.first;
+        last = span.last;
+        if (last <= first + 1) continue;
+        int here = start + first;
         if (here >= count) here -= count;
-        const double px = xy[here * 2];
-        const double py = xy[here * 2 + 1];
-        double gap = (px - ax) * (px - ax) + (py - ay) * (py - ay);
-        if (squared > 1e-12) {
-            const double dot = (px - ax) * dx + (py - ay) * dy;
-            if (dot > 0.0) {
-                double t = 1.0;
-                if (dot < squared) t = dot / squared;
-                const double cx = ax + t * dx;
-                const double cy = ay + t * dy;
-                gap = (px - cx) * (px - cx) + (py - cy) * (py - cy);
+        const double ax = xy[here * 2];
+        const double ay = xy[here * 2 + 1];
+        here = start + last;
+        if (here >= count) here -= count;
+        const double dx = xy[here * 2] - ax;
+        const double dy = xy[here * 2 + 1] - ay;
+        const double squared = dx * dx + dy * dy;
+        double worst = 0.0;
+        int worstAt = first;
+        for (int index = first + 1; index < last; index++) {
+            here = start + index;
+            if (here >= count) here -= count;
+            const double px = xy[here * 2];
+            const double py = xy[here * 2 + 1];
+            double gap = (px - ax) * (px - ax) + (py - ay) * (py - ay);
+            if (squared > 1e-12) {
+                const double dot = (px - ax) * dx + (py - ay) * dy;
+                if (dot > 0.0) {
+                    double t = 1.0;
+                    if (dot < squared) t = dot / squared;
+                    const double cx = ax + t * dx;
+                    const double cy = ay + t * dy;
+                    gap = (px - cx) * (px - cx) + (py - cy) * (py - cy);
+                }
+            }
+            if (gap > worst) {
+                worst = gap;
+                worstAt = index;
             }
         }
-        if (gap > worst) {
-            worst = gap;
-            worstAt = index;
+        if (sqrt(worst) <= epsilon) continue;
+        if (depth + 3 > capacity) {
+            capacity *= 2;
+            CurveSpan *grown = (CurveSpan *)realloc(stack, capacity * sizeof(CurveSpan));
+            if (grown == NULL) {
+                free(stack);
+                return false;
+            }
+            stack = grown;
         }
+        here = start + worstAt;
+        if (here >= count) here -= count;
+        /* Last in, first out: the stretch before the worst point is walked
+         * whole before the point is kept and the stretch after it begun. */
+        stack[depth++] = (CurveSpan){worstAt, last};
+        stack[depth++] = (CurveSpan){-1, here};
+        stack[depth++] = (CurveSpan){first, worstAt};
     }
-    if (sqrt(worst) <= epsilon) return;
-    curveSimplify(xy, count, start, first, worstAt, kept, keptCount, epsilon);
-    here = start + worstAt;
-    if (here >= count) here -= count;
-    kept[(*keptCount)++] = here;
-    curveSimplify(xy, count, start, worstAt, last, kept, keptCount, epsilon);
+    free(stack);
+    return true;
 }
 
 /* `points_approx(curve, epsilon, closed)` -- `approx_poly_dp` for a curve of
@@ -580,10 +620,13 @@ static bool primPointsApprox(int argc, Value *args, Value *out) {
     const int last = closed ? count : count - 1;
     int keptCount = 0;
     kept[keptCount++] = start;
-    /* Recursion depth is at most the number of points between the ends. */
-    curveSimplify(xy, count, start, 0, last, kept, &keptCount, epsilon);
-    if (!closed) kept[keptCount++] = count - 1;
+    const bool simplified = curveSimplify(xy, count, start, 0, last, kept, &keptCount, epsilon);
     free(xy);
+    if (!simplified) {
+        free(kept);
+        return jaiThrow(vm.cRuntimeError, "points_approx(): out of memory");
+    }
+    if (!closed) kept[keptCount++] = count - 1;
 
     ObjList *made = jaiListNew(keptCount);
     if (made == NULL) {
