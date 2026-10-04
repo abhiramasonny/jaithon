@@ -131,7 +131,16 @@ static bool safepoint(void) {
             }
             /* Given up on per HEAD: a guard that keeps failing on one loop
              * says nothing about the other loops in the same body. */
-            if (form != NULL && form->declines < JAI_OSR_GIVE_UP) {
+            /* No form here yet, but a tick spent on a loop nested in this
+             * one asked for it: compile it now, on this back edge, which is
+             * the one moment the interpreter's state matches the head. */
+            if (form == NULL && jaiJitOsrWanted(f, at)) {
+                jaiJitWantEnclosing(f, at);
+                uint32_t resumeAt = 0;
+                int outcome = jaiJitEnterOsr(top->closure, at, &resumeAt);
+                if (outcome == 2) return false;
+                if (outcome == 1) top->ip = f->chunk.code + resumeAt;
+            } else if (form != NULL && form->declines < JAI_OSR_GIVE_UP) {
                 uint32_t resumeAt = 0;
                 int outcome = jaiJitEnterOsr(top->closure, at, &resumeAt);
 #ifdef JAI_ALLOC_CENSUS

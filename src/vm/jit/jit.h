@@ -136,6 +136,13 @@ void jaiJitStartSampling(void);
  * False when the compiled loop left an exception pending. */
 bool jaiJitSample(ObjClosure *closure, uint32_t offset);
 
+/* Whether the back edge to `top` in `fn` -- a head with no compiled form yet --
+ * should compile one now: a tick landed on a loop nested inside it whose own
+ * form already existed, and spent itself there. Answers true once. */
+bool jaiJitOsrWanted(const ObjFunction *fn, uint32_t top);
+/* Asks for the loop enclosing the one headed at `top`, if it has no form. */
+void jaiJitWantEnclosing(const ObjFunction *fn, uint32_t top);
+
 /* Enter a compiled loop at `targetOffset`, compiling it first if this is the
  * first hot tick to land there. See jit_loop.c for the contract on `ip`. */
 bool jaiJitEnterLoop(ObjClosure *closure, uint32_t targetOffset);

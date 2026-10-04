@@ -295,8 +295,104 @@ static bool jaiJitArmOnFirstTick(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_OSR_PROMOTE: a tick that lands on a loop head which already
+ * has a compiled form asks for the loop around it instead. */
+static bool jitOsrPromote(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_OSR_PROMOTE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The one outstanding request. One slot rather than a field on ObjFunction:
+ * the request is answered at the very next back edge of the enclosing loop,
+ * so there is never more than one worth remembering -- and the pointer is
+ * only compared, never followed, so a function collected in between costs at
+ * most one compile attempt somewhere it would have been harmless anyway. */
+static const ObjFunction *gOsrWantFn;
+static uint32_t gOsrWantTop;
+
+/* The head of the innermost loop that encloses the loop headed at `top`, or
+ * UINT32_MAX. A loop is [head, its back edge]; an enclosing one starts before
+ * `top` and has a back edge after every back edge of `top`'s loop. */
+#if defined(__aarch64__) || defined(__arm64__)
+/* jit_osr.c's, which exists only where the tier does. */
+int instructionLength(const Chunk *c, int off);
+#endif
+
+static uint32_t enclosingLoopTop(const Chunk *c, uint32_t top) {
+#if !(defined(__aarch64__) || defined(__arm64__))
+    (void)c; (void)top;
+    return UINT32_MAX;
+#else
+    uint32_t innerEnd = 0;
+    for (int off = 0; off < c->count;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return UINT32_MAX;
+        if (c->code[off] == OP_LOOP) {
+            int16_t jump = jaiReadI16(c->code + off + 1);
+            if ((uint32_t)((int32_t)(off + 3) + jump) == top) {
+                innerEnd = (uint32_t)off;
+            }
+        }
+        off += len;
+    }
+    if (innerEnd == 0) return UINT32_MAX;
+    uint32_t best = UINT32_MAX;
+    for (int off = 0; off < c->count;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return UINT32_MAX;
+        if (c->code[off] == OP_LOOP && (uint32_t)off > innerEnd) {
+            int16_t jump = jaiReadI16(c->code + off + 1);
+            int32_t to = (int32_t)(off + 3) + jump;
+            if (to >= 0 && (uint32_t)to < top &&
+                (best == UINT32_MAX || (uint32_t)to > best)) {
+                best = (uint32_t)to;
+            }
+        }
+        off += len;
+    }
+    return best;
+#endif
+}
+
+void jaiJitWantEnclosing(const ObjFunction *fn, uint32_t top) {
+    if (!jitOsrPromote()) return;
+    uint32_t outer = enclosingLoopTop(&fn->chunk, top);
+    if (outer == UINT32_MAX) return;
+    for (unsigned i = 0; i < fn->osrCount; i++) {
+        if (fn->osrForms[i].top == outer) return;
+    }
+    gOsrWantFn  = fn;
+    gOsrWantTop = outer;
+}
+
+bool jaiJitOsrWanted(const ObjFunction *fn, uint32_t top) {
+    if (gOsrWantFn == NULL || fn != gOsrWantFn || top != gOsrWantTop) {
+        return false;
+    }
+    gOsrWantFn = NULL;
+    return true;
+}
+
 bool jaiJitSample(ObjClosure *closure, uint32_t offset) {
     ObjFunction *fn = closure->fn;
+    /* A tick on a head that already has a form is a tick the enclosing loop
+     * did not get. The inner form is entered from every one of its back edges
+     * anyway (vm.c's osrHot path), so all the tick buys here is a head that is
+     * already compiled -- while the loop around it, entered once per pass of
+     * the inner one, keeps running interpreted until a tick happens to land
+     * exactly on ITS back edge. mandelbrot's per-pixel loop waited that way
+     * for 0.8M to 8M interpreted instructions a run, which was most of the
+     * run-to-run spread. So the tick is passed outward: the enclosing head is
+     * compiled at its next back edge. */
+    /* And it is passed outward whether or not this head was compiled yet: a
+     * loop hot enough to take a tick sits inside one at least as hot, so the
+     * request cascades one level per back edge (vm.c asks again for the head
+     * it just compiled) instead of waiting a tick per level. */
+    if (fn->tickCount >= JAI_JIT_HOT_TICKS) jaiJitWantEnclosing(fn, offset);
     /* The tick that makes a body hot arrives on a back edge, which is exactly
      * the entry point the attempt below needs -- so spend it, rather than
      * waiting for the next one.
