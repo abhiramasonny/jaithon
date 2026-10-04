@@ -464,21 +464,24 @@ int64_t jitDictGetStr(ObjDict *d, ObjString *key, Value *result,
 }
 
 /* `d[k] = v` with a string key, as a leaf for the reason jitDictGetStr gives.
- * A typed dict goes back to the descriptor path, since jaiCheckKind can raise.
- * An insert can grow the table, but only through JAI_ALLOC, which never
- * collects (collections begin only in jaiGCMaybeCollect). Returns 0 stored,
- * 1 untouched. */
+ * A typed dict checks its kinds with jaiKindAccepts, the pure half of what
+ * jaiDictSet asks jaiCheckKind; a value the dict refuses goes back to the
+ * descriptor path, which raises. An insert can grow the table, but only
+ * through JAI_ALLOC, which never collects (collections begin only in
+ * jaiGCMaybeCollect). Returns 0 stored, 1 untouched. */
 int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
                       int64_t payload) {
+    Value v;
+    v.type = (ValueType)tag;
+    v.as.integer = payload;
     if (JAI_UNLIKELY(d->keyKind != FIELD_KIND_ANY ||
-                     d->valKind != FIELD_KIND_ANY)) {
+                     d->valKind != FIELD_KIND_ANY) &&
+        (!jaiKindAccepts(d->keyKind, OBJ_VAL(key)) ||
+         !jaiKindAccepts(d->valKind, v))) {
         return 1;
     }
     JaiEntry *e = jaiTableFindStr(&d->table, key);
     if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
-    Value v;
-    v.type = (ValueType)tag;
-    v.as.integer = payload;
     if (e != NULL) {
         /* insertAt's update half: the value and the version, nothing else. */
         e->value = v;

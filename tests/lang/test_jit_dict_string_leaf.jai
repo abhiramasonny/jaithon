@@ -2,12 +2,12 @@
 #: compiled code, which answer through a leaf call (jitDictGetStr /
 #: jitDictSetStr) and fall back to the descriptor call for anything the leaf
 #: cannot settle: a key that is not a string, a miss under `d[k]`, a stored key
-#: of another kind whose hash matches, a typed dict.
+#: of another kind whose hash matches, a value a typed dict refuses.
 #:
 #: Each helper is called more than JAI_JIT_THRESHOLD times, so the
 #: whole-function tier compiles it on call count alone, and every answer is
 #: one the interpreter gives too -- `JAITHON_NO_JIT=1` runs the same file.
-# jit-compiles: leaf_bump_words, leaf_sum_present, leaf_total_get, leaf_read_floats, leaf_get_each, leaf_mixed_keys
+# jit-compiles: leaf_bump_words, leaf_sum_present, leaf_total_get, leaf_read_floats, leaf_get_each, leaf_mixed_keys, leaf_bump_typed, leaf_store_any
 from std.test import assert_eq, assert_throws, assert_true
 
 let CALLS = 100
@@ -244,7 +244,7 @@ fn leaf_bump_typed(d: dict[str, int], keys: list[str]) -> void {
     }
 }
 
-pub fn test_a_typed_dict_takes_the_general_path() -> void {
+pub fn test_a_typed_dict() -> void {
     var d: dict[str, int] = {}
     let keys = ["t0", "t1", "t0"]
     var call = 0
@@ -255,6 +255,27 @@ pub fn test_a_typed_dict_takes_the_general_path() -> void {
     assert_eq(d.len(), 2)
     assert_eq(d["t0"], 2 * CALLS)
     assert_eq(d["t1"], CALLS)
+}
+
+fn leaf_store_any(d: dict[str, int], k: str, v: any) -> void {
+    d[k] = v
+}
+
+pub fn test_a_typed_dict_still_refuses_a_wrong_value() -> void {
+    #: The leaf checks the dict's declared kinds itself and hands a refusal
+    #: back to the descriptor call, which raises the interpreter's TypeError.
+    var d: dict[str, int] = {}
+    var call = 0
+    while call < CALLS {
+        leaf_store_any(d, f"n{call % 3}", call)
+        call += 1
+    }
+    assert_eq(d["n0"], 99)
+    let err = assert_throws(TypeError, fn() -> void {
+        leaf_store_any(d, "n1", "not an int")
+    }, "a str stored into a dict[str, int] from a compiled body")
+    assert_true(err.message.contains("int"), "the message names the kind")
+    assert_eq(d["n1"], 97)
 }
 
 fn leaf_touch_while_walking(d: dict[str, int]) -> void {
