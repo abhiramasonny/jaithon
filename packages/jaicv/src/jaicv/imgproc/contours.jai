@@ -24,7 +24,7 @@ import std.math
 from std.os import env
 from std.core import Printable
 from ..core.mat import Mat
-from ..core.types import LINE_8, LINE_AA, Point, Scalar
+from ..core.types import LINE_4, LINE_8, LINE_AA, Point, Scalar
 from .drawing import fill_poly, polylines, Painter, MAX_THICKNESS, XY_ONE, XY_SHIFT
 
 #: Only the outermost contours.
@@ -952,6 +952,16 @@ pub fn draw_contours(
         if not drawn { thick_contours(painter, chosen, offset.x, offset.y, thickness) }
         painter.finish()
         return image
+    }
+    #: A hairline, which is the default, in one primitive call. `polylines`
+    #: is a call, a list of segments and a surface read a contour, and a frame
+    #: of 8239 contours took 22.6 ms against OpenCV's 1.6 that way.
+    if _native_strokes and line_type != LINE_AA {
+        let painter = Painter(image, colour)
+        let connectivity = if line_type == LINE_4 { 4 } else { 8 }
+        let drawn = painter.thin_outlines(chosen, offset.x, offset.y, connectivity)
+        painter.finish()
+        if drawn { return image }
     }
     if offset.x == 0 and offset.y == 0 {
         return polylines(image, chosen, true, colour, thickness, line_type)

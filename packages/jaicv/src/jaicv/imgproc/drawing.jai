@@ -307,6 +307,32 @@ pub class Painter {
         )
     }
 
+    #: Every contour outlined one pixel wide and moved by the offset, in one
+    #: call: what `polylines` draws for a closed hairline, a contour at a time.
+    #: False, with nothing drawn, when a point is not something with integer
+    #: `x` and `y`, and the caller then draws it the long way.
+    pub fn thin_outlines(
+        self,
+        contours: list[list[Point]],
+        offset_x: int,
+        offset_y: int,
+        connectivity: int
+    ) -> bool {
+        return __prim__.draw_outlines(
+            self.target,
+            self.colour,
+            self.cn,
+            self.origin,
+            self.stride,
+            self.cols,
+            self.rows,
+            contours,
+            offset_x,
+            offset_y,
+            connectivity
+        )
+    }
+
     #: Fill `[x1, x2]` on row `y`, inclusive at both ends.
     #:
     #: One call rather than a `plot` a pixel. Every filled shape is made of

@@ -767,10 +767,133 @@ static bool primFillStrokes(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `draw_outlines(target, colour, cn, origin, stride, cols, rows, contours,
+ *  offset_x, offset_y, connectivity)` -- every contour outlined one pixel
+ *  wide, each closed back to its first point, moved by the offset.
+ *
+ * `draw_contours` with a hairline, which is its default: `polylines`, a
+ * `Painter.strokes` a contour building that contour's segments and handing
+ * them to `draw_lines`. A contour is a call, a list and a surface read, and a
+ * frame of contours is thousands of them: 8239 contours took 22.6 ms against
+ * OpenCV's 1.6, nearly all of it the per-contour machinery around segments a
+ * few pixels long. Here it is one call, and the segments are the ones
+ * `strokes` made -- the previous point to the current one, starting from the
+ * last -- walked by the same `clipAndOrient` and `lineWalk`. A single point
+ * is the one-pixel segment `draw_thick` reduces it to.
+ *
+ * Returns false, having drawn nothing, when a point is not an object with
+ * integer `x` and `y`, so the caller can take its own path. Moving a point
+ * by the offset is checked as Jaithon checks it, and throws before anything
+ * is drawn, as building the moved contours did. */
+static bool primDrawOutlines(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *contours;
+    int64_t offsetX, offsetY, connectivity;
+    if (!jaiArgList(args[7], 8, "draw_outlines", &contours)) return false;
+    if (!jaiStrWantInt(args[8], "draw_outlines", "the x offset", &offsetX)) return false;
+    if (!jaiStrWantInt(args[9], "draw_outlines", "the y offset", &offsetY)) return false;
+    if (!jaiStrWantInt(args[10], "draw_outlines", "the connectivity", &connectivity)) return false;
+    if (connectivity != 4 && connectivity != 8) {
+        return jaiThrow(vm.cValueError, "draw_outlines(): connectivity must be 4 or 8, got %lld",
+                        (long long)connectivity);
+    }
+
+    size_t total = 0;
+    for (int c = 0; c < contours->count; c++) {
+        const Value item = jaiListGet(contours, c);
+        if (!IS_LIST(item)) {
+            *out = BOOL_VAL(false);
+            return true;
+        }
+        total += (size_t)AS_LIST(item)->count;
+    }
+    int64_t *ends = (int64_t *)malloc((total > 0 ? total : 1) * 4 * sizeof(int64_t));
+    int64_t *moved = (int64_t *)malloc((total > 0 ? total : 1) * 2 * sizeof(int64_t));
+    if (ends == NULL || moved == NULL) {
+        free(ends);
+        free(moved);
+        return jaiThrow(vm.cRuntimeError, "draw_outlines(): out of memory");
+    }
+
+    /* Every point moved, contour by contour, before anything is drawn. */
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    size_t segments = 0;
+    for (int c = 0; c < contours->count; c++) {
+        ObjList *contour = AS_LIST(jaiListGet(contours, c));
+        const int count = contour->count;
+        for (int i = 0; i < count; i++) {
+            int64_t x, y;
+            if (!jaiReadPoint(&reader, jaiListGet(contour, i), &x, &y)) {
+                free(ends);
+                free(moved);
+                *out = BOOL_VAL(false);
+                return true;
+            }
+            if (__builtin_add_overflow(x, offsetX, &moved[i * 2]) ||
+                __builtin_add_overflow(y, offsetY, &moved[i * 2 + 1])) {
+                free(ends);
+                free(moved);
+                return jaiThrow(vm.cOverflowError, "draw_outlines(): integer overflow");
+            }
+        }
+        if (count == 0) continue;
+        if (count == 1) {
+            /* `draw_thick` takes a lone point through fixed point and back,
+             * which is the point itself unless it is too far out to shift --
+             * and those the caller draws. */
+            const int64_t limit = (int64_t)1 << 46;
+            if (moved[0] <= -limit || moved[0] >= limit || moved[1] <= -limit || moved[1] >= limit) {
+                free(ends);
+                free(moved);
+                *out = BOOL_VAL(false);
+                return true;
+            }
+            int64_t *at = ends + segments * 4;
+            at[0] = moved[0];
+            at[1] = moved[1];
+            at[2] = moved[0];
+            at[3] = moved[1];
+            segments++;
+            continue;
+        }
+        int64_t px = moved[(count - 1) * 2], py = moved[(count - 1) * 2 + 1];
+        for (int i = 0; i < count; i++) {
+            int64_t *at = ends + segments * 4;
+            at[0] = px;
+            at[1] = py;
+            at[2] = moved[i * 2];
+            at[3] = moved[i * 2 + 1];
+            px = at[2];
+            py = at[3];
+            segments++;
+        }
+    }
+    free(moved);
+
+    JaiSurface surface;
+    if (!readSurface(args, 0, "draw_outlines", &surface)) {
+        free(ends);
+        return false;
+    }
+    for (size_t i = 0; i < segments; i++) {
+        const int64_t *at = ends + i * 4;
+        JaiLineWalk walk;
+        if (clipAndOrient(surface.cols, surface.rows, at[0], at[1], at[2], at[3], (int)connectivity,
+                          &walk)) {
+            lineWalk(&walk, &surface);
+        }
+    }
+    free(ends);
+    *out = BOOL_VAL(true);
+    return true;
+}
+
 void jaiRasterRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "fill_span",     primFillSpan,     10, 10);
     jaiStrDefinePrim(ns, "draw_line",     primDrawLine,     12, 12);
     jaiStrDefinePrim(ns, "draw_lines",    primDrawLines,     9, 9);
     jaiStrDefinePrim(ns, "fill_convex",   primFillConvex,   11, 11);
     jaiStrDefinePrim(ns, "fill_strokes",  primFillStrokes,  11, 11);
+    jaiStrDefinePrim(ns, "draw_outlines", primDrawOutlines, 11, 11);
 }
