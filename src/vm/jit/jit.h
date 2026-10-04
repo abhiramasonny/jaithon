@@ -193,6 +193,8 @@ JaiCodeArena *jaiJitArena(void);
  * ambiguous -- `check lib/std` has three hot functions called `init` -- and
  * qualifiedName does not help, because a cached image stores none. */
 const char *jitFnLabel(const ObjFunction *fn);
+void jitPerfMapNote(const void *entry, unsigned words, const ObjFunction *fn,
+                    long top);
 
 /* The capacity both arenas are built at, JAITHON_JIT_ARENA_MB or one mebibyte. */
 size_t jaiCodeArenaDefaultCapacity(void);

@@ -1167,6 +1167,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         }
         return false;
     }
+    jitPerfMapNote(entry, e.count, fn, -1);
 
     if (e.whyNot != NULL && getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s stopped: %s\n",

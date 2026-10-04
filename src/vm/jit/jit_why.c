@@ -7,7 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 #include "vm/jit/jit_internal.h"
 
 /* "module.function", for every diagnostic this tier prints.
@@ -36,6 +38,37 @@ const char *jitFnLabel(const ObjFunction *fn) {
         snprintf(out, WIDTH, "%s", base);
     }
     return out;
+}
+
+/* JAI_JIT_PERFMAP=1: append `start size label` (hex, hex, text) for every body
+ * the tier installs to /tmp/jaithon-perf-<pid>.map, the format perf and most
+ * profilers read for JIT code. A sampling profiler otherwise attributes every
+ * compiled instruction to one anonymous address range -- which on a workload
+ * that runs 70% compiled is the question you came to it with. Output only. */
+void jitPerfMapNote(const void *entry, unsigned words, const ObjFunction *fn,
+                    long top) {
+    static int on = -1;
+    static FILE *fp;
+    if (on < 0) {
+        const char *v = getenv("JAI_JIT_PERFMAP");
+        on = (v != NULL && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+        if (on) {
+            char path[64];
+            snprintf(path, sizeof path, "/tmp/jaithon-perf-%d.map",
+                     (int)getpid());
+            fp = fopen(path, "w");
+            if (fp == NULL) on = 0;
+        }
+    }
+    if (!on || entry == NULL) return;
+    if (top >= 0) {
+        fprintf(fp, "%lx %x %s@osr%ld\n", (unsigned long)(uintptr_t)entry,
+                words * 4u, jitFnLabel(fn), top);
+    } else {
+        fprintf(fp, "%lx %x %s\n", (unsigned long)(uintptr_t)entry,
+                words * 4u, jitFnLabel(fn));
+    }
+    fflush(fp);
 }
 
 #if (defined(__aarch64__) || defined(__arm64__))
