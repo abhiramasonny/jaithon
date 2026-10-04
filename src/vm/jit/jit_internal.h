@@ -1088,10 +1088,7 @@ void jitOsrPicShort(int siteCache, unsigned ways, SlotKind rkind);
  * it the slow way for the rest of the run (jit_osr.c). */
 bool jitOsrColdWait(Emit *e, const ObjFunction *cfn);
 bool jitPicUpgradeOn(void);
-/* JAITHON_JIT_POLY_LOOP: a non-head `for x in xs` over a list of several
- * classes binds `x` unpinned rather than pinning the first element's class
- * and deoptimising on every other. */
-bool jitPolyLoopOn(void);
+
 bool offsetIsBranchTarget(const Chunk *c, uint32_t off);
 bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
                               int64_t *out);

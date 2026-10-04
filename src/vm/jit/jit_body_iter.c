@@ -10,7 +10,10 @@
 
 #if (defined(__aarch64__) || defined(__arm64__))
 
-bool jitPolyLoopOn(void) {
+/* JAITHON_JIT_POLY_LOOP: a non-head `for x in xs` over a list of several
+ * classes binds `x` unpinned rather than pinning the first element's class
+ * and deoptimising on every other. */
+static bool jitPolyLoopOn(void) {
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("JAITHON_JIT_POLY_LOOP");
