@@ -95,8 +95,20 @@ note() { echo "$1 $2"; [ "$1" = "FAIL" ] && fail=1; return 0; }
 
 expected=$'59334\n9017'
 "$JAITHON" run "$work/reshape.jai" >/dev/null 2>&1   # warm the cache
+
+# The answer holds in whatever mode the caller runs the suite in.
+answer=$("$JAITHON" run "$work/reshape.jai" 2>&1)
+if [ "$answer" != "$expected" ]; then
+    note FAIL "inherited mode printed '$answer'"
+else
+    note ok "inherited mode prints the right answer"
+fi
+
+# The instruction bound is a property of the compiled tiers, so it is checked
+# with the modes that keep a loop interpreted by design cleared.
 for tick in 50 100; do
-    out=$(JAITHON_JIT_TICK_US=$tick "$JAITHON" run --stats "$work/reshape.jai" 2>&1)
+    out=$(env -u JAITHON_NO_JIT -u JAITHON_JIT_DEOPT_STRESS \
+          JAITHON_JIT_TICK_US=$tick "$JAITHON" run --stats "$work/reshape.jai" 2>&1)
     answer=$(printf '%s\n' "$out" | grep -E '^[0-9]+$')
     interp=$(printf '%s\n' "$out" | sed -n 's/^vm: \([0-9]*\) instructions.*/\1/p')
     if [ "$answer" != "$expected" ]; then
