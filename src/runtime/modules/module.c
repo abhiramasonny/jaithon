@@ -1144,13 +1144,20 @@ void jaiModuleNameFor(const char *path, char *out, size_t outSize) {
  * The C walked the graph itself, over trees the C parser built. The front end
  * answers the same question -- `import_cycles` in lib/jaithon/compile/mod.jai --
  * so the walk went with the parser that fed it. */
+/*
+ * `fileId` is the id the compile that follows will be handed. Passing it lets
+ * the front end parse the entry file once under that id and keep the tree for
+ * `compile_source`, instead of parsing the file here and again there -- a
+ * fifth of `check`. The bag argument stays null, as it was. */
 static void checkImportCycles(const char *path, int fileId) {
-    (void)fileId;
-    Value arg = OBJ_VAL(jaiStringInternC(path));
-    jaiPushRoot(arg);
+    Value args[3];
+    args[0] = OBJ_VAL(jaiStringInternC(path));
+    args[1] = NULL_VAL;
+    args[2] = INT_VAL(fileId);
+    jaiPushRoot(args[0]);
     Value produced = NULL_VAL;
-    bool asked = jaiFrontEndInvoke(JAI_SELF_HOSTED_MODULE, "import_cycles", 1,
-                                   &arg, &produced);
+    bool asked = jaiFrontEndInvoke(JAI_SELF_HOSTED_MODULE, "import_cycles", 3,
+                                   args, &produced);
     jaiPopRoot();
     if (!asked) return;
 
