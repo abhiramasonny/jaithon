@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
@@ -246,6 +247,150 @@ unarmedOpcode:
     return JIT_ARM_UNARMED;
 }
 
+/* JAITHON_JIT_FMT_LEAF=0 sends every f-string back through its descriptor
+ * call, for a one-binary A/B of emitFormatLeaf. */
+static bool jitFmtLeafOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FMT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_FMT_INT_LEAF=0 sends the one-int-hole shape to the general
+ * f-string leaf too, for a one-binary A/B of jaiValueFormatIntLeaf. */
+static bool jitFormatIntLeaf(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FMT_INT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The f-string through jaiValueFormatLeaf, in front of the descriptor call to
+ * jitFormat, which stays behind it as the slow path -- the same layout as the
+ * dict leaves (see emitDictLeafGet):
+ *
+ *        args <- the parts;  blr jaiValueFormatLeaf
+ *        NULL ---------------------------------------\
+ *        result <- x0;  b done                         |
+ *   slow: <the descriptor call, unchanged>  <---------/
+ *   done: <load the result out of the descriptor>
+ *
+ * The leaf never collects, so the parts are written as plain arguments and
+ * nothing is rooted: no root fill, no root-range push and pop, no wrapper.
+ * Emitted only when every part is something formatShortInto renders or may
+ * be (an int, a bool, an object that may be a string), since a part it cannot
+ * render would take the slow path every time and pay for both. */
+static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitFmtLeafOn() || !jaiValueFormatShortOn() || e->inlining) return;
+    if (parts > JIT_MAX_ARGS_OUT || e->valueDepth < parts) return;
+    unsigned first = e->depth - parts;
+    size_t seen = 0;
+    for (unsigned i = 0; i < parts; i++) {
+        SlotKind k = e->stack[first + i];
+        if (k != SLOT_INT && k != SLOT_BOOL && k != SLOT_OBJ &&
+            k != SLOT_MAYBE_OBJ) {
+            return;
+        }
+        /* A literal part's sample is the pool's own string (OP_CONST pushes
+         * it as one), so its length is a fact; a local's is the value it held
+         * when the body was compiled, a prediction. An int is at least one
+         * digit. */
+        Value v = e->stackSeen[first + i];
+        if (IS_STRING(v)) {
+            seen += AS_STRING(v)->length;
+        } else if (k == SLOT_INT) {
+            seen += 1;
+        }
+    }
+    /* A result already past the short limit on what the compiler can see:
+     * the leaf would copy up to the limit, give up and leave the work to the
+     * descriptor path, every time -- the log line, the message, the path
+     * built with an f-string. A site whose samples were long and whose later
+     * values are short loses only the leaf, never an answer. */
+    if (seen > JAI_INTERN_MAX) return;
+    unsigned vfirst = e->valueDepth - parts;
+    for (unsigned i = 0; i < parts; i++) {
+        if (!leafRegOk(valueXReg(e, vfirst + i))) return;
+    }
+    unsigned argsAt = e->descOffset + (unsigned)offsetof(JitCallDesc, args);
+    unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+    if (argsAt > 4095u) return;
+    fpSyncAll(e);
+    settleAll(e);
+
+    /* One int hole between at most one object on either side -- `f"k{i}"`
+     * and its kin -- goes to jaiValueFormatIntLeaf in three registers; the
+     * leaf checks that the objects are strings. Everything else writes its
+     * parts out for the general leaf. */
+    int hole = -1;
+    bool oneIntHole = parts <= 3 && jitFormatIntLeaf();
+    for (unsigned i = 0; i < parts && oneIntHole; i++) {
+        SlotKind k = e->stack[first + i];
+        if (k == SLOT_INT) {
+            if (hole >= 0) oneIntHole = false;
+            hole = (int)i;
+        } else if (k != SLOT_OBJ) {
+            oneIntHole = false;
+        }
+    }
+    if (oneIntHole && hole >= 0 && (parts - (unsigned)hole) <= 2u &&
+        hole <= 1) {
+        unsigned rPre = hole == 1 ? valueXReg(e, vfirst) : 31u;
+        unsigned rN = valueXReg(e, vfirst + (unsigned)hole);
+        unsigned rPost = (unsigned)hole + 1 < parts
+                             ? valueXReg(e, vfirst + (unsigned)hole + 1)
+                             : 31u;
+        /* `mov x, xzr` is the NULL for an absent run; register 31 here is
+         * the zero register, which jaiA64MovX encodes as `orr x, xzr, xzr`. */
+        emit(e, jaiA64MovX(0, rPre));
+        emit(e, jaiA64MovX(1, rN));
+        emit(e, jaiA64MovX(2, rPost));
+        emitConst64(e, JIT_SCRATCH_A,
+                    (int64_t)(uintptr_t)&jaiValueFormatIntLeaf);
+    } else {
+        for (unsigned i = 0; i < parts; i++) {
+            unsigned reg = valueXReg(e, vfirst + i);
+            unsigned at = argsAt + i * (unsigned)sizeof(Value);
+            emitTagFor(e, e->stack[first + i], reg, JIT_SCRATCH_B,
+                       JIT_SCRATCH_A);
+            emit(e, jaiA64StrW(JIT_SCRATCH_B, 31, at));
+            emit(e, jaiA64StrX(reg, 31, at + 8));
+        }
+        emit(e, jaiA64AddXImm(0, 31, argsAt));
+        emit(e, jaiA64MovzX(1, parts, 0));
+        emitConst64(e, JIT_SCRATCH_A,
+                    (int64_t)(uintptr_t)&jaiValueFormatLeaf);
+    }
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    fx->slow[0] = (int)e->count;
+    fx->cond[0] = JAI_A64_EQ;
+    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    /* Straight into the register the result will occupy -- the first part's,
+     * once the parts are popped and the string pushed -- and past the load
+     * the descriptor path ends with (emitFormat places the join after it).
+     * Through the descriptor it was two stores and a load on the way from
+     * the leaf to whatever consumes the string, a store-forwarding round
+     * trip on the path that runs on into the dict probe. */
+    if (jitLeafInReg()) {
+        emit(e, jaiA64MovX(valueXReg(e, vfirst), 0));
+    } else {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
+        emit(e, jaiA64StrX(0, 31, rat + 8));
+    }
+    fx->done = (int)e->count;
+    emit(e, jaiA64B(0));
+    fx->on = true;
+}
+
 bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp) {
     int off = *offp;
     do {
@@ -269,28 +414,14 @@ bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp) {
                 return false;
             }
         }
-        /* The leaf first (see jitFormatLeaf), the rooted descriptor only
-         * when it declines; both leave the string in the descriptor's
-         * result. */
-        unsigned skipSlow = 0;
-        bool leaf = jitFormatLeafOn() && !e->inlining;
-        if (leaf) {
-            if (!emitDescriptorFull(e, NULL_VAL, e->depth - parts, parts,
-                                    (void *)&jitFormatLeaf, true, -1, true)) {
-                return false;
-            }
-            emit(e, jaiA64SubsXImm(31, 0, 0));
-            skipSlow = e->count;
-            emit(e, jaiA64BCond(JAI_A64_EQ, 0));   /* patched below */
-        }
+        LeafFix ffx;
+        emitFormatLeaf(e, parts, &ffx);
+        leafSlowHere(e, &ffx);
         if (!emitDescriptor(e, NULL_VAL, e->depth - parts, parts,
                             (void *)&jitFormat)) {
             return false;
         }
-        if (leaf && skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
-            e->code[skipSlow] =
-                jaiA64BCond(JAI_A64_EQ, (int32_t)(e->count - skipSlow));
-        }
+        if (!jitLeafInReg()) leafDoneHere(e, &ffx);
         for (unsigned i = 0; i < parts; i++) {
             unsigned drop;
             if (!popValue(e, &drop, NULL)) return false;
@@ -304,6 +435,8 @@ bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp) {
         emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
                            e->descOffset +
                                (unsigned)offsetof(JitCallDesc, result) + 8));
+        /* After the load: the leaf put its answer in this register itself. */
+        if (jitLeafInReg()) leafDoneHere(e, &ffx);
         e->wroteHeap = true;
         /* count u8, litmask u24, name u24, cache u16 -- nine after the
          * opcode. */

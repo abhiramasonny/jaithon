@@ -253,7 +253,47 @@ char  *jaiBufTakeCString(JaiBuf *b, size_t *outLen);
 /* ------------------------------------------------------------------ */
 
 uint64_t jaiHashBytes(const void *data, size_t len);   /* FNV-1a 64 */
+
+/* jaiHashBytes itself (memory.c returns this), for the few hot paths that hash
+ * a short string they have just built and want no call: the f-string
+ * formatter's intern probe. One definition, so the two cannot drift. */
+static inline uint64_t jaiHashBytesInline(const void *data, size_t len) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const uint8_t *p = (const uint8_t *)data;
+
+    if (p == NULL) return hash;
+
+    while (len >= 4) {
+        hash ^= (uint64_t)p[0];
+        hash *= UINT64_C(1099511628211);
+        hash ^= (uint64_t)p[1];
+        hash *= UINT64_C(1099511628211);
+        hash ^= (uint64_t)p[2];
+        hash *= UINT64_C(1099511628211);
+        hash ^= (uint64_t)p[3];
+        hash *= UINT64_C(1099511628211);
+        p += 4;
+        len -= 4;
+    }
+
+    while (len-- != 0) {
+        hash ^= (uint64_t)*p++;
+        hash *= UINT64_C(1099511628211);
+    }
+
+    return hash;
+}
 uint64_t jaiHashU64(uint64_t x);                       /* splitmix64 finaliser */
+
+/* jaiHashU64 itself (memory.c returns this), for the int-keyed dict leaves. */
+static inline uint64_t jaiHashU64Inline(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return x;
+}
 uint32_t jaiCrc32(const void *data, size_t len);
 uint32_t jaiCrc32Table(const void *data, size_t len);
 

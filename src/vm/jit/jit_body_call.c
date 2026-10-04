@@ -1119,6 +1119,17 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                     if (probe == NULL) return false;
                     oseen = OBJ_VAL((Obj *)probe);
                     oProbe = true;
+                } else if (jitDictProbeOn() &&
+                           e->stackObjType[ridx] == (uint8_t)(OBJ_DICT + 1)) {
+                    /* A predicted dict: what `var d = {}` in this body
+                     * leaves its local holding, since OP_BUILD_DICT records
+                     * the type and there is no live dict to sample until
+                     * the body runs. `counts.get(w, 0)` on such a local
+                     * declined the whole function. The probe is one empty
+                     * dict made once and held as a permanent root, so it
+                     * outlives every use below; the receiver's type is
+                     * guarded at run time either way. */
+                    oseen = OBJ_VAL((Obj *)jitDictProbe());
                 } else {
                     /* Naming the method is what priced this: the census
                      * showed `.len()` and nothing else, and the attribution
@@ -1335,10 +1346,37 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                 break;
             }
 
+            /* `d[k] = d.get(k, n) + c` as one leaf, when the statement is
+             * exactly that; the unfused code below stays as its fallback.
+             * See emitDictAddFused. */
+            if (OBJ_TYPE(oseen) == OBJ_DICT && argc == 2 && !odiscarded &&
+                AS_STRING(oname)->length == 3 &&
+                memcmp(AS_STRING(oname)->chars, "get", 3) == 0) {
+                (void)emitDictAddFused(e, &fn->chunk, off, count, ridx);
+            }
+            /* `d.get(k)` / `d.get(k, default)` with a string key: the leaf
+             * answers in place and this descriptor call stays behind it as
+             * the slow path. See emitDictLeafGet. */
+            LeafFix ofx;
+            ofx.on = false;
+            if (OBJ_TYPE(oseen) == OBJ_DICT && (argc == 1 || argc == 2) &&
+                AS_STRING(oname)->length == 3 &&
+                memcmp(AS_STRING(oname)->chars, "get", 3) == 0 &&
+                dictLeafKeyAt(e, ridx + 1) &&
+                holdsRegister(e->stack[ridx + argc])) {
+                unsigned vd = e->valueDepth;
+                emitDictLeafGet(e, valueXReg(e, vd - argc - 1),
+                                valueXReg(e, vd - argc), e->stack[ridx + 1],
+                                argc == 2 ? (int)(vd - 1) : -1,
+                                argc == 2 ? e->stack[ridx + 2] : SLOT_NULL,
+                                false, &ofx);
+            }
+            leafSlowHere(e, &ofx);
             if (!emitDescriptor(e, onative, ridx, argc + 1,
                                 (void *)&jitInvokeNative)) {
                 return false;
             }
+            leafDoneHere(e, &ofx);
             for (unsigned i = 0; i <= argc; i++) {
                 unsigned r;
                 if (!popValue(e, &r, NULL)) return false;

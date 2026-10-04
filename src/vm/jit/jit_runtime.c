@@ -5,6 +5,7 @@
 /* For jaiJitFieldReadFor: which builtins are one load from their receiver. */
 #include "vm/jit/jit_field_read.h"
 #include "vm/gc.h"
+#include "vm/table_inline.h"
 /* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
 /* For jaiOpBranchOperandAt: says which opcodes carry a branch target. */
 #include "vm/vm.h"
@@ -383,6 +384,19 @@ int jitMakeItemsIter(JitCallDesc *d) {
     return it != NULL ? 0 : 1;
 }
 
+/* OP_GET_ITER on a dict, for compiled code: the ITER_DICT_KEYS iterator
+ * `for k in d` walks, which is what jaiGetIter builds for a dict. The emitted
+ * guard has already proved the receiver is a dict; the test here is the same
+ * belt-and-braces jitMakeItemsIter carries. */
+int jitMakeDictKeysIter(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    Value src = d->args[0];
+    ObjIter *it = IS_DICT(src) ? jaiIterNew(ITER_DICT_KEYS, src) : NULL;
+    if (it != NULL) d->result = OBJ_VAL(it);
+    jaiGCPopRootRange();
+    return it != NULL ? 0 : 1;
+}
+
 /* OP_INVOKE's lazy `xs.enumerate()` head, for compiled code: the same
  * ITER_LIST_ENUM snapshot the interpreter builds at that site (vm.c), so the
  * pair loop that follows walks the same thing under either tier. The emitted
@@ -401,43 +415,6 @@ int jitMakeEnumIter(JitCallDesc *d) {
     ObjIter *it = jaiIterNewListEnum(AS_LIST(src));
     d->result = OBJ_VAL(it);
     jaiGCPopRootRange();
-    return 0;
-}
-
-/* JAITHON_JIT_FORMAT_LEAF=0 formats every f-string through the rooted
- * jitFormat descriptor again. */
-bool jitFormatLeafOn(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("JAITHON_JIT_FORMAT_LEAF");
-        cached = (v != NULL && v[0] == '0') ? 0 : 1;
-    }
-    return cached != 0;
-}
-
-/* jitFormat without the roots: 0 with d->result set, or 2 to decline. It
- * declines when a collection is wanted, and for any part that is not a
- * string, an int, a float, a bool or null -- every other part is rendered by
- * code that may call into the program. What is left is jaiValueFormat's own
- * fast path, which makes at most the one result string: with no collection
- * wanted that allocation cannot collect, so nothing the body holds needs
- * rooting. The rooted descriptor stores one word per live object in the body
- * and pushes them, per f-string. */
-int jitFormatLeaf(JitCallDesc *d) {
-    if (JAI_UNLIKELY(jaiGCWanted())) return 2;
-    const int count = (int)d->argc;
-    if (count <= 0 || count > JAI_FMT_MAX_PARTS) return 2;
-    for (int i = 0; i < count; i++) {
-        const Value v = d->args[i];
-        if (IS_OBJ(v) ? !IS_STRING(v)
-                      : !(IS_INT(v) || IS_FLOAT(v) || IS_BOOL(v) ||
-                          IS_NULL(v))) {
-            return 2;
-        }
-    }
-    ObjString *formatted = jaiValueFormat(d->args, count);
-    if (formatted == NULL) return 2;
-    d->result = OBJ_VAL(formatted);
     return 0;
 }
 
@@ -565,45 +542,6 @@ ObjIter *jitIterAlloc(Obj *source) {
 #endif
 }
 
-/* JAITHON_JIT_SLICE_LEAF=0 cuts every string slice through the jitGetSlice
- * descriptor again. */
-bool jitSliceLeafOn(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("JAITHON_JIT_SLICE_LEAF");
-        cached = (v != NULL && v[0] == '0') ? 0 : 1;
-    }
-    return cached != 0;
-}
-
-/* `s[a:b]`, `s[a:]` and `s[:b]` on a string whose every scalar is one byte,
- * as a leaf: NULL whenever the general path is needed -- a collection is
- * wanted (so nothing here may allocate through one), the scalar count is not
- * known to equal the byte count, or the slice is empty. The bounds are
- * clamped exactly as jaiSliceGet's sliceBounds and sliceCount do for step 1,
- * and the result is what jaiStringSlice returns for the same ASCII case: the
- * table singleton for one character, jaiStringNew otherwise -- which, with no
- * collection wanted, allocates without collecting. A token cut out of a line
- * paid the descriptor's stores, a root push and three Value unpackings for a
- * few bytes of copy. */
-ObjString *jitStrSliceLeaf(ObjString *s, int64_t start, int64_t stop,
-                           int64_t flags) {
-    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
-    if (s == NULL || s->scalars != s->length) return NULL;
-    const int64_t n = (int64_t)s->length;
-    if ((flags & 1) == 0) start = 0;
-    if ((flags & 2) == 0) stop = n;
-    if (n <= 0) return NULL;
-    if (start < 0) start = start < -n ? 0 : start + n;
-    else if (start > n) start = n;
-    if (stop < 0) stop = stop < -n ? 0 : stop + n;
-    else if (stop > n) stop = n;
-    if (stop <= start) return NULL;
-    const int64_t count = stop - start;
-    if (count == 1) return jaiStringChar((unsigned char)s->chars[start]);
-    return jaiStringNew(s->chars + start, (size_t)count);
-}
-
 int jitNewInstance(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));
@@ -646,6 +584,355 @@ int jitSetIndexDict(JitCallDesc *d) {
     (void)jaiDictSet(AS_DICT(d->args[0]), d->args[1], d->args[2]);
     jaiGCPopRootRange();
     return vm.hasException ? 1 : 0;
+}
+
+/* JAITHON_JIT_DICT_PROBE=0 refuses a dict the model knows only by its
+ * predicted type (stackObjType), as the tier did before, for a one-binary
+ * A/B: an invoke on one, a store into one, `in` against one. */
+bool jitDictProbeOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_PROBE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The exemplar a predicted dict is compiled against: empty, made once, and a
+ * permanent root, so a model entry may hold it for as long as any compile
+ * runs. Nothing writes to it -- compiled code guards the real receiver's type
+ * and works on that. */
+ObjDict *jitDictProbe(void) {
+    static ObjDict *probe;
+    if (probe == NULL) {
+        probe = jaiDictNew();
+        jaiGCAddPermanentRoot(OBJ_VAL((Obj *)probe));
+    }
+    return probe;
+}
+
+/* JAITHON_JIT_DICT_LEAF=0 sends every dict read and store back through its
+ * descriptor call, for a one-binary A/B of the leaves below. */
+bool jitDictLeaf(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* `d.get(k)`, `d.get(k, default)` and `d[k]` with a string key, called as a
+ * LEAF: no descriptor, no root range, no native dispatch. jaiTableFindStr and
+ * its quick form run no user code, allocate nothing and cannot raise, so nothing here can
+ * collect and the operands need no rooting -- the same argument
+ * jitInstanceAlloc and jaiStringOrder rest on.
+ *
+ * What it replaces is not the probe but everything around it: the descriptor's
+ * stores and root fill, a root-range push and pop, and
+ * jitInvokeNative -> callNativeAt -> dictGet -> jaiTableGet, each re-checking
+ * what the guards in front of this call already proved. That was ~200
+ * instructions around a ~20-instruction probe.
+ *
+ * Returns 0 with `*result` written, and 1 -- having written nothing -- when
+ * only the descriptor path can answer: a stored key whose hash matches and
+ * which is not a string, or an absent key when `defTag` is
+ * JIT_DICT_ABSENT_SLOW (`d[k]`, whose miss raises the interpreter's own
+ * KeyError). An absent key otherwise answers the default the caller passed as
+ * a tag and payload. */
+JAI_INLINE int64_t dictGetAnswer(JaiEntry *e, Value *result, uint64_t defTag,
+                                  int64_t defPayload) {
+    if (e != NULL) {
+        *result = e->value;
+        return 0;
+    }
+    if (defTag == JIT_DICT_ABSENT_SLOW) return 1;
+    Value v;
+    v.type = (ValueType)defTag;
+    v.as.integer = defPayload;
+    *result = v;
+    return 0;
+}
+
+/* What jaiTableFindStrQuick could not settle -- a lazy hash, a byte compare --
+ * through the full probe. Its own function, reached by a tail call, so that
+ * the fast path above it has no call in it and so no frame. */
+static JAI_NOINLINE int64_t dictGetStrSlow(ObjDict *d, ObjString *key,
+                                           Value *result, uint64_t defTag,
+                                           int64_t defPayload) {
+    JaiEntry *e = jaiTableFindStr(&d->table, key);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    return dictGetAnswer(e, result, defTag, defPayload);
+}
+
+int64_t jitDictGetStr(ObjDict *d, ObjString *key, Value *result,
+                      uint64_t defTag, int64_t defPayload) {
+    JaiEntry *e = jaiTableFindStrQuick(&d->table, key);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) {
+        return dictGetStrSlow(d, key, result, defTag, defPayload);
+    }
+    return dictGetAnswer(e, result, defTag, defPayload);
+}
+
+/* `d[k] = v` with a string key, as a leaf for the reason jitDictGetStr gives.
+ * A typed dict checks its kinds with jaiKindAccepts, the pure half of what
+ * jaiDictSet asks jaiCheckKind; a value the dict refuses goes back to the
+ * descriptor path, which raises. An insert can grow the table, but only
+ * through JAI_ALLOC, which never collects (collections begin only in
+ * jaiGCMaybeCollect). Returns 0 stored, 1 untouched.
+ *
+ * Split the same way as jitDictGetStr: the update of a key already present,
+ * which is what a counting loop does on every iteration but the first, is the
+ * call-free fast path, and everything else -- a typed dict, an insert, a probe
+ * the quick form could not settle -- is one tail call away. */
+static JAI_NOINLINE int64_t dictSetStrSlow(ObjDict *d, ObjString *key,
+                                           uint64_t tag, int64_t payload) {
+    Value v;
+    v.type = (ValueType)tag;
+    v.as.integer = payload;
+    if (JAI_UNLIKELY(d->keyKind != FIELD_KIND_ANY ||
+                     d->valKind != FIELD_KIND_ANY) &&
+        (!jaiKindAccepts(d->keyKind, OBJ_VAL(key)) ||
+         !jaiKindAccepts(d->valKind, v))) {
+        return 1;
+    }
+    JaiEntry *e = jaiTableFindStr(&d->table, key);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    if (e != NULL) {
+        /* insertAt's update half: the value and the version, nothing else. */
+        e->value = v;
+        ++d->table.version;
+        return 0;
+    }
+    /* Through jaiStringHash, never `key->hash`: an empty table answers NULL
+     * before the probe has forced the lazy hash, and a long run-time string
+     * still holds zero there -- filing it under 0 made the next lookup of an
+     * equal key miss and insert a second copy. */
+    (void)jaiTableSetHashed(&d->table, OBJ_VAL(key), jaiStringHash(key), v);
+    return 0;
+}
+
+int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
+                      int64_t payload) {
+    if (JAI_LIKELY(d->keyKind == FIELD_KIND_ANY &&
+                   d->valKind == FIELD_KIND_ANY)) {
+        JaiEntry *e = jaiTableFindStrQuick(&d->table, key);
+        if (JAI_LIKELY(e != NULL && e != JAI_TABLE_SLOW)) {
+            e->value.type = (ValueType)tag;
+            e->value.as.integer = payload;
+            ++d->table.version;
+            return 0;
+        }
+    }
+    return dictSetStrSlow(d, key, tag, payload);
+}
+
+/* The insert half of jitDictAddStr, and its typed-dict check, out of line so
+ * the update of a key already present -- every iteration of a counting loop
+ * but the first for each key -- is a leaf with no frame. */
+static JAI_NOINLINE int64_t dictAddStrSlow(ObjDict *d, ObjString *key,
+                                           int64_t defPayload,
+                                           int64_t addend,
+                                           int64_t absentSlow) {
+    if (d->keyKind != FIELD_KIND_ANY || d->valKind != FIELD_KIND_ANY) {
+        if (!jaiKindAccepts(d->keyKind, OBJ_VAL(key)) ||
+            !jaiKindAccepts(d->valKind, INT_VAL(0))) {
+            return 1;
+        }
+    }
+    JaiEntry *e = jaiTableFindStr(&d->table, key);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    int64_t base = defPayload;
+    if (e != NULL) {
+        if (e->value.type != VAL_INT) return 1;
+        base = e->value.as.integer;
+    } else if (absentSlow != 0) {
+        return 1;
+    }
+    int64_t sum;
+    if (__builtin_add_overflow(base, addend, &sum)) return 1;
+    if (e != NULL) {
+        e->value = INT_VAL(sum);
+        ++d->table.version;
+        return 0;
+    }
+    (void)jaiTableSetHashed(&d->table, OBJ_VAL(key), jaiStringHash(key),
+                            INT_VAL(sum));
+    return 0;
+}
+
+/* `d[k] = d.get(k, n) + c` -- the counting idiom, `counts[w] =
+ * counts.get(w, 0) + 1` -- in one leaf, for an int default and an int
+ * constant step: the entry's int value (or the default, for an absent key)
+ * plus the step, stored back. One probe where the unfused form makes two, and
+ * one call where it makes two, with the read, the add and the store between
+ * them done here.
+ *
+ * `d[k] += c` is the same leaf with `absentSlow` set: there is no default, and
+ * an absent key is the KeyError the unfused read raises.
+ *
+ * Returns 0 done, and 1 having written nothing whenever the unfused sequence
+ * would do something else: a container that is not a dict, a key that is not
+ * a string, a value that is not an int, an add that overflows (which raises),
+ * a typed dict that refuses, a probe the quick form cannot settle. The caller
+ * then runs that sequence.
+ * Leaf-safe for the reasons jitDictSetStr gives: nothing here runs user code,
+ * raises, or allocates an object. */
+int64_t jitDictAddStr(Obj *dictObj, Obj *keyObj, int64_t defPayload,
+                      int64_t addend, int64_t absentSlow) {
+    if (JAI_UNLIKELY(dictObj->type != OBJ_DICT ||
+                     keyObj->type != OBJ_STRING)) {
+        return 1;
+    }
+    ObjDict *d = (ObjDict *)dictObj;
+    ObjString *key = (ObjString *)keyObj;
+    if (JAI_LIKELY(d->keyKind == FIELD_KIND_ANY &&
+                   d->valKind == FIELD_KIND_ANY)) {
+        JaiEntry *e = jaiTableFindStrQuick(&d->table, key);
+        if (JAI_LIKELY(e != NULL && e != JAI_TABLE_SLOW &&
+                       e->value.type == VAL_INT)) {
+            int64_t sum;
+            if (__builtin_add_overflow(e->value.as.integer, addend, &sum)) {
+                return 1;
+            }
+            e->value.as.integer = sum;
+            ++d->table.version;
+            return 0;
+        }
+    }
+    return dictAddStrSlow(d, key, defPayload, addend, absentSlow);
+}
+
+/* The int-keyed dict leaves: jitDictGetStr, jitDictSetStr, jitDictHasStr and
+ * jitDictAddStr for a key the compiled code holds as an int, with the same
+ * contracts. Every probe is jaiTableFindIntQuick, and whatever it cannot
+ * settle -- a hash-equal key of another kind, which only the general path's
+ * equality may judge -- is the descriptor call, never a guess. */
+int64_t jitDictGetInt(ObjDict *d, int64_t key, Value *result, uint64_t defTag,
+                      int64_t defPayload) {
+    JaiEntry *e = jaiTableFindIntQuick(&d->table, key,
+                                       jaiHashU64Inline((uint64_t)key));
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    return dictGetAnswer(e, result, defTag, defPayload);
+}
+
+static JAI_NOINLINE int64_t dictSetIntSlow(ObjDict *d, int64_t key,
+                                           uint64_t tag, int64_t payload) {
+    Value v;
+    v.type = (ValueType)tag;
+    v.as.integer = payload;
+    if (!jaiKindAccepts(d->keyKind, INT_VAL(key)) ||
+        !jaiKindAccepts(d->valKind, v)) {
+        return 1;
+    }
+    const uint64_t hash = jaiHashU64Inline((uint64_t)key);
+    JaiEntry *e = jaiTableFindIntQuick(&d->table, key, hash);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    if (e != NULL) {
+        e->value = v;
+        ++d->table.version;
+        return 0;
+    }
+    (void)jaiTableSetHashed(&d->table, INT_VAL(key), hash, v);
+    return 0;
+}
+
+int64_t jitDictSetInt(ObjDict *d, int64_t key, uint64_t tag, int64_t payload) {
+    if (JAI_UNLIKELY(d->keyKind != FIELD_KIND_ANY ||
+                     d->valKind != FIELD_KIND_ANY)) {
+        return dictSetIntSlow(d, key, tag, payload);
+    }
+    const uint64_t hash = jaiHashU64Inline((uint64_t)key);
+    JaiEntry *e = jaiTableFindIntQuick(&d->table, key, hash);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    Value v;
+    v.type = (ValueType)tag;
+    v.as.integer = payload;
+    if (e != NULL) {
+        e->value = v;
+        ++d->table.version;
+        return 0;
+    }
+    /* After a NULL from the quick probe the insert walks the same slots and
+     * meets no hash-equal key, so it compares nothing. */
+    (void)jaiTableSetHashed(&d->table, INT_VAL(key), hash, v);
+    return 0;
+}
+
+int64_t jitDictHasInt(Obj *container, int64_t key, Value *result,
+                      int64_t negate) {
+    if (container->type != OBJ_DICT) return 1;
+    JaiEntry *e = jaiTableFindIntQuick(&((ObjDict *)container)->table, key,
+                                       jaiHashU64Inline((uint64_t)key));
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    *result = BOOL_VAL((e != NULL) != (negate != 0));
+    return 0;
+}
+
+static JAI_NOINLINE int64_t dictAddIntSlow(ObjDict *d, int64_t key,
+                                           int64_t defPayload, int64_t addend,
+                                           int64_t absentSlow) {
+    if (!jaiKindAccepts(d->keyKind, INT_VAL(key)) ||
+        !jaiKindAccepts(d->valKind, INT_VAL(0))) {
+        return 1;
+    }
+    const uint64_t hash = jaiHashU64Inline((uint64_t)key);
+    JaiEntry *e = jaiTableFindIntQuick(&d->table, key, hash);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    int64_t base = defPayload;
+    if (e != NULL) {
+        if (e->value.type != VAL_INT) return 1;
+        base = e->value.as.integer;
+    } else if (absentSlow != 0) {
+        return 1;
+    }
+    int64_t sum;
+    if (__builtin_add_overflow(base, addend, &sum)) return 1;
+    if (e != NULL) {
+        e->value = INT_VAL(sum);
+        ++d->table.version;
+        return 0;
+    }
+    (void)jaiTableSetHashed(&d->table, INT_VAL(key), hash, INT_VAL(sum));
+    return 0;
+}
+
+int64_t jitDictAddInt(Obj *dictObj, int64_t key, int64_t defPayload,
+                      int64_t addend, int64_t absentSlow) {
+    if (JAI_UNLIKELY(dictObj->type != OBJ_DICT)) return 1;
+    ObjDict *d = (ObjDict *)dictObj;
+    if (JAI_LIKELY(d->keyKind == FIELD_KIND_ANY &&
+                   d->valKind == FIELD_KIND_ANY)) {
+        JaiEntry *e = jaiTableFindIntQuick(&d->table, key,
+                                           jaiHashU64Inline((uint64_t)key));
+        if (JAI_LIKELY(e != NULL && e != JAI_TABLE_SLOW &&
+                       e->value.type == VAL_INT)) {
+            int64_t sum;
+            if (__builtin_add_overflow(e->value.as.integer, addend, &sum)) {
+                return 1;
+            }
+            e->value.as.integer = sum;
+            ++d->table.version;
+            return 0;
+        }
+    }
+    return dictAddIntSlow(d, key, defPayload, addend, absentSlow);
+}
+
+/* `k in d` and `k not in d` with a string `k`, as a leaf for the reason
+ * jitDictGetStr gives. The container is only predicted to be a dict, so the
+ * leaf checks both kinds itself, and anything else -- a list, a set, a class
+ * with `__contains__`, a probe the quick form cannot settle -- goes back to
+ * jitContains, which is jaiContainsOp. Returns 0 with the answer written as
+ * BOOL_VAL, as jitContains writes it, or 1 having written nothing. */
+int64_t jitDictHasStr(Obj *container, Obj *needle, Value *result,
+                      int64_t negate) {
+    if (container->type != OBJ_DICT || needle->type != OBJ_STRING) return 1;
+    JaiEntry *e = jaiTableFindStrQuick(&((ObjDict *)container)->table,
+                                       (ObjString *)needle);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    *result = BOOL_VAL((e != NULL) != (negate != 0));
+    return 0;
 }
 
 int jitCallOut(JitCallDesc *d) {

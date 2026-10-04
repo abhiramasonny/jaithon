@@ -1,6 +1,7 @@
 // table.c is the hash table and string intern table for Jaithon
 
 #include "vm/table.h"
+#include "vm/table_inline.h"
 
 #include "vm/gc.h"
 #include "vm/object/object.h"
@@ -13,6 +14,8 @@ const Value JAI_TOMBSTONE = {VAL_OBJ, {.obj = NULL}};
 #define TABLE_MAX_CAPACITY ((int64_t)1 << 30)
 
 #define ENTRY_EMPTY_ORDER     (-2)
+_Static_assert(ENTRY_EMPTY_ORDER == JAI_ENTRY_EMPTY_ORDER,
+               "table_inline.h probes for the same empty marker");
 #define ENTRY_TOMBSTONE_ORDER (-1)
 
 JAI_INLINE JAI_UNUSED bool entryIsEmpty(const JaiEntry *e) {
@@ -483,6 +486,43 @@ bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value) {
     return jaiTableSetInternedPrev(t, key, value, NULL);
 }
 
+/* findExisting for a string key, answered without anything that can run user
+ * code, allocate or raise -- which is what lets compiled code call it as a
+ * leaf, with no roots pushed (see jitDictGetStr).
+ *
+ * keyMatches can reach jaiValuesEqual, and through it a user `__eq__`, only
+ * when the stored key is not a string; a string against a string is the
+ * pointer test and then jaiStringEquals, both pure. So a stored key that
+ * matches the hash and is NOT a string is handed back as JAI_TABLE_SLOW for the
+ * caller's general path to settle, rather than settled here. Forcing the
+ * key's lazy hash writes the field it caches into, which every reader of it
+ * would have done anyway. */
+JaiEntry *jaiTableFindStr(JaiTable *t, ObjString *key) {
+    if (t->count == 0) return NULL;
+
+    const uint64_t hash = jaiStringHash(key);
+    const uint32_t mask = (uint32_t)t->capacity - 1;
+    uint32_t index = (uint32_t)hash & mask;
+    JaiEntry *const entries = t->entries;
+
+    for (;;) {
+        JaiEntry *const e = entries + index;
+        const int state = e->order;
+
+        if (state == ENTRY_EMPTY_ORDER) return NULL;
+        if (state >= 0 && e->hash == hash) {
+            const Value stored = e->key;
+            if (jaiValueType(stored) != VAL_OBJ) return JAI_TABLE_SLOW;
+            Obj *const o = AS_OBJ(stored);
+            if (o == (Obj *)key) return e;
+            if (o->type != OBJ_STRING) return JAI_TABLE_SLOW;
+            if (jaiStringEquals((const ObjString *)o, key)) return e;
+        }
+
+        index = (index + 1) & mask;
+    }
+}
+
 JaiEntry *jaiTableFindEntryInterned(JaiTable *t, ObjString *key) {
     if (t->count == 0) return NULL;
     return findExistingInterned(t->entries, t->capacity, key);
@@ -576,45 +616,25 @@ JaiTable *jaiInternTable(void) {
     return &internTable;
 }
 
-static inline uint64_t internFingerprint(const char *chars, size_t length) {
-    uint64_t fp = (uint64_t)(length > 255 ? 255 : length) << 56;
-    const size_t n = length < 7 ? length : 7;
+#define INTERN_SHORT_COMPARE 64
 
-    for (size_t i = 0; i < n; ++i)
-        fp |= (uint64_t)(uint8_t)chars[i] << (i * 8);
+/* Names and other long strings, out of line so that the short probe stays a
+ * leaf. */
+static JAI_NOINLINE ObjString *internFindLong(const char *chars, size_t length,
+                                              uint64_t hash, uint64_t fp) {
+    return jaiInternProbeInline(chars, length, hash, fp, true);
+}
 
-    return fp;
+static ObjString *internTableFindFp(const char *chars, size_t length,
+                                    uint64_t hash, uint64_t fp) {
+    if (length > INTERN_SHORT_COMPARE)
+        return internFindLong(chars, length, hash, fp);
+    return jaiInternProbeInline(chars, length, hash, fp, false);
 }
 
 ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
-    JaiTable *const t = &internTable;
-    if (t->count == 0) return NULL;
-
-    const uint32_t mask = (uint32_t)t->capacity - 1;
-    uint32_t index = (uint32_t)hash & mask;
-    JaiEntry *const entries = t->entries;
-    const uint64_t fp = internFingerprint(chars, length);
-
-    for (;;) {
-        JaiEntry *const e = entries + index;
-        const int state = e->order;
-
-        if (state == ENTRY_EMPTY_ORDER) return NULL;
-
-        if (state >= 0 && e->hash == hash &&
-            (uint64_t)AS_INT(e->value) == fp) {
-            JAI_ASSERT(IS_STRING(e->key), "intern table holds only strings");
-            ObjString *const s = (ObjString *)AS_OBJ(e->key);
-
-            if (length <= 7) return s;
-
-            if ((size_t)s->length == length &&
-                memcmp(s->chars, chars, length) == 0)
-                return s;
-        }
-
-        index = (index + 1) & mask;
-    }
+    return internTableFindFp(chars, length, hash,
+                                jaiInternFingerprint(chars, length));
 }
 
 void jaiInternTableAdd(ObjString *s) {
@@ -625,5 +645,5 @@ void jaiInternTableAdd(ObjString *s) {
 
     (void)jaiTableSetInterned(
         &internTable, s,
-        INT_VAL((int64_t)internFingerprint(s->chars, s->length)));
+        INT_VAL((int64_t)jaiInternFingerprint(s->chars, s->length)));
 }

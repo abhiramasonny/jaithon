@@ -35,12 +35,14 @@ dead       jaiChunkWriteU24            src/vm/bytecode/chunk.c
 dead       jaiCacheClear               src/vm/bytecode/serialize.c
 dead       jaiCacheLoad                src/vm/bytecode/serialize.c
 file-local jaiGCMarkArray              src/vm/gc.c
+file-local emitDescriptorFull          src/vm/jit/jit_call_desc.c
 file-local emitGlobalsGuard            src/vm/jit/jit_global.c
 file-local emitVersionBump             src/vm/jit/jit_global.c
 file-local globalClass                 src/vm/jit/jit_global.c
 file-local globalIsSelf                src/vm/jit/jit_global.c
 file-local globalNamespace             src/vm/jit/jit_global.c
 file-local globalSlot                  src/vm/jit/jit_global.c
+file-local jaiStringChar               src/vm/object/object_string.c
 dead       jaiTraceOpCount             src/vm/trace/trace.c
 file-local enumMember                  src/vm/vm_class.c
 file-local jaiVMPrintStack             src/vm/vm_lifecycle.c

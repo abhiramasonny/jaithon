@@ -5,9 +5,404 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
+
+/* ------------------------------------------------------------------ */
+/* The string-keyed dict leaf                                           */
+/* ------------------------------------------------------------------ */
+
+/* A string-keyed probe placed in FRONT of a dict arm's descriptor call, which
+ * stays where it was as the slow path:
+ *
+ *        key not a string ----------------------------\
+ *        x0..x4 <- dict, key, ...;  blr leaf            |
+ *        leaf said "can't" -------------------------\   |
+ *        b done                                      |   |
+ *   slow: <the descriptor call, unchanged>  <-------/---/
+ *   done: <whatever followed the call>
+ *
+ * Both paths meet with a read's answer in the descriptor's result slot, where
+ * the code after the call already looks, and a store done; so nothing after
+ * the call changes and a deopt that reads the result from the descriptor
+ * still finds it there.
+ *
+ * The leaf clobbers x0..x17 and the slow path after it still reads the
+ * operands, so every operand must be in a callee-saved register. A site that
+ * calls is planned that way already (noteScratchClobber); an operand anywhere
+ * else -- an inlined body's own bank -- emits no leaf at all, which leaves the
+ * site exactly as it was. */
+/* JAITHON_JIT_LEAF_IN_REG=0 hands a string leaf's answer back through the
+ * descriptor's result slot, as the descriptor call does, instead of moving it
+ * into the result's register and joining after the load. A one-binary A/B. */
+bool jitLeafInReg(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_LEAF_IN_REG");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+bool leafRegOk(unsigned r) {
+    return r >= JIT_FIRST_SAVED && r < JIT_FIRST_SAVED + JIT_MAX_SAVED;
+}
+
+static bool dictLeafValueKind(SlotKind k) {
+    return k == SLOT_INT || k == SLOT_FLOAT || k == SLOT_BOOL ||
+           k == SLOT_INST || k == SLOT_LIST || k == SLOT_OBJ ||
+           k == SLOT_MAYBE_INST || k == SLOT_MAYBE_OBJ;
+}
+
+static bool dictLeafKeyKind(SlotKind k) {
+    return k == SLOT_OBJ || k == SLOT_INT;
+}
+
+/* dictLeafKeyKind for stack entry `idx`, minus the object keys the compiler
+ * can already see are not strings: a tuple built in the body, or a local whose
+ * value was one when this compiled. The leaves would only guard or call and
+ * come back unanswered, every time -- a dict keyed by `(x, y)` paid ~25
+ * instructions an access for nothing. A prediction, so a key that turns out
+ * to be a string is merely not answered by a leaf. */
+bool dictLeafKeyAt(const Emit *e, unsigned idx) {
+    SlotKind k = e->stack[idx];
+    if (k == SLOT_INT) return true;
+    if (k != SLOT_OBJ) return false;
+    uint8_t ot = e->stackObjType[idx];
+    if (ot != 0 && ot != (uint8_t)(OBJ_STRING + 1)) return false;
+    Value v = e->stackSeen[idx];
+    if (IS_OBJ(v) && AS_OBJ(v) != NULL && !IS_STRING(v)) return false;
+    return true;
+}
+
+/* The key must really be a string; anything else takes the slow path, which
+ * is not a deopt, so a dict keyed by tuples at this site costs one compare.
+ * An int key needs no guard: its kind is the register's. */
+static void dictLeafKeyGuard(Emit *e, unsigned rKey, SlotKind keyKind,
+                             LeafFix *fx) {
+    if (keyKind == SLOT_INT) return;
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rKey, (unsigned)offsetof(Obj, type)));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+    fx->slow[0] = (int)e->count;
+    fx->cond[0] = JAI_A64_NE;
+    emit(e, jaiA64BCond(JAI_A64_NE, 0));
+}
+
+static void dictLeafCall(Emit *e, void *helper, LeafFix *fx) {
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)helper);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    fx->slow[1] = (int)e->count;
+    fx->cond[1] = JAI_A64_NE;
+    emit(e, jaiA64BCond(JAI_A64_NE, 0));
+    fx->done = (int)e->count;
+    emit(e, jaiA64B(0));
+    fx->on = true;
+}
+
+void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
+                     int defIdx, SlotKind defKind, bool absentSlow,
+                     LeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitDictLeaf() || e->inlining) return;
+    if (!leafRegOk(rDict) || !leafRegOk(rKey)) return;
+    if (e->descOffset + (unsigned)offsetof(JitCallDesc, result) > 4095u) return;
+    unsigned rDef = 0;
+    if (defIdx >= 0) {
+        if (!dictLeafValueKind(defKind)) return;
+        rDef = valueXReg(e, (unsigned)defIdx);
+        if (!leafRegOk(rDef)) return;
+    }
+    fpSyncAll(e);
+    settleAll(e);
+
+    if (!dictLeafKeyKind(keyKind)) return;
+    dictLeafKeyGuard(e, rKey, keyKind, fx);
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emit(e, jaiA64AddXImm(2, 31, e->descOffset +
+                                     (unsigned)offsetof(JitCallDesc, result)));
+    if (absentSlow) {
+        emit(e, jaiA64MovzX(3, JIT_DICT_ABSENT_SLOW, 0));
+        emit(e, jaiA64MovzX(4, 0, 0));
+    } else if (defIdx < 0) {
+        emit(e, jaiA64MovzX(3, VAL_NULL, 0));
+        emit(e, jaiA64MovzX(4, 0, 0));
+    } else {
+        emitTagFor(e, defKind, rDef, 3, JIT_SCRATCH_A);
+        emit(e, jaiA64MovX(4, rDef));
+    }
+    dictLeafCall(e, keyKind == SLOT_INT ? (void *)&jitDictGetInt
+                                        : (void *)&jitDictGetStr, fx);
+}
+
+static void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey,
+                            SlotKind keyKind, unsigned rVal, SlotKind vk,
+                            LeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitDictLeaf() || e->inlining) return;
+    if (!dictLeafValueKind(vk) || !dictLeafKeyKind(keyKind)) return;
+    if (!leafRegOk(rDict) || !leafRegOk(rKey) || !leafRegOk(rVal)) {
+        return;
+    }
+    fpSyncAll(e);
+    settleAll(e);
+
+    dictLeafKeyGuard(e, rKey, keyKind, fx);
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emitTagFor(e, vk, rVal, 2, JIT_SCRATCH_A);
+    emit(e, jaiA64MovX(3, rVal));
+    dictLeafCall(e, keyKind == SLOT_INT ? (void *)&jitDictSetInt
+                                        : (void *)&jitDictSetStr, fx);
+}
+
+/* `k in d`: the leaf checks the container and the key itself (see
+ * jitDictHasStr), so nothing is guarded here and a miss on either is the
+ * descriptor call, not a deopt. */
+void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
+                     bool negate, LeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitDictLeaf() || e->inlining || !dictLeafKeyKind(keyKind)) return;
+    if (!leafRegOk(rDict) || !leafRegOk(rKey)) return;
+    if (e->descOffset + (unsigned)offsetof(JitCallDesc, result) > 4095u) return;
+    fpSyncAll(e);
+    settleAll(e);
+
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emit(e, jaiA64AddXImm(2, 31, e->descOffset +
+                                     (unsigned)offsetof(JitCallDesc, result)));
+    emit(e, jaiA64MovzX(3, negate ? 1u : 0u, 0));
+    dictLeafCall(e, keyKind == SLOT_INT ? (void *)&jitDictHasInt
+                                        : (void *)&jitDictHasStr, fx);
+}
+
+/* JAITHON_JIT_DICT_ADD=0 turns the fused counting arm below off, for a
+ * one-binary A/B. */
+static bool jitDictAddFuse(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_ADD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Proves from the BYTECODE that the four entries under the get's default are
+ * the same two locals loaded twice, back to back: the instructions that end
+ * at `off` are exactly `<loads of a, b, a, b> <default>`, where the loads are
+ * OP_GET_LOCAL/OP_GET_LOCAL2 and the default is a literal or a local read --
+ * nothing that can write a local -- and nothing but fall-through reaches any
+ * of them past the first. stackLocal alone is not this proof: it says where
+ * an entry was read from, not that the local still holds it, and an
+ * if-expression between the two loads can write `k` or `d` and join back
+ * with the stack settled. */
+static bool dictAddLoadsAdjacent(const Emit *e, const Chunk *c, int off,
+                                 int dictLocal, int keyLocal) {
+    enum { RING = 8 };
+    int starts[RING];
+    int n = 0;
+    int at = 0;
+    while (at < off) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return false;
+        starts[n % RING] = at;
+        n++;
+        at += len;
+    }
+    if (at != off || n < 2) return false;
+    /* The default: one instruction that pushes without writing. */
+    int defAt = starts[(n - 1) % RING];
+    uint8_t defOp = c->code[defAt];
+    if (defOp != OP_INT && defOp != OP_CONST && defOp != OP_GET_LOCAL) {
+        return false;
+    }
+    /* Then, walking back, loads until exactly four slots are named. */
+    int slots[4];
+    int got = 0;
+    int i = n - 2;
+    int firstAt = -1;
+    while (got < 4) {
+        if (i < 0 || n - 1 - i >= RING) return false;
+        int ld = starts[i % RING];
+        uint8_t op = c->code[ld];
+        int s[2];
+        int k;
+        if (op == OP_GET_LOCAL) {
+            s[0] = (int)jaiReadU16(c->code + ld + 1);
+            k = 1;
+        } else if (op == OP_GET_LOCAL2) {
+            s[0] = (int)jaiReadU16(c->code + ld + 1);
+            s[1] = (int)jaiReadU16(c->code + ld + 3);
+            k = 2;
+        } else {
+            return false;
+        }
+        if (got + k > 4) return false;
+        /* Filled from the back: the last slot named is the fourth entry. */
+        for (int j = k - 1; j >= 0; j--) slots[3 - got - (k - 1 - j)] = s[j];
+        got += k;
+        firstAt = ld;
+        i--;
+    }
+    if (slots[0] != dictLocal || slots[2] != dictLocal ||
+        slots[1] != keyLocal || slots[3] != keyLocal) {
+        return false;
+    }
+    /* Straight-line from the first load to the INVOKE. */
+    for (int j = i + 2; j < n; j++) {
+        int st = starts[j % RING];
+        if (st <= firstAt) continue;
+        if (offsetIsBranchTarget(c, (uint32_t)st) ||
+            popSkipTarget(e, (uint32_t)st)) {
+            return false;
+        }
+    }
+    return !offsetIsBranchTarget(c, (uint32_t)off) &&
+           !popSkipTarget(e, (uint32_t)off);
+}
+
+/* `d[k] = d.get(k, n) + c`, at the OP_INVOKE of the `get`: the bytecode is
+ *
+ *     GET d, GET k, GET d, GET k, <n>, INVOKE get 2, INT c, ADD, SET_INDEX
+ *
+ * and when the two loads of `d` and of `k` are of the same locals, back to
+ * back (dictAddLoadsAdjacent), the whole statement is jitDictAddStr. Emitted
+ * in FRONT of the get's own code: on success it branches past the SET_INDEX,
+ * to where the statement ends with the five entries consumed; on anything
+ * else it falls into the unfused sequence, which the walk goes on to emit
+ * exactly as before -- so a refusal costs one call, never an answer. The
+ * caller has guarded the receiver as a dict. True when the fused call was
+ * emitted. */
+bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
+                      unsigned ridx) {
+    const uint8_t *code = chunk->code;
+    if (!jitDictAddFuse() || !jitDictLeaf() || e->inlining) return false;
+    if (off + 12 > count || code[off + 7] != OP_INT ||
+        code[off + 10] != OP_ADD || code[off + 11] != OP_SET_INDEX) {
+        return false;
+    }
+    if (ridx < 2 || e->depth != ridx + 3 || e->valueDepth < 5) return false;
+    if (e->stack[ridx - 2] != SLOT_OBJ || e->stack[ridx] != SLOT_OBJ) {
+        return false;
+    }
+    SlotKind keyKind = e->stack[ridx + 1];
+    if (!dictLeafKeyAt(e, ridx + 1) || !dictLeafKeyAt(e, ridx - 1) ||
+        e->stack[ridx - 1] != keyKind) {
+        return false;
+    }
+    if (e->stack[ridx + 2] != SLOT_INT) return false;
+    /* The same dict and the same key, read from the same locals, and (see
+     * dictAddLoadsAdjacent) nothing between the two loads can have written
+     * either. */
+    if (e->stackLocal[ridx - 2] < 0 ||
+        e->stackLocal[ridx - 2] != e->stackLocal[ridx] ||
+        e->stackLocal[ridx - 1] < 0 ||
+        e->stackLocal[ridx - 1] != e->stackLocal[ridx + 1]) {
+        return false;
+    }
+    if (!dictAddLoadsAdjacent(e, chunk, off, e->stackLocal[ridx - 2],
+                              e->stackLocal[ridx - 1])) {
+        return false;
+    }
+    unsigned vd = e->valueDepth;
+    unsigned rDict = valueXReg(e, vd - 3);
+    unsigned rKey = valueXReg(e, vd - 2);
+    unsigned rDef = valueXReg(e, vd - 1);
+    if (!leafRegOk(rDict) || !leafRegOk(rKey) || !leafRegOk(rDef)) {
+        return false;
+    }
+    fpSyncAll(e);
+    settleAll(e);
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emit(e, jaiA64MovX(2, rDef));
+    emitConst64(e, 3, (int64_t)jaiReadI16(code + off + 8));
+    emit(e, jaiA64MovzX(4, 0, 0));
+    emitConst64(e, JIT_SCRATCH_A,
+                keyKind == SLOT_INT ? (int64_t)(uintptr_t)&jitDictAddInt
+                                    : (int64_t)(uintptr_t)&jitDictAddStr);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    /* Done: past the SET_INDEX, where the statement leaves the stack five
+     * entries shallower than it is here. */
+    branchToDepth(e, (uint32_t)(off + 12), JAI_A64_EQ,
+                  stackSignatureAt(e, e->depth - 5));
+    e->wroteHeap = true;
+    return true;
+}
+
+/* `d[k] += c`, at its OP_DUP2: the bytecode is
+ *
+ *     <d>, <k>, DUP2, GET_INDEX, INT c, ADD, SET_INDEX
+ *
+ * and when `d` was a dict and `k` an object when this compiled, the whole
+ * statement is jitDictAddStr with no default -- an absent key is the read's
+ * KeyError, so the leaf hands it back. The leaf checks both kinds itself, as
+ * nothing here has guarded `d`. Same layout as emitDictAddFused: in front of
+ * the unfused code, branching past the SET_INDEX on success. */
+bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
+    if (!jitDictAddFuse() || !jitDictLeaf() || e->inlining) return false;
+    if (off + 7 > count || code[off + 1] != OP_GET_INDEX ||
+        code[off + 2] != OP_INT || code[off + 5] != OP_ADD ||
+        code[off + 6] != OP_SET_INDEX) {
+        return false;
+    }
+    if (e->depth < 2 || e->valueDepth < 2) return false;
+    SlotKind keyKind = e->stack[e->depth - 1];
+    if (e->stack[e->depth - 2] != SLOT_OBJ || !dictLeafKeyAt(e, e->depth - 1) ||
+        !JIT_SEEN_OR_PREDICTED_DICT(e, e->depth - 2)) {
+        return false;
+    }
+    unsigned rDict = valueXReg(e, e->valueDepth - 2);
+    unsigned rKey = valueXReg(e, e->valueDepth - 1);
+    if (!leafRegOk(rDict) || !leafRegOk(rKey)) return false;
+    fpSyncAll(e);
+    settleAll(e);
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emit(e, jaiA64MovzX(2, 0, 0));
+    emitConst64(e, 3, (int64_t)jaiReadI16(code + off + 3));
+    emit(e, jaiA64MovzX(4, 1, 0));
+    emitConst64(e, JIT_SCRATCH_A,
+                keyKind == SLOT_INT ? (int64_t)(uintptr_t)&jitDictAddInt
+                                    : (int64_t)(uintptr_t)&jitDictAddStr);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    /* Done: past the SET_INDEX, which leaves the container and the key
+     * consumed. */
+    branchToDepth(e, (uint32_t)(off + 7), JAI_A64_EQ,
+                  stackSignatureAt(e, e->depth - 2));
+    e->wroteHeap = true;
+    return true;
+}
+
+/* Where the descriptor call begins: both "can't" branches land here. */
+void leafSlowHere(Emit *e, LeafFix *fx) {
+    if (!fx->on || e->count > JIT_MAX_INSTS) return;
+    for (unsigned i = 0; i < 2; i++) {
+        int at = fx->slow[i];
+        if (at < 0 || at >= (int)e->count) continue;
+        e->code[at] = jaiA64BCond(fx->cond[i], (int32_t)((int)e->count - at));
+    }
+}
+
+/* Just past the descriptor call: the leaf's answered path rejoins here. */
+void leafDoneHere(Emit *e, LeafFix *fx) {
+    if (!fx->on || e->count > JIT_MAX_INSTS) return;
+    int at = fx->done;
+    if (at < 0 || at >= (int)e->count) return;
+    e->code[at] = jaiA64B((int32_t)((int)e->count - at));
+}
 
 bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
     int off = *offp;
@@ -178,10 +573,23 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
             branchOnDeopt(e, JAI_A64_NE);
 
+            /* A string key is answered by the leaf; a miss, or anything it
+             * cannot settle, falls through to this same descriptor call,
+             * which raises the KeyError a miss is owed. */
+            LeafFix gfx;
+            gfx.on = false;
+            if (dictLeafKeyAt(e, e->depth - 1)) {
+                emitDictLeafGet(e, valueXReg(e, e->valueDepth - 2),
+                                valueXReg(e, e->valueDepth - 1),
+                                e->stack[e->depth - 1], -1, SLOT_NULL, true,
+                                &gfx);
+            }
+            leafSlowHere(e, &gfx);
             if (!emitDescriptor(e, NULL_VAL, dsidx, 2,
                                 (void *)&jitGetIndexDict)) {
                 return false;
             }
+            leafDoneHere(e, &gfx);
             for (unsigned i = 0; i < 2; i++) {
                 unsigned drop;
                 if (!popValue(e, &drop, NULL)) return false;
@@ -456,7 +864,7 @@ bool emitSetIndex(Emit *e, int *offp) {
             /* `d[k] = v`: a dict is as ordinary a container here as a list -- without this, dict_ops' loop just
              * moved its decline from `get` to this store (a loop that declines anywhere runs interpreted end to end). Object type guarded before anything is consumed, so a miss resumes with container/key/value all still on the interpreter's stack. */
             unsigned sidx = e->depth - 3;
-            if (!IS_DICT(e->stackSeen[sidx])) {
+            if (!JIT_SEEN_OR_PREDICTED_DICT(e, sidx)) {
                 e->whyNot = "an index store into an object that is not a dict";
                 return false;
             }
@@ -464,10 +872,22 @@ bool emitSetIndex(Emit *e, int *offp) {
                                (unsigned)offsetof(Obj, type)));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
             branchOnDeopt(e, JAI_A64_NE);
+            LeafFix sfx;
+            sfx.on = false;
+            if (dictLeafKeyAt(e, e->depth - 2) &&
+                holdsRegister(e->stack[e->depth - 1])) {
+                emitDictLeafSet(e, valueXReg(e, e->valueDepth - 3),
+                                valueXReg(e, e->valueDepth - 2),
+                                e->stack[e->depth - 2],
+                                valueXReg(e, e->valueDepth - 1),
+                                e->stack[e->depth - 1], &sfx);
+            }
+            leafSlowHere(e, &sfx);
             if (!emitDescriptor(e, NULL_VAL, sidx, 3,
                                 (void *)&jitSetIndexDict)) {
                 return false;
             }
+            leafDoneHere(e, &sfx);
             for (unsigned i = 0; i < 3; i++) {
                 unsigned r;
                 if (!popValue(e, &r, NULL)) return false;
@@ -554,6 +974,75 @@ bool emitSetIndex(Emit *e, int *offp) {
     return true;
 }
 
+/* JAITHON_JIT_SLICE_LEAF=0 sends every string slice back through its
+ * descriptor call, for a one-binary A/B of emitStringSliceLeaf. */
+static bool jitSliceLeaf(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SLICE_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* `s[a:b]` on a string, through jaiStringSliceLeaf in front of the descriptor
+ * call to jitGetSlice -- the layout emitDictLeafGet draws. The container's
+ * type guard has already run; the bounds must be ints in registers, since the
+ * leaf takes them as plain integers. The leaf allocates nothing, so nothing is
+ * rooted, and every slice it does not answer is the descriptor call. */
+static void emitStringSliceLeaf(Emit *e, unsigned flags, unsigned nargs,
+                                LeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitSliceLeaf() || e->inlining) return;
+    unsigned first = e->depth - nargs;
+    for (unsigned i = 1; i < nargs; i++) {
+        if (e->stack[first + i] != SLOT_INT) return;
+    }
+    unsigned vfirst = e->valueDepth - nargs;
+    for (unsigned i = 0; i < nargs; i++) {
+        if (!leafRegOk(valueXReg(e, vfirst + i))) return;
+    }
+    unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+    fpSyncAll(e);
+    settleAll(e);
+
+    unsigned at = 1;
+    emit(e, jaiA64MovX(0, valueXReg(e, vfirst)));
+    if ((flags & 1u) != 0) {
+        emit(e, jaiA64MovX(1, valueXReg(e, vfirst + at)));
+        at++;
+    } else {
+        emit(e, jaiA64MovzX(1, 0, 0));
+    }
+    if ((flags & 2u) != 0) {
+        emit(e, jaiA64MovX(2, valueXReg(e, vfirst + at)));
+    } else {
+        emit(e, jaiA64MovzX(2, 0, 0));
+    }
+    emit(e, jaiA64MovzX(3, flags & 3u, 0));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jaiStringSliceLeaf);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    fx->slow[0] = (int)e->count;
+    fx->cond[0] = JAI_A64_EQ;
+    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    /* Into the register the slice will occupy -- the container's, once the
+     * operands are popped -- and past the descriptor path's load, as the
+     * f-string leaf does it (see emitFormatLeaf). */
+    if (jitLeafInReg()) {
+        emit(e, jaiA64MovX(valueXReg(e, vfirst), 0));
+    } else {
+        emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
+        emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
+        emit(e, jaiA64StrX(0, 31, rat + 8));
+    }
+    fx->done = (int)e->count;
+    emit(e, jaiA64B(0));
+    fx->on = true;
+}
+
 bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
     int off = *offp;
     do {
@@ -597,40 +1086,12 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
         emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, cType));
         branchOnDeopt(e, JAI_A64_NE);
 
-        /* A string cut by int bounds with no step: the leaf first (see
-         * jitStrSliceLeaf), the descriptor only when it declines. Operands
-         * go through scratch so no move reads a register an earlier move
-         * wrote; both paths leave the result in JIT_SCRATCH_C. */
-        unsigned skipSlow = 0;
-        bool leaf = cType == OBJ_STRING && (flags & 4u) == 0 &&
-                    flags != 0 && jitSliceLeafOn() && !e->inlining;
-        for (unsigned i = 1; leaf && i < nargs; i++) {
-            if (e->stack[cidx + i] != SLOT_INT) leaf = false;
+        LeafFix lfx;
+        lfx.on = false;
+        if (cType == OBJ_STRING && (flags & 4u) == 0) {
+            emitStringSliceLeaf(e, flags, nargs, &lfx);
         }
-        if (leaf) {
-            unsigned vbase = e->valueDepth - nargs;
-            emit(e, jaiA64MovX(JIT_SCRATCH_A, xHeldIn(e, vbase)));
-            emit(e, jaiA64MovX(JIT_SCRATCH_B, xHeldIn(e, vbase + 1)));
-            if (nargs > 2) {
-                emit(e, jaiA64MovX(JIT_SCRATCH_C, xHeldIn(e, vbase + 2)));
-            }
-            emit(e, jaiA64MovX(0, JIT_SCRATCH_A));
-            if ((flags & 1u) != 0) {
-                emit(e, jaiA64MovX(1, JIT_SCRATCH_B));
-                if (nargs > 2) emit(e, jaiA64MovX(2, JIT_SCRATCH_C));
-            } else {
-                emit(e, jaiA64MovX(2, JIT_SCRATCH_B));
-            }
-            emit(e, jaiA64MovzX(3, flags, 0));
-            emitConst64(e, JIT_SCRATCH_A,
-                        (int64_t)(uintptr_t)&jitStrSliceLeaf);
-            noteScratchClobber(e);
-            emit(e, jaiA64Blr(JIT_SCRATCH_A));
-            emit(e, jaiA64MovX(JIT_SCRATCH_C, 0));
-            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
-            skipSlow = e->count;
-            emit(e, jaiA64BCond(JAI_A64_NE, 0));   /* patched below */
-        }
+        leafSlowHere(e, &lfx);
         emit(e, jaiA64MovzX(JIT_SCRATCH_A, flags, 0));
         emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
                            e->descOffset +
@@ -639,13 +1100,7 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
                                   (void *)&jitGetSlice, false, -1)) {
             return false;
         }
-        emit(e, jaiA64LdrX(JIT_SCRATCH_C, 31,
-                           e->descOffset +
-                               (unsigned)offsetof(JitCallDesc, result) + 8));
-        if (leaf && skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
-            e->code[skipSlow] =
-                jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
-        }
+        if (!jitLeafInReg()) leafDoneHere(e, &lfx);
         for (unsigned i = 0; i < nargs; i++) {
             unsigned r;
             if (!popValue(e, &r, NULL)) return false;
@@ -655,7 +1110,11 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
          * every element read re-checks its own tag, so this is a hint and
          * not an assumption. */
         if (!pushValue3(e, sliceKind, 0, NULL, cseen, -1)) return false;
-        emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
+        emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                           e->descOffset +
+                               (unsigned)offsetof(JitCallDesc, result) + 8));
+        /* After the load: the leaf put its answer in this register itself. */
+        if (jitLeafInReg()) leafDoneHere(e, &lfx);
         /* Deliberately not e->wroteHeap: the only effect is a fresh object
          * and an interpreted re-run would make another. Setting it would
          * decline the next self-call, which is the shape `sort` has. */

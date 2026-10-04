@@ -23,6 +23,7 @@
 
 #include "vm/gc.h"
 #include "vm/table.h"
+#include "vm/table_inline.h"
 #include "vm/vm.h"
 
 /* Interning policy. Names — everything the compiler and the deserialiser
@@ -51,8 +52,10 @@
  * The cap has to clear the names as well, since they share the table; the
  * stdlib interns about 2,500. jaiStringCanonical is the way in for the few
  * reflective entry points that need identity for a string the caller built. */
-#define JAI_INTERN_MAX      32        /* longest run-time string worth a probe */
-#define JAI_INTERN_SOFT_CAP (1 << 15) /* entries, past which run-time strings stop */
+/* JAI_INTERN_MAX (the longest run-time string worth a probe) and
+ * JAI_INTERN_SOFT_CAP (entries, past which run-time strings stop) live in
+ * table.h, so that a caller building a short string somewhere else -- the
+ * f-string formatter in value.c -- can apply this same policy itself. */
 
 /* ------------------------------------------------------------------ */
 /* Strings                                                              */
@@ -78,6 +81,30 @@ static ObjString *allocString(size_t length) {
     return s;
 }
 
+/* memcpy for the lengths run-time strings mostly have, without the call:
+ * two overlapping loads and stores cover anything from four to sixteen bytes.
+ * A key or a formatted number is a handful of bytes, and the call into
+ * _platform_memmove costs several times the copy (see jaiStringFromParts). */
+JAI_INLINE void copyChars(char *dst, const char *src, size_t n) {
+    if (n >= 8 && n <= 16) {
+        uint64_t a, b;
+        memcpy(&a, src, 8);
+        memcpy(&b, src + n - 8, 8);
+        memcpy(dst, &a, 8);
+        memcpy(dst + n - 8, &b, 8);
+    } else if (n >= 4 && n < 8) {
+        uint32_t a, b;
+        memcpy(&a, src, 4);
+        memcpy(&b, src + n - 4, 4);
+        memcpy(dst, &a, 4);
+        memcpy(dst + n - 4, &b, 4);
+    } else if (n > 16) {
+        memcpy(dst, src, n);
+    } else {
+        for (size_t i = 0; i < n; ++i) dst[i] = src[i];
+    }
+}
+
 /* Adds `s` to the intern table. The table may grow, so `s` is rooted across
  * the insertion. */
 static inline void internString(ObjString *s) {
@@ -99,7 +126,7 @@ ObjString *jaiStringIntern(const char *chars, size_t length) {
     if (found != NULL) return found;
 
     ObjString *s = allocString(length);
-    if (length != 0) memcpy(s->chars, chars, length);
+    copyChars(s->chars, chars, length);
     s->hash = hash;
     internString(s);
     return s;
@@ -204,7 +231,7 @@ ObjString *jaiStringNew(const char *chars, size_t length) {
     }
 
     ObjString *s = allocString(length);
-    if (length != 0) memcpy(s->chars, chars, length);
+    copyChars(s->chars, chars, length);
     s->hash = hash;
     if (insert) internString(s);
     return s;
@@ -238,7 +265,7 @@ ObjString *jaiStringTake(char *chars, size_t length) {
     }
 
     ObjString *s = allocString(length);
-    if (length != 0) memcpy(s->chars, chars, length);
+    copyChars(s->chars, chars, length);
     s->hash = hash;
     (void)jaiRealloc(chars, length + 1, 0);
     if (insert) internString(s);
@@ -500,6 +527,42 @@ static uint32_t *buildScalarOffsets(const ObjString *s, int64_t n) {
 
     while (i <= n) offsets[i++] = s->length;
     return offsets;
+}
+
+/* `s[a:b]` for compiled code, as a LEAF: no descriptor and no roots, because
+ * it allocates nothing. It answers only the slices that need no allocation --
+ * a one-byte result, which is the shared ASCII table, and a short result the
+ * intern table already holds, which is what a scanner cutting the same words
+ * out of a text produces over and over -- and NULL for everything else, which
+ * the caller hands to jaiSliceGet through the descriptor call it would have
+ * made anyway. The source must be known ASCII (`scalars` already counted and
+ * equal to the byte length), so a character index is a byte index; the slow
+ * path counts it the first time. `flags` is OP_GET_SLICE's: bit 0 a start was
+ * given, bit 1 a stop; a step never reaches here. Clamped exactly as
+ * sliceCount clamps a step of one. */
+ObjString *jaiStringSliceLeaf(ObjString *s, int64_t start, int64_t stop,
+                              int64_t flags) {
+    const uint32_t len = s->length;
+    if (s->scalars != len || len == 0) return NULL;
+    const int64_t n = (int64_t)len;
+    if ((flags & 1) == 0) start = 0;
+    if ((flags & 2) == 0) stop = n;
+    if (start < 0) start = start < -n ? 0 : start + n;
+    else if (start > n) start = n;
+    if (stop < 0) stop = stop < -n ? 0 : stop + n;
+    else if (stop > n) stop = n;
+    if (stop <= start) return NULL;
+
+    const size_t count = (size_t)(stop - start);
+    const char *const p = s->chars + start;
+    if (count == 1) return jaiAsciiChars[(unsigned char)p[0]];
+    if (count > JAI_INTERN_MAX ||
+        jaiInternTableCount() >= JAI_INTERN_SOFT_CAP) {
+        return NULL;
+    }
+    const uint64_t hash = jaiHashBytesInline(p, count);
+    return jaiInternProbeInline(p, count, hash,
+                                jaiInternFingerprint(p, count), false);
 }
 
 ObjString *jaiStringSlice(ObjString *s, int64_t start, int64_t stop,

@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
@@ -38,6 +39,17 @@ static bool listHoldsSeveralClasses(const ObjList *xs) {
     return false;
 }
 
+/* JAITHON_JIT_DICT_KEYS_ITER=0 leaves `for k in d` to the interpreter, as the
+ * tier did before, for a one-binary A/B. */
+static bool jitDictKeysIterOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_KEYS_ITER");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool emitGetIter(Emit *e, int *offp) {
     int off = *offp;
     do {
@@ -56,6 +68,37 @@ bool emitGetIter(Emit *e, int *offp) {
             const bool strIter = jitStrIter() &&
                                  e->stack[e->depth - 1] == SLOT_OBJ &&
                                  IS_STRING(itSeen);
+            /* `for k in d`: the dict's keys, stepped inline by the shape-6
+             * arm of OP_FOR_ITER_BIND exactly as the pair head steps
+             * `d.items()`. The key exemplar is the dict's first live key,
+             * so an empty sample declines rather than guessing. */
+            if (jitDictKeysIterOn() && e->callsOut &&
+                e->stack[e->depth - 1] == SLOT_OBJ && IS_DICT(itSeen)) {
+                Value fk, fv;
+                if (!firstLiveEntry(&AS_DICT(itSeen)->table, &fk, &fv)) {
+                    e->whyNot = "iterating a dict with nothing to look at";
+                    return false;
+                }
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A,
+                                   valueXReg(e, e->valueDepth - 1),
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+                branchOnDeopt(e, JAI_A64_NE);
+                if (!emitDescriptor(e, NULL_VAL, e->depth - 1, 1,
+                                    (void *)&jitMakeDictKeysIter)) {
+                    return false;
+                }
+                unsigned kdrop;
+                if (!popValue(e, &kdrop, NULL)) return false;
+                if (!pushValue3(e, SLOT_ITER, 6u, NULL, fk, -1)) return false;
+                emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
+                                   e->descOffset +
+                                       (unsigned)offsetof(JitCallDesc,
+                                                          result) + 8));
+                e->wroteHeap = true;
+                off += 1;
+                break;
+            }
             if (e->stack[e->depth - 1] != SLOT_LIST && !strIter) {
                 /* Named: 4.3% of parser.jai's interpreted work sat behind
                  * this and it said nothing about WHAT was being iterated,
@@ -397,6 +440,110 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
             if (iterShape == 4) {
                 e->whyNot = "a non-destructuring loop over dict items";
                 return false;
+            }
+            /* `for k in d`, stepped inline: iterStep's ITER_DICT_KEYS case
+             * plus the jaiTableNext it calls, which is the dict-items pair
+             * head's step binding the key alone. Every guard -- the
+             * iterator's kind, the source's type, the version a mutation
+             * bumps, the key's tag -- runs before the index is written back,
+             * so a deopt resumes at this instruction with the iterator as the
+             * interpreter left it. */
+            if (iterShape == 6) {
+                Value ksample = e->stackSeen[e->depth - 1];
+                SlotKind kk;
+                unsigned ktag;
+                if (IS_INT(ksample))        { kk = SLOT_INT;   ktag = VAL_INT; }
+                else if (IS_FLOAT(ksample)) { kk = SLOT_FLOAT; ktag = VAL_FLOAT; }
+                else if (IS_BOOL(ksample))  { kk = SLOT_BOOL;  ktag = VAL_BOOL; }
+                else if (IS_OBJ(ksample) && AS_OBJ(ksample) != NULL) {
+                    kk = SLOT_OBJ; ktag = VAL_OBJ;
+                } else {
+                    e->whyNot = "a dict key of a kind the tier cannot hold";
+                    return false;
+                }
+                if (!adoptLocalKindSeen(e, fslot, kk, 0, NULL, ksample)) {
+                    return subWhy(e, "loop variable in local %u has kind "
+                                     "%s, not %s", fslot,
+                                  slotKindName(e->localKind[fslot]),
+                                  slotKindName(kk));
+                }
+                _Static_assert(sizeof(JaiEntry) == 48,
+                               "the dict-keys step scales the order index by "
+                               "hand: slot * 16 * 3");
+                const unsigned tOff = (unsigned)offsetof(ObjDict, table);
+
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, rIt,
+                                   (unsigned)offsetof(ObjIter, kind)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ITER_DICT_KEYS));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIt,
+                                   (unsigned)offsetof(ObjIter, source) + 8));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   (unsigned)offsetof(Obj, type)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
+                branchOnDeopt(e, JAI_A64_NE);
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable,
+                                                             version)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_C, rIt,
+                                   (unsigned)offsetof(ObjIter, version)));
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_C));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                emit(e, jaiA64LdrX(JIT_SCRATCH_C, rIt,
+                                   (unsigned)offsetof(ObjIter, index)));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable,
+                                                             orderCount)));
+                unsigned scanTop = e->count;
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_D));
+                /* The exhausted arm drops the iterator, so the target is
+                 * reached one entry shallower than this branch leaves
+                 * from. */
+                branchToDepth(e, (uint32_t)((int32_t)(off + 5) + fjump),
+                              JAI_A64_GE,
+                              (int)stackSignatureAt(e, e->depth - 1));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable, order)));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                      JIT_SCRATCH_C, 2));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_A, 0));
+                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 1));
+                /* A hole left by a delete: negative, so bit 31 after the
+                 * zero-extending load. */
+                emit(e, jaiA64Tbnz(JIT_SCRATCH_A, 31,
+                                   (int32_t)scanTop - (int32_t)e->count));
+                emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_B,
+                                   tOff + (unsigned)offsetof(JaiTable,
+                                                             entries)));
+                emit(e, jaiA64LslX(JIT_SCRATCH_A, JIT_SCRATCH_A, 4));
+                emit(e, jaiA64AddXLsl(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                                      JIT_SCRATCH_A, 1));
+                emit(e, jaiA64AddX(JIT_SCRATCH_B, JIT_SCRATCH_D,
+                                   JIT_SCRATCH_A));
+                emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                   (unsigned)offsetof(JaiEntry, key)));
+                emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, ktag));
+                branchOnDeopt(e, JAI_A64_NE);
+
+                /* Past the last guard. The index goes first: localOut may
+                 * spend JIT_SCRATCH_C and JIT_SCRATCH_D on a frame-resident
+                 * slot's tag. */
+                emit(e, jaiA64StrX(JIT_SCRATCH_C, rIt,
+                                   (unsigned)offsetof(ObjIter, index)));
+                if (kk == SLOT_BOOL) {
+                    emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                          (unsigned)offsetof(JaiEntry, key) +
+                                              8u));
+                } else {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                                       (unsigned)offsetof(JaiEntry, key) +
+                                           8u));
+                }
+                localOut(e, fslot, JIT_SCRATCH_A);
+                e->wroteHeap = true;
+                off += 5;
+                break;
             }
             /* `for c in <string>`, stepped inline: the interpreter's
              * ITER_STRING fast path (object_iter.c), instruction for

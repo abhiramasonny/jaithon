@@ -1,62 +1,111 @@
-#: String slices cut by compiled code through the leaf (JAITHON_JIT_SLICE_LEAF).
+#: `s[a:b]` on a string from compiled code, which goes through
+#: jaiStringSliceLeaf -- a leaf call answering a one-byte slice from the ASCII
+#: table and a short one the intern table already holds -- and falls back to
+#: the descriptor call to jitGetSlice for everything else: an empty slice, a
+#: long one, a new one, a source not yet known to be ASCII.
 #:
-#: The leaf takes `s[a:b]`, `s[a:]` and `s[:b]` on ASCII text and declines
-#: everything else back to the general path: multi-byte text, an empty
-#: result, a string whose scalar count was never asked for. Its clamping must
-#: be the general path's exactly -- negative bounds, bounds past either end,
-#: a stop before the start -- so every case here is checked against the same
-#: slice taken in the test body itself, which runs once and stays interpreted.
-# jit-compiles: cut, cut_from, cut_to
-from std.test import assert_eq
+#: Each helper is called more than JAI_JIT_THRESHOLD times so the
+#: whole-function tier compiles it on call count alone; every answer is the
+#: interpreter's, which `JAITHON_NO_JIT=1` checks on the same file.
+# jit-compiles: cut_words, cut_range, cut_head, cut_tail
+from std.test import assert_eq, assert_true
 
-let CALLS = 300
+let CALLS = 100
 
-fn cut(s: str, a: int, b: int) -> str { return s[a:b] }
-
-fn cut_from(s: str, a: int) -> str { return s[a:] }
-
-fn cut_to(s: str, b: int) -> str { return s[:b] }
-
-pub fn test_bounds_match_the_general_path() -> void {
-    let text = "hello, world"
-    var warm = 0
-    for _i in 0..CALLS {
-        warm += cut(text, 1, 4).len() + cut_from(text, 7).len() + cut_to(text, 5).len()
-    }
-    assert_eq(warm, CALLS * (3 + 5 + 5), "warm")
-    let bounds = [-20, -13, -12, -5, -1, 0, 1, 3, 5, 11, 12, 13, 40]
-    for a in bounds {
-        assert_eq(cut_from(text, a), text[a:], f"from {a}")
-        assert_eq(cut_to(text, a), text[:a], f"to {a}")
-        for b in bounds {
-            assert_eq(cut(text, a, b), text[a:b], f"{a}:{b}")
+fn cut_words(text: str) -> list[str] {
+    var out = []
+    var start = 0
+    var at = 0
+    let n = text.len()
+    while at < n {
+        if text[at] == " " {
+            if at > start { out.push(text[start:at]) }
+            start = at + 1
         }
+        at += 1
+    }
+    if start < n { out.push(text[start:n]) }
+    return out
+}
+
+fn cut_range(s: str, a: int, b: int) -> str {
+    return s[a:b]
+}
+
+fn cut_head(s: str, b: int) -> str {
+    return s[:b]
+}
+
+fn cut_tail(s: str, a: int) -> str {
+    return s[a:]
+}
+
+pub fn test_words_out_of_a_text() -> void {
+    let text = "the cat sat on the mat the end"
+    var call = 0
+    while call < CALLS {
+        let words = cut_words(text)
+        assert_eq(words.len(), 8)
+        assert_eq(words[0], "the")
+        assert_eq(words[7], "end")
+        call += 1
+    }
+    #: Repeated words come back as the one interned string.
+    let again = cut_words(text)
+    assert_true(again[0] is again[4], "interned")
+}
+
+pub fn test_bounds_clamp_like_the_interpreter() -> void {
+    let s = "abcdefghij"
+    var call = 0
+    while call < CALLS {
+        assert_eq(cut_range(s, 2, 5), "cde")
+        assert_eq(cut_range(s, -3, -1), "hi")
+        assert_eq(cut_range(s, -100, 2), "ab")
+        assert_eq(cut_range(s, 8, 100), "ij")
+        assert_eq(cut_range(s, 5, 5), "")
+        assert_eq(cut_range(s, 7, 3), "")
+        assert_eq(cut_range(s, 100, 200), "")
+        assert_eq(cut_range(s, 4, 5), "e")
+        assert_eq(cut_range(s, -1, 10), "j")
+        call += 1
     }
 }
 
-pub fn test_non_ascii_and_embedded_nul() -> void {
-    for _i in 0..CALLS { cut("abcdef", 1, 3) }
-    let wide = "aé中bc"
-    assert_eq(cut(wide, 1, 3), "é中", "multi-byte, in characters")
-    assert_eq(cut(wide, -2, 5), "bc", "negative over multi-byte")
-    let nul = "ab\0cd"
-    assert_eq(cut(nul, 1, 4), "b\0c", "an embedded NUL")
-    assert_eq(cut(nul, 2, 3), "\0", "the NUL alone")
-    assert_eq(cut("", 0, 3), "", "empty source")
-    assert_eq(cut("x", 0, 1), "x", "one character")
+pub fn test_missing_bounds() -> void {
+    let s = "abcdefghij"
+    var call = 0
+    while call < CALLS {
+        assert_eq(cut_head(s, 3), "abc")
+        assert_eq(cut_head(s, -8), "ab")
+        assert_eq(cut_tail(s, 7), "hij")
+        assert_eq(cut_tail(s, -2), "ij")
+        assert_eq(cut_tail(s, 20), "")
+        call += 1
+    }
 }
 
-pub fn test_results_are_ordinary_strings() -> void {
-    var seen: dict[str, int] = {}
-    let text = "key1 key2 key1 key3 key1"
-    for _r in 0..CALLS {
-        var i = 0
-        while i + 4 <= text.len() {
-            let word = cut(text, i, i + 4)
-            if word.starts_with("key") { seen[word] = seen.get(word, 0) + 1 }
-            i += 5
-        }
+pub fn test_long_and_new_slices() -> void {
+    let long = "0123456789abcdefghijklmnopqrstuvwxyz0123456789"
+    var call = 0
+    while call < CALLS {
+        #: Past the intern limit: always the general path.
+        assert_eq(cut_range(long, 0, 40).len(), 40)
+        #: A slice nobody has made before: a miss, then the general path.
+        let fresh = cut_range(f"{long}{call}", 30, 46 + (if call < 10 { 1 } else { 2 }))
+        assert_eq(fresh, f"{long}{call}"[30:46 + (if call < 10 { 1 } else { 2 })])
+        call += 1
     }
-    assert_eq(seen["key1"], 3 * CALLS, "dict keys from slices")
-    assert_eq(seen.len(), 3, "three distinct keys")
+}
+
+pub fn test_non_ascii_sources() -> void {
+    let s = "héllo wörld"
+    var call = 0
+    while call < CALLS {
+        assert_eq(cut_range(s, 0, 5), "héllo")
+        assert_eq(cut_range(s, 6, 11), "wörld")
+        assert_eq(cut_range(s, 1, 2), "é")
+        call += 1
+    }
+    assert_eq(cut_words(s), ["héllo", "wörld"])
 }

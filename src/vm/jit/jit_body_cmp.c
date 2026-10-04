@@ -759,11 +759,26 @@ JitArmResult emitMembership(Emit *e, const uint8_t *code, int *offp) {
         if (!jitMembership() || !e->callsOut || e->depth < 2) {
             goto unarmedOpcode;
         }
+        /* A string looked up in what was a dict when this compiled: the
+         * leaf answers in place, and this descriptor call stays behind it
+         * for everything else. See emitDictLeafHas. */
+        LeafFix mfx;
+        mfx.on = false;
+        if (e->stack[e->depth - 1] == SLOT_OBJ &&
+            dictLeafKeyAt(e, e->depth - 2) &&
+            JIT_SEEN_OR_PREDICTED_DICT(e, e->depth - 1)) {
+            emitDictLeafHas(e, valueXReg(e, e->valueDepth - 1),
+                            valueXReg(e, e->valueDepth - 2),
+                            e->stack[e->depth - 2], code[off] == OP_NOT_IN,
+                            &mfx);
+        }
+        leafSlowHere(e, &mfx);
         if (!emitDescriptor(e, NULL_VAL, e->depth - 2, 2,
                             code[off] == OP_IN ? (void *)&jitContains
                                                : (void *)&jitNotContains)) {
             return false;
         }
+        leafDoneHere(e, &mfx);
         for (unsigned i = 0; i < 2; i++) {
             unsigned r;
             if (!popValue(e, &r, NULL)) return false;

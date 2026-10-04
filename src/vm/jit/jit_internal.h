@@ -845,13 +845,58 @@ int jitListGrow(ObjList *list, uint64_t tag, int64_t payload);
 ObjInstance *jitInstanceAlloc(ObjClass *cls);
 ObjIter *jitIterAlloc(Obj *source);
 bool jitIterAllocOn(void);
-ObjString *jitStrSliceLeaf(ObjString *s, int64_t start, int64_t stop,
-                           int64_t flags);
-bool jitSliceLeafOn(void);
 int jitNewInstance(JitCallDesc *d);
 int jitGetSlice(JitCallDesc *d);
 int jitGetIndexDict(JitCallDesc *d);
+int jitMakeDictKeysIter(JitCallDesc *d);
 int jitSetIndexDict(JitCallDesc *d);
+
+/* The string-keyed dict leaves and the arm that calls them; see jitDictGetStr. */
+#define JIT_DICT_ABSENT_SLOW 0xFFFFu
+bool jitDictLeaf(void);
+bool jitDictProbeOn(void);
+ObjDict *jitDictProbe(void);
+/* A dict the model has a sample of, or knows by its predicted type alone. */
+#define JIT_SEEN_OR_PREDICTED_DICT(e, idx) \
+    (IS_DICT((e)->stackSeen[idx]) ||       \
+     (jitDictProbeOn() &&                  \
+      (e)->stackObjType[idx] == (uint8_t)(OBJ_DICT + 1)))
+int64_t jitDictGetStr(ObjDict *d, ObjString *key, Value *result,
+                      uint64_t defTag, int64_t defPayload);
+int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
+                      int64_t payload);
+int64_t jitDictHasStr(Obj *container, Obj *needle, Value *result,
+                      int64_t negate);
+int64_t jitDictAddStr(Obj *dictObj, Obj *keyObj, int64_t defPayload,
+                      int64_t addend, int64_t absentSlow);
+int64_t jitDictGetInt(ObjDict *d, int64_t key, Value *result, uint64_t defTag,
+                      int64_t defPayload);
+int64_t jitDictSetInt(ObjDict *d, int64_t key, uint64_t tag, int64_t payload);
+int64_t jitDictHasInt(Obj *container, int64_t key, Value *result,
+                      int64_t negate);
+int64_t jitDictAddInt(Obj *dictObj, int64_t key, int64_t defPayload,
+                      int64_t addend, int64_t absentSlow);
+typedef struct {
+    int      slow[2];   /* the branches to the descriptor path, or -1 */
+    unsigned cond[2];   /* the condition each of them branches on */
+    int      done;      /* the branch over it */
+    bool     on;        /* a leaf was emitted at all */
+} LeafFix;
+void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
+                     int defIdx, SlotKind defKind, bool absentSlow,
+                     LeafFix *fx);
+void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
+                     bool negate, LeafFix *fx);
+/* Whether the dict leaves take the key at a stack entry: an int, or an object
+ * not seen to be anything but a string. */
+bool dictLeafKeyAt(const Emit *e, unsigned idx);
+bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
+                      unsigned ridx);
+bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count);
+bool leafRegOk(unsigned r);
+bool jitLeafInReg(void);
+void leafSlowHere(Emit *e, LeafFix *fx);
+void leafDoneHere(Emit *e, LeafFix *fx);
 int jitCallOut(JitCallDesc *d);
 
 /* Defined in jit_osr.c. */
@@ -1093,8 +1138,6 @@ bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
 bool emitDescriptorFull(Emit *e, Value calleeVal, unsigned first,
                         unsigned nargs, void *helper, bool ownStatus,
                         int calleeReg, bool noRoots);
-int jitFormatLeaf(JitCallDesc *d);
-bool jitFormatLeafOn(void);
 bool concatOperands(const Emit *e, Value *sample);
 bool emitStringConcat(Emit *e, Value sample);
 bool nullLiteralPair(const Emit *e, uint8_t op, SlotKind ka, SlotKind kb);
