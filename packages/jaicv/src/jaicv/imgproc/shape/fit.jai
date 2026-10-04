@@ -1,5 +1,6 @@
 #: Matching two shapes, and fitting a line or an ellipse to points.
 import std.math
+from std.os import env
 from ..geometric import solve_dense
 from ...core.types import Point, Point2f, RotatedRect, Size2f
 from .moments import EPSILON, hu_moments, moments
@@ -129,6 +130,14 @@ fn weighted_fit(points: list[Point], weights: list[float]) -> list[float] {
     return [math.cos(angle), math.sin(angle), cx, cy]
 }
 
+#: Whether `fit_ellipse` asks `__prim__.points_fit_ellipse` first. Read once;
+#: `JAICV_NATIVE_FIT=0` keeps the Jaithon below, which it is checked against.
+#: Fitting 3600 blob contours took 572 ms against OpenCV's 29.
+let _native_fit = (env("JAICV_NATIVE_FIT") ?? "1") != "0"
+
+#: Where `points_fit_ellipse` leaves the ellipse: centre, axes and angle.
+var _ellipse_native: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
+
 #: Fit an ellipse to a set of points.
 #:
 #: Three least-squares fits, which is how OpenCV does it and why the answer
@@ -141,6 +150,12 @@ fn weighted_fit(points: list[Point], weights: list[float]) -> list[float] {
 pub fn fit_ellipse(points: list[Point]) -> RotatedRect {
     let count = points.len()
     if count < 5 { throw ValueError("an ellipse needs at least five points") }
+    #: All of the below in `__prim__.points_fit_ellipse`, operation for
+    #: operation; false for points it cannot read, which go on below.
+    if _native_fit and __prim__.points_fit_ellipse(points, _ellipse_native) {
+        let got = _ellipse_native
+        return RotatedRect(Point2f(got[0], got[1]), Size2f(got[2], got[3]), got[4])
+    }
 
     var cx = 0.0
     var cy = 0.0

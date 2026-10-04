@@ -868,6 +868,163 @@ static bool primPointsMoments(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* --- the ellipse fit ------------------------------------------------- */
+
+/* `solve_dense` in geometric.jai: Gauss-Jordan elimination with partial
+ * pivoting over an n by `width` system, `right` its last column, for the
+ * small systems the fits make. `matrix` is n rows of width + 1. */
+static void denseSolve(double *matrix, int n, int width, double *solution) {
+    const int span = width + 1;
+    int column = 0, pivotRow = 0;
+    while (column < width && pivotRow < n) {
+        int best = pivotRow;
+        double bestSize = fabs(matrix[pivotRow * span + column]);
+        for (int candidate = pivotRow + 1; candidate < n; candidate++) {
+            const double size = fabs(matrix[candidate * span + column]);
+            if (size > bestSize) {
+                best = candidate;
+                bestSize = size;
+            }
+        }
+        if (bestSize < 1e-12) {
+            column++;
+            continue;
+        }
+        if (best != pivotRow) {
+            for (int k = 0; k < span; k++) {
+                const double held = matrix[pivotRow * span + k];
+                matrix[pivotRow * span + k] = matrix[best * span + k];
+                matrix[best * span + k] = held;
+            }
+        }
+        const double leading = matrix[pivotRow * span + column];
+        for (int k = column; k < span; k++) matrix[pivotRow * span + k] /= leading;
+        for (int other = 0; other < n; other++) {
+            if (other == pivotRow) continue;
+            const double factor = matrix[other * span + column];
+            if (factor == 0.0) continue;
+            for (int k = column; k < span; k++) {
+                matrix[other * span + k] -= factor * matrix[pivotRow * span + k];
+            }
+        }
+        pivotRow++;
+        column++;
+    }
+    for (int k = 0; k < width; k++) solution[k] = 0.0;
+    int row = 0, lead = 0;
+    while (row < n && lead < width) {
+        if (fabs(matrix[row * span + lead]) < 1e-12) {
+            lead++;
+            continue;
+        }
+        solution[lead] = matrix[row * span + width];
+        row++;
+        lead++;
+    }
+}
+
+/* `points_fit_ellipse(points, out)` -- `fit_ellipse` in shape/fit.jai for
+ * five or more points: a conic by least squares about the centroid, a two by
+ * two solve for its true centre, a second conic about that, and the axes and
+ * angle from its eigenvalues. Every sum, product and division is the one the
+ * Jaithon makes, in its order -- the normal equations accumulated row by row,
+ * the same elimination with the same pivoting -- so the ellipse is the same
+ * to the bit. Written there it built a list of five floats a point and walked
+ * lists of lists, 159 microseconds for a 50-point blob against OpenCV's 8.
+ *
+ * Writes the centre's x and y, the shorter and the longer axis and the angle
+ * into `out` and returns true; false, writing nothing, when a point is not an
+ * object with integer `x` and `y`. A set that does not determine an ellipse
+ * throws as the Jaithon does. */
+static bool primPointsFitEllipse(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *points, *fitted;
+    if (!jaiArgList(args[0], 1, "points_fit_ellipse", &points)) return false;
+    if (!jaiArgList(args[1], 2, "points_fit_ellipse", &fitted)) return false;
+    if (fitted->count < 5) {
+        return jaiThrow(vm.cValueError, "points_fit_ellipse(): the out list holds %d of 5 values",
+                        fitted->count);
+    }
+    const int count = points->count;
+    *out = BOOL_VAL(false);
+    if (count < 5) return true;
+    double *xy = (double *)malloc((size_t)count * 2 * sizeof(double));
+    if (xy == NULL) return jaiThrow(vm.cRuntimeError, "points_fit_ellipse(): out of memory");
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    for (int i = 0; i < count; i++) {
+        int64_t x, y;
+        if (!jaiReadPoint(&reader, jaiListGet(points, i), &x, &y)) {
+            free(xy);
+            return true;
+        }
+        xy[i * 2] = (double)x;
+        xy[i * 2 + 1] = (double)y;
+    }
+
+    double cx = 0.0, cy = 0.0;
+    for (int i = 0; i < count; i++) {
+        cx += xy[i * 2];
+        cy += xy[i * 2 + 1];
+    }
+    cx /= (double)count;
+    cy /= (double)count;
+
+    /* `least_squares` over [-u*u, -v*v, -u*v, u, v]. */
+    double normal[5 * 6];
+    for (int k = 0; k < 30; k++) normal[k] = 0.0;
+    for (int p = 0; p < count; p++) {
+        const double u = xy[p * 2] - cx;
+        const double v = xy[p * 2 + 1] - cy;
+        const double row[5] = {-u * u, -v * v, -u * v, u, v};
+        for (int i = 0; i < 5; i++) {
+            for (int j = 0; j < 5; j++) normal[i * 6 + j] += row[i] * row[j];
+            normal[i * 6 + 5] += row[i];
+        }
+    }
+    double conic[5];
+    denseSolve(normal, 5, 5, conic);
+
+    double centre[2 * 3] = {2.0 * conic[0], conic[2], conic[3], conic[2], 2.0 * conic[1], conic[4]};
+    double offset[2];
+    denseSolve(centre, 2, 2, offset);
+
+    /* `least_squares` over [u*u, v*v, u*v] about the true centre. */
+    double second[3 * 4];
+    for (int k = 0; k < 12; k++) second[k] = 0.0;
+    for (int p = 0; p < count; p++) {
+        const double u = xy[p * 2] - cx - offset[0];
+        const double v = xy[p * 2 + 1] - cy - offset[1];
+        const double row[3] = {u * u, v * v, u * v};
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) second[i * 4 + j] += row[i] * row[j];
+            second[i * 4 + 3] += row[i];
+        }
+    }
+    free(xy);
+    double shape[3];
+    denseSolve(second, 3, 3, shape);
+    const double a = shape[0], b = shape[1], c = shape[2];
+
+    const double root = sqrt((a - b) * (a - b) + c * c);
+    const double larger = (a + b + root) * 0.5;
+    const double smaller = (a + b - root) * 0.5;
+    if (fabs(larger) <= 1e-12 || fabs(smaller) <= 1e-12) {
+        return jaiThrow(vm.cValueError, "these points do not determine an ellipse");
+    }
+    const double shortAxis = 2.0 / sqrt(fabs(larger));
+    const double longAxis = 2.0 / sqrt(fabs(smaller));
+    double angle = 0.5 * atan2(c, a - b) * 180.0 / 3.141592653589793 + 180.0;
+    while (angle >= 180.0) angle -= 180.0;
+    while (angle < 0.0) angle += 180.0;
+
+    const double values[5] = {cx + offset[0], cy + offset[1], shortAxis, longAxis, angle};
+    for (int i = 0; i < 5; i++) jaiListPut(fitted, i, FLOAT_VAL(values[i]));
+    jaiListTouch(fitted);
+    *out = BOOL_VAL(true);
+    return true;
+}
+
 void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_hull",    primPointsHull,   2, 2);
     jaiStrDefinePrim(ns, "points_min_box", primPointsMinBox, 2, 2);
@@ -875,4 +1032,5 @@ void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_min_circle", primPointsMinCircle, 2, 2);
     jaiStrDefinePrim(ns, "points_area", primPointsArea, 2, 2);
     jaiStrDefinePrim(ns, "points_moments", primPointsMoments, 2, 2);
+    jaiStrDefinePrim(ns, "points_fit_ellipse", primPointsFitEllipse, 2, 2);
 }
