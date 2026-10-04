@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
@@ -213,6 +214,36 @@ bool emitCmpLocalConstLt(Emit *e, const uint8_t *code, int *offp) {
     return true;
 }
 
+/* JAITHON_JIT_FUSED_SHAPE=0 leaves `local + k` and `local - k` fused into one
+ * instruction out of the index shapes. On by default.
+ *
+ * Emit::idxKnown follows an index from the GET_LOCAL that read it through the
+ * `+ k` / `- k` that offsets it, so a subscript can be proved in bounds at its
+ * loop's head. The emitter FUSES some of those reads into OP_ADD_INT_CONST /
+ * OP_SUB_INT_CONST (`n += mid[c - 1]` compiles that way where `up[c - 1]` does
+ * not), and those carried no shape -- so a stencil's middle and lower rows
+ * kept a compare and branch per neighbour while the upper row had none, and
+ * their spans came out short, which cost the head's guard the offsets it was
+ * missing. The arithmetic is checked for overflow exactly as the unfused form
+ * is, so the shape describes a value that was actually computed. */
+static bool fusedShapeOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_FUSED_SHAPE");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static void noteFusedIndexShape(Emit *e, unsigned slot, int32_t off) {
+    if (!fusedShapeOn()) return;
+    if (slot > UINT8_MAX || off < -4096 || off > 4096) return;
+    unsigned at = e->valueDepth - 1;
+    e->idxKnown |= 1u << at;
+    e->idxBase[at] = (uint8_t)slot;
+    e->idxOff[at]  = off;
+}
+
 bool emitAddIntConst(Emit *e, const uint8_t *code, int *offp) {
     int off = *offp;
     do {
@@ -222,6 +253,7 @@ bool emitAddIntConst(Emit *e, const uint8_t *code, int *offp) {
         if (e->localKind[slot] != SLOT_INT) return false;
         if (slot == 0) e->usesSlot0 = true;
         if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+        noteFusedIndexShape(e, slot, imm);
         {
             unsigned dst = pushReg(e) - 1;
             unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
@@ -254,6 +286,7 @@ bool emitSubIntConst(Emit *e, const uint8_t *code, int *offp) {
         if (e->localKind[slot] != SLOT_INT) return false;
         if (slot == 0) e->usesSlot0 = true;
         if (!pushValue(e, SLOT_INT, 0, NULL)) return false;
+        noteFusedIndexShape(e, slot, -(int32_t)imm);
         {
             unsigned dst = pushReg(e) - 1;
             unsigned cur = localIn(e, slot, JIT_SCRATCH_C);
