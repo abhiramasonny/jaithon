@@ -576,6 +576,18 @@ typedef struct {
         uint8_t  slot, countReg, verReg;
     } pushHoist[2];
     unsigned  pushHoistCount;
+    /* A for-in over a list whose iterator this body built keeps the
+     * iterator's index in a register for the loop (JAITHON_JIT_ITER_IDX_REG):
+     * loaded where the headers are, stored back after every step, never
+     * loaded again -- the store keeps the iterator current for a deopt, and
+     * the load it replaces was the step's dependency on the step before.
+     * `live` says the load was emitted: only over a list iterator. */
+    struct {
+        uint32_t top, end;
+        uint8_t  reg;
+        bool     live;
+    } iterHoist[2];
+    unsigned  iterHoistCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -948,6 +960,7 @@ void noteScratchClobber(Emit *e);
 void noteGrowClobber(Emit *e);
 unsigned hoistListRegFor(const Emit *e, unsigned slot);
 int pushHoistFor(const Emit *e, int slot);
+int iterHoistAt(const Emit *e, uint32_t top);
 bool jitHoistPush(void);
 unsigned valueXReg(const Emit *e, unsigned idx);
 unsigned pushReg(const Emit *e);

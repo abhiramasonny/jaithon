@@ -820,6 +820,15 @@ void noteScratchClobber(Emit *e) {
             return;
         }
     }
+    if (!e->measuring && e->iterHoistCount > 0) {
+        uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+        for (unsigned i = 0; i < e->iterHoistCount; i++) {
+            if (at < e->iterHoist[i].top || at >= e->iterHoist[i].end) continue;
+            e->whyNot = "a call reached a loop an iterator index was hoisted over";
+            e->failed = true;
+            return;
+        }
+    }
     /* And the ratchet the split bank rests on. `splitAt` was chosen as the
      * deepest the measuring pass ever saw the stack at one of these, so a real
      * pass standing deeper means the two walks disagreed and an entry in

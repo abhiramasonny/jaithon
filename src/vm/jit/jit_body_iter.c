@@ -515,9 +515,17 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                 branchOnDeopt(e, JAI_A64_NE);
 
                 /* `limit` is the snapshot count, not the live one -- the
-                 * version guard above owns any disagreement between them. */
-                emit(e, jaiA64LdrX(JIT_SCRATCH_A, rIt,
-                                   (unsigned)offsetof(ObjIter, index)));
+                 * version guard above owns any disagreement between them.
+                 * The index comes out of its loop register when it has one
+                 * (Emit::iterHoist): the same value, without the load that
+                 * waited on the last step's store. */
+                int ih = iterHoistAt(e, (uint32_t)off);
+                if (ih >= 0) {
+                    emit(e, jaiA64MovX(JIT_SCRATCH_A, e->iterHoist[ih].reg));
+                } else {
+                    emit(e, jaiA64LdrX(JIT_SCRATCH_A, rIt,
+                                       (unsigned)offsetof(ObjIter, index)));
+                }
                 emit(e, jaiA64LdrX(JIT_SCRATCH_B, rIt,
                                    (unsigned)offsetof(ObjIter, limit)));
                 emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
@@ -633,9 +641,16 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                  * write cannot touch. One byte for a bool: see the note in
                  * OP_GET_INDEX -- `strb` is what BOOL_VAL compiles to, so
                  * the rest of the payload word is stale. */
-                emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_A, 1));
-                emit(e, jaiA64StrX(JIT_SCRATCH_B, rIt,
-                                   (unsigned)offsetof(ObjIter, index)));
+                if (ih >= 0) {
+                    unsigned ri = e->iterHoist[ih].reg;
+                    emit(e, jaiA64AddXImm(ri, ri, 1));
+                    emit(e, jaiA64StrX(ri, rIt,
+                                       (unsigned)offsetof(ObjIter, index)));
+                } else {
+                    emit(e, jaiA64AddXImm(JIT_SCRATCH_B, JIT_SCRATCH_A, 1));
+                    emit(e, jaiA64StrX(JIT_SCRATCH_B, rIt,
+                                       (unsigned)offsetof(ObjIter, index)));
+                }
                 if (ek == SLOT_BOOL) {
                     emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
                 } else {

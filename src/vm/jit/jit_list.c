@@ -468,6 +468,57 @@ static void planPushHoists(Emit *e, const Chunk *c, const SlotKind *kinds,
     }
 }
 
+/* JAITHON_JIT_ITER_IDX_REG: see Emit::iterHoist. */
+static bool jitIterIdxReg(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_IDX_REG");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* A for-in head whose loop calls nothing but list growth: the iterator's
+ * index can live in a register for as long as the loop runs, because only
+ * this head's own step writes it and the grow stub saves x13..x17. Not the
+ * loop tier's own head, which has registers of its own for that. */
+static void planIterHoists(Emit *e, const Chunk *c, uint32_t regionLo,
+                           uint32_t regionHi) {
+    e->iterHoistCount = 0;
+    if (!jitIterIdxReg() || !jitHoistPush()) return;
+    for (int off = (int)regionLo; off < (int)regionHi;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return;
+        uint32_t lt = (uint32_t)off;
+        off += len;
+        if (c->code[lt] != OP_FOR_ITER_BIND) continue;
+        if (e->osr && lt == e->osrTop) continue;
+        uint32_t le = loopBodyEnd(c, lt);
+        if (le == 0 || le <= lt || le > regionHi) continue;
+        if (regionCalls(e, lt, le)) continue;
+        if (!onlyBackEdgesEnter(c, lt, le)) continue;
+        if (e->iterHoistCount >= 2u) return;
+        if (e->hoistPoolCount - e->hoistTaken < 1u) return;
+        unsigned r = e->hoistPool[e->hoistTaken++];
+        if (r < e->scratchRoom) e->scratchRoom = r;
+        unsigned k = e->iterHoistCount++;
+        e->iterHoist[k].top  = lt;
+        e->iterHoist[k].end  = le;
+        e->iterHoist[k].reg  = (uint8_t)r;
+        e->iterHoist[k].live = false;
+    }
+}
+
+/* The iterator hoist whose index register was loaded for the head at `top`,
+ * or -1. */
+int iterHoistAt(const Emit *e, uint32_t top) {
+    if (e->measuring || e->inlining) return -1;
+    for (unsigned i = 0; i < e->iterHoistCount; i++) {
+        if (e->iterHoist[i].top == top && e->iterHoist[i].live) return (int)i;
+    }
+    return -1;
+}
+
 /* The push hoist covering a push of `slot`'s list at the current offset, or
  * -1. */
 int pushHoistFor(const Emit *e, int slot) {
@@ -589,6 +640,7 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
         e->hoistCount++;
     }
     planPushHoists(e, c, kinds, regionLo, regionHi);
+    planIterHoists(e, c, regionLo, regionHi);
     if (!lean) return;
     /* Versions, for lists stored into inside their own region. */
     for (unsigned h = 0; h < e->hoistCount; h++) {
@@ -672,6 +724,20 @@ void emitHoistsAt(Emit *e, uint32_t off) {
      * instruction and a guard taken against it resumes somewhere whose operand
      * model has already been consumed. */
     if (e->inlining) return;
+    /* The index of the list iterator on top of the stack -- only when it IS
+     * one (OP_GET_ITER's list arm, shape 1): any other iterator kind keeps
+     * its index in memory and this hoist simply stays unused. */
+    for (unsigned i = 0; i < e->iterHoistCount; i++) {
+        if (e->iterHoist[i].top != off) continue;
+        if (e->depth == 0 || e->stack[e->depth - 1] != SLOT_ITER ||
+            e->stackShape[e->depth - 1] != 1u) {
+            continue;
+        }
+        unsigned rIt = pushReg(e) - 1;
+        emit(e, jaiA64LdrX(e->iterHoist[i].reg, rIt,
+                           (unsigned)offsetof(ObjIter, index)));
+        e->iterHoist[i].live = true;
+    }
     for (unsigned i = 0; i < e->pushHoistCount; i++) {
         if (e->pushHoist[i].top != off) continue;
         unsigned pl = hoistListReg(e, e->pushHoist[i].slot);

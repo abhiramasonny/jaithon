@@ -138,3 +138,40 @@ fn test_recursion_inside_the_loop() -> void {
         assert_eq(depth_sum([1, 2, 3], 2), 78, "recursive")
     }
 }
+
+#: The iterator's index lives in a register for a loop that calls nothing
+#: (JAITHON_JIT_ITER_IDX_REG) and is stored back after every step, so a
+#: `continue`, a deopt part-way and a store under the iterator must all still
+#: see the index the interpreter would.
+fn odd_total(xs: list[int]) -> int {
+    var t = 0
+    for x in xs {
+        if x % 2 == 0 { continue }
+        t += x
+    }
+    return t
+}
+
+fn store_under(xs: list[int]) -> int {
+    var n = 0
+    try {
+        for x in xs {
+            n += 1
+            if x == 3 { xs[0] = 99 }
+        }
+    } catch _e: RuntimeError {
+        n += 1000
+    }
+    return n
+}
+
+fn test_an_index_held_in_a_register() -> void {
+    var long: list[int] = []
+    for k in 0..200000 { long.push(k % 10) }
+    for _round in 0..40 {
+        assert_eq(odd_total([1, 2, 3, 4, 5, 6, 7]), 16, "continue")
+        assert_eq(odd_total(long), 500000, "long continue")
+        assert_eq(store_under([1, 2, 3, 4, 5]), 1003, "store under the iterator")
+        assert_eq(mixed([5, 6, "x", 8]), 103, "deopt part-way")
+    }
+}
