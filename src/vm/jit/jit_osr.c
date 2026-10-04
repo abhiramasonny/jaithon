@@ -896,6 +896,17 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                     e.hoist[i].itemsReg, cnt, ver,
                     e.hoist[i].stgPin ? ", storage pinned" : "");
         }
+        for (unsigned i = 0; i < e.pushHoistCount; i++) {
+            fprintf(stderr, "[jit] osr at %u keeps slot %u's push count over "
+                    "%u..%u in x%u\n", top, e.pushHoist[i].slot,
+                    e.pushHoist[i].top, e.pushHoist[i].end,
+                    e.pushHoist[i].countReg);
+        }
+        for (unsigned i = 0; i < e.iterHoistCount; i++) {
+            fprintf(stderr, "[jit] osr at %u keeps the iterator index of "
+                    "%u..%u in x%u\n", top, e.iterHoist[i].top,
+                    e.iterHoist[i].end, e.iterHoist[i].reg);
+        }
         for (unsigned i = 0; i < e.strFactCount; i++) {
             fprintf(stderr,
                     "[jit] osr at %u proves slot %u a%s%s string over %u..%u\n",

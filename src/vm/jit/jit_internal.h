@@ -643,6 +643,29 @@ typedef struct {
      * nothing, asking the walk to interpret from that instruction rather
      * than decline the body. Function tier only; see jitIterSoft. */
     bool      iterUnarmed;
+    /* The push whose list's count and version live in registers for a loop
+     * (JAITHON_JIT_PUSH_REG): loaded where the headers are, written back to
+     * the list after every push -- the stores stay, the loads that chained
+     * each push to the previous one through memory go. Planned only over a
+     * loop whose one push is a keeping grow site (jitGrowKeeps), so the stub
+     * puts the two registers back. */
+    struct {
+        uint32_t top, end;
+        uint8_t  slot, countReg, verReg;
+    } pushHoist[2];
+    unsigned  pushHoistCount;
+    /* A for-in over a list whose iterator this body built keeps the
+     * iterator's index in a register for the loop (JAITHON_JIT_ITER_IDX_REG):
+     * loaded where the headers are, stored back after every step, never
+     * loaded again -- the store keeps the iterator current for a deopt, and
+     * the load it replaces was the step's dependency on the step before.
+     * `live` says the load was emitted: only over a list iterator. */
+    struct {
+        uint32_t top, end;
+        uint8_t  reg;
+        bool     live;
+    } iterHoist[2];
+    unsigned  iterHoistCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -1218,6 +1241,8 @@ void emitElemStoreAt(Emit *e, uint8_t stg, unsigned rItems,
 void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount);
 int hoistFor(const Emit *e, int slot);
+int pushHoistFor(const Emit *e, int slot);
+int iterHoistAt(const Emit *e, uint32_t top);
 int hoistForStr(const Emit *e, int slot);
 ObjDict *jitDictExemplar(void);
 bool jitFieldDict(void);

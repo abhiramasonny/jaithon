@@ -1,6 +1,6 @@
-#: A loop's one `push` once kept its list's count and bumped version in
-#: registers, writing both back after every push but never loading them.
-#: That arm gave way to JAITHON_JIT_GROW_KEEPS; the shapes stay as a check.
+#: A loop's one `push` keeps its list's count and bumped version in registers
+#: (JAITHON_JIT_PUSH_REG), writing both back after every push but never
+#: loading them, so one push no longer waits on the last through memory.
 #:
 #: The shapes here are the ones where a count held in a register could drift
 #: from the list: another local naming the same list and reading its length or

@@ -170,7 +170,8 @@ fn test_break_out_of_nested_for_in() -> void {
     }
 }
 
-#: The iterator's index is stored back after every step, so a
+#: The iterator's index lives in a register for a loop that calls nothing
+#: (JAITHON_JIT_ITER_IDX_REG) and is stored back after every step, so a
 #: `continue`, a deopt part-way and a store under the iterator must all still
 #: see the index the interpreter would.
 fn odd_total(xs: list[int]) -> int {

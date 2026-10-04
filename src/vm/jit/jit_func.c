@@ -447,6 +447,13 @@ static void noteSlotWrite(Emit *e, unsigned slot) {
             e->whyNot = "a hoisted list header's local was written after all";
             e->failed = true;
         }
+        for (unsigned i = 0; i < e->pushHoistCount; i++) {
+            if (e->pushHoist[i].slot != (uint8_t)slot) continue;
+            if (e->curOffset < e->pushHoist[i].top) continue;
+            if (e->curOffset >= e->pushHoist[i].end) continue;
+            e->whyNot = "a pushed list's local was written after all";
+            e->failed = true;
+        }
         return;
     }
     if (e->inlining) return;
@@ -908,6 +915,24 @@ void noteScratchClobber(Emit *e) {
         for (unsigned i = 0; i < e->hoistCount; i++) {
             if (at < e->hoist[i].top || at >= e->hoist[i].end) continue;
             e->whyNot = "a call reached a loop a header was hoisted out of";
+            e->failed = true;
+            return;
+        }
+    }
+    if (!e->measuring && e->pushHoistCount > 0) {
+        uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+        for (unsigned i = 0; i < e->pushHoistCount; i++) {
+            if (at < e->pushHoist[i].top || at >= e->pushHoist[i].end) continue;
+            e->whyNot = "a call reached a loop a push count was hoisted over";
+            e->failed = true;
+            return;
+        }
+    }
+    if (!e->measuring && e->iterHoistCount > 0) {
+        uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+        for (unsigned i = 0; i < e->iterHoistCount; i++) {
+            if (at < e->iterHoist[i].top || at >= e->iterHoist[i].end) continue;
+            e->whyNot = "a call reached a loop an iterator index was hoisted over";
             e->failed = true;
             return;
         }

@@ -890,6 +890,17 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                         e.hoist[i].hasCount ? " with a count" : "",
                         e.hoist[i].hasVer ? " and a version" : "");
             }
+            for (unsigned i = 0; i < e.pushHoistCount; i++) {
+                fprintf(stderr, "[jit] %s keeps slot %u's push count over "
+                        "%u..%u in x%u\n", jitFnLabel(fn), e.pushHoist[i].slot,
+                        e.pushHoist[i].top, e.pushHoist[i].end,
+                        e.pushHoist[i].countReg);
+            }
+            for (unsigned i = 0; i < e.iterHoistCount; i++) {
+                fprintf(stderr, "[jit] %s keeps the iterator index of %u..%u "
+                        "in x%u\n", jitFnLabel(fn), e.iterHoist[i].top,
+                        e.iterHoist[i].end, e.iterHoist[i].reg);
+            }
         }
     }
     /* declineReason, not e.whyNot: an arm that noted only a whySub used to
