@@ -700,8 +700,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * so that runaway recursion still becomes a RecursionError. */
     int guardLoad = (int)e.count;
     emit(&e, jaiA64LdrLit(JIT_SCRATCH_A, 0));         /* patched below */
-    emit(&e, jaiA64AddXImm(JIT_SCRATCH_B, 31, 0));    /* mov x10, sp */
-    emit(&e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
+    emit(&e, jaiA64CmpSpX(JIT_SCRATCH_A));            /* every call pays it */
     unsigned guardBranch = e.count;
     emit(&e, jaiA64BCond(JAI_A64_LO, 0));             /* patched below */
 
@@ -1109,6 +1108,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         uint32_t word = e.code[f->instIndex];
         if ((word & 0xfc000000u) == 0x94000000u) {
             e.code[f->instIndex] = jaiA64Bl(rel);
+        } else if (f->conditional && jaiA64IsCbz(word)) {
+            e.code[f->instIndex] = jaiA64CbzRetarget(word, rel);
         } else if (f->conditional) {
             e.code[f->instIndex] = jaiA64BCond(word & 0xfu, rel);
         } else {

@@ -481,14 +481,15 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             return false;
         }
 
-        emit(e, jaiA64SubsXImm(31, 1, 0));
+        /* One word: the stub re-reads x1 for itself, so nothing here needs
+         * the flags a compare would leave. */
         if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
         e->fixups[e->fixupCount].instIndex    = (int)e->count;
         e->fixups[e->fixupCount].targetOffset = FIXUP_SELFSLOW - si;
         e->fixups[e->fixupCount].conditional  = true;
         e->fixups[e->fixupCount].depth        = -1;
         e->fixupCount++;
-        emit(e, jaiA64BCond(JAI_A64_NE, 0));
+        emit(e, jaiA64CbnzX(1, 0));
         emit(e, jaiA64MovX(resultReg, 0));
         e->selfSlow[si].returnTo = (int)e->count;
 

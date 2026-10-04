@@ -153,6 +153,31 @@ uint32_t jaiA64LdrLit(unsigned rt, int32_t instructions) {
     return 0x58000000u | (imm19 << 5) | rt;
 }
 
+/* cbnz Xt, <label> -- a compare against zero and a branch in one word; what
+ * a call site's verdict test is, x1 being zero on every ordinary return. */
+uint32_t jaiA64CbnzX(unsigned rt, int32_t instructions) {
+    uint32_t imm19 = (uint32_t)(instructions & 0x7ffff);
+    return 0xb5000000u | (imm19 << 5) | rt;
+}
+
+/* Whether `word` is a CBZ/CBNZ, whose 19-bit offset a fixup patches in place
+ * of a B.cond's -- see the patch loops in jit_compile.c and jit_osr.c. */
+bool jaiA64IsCbz(uint32_t word) {
+    return (word & 0x7e000000u) == 0x34000000u;
+}
+
+/* The same instruction with its offset replaced, register and sense kept. */
+uint32_t jaiA64CbzRetarget(uint32_t word, int32_t instructions) {
+    return (word & 0xff00001fu) | (((uint32_t)instructions & 0x7ffffu) << 5);
+}
+
+/* cmp sp, Xm -- SUBS XZR, SP, Xm (extended register, UXTX). SP cannot be a
+ * shifted-register operand, which is why the stack guard used to copy it to a
+ * scratch first. */
+uint32_t jaiA64CmpSpX(unsigned rm) {
+    return 0xeb2063ffu | (rm << 16);
+}
+
 /* movn Xd, #imm16 -- Xd = ~imm16, which is how a small negative constant
  * becomes one instruction instead of a materialise-and-negate pair. */
 uint32_t jaiA64MovnX(unsigned rd, unsigned imm16) {

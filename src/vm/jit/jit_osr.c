@@ -1041,6 +1041,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         int rel = target - f->instIndex;
         uint32_t word = e.code[f->instIndex];
         if ((word & 0xfc000000u) == 0x94000000u) e.code[f->instIndex] = jaiA64Bl(rel);
+        else if (f->conditional && jaiA64IsCbz(word))
+            e.code[f->instIndex] = jaiA64CbzRetarget(word, rel);
         else if (f->conditional) e.code[f->instIndex] = jaiA64BCond(word & 0xfu, rel);
         else e.code[f->instIndex] = jaiA64B(rel);
     }
