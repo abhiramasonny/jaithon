@@ -280,22 +280,19 @@ pub class Painter {
         )
     }
 
-    #: A batch of thick segments in one call: the quadrilateral each sweeps,
-    #: then the cap at each one's far end. `ends` is four integers a segment,
-    #: `offsets` two -- how far its quadrilateral stands off it, across and
-    #: along, in fixed point with `shift` fractional bits -- and `cap_dy` and
-    #: `cap_reach` are the cap disc's rows. Exactly a `fill` a segment and then
-    #: a `span` a cap row, in that order.
-    pub fn segments(
+    #: Every contour outlined `thickness` wide, in one call: the quadrilateral
+    #: each segment sweeps and the round cap at its far end, which is what
+    #: `draw_contours` draws for a stroke wider than a pixel. False, with
+    #: nothing drawn, when a point is not something with integer `x` and `y`,
+    #: and the caller then draws it the long way.
+    pub fn thick_outlines(
         self,
-        ends: list[int],
-        offsets: list[int],
-        cap_dy: list[int],
-        cap_reach: list[int],
-        shift: int,
-        rounding: int
-    ) -> void {
-        __prim__.fill_segments(
+        contours: list[list[Point]],
+        offset_x: int,
+        offset_y: int,
+        thickness: int
+    ) -> bool {
+        return __prim__.fill_strokes(
             self.target,
             self.colour,
             self.cn,
@@ -303,12 +300,10 @@ pub class Painter {
             self.stride,
             self.cols,
             self.rows,
-            ends,
-            offsets,
-            cap_dy,
-            cap_reach,
-            shift,
-            rounding
+            contours,
+            offset_x,
+            offset_y,
+            thickness
         )
     }
 

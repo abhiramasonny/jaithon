@@ -722,9 +722,11 @@ pub fn find_contours(
     return (contours, relate(parents_of(chosen, mode)))
 }
 
-#: Whether `thick_contours` hands its segments to `__prim__.fill_segments` in
-#: one batch rather than drawing them a primitive call at a time. Read once.
-let _batch_segments = (env("JAICV_BATCH_SEGMENTS") ?? "1") != "0"
+#: Whether `draw_contours` hands a wide stroke to `__prim__.fill_strokes`, which
+#: does everything `thick_contours` does in one call. Read once;
+#: `JAICV_NATIVE_STROKES=0` keeps the Jaithon passes, which it is checked
+#: against.
+let _native_strokes = (env("JAICV_NATIVE_STROKES") ?? "1") != "0"
 
 #: The disc a thick stroke caps a segment with, as one span a row.
 #:
@@ -872,16 +874,6 @@ fn thick_contours(
         offsets.push(offset_along)
     }
 
-    #: The two passes below as one primitive call. They are a `fill_convex` a
-    #: segment and a `fill_span` a cap row, and the calls were most of what
-    #: drawing cost -- each maps the picture and waits on it again whatever
-    #: it draws -- so `fill_segments` takes the whole batch and does the same
-    #: fills in the same order. `JAICV_BATCH_SEGMENTS=0` puts the calls back.
-    if _batch_segments {
-        painter.segments(ends, offsets, cap_dy, cap_reach, XY_SHIFT, rounding)
-        return
-    }
-
     #: One corner list, refilled rather than rebuilt: the primitive reads it
     #: and keeps nothing of it. A segment of no length is handed over too --
     #: its four corners coincide, and the scanline walk leaves a quadrilateral
@@ -950,7 +942,14 @@ pub fn draw_contours(
     #: case is worth writing out, and it is the one a detector draws.
     if thickness > 1 and line_type != LINE_AA {
         let painter = Painter(image, colour)
-        thick_contours(painter, chosen, offset.x, offset.y, thickness)
+        #: Everything `thick_contours` does, in one primitive call. Its cost
+        #: was calls -- a `fill_convex` a segment and a `fill_span` a cap row,
+        #: each mapping the picture again -- and the passes working out the
+        #: corners; together 88 microseconds against OpenCV's 34 for a frame
+        #: contour of 74 points.
+        let drawn = _native_strokes and
+            painter.thick_outlines(chosen, offset.x, offset.y, thickness)
+        if not drawn { thick_contours(painter, chosen, offset.x, offset.y, thickness) }
         painter.finish()
         return image
     }
