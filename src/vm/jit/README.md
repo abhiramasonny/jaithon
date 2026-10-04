@@ -497,6 +497,7 @@ this table complete in both directions.
 | `JAITHON_JIT_COLLECT_CLASHES` | Kind clashes gathered during a walk. |
 
 `JAI_JIT_ATTRIB=1` with `--stats` gives exact per-function attribution of
+| `JAI_JIT_PERFMAP` | Appends `start size name` for every installed body (OSR forms as `name@osrN`) to `/tmp/jaithon-perf-<pid>.map`, so a sampling profile (`xctrace record --template 'Time Profiler'`) can attribute compiled code to functions. |
 interpreted work (`sum(attrib) == vm.instructionCount`);
 `scripts/dev/jit_report.py` drives it. Rank refusals by **distinct sites**, not
 events -- the two orderings are nearly opposite.

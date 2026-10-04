@@ -818,6 +818,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     form->code  = entry;
     form->top   = top;
     form->slots = (uint8_t)e.locals;
+    jitPerfMapNote(entry, e.count, fn, (long)top);
     form->iterKind = iterKind;
     /* Kind in the low nibble, ListStore in the high one. See JaiOsrForm::kinds:
      * a list slot's storage was pinned when its element loads were emitted, so
