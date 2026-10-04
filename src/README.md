@@ -63,6 +63,13 @@ src/cli/*.c           src/cli/*/*.c
 so a directory nested deeper than these is silently not built. `runtime/` is
 the only tree that reaches three levels.
 
+On an arm64 Mac the `.m` files are not linked into `jaithon` at all. They
+become three dylibs beside it -- `gpu`, `gui` and `camera`, named
+`jaithon-native-<image>-<uuid>.dylib` -- which the core opens the first time a
+program calls into one, so a program that uses none of them never loads Cocoa,
+Metal or AVFoundation. A new `.m` joins the `gpu` image unless the Makefile's
+`NATIVE_SRCS_*` names it elsewhere. `src/native/native_image.h` has the design.
+
 Two things a new file in `vm/jit/` has to get right. It must reproduce the
 `#if (defined(__aarch64__) || defined(__arm64__))` guard the tier is wrapped
 in, and the non-arm64 fallback stubs must continue to exist exactly once

@@ -30,6 +30,10 @@ gate/check_packages.py       validate workspace package manifests and their deps
 gate/fixpoint_check.sh       compile each source twice, diff the images byte for
                          byte (make fixpoint-check)
 dev/gen_seed.py             generate boot/seed.c from the compiler's .jaic images
+dev/gen_native_bridge.sh    generate the core's trampolines into the Apple
+                         images from the names stubs.c defines (make, arm64 Mac)
+dev/gen_native_images.sh    describe the linked Apple images -- UUIDs, file
+                         names, which image exports each name -- to the core
 gate/kind_tag_check.py  pin every place the JIT builds a Value tag out of a
                          compile-time SlotKind (make kind-tag-check)
                          (make reseed)
