@@ -163,6 +163,27 @@ Named so that nobody has to find out by trying:
   well as a camera index, indexes the file when it opens and decodes a frame
   when it is asked for, so seeking by frame is exact and costs nothing.
 
+## Native paths
+
+Contours, the shapes fitted to them and the drawing of both run their inner
+loops in runtime primitives (`src/runtime/builtins/media/`), each a step-for-step
+copy of the Jaithon it replaces, which is kept as the fallback and as the
+reference the primitive is checked against. Each is behind a switch, read once,
+on unless set to `0`, so the two can be compared in one binary:
+
+| Switch | What it moves to a primitive |
+|---|---|
+| `JAICV_NATIVE_BORDERS` | `find_contours`' raster scan and border walk (`grid_borders`) |
+| `JAICV_NATIVE_POINTS` | making `find_contours`' `Point`s (`grid_border_points`) |
+| `JAICV_NATIVE_STROKES` | `draw_contours` outlines, thick and one pixel wide |
+| `JAICV_NATIVE_LINES` | `polylines`, hard-edged and anti-aliased |
+| `JAICV_NATIVE_FILL` | `fill_poly`, and so `draw_contours` with `FILLED` |
+| `JAICV_NATIVE_HULL` | `convex_hull` (`JAICV_HULL_COLUMNS=0` sorts instead of bucketing) |
+| `JAICV_NATIVE_BOX` | `min_area_rect` and `min_enclosing_circle` |
+| `JAICV_NATIVE_APPROX` | `approx_poly_dp` |
+| `JAICV_NATIVE_MEASURES` | `contour_area`, `moments`, `match_shapes` |
+| `JAICV_NATIVE_FIT` | `fit_ellipse`, `fit_line` |
+
 ## Camera access
 
 macOS asks before a program may use the camera, and the ask is made of the
