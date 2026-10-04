@@ -176,6 +176,7 @@ static void swapPopEntry(Emit *e) {
     e->stackClass[u]    = e->stackClass[t];
     e->stackSeen[u]     = e->stackSeen[t];
     e->stackLocal[u]    = e->stackLocal[t];
+    e->stackLocalEpoch[u] = e->stackLocalEpoch[t];
     e->stackAscii[u]    = e->stackAscii[t];
     e->stackUnit[u]     = e->stackUnit[t];
     e->stackNullLit[u]  = e->stackNullLit[t];

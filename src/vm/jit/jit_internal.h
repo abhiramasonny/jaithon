@@ -48,6 +48,13 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 /* Two registers each; four list headers is every stencil seen so far. */
 #define JIT_MAX_PIC_EXITS JAI_IC_WAYS
 #define JIT_MAX_HOIST    4u
+/* How many offsets one walk may carry an FP-resident or deferred value into,
+ * and how many float operators may write a local's home early. Past the
+ * limit every instruction settles instead, so a large float body ran its
+ * first sixty-four expressions in the FP bank and the rest through X. See
+ * jitCarryLimit and JAITHON_JIT_WIDE_CARRY. */
+#define JIT_MAX_CARRY      1024u
+#define JIT_MAX_HOME_EARLY  256u
 /* How many distinct clobber SITES the measuring pass will remember, so that
  * "does x0..x8 survive across this bytecode range" can be asked of a range
  * rather than of the whole body. Past this the body answers yes everywhere,
@@ -234,6 +241,11 @@ typedef struct {
     Value     stackElem[JIT_MAX_STACK];
     uint8_t   stackElemDecl[JIT_MAX_STACK];
     int       stackLocal[JIT_MAX_STACK];
+    /* localEpoch when the entry was pushed from its local. stackLocal says
+     * which local an entry was READ from; this says whether that local still
+     * holds it, which is what a memo keyed on the local needs (see
+     * stackLocalCurrent). */
+    uint32_t  stackLocalEpoch[JIT_MAX_STACK];
     bool      stackAscii[JIT_MAX_STACK];
     bool      stackUnit[JIT_MAX_STACK];
     /* This entry is a compile-time constant resolved out of the module, not a
@@ -651,11 +663,11 @@ typedef struct {
     bool      fpOff;
     /* Offsets this walk carried an FP-resident value INTO: a branch landing on one would arrive with the
      * value only in X, so the compile declines and retries with fpOff. Safety net, not a real path -- straight-line float expressions are never branch targets; JAI_JIT_WHY reports it when it fires. */
-    uint32_t  fpCarry[64];
+    uint32_t  fpCarry[JIT_MAX_CARRY];
     unsigned  fpCarryCount;
     /* Offsets of an OP_BIND whose local's d register was written EARLY by the float operator just above it,
      * so the bind itself emits nothing -- nothing may branch here, since an arriving path skipped the operator. Checked against fixups at the end of the walk, since a back-edge isn't in the list yet mid-walk (same reason as fpCarry). */
-    uint32_t  homeEarly[32];
+    uint32_t  homeEarly[JIT_MAX_HOME_EARLY];
     unsigned  homeEarlyCount;
     /* Value entries that are a plain read of a float local, held in that LOCAL's own d register instead of
      * copied into the bank (`x * x` becomes one multiply instead of two fmovs + a multiply). Read-only borrow: only localOut/localOutFp ever write a local's d home, and both release the borrow first. Cleared on push/pop/claim/before any deopt record. */
@@ -683,6 +695,12 @@ typedef struct {
      * back across register files -- which is what took the loop-carried `fmov d,x; fadd; fmov x,d` off the
      * accumulator's chain. See fpOperandReread and JAITHON_JIT_FP_REREAD. Cleared with every other
      * per-entry mask on push and pop, and by fpClaim and the in-place rewrites. */
+    /* Dynamic locals (slots 0..63) whose tag -- and class, for an instance --
+     * this edge has already guarded since the slot was last written: a second
+     * read of the same value along the same straight line needs no second
+     * guard. Retired exactly where a field-kind memo is (a join, a call out, a
+     * write of the slot). See JAITHON_JIT_DYN_MEMO. */
+    uint64_t  dynGuarded;
     uint32_t  fpSrc;
     uint8_t   fpSrcSlot[32];
     uint32_t  fpSrcEpoch[32];
@@ -730,7 +748,7 @@ typedef struct {
     uint16_t  rangeVar, rangeCur, rangeEnd;
     /* Offsets this walk carried a deferred entry into (same reason as fpCarry): a BACKWARD branch there
      * would arrive with the value in-register while the instruction reads the borrow. Forward branches are caught during the walk; this catches the rest. */
-    uint32_t  deferCarry[64];
+    uint32_t  deferCarry[JIT_MAX_CARRY];
     unsigned  deferCarryCount;
 } Emit;
 
@@ -922,6 +940,9 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
 bool pushValue(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass);
 SlotKind knownFieldKind(const Emit *e, int local, uint16_t field);
 void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind);
+void recordFieldRead(Emit *e, int local, uint16_t field, SlotKind kind);
+bool stackLocalCurrent(const Emit *e, unsigned depthIdx);
+bool jitFieldReadMemoOn(void);
 bool pushSelf(Emit *e);
 void clearStackProofs(Emit *e);
 bool anyStackProof(const Emit *e);
@@ -980,6 +1001,8 @@ void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount);
 int hoistFor(const Emit *e, int slot);
 bool jitHoistStg(void);
+unsigned jitCarryLimit(void);
+unsigned jitHomeEarlyLimit(void);
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
                                 int32_t *offOut, uint8_t *baseOut);
 void emitHoistsAt(Emit *e, uint32_t off);

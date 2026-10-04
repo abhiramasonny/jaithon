@@ -546,10 +546,11 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         }
         /* "Still equals its local" is a claim about one edge, the same as a
          * stack proof: a join may arrive from a path that wrote the local. */
-        if (e->fpSrc != 0 &&
+        if ((e->fpSrc != 0 || e->dynGuarded != 0) &&
             (!fellIn || offsetIsBranchTarget(&fn->chunk, (uint32_t)off) ||
              popSkipTarget(e, (uint32_t)off))) {
             e->fpSrc = 0;
+            e->dynGuarded = 0;
         }
         /* A field-kind memo is good along the same one edge, and goes for the
          * same reason -- see forgetFieldKinds. `fn` is whichever body is being
@@ -577,7 +578,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
              * opcode already takes, and it costs `mov`s that §5 prices at zero.
              */
             if (joinsHere || e->inProtected || !deferSurvives(op) ||
-                e->deferCarryCount >= 64) {
+                e->deferCarryCount >= jitCarryLimit()) {
                 settleAll(e);
             } else {
                 e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
@@ -630,7 +631,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                 /* handled below */
             } else if (!fpFastOp(op) || e->inProtected) {
                 fpSyncAll(e);
-            } else if (e->fpCarryCount < 64) {
+            } else if (e->fpCarryCount < jitCarryLimit()) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
             } else {
                 fpSyncAll(e);
@@ -1248,18 +1249,36 @@ bool compileBody(Emit *e, ObjClosure *closure) {
     }
     fpSyncAll(e);
     settleAll(e);
+    /* The three checks below ask one question -- does any branch land on
+     * this offset -- of up to JIT_MAX_CARRY offsets each, so the fixups'
+     * targets are marked once rather than rescanned per offset. Only targets
+     * inside this chunk: deopt and overflow fixups carry sentinel targets far
+     * above any offset, and never match a carried one either way. */
+    uint8_t *landed = NULL;
+    unsigned landedCount = (unsigned)fn->chunk.count + 1u;
+    if (e->fpCarryCount + e->homeEarlyCount + e->deferCarryCount > 0) {
+        landed = (uint8_t *)calloc(landedCount, 1);
+        if (landed == NULL) {
+            e->whyNot = "out of memory checking branch targets";
+            return false;
+        }
+        for (unsigned f = 0; f < e->fixupCount; f++) {
+            uint32_t t = e->fixups[f].targetOffset;
+            if (t < landedCount) landed[t] = 1;
+        }
+    }
     /* Nothing may branch to an offset this walk carried a float into (see fpCarry) -- declines, and the caller retries with the FP bank off. */
     for (unsigned i = 0; i < e->fpCarryCount; i++) {
-        for (unsigned f = 0; f < e->fixupCount; f++) {
-            if (e->fixups[f].targetOffset != e->fpCarry[i]) continue;
+        if (e->fpCarry[i] < landedCount && landed[e->fpCarry[i]]) {
+            free(landed);
             e->whyNot = "a branch lands inside a float expression";
             return false;
         }
     }
     /* Mirror image for homeEarly (see fpBindLookahead): a back edge to such a bind is only visible here, after the whole walk. */
     for (unsigned i = 0; i < e->homeEarlyCount; i++) {
-        for (unsigned f = 0; f < e->fixupCount; f++) {
-            if (e->fixups[f].targetOffset != e->homeEarly[i]) continue;
+        if (e->homeEarly[i] < landedCount && landed[e->homeEarly[i]]) {
+            free(landed);
             e->whyNot = "a branch lands on a bind whose local was written early";
             return false;
         }
@@ -1267,12 +1286,13 @@ bool compileBody(Emit *e, ObjClosure *closure) {
     /* Same for a deferred X entry: forward branches were settled during the walk, this catches a
      * backward one (a loop head sitting between an OP_INT and the operator consuming it). Nothing in the suite reaches it -- the point is that it costs a decline, not a register nothing wrote. */
     for (unsigned i = 0; i < e->deferCarryCount; i++) {
-        for (unsigned f = 0; f < e->fixupCount; f++) {
-            if (e->fixups[f].targetOffset != e->deferCarry[i]) continue;
+        if (e->deferCarry[i] < landedCount && landed[e->deferCarry[i]]) {
+            free(landed);
             e->whyNot = "a branch lands where a value was deferred";
             return false;
         }
     }
+    free(landed);
     return !e->failed;
 }
 

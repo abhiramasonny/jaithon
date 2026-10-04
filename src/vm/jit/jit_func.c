@@ -175,8 +175,26 @@ unsigned localTagFor(const Emit *e, unsigned slot) {
  * read was compiled for is a speculation until that tag confirms it. Both
  * tiers guard; only the address of the frame home differs, so it is passed
  * in rather than recomputed here. */
+/* JAITHON_JIT_DYN_MEMO: guard a dynamic local once per straight line rather
+ * than at every read. See Emit::dynGuarded. */
+static bool jitDynMemo(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DYN_MEMO");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static void localGuardDynamic(Emit *e, unsigned slot, unsigned scratch,
                               unsigned base, unsigned off) {
+    /* Already proved on this edge, and nothing since could have changed what
+     * the frame home holds: a write would have retired the bit (noteSlotWrite),
+     * and so would a call out (noteScratchClobber) -- the one way code that is
+     * not this body could reach an interpreter slot, through an upvalue -- and a
+     * join (compileBody), where another edge arrives with no proof at all. An
+     * object's class never changes, so its shape is as proved as its tag. */
+    if (slot < 64u && (e->dynGuarded & (1ull << slot)) != 0) return;
     /* Every exit below is a deopt, and a deopt record describes each stack entry
      * by its own register -- so nothing may still be a pending constant or a
      * borrow of a local's, and settling is what makes the guard legal at all.
@@ -258,6 +276,9 @@ static void localGuardDynamic(Emit *e, unsigned slot, unsigned scratch,
         emitConst64(e, JIT_SCRATCH_D, (int64_t)e->localShape[slot]);
         emit(e, jaiA64SubsXReg(31, scratch, JIT_SCRATCH_D));
         branchOnDeopt(e, JAI_A64_NE);
+    }
+    if (slot < 64u && !e->failed && jitDynMemo()) {
+        e->dynGuarded |= 1ull << slot;
     }
 }
 
@@ -376,6 +397,7 @@ static void noteSlotWrite(Emit *e, unsigned slot) {
      * local -- see fpOperandReread. Coarser than per slot, and that is the
      * point: nothing has to prove which home a write reached. */
     e->localEpoch++;
+    if (slot < 64u) e->dynGuarded &= ~(1ull << slot);
     /* Above the range check on purpose: the memo is keyed on the same slot
      * numbers, so a slot too high to record is still one to retire. */
     if (e->knownCount != 0) forgetFieldKindsOfLocal(e, slot);
@@ -704,6 +726,7 @@ void noteScratchClobber(Emit *e) {
      * (a list grow, an instance allocation) only over-retire, which costs the
      * tag guard the read would have emitted anyway. */
     forgetFieldKinds(e);
+    e->dynGuarded = 0;
     if (e->measuring) {
         /* An inlined body's offsets are the CALLEE's, so they say nothing
          * about where in the caller this sits; `inlIp` is the caller's own
@@ -851,6 +874,25 @@ unsigned fpOperand(Emit *e, unsigned idx) {
     return d;
 }
 
+/* JAITHON_JIT_WIDE_CARRY: the per-walk limits on carried and early-written
+ * offsets (see JIT_MAX_CARRY), or the sixty-four and thirty-two they were. */
+static bool jitWideCarry(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_WIDE_CARRY");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+unsigned jitCarryLimit(void) {
+    return jitWideCarry() ? JIT_MAX_CARRY : 64u;
+}
+
+unsigned jitHomeEarlyLimit(void) {
+    return jitWideCarry() ? JIT_MAX_HOME_EARLY : 32u;
+}
+
 /* JAITHON_JIT_FP_REREAD: a float operator reads a still-current float local
  * from its d home rather than through the X copy OP_GET_LOCAL took. See
  * Emit::fpSrc. */
@@ -931,7 +973,7 @@ unsigned fpBindLookahead(Emit *e, const uint8_t *code, int next,
                                 int stop, const ObjFunction *fn,
                                 uint32_t *bindOffOut) {
     if (!e->osr || e->fpOff || e->inlining) return 0;
-    if (e->homeEarlyCount >= 32) return 0;
+    if (e->homeEarlyCount >= jitHomeEarlyLimit()) return 0;
     if (next < stop && code[next] == OP_TYPE_GUARD) {
         /* Only the settled form: a guard that widens an int emits `scvtf` (making the entry an int, so this
          * arm is never reached); a guard naming any other type declines below. */
@@ -1077,6 +1119,7 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackClass[e->depth] = klass;
     e->stackSeen[e->depth]  = seen;
     e->stackLocal[e->depth] = fromLocal;
+    e->stackLocalEpoch[e->depth] = e->localEpoch;
     e->stackAscii[e->depth] = false;
     e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
@@ -1141,6 +1184,51 @@ void recordFieldStore(Emit *e, int local, uint16_t field, SlotKind kind) {
     }
     e->knownCount = out;
     if (local < 0) return;
+    if (e->knownCount >= 16) return;
+    e->known[e->knownCount].local = local;
+    e->known[e->knownCount].field = field;
+    e->known[e->knownCount].kind  = kind;
+    e->knownCount++;
+}
+
+/* JAITHON_JIT_FIELD_READ_MEMO: a field read whose tag guard passed is
+ * remembered like a store, so the next read of it through the same local
+ * along the same edge skips the guard -- and a store of the same kind there
+ * skips writing a tag the field already has. */
+bool jitFieldReadMemoOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FIELD_READ_MEMO");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Entry `depthIdx` was read from a local that has not been written since, so
+ * the object in its register is the one the local holds. A memo keyed on the
+ * local is only true of that object: `b.x += (if c { b = o; 1.0 } else {..})`
+ * stores through the OLD `b`, and remembering the store against `b` would let
+ * a later `b.x` skip the guard on `o`. */
+bool stackLocalCurrent(const Emit *e, unsigned depthIdx) {
+    if (depthIdx >= e->depth || e->stackLocal[depthIdx] < 0) return false;
+    return e->stackLocalEpoch[depthIdx] == e->localEpoch;
+}
+
+/* A read is a fact about the object, not a change to it, so unlike a store it
+ * retires nothing another receiver claimed: an alias read the same memory and
+ * saw the same tag. Scalars only -- the kinds a later read can replay with no
+ * sample behind them (see recordFieldStore's caller for why OBJ is not). The
+ * retirement rules are the store's: a store of this field through anything,
+ * a write of the local, a call out, a join. */
+void recordFieldRead(Emit *e, int local, uint16_t field, SlotKind kind) {
+    if (local < 0 || !jitFieldReadMemoOn()) return;
+    if (kind != SLOT_INT && kind != SLOT_FLOAT && kind != SLOT_BOOL) return;
+    for (unsigned i = 0; i < e->knownCount; i++) {
+        if (e->known[i].local == local && e->known[i].field == field) {
+            e->known[i].kind = kind;
+            return;
+        }
+    }
     if (e->knownCount >= 16) return;
     e->known[e->knownCount].local = local;
     e->known[e->knownCount].field = field;
