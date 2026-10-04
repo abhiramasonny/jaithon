@@ -90,12 +90,11 @@ MATCH_FUZZ_COUNT ?= 200
 FLOW_FUZZ_COUNT ?= 200
 EXTRA_LDFLAGS ?=
 
-# zlib inflates the seed's images. boot/seed.bin holds them deflated, one
-# stream per module, and boot/seed_blob.S pulls that file into the binary with
-# .incbin; boot/seed.c is only the index and the decoder. zlib is the one
-# library assumed present beyond libc -- it ships with macOS and with every
-# Linux distribution -- and nothing else links it, so dropping the compression
-# again is this line plus the generator.
+# zlib backs the compression builtins (builtins_compress.c). It used to inflate
+# the seed's images too; boot/seed.bin now holds them raw, served in place from
+# the binary, because inflating all ~99 cost ~2ms of every front-end load (see
+# scripts/dev/gen_seed.py). zlib is the one library assumed present beyond
+# libc -- it ships with macOS and with every Linux distribution.
 LIBS     += -lz
 
 ifeq ($(UNAME_S),Darwin)
