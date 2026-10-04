@@ -17,7 +17,8 @@
 from std.test import assert_eq, assert_true
 from jaicv.core.mat import Mat
 from jaicv.core.types import Point
-from jaicv.imgproc.contours import CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE, RETR_EXTERNAL, RETR_LIST, find_contours
+from jaicv.imgproc.contours import CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE, RETR_EXTERNAL, RETR_LIST, RETR_TREE
+from jaicv.imgproc.contours import find_contours
 
 let CV_8UC1 = 0
 
@@ -332,5 +333,59 @@ fn test_a_picture_traces_the_same_after_another_one() -> void {
         let (_d, _e) = find_contours(same_size, mode, CHAIN_APPROX_SIMPLE)
         let (after, _f) = find_contours(first, mode, CHAIN_APPROX_SIMPLE)
         assert_eq(shape_of(after), shape_of(before))
+    }
+}
+
+#: Rectangles set and cleared in turn, some only their one-pixel outline: rings
+#: inside holes inside rings, walls a pixel thick, islands in pockets, shapes on
+#: the picture's edge. The pictures the outer-only scan has to get right.
+fn nested_picture(rows: int, cols: int, seed: int) -> list[int] {
+    var cells = [0] * (rows * cols)
+    var state = seed * 7919 + 17
+    for k in 0..4 + seed % 13 {
+        state = (state * 1103515245 + 12345) % 2147483648
+        let y0 = state // 64 % rows
+        state = (state * 1103515245 + 12345) % 2147483648
+        let x0 = state // 64 % cols
+        state = (state * 1103515245 + 12345) % 2147483648
+        let h = 1 + state // 64 % max(1, rows - y0)
+        state = (state * 1103515245 + 12345) % 2147483648
+        let w = 1 + state // 64 % max(1, cols - x0)
+        let thin = state // 64 % 3 == 0
+        let value = if k % 2 == 0 { 1 } else { 0 }
+        for y in y0..min(rows, y0 + h) {
+            for x in x0..min(cols, x0 + w) {
+                let inner = y != y0 and y != y0 + h - 1 and x != x0 and x != x0 + w - 1
+                if thin and inner { continue }
+                cells[y * cols + x] = value
+            }
+        }
+    }
+    return cells
+}
+
+#: `RETR_EXTERNAL` walks only the shapes nothing encloses and never a hole, so
+#: what it finds is held against the full scan: the contours `RETR_TREE` puts
+#: at the top of the tree, which come out in the same order, point for point.
+fn test_external_matches_the_top_of_the_tree() -> void {
+    for seed in 0..60 {
+        let rows = 9 + seed % 23
+        let cols = 11 + seed * 7 % 31
+        let cells = if seed % 4 == 3 {
+            picture(rows, cols, seed % 6)
+        } else {
+            nested_picture(rows, cols, seed)
+        }
+        let image = as_mat(cells, rows, cols)
+        for method in [CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE] {
+            let (outer, links) = find_contours(image, RETR_EXTERNAL, method)
+            let (every, tree) = find_contours(image, RETR_TREE, method)
+            var top: list[list[Point]] = []
+            for index in 0..every.len() {
+                if tree[index].parent < 0 { top.push(every[index]) }
+            }
+            assert_eq(shape_of(outer), shape_of(top))
+            assert_eq(links.len(), outer.len())
+        }
     }
 }

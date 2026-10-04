@@ -19,10 +19,12 @@
 #: let (contours, hierarchy) = find_contours(mask, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
 #: draw_contours(frame, contours, -1, Scalar(0.0, 255.0, 0.0), 2)
 #: ```
+import std.gpu as gpu
 import std.math
+from std.os import env
 from std.core import Printable
 from ..core.mat import Mat
-from ..core.types import LINE_8, LINE_AA, Point, Scalar
+from ..core.types import LINE_4, LINE_8, LINE_AA, Point, Scalar
 from .drawing import fill_poly, polylines, Painter, MAX_THICKNESS, XY_ONE, XY_SHIFT
 
 #: Only the outermost contours.
@@ -505,6 +507,177 @@ fn relate(parents: list[int]) -> list[Hierarchy] {
     return out
 }
 
+#: Whether the scan and the walk run in `__prim__.grid_borders` rather than in
+#: `trace_all` above. Read once. `JAICV_NATIVE_BORDERS=0` puts the Jaithon
+#: tracer back, which is what the primitive is checked against.
+#:
+#: The tracer above is at the compiled tier's floor and the floor is eight
+#: times OpenCV: a 1080p frame is two million cells of a load, a compare and a
+#: branch on an eight-byte int. The primitive keeps a byte a cell and asks
+#: sixteen cells at a time whether any is one the scan stops on, and in a
+#: frame of large shapes almost none are.
+let _native_borders = (env("JAICV_NATIVE_BORDERS") ?? "1") != "0"
+
+#: Whether `find_contours` has `__prim__.grid_border_points` make its points
+#: rather than calling `Point` for each. Read once; `JAICV_NATIVE_POINTS=0`
+#: makes them here. A frame of 3600 blobs is 178660 points, and making them
+#: one class call at a time was most of the call.
+let _native_points = (env("JAICV_NATIVE_POINTS") ?? "1") != "0"
+
+#: For each border in `order`, the position in `order` of the one enclosing
+#: it, or -1. `parents_of` over the flat records `grid_borders` writes, three
+#: ints a border: outer or not, the enclosing border's number, and where its
+#: points end. Border `index` is the one numbered `index + 2`.
+fn parents_in(meta: list[int], order: list[int], mode: int) -> list[int] {
+    let total = meta.len() // 3
+    var at = __prim__.list_filled(total + 2, -1)
+    let count = order.len()
+    for position in 0..count { at[order[position] + 2] = position }
+    var out: list[int] = []
+    for position in 0..count {
+        let index = order[position]
+        let parent = meta[index * 3 + 1]
+        if mode == RETR_CCOMP and meta[index * 3] == 1 {
+            out.push(-1)
+        } elif parent >= 0 and parent <= total + 1 {
+            out.push(at[parent])
+        } else {
+            out.push(-1)
+        }
+    }
+    return out
+}
+
+#: `emit_order` over the flat records: a parent before its children, siblings
+#: in the reverse of the order the scan found them.
+fn emit_order_in(meta: list[int], mode: int) -> list[int] {
+    let count = meta.len() // 3
+    var everything: list[int] = []
+    for index in 0..count { everything.push(index) }
+    let parents = parents_in(meta, everything, mode)
+
+    var first_child = __prim__.list_filled(count + 1, -1)
+    var next_sibling = __prim__.list_filled(count, -1)
+    var index = count - 1
+    while index >= 0 {
+        let slot = parents[index] + 1
+        next_sibling[index] = first_child[slot]
+        first_child[slot] = index
+        index -= 1
+    }
+
+    var order: list[int] = []
+    var stack = [-1]
+    while stack.len() > 0 {
+        let parent = stack.pop()
+        if parent >= 0 { order.push(parent) }
+        var child = first_child[parent + 1]
+        while child >= 0 {
+            stack.push(child)
+            child = next_sibling[child]
+        }
+    }
+    return order
+}
+
+#: `find_contours` over `__prim__.grid_borders`. The primitive hands back
+#: every border with its points already thinned and already in picture
+#: coordinates; what is left here is choosing which borders the mode wants,
+#: in the order it wants them, and making points of them.
+fn native_contours(
+    image: Mat,
+    mode: int,
+    method: int,
+    offset: Point
+) -> tuple[list[list[Point]], list[Hierarchy]] {
+    var meta: list[int] = []
+    var xy: list[int] = []
+    #: The device buffer is read where it lies, a float a pixel. The host
+    #: mirror is a boxed list, four times the memory to walk, and a picture
+    #: the GPU produced has no mirror at all -- building one is a download of
+    #: the whole frame into a list that nothing else wants.
+    #:
+    #: RETR_EXTERNAL tells the primitive so, and it then walks the top-level
+    #: shapes and nothing else -- no holes, nothing inside one -- which is the
+    #: whole of the scan's work in a frame full of small holes.
+    let outer_only = if mode == RETR_EXTERNAL { 1 } else { 0 }
+    if gpu.is_available() {
+        let handle = image.buffer().handle_of()
+        let at = image.data_offset()
+        __prim__.grid_borders(
+            handle,
+            at,
+            image.step(),
+            image.rows,
+            image.cols,
+            method,
+            outer_only,
+            meta,
+            xy
+        )
+    } else {
+        __prim__.grid_borders(
+            image.values(),
+            0,
+            image.cols,
+            image.rows,
+            image.cols,
+            method,
+            outer_only,
+            meta,
+            xy
+        )
+    }
+    let count = meta.len() // 3
+
+    var chosen: list[int] = []
+    if mode == RETR_EXTERNAL {
+        #: A top-level shape is one whose enclosing border is the frame.
+        var index = count - 1
+        while index >= 0 {
+            if meta[index * 3] == 1 and meta[index * 3 + 1] == 1 { chosen.push(index) }
+            index -= 1
+        }
+    } elif mode == RETR_LIST {
+        var index = count - 1
+        while index >= 0 {
+            chosen.push(index)
+            index -= 1
+        }
+    } elif mode == RETR_CCOMP or mode == RETR_TREE {
+        chosen = emit_order_in(meta, mode)
+    } else {
+        throw ValueError(f"retrieval mode {mode} is not one jaicv implements")
+    }
+
+    let shift_x = offset.x
+    let shift_y = offset.y
+    #: The points made in C, a `Point` at a time with its two fields set, which
+    #: is what `Point(x, y)` makes; null if `Point` ever stops being only its
+    #: two fields, and then they are made below.
+    var contours: list[list[Point]] = []
+    var pending = chosen
+    if _native_points {
+        let built = __prim__.grid_border_points(Point, meta, xy, chosen, shift_x, shift_y)
+        if built is not null {
+            contours = built
+            pending = []
+        }
+    }
+    for index in pending {
+        let start = if index > 0 { meta[index * 3 - 1] } else { 0 }
+        let stop = meta[index * 3 + 2]
+        var points: list[Point] = []
+        for at in start..stop { points.push(Point(xy[at * 2] + shift_x, xy[at * 2 + 1] + shift_y)) }
+        contours.push(points)
+    }
+
+    if mode == RETR_EXTERNAL or mode == RETR_LIST {
+        return (contours, linked(contours.len()))
+    }
+    return (contours, relate(parents_in(meta, chosen, mode)))
+}
+
 #: Find the contours in a binary image.
 #:
 #: `mode` is one of the `RETR_` constants and `method` one of the `CHAIN_`
@@ -521,6 +694,7 @@ pub fn find_contours(
         throw ValueError(f"chain approximation {method} is not one jaicv implements")
     }
     image.flush()
+    if _native_borders { return native_contours(image, mode, method, offset) }
     let stride = image.cols + 2
     let found = trace_all(image.values(), image.rows, image.cols)
 
@@ -564,6 +738,12 @@ pub fn find_contours(
     }
     return (contours, relate(parents_of(chosen, mode)))
 }
+
+#: Whether `draw_contours` hands a wide stroke to `__prim__.fill_strokes`, which
+#: does everything `thick_contours` does in one call. Read once;
+#: `JAICV_NATIVE_STROKES=0` keeps the Jaithon passes, which it is checked
+#: against.
+let _native_strokes = (env("JAICV_NATIVE_STROKES") ?? "1") != "0"
 
 #: The disc a thick stroke caps a segment with, as one span a row.
 #:
@@ -779,9 +959,26 @@ pub fn draw_contours(
     #: case is worth writing out, and it is the one a detector draws.
     if thickness > 1 and line_type != LINE_AA {
         let painter = Painter(image, colour)
-        thick_contours(painter, chosen, offset.x, offset.y, thickness)
+        #: Everything `thick_contours` does, in one primitive call. Its cost
+        #: was calls -- a `fill_convex` a segment and a `fill_span` a cap row,
+        #: each mapping the picture again -- and the passes working out the
+        #: corners; together 88 microseconds against OpenCV's 34 for a frame
+        #: contour of 74 points.
+        let drawn = _native_strokes and
+            painter.thick_outlines(chosen, offset.x, offset.y, thickness)
+        if not drawn { thick_contours(painter, chosen, offset.x, offset.y, thickness) }
         painter.finish()
         return image
+    }
+    #: A hairline, which is the default, in one primitive call. `polylines`
+    #: is a call, a list of segments and a surface read a contour, and a frame
+    #: of 8239 contours took 22.6 ms against OpenCV's 1.6 that way.
+    if _native_strokes and line_type != LINE_AA {
+        let painter = Painter(image, colour)
+        let connectivity = if line_type == LINE_4 { 4 } else { 8 }
+        let drawn = painter.thin_outlines(chosen, offset.x, offset.y, connectivity)
+        painter.finish()
+        if drawn { return image }
     }
     if offset.x == 0 and offset.y == 0 {
         return polylines(image, chosen, true, colour, thickness, line_type)

@@ -93,6 +93,11 @@ pub class Point: Printable {
     pub var x: int
     pub var y: int
 
+    #: Nothing but the two assignments, and no field besides these two:
+    #: `find_contours` has `__prim__.grid_border_points` make its points with
+    #: the fields set directly, which is this `Point(x, y)` only while that
+    #: holds. A third field makes the primitive refuse and the points be made
+    #: here; more work in `init` would be skipped silently.
     pub fn init(self, x: int = 0, y: int = 0) {
         self.x = x
         self.y = y

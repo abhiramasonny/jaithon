@@ -32,6 +32,7 @@
 #: ```
 import std.gpu as gpu
 import std.math
+from std.os import env
 from ..core.mat import Mat
 from ..core.types import depth_is_integer, depth_max, depth_min
 from ..core.types import LINE_4, LINE_8, LINE_AA, Point, Point2f, Rect, RotatedRect, Scalar, Size
@@ -88,6 +89,16 @@ fn to_fixed(point: Point, shift: int) -> Point {
 fn from_fixed(point: Point) -> Point {
     return Point(point.x + (XY_ONE >> 1) >> XY_SHIFT, point.y + (XY_ONE >> 1) >> XY_SHIFT)
 }
+
+#: Whether `polylines` hands whole-pixel, hard-edged runs to the stroke
+#: primitives `draw_contours` uses. Read once; `JAICV_NATIVE_LINES=0` keeps
+#: drawing them a segment at a time.
+let _native_lines = (env("JAICV_NATIVE_LINES") ?? "1") != "0"
+
+#: Whether `fill_poly` hands its polygons to `__prim__.fill_polygons`. Read
+#: once; `JAICV_NATIVE_FILL=0` keeps the Jaithon scanline fill, which the
+#: primitive is checked against.
+let _native_fill = (env("JAICV_NATIVE_FILL") ?? "1") != "0"
 
 #: The surface a shape draws onto: a picture, one colour already saturated
 #: into its depth, and wherever its pixels happen to live.
@@ -278,6 +289,165 @@ pub class Painter {
             delta1,
             delta2
         )
+    }
+
+    #: Every contour outlined `thickness` wide, in one call: the quadrilateral
+    #: each segment sweeps and the round cap at its far end, which is what
+    #: `draw_contours` draws for a stroke wider than a pixel. False, with
+    #: nothing drawn, when a point is not something with integer `x` and `y`
+    #: or lies past 2^30, or a segment runs past 2^26, where the long ways
+    #: start to disagree; the caller then draws it its own long way.
+    pub fn thick_outlines(
+        self,
+        contours: list[list[Point]],
+        offset_x: int,
+        offset_y: int,
+        thickness: int,
+        closed: bool = true
+    ) -> bool {
+        return __prim__.fill_strokes(
+            self.target,
+            self.colour,
+            self.cn,
+            self.origin,
+            self.stride,
+            self.cols,
+            self.rows,
+            contours,
+            offset_x,
+            offset_y,
+            thickness,
+            closed
+        )
+    }
+
+    #: Every contour outlined one pixel wide and moved by the offset, in one
+    #: call: what `polylines` draws for a closed hairline, a contour at a time.
+    #: False, with nothing drawn, when a point is not something with integer
+    #: `x` and `y`, and the caller then draws it the long way.
+    pub fn thin_outlines(
+        self,
+        contours: list[list[Point]],
+        offset_x: int,
+        offset_y: int,
+        connectivity: int,
+        closed: bool = true
+    ) -> bool {
+        return __prim__.draw_outlines(
+            self.target,
+            self.colour,
+            self.cn,
+            self.origin,
+            self.stride,
+            self.cols,
+            self.rows,
+            contours,
+            offset_x,
+            offset_y,
+            connectivity,
+            closed
+        )
+    }
+
+    #: Every polygon moved by the offset, outlined unless anti-aliased, and
+    #: filled even-odd, in one call: `fill_poly`'s edges and spans. False,
+    #: with nothing drawn, when a point is not something with integer `x` and
+    #: `y`.
+    pub fn fill_polygons(
+        self,
+        polygons: list[list[Point]],
+        offset_x: int,
+        offset_y: int,
+        shift: int,
+        line_type: int
+    ) -> bool {
+        return __prim__.fill_polygons(
+            self.target,
+            self.colour,
+            self.cn,
+            self.origin,
+            self.stride,
+            self.cols,
+            self.rows,
+            polygons,
+            offset_x,
+            offset_y,
+            shift,
+            line_type
+        )
+    }
+
+    #: Every run as an anti-aliased hairline, blended into the host mirror in
+    #: one call: what `blend` does four times a step along each segment. False,
+    #: with nothing drawn, when a point is not something with integer `x` and
+    #: `y`.
+    #: Every run as an anti-aliased stroke `thickness` wide, in one call where
+    #: it can be: `draw_thick` a segment, quadrilateral and then caps, in
+    #: order. False, with nothing drawn, when a point is not something with
+    #: integer `x` and `y`.
+    #:
+    #: The primitive draws on whichever side the painter is, as `blend` does,
+    #: and a walk on the device stops at the first blend that has to read a
+    #: pixel back, saying how far it got. Then the picture comes over exactly
+    #: as `blend` would bring it, and the walk picks up from there on the
+    #: host -- so every write lands where `blend` would have put it, which a
+    #: view of a larger picture can see.
+    pub fn blend_strokes(self, contours: list[list[Point]], closed: bool, thickness: int) -> bool {
+        var taken = 0
+        loop {
+            let stopped = __prim__.blend_strokes(
+                self.target,
+                self.colour,
+                self.cn,
+                self.origin,
+                self.stride,
+                self.cols,
+                self.rows,
+                contours,
+                closed,
+                self.integral,
+                self.low,
+                self.high,
+                taken,
+                not self.on_device,
+                thickness
+            )
+            if stopped == -2 { return false }
+            if stopped < 0 { return true }
+            let _ = self.on_host()
+            taken = stopped
+        }
+        return true
+    }
+
+    #: Every run as an anti-aliased hairline, in one call where it can be:
+    #: what `blend` does four times a step along each segment, with the same
+    #: move to the host as `blend_strokes`.
+    pub fn blend_outlines(self, contours: list[list[Point]], closed: bool) -> bool {
+        var taken = 0
+        loop {
+            let stopped = __prim__.blend_outlines(
+                self.target,
+                self.colour,
+                self.cn,
+                self.origin,
+                self.stride,
+                self.cols,
+                self.rows,
+                contours,
+                closed,
+                self.integral,
+                self.low,
+                self.high,
+                taken,
+                not self.on_device
+            )
+            if stopped == -2 { return false }
+            if stopped < 0 { return true }
+            let _ = self.on_host()
+            taken = stopped
+        }
+        return true
     }
 
     #: Fill `[x1, x2]` on row `y`, inclusive at both ends.
@@ -1164,6 +1334,36 @@ pub fn polylines(
 ) -> Mat {
     if thickness > MAX_THICKNESS { throw ValueError(f"a thickness of {thickness} is too large") }
     let painter = Painter(img, colour)
+    #: Whole points and hard edges go over in one call: the strokes
+    #: `draw_contours` draws, which are these segment for segment. A call a
+    #: segment, a quadrilateral and a disc each, was 6.8 ms for 800 small
+    #: contours at a width of two, against OpenCV's 0.65.
+    if _native_lines and shift == 0 and line_type != LINE_AA {
+        let connectivity = if line_type == LINE_4 { 4 } else { 8 }
+        let drawn = if thickness > 1 {
+            painter.thick_outlines(polygons, 0, 0, thickness, closed)
+        } else {
+            painter.thin_outlines(polygons, 0, 0, connectivity, closed)
+        }
+        if drawn {
+            painter.finish()
+            return img
+        }
+    }
+    #: An anti-aliased hairline blends into the host mirror, which the first
+    #: partial blend below would bring over anyway; the primitive blends every
+    #: run there in one call, four reads, mixes and roundings a step.
+    if _native_lines and shift == 0 and line_type == LINE_AA {
+        let drawn = if thickness > 1 {
+            painter.blend_strokes(polygons, closed, thickness)
+        } else {
+            painter.blend_outlines(polygons, closed)
+        }
+        if drawn {
+            painter.finish()
+            return img
+        }
+    }
     for polygon in polygons { poly_line(painter, polygon, closed, thickness, line_type, shift) }
     painter.finish()
     return img
@@ -1193,6 +1393,14 @@ pub fn fill_poly(
     offset: Point = Point(0, 0)
 ) -> Mat {
     let painter = Painter(img, colour)
+    #: All of the below in one primitive call when every point is a plain
+    #: one. The edge sort below is an insertion into a list kept in order,
+    #: which is quadratic: 8239 contours drawn filled took 4.6 seconds against
+    #: OpenCV's 4.5 milliseconds. `JAICV_NATIVE_FILL=0` keeps this path.
+    if _native_fill and painter.fill_polygons(polygons, offset.x, offset.y, shift, line_type) {
+        painter.finish()
+        return img
+    }
     var edges: list[PolyEdge] = []
     for polygon in polygons {
         if polygon.len() == 0 { continue }

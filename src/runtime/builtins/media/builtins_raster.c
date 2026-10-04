@@ -17,13 +17,24 @@
  * The arithmetic is OpenCV's throughout, matching what jaicv's drawing module
  * computed when these loops lived there. `tests/test_against_opencv.jai` is
  * what holds them to it. */
+#include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "runtime/builtins/text/builtins_str.h"
+#include "runtime/builtins/media/points.h"
 #include "runtime/runtime.h"
 
 #include "native/native.h"
+
+/* `fill_strokes` reproduces Jaithon's floating point operation by operation,
+ * and Jaithon never fuses a multiply into an add. */
+#pragma STDC FP_CONTRACT OFF
 
 #define JAI_XY_SHIFT 16
 #define JAI_XY_ONE   (1 << JAI_XY_SHIFT)
@@ -48,12 +59,13 @@ typedef struct {
     int      cn;
     Value    colour[4];
     float    rawColour[4];
+    bool     rawUniform;    /* every channel of rawColour holds the same bits */
 } JaiSurface;
 
 /* `run` pixels of the surface's colour, starting at (x, y). Out of range is
  * dropped rather than refused: a shape is clipped to the picture, and the
  * caller has already decided the shape is worth drawing. */
-static void surfaceRun(const JaiSurface *s, int64_t x, int64_t y, int64_t run) {
+JAI_INLINE void surfaceRun(const JaiSurface *s, int64_t x, int64_t y, int64_t run) {
     if (run <= 0 || y < 0 || y >= s->rows) return;
     if (x < 0) {
         run += x;
@@ -65,17 +77,57 @@ static void surfaceRun(const JaiSurface *s, int64_t x, int64_t y, int64_t run) {
     const int cn = s->cn;
     const int64_t base = s->origin + y * s->stride + x * (int64_t)cn;
     if (base < 0 || base + run * cn > s->capacity) return;
+    /* The colour is read into locals before the first store. Read through
+     * `s` inside the loop, every channel was loaded again after every store,
+     * because a float store may alias the float array the colour lives in --
+     * and the rows a thick stroke is made of are a few pixels each, so that
+     * reload was most of the cost of drawing one. */
     if (s->raw != NULL) {
         float *write = s->raw + base;
-        for (int64_t i = 0; i < run; i++) {
-            for (int c = 0; c < cn; c++) write[c] = s->rawColour[c];
-            write += cn;
+        if (s->rawUniform) {
+            /* Every channel the same, grey or white: one flat run, four
+             * floats a store. Written out rather than left to the vectoriser,
+             * whose checks and remainder loop cost more than the stores do on
+             * the few pixels a row of a stroke is. */
+            const float v = s->rawColour[0];
+            int64_t n = run * cn;
+#if defined(__aarch64__)
+            const float32x4_t four = vdupq_n_f32(v);
+            for (; n >= 4; n -= 4, write += 4) vst1q_f32(write, four);
+#endif
+            for (; n > 0; n--) *write++ = v;
+            return;
+        }
+        const float c0 = s->rawColour[0], c1 = s->rawColour[1];
+        const float c2 = s->rawColour[2], c3 = s->rawColour[3];
+        if (cn == 3) {
+            for (int64_t i = 0; i < run; i++, write += 3) {
+                write[0] = c0;
+                write[1] = c1;
+                write[2] = c2;
+            }
+            return;
+        }
+        if (cn == 4) {
+            for (int64_t i = 0; i < run; i++, write += 4) {
+                write[0] = c0;
+                write[1] = c1;
+                write[2] = c2;
+                write[3] = c3;
+            }
+            return;
+        }
+        for (int64_t i = 0; i < run; i++, write += 2) {
+            write[0] = c0;
+            write[1] = c1;
         }
         return;
     }
+    Value colour[4];
+    memcpy(colour, s->colour, sizeof colour);
     Value *write = s->boxed + base;
     for (int64_t i = 0; i < run; i++) {
-        for (int c = 0; c < cn; c++) write[c] = s->colour[c];
+        for (int c = 0; c < cn; c++) write[c] = colour[c];
         write += cn;
     }
 }
@@ -114,6 +166,10 @@ static bool readSurface(Value *args, int first, const char *fnName, JaiSurface *
         }
         s->colour[c] = v;
         s->rawColour[c] = (float)(IS_FLOAT(v) ? AS_FLOAT(v) : (double)AS_INT(v));
+    }
+    s->rawUniform = true;
+    for (int c = 1; c < s->cn; c++) {
+        if (memcmp(&s->rawColour[c], &s->rawColour[0], sizeof(float)) != 0) s->rawUniform = false;
     }
 
     if (IS_LIST(args[first])) {
@@ -484,9 +540,1002 @@ static bool primFillConvex(int argc, Value *args, Value *out) {
     return true;
 }
 
+static bool rasterOverflow(void) {
+    return jaiThrow(vm.cOverflowError, "fill_strokes(): integer overflow");
+}
+
+/* OpenCV's cvRound as `thick_contours` spells it out: the floor, then up when
+ * the remainder is over a half, and to even when it is exactly one. */
+static int64_t roundHalfEven(double value) {
+    double floor = (double)(int64_t)value;
+    if (floor > value) floor -= 1.0;
+    int64_t whole = (int64_t)floor;
+    const double part = value - floor;
+    if (part > 0.5) {
+        whole += 1;
+    } else if (part == 0.5) {
+        if (whole % 2 != 0) whole += 1;
+    }
+    return whole;
+}
+
+/* `fill_strokes(target, colour, cn, origin, stride, cols, rows, contours,
+ *  offset_x, offset_y, thickness, closed)` -- every contour outlined with a
+ *  stroke `thickness` pixels wide, closed back to its first point or not.
+ *
+ * Open, a run is `polylines`' open one: no closing segment, and the first
+ * segment capped at its start as well as its end.
+ *
+ * jaicv's `thick_contours`, moved here whole: for each segment the
+ * quadrilateral a pen of that width sweeps, then the round cap at each one's
+ * far end, all with OpenCV's arithmetic -- the same `cvRound` of the same
+ * products, the same corners, the same order of fills. What made it worth
+ * moving is that its cost was all calls: a segment was a `fill_convex` and a
+ * `fill_span` a cap row, each a fraction of a microsecond whatever it drew and
+ * each mapping the picture again, and a frame contour is hundreds of segments.
+ * Written in Jaithon, the passes that work out the corners were most of the
+ * rest.
+ *
+ * `contours` is a list of lists of points, where a point is anything with
+ * integer fields `x` and `y`. Returns false, having drawn nothing, if one is
+ * not, so the caller can take its own path; every check is made before the
+ * first pixel. It also declines a point beyond `STROKE_COORD_LIMIT` or a
+ * segment longer than `STROKE_RUN_LIMIT` in x or y, which is where the two
+ * Jaithon paths stop agreeing with it and with each other: `thick_contours`
+ * squares a length in integers and throws when that overflows, `polylines`'
+ * `draw_thick` squares it in floats, rounding past 2^53, and wraps a cap's
+ * centre through fixed point past 2^47. Each caller's own path then decides. */
+#define STROKE_COORD_LIMIT ((int64_t)1 << 30)
+#define STROKE_RUN_LIMIT ((int64_t)1 << 26)
+
+static bool strokeOutOfReach(int64_t v, int64_t limit) { return v <= -limit || v >= limit; }
+
+static bool primFillStrokes(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *contours;
+    int64_t offsetX, offsetY, thickness;
+    if (!jaiArgList(args[7], 8, "fill_strokes", &contours)) return false;
+    if (!jaiStrWantInt(args[8], "fill_strokes", "the x offset", &offsetX)) return false;
+    if (!jaiStrWantInt(args[9], "fill_strokes", "the y offset", &offsetY)) return false;
+    if (!jaiStrWantInt(args[10], "fill_strokes", "the thickness", &thickness)) return false;
+    if (!IS_BOOL(args[11])) return jaiThrow(vm.cTypeError, "fill_strokes(): closed must be a bool");
+    const bool closed = AS_BOOL(args[11]);
+    if (thickness < 2 || thickness > 32767) {
+        return jaiThrow(vm.cValueError, "fill_strokes(): a thickness of %lld is out of range",
+                        (long long)thickness);
+    }
+
+    /* Pass one, as `thick_contours`' first loop: every segment's two ends,
+     * from the previous point to the current one, closing each contour, and
+     * its squared length. */
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    size_t total = 0;
+    for (int c = 0; c < contours->count; c++) {
+        const Value item = jaiListGet(contours, c);
+        if (!IS_LIST(item)) {
+            *out = BOOL_VAL(false);
+            return true;
+        }
+        total += (size_t)AS_LIST(item)->count;
+    }
+    int64_t *ends = (int64_t *)malloc((total > 0 ? total : 1) * 4 * sizeof(int64_t));
+    double *reach = (double *)malloc((total > 0 ? total : 1) * sizeof(double));
+    /* The extra cap an open run has at its first point, one a contour. */
+    int64_t *starts = (int64_t *)malloc((size_t)(contours->count > 0 ? contours->count : 1) * 2 *
+                                        sizeof(int64_t));
+    if (ends == NULL || reach == NULL || starts == NULL) {
+        free(ends);
+        free(reach);
+        free(starts);
+        return jaiThrow(vm.cRuntimeError, "fill_strokes(): out of memory");
+    }
+    size_t segments = 0;
+    size_t opened = 0;
+    bool readable = true;
+    bool overflow = false;
+    for (int c = 0; c < contours->count && readable && !overflow; c++) {
+        ObjList *contour = AS_LIST(jaiListGet(contours, c));
+        const int count = contour->count;
+        if (count == 0) continue;
+        int64_t px, py;
+        /* Closed, the first segment runs from the last point; open, from the
+         * first, and the walk below starts at the second -- except a lone
+         * point, which is its own segment either way. */
+        const int from = (closed || count == 1) ? count - 1 : 0;
+        if (!jaiReadPoint(&reader, jaiListGet(contour, from), &px, &py)) {
+            readable = false;
+            break;
+        }
+        if (!closed) {
+            if (__builtin_add_overflow(px, offsetX, &starts[opened * 2]) ||
+                __builtin_add_overflow(py, offsetY, &starts[opened * 2 + 1]) ||
+                strokeOutOfReach(starts[opened * 2], STROKE_COORD_LIMIT) ||
+                strokeOutOfReach(starts[opened * 2 + 1], STROKE_COORD_LIMIT)) {
+                overflow = true;
+                break;
+            }
+            opened++;
+        }
+        for (int i = (closed || count == 1) ? 0 : 1; i < count; i++) {
+            int64_t cx, cy;
+            if (!jaiReadPoint(&reader, jaiListGet(contour, i), &cx, &cy)) {
+                readable = false;
+                break;
+            }
+            int64_t runX, runY, xx, yy, squared;
+            int64_t *at = ends + segments * 4;
+            if (__builtin_sub_overflow(px, cx, &runX) || __builtin_sub_overflow(cy, py, &runY) ||
+                __builtin_mul_overflow(runX, runX, &xx) || __builtin_mul_overflow(runY, runY, &yy) ||
+                __builtin_add_overflow(xx, yy, &squared) ||
+                __builtin_add_overflow(px, offsetX, &at[0]) ||
+                __builtin_add_overflow(py, offsetY, &at[1]) ||
+                __builtin_add_overflow(cx, offsetX, &at[2]) ||
+                __builtin_add_overflow(cy, offsetY, &at[3]) ||
+                strokeOutOfReach(runX, STROKE_RUN_LIMIT) || strokeOutOfReach(runY, STROKE_RUN_LIMIT) ||
+                strokeOutOfReach(at[0], STROKE_COORD_LIMIT) ||
+                strokeOutOfReach(at[1], STROKE_COORD_LIMIT) ||
+                strokeOutOfReach(at[2], STROKE_COORD_LIMIT) ||
+                strokeOutOfReach(at[3], STROKE_COORD_LIMIT)) {
+                overflow = true;
+                break;
+            }
+            reach[segments] = (double)squared;
+            segments++;
+            px = cx;
+            py = cy;
+        }
+    }
+    if (!readable || overflow) {
+        free(ends);
+        free(reach);
+        free(starts);
+        *out = BOOL_VAL(false);
+        return true;
+    }
+
+    /* Pass two: how far the quadrilateral stands off the segment, per unit of
+     * its run. A segment of no length has no quadrilateral, only its cap. */
+    const int64_t odd = thickness & 1;
+    const int64_t halfWidth = thickness << (JAI_XY_SHIFT - 1);
+    const double bias = (double)halfWidth + (double)odd * (double)JAI_XY_ONE * 0.5;
+    const int64_t rounding = JAI_XY_ONE >> 1;
+    for (size_t i = 0; i < segments; i++) {
+        const double squared = reach[i];
+        reach[i] = squared > 0 ? bias / sqrt(squared) : 0.0;
+    }
+
+    /* The cap disc, one span a row: `cap_rows` in contours.jai, the widest of
+     * the up to four spans the midpoint circle names for each row. */
+    const int64_t radius = (halfWidth + (JAI_XY_ONE >> 1)) >> JAI_XY_SHIFT;
+    int64_t *widest = (int64_t *)malloc((size_t)(radius * 2 + 1) * sizeof(int64_t));
+    if (widest == NULL) {
+        free(ends);
+        free(reach);
+        free(starts);
+        return jaiThrow(vm.cRuntimeError, "fill_strokes(): out of memory");
+    }
+    for (int64_t i = 0; i < radius * 2 + 1; i++) widest[i] = -1;
+    {
+        int64_t err = 0, dx = radius, dy = 0, plus = 1, minus = (radius << 1) - 1;
+        while (dx >= dy) {
+            if (dx > widest[radius - dy]) widest[radius - dy] = dx;
+            if (dx > widest[radius + dy]) widest[radius + dy] = dx;
+            if (dy > widest[radius - dx]) widest[radius - dx] = dy;
+            if (dy > widest[radius + dx]) widest[radius + dx] = dy;
+            dy += 1;
+            err += plus;
+            plus += 2;
+            if (err > 0) {
+                err -= minus;
+                dx -= 1;
+                minus -= 2;
+            }
+        }
+    }
+
+    JaiSurface surface;
+    if (!readSurface(args, 0, "fill_strokes", &surface)) {
+        free(ends);
+        free(reach);
+        free(widest);
+        free(starts);
+        return false;
+    }
+
+    /* The quadrilaterals, then the caps. */
+    bool ok = true;
+    for (size_t i = 0; i < segments && ok; i++) {
+        const int64_t *at = ends + i * 4;
+        int64_t riseY, runX;
+        if (__builtin_sub_overflow(at[3], at[1], &riseY) ||
+            __builtin_sub_overflow(at[0], at[2], &runX)) {
+            ok = false;
+            break;
+        }
+        const int64_t across = roundHalfEven((double)riseY * reach[i]);
+        const int64_t along = roundHalfEven((double)runX * reach[i]);
+        /* `<<` wraps in Jaithon; the sums are checked there and here. */
+        const int64_t fromX = (int64_t)((uint64_t)at[0] << JAI_XY_SHIFT);
+        const int64_t fromY = (int64_t)((uint64_t)at[1] << JAI_XY_SHIFT);
+        const int64_t toX = (int64_t)((uint64_t)at[2] << JAI_XY_SHIFT);
+        const int64_t toY = (int64_t)((uint64_t)at[3] << JAI_XY_SHIFT);
+        int64_t xs[4], ys[4];
+        if (__builtin_add_overflow(fromX, across, &xs[0]) ||
+            __builtin_add_overflow(fromY, along, &ys[0]) ||
+            __builtin_sub_overflow(fromX, across, &xs[1]) ||
+            __builtin_sub_overflow(fromY, along, &ys[1]) ||
+            __builtin_sub_overflow(toX, across, &xs[2]) ||
+            __builtin_sub_overflow(toY, along, &ys[2]) ||
+            __builtin_add_overflow(toX, across, &xs[3]) ||
+            __builtin_add_overflow(toY, along, &ys[3])) {
+            ok = false;
+            break;
+        }
+        convexFill(&surface, xs, ys, 4, JAI_XY_SHIFT, rounding, rounding);
+    }
+    /* Every segment's far end, then each open run's first point. */
+    for (size_t i = 0; i < segments + opened && ok; i++) {
+        const int64_t toX = i < segments ? ends[i * 4 + 2] : starts[(i - segments) * 2];
+        const int64_t toY = i < segments ? ends[i * 4 + 3] : starts[(i - segments) * 2 + 1];
+        for (int64_t row = 0; row < radius * 2 + 1; row++) {
+            const int64_t extent = widest[row];
+            if (extent < 0) continue;
+            int64_t x1, x2, y;
+            if (__builtin_sub_overflow(toX, extent, &x1) ||
+                __builtin_add_overflow(toX, extent, &x2) ||
+                __builtin_add_overflow(toY, row - radius, &y)) {
+                ok = false;
+                break;
+            }
+            /* `Painter.span`: clipped to the picture's columns, nothing when
+             * the clipped run is empty. */
+            const int64_t start = x1 > 0 ? x1 : 0;
+            const int64_t end = x2 < surface.cols - 1 ? x2 : surface.cols - 1;
+            if (start > end) continue;
+            surfaceRun(&surface, start, y, end - start + 1);
+        }
+    }
+    free(ends);
+    free(reach);
+    free(widest);
+    free(starts);
+    if (!ok) return rasterOverflow();
+    *out = BOOL_VAL(true);
+    return true;
+}
+
+/* `draw_outlines(target, colour, cn, origin, stride, cols, rows, contours,
+ *  offset_x, offset_y, connectivity, closed)` -- every contour outlined one
+ *  pixel wide, closed back to its first point or not, moved by the offset.
+ *
+ * `draw_contours` with a hairline, which is its default: `polylines`, a
+ * `Painter.strokes` a contour building that contour's segments and handing
+ * them to `draw_lines`. A contour is a call, a list and a surface read, and a
+ * frame of contours is thousands of them: 8239 contours took 22.6 ms against
+ * OpenCV's 1.6, nearly all of it the per-contour machinery around segments a
+ * few pixels long. Here it is one call, and the segments are the ones
+ * `strokes` made -- the previous point to the current one, starting from the
+ * last -- walked by the same `clipAndOrient` and `lineWalk`. A single point
+ * is the one-pixel segment `draw_thick` reduces it to.
+ *
+ * Returns false, having drawn nothing, when a point is not an object with
+ * integer `x` and `y`, so the caller can take its own path. Moving a point
+ * by the offset is checked as Jaithon checks it, and throws before anything
+ * is drawn, as building the moved contours did. */
+static bool primDrawOutlines(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *contours;
+    int64_t offsetX, offsetY, connectivity;
+    if (!jaiArgList(args[7], 8, "draw_outlines", &contours)) return false;
+    if (!jaiStrWantInt(args[8], "draw_outlines", "the x offset", &offsetX)) return false;
+    if (!jaiStrWantInt(args[9], "draw_outlines", "the y offset", &offsetY)) return false;
+    if (!jaiStrWantInt(args[10], "draw_outlines", "the connectivity", &connectivity)) return false;
+    if (!IS_BOOL(args[11])) return jaiThrow(vm.cTypeError, "draw_outlines(): closed must be a bool");
+    const bool closed = AS_BOOL(args[11]);
+    if (connectivity != 4 && connectivity != 8) {
+        return jaiThrow(vm.cValueError, "draw_outlines(): connectivity must be 4 or 8, got %lld",
+                        (long long)connectivity);
+    }
+
+    size_t total = 0;
+    for (int c = 0; c < contours->count; c++) {
+        const Value item = jaiListGet(contours, c);
+        if (!IS_LIST(item)) {
+            *out = BOOL_VAL(false);
+            return true;
+        }
+        total += (size_t)AS_LIST(item)->count;
+    }
+    int64_t *ends = (int64_t *)malloc((total > 0 ? total : 1) * 4 * sizeof(int64_t));
+    int64_t *moved = (int64_t *)malloc((total > 0 ? total : 1) * 2 * sizeof(int64_t));
+    if (ends == NULL || moved == NULL) {
+        free(ends);
+        free(moved);
+        return jaiThrow(vm.cRuntimeError, "draw_outlines(): out of memory");
+    }
+
+    /* Every point moved, contour by contour, before anything is drawn. */
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    size_t segments = 0;
+    for (int c = 0; c < contours->count; c++) {
+        ObjList *contour = AS_LIST(jaiListGet(contours, c));
+        const int count = contour->count;
+        for (int i = 0; i < count; i++) {
+            int64_t x, y;
+            if (!jaiReadPoint(&reader, jaiListGet(contour, i), &x, &y)) {
+                free(ends);
+                free(moved);
+                *out = BOOL_VAL(false);
+                return true;
+            }
+            if (__builtin_add_overflow(x, offsetX, &moved[i * 2]) ||
+                __builtin_add_overflow(y, offsetY, &moved[i * 2 + 1])) {
+                free(ends);
+                free(moved);
+                return jaiThrow(vm.cOverflowError, "draw_outlines(): integer overflow");
+            }
+        }
+        if (count == 0) continue;
+        if (count == 1) {
+            /* `draw_thick` takes a lone point through fixed point and back,
+             * which is the point itself unless it is too far out to shift --
+             * and those the caller draws. */
+            const int64_t limit = (int64_t)1 << 46;
+            if (moved[0] <= -limit || moved[0] >= limit || moved[1] <= -limit || moved[1] >= limit) {
+                free(ends);
+                free(moved);
+                *out = BOOL_VAL(false);
+                return true;
+            }
+            int64_t *at = ends + segments * 4;
+            at[0] = moved[0];
+            at[1] = moved[1];
+            at[2] = moved[0];
+            at[3] = moved[1];
+            segments++;
+            continue;
+        }
+        /* Closed, from the last point round; open, from the first. */
+        const int from = closed ? count - 1 : 0;
+        int64_t px = moved[from * 2], py = moved[from * 2 + 1];
+        for (int i = closed ? 0 : 1; i < count; i++) {
+            int64_t *at = ends + segments * 4;
+            at[0] = px;
+            at[1] = py;
+            at[2] = moved[i * 2];
+            at[3] = moved[i * 2 + 1];
+            px = at[2];
+            py = at[3];
+            segments++;
+        }
+    }
+    free(moved);
+
+    JaiSurface surface;
+    if (!readSurface(args, 0, "draw_outlines", &surface)) {
+        free(ends);
+        return false;
+    }
+    for (size_t i = 0; i < segments; i++) {
+        const int64_t *at = ends + i * 4;
+        JaiLineWalk walk;
+        if (clipAndOrient(surface.cols, surface.rows, at[0], at[1], at[2], at[3], (int)connectivity,
+                          &walk)) {
+            lineWalk(&walk, &surface);
+        }
+    }
+    free(ends);
+    *out = BOOL_VAL(true);
+    return true;
+}
+
+/* --- filled polygons ------------------------------------------------- */
+
+/* One edge of a polygon in the active list the scanline fill walks: `PolyEdge`
+ * in drawing.jai, with `next` an index into the edge array, -1 for none. */
+typedef struct {
+    int64_t y0, y1, x, dx;
+    int32_t next;
+} RasterEdge;
+
+/* `edge_precedes`: by the row it starts on, then by x, then by slope. */
+JAI_INLINE bool rasterEdgeBefore(const RasterEdge *a, const RasterEdge *b) {
+    if (a->y0 != b->y0) return a->y0 < b->y0;
+    if (a->x != b->x) return a->x < b->x;
+    return a->dx < b->dx;
+}
+
+/* A stable merge sort -- an edge that ties stays after the ones it tied with,
+ * which is the order `sort_edges`' insertion sort leaves -- in n log n where
+ * that one was quadratic: a frame of 8239 contours is 33 thousand edges, and
+ * inserting each into a list in order took seconds. */
+static void rasterSortEdges(RasterEdge *edges, RasterEdge *spare, size_t count) {
+    for (size_t width = 1; width < count; width *= 2) {
+        for (size_t left = 0; left < count; left += 2 * width) {
+            const size_t mid = left + width < count ? left + width : count;
+            const size_t right = left + 2 * width < count ? left + 2 * width : count;
+            size_t i = left, j = mid, k = left;
+            while (i < mid && j < right) {
+                spare[k++] = rasterEdgeBefore(&edges[j], &edges[i]) ? edges[j++] : edges[i++];
+            }
+            while (i < mid) spare[k++] = edges[i++];
+            while (j < right) spare[k++] = edges[j++];
+        }
+        memcpy(edges, spare, count * sizeof(RasterEdge));
+    }
+}
+
+/* `resort_active`: bubble passes over the active list until it is in x order,
+ * swapping only where one is strictly greater, so ties keep their order. */
+static void rasterResortActive(RasterEdge *edges, int32_t head) {
+    bool swapped = true;
+    while (swapped) {
+        swapped = false;
+        int32_t previous = head;
+        int32_t current = edges[head].next;
+        while (current >= 0) {
+            const int32_t node = current;
+            const int32_t following = edges[node].next;
+            if (following < 0) break;
+            if (edges[node].x > edges[following].x) {
+                edges[previous].next = following;
+                edges[node].next = edges[following].next;
+                edges[following].next = node;
+                previous = following;
+                swapped = true;
+            } else {
+                previous = node;
+                current = following;
+            }
+        }
+    }
+}
+
+/* `fill_polygons(target, colour, cn, origin, stride, cols, rows, polygons,
+ *  offset_x, offset_y, shift, line_type)` -- jaicv's `fill_poly`: every
+ *  polygon moved by the offset, its outline drawn one pixel wide unless the
+ *  line is anti-aliased, and the whole set filled by one scanline pass with
+ *  the even-odd rule. The edges, their fixed point, the slopes, the active
+ *  list and the spans are `collect_edges` and `fill_edges` step for step,
+ *  over the same arithmetic.
+ *
+ * What made it worth moving is the edge sort, an insertion into a list kept
+ * in order: quadratic, and a frame of contours drawn filled is tens of
+ * thousands of edges -- 8239 contours took 4.6 seconds against OpenCV's 4.5
+ * milliseconds. The per-edge outline call and the per-span fill call were
+ * the rest.
+ *
+ * Returns false, having drawn nothing, when a point is not an object with
+ * integer `x` and `y`. Arithmetic Jaithon checks is checked here, in the same
+ * order, and throws at the same polygon. */
+static bool primFillPolygons(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *polygons;
+    int64_t offsetX, offsetY, shift, lineType;
+    if (!jaiArgList(args[7], 8, "fill_polygons", &polygons)) return false;
+    if (!jaiStrWantInt(args[8], "fill_polygons", "the x offset", &offsetX)) return false;
+    if (!jaiStrWantInt(args[9], "fill_polygons", "the y offset", &offsetY)) return false;
+    if (!jaiStrWantInt(args[10], "fill_polygons", "the shift", &shift)) return false;
+    if (!jaiStrWantInt(args[11], "fill_polygons", "the line type", &lineType)) return false;
+    if (shift < 0 || shift > JAI_XY_SHIFT) {
+        return jaiThrow(vm.cValueError, "fill_polygons(): a shift of %lld is out of range",
+                        (long long)shift);
+    }
+
+    /* Every point readable, or nothing is drawn and the caller goes its own
+     * way. */
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    size_t total = 0;
+    for (int p = 0; p < polygons->count; p++) {
+        const Value item = jaiListGet(polygons, p);
+        if (!IS_LIST(item)) {
+            *out = BOOL_VAL(false);
+            return true;
+        }
+        ObjList *polygon = AS_LIST(item);
+        for (int i = 0; i < polygon->count; i++) {
+            int64_t x, y;
+            if (!jaiReadPoint(&reader, jaiListGet(polygon, i), &x, &y)) {
+                *out = BOOL_VAL(false);
+                return true;
+            }
+        }
+        total += (size_t)polygon->count;
+    }
+
+    JaiSurface surface;
+    if (!readSurface(args, 0, "fill_polygons", &surface)) return false;
+    /* The edges, the sort's spare and the sentinel head, and the moved points
+     * of the polygon at hand. */
+    RasterEdge *edges = (RasterEdge *)malloc((total * 2 + 1) * sizeof(RasterEdge));
+    int64_t *moved = (int64_t *)malloc((total > 0 ? total : 1) * 2 * sizeof(int64_t));
+    if (edges == NULL || moved == NULL) {
+        free(edges);
+        free(moved);
+        return jaiThrow(vm.cRuntimeError, "fill_polygons(): out of memory");
+    }
+    RasterEdge *spare = edges + total + 1;
+    size_t count = 0;
+    const int connectivity = lineType == 4 ? 4 : 8;
+    const bool outline = lineType != 16;   /* LINE_AA */
+    const int64_t delta = ((int64_t)1 << shift) >> 1;
+    const int up = (int)(JAI_XY_SHIFT - shift);
+    bool overflow = false;
+
+    for (int p = 0; p < polygons->count && !overflow; p++) {
+        ObjList *polygon = AS_LIST(jaiListGet(polygons, p));
+        const int n = polygon->count;
+        if (n == 0) continue;
+        /* The moved copy first, whole, as `fill_poly` builds it. */
+        for (int i = 0; i < n; i++) {
+            int64_t x, y;
+            jaiReadPoint(&reader, jaiListGet(polygon, i), &x, &y);
+            if (__builtin_add_overflow(x, offsetX, &moved[i * 2]) ||
+                __builtin_add_overflow(y, offsetY, &moved[i * 2 + 1])) {
+                overflow = true;
+                break;
+            }
+        }
+        if (overflow) break;
+        /* `collect_edges`. */
+        int64_t previousX = (int64_t)((uint64_t)moved[(n - 1) * 2] << up);
+        int64_t previousY;
+        if (__builtin_add_overflow(moved[(n - 1) * 2 + 1], delta, &previousY)) {
+            overflow = true;
+            break;
+        }
+        previousY >>= shift;
+        for (int i = 0; i < n; i++) {
+            const int64_t currentX = (int64_t)((uint64_t)moved[i * 2] << up);
+            int64_t currentY;
+            if (__builtin_add_overflow(moved[i * 2 + 1], delta, &currentY)) {
+                overflow = true;
+                break;
+            }
+            currentY >>= shift;
+            if (outline) {
+                int64_t ax, bx;
+                if (__builtin_add_overflow(previousX, (int64_t)(JAI_XY_ONE >> 1), &ax) ||
+                    __builtin_add_overflow(currentX, (int64_t)(JAI_XY_ONE >> 1), &bx)) {
+                    overflow = true;
+                    break;
+                }
+                JaiLineWalk walk;
+                if (clipAndOrient(surface.cols, surface.rows, ax >> JAI_XY_SHIFT, previousY,
+                                  bx >> JAI_XY_SHIFT, currentY, connectivity, &walk)) {
+                    lineWalk(&walk, &surface);
+                }
+            }
+            if (previousY != currentY) {
+                int64_t run, rise;
+                if (__builtin_sub_overflow(currentX, previousX, &run) ||
+                    __builtin_sub_overflow(currentY, previousY, &rise) ||
+                    (run == INT64_MIN && rise == -1)) {
+                    overflow = true;
+                    break;
+                }
+                const int64_t slope = truncDiv(run, rise);
+                RasterEdge *edge = &edges[count++];
+                if (previousY < currentY) {
+                    edge->y0 = previousY;
+                    edge->y1 = currentY;
+                    edge->x = previousX;
+                } else {
+                    edge->y0 = currentY;
+                    edge->y1 = previousY;
+                    edge->x = currentX;
+                }
+                edge->dx = slope;
+                edge->next = -1;
+            }
+            previousX = currentX;
+            previousY = currentY;
+        }
+    }
+    free(moved);
+    if (overflow) {
+        free(edges);
+        return jaiThrow(vm.cOverflowError, "fill_polygons(): integer overflow");
+    }
+
+    /* `fill_edges`. */
+    bool ok = true;
+    if (count >= 2) {
+        rasterSortEdges(edges, spare, count);
+        int64_t yMin = edges[0].y0, yMax = edges[0].y1;
+        for (size_t i = 0; i < count; i++) {
+            if (edges[i].y0 < yMin) yMin = edges[i].y0;
+            if (edges[i].y1 > yMax) yMax = edges[i].y1;
+        }
+        if (!(yMax < 0 || yMin >= surface.rows)) {
+            if (yMax > surface.rows) yMax = surface.rows;
+            const int32_t head = (int32_t)count;
+            edges[head].next = -1;
+            edges[head].x = 0;
+            size_t nextEdge = 0;
+            for (int64_t y = edges[0].y0; ok && y < yMax; y++) {
+                int32_t previous = head;
+                int32_t current = edges[head].next;
+                bool draw = false;
+                for (;;) {
+                    const bool waiting = nextEdge < count && edges[nextEdge].y0 == y;
+                    if (current < 0 && !waiting) break;
+                    const int32_t live = current;
+                    if (live >= 0 && edges[live].y1 == y) {
+                        edges[previous].next = edges[live].next;
+                        current = edges[live].next;
+                        continue;
+                    }
+                    const int32_t keep = previous;
+                    const bool entering = nextEdge < count;
+                    const bool takeLive = live >= 0 &&
+                        (!entering || edges[nextEdge].y0 > y || edges[live].x < edges[nextEdge].x);
+                    if (takeLive) {
+                        previous = live;
+                        current = edges[live].next;
+                    } else if (entering) {
+                        const int32_t arrival = (int32_t)nextEdge;
+                        edges[previous].next = arrival;
+                        edges[arrival].next = live;
+                        previous = arrival;
+                        nextEdge++;
+                    } else {
+                        break;
+                    }
+                    if (draw) {
+                        if (y >= 0) {
+                            int64_t x1, x2, sum;
+                            const int64_t kx = edges[keep].x, px = edges[previous].x;
+                            const int64_t low = kx > px ? px : kx;
+                            const int64_t high = kx > px ? kx : px;
+                            /* `low + XY_ONE - 1`, the two steps Jaithon takes. */
+                            if (__builtin_add_overflow(low, (int64_t)JAI_XY_ONE, &sum) ||
+                                __builtin_sub_overflow(sum, (int64_t)1, &sum)) {
+                                ok = false;
+                                break;
+                            }
+                            x1 = sum >> JAI_XY_SHIFT;
+                            x2 = high >> JAI_XY_SHIFT;
+                            /* `Painter.span`. */
+                            const int64_t start = x1 > 0 ? x1 : 0;
+                            const int64_t end = x2 < surface.cols - 1 ? x2 : surface.cols - 1;
+                            if (start <= end) surfaceRun(&surface, start, y, end - start + 1);
+                        }
+                        if (__builtin_add_overflow(edges[keep].x, edges[keep].dx, &edges[keep].x) ||
+                            __builtin_add_overflow(edges[previous].x, edges[previous].dx,
+                                                   &edges[previous].x)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    draw = !draw;
+                }
+                if (ok) rasterResortActive(edges, head);
+            }
+        }
+    }
+    free(edges);
+    if (!ok) return jaiThrow(vm.cOverflowError, "fill_polygons(): integer overflow");
+    *out = BOOL_VAL(true);
+    return true;
+}
+
+/* --- anti-aliased drawing -------------------------------------------- */
+
+/* Where anti-aliased drawing goes, and how far it has got.
+ *
+ * `Painter` draws on the device until the first blend that has to read a
+ * pixel back, and only then brings the picture over to the host -- `on_host`
+ * -- and draws there from then on. Which side a write lands on is visible
+ * through a view of a larger picture, whose host copy is its own until it is
+ * flushed, so the primitives keep to exactly that: on the device, every write
+ * up to the first partial blend is made and the walk stops there, returning
+ * how many steps it took; the caller moves the painter over and calls again
+ * with that count, and the walk replays that far without writing and carries
+ * on on the host. A step is one `blend`, or one quadrilateral fill. */
+typedef struct {
+    JaiSurface surface;
+    bool       onHost;
+    bool       integral;
+    double     low, high;
+    double     colourF[4];
+    int64_t    step;      /* steps taken so far, written or replayed */
+    int64_t    skip;      /* steps the previous call already wrote */
+    int64_t    stopAt;    /* the step a device walk stopped at, or -1 */
+    bool       bad;       /* a mixed value that cannot be rounded to an int */
+} BlendTarget;
+
+JAI_INLINE bool blendStopped(const BlendTarget *t) { return t->stopAt >= 0 || t->bad; }
+
+/* `cv_round` in drawing.jai: the floor, then up past a half, and to even on
+ * exactly one. */
+static double blendRound(double value, bool *bad) {
+    const double down = floor(value);
+    if (!(down > -9.0e18 && down < 9.0e18)) {
+        *bad = true;
+        return 0.0;
+    }
+    const double fraction = value - down;
+    int64_t lower = (int64_t)down;
+    if (fraction > 0.5) lower += 1;
+    else if (!(fraction < 0.5) && lower % 2 != 0) lower += 1;
+    return (double)lower;
+}
+
+/* `Painter.blend`: `alpha` of the colour over the pixel at (x, y) -- a plain
+ * write when it is all colour, nothing when it is none or off the picture. */
+static void blendPixel(BlendTarget *t, int64_t x, int64_t y, double alpha) {
+    if (blendStopped(t)) return;
+    const int64_t step = t->step++;
+    if (step < t->skip) return;
+    const JaiSurface *s = &t->surface;
+    if (x < 0 || y < 0 || x >= s->cols || y >= s->rows) return;
+    if (alpha <= 0.0) return;
+    if (alpha >= 1.0) {
+        surfaceRun(s, x, y, 1);   /* `plot`, on whichever side the painter is */
+        return;
+    }
+    if (!t->onHost) {
+        t->stopAt = step;
+        return;
+    }
+    const int64_t base = s->origin + y * s->stride + x * (int64_t)s->cn;
+    if (base < 0 || base + s->cn > s->capacity) return;
+    for (int c = 0; c < s->cn; c++) {
+        const Value held = s->boxed[base + c];
+        const double v = IS_FLOAT(held) ? AS_FLOAT(held) : (double)AS_INT(held);
+        double mixed = v * (1.0 - alpha) + t->colourF[c] * alpha;
+        if (t->integral) {
+            mixed = blendRound(mixed, &t->bad);
+            /* Jaithon's `int` refuses a NaN or an infinity where `cv_round`
+             * takes it, before the channel is written; so does this. */
+            if (t->bad) return;
+            if (mixed < t->low) mixed = t->low;
+            if (mixed > t->high) mixed = t->high;
+        }
+        s->boxed[base + c] = FLOAT_VAL(mixed);
+    }
+}
+
+/* `draw_line_aa`: a step a pixel along the longer axis, each landing spread
+ * over the four pixels around it by how near it falls to each. */
+static void blendLine(BlendTarget *t, int64_t x1, int64_t y1, int64_t x2, int64_t y2) {
+    const double dx = (double)(x2 - x1);
+    const double dy = (double)(y2 - y1);
+    const int64_t across = (int64_t)fabs(dx);
+    const int64_t down = (int64_t)fabs(dy);
+    const int64_t steps = across > down ? across : down;
+    if (steps == 0) {
+        blendPixel(t, x1, y1, 1.0);
+        return;
+    }
+    const double stepX = dx / (double)steps;
+    const double stepY = dy / (double)steps;
+    double x = (double)x1;
+    double y = (double)y1;
+    for (int64_t i = 0; i < steps + 1 && !blendStopped(t); i++) {
+        const int64_t ix = (int64_t)floor(x);
+        const int64_t iy = (int64_t)floor(y);
+        const double fx = x - (double)ix;
+        const double fy = y - (double)iy;
+        blendPixel(t, ix, iy, (1.0 - fx) * (1.0 - fy));
+        blendPixel(t, ix + 1, iy, fx * (1.0 - fy));
+        blendPixel(t, ix, iy + 1, (1.0 - fx) * fy);
+        blendPixel(t, ix + 1, iy + 1, fx * fy);
+        x += stepX;
+        y += stepY;
+    }
+}
+
+/* `draw_circle_aa` filled: every pixel within reach blended by how much of
+ * it the disc covers. */
+static void blendDisc(BlendTarget *t, int64_t cx, int64_t cy, int64_t radius) {
+    if (radius < 0) return;
+    const double r = (double)radius;
+    const int64_t reach = radius + 2;
+    for (int64_t oy = -reach; oy < reach + 1 && !blendStopped(t); oy++) {
+        for (int64_t ox = -reach; ox < reach + 1 && !blendStopped(t); ox++) {
+            const double distance = sqrt((double)(ox * ox + oy * oy));
+            double coverage = r + 0.5 - distance;
+            if (coverage < 0.0) coverage = 0.0;
+            if (coverage > 1.0) coverage = 1.0;
+            if (coverage > 0.0) blendPixel(t, cx + ox, cy + oy, coverage);
+        }
+    }
+}
+
+/* The arguments both anti-aliased primitives share: the surface, the runs,
+ * whether they close, the depth's rounding and range, how many steps are
+ * already written, and whether the surface is the host mirror. Returns -2,
+ * the caller to draw the long way, when a point is not an object with integer
+ * `x` and `y` or lies too far out to shift into fixed point exactly. */
+static bool blendSetup(Value *args, const char *fnName, BlendTarget *t, ObjList **contours,
+                       bool *closed, int64_t *result) {
+    *result = -1;
+    memset(t, 0, sizeof *t);
+    t->stopAt = -1;
+    if (!readSurface(args, 0, fnName, &t->surface)) return false;
+    if (!jaiArgList(args[7], 8, fnName, contours)) return false;
+    if (!IS_BOOL(args[8]) || !IS_BOOL(args[9]) || !IS_BOOL(args[13])) {
+        return jaiThrow(vm.cTypeError, "%s(): closed, integral and on_host must be bools", fnName);
+    }
+    *closed = AS_BOOL(args[8]);
+    t->integral = AS_BOOL(args[9]);
+    t->onHost = AS_BOOL(args[13]);
+    for (int i = 0; i < 2; i++) {
+        if (!IS_FLOAT(args[10 + i]) && !IS_INT(args[10 + i])) {
+            return jaiThrow(vm.cTypeError, "%s(): the depth's range must be numbers", fnName);
+        }
+    }
+    t->low = IS_FLOAT(args[10]) ? AS_FLOAT(args[10]) : (double)AS_INT(args[10]);
+    t->high = IS_FLOAT(args[11]) ? AS_FLOAT(args[11]) : (double)AS_INT(args[11]);
+    if (!jaiStrWantInt(args[12], fnName, "the steps already taken", &t->skip)) return false;
+    if (t->onHost && t->surface.boxed == NULL) {
+        return jaiThrow(vm.cValueError, "%s(): on the host the target must be a list", fnName);
+    }
+    for (int c = 0; c < t->surface.cn; c++) {
+        const Value v = t->surface.colour[c];
+        t->colourF[c] = IS_FLOAT(v) ? AS_FLOAT(v) : (double)AS_INT(v);
+    }
+    const int64_t limit = (int64_t)1 << 40;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    for (int c = 0; c < (*contours)->count; c++) {
+        const Value item = jaiListGet(*contours, c);
+        if (!IS_LIST(item)) {
+            *result = -2;
+            return true;
+        }
+        ObjList *contour = AS_LIST(item);
+        for (int i = 0; i < contour->count; i++) {
+            int64_t x, y;
+            if (!jaiReadPoint(&reader, jaiListGet(contour, i), &x, &y) ||
+                x <= -limit || x >= limit || y <= -limit || y >= limit) {
+                *result = -2;
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
+/* `blend_outlines(target, colour, cn, origin, stride, cols, rows, contours,
+ *  closed, integral, low, high, taken, on_host)` -- every run as an
+ *  anti-aliased hairline: what `polylines` draws with LINE_AA one pixel wide,
+ *  a `draw_line_aa` a segment and four `Painter.blend`s a step. As Jaithon
+ *  calls that was 12.2 ms for 800 small contours against OpenCV's 0.24.
+ *
+ * Returns -1 when every run is drawn, -2 having drawn nothing when a point is
+ * not one this takes, or the step a walk on the device stopped at -- see
+ * `BlendTarget`. */
+static bool primBlendOutlines(int argc, Value *args, Value *out) {
+    (void)argc;
+    BlendTarget t;
+    ObjList *contours;
+    bool closed;
+    int64_t result;
+    if (!blendSetup(args, "blend_outlines", &t, &contours, &closed, &result)) return false;
+    if (result == -2) {
+        *out = INT_VAL(-2);
+        return true;
+    }
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    for (int c = 0; c < contours->count && !blendStopped(&t); c++) {
+        ObjList *contour = AS_LIST(jaiListGet(contours, c));
+        const int count = contour->count;
+        if (count == 0) continue;
+        int64_t px, py;
+        if (count == 1) {
+            jaiReadPoint(&reader, jaiListGet(contour, 0), &px, &py);
+            blendLine(&t, px, py, px, py);
+            continue;
+        }
+        jaiReadPoint(&reader, jaiListGet(contour, closed ? count - 1 : 0), &px, &py);
+        for (int i = closed ? 0 : 1; i < count && !blendStopped(&t); i++) {
+            int64_t cx, cy;
+            jaiReadPoint(&reader, jaiListGet(contour, i), &cx, &cy);
+            blendLine(&t, px, py, cx, cy);
+            px = cx;
+            py = cy;
+        }
+    }
+    if (t.bad) return jaiThrow(vm.cValueError, "cannot convert float NaN to int");
+    *out = INT_VAL(t.stopAt);
+    return true;
+}
+
+/* `blend_strokes(target, colour, cn, origin, stride, cols, rows, contours,
+ *  closed, integral, low, high, taken, on_host, thickness)` -- every run as
+ *  an anti-aliased stroke `thickness` wide: what `polylines` draws with
+ *  LINE_AA wider than a pixel, `draw_thick` a segment -- the quadrilateral
+ *  with the anti-aliased roundings, then a blended disc at whichever ends the
+ *  segment caps, segment by segment. A lone point is its two caps at the one
+ *  place. At 800 small contours this was 40 ms against OpenCV's 2.1.
+ *
+ * Returns as `blend_outlines` does. */
+static bool primBlendStrokes(int argc, Value *args, Value *out) {
+    (void)argc;
+    BlendTarget t;
+    ObjList *contours;
+    bool closed;
+    int64_t result, thickness;
+    if (!blendSetup(args, "blend_strokes", &t, &contours, &closed, &result)) return false;
+    if (!jaiStrWantInt(args[14], "blend_strokes", "the thickness", &thickness)) return false;
+    if (thickness < 2 || thickness > 32767) {
+        return jaiThrow(vm.cValueError, "blend_strokes(): a thickness of %lld is out of range",
+                        (long long)thickness);
+    }
+    if (result == -2) {
+        *out = INT_VAL(-2);
+        return true;
+    }
+    const int64_t odd = thickness & 1;
+    const int64_t halfWidth = thickness << (JAI_XY_SHIFT - 1);
+    const double bias = (double)halfWidth + (double)odd * (double)JAI_XY_ONE * 0.5;
+    const int64_t radius = (halfWidth + (JAI_XY_ONE >> 1)) >> JAI_XY_SHIFT;
+    enum { CAP_START = 1, CAP_END = 2 };
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+
+    for (int c = 0; c < contours->count && !blendStopped(&t); c++) {
+        ObjList *contour = AS_LIST(jaiListGet(contours, c));
+        const int count = contour->count;
+        if (count == 0) continue;
+        int64_t px, py;
+        if (count == 1) {
+            jaiReadPoint(&reader, jaiListGet(contour, 0), &px, &py);
+            blendDisc(&t, px, py, radius);
+            blendDisc(&t, px, py, radius);
+            continue;
+        }
+        int caps = closed ? CAP_END : (CAP_START | CAP_END);
+        jaiReadPoint(&reader, jaiListGet(contour, closed ? count - 1 : 0), &px, &py);
+        for (int i = closed ? 0 : 1; i < count && !blendStopped(&t); i++) {
+            int64_t cx, cy;
+            jaiReadPoint(&reader, jaiListGet(contour, i), &cx, &cy);
+            /* `draw_thick` in fixed point. */
+            const int64_t x0 = px << JAI_XY_SHIFT, y0 = py << JAI_XY_SHIFT;
+            const int64_t x1 = cx << JAI_XY_SHIFT, y1 = cy << JAI_XY_SHIFT;
+            const double dx = (double)(x0 - x1) / (double)JAI_XY_ONE;
+            const double dy = (double)(y1 - y0) / (double)JAI_XY_ONE;
+            const double squared = dx * dx + dy * dy;
+            if (squared > 1e-12) {
+                /* A quadrilateral is one step, written on whichever side the
+                 * painter is when the walk reaches it. */
+                const int64_t step = t.step++;
+                if (step >= t.skip) {
+                    const double reach = bias / sqrt(squared);
+                    const int64_t ox = roundHalfEven(dy * reach);
+                    const int64_t oy = roundHalfEven(dx * reach);
+                    const int64_t xs[4] = {x0 + ox, x0 - ox, x1 - ox, x1 + ox};
+                    const int64_t ys[4] = {y0 + oy, y0 - oy, y1 - oy, y1 + oy};
+                    convexFill(&t.surface, xs, ys, 4, JAI_XY_SHIFT, JAI_XY_ONE - 1, 0);
+                }
+            }
+            if (caps & CAP_START) blendDisc(&t, px, py, radius);
+            if (caps & CAP_END) blendDisc(&t, cx, cy, radius);
+            px = cx;
+            py = cy;
+            caps = CAP_END;
+        }
+    }
+    if (t.bad) return jaiThrow(vm.cValueError, "cannot convert float NaN to int");
+    *out = INT_VAL(t.stopAt);
+    return true;
+}
+
 void jaiRasterRegisterPrimitives(ObjModule *ns) {
-    jaiStrDefinePrim(ns, "fill_span",   primFillSpan,   10, 10);
-    jaiStrDefinePrim(ns, "draw_line",   primDrawLine,   12, 12);
-    jaiStrDefinePrim(ns, "draw_lines",  primDrawLines,   9, 9);
-    jaiStrDefinePrim(ns, "fill_convex", primFillConvex, 11, 11);
+    jaiStrDefinePrim(ns, "fill_span",     primFillSpan,     10, 10);
+    jaiStrDefinePrim(ns, "draw_line",     primDrawLine,     12, 12);
+    jaiStrDefinePrim(ns, "draw_lines",    primDrawLines,     9, 9);
+    jaiStrDefinePrim(ns, "fill_convex",   primFillConvex,   11, 11);
+    jaiStrDefinePrim(ns, "fill_strokes",  primFillStrokes,  12, 12);
+    jaiStrDefinePrim(ns, "draw_outlines", primDrawOutlines, 12, 12);
+    jaiStrDefinePrim(ns, "fill_polygons", primFillPolygons, 12, 12);
+    jaiStrDefinePrim(ns, "blend_outlines", primBlendOutlines, 14, 14);
+    jaiStrDefinePrim(ns, "blend_strokes", primBlendStrokes, 15, 15);
 }
