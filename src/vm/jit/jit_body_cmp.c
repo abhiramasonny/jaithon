@@ -673,7 +673,7 @@ JitArmResult emitMembership(Emit *e, const uint8_t *code, int *offp) {
         mfx.on = false;
         if (e->stack[e->depth - 1] == SLOT_OBJ &&
             dictLeafKeyKind(e->stack[e->depth - 2]) &&
-            IS_DICT(e->stackSeen[e->depth - 1])) {
+            JIT_SEEN_OR_PREDICTED_DICT(e, e->depth - 1)) {
             emitDictLeafHas(e, valueXReg(e, e->valueDepth - 1),
                             valueXReg(e, e->valueDepth - 2),
                             e->stack[e->depth - 2], code[off] == OP_NOT_IN,

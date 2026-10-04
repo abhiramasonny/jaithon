@@ -1087,6 +1087,17 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                     if (probe == NULL) return false;
                     oseen = OBJ_VAL((Obj *)probe);
                     oProbe = true;
+                } else if (jitDictProbeOn() &&
+                           e->stackObjType[ridx] == (uint8_t)(OBJ_DICT + 1)) {
+                    /* A predicted dict: what `var d = {}` in this body
+                     * leaves its local holding, since OP_BUILD_DICT records
+                     * the type and there is no live dict to sample until
+                     * the body runs. `counts.get(w, 0)` on such a local
+                     * declined the whole function. The probe is one empty
+                     * dict made once and held as a permanent root, so it
+                     * outlives every use below; the receiver's type is
+                     * guarded at run time either way. */
+                    oseen = OBJ_VAL((Obj *)jitDictProbe());
                 } else {
                     /* Naming the method is what priced this: the census
                      * showed `.len()` and nothing else, and the attribution

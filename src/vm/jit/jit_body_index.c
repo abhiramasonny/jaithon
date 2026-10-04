@@ -260,7 +260,7 @@ bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
     if (e->depth < 2 || e->valueDepth < 2) return false;
     SlotKind keyKind = e->stack[e->depth - 1];
     if (e->stack[e->depth - 2] != SLOT_OBJ || !dictLeafKeyKind(keyKind) ||
-        !IS_DICT(e->stackSeen[e->depth - 2])) {
+        !JIT_SEEN_OR_PREDICTED_DICT(e, e->depth - 2)) {
         return false;
     }
     unsigned rDict = valueXReg(e, e->valueDepth - 2);
@@ -740,7 +740,7 @@ bool emitSetIndex(Emit *e, int *offp) {
             /* `d[k] = v`: a dict is as ordinary a container here as a list -- without this, dict_ops' loop just
              * moved its decline from `get` to this store (a loop that declines anywhere runs interpreted end to end). Object type guarded before anything is consumed, so a miss resumes with container/key/value all still on the interpreter's stack. */
             unsigned sidx = e->depth - 3;
-            if (!IS_DICT(e->stackSeen[sidx])) {
+            if (!JIT_SEEN_OR_PREDICTED_DICT(e, sidx)) {
                 e->whyNot = "an index store into an object that is not a dict";
                 return false;
             }

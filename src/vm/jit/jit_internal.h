@@ -795,6 +795,13 @@ int jitSetIndexDict(JitCallDesc *d);
 /* The string-keyed dict leaves and the arm that calls them; see jitDictGetStr. */
 #define JIT_DICT_ABSENT_SLOW 0xFFFFu
 bool jitDictLeaf(void);
+bool jitDictProbeOn(void);
+ObjDict *jitDictProbe(void);
+/* A dict the model has a sample of, or knows by its predicted type alone. */
+#define JIT_SEEN_OR_PREDICTED_DICT(e, idx) \
+    (IS_DICT((e)->stackSeen[idx]) ||       \
+     (jitDictProbeOn() &&                  \
+      (e)->stackObjType[idx] == (uint8_t)(OBJ_DICT + 1)))
 int64_t jitDictGetStr(ObjDict *d, ObjString *key, Value *result,
                       uint64_t defTag, int64_t defPayload);
 int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,

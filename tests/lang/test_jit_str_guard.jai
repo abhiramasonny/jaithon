@@ -2,7 +2,7 @@
 #: object": one type check, and a deopt that hands a non-string back to the
 #: interpreter, which raises the TypeError a wrong return is owed. Before the
 #: arm the guard declined the whole body around it.
-# jit-compiles: guard_str_return, guard_str_param
+# jit-compiles: guard_str_return, guard_str_param, guard_get_str
 from std.test import assert_eq, assert_throws
 
 let CALLS = 100
@@ -38,6 +38,25 @@ pub fn test_anything_else_still_raises() -> void {
     assert_throws(TypeError, fn() -> void {
         let _ = guard_str_return([1])
     }, "a list through a `-> str` boundary")
+}
+
+fn guard_get_str(d: dict[str, any], k: str) -> str {
+    return d.get(k)
+}
+
+pub fn test_a_predicted_string_is_still_checked() -> void {
+    #: The `get` site has only ever seen strings, so the model predicts one;
+    #: a list under another key passes the tag check and must still fail the
+    #: `-> str` boundary, because a prediction is not a proof.
+    let d: dict[str, any] = {"s": "text", "l": [1, 2]}
+    var call = 0
+    while call < CALLS {
+        assert_eq(guard_get_str(d, "s"), "text")
+        call += 1
+    }
+    assert_throws(TypeError, fn() -> void {
+        let _ = guard_get_str(d, "l")
+    }, "a list through a `-> str` boundary after strings only")
 }
 
 pub fn test_a_local_annotation() -> void {

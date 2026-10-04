@@ -419,6 +419,31 @@ int jitSetIndexDict(JitCallDesc *d) {
     return vm.hasException ? 1 : 0;
 }
 
+/* JAITHON_JIT_DICT_PROBE=0 refuses a dict the model knows only by its
+ * predicted type (stackObjType), as the tier did before, for a one-binary
+ * A/B: an invoke on one, a store into one, `in` against one. */
+bool jitDictProbeOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_PROBE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The exemplar a predicted dict is compiled against: empty, made once, and a
+ * permanent root, so a model entry may hold it for as long as any compile
+ * runs. Nothing writes to it -- compiled code guards the real receiver's type
+ * and works on that. */
+ObjDict *jitDictProbe(void) {
+    static ObjDict *probe;
+    if (probe == NULL) {
+        probe = jaiDictNew();
+        jaiGCAddPermanentRoot(OBJ_VAL((Obj *)probe));
+    }
+    return probe;
+}
+
 /* JAITHON_JIT_DICT_LEAF=0 sends every dict read and store back through its
  * descriptor call, for a one-binary A/B of the leaves below. */
 bool jitDictLeaf(void) {
