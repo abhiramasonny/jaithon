@@ -145,16 +145,6 @@ uint32_t jaiA64LdpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
     return 0xa9400000u | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt;
 }
 
-/* and Xd, Xn, Xm, asr #shift -- logical (shifted register), shift type 10. */
-uint32_t jaiA64AndXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
-    return 0x8a800000u | (rm << 16) | ((shift & 63u) << 10) | (rn << 5) | rd;
-}
-
-/* add Xd, Xn, Xm, asr #shift -- add (shifted register), shift type 10. */
-uint32_t jaiA64AddXAsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
-    return 0x8b800000u | (rm << 16) | ((shift & 63u) << 10) | (rn << 5) | rd;
-}
-
 /* stp Dt1, Dt2, [Xn, #imm] -- opc 01 of the SIMD&FP pair, signed offset. */
 uint32_t jaiA64StpDOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
     uint32_t imm7 = (uint32_t)((imm / 8) & 0x7f);

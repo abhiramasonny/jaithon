@@ -506,7 +506,7 @@ bool emitModIntConst(Emit *e, const uint8_t *code, int *offp) {
         emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, JIT_SCRATCH_A));
         emit(e, jaiA64MsubX(rx, JIT_SCRATCH_B, JIT_SCRATCH_A, rx));
         if (imm < 0 ||
-            !emitFloorModFixupFast(e, rx, JIT_SCRATCH_A, JIT_SCRATCH_B)) {
+            !emitColdFixup(e, rx, jaiA64AddX(rx, rx, JIT_SCRATCH_A))) {
             emitFloorFixup(e, rx, JIT_SCRATCH_A, true, imm,
                            jaiA64AddX(rx, rx, JIT_SCRATCH_A));
         }

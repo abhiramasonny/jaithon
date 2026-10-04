@@ -81,39 +81,48 @@ void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
     emit(e, fixup);
 }
 
-/* JAITHON_JIT_FLOOR_SELECT=0 puts the branch back into the floor correction
- * of `x % k` and `x // k` for a literal k > 0. On by default. */
-static bool floorSelectOn(void) {
+/* JAITHON_JIT_FLOOR_COLD=0 puts the floor correction of `x % k` and `x // k`
+ * for a literal k > 0 back inline, behind a `tbz`. On by default.
+ *
+ * emitFloorFixup's `tbz` over one instruction is TAKEN for every non-negative
+ * dividend -- the common case -- and a core retires one taken branch a cycle,
+ * so a loop taking a remainder carried two where its peer carries one:
+ * loop_sum's `i % 7` ran 3.3 cycles an iteration against 2.5 without it.
+ * Branch-free (`and`/`add` on the smeared sign) fixed that and cost
+ * poly_dispatch 9%: there the remainder feeds the next call's argument, and
+ * the correction then sits on the dependency chain where the predicted branch
+ * had cost nothing. Out of line keeps both -- the compare falls through when
+ * the remainder is non-negative, with nothing on the chain, and only a
+ * negative one leaves to apply the correction and come back. */
+static bool floorColdOn(void) {
     static int on = -1;
     if (on < 0) {
-        const char *v = getenv("JAITHON_JIT_FLOOR_SELECT");
+        const char *v = getenv("JAITHON_JIT_FLOOR_COLD");
         on = (v != NULL && v[0] == '0') ? 0 : 1;
     }
     return on != 0;
 }
 
-/* The floor correction for a divisor known positive, with no branch: the
- * remainder's sign bit, smeared across the register by `asr #63`, is all-ones
- * exactly when the correction applies. emitFloorFixup's `tbz` over one
- * instruction is TAKEN for every non-negative dividend -- the common case --
- * which puts a second taken branch in every loop that takes a remainder, and
- * a core retires one taken branch a cycle. `i % 7` in a counted loop is the
- * shape: loop_sum's compiled body had two taken branches against the peer's
- * one.
- *
- * rrem += (rrem < 0 ? rd : 0); rtmp is clobbered. */
-bool emitFloorModFixupFast(Emit *e, unsigned rrem, unsigned rd,
-                           unsigned rtmp) {
-    if (!floorSelectOn()) return false;
-    emit(e, jaiA64AndXAsr(rtmp, rd, rrem, 63));
-    emit(e, jaiA64AddX(rrem, rrem, rtmp));
-    return true;
-}
-
-/* rq -= (rrem < 0 ? 1 : 0): the smeared sign is -1 or 0, so it is added. */
-bool emitFloorDivFixupFast(Emit *e, unsigned rq, unsigned rrem) {
-    if (!floorSelectOn()) return false;
-    emit(e, jaiA64AddXAsr(rq, rq, rrem, 63));
+/* `if rrem < 0 { insn }`, with `insn` emitted after the body (emitGrowStubs)
+ * and a branch back. False, emitting nothing, when the switch is off or the
+ * table is full; the caller then emits the inline form. `insn` must touch only
+ * registers, and nothing it reads may change between here and the stub --
+ * which is immediate, since the stub is the branch's only successor. */
+bool emitColdFixup(Emit *e, unsigned rrem, uint32_t insn) {
+    if (!floorColdOn()) return false;
+    if (e->coldCount >= JIT_MAX_COLD) return false;
+    if (e->fixupCount >= JIT_MAX_FIXUPS) return false;
+    unsigned ci = e->coldCount++;
+    emit(e, jaiA64SubsXImm(31, rrem, 0));
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_COLD - ci;
+    e->fixups[e->fixupCount].conditional  = true;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, jaiA64BCond(JAI_A64_LT, 0));
+    e->cold[ci].stub     = -1;
+    e->cold[ci].returnTo = (int)e->count;
+    e->cold[ci].insn     = insn;
     return true;
 }
 

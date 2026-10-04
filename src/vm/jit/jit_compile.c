@@ -1022,6 +1022,13 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
                 return false;
             }
+        } else if (f->targetOffset <= FIXUP_COLD &&
+                   f->targetOffset > FIXUP_COLD - JIT_MAX_COLD) {
+            target = e.cold[FIXUP_COLD - f->targetOffset].stub;
+            if (target < 0) {
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+                return false;
+            }
         } else if (f->targetOffset <= FIXUP_GROW &&
                    f->targetOffset > FIXUP_GROW - JIT_MAX_GROW) {
             target = e.grow[FIXUP_GROW - f->targetOffset].stub;

@@ -160,13 +160,17 @@ _Static_assert(SLOT_DYNAMIC == SLOT_MAYBE_OBJ + 1 && SLOT_DYNAMIC == 16,
 #define FIXUP_EXIT     (FIXUP_DEOPT - JIT_MAX_DEOPT)         /* minus an exit index */
 #define FIXUP_SELFSLOW (FIXUP_EXIT - JIT_MAX_EXIT)           /* minus a self-call index */
 #define FIXUP_GROW     (FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW)  /* minus a growth index */
+#define JIT_MAX_COLD      16u
+#define FIXUP_COLD     (FIXUP_GROW - JIT_MAX_GROW)           /* minus a cold index */
 
 /* Every sentinel range must stay above any offset a real chunk can have. A
  * chunk that large is not representable long before this matters, so half the
  * u32 range is an enormous margin -- the point is that the build fails if the
  * tables ever grow enough to reach down into bytecode-offset territory. */
-_Static_assert(FIXUP_GROW - JIT_MAX_GROW > UINT32_MAX / 2u,
+_Static_assert(FIXUP_COLD - JIT_MAX_COLD > UINT32_MAX / 2u,
                "jit fixup sentinels have grown down into bytecode offsets");
+_Static_assert(FIXUP_COLD < FIXUP_GROW - (JIT_MAX_GROW - 1u),
+               "jit growth and cold fixup ranges overlap");
 _Static_assert(FIXUP_EXIT < FIXUP_DEOPT - (JIT_MAX_DEOPT - 1u),
                "jit deopt and exit fixup ranges overlap");
 _Static_assert(FIXUP_SELFSLOW < FIXUP_EXIT - (JIT_MAX_EXIT - 1u),
@@ -656,6 +660,14 @@ typedef struct {
         bool     shape;
     } grow[JIT_MAX_GROW];
     unsigned  growCount;
+    /* One instruction a rare branch takes out of line and comes straight
+     * back from (see emitColdFixup), so the common path falls through. */
+    struct {
+        int      stub;
+        int      returnTo;
+        uint32_t insn;
+    } cold[JIT_MAX_COLD];
+    unsigned  coldCount;
     uint32_t  curOffset;
     uint32_t  chainSkip[JIT_MAX_CHAIN];
     unsigned  chainSkipCount;
@@ -1117,8 +1129,7 @@ bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
 void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
                            bool signKnown, int64_t divisor, uint32_t fixup);
 bool powerOfTwoShift(int64_t k, unsigned *shift);
-bool emitFloorModFixupFast(Emit *e, unsigned rrem, unsigned rd, unsigned rtmp);
-bool emitFloorDivFixupFast(Emit *e, unsigned rq, unsigned rrem);
+bool emitColdFixup(Emit *e, unsigned rrem, uint32_t insn);
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg);
 bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,

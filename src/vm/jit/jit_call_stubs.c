@@ -220,6 +220,13 @@ void emitGrowStubs(Emit *e) {
                            (unsigned)offsetof(ObjList, count)));
         emit(e, jaiA64B((int32_t)(e->grow[gi].returnTo - (int)e->count)));
     }
+    /* And the one-instruction cold fixups (emitColdFixup), each straight back
+     * to the instruction after its branch. */
+    for (unsigned ci = 0; ci < e->coldCount; ci++) {
+        e->cold[ci].stub = (int)e->count;
+        emit(e, e->cold[ci].insn);
+        emit(e, jaiA64B((int32_t)(e->cold[ci].returnTo - (int)e->count)));
+    }
 }
 
 #endif /* __aarch64__ || __arm64__ */

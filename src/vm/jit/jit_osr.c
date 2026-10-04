@@ -822,6 +822,9 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         else if (f->targetOffset <= FIXUP_GROW &&
                  f->targetOffset > FIXUP_GROW - JIT_MAX_GROW)
             target = e.grow[FIXUP_GROW - f->targetOffset].stub;
+        else if (f->targetOffset <= FIXUP_COLD &&
+                 f->targetOffset > FIXUP_COLD - JIT_MAX_COLD)
+            target = e.cold[FIXUP_COLD - f->targetOffset].stub;
         else if (f->targetOffset <= FIXUP_OVF && f->targetOffset >= FIXUP_OVF - 2u)
             target = e.overflowStub[FIXUP_OVF - f->targetOffset];
         else {

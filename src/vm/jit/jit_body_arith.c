@@ -411,7 +411,7 @@ bool emitMod(Emit *e, ObjFunction *fn, int prevOff, int *offp) {
         emit(e, jaiA64SdivX(JIT_SCRATCH_B, rx, ry));
         emit(e, jaiA64MsubX(rx, JIT_SCRATCH_B, ry, rx));
         if (!kmodKnown || kmod < 0 ||
-            !emitFloorModFixupFast(e, rx, ry, JIT_SCRATCH_B)) {
+            !emitColdFixup(e, rx, jaiA64AddX(rx, rx, ry))) {
             emitFloorFixup(e, rx, ry, kmodKnown, kmod,
                            jaiA64AddX(rx, rx, ry));
         }
@@ -486,7 +486,7 @@ bool emitFloorDiv(Emit *e, ObjFunction *fn, int prevOff, int *offp) {
         /* A literal divisor makes the correction a single sign test on the remainder (see emitFloorFixup).
          * JIT_SCRATCH_B is free again here -- the quotient is in rq, not in it. */
         if (!kdivKnown || kdiv < 0 ||
-            !emitFloorDivFixupFast(e, rq, JIT_SCRATCH_A)) {
+            !emitColdFixup(e, JIT_SCRATCH_A, jaiA64SubXImm(rq, rq, 1))) {
             emitFloorFixup(e, JIT_SCRATCH_A, rb, kdivKnown, kdiv,
                            jaiA64SubXImm(rq, rq, 1));
         }
