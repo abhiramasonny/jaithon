@@ -267,6 +267,23 @@ void emitGrowStubs(Emit *e) {
             e->fixupCount++;
             emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_NE, 0));
             emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 8));
+        } else if (e->cold[ci].kind == 3) {
+            /* The boxed arm of a dispatched append (emitListStore): storage
+             * BOXED or deopt, then the tag-and-payload store at the index in
+             * JIT_SCRATCH_A off the items in JIT_SCRATCH_C, as the inline arm
+             * made it. */
+            bool always = jitDeoptStressOn();
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, LIST_STORE_BOXED));
+            if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset =
+                FIXUP_DEOPT - (unsigned)e->cold[ci].deoptK;
+            e->fixups[e->fixupCount].conditional  = !always;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_NE, 0));
+            emitListElemStore(e, LIST_STORE_BOXED, e->cold[ci].tag,
+                              e->cold[ci].rOut);
         } else {
             emit(e, e->cold[ci].insn);
         }

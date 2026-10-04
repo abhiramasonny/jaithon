@@ -466,12 +466,44 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
     /* JIT_SCRATCH_C is the items pointer and JIT_SCRATCH_A the index; every
      * arm below starts from those two, so the test costs a load, a compare and
      * two branches and touches nothing else. */
+    /* As an element read's: the predicted unboxed arm falls through and the
+     * boxed one waits after the body (jitDispatchColdOn), because inline one
+     * of the two always took a branch and the unboxed one is the common one. */
+    bool pCold = false;
+    if (pAcc.dynamic && pAcc.stg == LIST_STORE_BOXED &&
+        jitDispatchColdOn() && e->coldCount < JIT_MAX_COLD &&
+        e->fixupCount < JIT_MAX_FIXUPS) {
+        int dk = deoptRecordNow(e);
+        if (dk >= 0) {
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_D, rList,
+                                  (unsigned)offsetof(ObjList, stg)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, pAcc.alt));
+            unsigned ci = e->coldCount++;
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_COLD - ci;
+            e->fixups[e->fixupCount].conditional  = true;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, jaiA64BCond(JAI_A64_NE, 0));
+            emitListElemStore(e, pAcc.alt, vtag, rVal);
+            e->cold[ci].stub     = -1;
+            e->cold[ci].returnTo = (int)e->count;
+            e->cold[ci].insn     = 0;
+            e->cold[ci].kind     = 3;
+            e->cold[ci].deoptK   = dk;
+            e->cold[ci].rOut     = (uint8_t)rVal;
+            e->cold[ci].tag      = vtag;
+            pCold = true;
+        }
+    }
+    if (!pCold) {
     int pSkip = listDispatchBegin(e, &pAcc, rList, JIT_SCRATCH_D);
     emitListElemStore(e, pAcc.stg, vtag, rVal);
     if (pSkip >= 0) {
         int pJoin = listDispatchElse(e, pSkip);
         emitListElemStore(e, pAcc.alt, vtag, rVal);
         listDispatchEnd(e, pJoin);
+    }
     }
     emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
     emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
