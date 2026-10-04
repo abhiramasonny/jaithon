@@ -200,12 +200,44 @@ ifneq ($(READLINE_FLAGS),)
   LIBS        += $(filter-out -I% -L%,$(READLINE_FLAGS))
 endif
 
+# --- profile-guided optimisation ----------------------------------------------
+#
+# Release builds read boot/jaithon.profdata, an instrumented binary's counts
+# over the benchmarks, the self-hosted compiler checking and formatting
+# lib/jaithon, and the language test suites (`make pgo-train` regenerates it,
+# scripts/dev/pgo_train.sh says exactly what runs). Clang lays out the
+# interpreter, collector and runtime by what is actually hot: measured with
+# scripts/dev/cycles.py, 1.135x on `check --no-cache parser.jai` and 1.12x on
+# json_parse, floors ~1%.
+#
+# A stale profile is safe -- clang drops the counts of any function whose body
+# changed and keeps the rest, which is why the out-of-date warnings are off --
+# but retrain after large changes or the gain decays. A profile this clang
+# cannot read (a different LLVM's format) is probed for and skipped rather than
+# failing the build. PGO=0 builds without it.
+PGO_PROFILE ?= boot/jaithon.profdata
+PGO_CFLAGS  :=
+ifneq ($(PGO),0)
+  ifneq ($(wildcard $(PGO_PROFILE)),)
+    PGO_USABLE := $(shell $(CC) -fprofile-instr-use=$(PGO_PROFILE) -x c -c \
+                    -o /dev/null /dev/null 2>/dev/null && echo yes)
+    ifeq ($(PGO_USABLE),yes)
+      PGO_CFLAGS := -fprofile-instr-use=$(PGO_PROFILE) \
+                    -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date \
+                    -Wno-profile-instr-missing -Wno-backend-plugin
+      # The flags name the file, not its contents; this makes a retrained
+      # profile rebuild every object through CC_ID below.
+      PGO_CFLAGS += -DJAI_PGO_ID=$(firstword $(shell shasum $(PGO_PROFILE)))
+    endif
+  endif
+endif
+
 ifeq ($(BUILD_TYPE),debug)
   CFLAGS     := $(BASE_CFLAGS) $(DEBUG_CFLAGS)
   BUILD      := $(BUILD_ROOT)/debug
   BUILD_NAME := debug
 else
-  CFLAGS     := $(BASE_CFLAGS) $(RELEASE_CFLAGS)
+  CFLAGS     := $(BASE_CFLAGS) $(RELEASE_CFLAGS) $(PGO_CFLAGS)
   BUILD      := $(BUILD_ROOT)/release
   BUILD_NAME := release
   # Matches the -flto in RELEASE_CFLAGS; the link needs it too, and a debug

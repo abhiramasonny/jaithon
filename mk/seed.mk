@@ -82,3 +82,9 @@ workspace-sync:
 
 package-check: workspace-sync
 	@python3 scripts/gate/check_packages.py
+
+# Regenerate boot/jaithon.profdata, the profile release builds are optimised
+# with (see PGO_PROFILE in the Makefile). About a minute; then `make` rebuilds.
+.PHONY: pgo-train
+pgo-train:
+	@scripts/dev/pgo_train.sh
