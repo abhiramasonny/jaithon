@@ -125,6 +125,8 @@ typedef struct {
     JaiPage *nextPage;   /* the next page of `pages` to look in */
     JaiPage *pages;      /* every page of this class */
     uint64_t handedOut;  /* blocks made available since the last collection */
+    uint64_t stash;      /* free blocks of the current word held back, one at a
+                          * time, while jaiGCLimit is 0 (see jaiPageRefill) */
     uint32_t word;       /* index of the current word in `page` */
     uint32_t pad;
 } JaiPageCursor;
@@ -143,8 +145,11 @@ JAI_INLINE bool jaiInPageSpace(const void *p) {
 }
 
 /* A block of `cls` grains, or NULL when the page space cannot serve one right
- * now (switched off, out of range, or mid-collection). Not zeroed and not
- * accounted: the caller adds cls * 16 to jaiHeapBytes. */
+ * now (switched off, out of range, or mid-collection). Not zeroed. Already
+ * accounted: jaiHeapBytes is charged a whole word's blocks when the refill
+ * hands the word out, so the pop below is all an allocation costs -- and a
+ * caller that does not ask jaiGCWanted() first still meets the collector at
+ * the next refill, at most one 1 KiB word later. */
 JAI_INLINE void *jaiPageNew(unsigned cls) {
     JaiPageCursor *pc = &jaiPageCursor[cls];
     uint64_t m = pc->freeMask;

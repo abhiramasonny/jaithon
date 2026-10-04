@@ -108,10 +108,31 @@ static JaiPage *newPage(unsigned cls) {
     return pg;
 }
 
+/* Gives the fast path the free blocks `m` of the current word, charging all of
+ * them to jaiHeapBytes now, and returns the first. While jaiGCLimit is zero --
+ * --gc-stress, a disabled collector -- it gives ONE block and stashes the rest,
+ * so every allocation comes back through here and through the jaiGCWanted()
+ * test its caller makes on the way; a whole word handed out would let sixteen
+ * allocations pass a stress collection by. */
+static void *handOut(JaiPageCursor *pc, unsigned cls, uint64_t m) {
+    uint64_t take = m;
+    pc->stash = 0;
+    if (JAI_UNLIKELY(jaiGCLimit == 0)) {
+        take = m & (~m + 1u);
+        pc->stash = m & (m - 1u);
+    }
+    unsigned n = (unsigned)__builtin_popcountll(take);
+    pc->handedOut += n;
+    jaiHeapBytes += (size_t)n * cls * 16u;
+    pc->freeMask = take & (take - 1u);
+    return pc->wordBase + ((size_t)__builtin_ctzll(take) << 4);
+}
+
 void *jaiPageRefill(unsigned cls) {
     if (jaiPageSpan == 0 || jaiGCInCollect) return NULL;
 
     JaiPageCursor *pc = &jaiPageCursor[cls];
+    if (pc->stash != 0) return handOut(pc, cls, pc->stash);
     const uint64_t *pat = gPattern[cls];
     JaiPage *pg = pc->page;
     unsigned w = pc->word + 1u;
@@ -134,9 +155,7 @@ void *jaiPageRefill(unsigned cls) {
                         for (unsigned l = 0; l < 1024u; l += 128u)
                             __builtin_prefetch(ahead + l, 1, 3);
                     }
-                    pc->handedOut += (uint64_t)__builtin_popcountll(m);
-                    pc->freeMask = m & (m - 1);
-                    return pc->wordBase + ((size_t)__builtin_ctzll(m) << 4);
+                    return handOut(pc, cls, m);
                 }
             }
         }
@@ -161,6 +180,7 @@ void *jaiPageRefill(unsigned cls) {
 
 static void resetCursor(JaiPageCursor *pc) {
     pc->freeMask = 0;
+    pc->stash = 0;
     pc->wordBase = NULL;
     pc->page = NULL;
     pc->nextPage = pc->pages;
@@ -173,11 +193,15 @@ void jaiPageCollectBegin(void) {
     size_t inUse = gLiveBytes;
     for (unsigned cls = 1; cls <= JAI_SMALL_CLASSES; cls++) {
         JaiPageCursor *pc = &jaiPageCursor[cls];
-        uint64_t used = pc->handedOut - (uint64_t)__builtin_popcountll(pc->freeMask);
+        uint64_t unused = (uint64_t)__builtin_popcountll(pc->freeMask);
+        uint64_t used = pc->handedOut - unused;
         inUse += (size_t)used * cls * 16u;
+        /* Charged when the word was handed out, never allocated. */
+        jaiHeapAccountFreed((size_t)unused * cls * 16u);
         /* No allocation from here until the sweep is done: refill declines
          * while jaiGCInCollect, and this makes every allocation reach it. */
         pc->freeMask = 0;
+        pc->stash = 0;
         pc->handedOut = 0;
     }
     gInUseAtBegin = inUse;

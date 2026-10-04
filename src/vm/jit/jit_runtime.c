@@ -353,7 +353,9 @@ static JAI_NOINLINE ObjInstance *jitInstanceAllocSlow(ObjClass *cls);
  * `zero` is false only for jitInstanceAllocBare, whose caller stores every
  * field before anything else runs. */
 JAI_INLINE ObjInstance *instanceAllocFast(ObjClass *cls, bool zero) {
-    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    /* No jaiGCWanted() test and no jaiHeapBytes charge: the refill that handed
+     * out this word made both (gc.h, jaiPageNew), and the slow half below
+     * makes the test before it allocates anything else. */
     const unsigned count = cls->fieldCount;
     const unsigned c = 2u + count;   /* grains: a 32-byte header, 16 a field */
     if (JAI_LIKELY(c <= JAI_SMALL_CLASSES)) {
@@ -363,7 +365,6 @@ JAI_INLINE ObjInstance *instanceAllocFast(ObjClass *cls, bool zero) {
             pc->freeMask = m & (m - 1);
             uint64_t *w = (uint64_t *)(void *)(pc->wordBase +
                                                ((size_t)__builtin_ctzll(m) << 4));
-            jaiHeapBytes += (size_t)c << 4;
             _Static_assert(offsetof(Obj, type) == 0 && offsetof(Obj, isMarked) == 4 &&
                            offsetof(Obj, subFlag) == 5 && offsetof(Obj, subFlag2) == 6 &&
                            offsetof(Obj, next) == 8,
@@ -424,11 +425,7 @@ static JAI_NOINLINE ObjInstance *jitInstanceAllocSlow(ObjClass *cls) {
     if (JAI_LIKELY(jaiPageKind[OBJ_INSTANCE]))
         inst = (ObjInstance *)jaiPageNew(c);
     const bool paged = inst != NULL;
-    if (paged) {
-        jaiHeapBytes += (size_t)c * JAI_SMALL_GRAIN;
-    } else {
-        inst = (ObjInstance *)jaiSmallNew(size);
-    }
+    if (!paged) inst = (ObjInstance *)jaiSmallNew(size);
     Obj *obj = (Obj *)inst;
 
     obj->type = OBJ_INSTANCE;

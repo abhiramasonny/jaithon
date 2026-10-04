@@ -98,7 +98,6 @@ static inline Obj *allocObj(size_t size, ObjType type) {
         unsigned cls = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
         if (JAI_LIKELY(jaiPageKind[type]) &&
             JAI_LIKELY((obj = (Obj *)jaiPageNew(cls)) != NULL)) {
-            jaiHeapBytes += (size_t)cls * JAI_SMALL_GRAIN;
             obj->type = type;
             obj->isMarked = jaiGCEpoch;
             obj->subFlag = false;
