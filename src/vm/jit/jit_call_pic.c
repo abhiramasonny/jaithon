@@ -19,6 +19,17 @@
  * jaiJitEnabled's JAITHON_NO_JIT. Read once: this sits on every unpinned
  * OP_INVOKE, and an uncached getenv there is its own cost (see
  * jitReconTrace above). */
+/* JAITHON_JIT_PIC_INLINE_ONLY=0 takes a polymorphic way only when its callee
+ * can be called directly, as before ways could be inlined. */
+static bool jitPicInlineOnlyOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_PIC_INLINE_ONLY");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 bool jitPicEnabled(void) {
     static int on = -1;
     if (on < 0) {
@@ -164,6 +175,7 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
     Value       wayVal  [JAI_IC_WAYS];
     ObjFunction *wayFn  [JAI_IC_WAYS];
     ObjClass    *wayCls [JAI_IC_WAYS];
+    bool        wayInlineOnly[JAI_IC_WAYS];
     unsigned    ways = 0;
     unsigned    curable = 0;   /* dropped ways that time alone can mend */
 
@@ -191,6 +203,32 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
         } else if (!jitPic1Admissible(e, fn, cf, ridx, argc, ic->shapeId[w])) {
             drop = "not admissible";
         }
+        /* A way this site cannot CALL directly -- the callee has not
+         * compiled, or its compiled form was specialised to something else
+         * -- can still have its body inlined, which needs neither: only the
+         * class, a public method, and a body the inliner speaks. Whether it
+         * does is settled at emission, where the way's model exists; a body
+         * it cannot speak leaves the way empty and both edges of its compare
+         * fall through to the next. The return kind has to match what the
+         * merge expects, so the interpreter's record of it is consulted. */
+        bool inlineOnly = false;
+        if (drop != NULL && cf != NULL && ic->payload[w] == 0 &&
+            jitPicInlineOnlyOn() && !e->noInline && cf->upvalueCount == 0 &&
+            (cf->jitFunc == NULL || drop[0] == 'n' /* not admissible */)) {
+            ObjClass *ic2 = NULL;
+            SlotKind ok2;
+            uint32_t oshape = 0;
+            bool kindOk = cf->jitFunc != NULL
+                ? ((SlotKind)cf->jitReturnKind == rkind &&
+                   cf->jitReturnShape == 0)
+                : (observedReturnKind(cf, &ok2, &oshape, NULL) &&
+                   ok2 == rkind && oshape == 0);
+            if (kindOk && jaiClassForShape(ic->shapeId[w], &ic2) && ic2 != NULL) {
+                cc = ic2;
+                inlineOnly = true;
+                drop = NULL;
+            }
+        }
         if (drop != NULL) {
             if (later) curable++;
             if (getenv("JAI_JIT_WHY")) {
@@ -203,6 +241,7 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
         wayVal[ways]   = cv;
         wayFn[ways]    = cf;
         wayCls[ways]   = cc;
+        wayInlineOnly[ways] = inlineOnly;
         ways++;
     }
     /* Fewer ways than the cache holds is usually a matter of TIME, not of
@@ -298,6 +337,16 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
             }
         } else if (e->failed) {
             return false;
+        } else if (wayInlineOnly[w]) {
+            /* Nothing emitted past the compare: the hit edge falls into the
+             * next way's compare, as the miss edge does, and the receiver
+             * goes round the descriptor. */
+            if (e->count != inlCount) { e->failed = true; return false; }
+            if (armMiss[w] < (int)e->count && e->count <= JIT_MAX_INSTS) {
+                e->code[armMiss[w]] =
+                    jaiA64BCond(JAI_A64_NE, (int32_t)((int)e->count - armMiss[w]));
+            }
+            continue;
         } else if (!emitDirectCall(e, fn, wayFn[w], wayVal[w], -1, ridx, argc,
                             callOff, after, true)) {
             /* jitPic1Admissible said it would take this and it did not: the
