@@ -104,6 +104,20 @@ ListAccess listAccessFor(Emit *e, unsigned rList, int slot,
         a.dynamic = false;
         return a;
     }
+    /* PINNED BY A HOIST. Proved where the header was loaded, above the loop
+     * this site is in -- see Emit::hoist. Only when the storage is the one a
+     * `vk` element would have: the site's kind comes from its own sample, and
+     * a disagreement is the dispatched path's to handle, not a refusal. */
+    if (e->osr && slot >= 0 && slot <= (int)JIT_MAX_SLOTS) {
+        int h = hoistFor(e, slot);
+        if (h >= 0 && e->hoist[h].stgPin &&
+            listStgKind(e->hoist[h].stg) == vk) {
+            a.stg = e->hoist[h].stg;
+            a.alt = a.stg;
+            a.dynamic = false;
+            return a;
+        }
+    }
     a.alt = listAltFor(vk);
     a.stg = (uint8_t)LIST_STORE_BOXED;
     a.dynamic = a.alt != LIST_STORE_BOXED;
@@ -238,6 +252,17 @@ bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi) {
  * `slot`, or -1. `curOffset` is checked against the loop the entry was made
  * for, so an entry the walk has already left cannot be picked up again by a
  * later loop that happens to name the same slot. */
+/* JAITHON_JIT_HOIST_STG: a hoisted list header also pins the list's storage
+ * for the loop it was hoisted out of. See Emit::hoist. */
+bool jitHoistStg(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_STG");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 int hoistFor(const Emit *e, int slot) {
     if (slot < 0 || e->inlining) return -1;
     for (unsigned i = 0; i < e->hoistCount; i++) {
@@ -370,6 +395,20 @@ void planHoists(Emit *e, ObjFunction *fn) {
         e->hoist[e->hoistCount].itemsReg = (uint8_t)rI;
         e->hoist[e->hoistCount].countReg = (uint8_t)rC;
         e->hoist[e->hoistCount].rangeOk  = false;
+        /* A slot pinned at entry needs nothing more. Anything else is pinned
+         * here to the storage the live list has now, when that is an unboxed
+         * one -- a boxed list keeps the per-access dispatch it always had,
+         * since BOXED is where every storage ends up and pinning it buys only
+         * the arm a boxed access already takes first. */
+        e->hoist[e->hoistCount].stgPin = false;
+        e->hoist[e->hoistCount].stg    = (uint8_t)LIST_STORE_BOXED;
+        if (jitHoistStg() && !e->localStgPin[cand[pick].slot]) {
+            uint8_t sampled = localStgOf(e, cand[pick].slot);
+            if (sampled != (uint8_t)LIST_STORE_BOXED) {
+                e->hoist[e->hoistCount].stgPin = true;
+                e->hoist[e->hoistCount].stg    = sampled;
+            }
+        }
         uint32_t ht = cand[pick].top;
         if (ht + 9u <= (uint32_t)c->count && c->code[ht] == OP_FOR_RANGE_BIND) {
             e->hoist[e->hoistCount].rangeOk = true;
@@ -443,6 +482,15 @@ void emitHoistsAt(Emit *e, uint32_t off) {
         }
         emitListHeader(e, e->slotXReg[e->hoist[i].slot],
                        e->hoist[i].itemsReg, e->hoist[i].countReg);
+        /* The storage this loop's accesses were emitted against. A list that
+         * arrives with another resumes at the head, in the interpreter, which
+         * is where the bounds guard below goes too. */
+        if (e->hoist[i].stgPin) {
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_A, e->slotXReg[e->hoist[i].slot],
+                                  (unsigned)offsetof(ObjList, stg)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, e->hoist[i].stg));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        }
 
         /* And, once, the bounds every subscript of this slot inside the loop
          * would otherwise check for itself. The counter runs [IDX, LIM), so

@@ -522,6 +522,14 @@ typedef struct {
          * where every subscript actually happens. */
         bool     rangeOk;
         uint16_t rVar, rCur, rEnd;
+        /* The list's storage, checked once where the header is loaded, for a
+         * slot the form could not pin at entry because the loop around this
+         * one rebinds it (a stencil's row locals). Inside a call-free loop
+         * that never writes the slot nothing can change it, so every access
+         * in [top, end) takes the one arm instead of dispatching per element.
+         * See JAITHON_JIT_HOIST_STG. */
+        bool     stgPin;
+        uint8_t  stg;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
@@ -971,6 +979,7 @@ void emitElemStoreAt(Emit *e, uint8_t stg, unsigned rItems,
 void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount);
 int hoistFor(const Emit *e, int slot);
+bool jitHoistStg(void);
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
                                 int32_t *offOut, uint8_t *baseOut);
 void emitHoistsAt(Emit *e, uint32_t off);
