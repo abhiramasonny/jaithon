@@ -121,6 +121,9 @@ ifeq ($(UNAME_S),Darwin)
   # src/native/native_image.h; NATIVE_SPLIT=0 links them statically as before.
   NATIVE_SPLIT ?= $(if $(filter arm64,$(shell uname -m)),1,0)
   ifeq ($(NATIVE_SPLIT),1)
+    ifneq ($(shell uname -m),arm64)
+      $(error NATIVE_SPLIT=1 needs arm64: the generated trampolines are arm64 assembly)
+    endif
     BASE_CFLAGS += -DJAI_NATIVE_SPLIT
   else
     LIBS += $(APPLE_FRAMEWORKS)
