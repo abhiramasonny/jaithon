@@ -62,13 +62,26 @@ static inline bool jaiGCWanted(void) {
 void jaiGCSyncLimit(void);
 void jaiGCTrackObject(Obj *obj);
 
+/* What `isMarked` holds for a marked object. It flips at the start of every
+ * collection, so every object is unmarked the moment a collection begins
+ * without anything having to visit it to say so: a survivor keeps the value it
+ * was marked with, an object allocated since is given the current value, and
+ * after the flip both read as unmarked. That is what lets the sweep leave a
+ * survivor untouched -- it used to clear the bit on every live object -- */
+extern bool jaiGCEpoch;
+
+JAI_INLINE bool jaiGCIsMarked(const Obj *obj) {
+    return obj->isMarked == jaiGCEpoch;
+}
+
 void jaiGCMarkValue(Value v);
 void jaiGCMarkObject(Obj *obj);
 void jaiGCMarkArray(const ValueArray *a);
 
 JAI_INLINE void jaiGCMark(Obj *obj) {
-    if (obj != NULL && !obj->isMarked) jaiGCMarkObject(obj);
+    if (obj != NULL && obj->isMarked != jaiGCEpoch) jaiGCMarkObject(obj);
 }
+
 
 JAI_INLINE void jaiGCMarkVal(Value v) {
     if (IS_OBJ(v)) jaiGCMark(AS_OBJ(v));

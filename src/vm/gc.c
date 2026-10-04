@@ -52,6 +52,7 @@ static double gcGrowthEnvOverride(void) {
 
 GCState *jaiGCActive;
 bool jaiGCInCollect;
+bool jaiGCEpoch;
 static GCState *activeGC(void) { return jaiGCActive != NULL ? jaiGCActive : vm.gc; }
 size_t jaiGCLimit;
 
@@ -195,8 +196,8 @@ double   jaiGCRootSec, jaiGCTraceSec;
 #endif
 
 void jaiGCMarkObject(Obj *obj) {
-    if (obj == NULL || obj->isMarked) return;
-    obj->isMarked = true;
+    if (obj == NULL || obj->isMarked == jaiGCEpoch) return;
+    obj->isMarked = jaiGCEpoch;
 #ifdef JAI_ALLOC_CENSUS
     jaiGCMarked++;
 #endif
@@ -505,13 +506,16 @@ static int sweep(GCState *g) {
     Obj *previous = NULL;
     Obj *object = g->objects;
 
+    const bool epoch = jaiGCEpoch;
+
     while (object != NULL) {
 #ifdef JAI_ALLOC_CENSUS
         jaiGCSwept++;
-        if (!object->isMarked) jaiGCSweptDead++;
+        if (object->isMarked != epoch) jaiGCSweptDead++;
 #endif
-        if (object->isMarked) {
-            object->isMarked = false; //white again for the next cycle
+        /* A survivor is left as it is: the next collection's epoch flip makes
+         * it white again without a store here. */
+        if (object->isMarked == epoch) {
             previous = object;
             object = object->next;
             continue;
@@ -557,6 +561,9 @@ void jaiGCCollect(void) {
     bool verbose = gcVerboseOn(g);
     size_t before = gcLiveBytes(g);
     if (verbose) fprintf(stderr, "-- gc begin\n");
+
+    /* Everything allocated so far now reads white. */
+    jaiGCEpoch = !jaiGCEpoch;
 
 #ifdef JAI_ALLOC_CENSUS
     double t0 = jaiClockMonotonic();
@@ -618,7 +625,9 @@ static void jaiGCGrowRoots(void);
 void jaiGCTrackObject(Obj *obj) {
     GCState *g = jaiGCActive;
     if (JAI_UNLIKELY(g == NULL)) JAI_PANIC("jaiGCTrackObject before jaiGCInit");
-    obj->isMarked = jaiGCInCollect;
+    /* The current epoch: unmarked as of the next collection's flip, and
+     * marked if one is under way, which is when the old code said true. */
+    obj->isMarked = jaiGCEpoch;
     obj->next = g->objects;
     g->objects = obj;
 }

@@ -45,9 +45,9 @@ void jaiMethodCacheRemoveWhite(void) {
     for (unsigned i = 0; i < JAI_MEGA_WAYS; i++) {
         MegaEntry *e = &sMegaCache[i];
         if (e->klass == NULL) continue;
-        if (!((Obj *)e->klass)->isMarked ||
-            !((Obj *)e->name)->isMarked ||
-            (IS_OBJ(e->method) && !AS_OBJ(e->method)->isMarked)) {
+        if (!jaiGCIsMarked((Obj *)e->klass) ||
+            !jaiGCIsMarked((Obj *)e->name) ||
+            (IS_OBJ(e->method) && !jaiGCIsMarked(AS_OBJ(e->method)))) {
             e->klass = NULL;
             e->name = NULL;
             e->method = NULL_VAL;

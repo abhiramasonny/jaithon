@@ -549,7 +549,7 @@ void jaiTableRemoveWhite(JaiTable *t) {
         if (slot < 0) continue;
 
         JaiEntry *const e = t->entries + slot;
-        if (IS_OBJ(e->key) && !AS_OBJ(e->key)->isMarked)
+        if (IS_OBJ(e->key) && !jaiGCIsMarked(AS_OBJ(e->key)))
             removeEntry(t, e);
     }
 

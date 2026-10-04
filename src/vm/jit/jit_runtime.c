@@ -356,7 +356,7 @@ ObjInstance *jitInstanceAlloc(ObjClass *cls) {
     Obj *obj = (Obj *)inst;
 
     obj->type = OBJ_INSTANCE;
-    obj->isMarked = false;
+    obj->isMarked = jaiGCEpoch;
     obj->subFlag = false;
     obj->subFlag2 = false;
 
