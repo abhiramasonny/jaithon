@@ -356,15 +356,19 @@ static void osrShortDrop(OsrShortForm *s) {
 #define OSR_COLD_HEADS 32
 
 typedef struct {
-    const ObjFunction *fn;   /* identity only, never dereferenced */
+    const ObjFunction *fn;       /* identity only, never dereferenced */
     uint32_t           top;
     uint8_t            waits;
+    const ObjFunction *callee;   /* what the last wait was for: identity only */
+    uint16_t           lastCount;   /* its entryCount then */
 } OsrColdHead;
 
 static OsrColdHead sColdHeads[OSR_COLD_HEADS];
 static unsigned    sColdNext;
 /* Set by an arm that chose to wait; read by the compile driver. */
 static bool        sColdWaited;
+/* The head the compile in progress belongs to, for the arm to consult. */
+static OsrColdHead *sColdCur;
 /* Cleared for an attempt whose head has spent its waits. */
 static bool        sColdMayWait;
 
@@ -384,8 +388,36 @@ bool jitOsrColdWait(Emit *e, const ObjFunction *cfn) {
      * threshold, so a count at the threshold with no attempt yet is the
      * closest a callee gets to compiling, not a sign it never will. */
     if (cfn->entryCount == 0) return false;
-    if (cfn->entryCount >= jaiJitThreshold(cfn) && cfn->jitAttempts != 0) {
+    uint32_t thr = jaiJitThreshold(cfn);
+    if (cfn->entryCount >= thr && cfn->jitAttempts != 0) {
         return false;
+    }
+    /* A wait is a whole compile attempt thrown away, so it is only worth
+     * paying while the callee is plainly about to cross its threshold: after
+     * the first two waits -- free, because the first iterations of a loop
+     * are slow while its callees' caches fill and they compile, so two ticks
+     * can land inside one -- the calls it made since the last look have to
+     * cover what is left in about two more ticks. A callee called once per iteration of a loop
+     * whose iterations are slow -- dict_iter's, each summing a dict -- would
+     * otherwise be waited for tick after tick while the loop runs
+     * interpreted. */
+    OsrColdHead *h = sColdCur;
+    if (h != NULL) {
+        if (h->waits >= 2 && h->callee == cfn) {
+            unsigned now  = cfn->entryCount;
+            unsigned made = now > h->lastCount ? now - h->lastCount : 0;
+            unsigned left = thr > now ? thr - now : 0;
+            if (left > 2u * made + 2u) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] osr: not waiting for %s: %u calls "
+                            "since the last look, %u to go\n",
+                            cfn->name ? cfn->name->chars : "?", made, left);
+                }
+                return false;
+            }
+        }
+        h->callee = cfn;
+        h->lastCount = cfn->entryCount;
     }
     sColdWaited = true;
     e->whyNot = "a callee still on its way to compiling";
@@ -402,6 +434,8 @@ static OsrColdHead *osrColdHead(const ObjFunction *fn, uint32_t top) {
     h->fn = fn;
     h->top = top;
     h->waits = 0;
+    h->callee = NULL;
+    h->lastCount = 0;
     return h;
 }
 
@@ -1424,10 +1458,12 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
         sPendingRetries = 0;
         OsrColdHead *cold = osrColdWaitOn() ? osrColdHead(fn, top) : NULL;
         sColdMayWait = cold != NULL && cold->waits < OSR_COLD_WAITS;
+        sColdCur = cold;
         bool built = compileOsrAny(closure, top, frame->slots, iterKind,
                                    elemSample, elemMixed, elemStg);
         bool waited = !built && sColdWaited;
         sColdMayWait = false;
+        sColdCur = NULL;
         sColdWaited = false;
         if (waited) {
             cold->waits++;
