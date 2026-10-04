@@ -10,7 +10,9 @@
 #:
 #: Concatenating a typed list with an untyped one of the same storage must not
 #: hand the result the typed list's promise, and records built element by
-#: element with mixed kinds must stay as they were.
+#: element with mixed kinds must stay as they were -- including a long one whose
+#: body appends ints and then an object, which compiled code leaves unshaped
+#: (JAITHON_JIT_SHAPE_SIBLINGS).
 fn pinned_then_short(a: list, n: int, gate: int) -> int {
     var s = 0
     for i in 0..n {
@@ -26,6 +28,13 @@ fn record(i: int) -> list {
     r.push(i)
     r.push("k")
     r.push(i * 2)
+    return r
+}
+
+fn long_record(i: int) -> list {
+    var r = []
+    for k in 0..10 { r.push(i + k) }
+    r.push("end")
     return r
 }
 
@@ -68,6 +77,14 @@ fn main() -> int {
     }
     print(t)
     print(record(7))
+
+    var lt = 0
+    for i in 0..20000 {
+        let r = long_record(i)
+        lt += r[0] + r[9]
+    }
+    print(lt)
+    print(long_record(3))
 
     print(grown(8, 2.5))
     print(grown(9, "z"))
