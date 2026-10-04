@@ -538,6 +538,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     int *chunkDepth = chunkDepthTable(fn);
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
 
+    jitRangeReset();
     static Emit e;
     memset(&e, 0, sizeof e);
     e.osr = true;

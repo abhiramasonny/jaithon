@@ -197,15 +197,41 @@ static void guardBound(const Emit *e, const ObjFunction *fn, const JaiBlock *p,
     else if (b == slot) boundFromLocal(cmp, truth, false, lo, hi);
 }
 
+/* The graph and the closure scan, kept for the compile in progress: building
+ * the graph runs the whole verifier, and a body asks once per fused step it
+ * holds -- per pass. jitRangeReset drops it at the start of every compile, so
+ * it can never describe a function other than the one being compiled. */
+static const ObjFunction *sCfgFn;
+static JaiChunkCfg        *sCfg;
+static bool                sCfgClosures;
+
+void jitRangeReset(void) {
+    if (sCfg != NULL) jaiChunkCfgFree(sCfg);
+    sCfg = NULL;
+    sCfgFn = NULL;
+}
+
+static JaiChunkCfg *rangeCfg(const ObjFunction *fn, bool *closures) {
+    if (sCfgFn != fn) {
+        jitRangeReset();
+        sCfgFn = fn;
+        sCfgClosures = hasClosures(&fn->chunk);
+        sCfg = sCfgClosures ? NULL : jaiChunkCfg(fn);
+    }
+    *closures = sCfgClosures;
+    return sCfg;
+}
+
 static bool jitSlotBoundsAt(const Emit *e, const ObjFunction *fn, uint32_t q,
                             unsigned slot, int64_t *loOut, int64_t *hiOut) {
     if (!rangeFactsOn() || e->inlining || !intLocal(e, slot)) return false;
     if (fn->exceptionCount > 0 || fn->defaultCount > 0) return false;
     const Chunk *c = &fn->chunk;
-    if (q >= (uint32_t)c->count || hasClosures(c)) return false;
+    if (q >= (uint32_t)c->count) return false;
 
-    JaiChunkCfg *cfg = jaiChunkCfg(fn);
-    if (cfg == NULL) return false;
+    bool closures = false;
+    JaiChunkCfg *cfg = rangeCfg(fn, &closures);
+    if (closures || cfg == NULL) return false;
     int64_t lo = INT64_MIN, hi = INT64_MAX;
     uint32_t bi = cfg->blockAt[q];
     uint32_t upto = q;   /* the part of this block that runs before q */
@@ -226,7 +252,6 @@ static bool jitSlotBoundsAt(const Emit *e, const ObjFunction *fn, uint32_t q,
         bi = pi;
         upto = p->end;
     }
-    jaiChunkCfgFree(cfg);
     *loOut = lo;
     *hiOut = hi;
     return lo != INT64_MIN || hi != INT64_MAX;

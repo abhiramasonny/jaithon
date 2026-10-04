@@ -444,6 +444,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     /* Static, not automatic: at this size two of them would be a large stack
      * frame, and compilation is not reentrant -- nothing it calls compiles
      * anything. */
+    jitRangeReset();
     static Emit e;
     memset(&e, 0, sizeof e);
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);

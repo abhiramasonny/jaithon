@@ -1249,6 +1249,9 @@ bool emitIncLocal(Emit *e, const ObjFunction *fn, const uint8_t *code, int *offp
  * `slot + k` cannot overflow there. */
 bool jitSlotAddSafe(const Emit *e, const ObjFunction *fn, uint32_t q,
                     unsigned slot, int64_t k);
+/* Forget the control-flow graph jit_range.c keeps for the compile in
+ * progress; called as each compile starts. */
+void jitRangeReset(void);
 bool emitModIntConst(Emit *e, const uint8_t *code, int *offp);
 
 #endif /* arm64 */
