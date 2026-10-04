@@ -144,7 +144,7 @@ pub class SigLoader {
 
     var _cache: dict[str, ModuleSig]
     var _by_file: dict[int, ModuleSig]
-    var _resolved: dict[str, str]
+    var _resolved: dict[str, dict[str, str]]
     var _next_file_id: int
     var _visiting: list[str]
     var _partial: bool
@@ -209,11 +209,19 @@ pub class SigLoader {
     #: search path with two `stat` calls per directory: those calls were 5% of
     #: a `check`. Only a hit is remembered, so a module that appears later is
     #: still found.
+    #:
+    #: Keyed by directory and then by name, not by the two joined: `load` runs
+    #: for every edge of every import walk, and a joined key was a string built
+    #: and thrown away each time.
     fn _resolve(self, dotted: str, from_dir: str) -> str? {
-        let key = from_dir + "\n" + dotted
-        if key in self._resolved { return self._resolved[key] }
+        var known = self._resolved.get(from_dir, null)
+        if known is null {
+            known = {}
+            self._resolved[from_dir] = known
+        }
+        if dotted in known { return known[dotted] }
         let found = resolve_module_path(dotted, from_dir, self.search)
-        if found is not null { self._resolved[key] = found }
+        if found is not null { known[dotted] = found }
         return found
     }
 
