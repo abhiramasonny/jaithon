@@ -556,8 +556,7 @@ bool jaiMapRunOn(void) {
     return on != 0;
 }
 
-/* See vm.h. jaiCallPreparedFn1's int-to-int path, with the loop moved inside
- * it.
+/* See vm.h. jaiCallPreparedFn1's flat path, with the loop moved inside it.
  *
  * Per element, jaiCallPreparedFn1 is a non-inlined call with five callee-saved
  * pairs to save and restore, a staleness test of four loads, a window set up
@@ -568,26 +567,33 @@ bool jaiMapRunOn(void) {
  * moves fn->jitFunc, and one that defines a global moves the module version --
  * so what is left per element is the load, the call and the store.
  *
- * Anything off the int-to-int path is not handled here at all: it stops the
- * run, and the caller takes that element the ordinary way. The one exception
- * is a call that comes back with a non-zero verdict, which has already
- * happened and so cannot be handed back; it is finished exactly as
- * jaiCallPreparedFn1 would finish it. */
-int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
-                          ObjList *dst, bool *ok) {
+ * Taken for a callee whose one parameter is an int or a float and whose result
+ * is an int, a float or a bool -- the kinds whose register form is the whole
+ * value. Anything else stops the run, and the caller takes that element the
+ * ordinary way. The one exception is a call that comes back with a non-zero
+ * verdict, which has already happened and so cannot be handed back; it is
+ * finished exactly as jaiCallPreparedFn1 would finish it. */
+int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
+                         ObjList *dst, bool *ok) {
     *ok = true;
-    if (!p->flat || !p->intArg || p->nargs != 1 ||
-        p->returnKind != (uint8_t)SLOT_INT) {
-        return from;
-    }
+    if (!p->flat || p->nargs != 1) return from;
     ObjFunction *fn = p->fn;
+    if (fn->jitArgBase != 1) return from;
+    SlotKind pk = (SlotKind)fn->jitParamKind[0];
+    SlotKind rk = (SlotKind)p->returnKind;
+    if (pk != SLOT_INT && pk != SLOT_FLOAT) return from;
+    if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL) return from;
     void *entry = p->entry;
     uint32_t mv = p->moduleVersion;
     Value *base = vm.stackTop;
     if (base > p->limit) return from;
     base[0] = p->callee;
-    base[1] = INT_VAL(0);
+    base[1] = pk == SLOT_INT ? INT_VAL(0) : FLOAT_VAL(0.0);
     vm.stackTop = base + 2;
+    /* The result storage that takes this kind as it is, if any. */
+    uint8_t rawStg = rk == SLOT_INT   ? (uint8_t)LIST_STORE_I64
+                   : rk == SLOT_FLOAT ? (uint8_t)LIST_STORE_F64
+                                      : (uint8_t)LIST_STORE_U8;
 
     int i = from;
     for (; i < src->count; i++) {
@@ -599,23 +605,35 @@ int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
         /* Re-read every time: the callee may push onto, box, or shrink the
          * very list being mapped, and the loop bound above is live for the
          * same reason. */
-        if (src->stg == (uint8_t)LIST_STORE_I64) {
+        uint8_t stg = src->stg;
+        if (stg == (uint8_t)LIST_STORE_I64 && pk == SLOT_INT) {
             a0 = ((const int64_t *)src->items)[i];
-        } else if (src->stg == (uint8_t)LIST_STORE_BOXED) {
+        } else if (stg == (uint8_t)LIST_STORE_F64 && pk == SLOT_FLOAT) {
+            memcpy(&a0, &((const double *)src->items)[i], sizeof a0);
+        } else if (stg == (uint8_t)LIST_STORE_BOXED) {
             Value v = ((const Value *)src->items)[i];
-            if (JAI_UNLIKELY(!IS_INT(v))) break;
-            a0 = AS_INT(v);
+            if (pk == SLOT_INT ? !IS_INT(v) : !IS_FLOAT(v)) break;
+            memcpy(&a0, &v.as, sizeof a0);
         } else {
             break;
         }
-        /* The cell's tag was written INT once, above the loop; only the
-         * payload changes. */
+        /* The cell's tag was written once, above the loop; only the payload
+         * changes -- an int's value or a double's bits, which is also what
+         * the compiled body takes in its argument register (jitArgIn). */
         base[1].as.integer = a0;
         int frameBase = vm.frameCount;
         JitResult r = ((Fn1)(uintptr_t)entry)(a0);
         Value mapped;
         if (JAI_LIKELY(r.bailed == 0)) {
-            mapped = INT_VAL(r.value);
+            if (rk == SLOT_INT) {
+                mapped = INT_VAL(r.value);
+            } else if (rk == SLOT_FLOAT) {
+                double d;
+                memcpy(&d, &r.value, sizeof d);
+                mapped = FLOAT_VAL(d);
+            } else {
+                mapped = BOOL_VAL(r.value != 0);
+            }
         } else {
             JaiJitOutcome outcome = jitResultOut(fn, r, base);
             bool good;
@@ -635,7 +653,7 @@ int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
                 *ok = false;
                 return i;
             }
-            /* Not an int, perhaps, and the window is gone: store it the
+            /* Another kind, perhaps, and the window is gone: store it the
              * ordinary way and hand the rest back to the caller, which will
              * prepare again before the next run. */
             if (JAI_LIKELY(dst->count < dst->capacity)) {
@@ -649,17 +667,16 @@ int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
             if (vm.hasException) *ok = false;
             return i + 1;
         }
-        /* An int into the result, at whichever width it has, without
-         * jaiListPut's four-way switch: boxed is what jaiListNew made, and
-         * I64 is the only other storage an int can go into as it is. */
+        /* Into the result at whichever width it has, without jaiListPut's
+         * four-way switch: boxed is what jaiListNew made, and the one unboxed
+         * storage this kind fits is the only other that takes it as it is. */
         int at = dst->count;
         if (JAI_LIKELY(at < dst->capacity &&
                        dst->stg == (uint8_t)LIST_STORE_BOXED)) {
             ((Value *)dst->items)[at] = mapped;
             dst->count = at + 1;
-        } else if (at < dst->capacity &&
-                   dst->stg == (uint8_t)LIST_STORE_I64) {
-            ((int64_t *)dst->items)[at] = r.value;
+        } else if (at < dst->capacity && dst->stg == rawStg) {
+            jaiListSetRaw(dst, at, mapped);
             dst->count = at + 1;
         } else if (at < dst->capacity) {
             jaiListPut(dst, dst->count++, mapped);
@@ -784,8 +801,8 @@ int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
     return from;
 }
 
-int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
-                          ObjList *dst, bool *ok) {
+int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
+                         ObjList *dst, bool *ok) {
     (void)p; (void)src; (void)dst;
     *ok = true;
     return from;

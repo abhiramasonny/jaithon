@@ -507,13 +507,13 @@ static bool listMap(int argc, Value *args, Value *out) {
     bool ok = true;
     bool runs = jaiMapRunOn();
     for (int i = 0; i < self->count; i++) {
-        /* As many elements as the int-to-int run will take at once, and the
+        /* As many elements as the flat run will take at once, and the
          * element it stops at the ordinary way below. A callee that has not
          * compiled yet is not flat, so the first sixty-four go the long way
          * and the run picks up once jaiCallPreparedFn1 has re-prepared. */
         if (runs && mapper.flat && result->count > 0) {
             bool runOk;
-            i = jaiMapPreparedFn1Ints(&mapper, self, i, result, &runOk);
+            i = jaiMapPreparedFn1Run(&mapper, self, i, result, &runOk);
             if (!runOk) {
                 ok = false;
                 break;
