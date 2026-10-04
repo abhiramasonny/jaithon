@@ -103,9 +103,15 @@ int jaiCliDispatch(const JaiCliOptions *opts)
     return 1;
 }
 
+/* LC_CTYPE only, as Python does at startup. It is the category the REPL's line
+ * editing and the byte classifiers need; the others changed what the language
+ * means -- under LANG=de_DE.UTF-8, LC_NUMERIC made print(3.25) write "3,25.0"
+ * and float("2.5") raise, because snprintf and strtod follow it -- and loading
+ * every category of en_US.UTF-8 cost ~2.1M instructions at each launch
+ * against ~0.45M for this one. */
 static void initLocale(void)
 {
-    if (setlocale(LC_ALL, "") != NULL)
+    if (setlocale(LC_CTYPE, "") != NULL)
     {
         const char *codeset = nl_langinfo(CODESET);
         if (codeset != NULL &&
@@ -118,7 +124,7 @@ static void initLocale(void)
     static const char *const candidates[] = {"C.UTF-8", "en_US.UTF-8", "UTF-8"};
     for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++)
     {
-        if (setlocale(LC_ALL, candidates[i]) != NULL)
+        if (setlocale(LC_CTYPE, candidates[i]) != NULL)
             return;
     }
     (void)setlocale(LC_CTYPE, "UTF-8");
