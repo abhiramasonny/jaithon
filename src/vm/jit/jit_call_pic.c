@@ -78,6 +78,7 @@ static bool jitPic1Admissible(Emit *e, ObjFunction *caller, ObjFunction *cfn,
             return false;
         }
         if ((want == SLOT_INST || want == SLOT_MAYBE_INST) &&
+            cfn->jitParamShape[i] != 0 &&
             e->stackShape[idx] != cfn->jitParamShape[i]) {
             return false;
         }

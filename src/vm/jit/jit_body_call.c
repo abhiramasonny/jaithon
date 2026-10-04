@@ -368,7 +368,9 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
                     e->whyNot = "a self-call argument is not the parameter's kind";
                     return false;
                 }
+                /* A parameter bound unpinned (no class) takes any. */
                 if ((pk == SLOT_INST || pk == SLOT_MAYBE_INST) &&
+                    e->localClass[pslot] != NULL &&
                     e->stackClass[aidx] != e->localClass[pslot]) {
                     e->whyNot = "a self-call passing a different class";
                     return false;

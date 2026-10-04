@@ -58,7 +58,7 @@ static uintptr_t stackLimit(void) {
 /* The kinds of the parameters, read off the arguments this call was made with.
  * Everything downstream is specialised to them, and the entry guard re-checks
  * them on every later call. */
-static bool seedLocals(Emit *e, Value *slotBase) {
+static bool seedLocals(Emit *e, Value *slotBase, uint32_t unpin) {
     e->observed = slotBase;
     for (unsigned i = 0; i < e->base + e->locals; i++) {
         e->localKind[i]   = SLOT_INT;
@@ -79,6 +79,13 @@ static bool seedLocals(Emit *e, Value *slotBase) {
                                                    : SLOT_INST;
             e->localClass[i] = AS_INSTANCE(v)->klass;
             e->localShape[i] = AS_INSTANCE(v)->klass->shapeId;
+            /* A parameter calls pass several classes through: no class, so
+             * its methods dispatch through their site's cache and the entry
+             * check asks only for an instance (jitPolyParamMask). */
+            if (i >= 1 && i < 32 && (unpin & (1u << i)) != 0) {
+                e->localClass[i] = NULL;
+                e->localShape[i] = 0;
+            }
         } else if (IS_LIST(v)) {
             e->localKind[i] = SLOT_LIST;
         } else if (IS_OBJ(v)) {
@@ -484,7 +491,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * nested the site is. Without it every site in the function counts the
      * same and `n`, read once to set the loop up, outranks nothing. */
     body.loopDepth = loopDepthFor(&fn->chunk, &body.loopDepthCount);
-    if (!seedLocals(&body, slotBase)) {
+    if (!seedLocals(&body, slotBase, jitPolyParamMask(fn))) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
                     jitFnLabel(fn),
@@ -712,7 +719,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     e.offsetToDepth = depths;
     e.chunkDepth = chunkDepth;
     e.chunkDepthCount = fn->chunk.count + 1;
-    if (!seedLocals(&e, slotBase)) {
+    if (!seedLocals(&e, slotBase, jitPolyParamMask(fn))) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: its locals could not be seeded on the real pass\n",
                     jitFnLabel(fn));

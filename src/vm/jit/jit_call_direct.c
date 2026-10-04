@@ -35,7 +35,10 @@ bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
             e->whyNot = "a direct call argument is not the parameter's kind";
             return false;
         }
+        /* Shape 0 is a parameter the callee bound unpinned: any instance
+         * will do, and it relies on no class (jitPolyParamMask). */
         if ((want == SLOT_INST || want == SLOT_MAYBE_INST) &&
+            cfn->jitParamShape[i] != 0 &&
             e->stackShape[idx] != cfn->jitParamShape[i]) {
             e->whyNot = "a direct call passing a different class";
             return false;

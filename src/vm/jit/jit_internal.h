@@ -1088,6 +1088,11 @@ void jitOsrPicShort(int siteCache, unsigned ways, SlotKind rkind);
  * it the slow way for the rest of the run (jit_osr.c). */
 bool jitOsrColdWait(Emit *e, const ObjFunction *cfn);
 bool jitPicUpgradeOn(void);
+/* Parameters of `fn` the whole-function tier should bind unpinned -- an
+ * instance of no class in particular -- because its pinned form kept
+ * declining calls that passed another class there (jit_entry.c). Bit i is
+ * slot i. */
+uint32_t jitPolyParamMask(const ObjFunction *fn);
 
 bool offsetIsBranchTarget(const Chunk *c, uint32_t off);
 bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
