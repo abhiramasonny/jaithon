@@ -32,6 +32,10 @@
 
 #include "native/native.h"
 
+/* `fill_strokes` reproduces Jaithon's floating point operation by operation,
+ * and Jaithon never fuses a multiply into an add. */
+#pragma STDC FP_CONTRACT OFF
+
 #define JAI_XY_SHIFT 16
 #define JAI_XY_ONE   (1 << JAI_XY_SHIFT)
 #define JAI_MAX_CORNERS 4096

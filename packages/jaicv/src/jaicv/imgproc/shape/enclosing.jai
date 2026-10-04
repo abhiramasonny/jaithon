@@ -1,5 +1,6 @@
 #: The smallest rotated rectangle and the smallest circle over a set of points.
 import std.math
+from std.os import env
 from ...core.types import Point, Point2f, RotatedRect, Size2f
 from .hull import convex_hull
 
@@ -21,6 +22,15 @@ fn normalised_angle(degrees: float) -> float {
 #: and `PI` -- came to 1.7 microseconds of the 7.3 it took. `BOX_PI` is the
 #: same double `math.PI` is, so nothing it divides moves by a bit.
 let BOX_PI = math.PI
+
+#: Whether `min_area_rect` asks `__prim__.points_min_box` first. Read once;
+#: `JAICV_NATIVE_BOX=0` keeps the Jaithon below, which it is checked against.
+#: A box over a 74-point frame contour was 4.7 microseconds against OpenCV's
+#: 1.6, most of it the hull and the rest calls and allocation.
+let _native_box = (env("JAICV_NATIVE_BOX") ?? "1") != "0"
+
+#: Where `points_min_box` leaves the box: centre, size and angle.
+var _box_native: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
 
 #: The hull as floats and the winning edge's box, kept between calls.
 #:
@@ -186,6 +196,13 @@ fn best_box(hx: list[float], hy: list[float], count: int, out: list[float]) -> v
 #: Rotating calipers over the convex hull: every minimal box has a side flush
 #: with a hull edge, so trying each edge in turn is enough.
 pub fn min_area_rect(points: list[Point]) -> RotatedRect {
+    #: All of the below in `__prim__.points_min_box`, operation for operation:
+    #: the hull, the calipers and the quarter turns. False for a set it does
+    #: not take, which `points_hull` would have refused, and that goes on below.
+    if _native_box and __prim__.points_min_box(points, _box_native) {
+        let got = _box_native
+        return RotatedRect(Point2f(got[0], got[1]), Size2f(got[2], got[3]), got[4])
+    }
     var hx: list[float] = []
     var hy: list[float] = []
     let count = hull_floats(points, hx, hy)
