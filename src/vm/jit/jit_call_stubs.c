@@ -284,6 +284,34 @@ void emitGrowStubs(Emit *e) {
             emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_NE, 0));
             emitListElemStore(e, LIST_STORE_BOXED, e->cold[ci].tag,
                               e->cold[ci].rOut);
+        } else if (e->cold[ci].kind == 4) {
+            /* The boxed arm of a nested `for x in xs` step: storage BOXED or
+             * deopt, the element's tag or deopt, and JIT_SCRATCH_C left on
+             * its payload; JIT_SCRATCH_A, the index, is untouched for the
+             * advance after the join. */
+            bool always = jitDeoptStressOn();
+            unsigned dk = (unsigned)e->cold[ci].deoptK;
+            if (e->fixupCount + 2u > JIT_MAX_FIXUPS) { e->failed = true; return; }
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, LIST_STORE_BOXED));
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - dk;
+            e->fixups[e->fixupCount].conditional  = !always;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_NE, 0));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                               (unsigned)offsetof(ObjList, items)));
+            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                  JIT_SCRATCH_A, 4));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, e->cold[ci].tag));
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_DEOPT - dk;
+            e->fixups[e->fixupCount].conditional  = !always;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_NE, 0));
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 8));
         } else {
             emit(e, e->cold[ci].insn);
         }

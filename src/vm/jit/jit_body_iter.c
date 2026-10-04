@@ -562,6 +562,43 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                               JAI_A64_GE,
                               (int)stackSignatureAt(e, e->depth - 1));
 
+                /* The predicted unboxed arm falls through and the boxed one
+                 * waits after the body (jitDispatchColdOn), as OP_GET_INDEX's
+                 * does: inline, one arm or the other took a branch per
+                 * element. JIT_SCRATCH_C is still the list here and
+                 * JIT_SCRATCH_A the index, which the cold arm keeps. */
+                bool nCold = false;
+                if (nAcc.dynamic && nAcc.stg == LIST_STORE_BOXED &&
+                    (ek == SLOT_INT || ek == SLOT_FLOAT || ek == SLOT_BOOL) &&
+                    jitDispatchColdOn() && e->coldCount < JIT_MAX_COLD &&
+                    e->fixupCount < JIT_MAX_FIXUPS) {
+                    int dk = deoptRecordNow(e);
+                    if (dk >= 0) {
+                        emit(e, jaiA64LdrByte(JIT_SCRATCH_D, JIT_SCRATCH_C,
+                                              (unsigned)offsetof(ObjList, stg)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, nAcc.alt));
+                        unsigned ci = e->coldCount++;
+                        e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                        e->fixups[e->fixupCount].targetOffset = FIXUP_COLD - ci;
+                        e->fixups[e->fixupCount].conditional  = true;
+                        e->fixups[e->fixupCount].depth        = -1;
+                        e->fixupCount++;
+                        emit(e, jaiA64BCond(JAI_A64_NE, 0));
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                           (unsigned)offsetof(ObjList, items)));
+                        emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
+                                              JIT_SCRATCH_A,
+                                              listStgShift(nAcc.alt)));
+                        e->cold[ci].stub     = -1;
+                        e->cold[ci].returnTo = (int)e->count;
+                        e->cold[ci].insn     = 0;
+                        e->cold[ci].kind     = 4;
+                        e->cold[ci].deoptK   = dk;
+                        e->cold[ci].tag      = etag;
+                        nCold = true;
+                    }
+                }
+                if (!nCold) {
                 /* Reload items rather than hoisting: a reallocation bumps
                  * the version, which the guard above covers. */
                 /* JIT_SCRATCH_D is the dispatch scratch: JIT_SCRATCH_A still
@@ -628,6 +665,7 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                                           JIT_SCRATCH_A,
                                           listStgShift(nAcc.alt)));
                     listDispatchEnd(e, nJoin);
+                }
                 }
 
                 /* Past the last guard: advance, then bind. The advance goes
