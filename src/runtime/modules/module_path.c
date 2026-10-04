@@ -18,6 +18,7 @@
  */
 
 #include <stdlib.h>
+#include <sys/stat.h>
 
 #include "runtime/runtime.h"
 #include "runtime/modules/module_internal.h"
@@ -151,10 +152,138 @@ static void addPackageDirsRelative(const char *base, const char *suffix) {
     addPackageSourceDirs(candidate);
 }
 
+/* ------------------------------------------------------------------ */
+/* Resolution memo                                                      */
+/* ------------------------------------------------------------------ */
+
+/* (importing directory, dotted name) -> the path a successful resolution
+ * produced. Every `import` statement a module top level runs resolves its
+ * name again, whether or not the module is already loaded -- the module table
+ * is keyed by the canonical path, so the path has to be found first -- and a
+ * resolution is a stat per candidate plus a realpath of the winner, which on
+ * macOS is one getattrlist per path component: ~157K instructions for a file a
+ * dozen directories deep. `import jaicv` ran 2,618 of them for 332 distinct
+ * files, 5,007 stats beside them, and spent more than half of its 854M
+ * instructions there.
+ *
+ * Only successes are kept, so a module that does not exist yet is looked for
+ * again and every diagnostic is produced exactly as before. The search path
+ * only ever grows at its end once built (completePath appends), which cannot
+ * change where an earlier success was found; anything that rebuilds or
+ * prepends to it clears the memo. What the memo does give up is noticing a
+ * file that appears, mid-run, earlier on the path than one already found --
+ * the same trade Python's sys.modules makes. JAITHON_RESOLVE_MEMO=0 turns it
+ * off. */
+typedef struct {
+    char    *key;      /* NULL for an empty slot */
+    size_t   keyLen;
+    char    *path;
+    uint32_t hash;
+} MemoEntry;
+
+typedef struct {
+    MemoEntry *slots;
+    size_t     cap;    /* zero or a power of two */
+    size_t     count;
+} Memo;
+
+/* (fromDir NUL dottedName NUL) -> resolved path. */
+static Memo sResolved;
+/* A candidate path -> what realpath made of it. Different importers name the
+ * same file through different (fromDir, name) keys, so this second table is
+ * what keeps the 932 realpaths `import jaicv` still made with only the first
+ * down to the 332 distinct files it has. */
+static Memo sCanonical;
+
+static bool memoEnabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_RESOLVE_MEMO");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+static uint32_t memoHash(const char *key, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (unsigned char)key[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* The resolution key, or 0 when it does not fit. */
+static size_t memoKey(char *buf, size_t size, const char *fromDir,
+                      const char *dottedName) {
+    const char *dir = fromDir != NULL ? fromDir : "";
+    size_t a = strlen(dir);
+    size_t b = strlen(dottedName);
+    if (a + b + 2 > size) return 0;
+    memcpy(buf, dir, a);
+    buf[a] = '\0';
+    memcpy(buf + a + 1, dottedName, b);
+    buf[a + 1 + b] = '\0';
+    return a + b + 2;
+}
+
+static MemoEntry *memoSlot(MemoEntry *table, size_t cap, const char *key,
+                           size_t len, uint32_t hash) {
+    for (size_t i = hash & (cap - 1);; i = (i + 1) & (cap - 1)) {
+        MemoEntry *e = &table[i];
+        if (e->key == NULL) return e;
+        if (e->hash == hash && e->keyLen == len && memcmp(e->key, key, len) == 0)
+            return e;
+    }
+}
+
+static const char *memoFind(const Memo *m, const char *key, size_t len,
+                            uint32_t hash) {
+    if (m->cap == 0) return NULL;
+    const MemoEntry *e = memoSlot(m->slots, m->cap, key, len, hash);
+    return e->key != NULL ? e->path : NULL;
+}
+
+static void memoInsert(Memo *m, const char *key, size_t len, uint32_t hash,
+                       const char *path) {
+    if ((m->count + 1) * 2 > m->cap) {
+        size_t cap = m->cap == 0 ? 64 : m->cap * 2;
+        MemoEntry *table = JAI_ALLOC_ZEROED(MemoEntry, cap);
+        for (size_t i = 0; i < m->cap; i++) {
+            MemoEntry *old = &m->slots[i];
+            if (old->key != NULL) *memoSlot(table, cap, old->key, old->keyLen, old->hash) = *old;
+        }
+        if (m->slots != NULL) JAI_FREE_ARRAY(MemoEntry, m->slots, m->cap);
+        m->slots = table;
+        m->cap = cap;
+    }
+    MemoEntry *e = memoSlot(m->slots, m->cap, key, len, hash);
+    if (e->key != NULL) return;
+    e->key = jaiMemdup(key, len);
+    e->keyLen = len;
+    e->path = jaiStrdup(path);
+    e->hash = hash;
+    m->count++;
+}
+
+static void memoClear(Memo *m) {
+    for (size_t i = 0; i < m->cap; i++) {
+        MemoEntry *e = &m->slots[i];
+        if (e->key == NULL) continue;
+        JAI_FREE_ARRAY(char, e->key, e->keyLen + 1);   /* jaiMemdup adds a NUL */
+        JAI_FREE_ARRAY(char, e->path, strlen(e->path) + 1);
+        e->key = NULL;
+        e->path = NULL;
+    }
+    m->count = 0;
+}
+
 static bool lazyModulePath(void);
 static void completePath(void);
 
 void jaiModulePathInit(const char *execDir) {
+    memoClear(&sResolved);
+    memoClear(&sCanonical);
     dirListClear(&sLibDirs);
     sPathReady = true;
 
@@ -236,6 +365,7 @@ void jaiModulePathComplete(void) {
 
 void jaiModulePathAdd(const char *dir) {
     if (dir == NULL || dir[0] == '\0') return;
+    memoClear(&sResolved);
     dirListAdd(&sUserDirs, dir);
     syncModulePathMirror();
 }
@@ -311,12 +441,29 @@ const char *displayName(const char *dotted) {
     return *p != '\0' ? p : dotted;
 }
 
+/* One stat, not jaiPathExists and then jaiPathIsDir: the pair stat'd every
+ * module a resolution found twice. */
 bool isRegularFile(const char *path) {
-    return path[0] != '\0' && jaiPathExists(path) && !jaiPathIsDir(path);
+    struct stat st;
+    return path[0] != '\0' && stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
 }
 
 bool storeResolved(char *out, size_t outSize, const char *candidate) {
-    if (jaiPathAbsolute(out, outSize, candidate)) return true;
+    if (memoEnabled()) {
+        size_t len = strlen(candidate);
+        uint32_t hash = memoHash(candidate, len);
+        const char *hit = memoFind(&sCanonical, candidate, len, hash);
+        if (hit != NULL && strlen(hit) + 1 <= outSize) {
+            memcpy(out, hit, strlen(hit) + 1);
+            return true;
+        }
+        if (jaiPathAbsolute(out, outSize, candidate)) {
+            memoInsert(&sCanonical, candidate, len, hash, out);
+            return true;
+        }
+    } else if (jaiPathAbsolute(out, outSize, candidate)) {
+        return true;
+    }
     size_t len = strlen(candidate);
     if (len + 1 > outSize) {
         out[0] = '\0';
@@ -366,8 +513,36 @@ static bool relativeBase(const char *fromDir, int dots, char *out,
     return true;
 }
 
+static bool resolveUncached(const char *dottedName, const char *fromDir,
+                            char *out, size_t outSize);
+
 bool jaiResolveModulePath(const char *dottedName, const char *fromDir,
                           char *out, size_t outSize) {
+    if (out == NULL || outSize == 0) return false;
+    out[0] = '\0';
+    if (dottedName == NULL || !memoEnabled())
+        return resolveUncached(dottedName, fromDir, out, outSize);
+
+    ensurePathReady();
+    char key[2 * JAI_MAX_PATH];
+    size_t len = memoKey(key, sizeof key, fromDir, dottedName);
+    if (len == 0) return resolveUncached(dottedName, fromDir, out, outSize);
+    uint32_t hash = memoHash(key, len);
+    const char *hit = memoFind(&sResolved, key, len, hash);
+    if (hit != NULL) {
+        size_t n = strlen(hit);
+        if (n + 1 <= outSize) {
+            memcpy(out, hit, n + 1);
+            return true;
+        }
+    }
+    if (!resolveUncached(dottedName, fromDir, out, outSize)) return false;
+    if (out[0] != '\0') memoInsert(&sResolved, key, len, hash, out);
+    return true;
+}
+
+static bool resolveUncached(const char *dottedName, const char *fromDir,
+                            char *out, size_t outSize) {
     if (out == NULL || outSize == 0) return false;
     out[0] = '\0';
     ensurePathReady();
