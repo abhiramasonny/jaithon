@@ -380,41 +380,73 @@ pub class Painter {
     #: one call: what `blend` does four times a step along each segment. False,
     #: with nothing drawn, when a point is not something with integer `x` and
     #: `y`.
-    #: Every run as an anti-aliased stroke `thickness` wide, blended into the
-    #: host mirror in one call: `draw_thick` a segment, quadrilateral and then
-    #: caps, in order. False, with nothing drawn, when a point is not something
-    #: with integer `x` and `y`.
+    #: Every run as an anti-aliased stroke `thickness` wide, in one call where
+    #: it can be: `draw_thick` a segment, quadrilateral and then caps, in
+    #: order. False, with nothing drawn, when a point is not something with
+    #: integer `x` and `y`.
+    #:
+    #: The primitive draws on whichever side the painter is, as `blend` does,
+    #: and a walk on the device stops at the first blend that has to read a
+    #: pixel back, saying how far it got. Then the picture comes over exactly
+    #: as `blend` would bring it, and the walk picks up from there on the
+    #: host -- so every write lands where `blend` would have put it, which a
+    #: view of a larger picture can see.
     pub fn blend_strokes(self, contours: list[list[Point]], closed: bool, thickness: int) -> bool {
-        let values = self.on_host()
-        return __prim__.blend_strokes(
-            values,
-            self.colour,
-            self.cn,
-            self.cols,
-            self.rows,
-            contours,
-            closed,
-            self.integral,
-            self.low,
-            self.high,
-            thickness
-        )
+        var taken = 0
+        loop {
+            let stopped = __prim__.blend_strokes(
+                self.target,
+                self.colour,
+                self.cn,
+                self.origin,
+                self.stride,
+                self.cols,
+                self.rows,
+                contours,
+                closed,
+                self.integral,
+                self.low,
+                self.high,
+                taken,
+                not self.on_device,
+                thickness
+            )
+            if stopped == -2 { return false }
+            if stopped < 0 { return true }
+            let _ = self.on_host()
+            taken = stopped
+        }
+        return true
     }
 
+    #: Every run as an anti-aliased hairline, in one call where it can be:
+    #: what `blend` does four times a step along each segment, with the same
+    #: move to the host as `blend_strokes`.
     pub fn blend_outlines(self, contours: list[list[Point]], closed: bool) -> bool {
-        let values = self.on_host()
-        return __prim__.blend_outlines(
-            values,
-            self.colour,
-            self.cn,
-            self.cols,
-            self.rows,
-            contours,
-            closed,
-            self.integral,
-            self.low,
-            self.high
-        )
+        var taken = 0
+        loop {
+            let stopped = __prim__.blend_outlines(
+                self.target,
+                self.colour,
+                self.cn,
+                self.origin,
+                self.stride,
+                self.cols,
+                self.rows,
+                contours,
+                closed,
+                self.integral,
+                self.low,
+                self.high,
+                taken,
+                not self.on_device
+            )
+            if stopped == -2 { return false }
+            if stopped < 0 { return true }
+            let _ = self.on_host()
+            taken = stopped
+        }
+        return true
     }
 
     #: Fill `[x1, x2]` on row `y`, inclusive at both ends.
