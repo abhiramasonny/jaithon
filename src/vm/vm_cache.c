@@ -118,3 +118,15 @@ bool jaiClassForShape(uint32_t shape, ObjClass **out) {
     *out = c;
     return true;
 }
+/* Held weakly, like the megamorphic cache above: a class can be local to a
+ * function and die, and the identity check in jaiClassForShape reads the
+ * class it holds -- through a dangling pointer once the sweep has freed it,
+ * where a reused block can still carry the shape it is asked for. Every IC
+ * miss in the interpreter remembers its receiver's class now, so this is no
+ * longer a table only a few compile paths fill. */
+void jaiShapeCacheRemoveWhite(void) {
+    for (unsigned i = 0; i < 256u; i++) {
+        ObjClass *c = sShapeCache[i];
+        if (c != NULL && !((Obj *)c)->isMarked) sShapeCache[i] = NULL;
+    }
+}

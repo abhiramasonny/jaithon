@@ -143,6 +143,9 @@ JaiRunResult jaiVMRunModule(ObjModule *module, ObjFunction *body);
  * with the pending exception set on error. */
 void jaiClassRememberShape(ObjClass *c);
 bool jaiClassForShape(uint32_t shape, ObjClass **out);
+/* Drops every remembered class the marker did not reach. Same phase as
+ * jaiMethodCacheRemoveWhite: after tracing, before the sweep. */
+void jaiShapeCacheRemoveWhite(void);
 bool jaiClassFindMethod(ObjClass *klass, ObjString *name, Value *out);
 bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver,
                                int count, Value *out);

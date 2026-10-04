@@ -575,6 +575,7 @@ void jaiGCCollect(void) {
     JaiTable *interned = jaiInternTable();
     if (interned != NULL) jaiTableRemoveWhite(interned);
     jaiMethodCacheRemoveWhite();
+    jaiShapeCacheRemoveWhite();
 #ifdef JAI_ALLOC_CENSUS
     double t2 = jaiClockMonotonic();
 #endif
