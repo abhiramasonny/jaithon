@@ -631,6 +631,103 @@ uint32_t jaiCrc32(const void *data, size_t len) {
 #endif
 
 /* ------------------------------------------------------------------ */
+/* Substring search                                                    */
+/* ------------------------------------------------------------------ */
+
+/* JAITHON_MEMFIND_SIMD=0 restores the memchr-on-the-first-byte loop for every
+ * needle. Read once. */
+static bool memFindSimd(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_MEMFIND_SIMD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The scalar search: memchr to the next copy of the first byte, then the last
+ * byte, then the middle. Fine while the first byte is rare; quadratic in calls
+ * when it is common, which is what text usually looks like. */
+static const char *memFindScalar(const char *hay, size_t hayLen,
+                                 const char *needle, size_t needleLen) {
+    const unsigned char first = (unsigned char)needle[0];
+    const unsigned char last = (unsigned char)needle[needleLen - 1];
+    const char *p = hay;
+    size_t remaining = hayLen - needleLen + 1;
+
+    while (remaining) {
+        const char *hit = (const char *)memchr(p, first, remaining);
+        if (hit == NULL) return NULL;
+
+        if ((unsigned char)hit[needleLen - 1] == last &&
+            (needleLen == 2 ||
+             memcmp(hit + 1, needle + 1, needleLen - 2) == 0))
+            return hit;
+
+        const size_t consumed = (size_t)(hit - p) + 1;
+        p += consumed;
+        remaining -= consumed;
+    }
+    return NULL;
+}
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+
+/* Sixteen candidate positions at a time, each kept only when BOTH its first
+ * byte and its last byte match the needle's: two compares and an AND per
+ * block, and the middle is compared only for the survivors. Requiring the
+ * pair is what makes a common first byte cheap -- `count("w49")` over text
+ * that is a `w` every five bytes calls memchr once per word in the scalar
+ * loop, and here mostly reads two vectors per sixteen bytes.
+ *
+ * Every load stays inside the haystack: a block at `i` reads [i, i+16) and
+ * [i+m-1, i+m+15), and the loop runs only while i + m - 1 + 16 <= hayLen. The
+ * tail is the scalar search over what is left, so an answer never depends on
+ * how the length divides by sixteen. Byte for byte, so embedded NULs and
+ * UTF-8 alike are just bytes; the earliest match is returned. */
+static const char *memFindNeon(const char *hay, size_t hayLen,
+                               const char *needle, size_t needleLen) {
+    const uint8x16_t first = vdupq_n_u8((uint8_t)needle[0]);
+    const uint8x16_t last = vdupq_n_u8((uint8_t)needle[needleLen - 1]);
+    const uint8_t *h = (const uint8_t *)hay;
+    size_t i = 0;
+
+    while (i + needleLen - 1 + 16 <= hayLen) {
+        uint8x16_t a = vld1q_u8(h + i);
+        uint8x16_t b = vld1q_u8(h + i + needleLen - 1);
+        uint8x16_t eq = vandq_u8(vceqq_u8(a, first), vceqq_u8(b, last));
+        /* Four bits per lane: narrow each 16-bit pair by four. */
+        uint64_t mask = vget_lane_u64(
+            vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+        while (mask != 0) {
+            unsigned lane = (unsigned)__builtin_ctzll(mask) >> 2;
+            const char *cand = hay + i + lane;
+            if (needleLen <= 2 ||
+                memcmp(cand + 1, needle + 1, needleLen - 2) == 0)
+                return cand;
+            mask &= ~((uint64_t)0xF << (lane * 4u));
+        }
+        i += 16;
+    }
+    if (i + needleLen > hayLen) return NULL;
+    return memFindScalar(hay + i, hayLen - i, needle, needleLen);
+}
+#endif
+
+const char *jaiMemFind(const char *hay, size_t hayLen,
+                       const char *needle, size_t needleLen) {
+    if (needleLen == 0) return hay;
+    if (needleLen > hayLen) return NULL;
+    if (needleLen == 1)
+        return (const char *)memchr(hay, (unsigned char)needle[0], hayLen);
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    if (memFindSimd()) return memFindNeon(hay, hayLen, needle, needleLen);
+#endif
+    return memFindScalar(hay, hayLen, needle, needleLen);
+}
+
+/* ------------------------------------------------------------------ */
 /* UTF-8                                                               */
 /* ------------------------------------------------------------------ */
 
