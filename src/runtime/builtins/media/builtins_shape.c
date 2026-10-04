@@ -52,6 +52,11 @@ static double shapeSin(double x) {
  * product of two 62, and the turn test's difference of products 63. */
 #define JAI_HULL_COORD_LIMIT 1073741824LL
 
+/* `HULL_WIDTH_LIMIT` in hull.jai: the widest span sorted into columns. The
+ * columns are kept for the thread's life, and past this a scattered set of
+ * points paid more to clear them than a sort costs: 100,000 points over 6M
+ * columns held 321 MB and ran 27% slower than sorting. */
+#define JAI_HULL_WIDTH_LIMIT 262144
 
 typedef struct {
     int64_t x, y;
@@ -244,7 +249,7 @@ static int hullRing(ObjList *points, bool clockwise, HullPoint **itemsOut, int32
      * walk. */
     int unique;
     const size_t width = (size_t)(right - left) + 1;
-    if (jaiHullColumnsOn() && width <= (size_t)count * 64 + 8192 &&
+    if (jaiHullColumnsOn() && width <= JAI_HULL_WIDTH_LIMIT && width <= (size_t)count * 64 + 8192 &&
         hullColumnsReserve(&tColumns, width)) {
         memcpy(spare, items, (size_t)count * sizeof(HullPoint));
         unique = hullByColumns(spare, count, left, width, items);
