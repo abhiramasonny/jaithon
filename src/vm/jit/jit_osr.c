@@ -532,7 +532,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         }
     }
 
-    planHoists(&e, fn);
+    planHoists(&e, fn, e.localKind);
     if (getenv("JAI_JIT_WHY")) {
         if (probeRan) fprintf(stderr,
                 "[jit] osr %s at %u registers: %u reserved, %u stack "

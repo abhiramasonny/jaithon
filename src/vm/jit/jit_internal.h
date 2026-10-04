@@ -875,7 +875,8 @@ void emitEpilogueKeepX1(Emit *e);
 void emitReturnLeave(Emit *e, SlotKind k);
 bool jitSplitStress(void);
 bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi);
-void planHoists(Emit *e, ObjFunction *fn);
+void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds);
+unsigned hoistListReg(const Emit *e, unsigned slot);
 const char *declineReason(Emit *e);
 unsigned jitShapeLimit(void);
 const char *unarmedDetail(const ObjFunction *fn, uint8_t op,

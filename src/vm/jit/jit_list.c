@@ -388,25 +388,37 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
  *
  * The loop chosen is the OUTERMOST one the slot is invariant across, so the
  * load runs as rarely as the proof allows. */
-void planHoists(Emit *e, ObjFunction *fn) {
-    if (e->measuring || !e->osr) return;
+/* The register a hoisted list's local lives in, or 0. The loop tier's homes
+ * are slotXReg; the function tier's are its fixed x19.. registers unless the
+ * frame was planned, when they are slotXReg too. A dynamic slot has none. */
+unsigned hoistListReg(const Emit *e, unsigned slot) {
+    if (slot > JIT_MAX_SLOTS || e->dynamicLocal[slot]) return 0;
+    if (e->osr || e->spilled) return e->slotXReg[slot];
+    return localHomeX(e, slot);
+}
+
+void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
+    if (e->measuring) return;
     const Chunk *c = &fn->chunk;
+    /* The function tier walks the whole chunk; the loop tier its own loop. */
+    uint32_t regionLo = e->osr ? e->osrTop : 0u;
+    uint32_t regionHi = e->osr ? e->osrEnd : (uint32_t)c->count;
 
     struct { uint32_t top, end, use; uint8_t slot; } cand[JIT_MAX_SLOTS + 1];
     unsigned ncand = 0;
 
-    for (unsigned s = 0; s < e->locals && s <= JIT_MAX_SLOTS; s++) {
-        if (e->localKind[s] != SLOT_LIST) continue;
-        if (e->slotXReg[s] == 0) continue;   /* no register to load from */
+    for (unsigned s = 0; s < e->base + e->locals && s <= JIT_MAX_SLOTS; s++) {
+        if (kinds[s] != SLOT_LIST) continue;
+        if (hoistListReg(e, s) == 0) continue;   /* no register to load from */
         if (e->slotIndexUse[s] == 0) continue;
         uint32_t bestTop = 0, bestEnd = 0;
-        for (int at = (int)e->osrTop; at < (int)e->osrEnd;) {
+        for (int at = (int)regionLo; at < (int)regionHi;) {
             int len = instructionLength(c, at);
             if (len <= 0) break;
             uint32_t lt = (uint32_t)at;
             uint32_t le = loopBodyEnd(c, lt);
             at += len;
-            if (le == 0 || le <= lt || le > e->osrEnd) continue;
+            if (le == 0 || le <= lt || le > regionHi) continue;
             /* Every subscript of this slot inside the loop... */
             if (e->slotIndexLo[s] < lt || e->slotIndexHi[s] >= le) continue;
             /* ...and no write to it anywhere in the loop. */
@@ -467,7 +479,10 @@ void planHoists(Emit *e, ObjFunction *fn) {
          * the arm a boxed access already takes first. */
         e->hoist[e->hoistCount].stgPin = false;
         e->hoist[e->hoistCount].stg    = (uint8_t)LIST_STORE_BOXED;
-        if (jitHoistStg() && !e->localStgPin[cand[pick].slot]) {
+        /* The loop tier only: the function tier's sample is the FIRST call's
+         * arguments, and a later call with another storage would deoptimise
+         * at this head every time. Its accesses keep their own dispatch. */
+        if (e->osr && jitHoistStg() && !e->localStgPin[cand[pick].slot]) {
             uint8_t sampled = localStgOf(e, cand[pick].slot);
             if (sampled != (uint8_t)LIST_STORE_BOXED) {
                 e->hoist[e->hoistCount].stgPin = true;
@@ -536,7 +551,6 @@ void planHoists(Emit *e, ObjFunction *fn) {
  * has its own counter and those registers describe the outer. */
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
                                 int32_t *offOut, uint8_t *baseOut) {
-    if (!e->osr) return false;
     if (slot < 0 || slot > (int)JIT_MAX_SLOTS) return false;
     if ((e->idxKnown & (1u << vidx)) == 0) return false;
     unsigned base = e->idxBase[vidx];
@@ -575,12 +589,7 @@ void emitHoistsAt(Emit *e, uint32_t off) {
     if (e->inlining) return;
     for (unsigned i = 0; i < e->hoistCount; i++) {
         if (e->hoist[i].top != off) continue;
-        /* Outside the loop, so the function tier pays its two instructions
-         * once per entry rather than per element. */
-        if (!e->osr) {
-            emitListBoxedGuard(e, e->slotXReg[e->hoist[i].slot], JIT_SCRATCH_A);
-        }
-        unsigned hList = e->slotXReg[e->hoist[i].slot];
+        unsigned hList = hoistListReg(e, e->hoist[i].slot);
         /* The count for the guard below: its own register when it has one,
          * otherwise a scratch that is dead once the guard is past. */
         unsigned hCount = e->hoist[i].hasCount ? e->hoist[i].countReg
@@ -616,7 +625,7 @@ void emitHoistsAt(Emit *e, uint32_t off) {
          * loop would hand the whole rest of the function to the interpreter
          * for no reason. */
         unsigned sl = e->hoist[i].slot;
-        if (!e->osr || !e->hoist[i].rangeOk) continue;
+        if (!e->hoist[i].rangeOk) continue;
         if (!e->spanOk[sl] || e->spanLo[sl] > e->spanHi[sl]) continue;
         if (!e->spanSeen[sl] || e->spanBase[sl] != e->hoist[i].rVar) continue;
         /* localIn, not localHomeX: the counter and the end are temporaries the
