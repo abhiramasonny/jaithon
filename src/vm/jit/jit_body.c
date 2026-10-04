@@ -785,11 +785,11 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
 
         case OP_ADD_INT_CONST:
-            if (!emitAddIntConst(e, code, &off)) return false;
+            if (!emitAddIntConst(e, fn, code, &off)) return false;
             break;
 
         case OP_SUB_INT_CONST:
-            if (!emitSubIntConst(e, code, &off)) return false;
+            if (!emitSubIntConst(e, fn, code, &off)) return false;
             break;
 
         case OP_MUL_INT_CONST:
@@ -809,7 +809,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
 
         case OP_INC_LOCAL:
-            if (!emitIncLocal(e, code, &off)) return false;
+            if (!emitIncLocal(e, fn, code, &off)) return false;
             break;
 
         case OP_EQ: case OP_NE:

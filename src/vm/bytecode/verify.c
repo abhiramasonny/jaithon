@@ -81,6 +81,10 @@ bool jaiOpFallsThrough(uint8_t op) {
 }
 
 /* Byte offsets of the u16 local-slot operands of `op`, if any. */
+static int slotOperands(uint8_t op, int *out);
+
+int jaiOpSlotOperands(uint8_t op, int *out) { return slotOperands(op, out); }
+
 static int slotOperands(uint8_t op, int *out) {
     switch (op) {
     case OP_GET_LOCAL:

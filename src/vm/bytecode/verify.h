@@ -30,6 +30,12 @@ int jaiOpBranchOperandAt(uint8_t op);
  * its fall-through edge ends, and a second copy of the list would drift. */
 bool jaiOpFallsThrough(uint8_t op);
 
+/* Byte offsets (within the operand run) of every u16 local-slot operand `op`
+ * carries, written to `out` (room for three); the count is returned. Exported
+ * so the JIT's range facts ask the verifier which opcodes NAME a slot rather
+ * than keeping a list of their own that could miss one. */
+int jaiOpSlotOperands(uint8_t op, int *out);
+
 
 /* ------------------------------------------------------------------ */
 /* The control-flow graph                                              */

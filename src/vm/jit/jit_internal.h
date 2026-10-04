@@ -1207,12 +1207,16 @@ JitArmResult emitUnaryPlus(Emit *e, int *offp);
 bool emitAddLocals(Emit *e, const uint8_t *code, int *offp);
 bool emitAddBind(Emit *e, const uint8_t *code, int *offp);
 bool emitCmpLocalConstLt(Emit *e, const uint8_t *code, int *offp);
-bool emitAddIntConst(Emit *e, const uint8_t *code, int *offp);
-bool emitSubIntConst(Emit *e, const uint8_t *code, int *offp);
+bool emitAddIntConst(Emit *e, const ObjFunction *fn, const uint8_t *code, int *offp);
+bool emitSubIntConst(Emit *e, const ObjFunction *fn, const uint8_t *code, int *offp);
 bool emitMulIntConst(Emit *e, const uint8_t *code, int *offp);
 bool emitMulBind(Emit *e, const uint8_t *code, int *offp);
 bool emitSubBind(Emit *e, const uint8_t *code, int *offp);
-bool emitIncLocal(Emit *e, const uint8_t *code, int *offp);
+bool emitIncLocal(Emit *e, const ObjFunction *fn, const uint8_t *code, int *offp);
+/* jit_range.c: whether a comparison every path to offset `q` made proves
+ * `slot + k` cannot overflow there. */
+bool jitSlotAddSafe(const Emit *e, const ObjFunction *fn, uint32_t q,
+                    unsigned slot, int64_t k);
 bool emitModIntConst(Emit *e, const uint8_t *code, int *offp);
 
 #endif /* arm64 */
