@@ -257,9 +257,10 @@ static bool selfHosting(void) {
  * the pause are then credited to the collector as permanent (jaiGCCredit):
  * they never count toward the next collection, and the budget is at least what
  * a collection at the end would have given them. Measured together with the
- * intern sizing below: -2.3% cycles on a one-line `check`, -4.7% on
- * edit-then-run. --gc-stress keeps collecting, since finding what a collection
- * breaks is its whole job.
+ * intern sizing below, as an env A/B in one binary (cycles.py -n 7): -3.9%
+ * cycles on a one-line `check` (floor 2.1%), -1.2% on edit-then-run (floor
+ * 0.4%). --gc-stress keeps collecting, since finding what a collection breaks
+ * is its whole job.
  *
  * The credit is the bytes allocated DURING the pause, never the heap as it
  * stands. Every eval, REPL line, test case and `check` file comes through here
