@@ -626,9 +626,197 @@ static bool primPointsArcLength(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* --- the enclosing circle ------------------------------------------- */
+
+/* `points_min_circle(points, out)` -- `min_enclosing_circle` in
+ * shape/enclosing.jai for two or more points: the same fixed shuffle, the
+ * same widest pair moved to the front, Welzl's three nested walks with the
+ * same slack, and the farthest point as the final say on the radius. Every
+ * floating point operation is the one written there, in its order, so the
+ * circle is the same to the bit.
+ *
+ * Writes the centre's x and y and the radius into the first three elements of
+ * `out` and returns true; false, writing nothing, when a point is not an
+ * object with integer `x` and `y` or a difference of two coordinates would
+ * overflow, both of which the Jaithon then meets for itself. */
+static bool primPointsMinCircle(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *points, *circle;
+    if (!jaiArgList(args[0], 1, "points_min_circle", &points)) return false;
+    if (!jaiArgList(args[1], 2, "points_min_circle", &circle)) return false;
+    if (circle->count < 3) {
+        return jaiThrow(vm.cValueError, "points_min_circle(): the circle list holds %d of 3 values",
+                        circle->count);
+    }
+    const int count = points->count;
+    *out = BOOL_VAL(false);
+    if (count < 2) return true;
+    int64_t *xs = (int64_t *)malloc((size_t)count * 2 * sizeof(int64_t));
+    if (xs == NULL) return jaiThrow(vm.cRuntimeError, "points_min_circle(): out of memory");
+    int64_t *ys = xs + count;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    for (int i = 0; i < count; i++) {
+        if (!jaiReadPoint(&reader, jaiListGet(points, i), &xs[i], &ys[i])) {
+            free(xs);
+            return true;
+        }
+    }
+
+    /* `shuffle_points`: Fisher-Yates from the C standard's sample `rand`. */
+    {
+        int64_t state = 1;
+        for (int index = count - 1; index > 0; index--) {
+            state = (state * 1103515245 + 12345) % 2147483648LL;
+            const int pick = (int)(state % (index + 1));
+            const int64_t hx = xs[index], hy = ys[index];
+            xs[index] = xs[pick];
+            ys[index] = ys[pick];
+            xs[pick] = hx;
+            ys[pick] = hy;
+        }
+    }
+
+    /* `lead_with_extremes`: the wider of the two extreme spans to the front. */
+    {
+        int64_t minX = xs[0], maxX = xs[0], minY = ys[0], maxY = ys[0];
+        int left = 0, right = 0, top = 0, bottom = 0;
+        for (int index = 1; index < count; index++) {
+            const int64_t x = xs[index], y = ys[index];
+            if (x < minX) {
+                minX = x;
+                left = index;
+            }
+            if (x > maxX) {
+                maxX = x;
+                right = index;
+            }
+            if (y < minY) {
+                minY = y;
+                top = index;
+            }
+            if (y > maxY) {
+                maxY = y;
+                bottom = index;
+            }
+        }
+        int64_t wideI, tallI, acrossYI, acrossXI;
+        if (__builtin_sub_overflow(maxX, minX, &wideI) || __builtin_sub_overflow(maxY, minY, &tallI) ||
+            __builtin_sub_overflow(ys[right], ys[left], &acrossYI) ||
+            __builtin_sub_overflow(xs[bottom], xs[top], &acrossXI)) {
+            free(xs);
+            return true;
+        }
+        const double wide = (double)wideI, tall = (double)tallI;
+        const double acrossY = (double)acrossYI, acrossX = (double)acrossXI;
+        int first = left, second = right;
+        if (tall * tall + acrossX * acrossX > wide * wide + acrossY * acrossY) {
+            first = top;
+            second = bottom;
+        }
+        if (first != second) {
+            int64_t hx = xs[0], hy = ys[0];
+            xs[0] = xs[first];
+            ys[0] = ys[first];
+            xs[first] = hx;
+            ys[first] = hy;
+            if (second == 0) second = first;
+            hx = xs[1];
+            hy = ys[1];
+            xs[1] = xs[second];
+            ys[1] = ys[second];
+            xs[second] = hx;
+            ys[second] = hy;
+        }
+    }
+
+    /* `welzl_walk`. */
+    const double x0 = (double)xs[0];
+    const double y0 = (double)ys[0];
+    double cx = (x0 + (double)xs[1]) * 0.5;
+    double cy = (y0 + (double)ys[1]) * 0.5;
+    double r2 = (x0 - cx) * (x0 - cx) + (y0 - cy) * (y0 - cy);
+    double limit = r2 + r2 * 1e-12 + 1e-12;
+    for (int i = 2; i < count; i++) {
+        const double ax = (double)xs[i];
+        const double ay = (double)ys[i];
+        const double ox = ax - cx;
+        const double oy = ay - cy;
+        if (ox * ox + oy * oy <= limit) continue;
+        cx = (ax + x0) * 0.5;
+        cy = (ay + y0) * 0.5;
+        r2 = (ax - cx) * (ax - cx) + (ay - cy) * (ay - cy);
+        limit = r2 + r2 * 1e-12 + 1e-12;
+        for (int j = 1; j < i; j++) {
+            const double bx = (double)xs[j];
+            const double by = (double)ys[j];
+            const double mx = bx - cx;
+            const double my = by - cy;
+            if (mx * mx + my * my <= limit) continue;
+            cx = (ax + bx) * 0.5;
+            cy = (ay + by) * 0.5;
+            r2 = (ax - cx) * (ax - cx) + (ay - cy) * (ay - cy);
+            limit = r2 + r2 * 1e-12 + 1e-12;
+            for (int k = 0; k < j; k++) {
+                const double px = (double)xs[k];
+                const double py = (double)ys[k];
+                const double ix = px - cx;
+                const double iy = py - cy;
+                if (ix * ix + iy * iy <= limit) continue;
+                const double d = 2.0 * (ax * (by - py) + bx * (py - ay) + px * (ay - by));
+                if (d > -1e-12 && d < 1e-12) {
+                    const double ab = (ax - bx) * (ax - bx) + (ay - by) * (ay - by);
+                    const double ap = (ax - px) * (ax - px) + (ay - py) * (ay - py);
+                    const double bp = (bx - px) * (bx - px) + (by - py) * (by - py);
+                    if (ab >= ap && ab >= bp) {
+                        cx = (ax + bx) * 0.5;
+                        cy = (ay + by) * 0.5;
+                        r2 = ab * 0.25;
+                    } else if (ap >= bp) {
+                        cx = (ax + px) * 0.5;
+                        cy = (ay + py) * 0.5;
+                        r2 = ap * 0.25;
+                    } else {
+                        cx = (bx + px) * 0.5;
+                        cy = (by + py) * 0.5;
+                        r2 = bp * 0.25;
+                    }
+                } else {
+                    const double a2 = ax * ax + ay * ay;
+                    const double b2 = bx * bx + by * by;
+                    const double p2 = px * px + py * py;
+                    cx = (a2 * (by - py) + b2 * (py - ay) + p2 * (ay - by)) / d;
+                    cy = (a2 * (px - bx) + b2 * (ax - px) + p2 * (bx - ax)) / d;
+                    r2 = (ax - cx) * (ax - cx) + (ay - cy) * (ay - cy);
+                }
+                limit = r2 + r2 * 1e-12 + 1e-12;
+            }
+        }
+    }
+
+    /* `farthest_squared`, which has the last word on the radius. */
+    double worst = 0.0;
+    for (int index = 0; index < count; index++) {
+        const double dx = (double)xs[index] - cx;
+        const double dy = (double)ys[index] - cy;
+        const double squared = dx * dx + dy * dy;
+        if (squared > worst) worst = squared;
+    }
+    free(xs);
+    if (worst > r2) r2 = worst;
+
+    jaiListPut(circle, 0, FLOAT_VAL(cx));
+    jaiListPut(circle, 1, FLOAT_VAL(cy));
+    jaiListPut(circle, 2, FLOAT_VAL(sqrt(r2)));
+    jaiListTouch(circle);
+    *out = BOOL_VAL(true);
+    return true;
+}
+
 void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_hull",    primPointsHull,   2, 2);
     jaiStrDefinePrim(ns, "points_min_box", primPointsMinBox, 2, 2);
     jaiStrDefinePrim(ns, "points_approx", primPointsApprox, 3, 3);
     jaiStrDefinePrim(ns, "points_arc_length", primPointsArcLength, 2, 2);
+    jaiStrDefinePrim(ns, "points_min_circle", primPointsMinCircle, 2, 2);
 }

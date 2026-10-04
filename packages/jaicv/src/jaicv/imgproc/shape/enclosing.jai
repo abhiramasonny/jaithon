@@ -29,6 +29,10 @@ let BOX_PI = math.PI
 #: 1.6, most of it the hull and the rest calls and allocation.
 let _native_box = (env("JAICV_NATIVE_BOX") ?? "1") != "0"
 
+#: Where `points_min_circle` leaves the circle: centre and radius. The same
+#: switch as the box, `JAICV_NATIVE_BOX`, turns it off.
+var _circle_native: list[float] = [0.0, 0.0, 0.0]
+
 #: Where `points_min_box` leaves the box: centre, size and angle.
 var _box_native: list[float] = [0.0, 0.0, 0.0, 0.0, 0.0]
 
@@ -513,6 +517,12 @@ pub fn min_enclosing_circle(points: list[Point]) -> tuple[Point2f, float] {
     let count = points.len()
     if count == 0 { return (Point2f(0.0, 0.0), 0.0) }
     if count == 1 { return (Point2f(float(points[0].x), float(points[0].y)), 0.0) }
+    #: All of the below in `__prim__.points_min_circle`, operation for
+    #: operation; false for points it cannot read, which go on below.
+    if _native_box and __prim__.points_min_circle(points, _circle_native) {
+        let got = _circle_native
+        return (Point2f(got[0], got[1]), got[2])
+    }
 
     var order = points.copy()
     let _mixed = shuffle_points(order, count)
