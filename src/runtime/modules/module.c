@@ -901,6 +901,7 @@ ObjModule *jaiImportModule(const char *dottedName, const char *fromDir) {
         /* Drop the registration so a later attempt reports the real error
          * again instead of "failed earlier". */
         forgetModule(pathKey);
+        resolveMemoForgetAll();
         if (!vm.hasException && vm.frameCount > 0) {
             (void)jaiThrow(vm.cImportError, "%s: module '%s' failed to load",
                            jaiDiagCodeString(E0800_MODULE_NOT_FOUND), name);

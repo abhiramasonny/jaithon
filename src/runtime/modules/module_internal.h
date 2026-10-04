@@ -20,6 +20,8 @@ bool isRegularFile(const char *path);
 
 bool storeResolved(char *out, size_t outSize, const char *candidate);
 
+void resolveMemoForgetAll(void);
+
 const char *displayName(const char *dotted);
 
 /* -- module_cache.c, used by module.c ---------------------------------- */

@@ -492,6 +492,13 @@ void jaiModulePathComplete(void) {
     completePath();
 }
 
+/* A module failed to load. Whatever made it fail -- the file deleted or
+ * renamed since it was found, say -- the next import of that name must search
+ * again and report what it finds, as it did before there was a memo. */
+void resolveMemoForgetAll(void) {
+    memoClear(&sResolved);
+}
+
 void jaiModulePathAdd(const char *dir) {
     if (dir == NULL || dir[0] == '\0') return;
     memoClear(&sResolved);
