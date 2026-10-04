@@ -987,6 +987,8 @@ int hoistFor(const Emit *e, int slot);
 int hoistForStr(const Emit *e, int slot);
 bool jitStrHoist(void);
 bool jitStrFacts(void);
+ObjDict *jitDictExemplar(void);
+bool jitFieldDict(void);
 void planStrFacts(Emit *e, ObjFunction *fn);
 bool strFactAscii(const Emit *e, int slot);
 bool strFactInterned(const Emit *e, int slot);

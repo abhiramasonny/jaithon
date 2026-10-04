@@ -21,10 +21,38 @@
  * registers are invisible to a collection inside the callee -- the tier refuses allocate-then-self-call for exactly this reason. */
 JitCallDesc *gJitFrames;
 
+/* An empty dict the tier hands out as the SAMPLE for a value it knows is a
+ * dict but cannot see -- a declared `dict[K, V]` field read off a receiver
+ * the body built itself. Arms ask the sample which arm to emit and guard
+ * OBJ_DICT at run time regardless; nothing compiled ever holds this pointer.
+ * Kept here, and marked below, because a compile may allocate and so collect
+ * while an entry still names it. */
+static ObjDict *gDictExemplar;
+
+ObjDict *jitDictExemplar(void) {
+    if (gDictExemplar == NULL) gDictExemplar = jaiDictNew();
+    return gDictExemplar;
+}
+
+/* After a VM teardown's sweep the exemplar is freed memory. */
+void jaiJitExemplarsReset(void) { gDictExemplar = NULL; }
+
+/* JAITHON_JIT_FIELD_DICT=0 stops a declared `dict` field being predicted when
+ * there is no live receiver to read it off, which is the decline it was. */
+bool jitFieldDict(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FIELD_DICT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 void jaiJitMarkFrames(void) {
     for (JitCallDesc *f = gJitFrames; f != NULL; f = f->link) {
         for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);
     }
+    if (gDictExemplar != NULL) jaiGCMarkObject((Obj *)gDictExemplar);
 }
 
 /* Roots go in as a RANGE (jaiGCPushRootRange/Pop), not copied one at a time -- copying individually
@@ -433,6 +461,9 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return false;
 }
 void jaiJitMarkFrames(void) {
+}
+
+void jaiJitExemplarsReset(void) {
 }
 
 #endif

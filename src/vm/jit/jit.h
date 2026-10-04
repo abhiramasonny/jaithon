@@ -118,6 +118,7 @@ bool jaiJitFinishDeopt(ObjClosure *closure, Value *out);
 
 /* Mark the roots of every compiled frame that has linked itself. */
 void jaiJitMarkFrames(void);
+void jaiJitExemplarsReset(void);
 
 /* Compile and enter the loop at `top` with the interpreter's own slots. On
  * success `*resumeAt` is the bytecode offset the interpreter should continue

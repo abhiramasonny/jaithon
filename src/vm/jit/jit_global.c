@@ -672,6 +672,15 @@ bool declaredScalarFieldKind(uint32_t typeId, SlotKind *k, unsigned *tag) {
      * declared `Foo` is null only before its init assigns it, and a field never
      * assigned at all would deopt on every read rather than answer wrongly. */
     case FIELD_KIND_DECLARED: *k = SLOT_OBJ; *tag = VAL_OBJ;   return true;
+    /* A declared `dict[K, V]`. Two guards, as for `list` and `str`: the tag,
+     * then OBJ_DICT, since VAL_OBJ is every heap object and the index arms
+     * read ObjDict's table. The callers hand the entry jitDictExemplar() as
+     * its sample, which is what `d[k] = v` and the dict methods ask for.
+     * `node.fields[key] = value` on a node the body built itself -- every
+     * hand-written parser's object case -- declined the whole function. */
+    case FIELD_KIND_DICT:
+        if (!jitFieldDict()) return false;
+        *k = SLOT_OBJ; *tag = VAL_OBJ;   return true;
     default: return false;
     }
 }
