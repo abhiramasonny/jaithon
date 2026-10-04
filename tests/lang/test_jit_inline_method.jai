@@ -278,3 +278,46 @@ fn test_fused_constant_ops_inline() {
     assert_throws(OverflowError, || l.dbl(big))
     assert_throws(OverflowError, || run_lin(Lin(0), 1) + l.dbl(big))
 }
+
+#: A predicate method: a compare and nothing else, inlined as a `cset`.
+class Window {
+    pub var lo: int
+    pub var hi: int
+    pub var cut: float
+
+    fn init(self, lo: int, hi: int) {
+        self.lo = lo
+        self.hi = hi
+        self.cut = 0.5
+    }
+
+    pub fn holds(self, x: int) -> bool { return x >= self.lo }
+
+    pub fn below(self, x: int) -> bool { return x < self.hi }
+
+    pub fn small(self, f: float) -> bool { return f <= self.cut }
+}
+
+fn count_in(w: Window, n: int) -> int {
+    var c = 0
+    var i = 0
+    while i < n {
+        if w.holds(i) and w.below(i) { c += 1 }
+        if w.small(i * 0.25) { c += 100 }
+        i += 1
+    }
+    return c
+}
+
+fn test_predicate_methods_inline() {
+    let w = Window(10, 20)
+    for _r in 0..80 {
+        assert_eq(count_in(w, 50), 10 + 300)
+    }
+    w.cut = -1.0
+    assert_eq(count_in(w, 50), 10)
+    # A NaN cannot be ordered: the interpreter raises, so the inlined compare
+    # has to hand the call back rather than answer.
+    w.cut = float("nan")
+    assert_throws(TypeError, || count_in(w, 50))
+}

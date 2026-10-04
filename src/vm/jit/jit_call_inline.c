@@ -124,6 +124,14 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
             slot = jaiReadU16(c->code + off + 1);
             if (slot > maxSlot) maxSlot = slot;
             break;
+        /* A predicate -- `return self.pos >= self.len` -- is a compare and a
+         * `cset`: straight-line, and emitCompare reads its operands through
+         * xHeldIn/fpOperand, so the inlined bank is where it looks. Its
+         * string and object-equality arms, the two that call out, already
+         * refuse inside an inline. */
+        case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+            if (!jitInlineMethodsOn()) return false;
+            break;
         case OP_CONST: case OP_INT: case OP_TRUE: case OP_FALSE:
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
         case OP_FLOORDIV: case OP_MOD: case OP_POW: case OP_NEG:
