@@ -29,9 +29,8 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
                  * itself are per character. */
                 emitBoundsNormalise(e, rIdx, e->hoist[sh].countReg,
                                     JIT_SCRATCH_B, false);
-                emit(e, jaiA64AddX(JIT_SCRATCH_C, e->hoist[sh].itemsReg,
-                                   JIT_SCRATCH_B));
-                emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+                emit(e, jaiA64LdrByteReg(JIT_SCRATCH_A, e->hoist[sh].itemsReg,
+                                         JIT_SCRATCH_B));
             } else if (strFactAscii(e, sSlot)) {
             /* The loop head proved the two facts the guards below would
              * (see planStrFacts); the header itself is reloaded, because
@@ -42,8 +41,8 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
                                 false);
             emit(e, jaiA64LdrX(JIT_SCRATCH_C, rStr,
                                (unsigned)offsetof(ObjString, chars)));
-            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_B));
-            emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64LdrByteReg(JIT_SCRATCH_A, JIT_SCRATCH_C,
+                                     JIT_SCRATCH_B));
             } else {
             /* Really a string, and not something else this object slot
              * happened to hold when the loop was compiled. */
@@ -70,8 +69,8 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
 
             emit(e, jaiA64LdrX(JIT_SCRATCH_C, rStr,
                                (unsigned)offsetof(ObjString, chars)));
-            emit(e, jaiA64AddX(JIT_SCRATCH_C, JIT_SCRATCH_C, JIT_SCRATCH_B));
-            emit(e, jaiA64LdrByte(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
+            emit(e, jaiA64LdrByteReg(JIT_SCRATCH_A, JIT_SCRATCH_C,
+                                     JIT_SCRATCH_B));
             }
             /* 128 is an imm12, so the compare needs no register: a
              * materialised constant on a body this hot is not free the way
@@ -84,9 +83,6 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
              * jaiAsciiCharsFill. The scaled add folds the shift in. */
             emitConst64(e, JIT_SCRATCH_C,
                         (int64_t)(uintptr_t)jaiAsciiCharTable());
-            emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, JIT_SCRATCH_C,
-                                  JIT_SCRATCH_A, 3));
-            emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_C, 0));
 
             /* Carry a sample so later instructions know this is a
              * string: the receiver serves, since only its type is read.
@@ -103,7 +99,10 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
              * jaiStringChar -- so a consumer that would guard this for
              * being a string, and for being interned, need not. */
             e->stackAscii[e->depth - 1] = true;
-            emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
+            /* Straight into the entry's register, the shift folded into the
+             * load: no `add` to form the slot address, no `mov` after. */
+            emit(e, jaiA64LdrXRegLsl3(pushReg(e) - 1, JIT_SCRATCH_C,
+                                      JIT_SCRATCH_A));
             off += 1;
             break;
         }
