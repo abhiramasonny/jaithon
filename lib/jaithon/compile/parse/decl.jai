@@ -32,8 +32,8 @@ pub fn _parse_generics(p: Parser) -> list[dict[str, any]] {
             if name == null { break }
             var bound: TypeExpr? = null
             if p._match(TokenKind.Colon) { bound = _parse_type(p) }
-            p._check_reserved_type_name(name, name_token.span)
-            generics.push(_generic(name, bound, name_token.span))
+            p._check_reserved_type_name(name, name_token)
+            generics.push(_generic(name, bound, p._span_of(name_token)))
             if not p._match(TokenKind.Comma) { break }
             if p._check(TokenKind.RBracket) or p._check(TokenKind.Eof) { break }
         }
@@ -266,7 +266,7 @@ pub fn _parse_class_decl(p: Parser, visibility: Visibility, start_index: int) ->
     let name_token = p._peek()
     let name = p._expect_ident_name("a class name")
     if name == null { return null }
-    p._check_reserved_type_name(name, name_token.span)
+    p._check_reserved_type_name(name, name_token)
 
     let generics = _parse_generics(p)
     var superclass: TypeExpr? = null
@@ -389,7 +389,7 @@ pub fn _parse_field(p: Parser, visibility: Visibility, is_static: bool) -> dict[
     } else {
         let keyword_text = is_let ? "let" : "var"
         p._error_at(
-            name_token.span,
+            p._span_of(name_token),
             Code.E0105_EXPECTED_TYPE,
             f"field `{name}` needs a type annotation",
             help: f"write `{keyword_text} {name}: <type>`"
@@ -408,7 +408,7 @@ pub fn _parse_trait_decl(p: Parser, visibility: Visibility, start_index: int) ->
     let name_token = p._peek()
     let name = p._expect_ident_name("a trait name")
     if name == null { return null }
-    p._check_reserved_type_name(name, name_token.span)
+    p._check_reserved_type_name(name, name_token)
 
     let generics = _parse_generics(p)
     var supers: list[TypeExpr] = []
@@ -468,7 +468,7 @@ pub fn _parse_enum_decl(p: Parser, visibility: Visibility, start_index: int) -> 
     let name_token = p._peek()
     let name = p._expect_ident_name("an enum name")
     if name == null { return null }
-    p._check_reserved_type_name(name, name_token.span)
+    p._check_reserved_type_name(name, name_token)
 
     let generics = _parse_generics(p)
     var variants: list[dict[str, any]] = []
@@ -543,7 +543,7 @@ pub fn _parse_type_decl(p: Parser, visibility: Visibility, start_index: int) -> 
     let name_token = p._peek()
     let name = p._expect_ident_name("a type name")
     if name == null { return null }
-    p._check_reserved_type_name(name, name_token.span)
+    p._check_reserved_type_name(name, name_token)
 
     let generics = _parse_generics(p)
     p._expect(TokenKind.Eq, "`=` in a type alias")
@@ -560,7 +560,7 @@ pub fn _parse_type_decl(p: Parser, visibility: Visibility, start_index: int) -> 
 pub fn _parse_module_path(p: Parser) -> str? {
     var path = ""
     while p._check(TokenKind.Dot) or p._check(TokenKind.DotDot) or p._check(TokenKind.Ellipsis) {
-        path = path + p._advance().text
+        path = path + p._advance().slice_text()
     }
 
     if not p._check(TokenKind.Ident) {
@@ -571,10 +571,10 @@ pub fn _parse_module_path(p: Parser) -> str? {
         )
         return null
     }
-    path = path + p._advance().text
+    path = path + p._advance().word
     while p._check(TokenKind.Dot) and p._kind_at(1) == TokenKind.Ident {
         p._advance()
-        path = path + "." + p._advance().text
+        path = path + "." + p._advance().word
     }
     return path
 }
@@ -611,7 +611,7 @@ pub fn _parse_from_import(p: Parser, start_index: int) -> Node? {
             if p._match(TokenKind.KwAs) {
                 alias = p._expect_ident_name("an import alias")
             }
-            items.push(_import_item(name, alias, name_token.span))
+            items.push(_import_item(name, alias, p._span_of(name_token)))
             if not p._match(TokenKind.Comma) { break }
             if p._check(TokenKind.Eof) or p.panic_mode { break }
         }

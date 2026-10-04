@@ -78,7 +78,7 @@ pub fn _parse_postfix(p: Parser) -> Node {
             let name = p._expect_ident_name("a member name after `.`")
             if name == null { break }
             let kind = optional ? NodeKind.OptMember : NodeKind.Member
-            expr = _member(kind, _join(expr.span, name_token.span), expr, name)
+            expr = _member(kind, p._join_token(expr.span, name_token), expr, name)
         } elif p._check(TokenKind.LParen) {
             let open_index = p.current
             p._advance()
@@ -241,7 +241,7 @@ pub fn _peek_compare_op(p: Parser) -> tuple[OpKind, int, bool]? {
         return null
     }
     if kind == TokenKind.Ident {
-        let text = p._peek().text
+        let text = p._peek().word
         if text == "eq" { return (OpKind.Eq, 1, true) }
         if text == "ne" or text == "neq" { return (OpKind.Ne, 1, true) }
     }
@@ -263,7 +263,7 @@ pub fn _parse_comparison(p: Parser) -> Node {
             p._error_recovered(
                 p._cur_span(),
                 Code.E0100_UNEXPECTED_TOKEN,
-                f"`{p._peek().text}` is not an operator in Jaithon 3",
+                f"`{p._peek().word}` is not an operator in Jaithon 3",
                 help: f"write `{spelling}`"
             )
         }

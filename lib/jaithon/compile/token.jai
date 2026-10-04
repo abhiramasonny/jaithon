@@ -463,14 +463,69 @@ pub fn kind_text(kind: TokenKind) -> str {
     }
 }
 
+#: The file a token was cut from, shared by every token one `Lexer` makes.
+#:
+#: A token points at one of these instead of carrying a `Span` and a
+#: substring of its own, so neither is built until a reader asks for it.
+#:
+#: The two coordinate systems disagree: a `Span` records UTF-8 byte offsets,
+#: while a `str` is indexed by character. When the file is all ASCII they
+#: coincide and `slice` indexes `text` directly; otherwise `scalar_of` -- the
+#: lexer's own table, not a copy -- maps a byte offset to its character.
+pub class Source {
+    #: The file id every `Span` cut from this source carries, or -1.
+    pub let file: int
+    #: The source text, exactly as the lexer received it.
+    pub let text: str
+    let ascii: bool
+    #: When `text` is not ASCII: the character index of each byte offset, and
+    #: of the end. Otherwise `[0]` and never read.
+    let scalar_of: list[int]
+
+    #: Describe the file numbered `file`, whose text is `text`.
+    pub fn init(self, file: int, text: str, ascii: bool, scalar_of: list[int]) {
+        self.file = file
+        self.text = text
+        self.ascii = ascii
+        self.scalar_of = scalar_of
+    }
+
+    #: The source text between two byte offsets.
+    pub fn slice(self, start: int, end: int) -> str {
+        if self.ascii { return self.text[start:end] }
+        return self.text[self.scalar_of[start]:self.scalar_of[end]]
+    }
+}
+
 #: One token: what it is, where it is, and what it means.
+#:
+#: A token records the byte range it covers and the `Source` it was cut from,
+#: not a `Span` and a substring: most tokens -- punctuation, most keywords, the
+#: newlines -- are read for their kind and nothing else, and paid for both.
+#: `span` and `text` are computed when read, so a reader spells them as it
+#: always did.
+#:
+#: A getter read allocates a bound method and calls back into the interpreter,
+#: so a reader on a hot path does not use one: it reads `word`, `start` and
+#: `end`, or calls `make_span` and `slice_text`.
 pub class Token {
     #: What kind of token this is.
     pub let kind: TokenKind
-    #: The byte range the token covers.
-    pub let span: Span
-    #: The source text the token covers, verbatim.
-    pub let text: str
+    #: The file the token was cut from.
+    pub let source: Source
+    #: Byte offset of the token's first byte.
+    pub let start: int
+    #: Byte offset one past the token's last byte.
+    pub let end: int
+    #: The text of a word -- an identifier, a keyword or `_` -- and "" for
+    #: every other kind.
+    #:
+    #: The one substring a token still holds, because it costs nothing: the
+    #: lexer has already cut it to look the word up as a keyword, and the
+    #: parser reads nearly every identifier's name. Cutting it again from
+    #: `source` would be a second slice per name, and a call the compiled tier
+    #: cannot make, since `source` is an object it reads out of a field.
+    pub let word: str
     #: The cooked value, or null when the kind carries no value. The lexer
     #: sets it after construction, on the literal kinds that carry one.
     pub var value: any
@@ -482,12 +537,43 @@ pub class Token {
     #: The value is not a parameter. A parameter that is an int on one call,
     #: a string on the next and null on most has no kind the tier can give it,
     #: and that one parameter kept every token's construction interpreted.
-    pub fn init(self, kind: TokenKind, span: Span, text: str, flags: int = 0) {
+    pub fn init(
+        self,
+        kind: TokenKind,
+        source: Source,
+        start: int,
+        end: int,
+        word: str = "",
+        flags: int = 0
+    ) {
         self.kind = kind
-        self.span = span
-        self.text = text
+        self.source = source
+        self.start = start
+        self.end = end
+        self.word = word
         self.value = null
         self.flags = flags
+    }
+
+    #: The byte range the token covers.
+    pub get span() -> Span {
+        return self.make_span()
+    }
+
+    #: The source text the token covers, verbatim.
+    pub get text() -> str {
+        return self.slice_text()
+    }
+
+    #: `span`, built now: a new `Span` on every call.
+    pub fn make_span(self) -> Span {
+        return Span(self.source.file, self.start, self.end)
+    }
+
+    #: `text`, without the getter: the word, or a slice of the source.
+    pub fn slice_text(self) -> str {
+        if self.word.len() > 0 { return self.word }
+        return self.source.slice(self.start, self.end)
     }
 
     #: Report whether `flag`, one of the `TokenFlags` bits, is set.
@@ -498,10 +584,10 @@ pub class Token {
     #: The cooked text of a string token; the source text of anything else.
     pub fn string_value(self) -> str {
         if isinstance(self.value, str) { return self.value }
-        return self.text
+        return self.slice_text()
     }
 
     fn __str__(self) -> str {
-        return f"Token({kind_text(self.kind)}, {self.span.start}..{self.span.end})"
+        return f"Token({kind_text(self.kind)}, {self.start}..{self.end})"
     }
 }

@@ -144,7 +144,7 @@ fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
     for token in tokens {
         let opener = _opener_text(token.kind)
         if opener is not null {
-            stack.push((opener, token.span.start))
+            stack.push((opener, token.start))
             continue
         }
 
@@ -154,7 +154,7 @@ fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
         if stack.len() == 0 or _closer_for(stack[stack.len() - 1][0]) != closer {
             out.mismatched = true
             out.closer = closer
-            let (line, column) = text.position_at(token.span.start)
+            let (line, column) = text.position_at(token.start)
             out.closer_line = line
             out.closer_col = column
             if stack.len() > 0 {
@@ -200,7 +200,7 @@ fn _is_triple_quote_at(text: _Text, offset: int) -> bool {
 fn _open_fstring_offset(tokens: list[Token]) -> int {
     var offset = -1
     for token in tokens {
-        if token.kind == TokenKind.FStringStart { offset = token.span.start }
+        if token.kind == TokenKind.FStringStart { offset = token.start }
     }
     return offset
 }

@@ -51,7 +51,7 @@ pub fn _expect_block(p: Parser, what: str) -> Node {
         p._error_at(
             p._cur_span(),
             Code.E0104_EXPECTED_BLOCK,
-            f"`{p._peek().text}` is not a Jaithon 3 keyword",
+            f"`{p._peek().word}` is not a Jaithon 3 keyword",
             help: f"blocks are braces: `{what} {{ ... }}`"
         )
         return _empty_block(p)
@@ -274,8 +274,9 @@ pub fn _parse_expr_or_assign(p: Parser) -> Node {
 pub fn _parse_legacy_call_statement(p: Parser, name: str) -> Node {
     let start_index = p.current
     let name_token = p._advance()
+    let name_span = p._span_of(name_token)
     let diag = p._error_recovered(
-        name_token.span,
+        name_span,
         Code.E0100_UNEXPECTED_TOKEN,
         f"`{name}` is a function in Jaithon 3"
     )
@@ -297,7 +298,7 @@ pub fn _parse_legacy_call_statement(p: Parser, name: str) -> Node {
     let call = _node(
         NodeKind.Call,
         p._span_since(start_index),
-        {"callee": _ident(name_token.span, name_token.text), "args": args}
+        {"callee": _ident(name_span, name_token.word), "args": args}
     )
     let stmt = _node(NodeKind.ExprStmt, call.span, {"expr": call})
     p._end_statement()
@@ -306,7 +307,7 @@ pub fn _parse_legacy_call_statement(p: Parser, name: str) -> Node {
 
 pub fn _check_legacy_statement(p: Parser) -> tuple[bool, Node?] {
     if not p._check(TokenKind.Ident) { return (false, null) }
-    let text = p._peek().text
+    let text = p._peek().word
 
     if text == "print" or text == "input" or text == "system" {
         if not _starts_bare_argument(p._kind_at(1)) { return (false, null) }
@@ -409,7 +410,7 @@ pub fn _parse_statement(p: Parser) -> Node? {
         kind == TokenKind.KwElif or
         kind == TokenKind.KwCatch or
         kind == TokenKind.KwFinally {
-        let word = p._peek().text
+        let word = p._peek().word
         p._error_at(
             p._cur_span(),
             Code.E0100_UNEXPECTED_TOKEN,

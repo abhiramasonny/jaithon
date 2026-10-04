@@ -37,7 +37,7 @@ pub fn _parse_args(p: Parser, open_index: int) -> list[dict[str, any]] {
             var name: str? = null
             let is_spread = p._match(TokenKind.Ellipsis)
             if not is_spread and p._check(TokenKind.Ident) and p._kind_at(1) == TokenKind.Colon {
-                name = p._advance().text
+                name = p._advance().word
                 p._advance()
             }
             let value = parse_expression(p)
@@ -73,7 +73,7 @@ pub fn _apply_format_spec(p: Parser, value: Node) -> Node {
     while not p._check(TokenKind.FStringMid) and
         not p._check(TokenKind.FStringEnd) and
         not p._check(TokenKind.Eof) {
-        spec_end = p._advance().span.end
+        spec_end = p._advance().end
     }
     if spec_end <= spec_span.start { return value }
 
@@ -93,7 +93,7 @@ pub fn _parse_fstring(p: Parser) -> Node {
 
     let start_token = p._advance()
     if start_token.string_value().len() > 0 {
-        parts.push(_str_lit(start_token.span, start_token.string_value()))
+        parts.push(_str_lit(p._span_of(start_token), start_token.string_value()))
     }
     let complete = start_token.kind == TokenKind.FStringEnd
 
@@ -116,14 +116,14 @@ pub fn _parse_fstring(p: Parser) -> Node {
         if p._check(TokenKind.FStringMid) {
             let mid = p._advance()
             if mid.string_value().len() > 0 {
-                parts.push(_str_lit(mid.span, mid.string_value()))
+                parts.push(_str_lit(p._span_of(mid), mid.string_value()))
             }
             continue
         }
         if p._check(TokenKind.FStringEnd) {
             let end = p._advance()
             if end.string_value().len() > 0 {
-                parts.push(_str_lit(end.span, end.string_value()))
+                parts.push(_str_lit(p._span_of(end), end.string_value()))
             }
             break
         }
@@ -345,8 +345,9 @@ pub fn _parse_lambda(p: Parser) -> Node {
             if name == null { break }
             var declared: TypeExpr? = null
             if p._match(TokenKind.Colon) { declared = _parse_type(p) }
-            p._check_duplicate_param(params, name, name_token.span)
-            params.push(_param(name, declared, null, name_token.span, false, false))
+            let name_span = p._span_of(name_token)
+            p._check_duplicate_param(params, name, name_span)
+            params.push(_param(name, declared, null, name_span, false, false))
             if not p._match(TokenKind.Comma) { break }
             if p._check(TokenKind.Eof) { break }
         }
@@ -385,15 +386,15 @@ pub fn _parse_primary(p: Parser) -> Node {
 
     if kind == TokenKind.Int {
         p._advance()
-        return _node(NodeKind.IntLit, token.span, {"intLit": token.value ?? 0})
+        return _node(NodeKind.IntLit, p._span_of(token), {"intLit": token.value ?? 0})
     }
     if kind == TokenKind.Float {
         p._advance()
-        return _node(NodeKind.FloatLit, token.span, {"floatLit": token.value ?? 0.0})
+        return _node(NodeKind.FloatLit, p._span_of(token), {"floatLit": token.value ?? 0.0})
     }
     if kind == TokenKind.Str {
         p._advance()
-        return _str_lit(token.span, token.string_value())
+        return _str_lit(p._span_of(token), token.string_value())
     }
     if kind == TokenKind.FStringStart or kind == TokenKind.FStringEnd {
         return _parse_fstring(p)
@@ -405,23 +406,23 @@ pub fn _parse_primary(p: Parser) -> Node {
     }
     if kind == TokenKind.KwTrue or kind == TokenKind.KwFalse {
         p._advance()
-        return _node(NodeKind.BoolLit, token.span, {"boolLit": kind == TokenKind.KwTrue})
+        return _node(NodeKind.BoolLit, p._span_of(token), {"boolLit": kind == TokenKind.KwTrue})
     }
     if kind == TokenKind.KwNull {
         p._advance()
-        return _node(NodeKind.NullLit, token.span)
+        return _node(NodeKind.NullLit, p._span_of(token))
     }
     if kind == TokenKind.KwSelf {
         p._advance()
-        return _node(NodeKind.Self, token.span)
+        return _node(NodeKind.Self, p._span_of(token))
     }
     if kind == TokenKind.KwSuper {
         p._advance()
-        return _node(NodeKind.Super, token.span)
+        return _node(NodeKind.Super, p._span_of(token))
     }
     if kind == TokenKind.Underscore {
         p._advance()
-        return _ident(token.span, "_")
+        return _ident(p._span_of(token), "_")
     }
     if kind == TokenKind.LParen { return _parse_paren_expr(p) }
     if kind == TokenKind.LBracket { return _parse_list_literal(p) }
@@ -431,7 +432,7 @@ pub fn _parse_primary(p: Parser) -> Node {
     if kind == TokenKind.KwMatch { return parse_match(p, true) }
     if kind == TokenKind.KwFn {
         let anonymous = parse_fn_rest(p, Visibility.Private, false, start_index, false, false)
-        return anonymous ?? p._error_expr(token.span)
+        return anonymous ?? p._error_expr(p._span_of(token))
     }
     if kind == TokenKind.KwYield {
         p._advance()
@@ -442,25 +443,25 @@ pub fn _parse_primary(p: Parser) -> Node {
     if kind == TokenKind.Ident { return _parse_ident_primary(p, token, start_index) }
 
     let diag = p._error_at(
-        token.span,
+        p._span_of(token),
         Code.E0102_EXPECTED_EXPRESSION,
         f"expected an expression, found {p._describe(token)}"
     )
     if diag != null {
         if kind == TokenKind.KwElse or kind == TokenKind.KwElif {
-            diag.with_help(f"put `{token.text}` on the same line as the closing `}}`")
+            diag.with_help(f"put `{token.word}` on the same line as the closing `}}`")
         } elif kind == TokenKind.Eq {
             diag.with_help("`==` compares, `=` assigns")
         }
     }
-    return p._error_expr(token.span)
+    return p._error_expr(p._span_of(token))
 }
 
 pub fn _parse_ident_primary(p: Parser, token: Token, start_index: int) -> Node {
-    if token.text == "new" and p._kind_at(1) == TokenKind.Ident {
-        let class_name = p._token_at(p.current + 1).text
+    if token.word == "new" and p._kind_at(1) == TokenKind.Ident {
+        let class_name = p._token_at(p.current + 1).word
         p._error_recovered(
-            token.span,
+            p._span_of(token),
             Code.E0100_UNEXPECTED_TOKEN,
             "the `new` keyword was removed in Jaithon 3",
             help: f"a class is callable: write `{class_name}(...)`"
@@ -468,11 +469,11 @@ pub fn _parse_ident_primary(p: Parser, token: Token, start_index: int) -> Node {
         p._advance()
         return _parse_primary(p)
     }
-    if token.text == "await" and _starts_await_operand(p._kind_at(1)) {
+    if token.word == "await" and _starts_await_operand(p._kind_at(1)) {
         p._advance()
         let operand = parse_unary(p)
         return _wrap(NodeKind.Await, p._span_since(start_index), operand)
     }
     p._advance()
-    return _ident(token.span, token.text)
+    return _ident(p._span_of(token), token.word)
 }
