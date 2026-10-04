@@ -548,6 +548,14 @@ static bool primGridNonzero(int argc, Value *args, Value *out) {
         /* Only a boxed source can hold something that is not a number; an
          * unboxed one is numbers by construction, so the pass is skipped
          * rather than boxing every element to ask. */
+        /* An untyped list of bools can be unboxed too (jaiListShapeOnGrow),
+         * and it says the same thing a boxed one would; a `list[bool]` was
+         * always read as 0/1 and still is. */
+        if ((ListStore)srcStore == LIST_STORE_U8 &&
+            items->elemKind == FIELD_KIND_ANY && srcCount != 0) {
+            return jaiThrow(vm.cTypeError,
+                            "grid_nonzero(): source element 0 is bool, not a number");
+        }
         if ((ListStore)srcStore == LIST_STORE_BOXED) {
             const Value *boxed = (const Value *)src;
             for (size_t i = 0; i < srcCount; i++) {
