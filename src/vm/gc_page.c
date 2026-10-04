@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 
 #include "vm/gc.h"
+#include "vm/object/object.h"
 
 /* The reserved range. Address space only: a page is touched, and so costs
  * memory, when the allocator first carves it. 32 GiB of small objects is far
@@ -19,7 +20,8 @@
     ((unsigned)(((sizeof(JaiPage) + 127u) & ~(size_t)127u) >> 4))
 
 JaiPageCursor jaiPageCursor[JAI_SMALL_CLASSES + 1];
-bool          jaiPageKind[OBJ_TYPE_COUNT];
+JaiPageCursor jaiPageCursorFin[JAI_SMALL_CLASSES + 1];
+uint8_t       jaiPageKind[OBJ_TYPE_COUNT];
 uintptr_t     jaiPageBase;
 uintptr_t     jaiPageSpan;
 
@@ -75,22 +77,47 @@ void jaiPageSpaceInit(void) {
     jaiPageBase = base;
     jaiPageSpan = JAI_PAGE_RESERVE;
 
+    for (unsigned c = 0; c <= JAI_SMALL_CLASSES; c++) {
+        jaiPageCursor[c].cls = (uint16_t)c;
+        jaiPageCursorFin[c].cls = (uint16_t)c;
+        jaiPageCursorFin[c].fin = 1;
+    }
+
     /* Exactly the kinds jaiObjSoleBlock sizes: nothing to free but the block. */
-    jaiPageKind[OBJ_STRING] = true;
-    jaiPageKind[OBJ_STRBUF] = true;
-    jaiPageKind[OBJ_BYTES] = true;
-    jaiPageKind[OBJ_TUPLE] = true;
-    jaiPageKind[OBJ_INSTANCE] = true;
-    jaiPageKind[OBJ_ENUM_VAL] = true;
-    jaiPageKind[OBJ_RANGE] = true;
-    jaiPageKind[OBJ_UPVALUE] = true;
-    jaiPageKind[OBJ_NATIVE] = true;
-    jaiPageKind[OBJ_BOUND] = true;
-    jaiPageKind[OBJ_ITER] = true;
-    jaiPageKind[OBJ_ENUM_CTOR] = true;
+    jaiPageKind[OBJ_STRING] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_STRBUF] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_BYTES] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_TUPLE] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_INSTANCE] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_ENUM_VAL] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_RANGE] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_UPVALUE] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_NATIVE] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_BOUND] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_ITER] = JAI_PAGE_PLAIN;
+    jaiPageKind[OBJ_ENUM_CTOR] = JAI_PAGE_PLAIN;
+
+    /* The common kinds that own one array or table, which jaiObjFinalize
+     * frees. The rare ones stay on the list. */
+    const char *f = getenv("JAITHON_GC_FIN_PAGES");
+    if (!(f != NULL && f[0] == '0')) {
+        jaiPageKind[OBJ_LIST] = JAI_PAGE_FIN;
+        jaiPageKind[OBJ_DICT] = JAI_PAGE_FIN;
+        jaiPageKind[OBJ_SET] = JAI_PAGE_FIN;
+        jaiPageKind[OBJ_CLOSURE] = JAI_PAGE_FIN;
+    }
 }
 
-static JaiPage *newPage(unsigned cls) {
+/* Every cursor, plain then finalizing. */
+#define FOR_EACH_CURSOR(pc)                                                     \
+    for (unsigned fi_ = 0; fi_ < 2u; fi_++)                                     \
+        for (unsigned c_ = 1; c_ <= JAI_SMALL_CLASSES; c_++)                    \
+            for (JaiPageCursor *pc = fi_ ? &jaiPageCursorFin[c_]                \
+                                         : &jaiPageCursor[c_];                  \
+                 pc != NULL; pc = NULL)
+
+static JaiPage *newPage(JaiPageCursor *pc) {
+    const unsigned cls = pc->cls;
     JaiPage *pg = gPool;
     if (pg != NULL) {
         gPool = pg->next;
@@ -102,7 +129,7 @@ static JaiPage *newPage(unsigned cls) {
     if (gCapacity[cls] == 0) buildPattern(cls);
     pg->cls = cls;
     pg->liveBlocks = 0;
-    JaiPageCursor *pc = &jaiPageCursor[cls];
+    pg->fin = pc->fin;
     pg->next = pc->pages;
     pc->pages = pg;
     return pg;
@@ -114,13 +141,17 @@ static JaiPage *newPage(unsigned cls) {
  * so every allocation comes back through here and through the jaiGCWanted()
  * test its caller makes on the way; a whole word handed out would let sixteen
  * allocations pass a stress collection by. */
-static void *handOut(JaiPageCursor *pc, unsigned cls, uint64_t m) {
+static void *handOut(JaiPageCursor *pc, uint64_t m) {
+    const unsigned cls = pc->cls;
     uint64_t take = m;
     pc->stash = 0;
     if (JAI_UNLIKELY(jaiGCLimit == 0)) {
         take = m & (~m + 1u);
         pc->stash = m & (m - 1u);
     }
+    /* In use from now: the ones never popped are taken back at the next
+     * collection's start (jaiPageCollectBegin). */
+    if (pc->fin) pc->page->inuse[pc->word] |= take;
     unsigned n = (unsigned)__builtin_popcountll(take);
     pc->handedOut += n;
     jaiHeapBytes += (size_t)n * cls * 16u;
@@ -128,11 +159,11 @@ static void *handOut(JaiPageCursor *pc, unsigned cls, uint64_t m) {
     return pc->wordBase + ((size_t)__builtin_ctzll(take) << 4);
 }
 
-void *jaiPageRefill(unsigned cls) {
+void *jaiPageRefill(JaiPageCursor *pc) {
     if (jaiPageSpan == 0 || jaiGCInCollect) return NULL;
 
-    JaiPageCursor *pc = &jaiPageCursor[cls];
-    if (pc->stash != 0) return handOut(pc, cls, pc->stash);
+    const unsigned cls = pc->cls;
+    if (pc->stash != 0) return handOut(pc, pc->stash);
     const uint64_t *pat = gPattern[cls];
     JaiPage *pg = pc->page;
     unsigned w = pc->word + 1u;
@@ -155,7 +186,7 @@ void *jaiPageRefill(unsigned cls) {
                         for (unsigned l = 0; l < 1024u; l += 128u)
                             __builtin_prefetch(ahead + l, 1, 3);
                     }
-                    return handOut(pc, cls, m);
+                    return handOut(pc, m);
                 }
             }
         }
@@ -167,7 +198,7 @@ void *jaiPageRefill(unsigned cls) {
          * whole run of full ones again, quadratic in a large live heap. */
         pc->nextPage = pg != NULL ? pg->next : NULL;
         if (pg == NULL) {
-            pg = newPage(cls);
+            pg = newPage(pc);
             if (pg == NULL) {
                 pc->page = NULL;
                 return NULL;
@@ -191,9 +222,11 @@ static void resetCursor(JaiPageCursor *pc) {
 void jaiPageCollectBegin(void) {
     if (jaiPageSpan == 0) return;
     size_t inUse = gLiveBytes;
-    for (unsigned cls = 1; cls <= JAI_SMALL_CLASSES; cls++) {
-        JaiPageCursor *pc = &jaiPageCursor[cls];
+    FOR_EACH_CURSOR(pc) {
+        const unsigned cls = pc->cls;
         uint64_t unused = (uint64_t)__builtin_popcountll(pc->freeMask);
+        /* Handed out but never popped: no object there to finalize. */
+        if (pc->fin && pc->page != NULL) pc->page->inuse[pc->word] &= ~pc->freeMask;
         uint64_t used = pc->handedOut - unused;
         inUse += (size_t)used * cls * 16u;
         /* Charged when the word was handed out, never allocated. */
@@ -219,6 +252,21 @@ static void poisonFree(JaiPage *pg, unsigned cls) {
     }
 }
 
+/* Frees what each dead object of a finalizing page owns -- in use, unmarked --
+ * and makes the marked ones the in-use set. Before any poisoning, since it
+ * reads the objects. */
+static void finalizeDead(JaiPage *pg) {
+    for (unsigned w = 0; w < JAI_PAGE_WORDS; w++) {
+        uint64_t dead = pg->inuse[w] & ~pg->mark[w];
+        pg->inuse[w] = pg->mark[w];
+        while (dead != 0) {
+            unsigned g = (w << 6) + (unsigned)__builtin_ctzll(dead);
+            dead &= dead - 1;
+            jaiObjFinalize((Obj *)(void *)((char *)pg + ((size_t)g << 4)));
+        }
+    }
+}
+
 size_t jaiPageCollectEnd(void) {
     if (jaiPageSpan == 0) return 0;
     size_t liveBytes = 0;
@@ -229,11 +277,12 @@ size_t jaiPageCollectEnd(void) {
      * every cycle start on the coldest page it owned. */
     JaiPage *emptied = NULL;
     JaiPage **emptiedTail = &emptied;
-    for (unsigned cls = 1; cls <= JAI_SMALL_CLASSES; cls++) {
-        JaiPageCursor *pc = &jaiPageCursor[cls];
+    FOR_EACH_CURSOR(pc) {
+        const unsigned cls = pc->cls;
         JaiPage **link = &pc->pages;
         while (*link != NULL) {
             JaiPage *pg = *link;
+            if (pg->fin) finalizeDead(pg);
             uint32_t n = 0;
             for (unsigned w = 0; w < JAI_PAGE_WORDS; w++) {
                 uint64_t m = pg->mark[w];
@@ -246,6 +295,7 @@ size_t jaiPageCollectEnd(void) {
                 if (gPoison) poisonFree(pg, cls);
                 pg->cls = 0;
                 pg->liveBlocks = 0;
+                pg->fin = 0;
                 pg->next = NULL;
                 *emptiedTail = pg;
                 emptiedTail = &pg->next;
@@ -270,14 +320,16 @@ size_t jaiPageSpaceReset(void) {
     if (jaiPageSpan == 0) return 0;
     jaiPageCollectBegin();
     size_t inUse = gInUseAtBegin;
-    for (unsigned cls = 1; cls <= JAI_SMALL_CLASSES; cls++) {
-        JaiPageCursor *pc = &jaiPageCursor[cls];
+    FOR_EACH_CURSOR(pc) {
         JaiPage *pg = pc->pages;
         while (pg != NULL) {
             JaiPage *next = pg->next;
             memset(pg->mark, 0, sizeof pg->mark);
+            if (pg->fin) finalizeDead(pg);   /* nothing marked: all of them */
             memset(pg->live, 0, sizeof pg->live);
+            memset(pg->inuse, 0, sizeof pg->inuse);
             pg->cls = 0;
+            pg->fin = 0;
             pg->liveBlocks = 0;
             pg->next = gPool;
             gPool = pg;

@@ -96,8 +96,11 @@ static inline Obj *allocObj(size_t size, ObjType type) {
          * the collector frees it without visiting it and nothing links it into
          * GCState.objects (gc.h). */
         unsigned cls = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
-        if (JAI_LIKELY(jaiPageKind[type]) &&
-            JAI_LIKELY((obj = (Obj *)jaiPageNew(cls)) != NULL)) {
+        const uint8_t kind = jaiPageKind[type];
+        if (JAI_LIKELY(kind != 0) &&
+            JAI_LIKELY((obj = (Obj *)jaiPageNewAt(
+                            kind == JAI_PAGE_FIN ? &jaiPageCursorFin[cls]
+                                                 : &jaiPageCursor[cls])) != NULL)) {
             obj->type = type;
             obj->isMarked = jaiGCEpoch;
             obj->subFlag = false;
@@ -135,6 +138,35 @@ Obj *jaiAllocateObject(size_t size, ObjType type) {
      * mention a field leaves it NULL or 0 rather than garbage. */
     memset((char *)obj + sizeof(Obj), 0, size - sizeof(Obj));
     return obj;
+}
+
+/* What a finalizing page's sweep calls on a dead object: frees what it owns,
+ * and not the block, which belongs to the page. Exactly the kinds
+ * jaiPageSpaceInit marks JAI_PAGE_FIN, freed exactly as jaiFreeObject frees
+ * them. */
+void jaiObjFinalize(Obj *obj) {
+    switch (obj->type) {
+    case OBJ_LIST: {
+        ObjList *l = (ObjList *)obj;
+        JAI_FREE_ARRAY(char, l->items,
+                       (size_t)l->capacity * jaiListStoreWidth(l->stg));
+        return;
+    }
+    case OBJ_DICT:
+        jaiTableFree(&((ObjDict *)obj)->table);
+        return;
+    case OBJ_SET:
+        jaiTableFree(&((ObjSet *)obj)->table);
+        return;
+    case OBJ_CLOSURE: {
+        ObjClosure *c = (ObjClosure *)obj;
+        JAI_FREE_ARRAY(ObjUpvalue *, c->upvalues, c->upvalueCount);
+        return;
+    }
+    default:
+        JAI_PANIC("jaiObjFinalize: a %s in a finalizing page",
+                  jaiObjTypeName(obj->type));
+    }
 }
 
 void jaiFreeObject(Obj *obj) {

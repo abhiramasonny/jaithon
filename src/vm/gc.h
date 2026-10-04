@@ -99,10 +99,16 @@ JAI_INLINE void jaiGCMark(Obj *obj) {
  * the allocator, which pops a bit instead of loading a free-list link from the
  * block it is about to hand out.
  *
- * Everything that owns an array, a table or a FILE stays on the list and is
- * swept exactly as before, since freeing it means visiting it.
+ * Lists, dicts, sets and closures own an array or a table, so a dead one has
+ * to be visited to free it. They live in FINALIZING pages of their own, which
+ * also keep an in-use bitmap: the sweep visits exactly in-use-and-unmarked,
+ * in address order, and never a survivor -- where the list sweep chased `next`
+ * through every one of them, live or dead, at 85ns apiece on `check
+ * lib/jaithon`. Everything rarer that owns something (functions, classes,
+ * modules, enums, traits, files) stays on the list and is swept as before.
  *
- * JAITHON_GC_PAGES=0 sends every object down the list path again. */
+ * JAITHON_GC_PAGES=0 sends every object down the list path again, and
+ * JAITHON_GC_FIN_PAGES=0 just the finalizing kinds. */
 #define JAI_PAGE_SHIFT  16u
 #define JAI_PAGE_BYTES  ((size_t)1 << JAI_PAGE_SHIFT)
 #define JAI_PAGE_GRAINS (JAI_PAGE_BYTES >> 4)
@@ -111,9 +117,13 @@ JAI_INLINE void jaiGCMark(Obj *obj) {
 typedef struct JaiPage {
     uint64_t        mark[JAI_PAGE_WORDS];   /* set by the marker this cycle */
     uint64_t        live[JAI_PAGE_WORDS];   /* marked at the last collection */
+    /* Finalizing pages only: every block holding an object -- live at the last
+     * collection or handed out since. Zero on any other page. */
+    uint64_t        inuse[JAI_PAGE_WORDS];
     struct JaiPage *next;                   /* its class's list, or the pool */
     uint32_t        cls;                    /* grains per block; 0 in the pool */
     uint32_t        liveBlocks;
+    uint32_t        fin;                    /* a finalizing page */
 } JaiPage;
 
 /* The allocator's position in one size class. The first two fields are the
@@ -128,17 +138,22 @@ typedef struct {
     uint64_t stash;      /* free blocks of the current word held back, one at a
                           * time, while jaiGCLimit is 0 (see jaiPageRefill) */
     uint32_t word;       /* index of the current word in `page` */
-    uint32_t pad;
+    uint16_t cls;        /* grains per block, fixed per cursor */
+    uint16_t fin;        /* serves finalizing pages */
 } JaiPageCursor;
 
 extern JaiPageCursor jaiPageCursor[JAI_SMALL_CLASSES + 1];
-/* Which kinds may live in a page. All false when the page space is off, so the
- * allocator's one table load is the whole cost of the switch. */
-extern bool      jaiPageKind[OBJ_TYPE_COUNT];
+extern JaiPageCursor jaiPageCursorFin[JAI_SMALL_CLASSES + 1];
+/* Which kinds may live in a page: JAI_PAGE_PLAIN, JAI_PAGE_FIN, or 0. All 0
+ * when the page space is off, so the allocator's one table load is the whole
+ * cost of the switch. */
+#define JAI_PAGE_PLAIN 1u
+#define JAI_PAGE_FIN   2u
+extern uint8_t   jaiPageKind[OBJ_TYPE_COUNT];
 extern uintptr_t jaiPageBase;
 extern uintptr_t jaiPageSpan;   /* 0 when off: nothing is in range */
 
-void *jaiPageRefill(unsigned cls);
+void *jaiPageRefill(JaiPageCursor *pc);
 
 JAI_INLINE bool jaiInPageSpace(const void *p) {
     return (uintptr_t)p - jaiPageBase < jaiPageSpan;
@@ -150,14 +165,17 @@ JAI_INLINE bool jaiInPageSpace(const void *p) {
  * hands the word out, so the pop below is all an allocation costs -- and a
  * caller that does not ask jaiGCWanted() first still meets the collector at
  * the next refill, at most one 1 KiB word later. */
-JAI_INLINE void *jaiPageNew(unsigned cls) {
-    JaiPageCursor *pc = &jaiPageCursor[cls];
+JAI_INLINE void *jaiPageNewAt(JaiPageCursor *pc) {
     uint64_t m = pc->freeMask;
     if (JAI_LIKELY(m != 0)) {
         pc->freeMask = m & (m - 1);
         return pc->wordBase + ((size_t)__builtin_ctzll(m) << 4);
     }
-    return jaiPageRefill(cls);
+    return jaiPageRefill(pc);
+}
+
+JAI_INLINE void *jaiPageNew(unsigned cls) {
+    return jaiPageNewAt(&jaiPageCursor[cls]);
 }
 
 /* Sets the page's mark bit for a page object. The marker's job, nobody else's. */
@@ -167,6 +185,9 @@ JAI_INLINE void jaiPageMark(const Obj *obj) {
     unsigned g = (unsigned)((a >> 4) & (JAI_PAGE_GRAINS - 1));
     pg->mark[g >> 6] |= (uint64_t)1 << (g & 63u);
 }
+
+/* Frees what a dead finalizing-page object owns (object.c). */
+void jaiObjFinalize(Obj *obj);
 
 void jaiPageSpaceInit(void);
 /* Called at the start of a collection, before anything is marked. */
