@@ -111,7 +111,9 @@ ListAccess listAccessFor(Emit *e, unsigned rList, int slot,
     if (e->osr && slot >= 0 && slot <= (int)JIT_MAX_SLOTS) {
         int h = hoistFor(e, slot);
         if (h >= 0 && e->hoist[h].stgPin &&
-            listStgKind(e->hoist[h].stg) == vk) {
+            (listStgKind(e->hoist[h].stg) == vk ||
+             (e->hoist[h].stg == (uint8_t)LIST_STORE_BOXED &&
+              listAltFor(vk) == (uint8_t)LIST_STORE_BOXED))) {
             a.stg = e->hoist[h].stg;
             a.alt = a.stg;
             a.dynamic = false;
@@ -265,6 +267,31 @@ static bool jitHoistStg(void) {
 
 /* JAITHON_JIT_INDEX_REG: a subscript whose header is hoisted and whose
  * bounds and storage are proved loads through `[items, idx, lsl #n]`. */
+/* JAITHON_JIT_HOIST_BOXED: a hoisted list of objects proves BOXED once. */
+static bool jitHoistBoxed(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_BOXED");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Whether the live list in `slot` holds objects -- the kind of element no
+ * unboxed storage represents. Read off the first element, as the access sites
+ * read their own exemplar; a list that turns out otherwise is still only
+ * guarded BOXED, which every list of anything satisfies or deopts on. */
+static bool hoistHoldsObjects(const Emit *e, unsigned slot) {
+    if (e->observed == NULL || slot > JIT_MAX_SLOTS) return false;
+    if (e->localKind[slot] != SLOT_LIST) return false;
+    Value v = e->observed[slot];
+    if (!IS_LIST(v)) return false;
+    ObjList *l = AS_LIST(v);
+    if (l->stg != LIST_STORE_BOXED || l->count <= 0) return false;
+    Value first = jaiListGet(l, 0);
+    return IS_OBJ(first);
+}
+
 /* JAITHON_JIT_HOIST_LEAN: a hoist takes one register for `items`, a list
  * stored into takes one for its bumped version, and counts get the rest. See
  * Emit::hoist. */
@@ -445,6 +472,12 @@ void planHoists(Emit *e, ObjFunction *fn) {
             if (sampled != (uint8_t)LIST_STORE_BOXED) {
                 e->hoist[e->hoistCount].stgPin = true;
                 e->hoist[e->hoistCount].stg    = sampled;
+            } else if (jitHoistBoxed() && hoistHoldsObjects(e, cand[pick].slot)) {
+                /* A list of lists, instances or strings has no other storage
+                 * to be in, so its per-access "still boxed?" guard is the same
+                 * question every time -- asked once here instead. */
+                e->hoist[e->hoistCount].stgPin = true;
+                e->hoist[e->hoistCount].stg    = (uint8_t)LIST_STORE_BOXED;
             }
         }
         uint32_t ht = cand[pick].top;
