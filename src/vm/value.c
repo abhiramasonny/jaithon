@@ -1355,6 +1355,17 @@ static JAI_NOINLINE ObjString *formatLeafMiss(const Value *parts,
     return formatShort(parts, (int)count, &made) ? made : NULL;
 }
 
+/* A miss whose bytes are already built: the string made from them, unless a
+ * collection is due -- the one state in which its allocation could collect --
+ * when NULL sends the caller to the descriptor path. Before this a miss
+ * formatted every part a second time on the way to the same jaiStringNew,
+ * which a stream of distinct strings (`parts.push(f"item-{i}")`) paid on
+ * every one of them. */
+static JAI_NOINLINE ObjString *formatLeafBuilt(const char *buf, size_t o) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    return o == 0 ? jaiStringIntern("", 0) : jaiStringNew(buf, o);
+}
+
 ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
     if (count <= 0 || count > JAI_FMT_MAX_PARTS || !fmtShortOn()) return NULL;
     /* An intern hit allocates nothing, so it needs no collection test; only
@@ -1367,6 +1378,7 @@ ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
     if (JAI_LIKELY(o >= 0)) {
         ObjString *found = formatShortProbe(buf, (size_t)o);
         if (JAI_LIKELY(found != NULL)) return found;
+        return formatLeafBuilt(buf, (size_t)o);
     }
     return formatLeafMiss(parts, count);
 }
@@ -1402,6 +1414,7 @@ ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
         if (JAI_LIKELY(o <= JAI_STR_SHORT_MAX && fmtRun(buf, &o, post))) {
             ObjString *found = formatShortProbe(buf, o);
             if (JAI_LIKELY(found != NULL)) return found;
+            return formatLeafBuilt(buf, o);
         }
     }
     Value parts[3];
