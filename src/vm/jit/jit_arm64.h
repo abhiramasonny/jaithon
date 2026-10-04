@@ -93,6 +93,10 @@ uint32_t jaiA64StrByte(unsigned rt, unsigned rn, unsigned offset);
  * word, so reading it four bytes wide returns the neighbour in the high bits. */
 uint32_t jaiA64LdrHalf(unsigned rd, unsigned rn, unsigned offset);
 uint32_t jaiA64AndX(unsigned rd, unsigned rn, unsigned rm);
+/* rbit Xd, Xn -- reverse the bits; with clz, a count of trailing zeros */
+uint32_t jaiA64RbitX(unsigned rd, unsigned rn);
+/* clz Xd, Xn -- leading zeros, 64 for zero */
+uint32_t jaiA64ClzX(unsigned rd, unsigned rn);
 uint32_t jaiA64OrrX(unsigned rd, unsigned rn, unsigned rm);
 /* and Xd, Xn, #((1 << ones) - 1) -- `ones` is 1..63, a low run of set bits */
 uint32_t jaiA64AndXOnes(unsigned rd, unsigned rn, unsigned ones);
