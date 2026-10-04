@@ -179,8 +179,11 @@ static void addPackageDirsRelative(const char *base, const char *suffix) {
  * change where an earlier success was found; anything that rebuilds or
  * prepends to it clears the memo. What the memo does give up is noticing a
  * file that appears, mid-run, earlier on the path than one already found --
- * the same trade Python's sys.modules makes. JAITHON_RESOLVE_MEMO=0 turns it
- * off. */
+ * the same trade Python's sys.modules makes. A resolution that looked in a
+ * directory named relative to the current one is not kept at all, nor is a
+ * relative candidate's realpath: after an os.chdir the REPL's `import m` must
+ * find the new directory's m, as it always did. JAITHON_RESOLVE_MEMO=0 turns
+ * it off. */
 typedef struct {
     char    *key;      /* NULL for an empty slot */
     size_t   keyLen;
@@ -576,7 +579,9 @@ bool isRegularFile(const char *path) {
 }
 
 bool storeResolved(char *out, size_t outSize, const char *candidate) {
-    if (memoEnabled()) {
+    /* A relative candidate means something else after a chdir, so only an
+     * absolute one is remembered. */
+    if (memoEnabled() && candidate[0] == '/') {
         size_t len = strlen(candidate);
         uint32_t hash = memoHash(candidate, len);
         const char *hit = memoFind(&sCanonical, candidate, len, hash);
@@ -601,10 +606,18 @@ bool storeResolved(char *out, size_t outSize, const char *candidate) {
     return true;
 }
 
+/* Set when a resolution looked in a directory named relative to the current
+ * one: what it found, or did not find, can change with a chdir, so it is not
+ * remembered. The REPL imports from ".", and a module path with no directory
+ * does the same. */
+static bool sSawRelativeDir;
+
 static bool tryDirectory(const char *dir, const char *relative, char *out,
                          size_t outSize) {
     char leaf[JAI_MAX_PATH];
     char candidate[JAI_MAX_PATH];
+
+    if (dir[0] != '/') sSawRelativeDir = true;
 
     int n = snprintf(leaf, sizeof leaf, "%s%s", relative, JAI_MODULE_EXT);
     if (n > 0 && (size_t)n < sizeof leaf) {
@@ -632,6 +645,7 @@ static void noteSearched(JaiBuf *searched, int *count, const char *dir) {
 static bool relativeBase(const char *fromDir, int dots, char *out,
                          size_t outSize) {
     const char *start = (fromDir != NULL && fromDir[0] != '\0') ? fromDir : ".";
+    if (start[0] != '/') sSawRelativeDir = true;
     if (!storeResolved(out, outSize, start)) return false;
 
     for (int i = 1; i < dots; i++) {
@@ -666,8 +680,10 @@ bool jaiResolveModulePath(const char *dottedName, const char *fromDir,
             return true;
         }
     }
+    sSawRelativeDir = false;
     if (!resolveUncached(dottedName, fromDir, out, outSize)) return false;
-    if (out[0] != '\0') memoInsert(&sResolved, key, len, hash, out);
+    if (out[0] != '\0' && !sSawRelativeDir)
+        memoInsert(&sResolved, key, len, hash, out);
     return true;
 }
 

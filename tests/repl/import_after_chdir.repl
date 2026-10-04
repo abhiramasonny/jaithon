@@ -1,0 +1,9 @@
+import std.os as os
+os.chdir("chdir_a")
+import probe as first
+print(first.which())
+os.chdir("../chdir_b")
+import probe as second
+print(second.which())
+from .probe import which
+print(which())
