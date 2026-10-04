@@ -96,6 +96,21 @@ int jitInvokeByName(JitCallDesc *d) {
     return ok ? 0 : 1;
 }
 
+/* The same, at a site whose loop form may be re-compiled for more ways
+ * (jitOsrPicShort): `aux` carries the site's InlineCache, and a call that
+ * succeeds teaches it the receiver's class. */
+int jitInvokeByNameLearn(JitCallDesc *d) {
+    Value receiver = d->args[0];
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    bool ok = jaiInvokeMethodByName(AS_STRING(d->callee), d->args,
+                                    (int)d->argc, &d->result);
+    jaiGCPopRootRange();
+    if (!ok) return 1;
+    jaiInvokeCacheLearn((InlineCache *)(uintptr_t)d->aux, receiver,
+                        AS_STRING(d->callee));
+    return 0;
+}
+
 int jitInvokeNative(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     bool ok = jaiInvokeNativeWithReceiver(d->callee, d->args, (int)d->argc,

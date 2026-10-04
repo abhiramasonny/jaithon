@@ -803,8 +803,24 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                     }
                 }
 
+                /* A loop form can be re-compiled for more ways (see
+                 * jitOsrPicShort), but only if the site's cache keeps
+                 * learning classes -- and once this form runs, every class
+                 * it does not hold comes through here rather than through
+                 * the interpreter's miss. So the call out carries the cache
+                 * in `aux` and fills a way on the interpreter's behalf. */
+                bool learn = e->osr && jitPicUpgradeOn() &&
+                             fn->chunk.caches != NULL &&
+                             (int)invokeCache < fn->chunk.cacheCount;
+                if (learn) {
+                    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)
+                                &fn->chunk.caches[invokeCache]);
+                    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31, e->descOffset +
+                                       (unsigned)offsetof(JitCallDesc, aux)));
+                }
                 if (!emitDescriptor(e, mname, ridx, argc + 1,
-                                    (void *)&jitInvokeByName)) {
+                                    learn ? (void *)&jitInvokeByNameLearn
+                                          : (void *)&jitInvokeByName)) {
                     return false;
                 }
                 for (unsigned i = 0; i <= argc; i++) {

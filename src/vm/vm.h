@@ -261,6 +261,9 @@ bool jaiInvokeMethod(Value receiver, ObjString *name, int argc, Value *args,
  * returning false when there is no such method. */
 bool jaiInvokeMethodByName(ObjString *name, Value *argsWithReceiver, int count,
                            Value *out);
+/* Add the receiver's class as one more way of an OP_INVOKE site's cache, as
+ * the interpreter's miss would. See jaiInvokeCacheLearn in vm_call.c. */
+void jaiInvokeCacheLearn(InlineCache *ic, Value receiver, ObjString *name);
 
 /* Field access honouring visibility and properties. */
 bool jaiGetProperty(Value receiver, ObjString *name, Value *out);

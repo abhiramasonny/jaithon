@@ -165,28 +165,60 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
     ObjFunction *wayFn  [JAI_IC_WAYS];
     ObjClass    *wayCls [JAI_IC_WAYS];
     unsigned    ways = 0;
+    unsigned    curable = 0;   /* dropped ways that time alone can mend */
 
     for (int w = 0; w < ic->count && w < JAI_IC_WAYS; w++) {
+        const char *drop = NULL;
         /* What the cache settles is which method a shape resolves to, not
          * whether THIS caller may call it -- one site can present as two
          * classes at different visibilities, so the interpreter re-decides
          * that on every hit and nothing emitted here can. */
-        if (ic->payload[w] != 0) continue;
         Value cv = ic->cached[w];
-        if (!IS_CLOSURE(cv)) continue;
-        ObjFunction *cf = AS_CLOSURE(cv)->fn;
-        if (cf->jitFunc == NULL) continue;
-        if ((SlotKind)cf->jitReturnKind != rkind || cf->jitReturnShape != 0) {
+        ObjFunction *cf = IS_CLOSURE(cv) ? AS_CLOSURE(cv)->fn : NULL;
+        ObjClass *cc = NULL;
+        bool later = false;   /* a drop that time alone can mend */
+        if (ic->payload[w] != 0) drop = "not public";
+        else if (cf == NULL) drop = "not a closure";
+        else if (cf->jitFunc == NULL) {
+            drop = "callee not compiled";
+            later = true;
+        } else if ((SlotKind)cf->jitReturnKind != rkind ||
+                 cf->jitReturnShape != 0) {
+            drop = "callee returns another kind";
+        } else if (!jaiClassForShape(ic->shapeId[w], &cc) || cc == NULL) {
+            drop = "class not on record";
+            later = true;
+        } else if (!jitPic1Admissible(e, fn, cf, ridx, argc, ic->shapeId[w])) {
+            drop = "not admissible";
+        }
+        if (drop != NULL) {
+            if (later) curable++;
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] pic way %d at %u dropped: %s\n",
+                        w, callOff, drop);
+            }
             continue;
         }
-        ObjClass *cc = NULL;
-        if (!jaiClassForShape(ic->shapeId[w], &cc) || cc == NULL) continue;
-        if (!jitPic1Admissible(e, fn, cf, ridx, argc, ic->shapeId[w])) continue;
         wayShape[ways] = ic->shapeId[w];
         wayVal[ways]   = cv;
         wayFn[ways]    = cf;
         wayCls[ways]   = cc;
         ways++;
+    }
+    /* Fewer ways than the cache holds is usually a matter of TIME, not of
+     * the program: the tick that compiled this loop landed before some of
+     * the site's callees had been called often enough to compile. The form
+     * would otherwise keep that shortfall for the rest of the run, every
+     * missing class going round the descriptor -- poly_dispatch measured
+     * 400M cycles for a 1-way form against 125M for the 8-way one, decided
+     * by when the timer fired. Noted, so the form can be compiled again
+     * once the stragglers have compiled. */
+    /* A cache that can still grow is short too: a site whose first callee
+     * had barely run was compiled "1-way of 1 recorded", and the seven
+     * classes it met afterwards never reached the form. */
+    if (e->osr && (curable > 0 ||
+                   (ic->state != IC_MEGA && ic->count < JAI_IC_WAYS))) {
+        jitOsrPicShort(siteCache, ways, rkind);
     }
     if (ways == 0) return subWhy(e, "no way of this site's cache is usable");
 

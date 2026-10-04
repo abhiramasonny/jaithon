@@ -763,6 +763,7 @@ extern JitDeoptRecord gDeopt;
 void jitThrowOverflow(int64_t which);
 int jitInvokeMethod(JitCallDesc *d);
 int jitInvokeByName(JitCallDesc *d);
+int jitInvokeByNameLearn(JitCallDesc *d);
 int jitInvokeNative(JitCallDesc *d);
 int jitBuildList(JitCallDesc *d);
 int jitContains(JitCallDesc *d);
@@ -1049,6 +1050,13 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
                            unsigned argc, uint32_t callOff, uint32_t after,
                            int siteCache, bool havePrediction, SlotKind rkind,
                            int *toEnd);
+/* An OSR compile's polymorphic site took `ways` of the ways its cache holds,
+ * short because a way's callee had not compiled yet (or its class was not on
+ * record). jit_osr.c attaches the note to the form it installs, and
+ * re-compiles that form once more of the site's ways have become usable.
+ * JAITHON_JIT_PIC_UPGRADE=0 turns the re-compile off. */
+void jitOsrPicShort(int siteCache, unsigned ways, SlotKind rkind);
+bool jitPicUpgradeOn(void);
 bool offsetIsBranchTarget(const Chunk *c, uint32_t off);
 bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
                               int64_t *out);

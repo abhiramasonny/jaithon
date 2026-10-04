@@ -439,6 +439,7 @@ this table complete in both directions.
 | `JAITHON_JIT_MAYBE_OBJ_STACK` | **off** | Let `SLOT_MAYBE_OBJ` reach the operand stack. Off until every site that reads an entry's kind is shown to exclude or handle it; `1` turns it on. |
 | `JAITHON_JIT_PAIR_LIST` | on | Let a pair loop over a **list of 2-tuples** be an OSR loop head (iterKind 4), not only a dict-items view. The step is not new -- it is `emitForIterPair`'s non-dict tail, which the function tier already reaches; only `jaiJitEnterOsr`'s head gate refused it. Off restores that gate. |
 | `JAITHON_JIT_PIC` | on | The polymorphic inline-cache arm at an invoke. |
+| `JAITHON_JIT_PIC_UPGRADE` | on | Re-compile a loop form whose polymorphic site came up short of ways because the timer tick beat its callees' compiles (`jitOsrPicShort`), and let that form's miss path keep teaching the site's cache (`jitInvokeByNameLearn`). On `poly_dispatch` the form was 0-, 1- or 8-way by the race, 400-490M cycles against 120M; under `JAITHON_JIT_TICK_US=50` it was always short, and this is worth 3.48x there. |
 | `JAITHON_JIT_CLASS_CALLS` | on | Direct calls to a class constructor. |
 | `JAITHON_JIT_MODULE_CALLS` | on | Calls through a module member. |
 | `JAITHON_JIT_MODULE_NATIVE` | on | Native calls through a module member. |
