@@ -5,7 +5,22 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "vm/jit/jit_internal.h"
+
+/* JAITHON_JIT_HOIST_FRESH_COUNT: a subscript of a hoisted list whose count is
+ * not in a register (the pool ran out, or the loop pushes -- see regionPushes)
+ * and that the head's guard does not cover keeps the hoisted `items` and reads
+ * only `count` fresh. The count feeds the bounds branch and nothing else, so
+ * the element's address no longer waits on a header load. */
+static bool jitHoistFreshCount(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_FRESH_COUNT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
 
 #if (defined(__aarch64__) || defined(__arm64__))
 
@@ -328,6 +343,11 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             gItems = e->hoist[gh].itemsReg;
             gCount = e->hoist[gh].hasCount ? e->hoist[gh].countReg
                                            : JIT_SCRATCH_A;
+        } else if (gh >= 0 && jitHoistFreshCount()) {
+            gItems = e->hoist[gh].itemsReg;
+            emit(e, jaiA64LdrW(gCount, rList,
+                               (unsigned)offsetof(ObjList, count)));
+            gh = -1;
         } else {
             emitListHeader(e, rList, gItems, gCount);
             gh = -1;
@@ -525,6 +545,11 @@ bool emitSetIndex(Emit *e, int *offp) {
             sItems = e->hoist[sh].itemsReg;
             sCount = e->hoist[sh].hasCount ? e->hoist[sh].countReg
                                            : JIT_SCRATCH_A;
+        } else if (sh >= 0 && jitHoistFreshCount()) {
+            sItems = e->hoist[sh].itemsReg;
+            emit(e, jaiA64LdrW(sCount, rList,
+                               (unsigned)offsetof(ObjList, count)));
+            sh = -1;
         } else {
             emitListHeader(e, rList, sItems, sCount);
             sh = -1;
