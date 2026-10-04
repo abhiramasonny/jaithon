@@ -790,6 +790,7 @@ ObjInstance *jitInstanceAlloc(ObjClass *cls);
 int jitNewInstance(JitCallDesc *d);
 int jitGetSlice(JitCallDesc *d);
 int jitGetIndexDict(JitCallDesc *d);
+int jitMakeDictKeysIter(JitCallDesc *d);
 int jitSetIndexDict(JitCallDesc *d);
 
 /* The string-keyed dict leaves and the arm that calls them; see jitDictGetStr. */

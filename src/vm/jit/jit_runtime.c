@@ -290,6 +290,19 @@ int jitMakeItemsIter(JitCallDesc *d) {
     return it != NULL ? 0 : 1;
 }
 
+/* OP_GET_ITER on a dict, for compiled code: the ITER_DICT_KEYS iterator
+ * `for k in d` walks, which is what jaiGetIter builds for a dict. The emitted
+ * guard has already proved the receiver is a dict; the test here is the same
+ * belt-and-braces jitMakeItemsIter carries. */
+int jitMakeDictKeysIter(JitCallDesc *d) {
+    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    Value src = d->args[0];
+    ObjIter *it = IS_DICT(src) ? jaiIterNew(ITER_DICT_KEYS, src) : NULL;
+    if (it != NULL) d->result = OBJ_VAL(it);
+    jaiGCPopRootRange();
+    return it != NULL ? 0 : 1;
+}
+
 /* OP_INVOKE's lazy `xs.enumerate()` head, for compiled code: the same
  * ITER_LIST_ENUM snapshot the interpreter builds at that site (vm.c), so the
  * pair loop that follows walks the same thing under either tier. The emitted
