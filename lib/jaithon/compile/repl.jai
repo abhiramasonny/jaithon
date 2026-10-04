@@ -66,59 +66,45 @@ pub class Scan {
     }
 }
 
-fn _utf8_length(code_point: int) -> int {
-    if code_point < 0x80 { return 1 }
-    if code_point < 0x800 { return 2 }
-    if code_point < 0x10000 { return 3 }
-    return 4
-}
+# The bytes this file compares against, by name.
+const _C_LF = 10
+const _C_DQUOTE = 34
+const _C_SQUOTE = 39
+const _C_LOWER_F = 102
+const _C_LOWER_R = 114
 
-#: The buffer indexed both ways at once.
+#: The buffer, in the unit a lexer span is already in.
 #:
-#: Lexer spans are *byte* offsets; a `str` is indexed by scalar. Mixing the
-#: two silently works on ASCII and misplaces the caret on anything else, so
-#: the conversion happens here and nowhere else.
+#: Lexer spans are *byte* offsets. This used to hold a `list[str]` of the
+#: characters and a table from character to byte, rebuilt on every scan the
+#: prompt makes -- the scheme `lexer.jai` dropped when it moved to bytes. A
+#: byte offset now needs no conversion, and a line and column still count
+#: characters: a byte that is not a UTF-8 continuation byte (`0b10xxxxxx`)
+#: starts exactly one character.
 class _Text {
-    pub let chars: list[str]
-    #: Byte offset of each character, plus the total length at the end.
-    pub let offsets: list[int]
+    pub let bytes: list[int]
 
     pub fn init(self, source: str) {
-        self.chars = [character for character in source]
-        var byte_offset = 0
-        var offsets: list[int] = []
-        for character in self.chars {
-            offsets.push(byte_offset)
-            byte_offset += _utf8_length(ord(character))
-        }
-        offsets.push(byte_offset)
-        self.offsets = offsets
+        self.bytes = source.bytes()
     }
 
     #: Total size in bytes.
-    pub fn byte_length(self) -> int { return self.offsets[self.offsets.len() - 1] }
+    pub fn byte_length(self) -> int { return self.bytes.len() }
 
-    #: The character index a byte offset falls on, clamped to the end.
-    pub fn index_of_byte(self, offset: int) -> int {
-        var low = 0
-        var high = self.chars.len()
-        while low < high {
-            let mid = (low + high) // 2
-            if self.offsets[mid] < offset { low = mid + 1 } else { high = mid }
-        }
-        return low
-    }
-
+    #: The 1-based line and column of byte `offset`, both counted in
+    #: characters. An offset past the end is clamped to it.
     pub fn position_at(self, offset: int) -> tuple[int, int] {
-        let limit = self.index_of_byte(offset)
+        let bytes = self.bytes
+        let limit = if offset > bytes.len() { bytes.len() } else { offset }
         var line = 1
         var column = 1
         var index = 0
         while index < limit {
-            if self.chars[index] == "\n" {
+            let byte = bytes[index]
+            if byte == _C_LF {
                 line += 1
                 column = 1
-            } else {
+            } elif byte & 0xC0 != 0x80 {
                 column += 1
             }
             index += 1
@@ -193,15 +179,16 @@ fn _scan_brackets(tokens: list[Token], text: _Text, out: Scan) -> void {
 
 #: True when the quote at byte `offset`, past any `r`/`f` prefix, is tripled.
 fn _is_triple_quote_at(text: _Text, offset: int) -> bool {
-    var index = text.index_of_byte(offset)
-    let length = text.chars.len()
-    while index < length and (text.chars[index] == "r" or text.chars[index] == "f") {
+    let bytes = text.bytes
+    let length = bytes.len()
+    var index = if offset < 0 { 0 } else { offset }
+    while index < length and (bytes[index] == _C_LOWER_R or bytes[index] == _C_LOWER_F) {
         index += 1
     }
     if index + 2 >= length { return false }
-    let quote = text.chars[index]
-    if quote != "\"" and quote != "'" { return false }
-    return text.chars[index + 1] == quote and text.chars[index + 2] == quote
+    let quote = bytes[index]
+    if quote != _C_DQUOTE and quote != _C_SQUOTE { return false }
+    return bytes[index + 1] == quote and bytes[index + 2] == quote
 }
 
 #: Where the f-string the lexer is still inside was opened, or -1.
