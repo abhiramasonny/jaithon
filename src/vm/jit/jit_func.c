@@ -882,6 +882,19 @@ unsigned fpOperand(Emit *e, unsigned idx) {
     return d;
 }
 
+/* JAITHON_JIT_FN_BIND_EARLY: the function tier's planned (spilled) frame has
+ * d homes too, so a float operator feeding OP_BIND may write the home
+ * directly there as well -- `dx = bi.x - bj.x` was an `fsub` into the bank
+ * and an `fmov` out of it, five times an nbody pair. */
+static bool earlyBindTier(const Emit *e) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FN_BIND_EARLY");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return e->osr || (e->spilled && cached != 0);
+}
+
 /* JAITHON_JIT_WIDE_CARRY: the per-walk limits on carried and early-written
  * offsets (see JIT_MAX_CARRY), or the sixty-four and thirty-two they were. */
 static bool jitWideCarry(void) {
@@ -981,7 +994,7 @@ void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
 /* Float op writing straight to a local's home instead of the bank + fmov (saves the trailing `fmov`
  * on every `*_BIND`). Safe only because the borrow release happens HERE, before the operator, not after in localOutFp -- a borrower wants the pre-operator value, and since arm64 reads sources before writing its destination, `sum += x` naming the home among its own sources is fine once the borrow is already released. No FP register on the local: bank returned unchanged, so callers see one shape either way. */
 unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank) {
-    if (!e->osr || e->slotFpReg[slot] == 0) return bank;
+    if (!earlyBindTier(e) || e->slotFpReg[slot] == 0) return bank;
     fpReleaseHome(e, e->slotFpReg[slot]);
     return e->slotFpReg[slot];
 }
@@ -991,7 +1004,7 @@ unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank) {
 unsigned fpBindLookahead(Emit *e, const uint8_t *code, int next,
                                 int stop, const ObjFunction *fn,
                                 uint32_t *bindOffOut) {
-    if (!e->osr || e->fpOff || e->inlining) return 0;
+    if (!earlyBindTier(e) || e->fpOff || e->inlining) return 0;
     if (e->homeEarlyCount >= jitHomeEarlyLimit()) return 0;
     if (next < stop && code[next] == OP_TYPE_GUARD) {
         /* Only the settled form: a guard that widens an int emits `scvtf` (making the entry an int, so this
