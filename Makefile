@@ -137,9 +137,24 @@ ifeq ($(UNAME_S),Darwin)
   # update -- and only the executable is flat: the Apple images and every
   # system library keep their two-level namespaces. FLAT_NAMESPACE=0 turns it
   # off.
+  #
+  # A flat lookup walks the images in load order, which is depth-first from the
+  # executable's first dylib. With libSystem.B first that order is its ~40
+  # re-exports alphabetically, and libsystem_c -- where 67 of the 165 live --
+  # is the fourteenth. Naming libsystem_c first puts it and its own
+  # dependencies (kernel, m, malloc, platform, pthread, dyld: 158 of the 165
+  # between them) at the head of the walk: a probe binding the same 165 symbols
+  # retired 12.98M instructions before main this way against 15.65M flat in the
+  # default order and 17.94M two-level, with 10.88M for an empty program. It is
+  # an order, not a promise about where a symbol lives -- the lookup is still
+  # flat, so a symbol a later macOS moves to another library is still found --
+  # and it is skipped when the SDK no longer ships the stub.
   FLAT_NAMESPACE ?= 1
   ifeq ($(FLAT_NAMESPACE),1)
     CORE_LDFLAGS := -Wl,-flat_namespace
+    ifneq ($(wildcard $(SDKROOT)/usr/lib/system/libsystem_c.tbd),)
+      CORE_LDFLAGS += -L$(SDKROOT)/usr/lib/system -lsystem_c
+    endif
   endif
 endif
 
