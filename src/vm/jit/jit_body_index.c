@@ -178,19 +178,95 @@ static bool jitDictAddFuse(void) {
     return cached != 0;
 }
 
+/* Proves from the BYTECODE that the four entries under the get's default are
+ * the same two locals loaded twice, back to back: the instructions that end
+ * at `off` are exactly `<loads of a, b, a, b> <default>`, where the loads are
+ * OP_GET_LOCAL/OP_GET_LOCAL2 and the default is a literal or a local read --
+ * nothing that can write a local -- and nothing but fall-through reaches any
+ * of them past the first. stackLocal alone is not this proof: it says where
+ * an entry was read from, not that the local still holds it, and an
+ * if-expression between the two loads can write `k` or `d` and join back
+ * with the stack settled. */
+static bool dictAddLoadsAdjacent(const Emit *e, const Chunk *c, int off,
+                                 int dictLocal, int keyLocal) {
+    enum { RING = 8 };
+    int starts[RING];
+    int n = 0;
+    int at = 0;
+    while (at < off) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return false;
+        starts[n % RING] = at;
+        n++;
+        at += len;
+    }
+    if (at != off || n < 2) return false;
+    /* The default: one instruction that pushes without writing. */
+    int defAt = starts[(n - 1) % RING];
+    uint8_t defOp = c->code[defAt];
+    if (defOp != OP_INT && defOp != OP_CONST && defOp != OP_GET_LOCAL) {
+        return false;
+    }
+    /* Then, walking back, loads until exactly four slots are named. */
+    int slots[4];
+    int got = 0;
+    int i = n - 2;
+    int firstAt = -1;
+    while (got < 4) {
+        if (i < 0 || n - 1 - i >= RING) return false;
+        int ld = starts[i % RING];
+        uint8_t op = c->code[ld];
+        int s[2];
+        int k;
+        if (op == OP_GET_LOCAL) {
+            s[0] = (int)jaiReadU16(c->code + ld + 1);
+            k = 1;
+        } else if (op == OP_GET_LOCAL2) {
+            s[0] = (int)jaiReadU16(c->code + ld + 1);
+            s[1] = (int)jaiReadU16(c->code + ld + 3);
+            k = 2;
+        } else {
+            return false;
+        }
+        if (got + k > 4) return false;
+        /* Filled from the back: the last slot named is the fourth entry. */
+        for (int j = k - 1; j >= 0; j--) slots[3 - got - (k - 1 - j)] = s[j];
+        got += k;
+        firstAt = ld;
+        i--;
+    }
+    if (slots[0] != dictLocal || slots[2] != dictLocal ||
+        slots[1] != keyLocal || slots[3] != keyLocal) {
+        return false;
+    }
+    /* Straight-line from the first load to the INVOKE. */
+    for (int j = i + 2; j < n; j++) {
+        int st = starts[j % RING];
+        if (st <= firstAt) continue;
+        if (offsetIsBranchTarget(c, (uint32_t)st) ||
+            popSkipTarget(e, (uint32_t)st)) {
+            return false;
+        }
+    }
+    return !offsetIsBranchTarget(c, (uint32_t)off) &&
+           !popSkipTarget(e, (uint32_t)off);
+}
+
 /* `d[k] = d.get(k, n) + c`, at the OP_INVOKE of the `get`: the bytecode is
  *
  *     GET d, GET k, GET d, GET k, <n>, INVOKE get 2, INT c, ADD, SET_INDEX
  *
- * and when the two loads of `d` and of `k` are of the same locals, the whole
- * statement is jitDictAddStr. Emitted in FRONT of the get's own code: on
- * success it branches past the SET_INDEX, to where the statement ends with
- * the five entries consumed; on anything else it falls into the unfused
- * sequence, which the walk goes on to emit exactly as before -- so a refusal
- * costs one call, never an answer. The caller has guarded the receiver as a
- * dict. True when the fused call was emitted. */
-bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
+ * and when the two loads of `d` and of `k` are of the same locals, back to
+ * back (dictAddLoadsAdjacent), the whole statement is jitDictAddStr. Emitted
+ * in FRONT of the get's own code: on success it branches past the SET_INDEX,
+ * to where the statement ends with the five entries consumed; on anything
+ * else it falls into the unfused sequence, which the walk goes on to emit
+ * exactly as before -- so a refusal costs one call, never an answer. The
+ * caller has guarded the receiver as a dict. True when the fused call was
+ * emitted. */
+bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
                       unsigned ridx) {
+    const uint8_t *code = chunk->code;
     if (!jitDictAddFuse() || !jitDictLeaf() || e->inlining) return false;
     if (off + 12 > count || code[off + 7] != OP_INT ||
         code[off + 10] != OP_ADD || code[off + 11] != OP_SET_INDEX) {
@@ -205,12 +281,17 @@ bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
         return false;
     }
     if (e->stack[ridx + 2] != SLOT_INT) return false;
-    /* The same dict and the same key, read from the same locals: nothing
-     * between the two loads can have written either. */
+    /* The same dict and the same key, read from the same locals, and (see
+     * dictAddLoadsAdjacent) nothing between the two loads can have written
+     * either. */
     if (e->stackLocal[ridx - 2] < 0 ||
         e->stackLocal[ridx - 2] != e->stackLocal[ridx] ||
         e->stackLocal[ridx - 1] < 0 ||
         e->stackLocal[ridx - 1] != e->stackLocal[ridx + 1]) {
+        return false;
+    }
+    if (!dictAddLoadsAdjacent(e, chunk, off, e->stackLocal[ridx - 2],
+                              e->stackLocal[ridx - 1])) {
         return false;
     }
     unsigned vd = e->valueDepth;

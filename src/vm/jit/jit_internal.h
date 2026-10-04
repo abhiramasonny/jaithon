@@ -831,7 +831,9 @@ void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
                      bool negate, LeafFix *fx);
 /* A key kind the dict leaves take: a string (as an object) or an int. */
 bool dictLeafKeyKind(SlotKind k);
-bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
+/* dictLeafKeyKind for a stack entry, declining a key seen not to be a string. */
+bool dictLeafKeyAt(const Emit *e, unsigned idx);
+bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
                       unsigned ridx);
 bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count);
 bool leafRegOk(unsigned r);

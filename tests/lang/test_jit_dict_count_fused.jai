@@ -7,7 +7,7 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it on call count alone; `JAITHON_NO_JIT=1`
 #: runs the same file, and every answer is the interpreter's.
-# jit-compiles: count_into, count_by, count_any, count_typed, count_two_dicts, bump_aug
+# jit-compiles: count_into, count_by, count_any, count_typed, count_two_dicts, bump_aug, count_key_rebound, count_dict_rebound
 from std.test import assert_eq, assert_throws, assert_true
 
 let CALLS = 100
@@ -205,5 +205,55 @@ pub fn test_a_count_during_iteration_is_still_seen() -> void {
         }
         call += 1
     }
-    assert_true(raised == 0 or raised == CALLS, "consistent across calls")
+    #: A store during iteration bumps the dict's version, so every call
+    #: raises -- compiled or not.
+    assert_eq(raised, CALLS)
+}
+
+fn nonempty(s: str) -> bool {
+    return s.len() > 0
+}
+
+#: The store's dict and key are read before its value, and a block inside the
+#: value can rebind either local after a call has settled the stack: the
+#: second pair of loads then reads something else, and the leaf, which uses
+#: the second pair for both, would store to the wrong place.
+fn count_key_rebound(d: dict, k: str) -> void {
+    d[k] = (if nonempty(k) {
+        k = "zz"
+        d
+    } else {
+        d
+    }).get(k, 0) + 1
+}
+
+fn count_dict_rebound(d: dict, other: dict, k: str) -> void {
+    d[k] = (if nonempty(k) {
+        d = other
+        d
+    } else {
+        d
+    }).get(k, 0) + 1
+}
+
+pub fn test_a_local_rebound_between_the_loads_is_not_fused() -> void {
+    var d: dict[str, int] = {}
+    var call = 0
+    while call < CALLS {
+        count_key_rebound(d, "a")
+        call += 1
+    }
+    #: Stored under "a" every time, from a read of "zz", which is never set.
+    assert_eq(d.len(), 1)
+    assert_eq(d["a"], 1)
+    var a: dict[str, int] = {}
+    var b: dict[str, int] = {}
+    call = 0
+    while call < CALLS {
+        count_dict_rebound(a, b, "x")
+        call += 1
+    }
+    assert_eq(a.len(), 1)
+    assert_eq(a["x"], 1)
+    assert_eq(b.len(), 0)
 }

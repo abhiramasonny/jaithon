@@ -1320,7 +1320,7 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             if (OBJ_TYPE(oseen) == OBJ_DICT && argc == 2 && !odiscarded &&
                 AS_STRING(oname)->length == 3 &&
                 memcmp(AS_STRING(oname)->chars, "get", 3) == 0) {
-                (void)emitDictAddFused(e, code, off, count, ridx);
+                (void)emitDictAddFused(e, &fn->chunk, off, count, ridx);
             }
             /* `d.get(k)` / `d.get(k, default)` with a string key: the leaf
              * answers in place and this descriptor call stays behind it as
