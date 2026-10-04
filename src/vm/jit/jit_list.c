@@ -250,10 +250,6 @@ bool regionCalls(const Emit *e, uint32_t lo, uint32_t hi) {
     return false;
 }
 
-/* The hoisted header for a subscript whose base is a plain read of local
- * `slot`, or -1. `curOffset` is checked against the loop the entry was made
- * for, so an entry the walk has already left cannot be picked up again by a
- * later loop that happens to name the same slot. */
 /* JAITHON_JIT_HOIST_STG: a hoisted list header also pins the list's storage
  * for the loop it was hoisted out of. See Emit::hoist. */
 static bool jitHoistStg(void) {
@@ -265,8 +261,6 @@ static bool jitHoistStg(void) {
     return cached != 0;
 }
 
-/* JAITHON_JIT_INDEX_REG: a subscript whose header is hoisted and whose
- * bounds and storage are proved loads through `[items, idx, lsl #n]`. */
 /* JAITHON_JIT_HOIST_BOXED: a hoisted list of objects proves BOXED once. */
 static bool jitHoistBoxed(void) {
     static int cached = -1;
@@ -306,6 +300,8 @@ static bool jitHoistLean(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_INDEX_REG: a subscript whose header is hoisted and whose
+ * bounds and storage are proved loads through `[items, idx, lsl #n]`. */
 bool jitIndexReg(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -315,6 +311,10 @@ bool jitIndexReg(void) {
     return cached != 0;
 }
 
+/* The hoisted header for a subscript whose base is a plain read of local
+ * `slot`, or -1. `curOffset` is checked against the loop the entry was made
+ * for, so an entry the walk has already left cannot be picked up again by a
+ * later loop that happens to name the same slot. */
 int hoistFor(const Emit *e, int slot) {
     if (slot < 0 || e->inlining) return -1;
     for (unsigned i = 0; i < e->hoistCount; i++) {
@@ -607,7 +607,6 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
             if (cand[i].use > bestUse) { bestUse = cand[i].use; pick = i; }
         }
         if (pick == ncand) break;
-        unsigned pickUse = cand[pick].use;
         cand[pick].use = 0;                  /* taken */
         unsigned rI = e->hoistPool[e->hoistTaken++];
         unsigned rC = 0;
@@ -618,7 +617,6 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
             !lean && !regionPushes(e, cand[pick].top, cand[pick].end);
         e->hoist[e->hoistCount].hasVer   = false;
         e->hoist[e->hoistCount].verReg   = 0;
-        (void)pickUse;
         e->hoist[e->hoistCount].top      = cand[pick].top;
         e->hoist[e->hoistCount].end      = cand[pick].end;
         e->hoist[e->hoistCount].slot     = cand[pick].slot;

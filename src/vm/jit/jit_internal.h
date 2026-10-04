@@ -740,6 +740,12 @@ typedef struct {
     uint32_t  fTwo;
     uint32_t  xBorrow;
     uint8_t   xBorrowReg[32];
+    /* Dynamic locals (slots 0..63) whose tag -- and class, for an instance --
+     * this edge has already guarded since the slot was last written: a second
+     * read of the same value along the same straight line needs no second
+     * guard. Retired exactly where a field-kind memo is (a join, a call out, a
+     * write of the slot). See JAITHON_JIT_DYN_MEMO. */
+    uint64_t  dynGuarded;
     /* Entries that are an X-side copy of a float LOCAL, taken by OP_GET_LOCAL when no float consumer was
      * in reach (`sum += f(i) * v[j]` pushes `sum` before the call). While no local has been written and no
      * join crossed since the read (localEpoch unchanged), the local's own d home still holds exactly those
@@ -747,12 +753,6 @@ typedef struct {
      * back across register files -- which is what took the loop-carried `fmov d,x; fadd; fmov x,d` off the
      * accumulator's chain. See fpOperandReread and JAITHON_JIT_FP_REREAD. Cleared with every other
      * per-entry mask on push and pop, and by fpClaim and the in-place rewrites. */
-    /* Dynamic locals (slots 0..63) whose tag -- and class, for an instance --
-     * this edge has already guarded since the slot was last written: a second
-     * read of the same value along the same straight line needs no second
-     * guard. Retired exactly where a field-kind memo is (a join, a call out, a
-     * write of the slot). See JAITHON_JIT_DYN_MEMO. */
-    uint64_t  dynGuarded;
     uint32_t  fpSrc;
     uint8_t   fpSrcSlot[32];
     uint32_t  fpSrcEpoch[32];
