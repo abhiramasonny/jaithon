@@ -154,6 +154,73 @@ void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, bool negate,
     dictLeafCall(e, (void *)&jitDictHasStr, fx);
 }
 
+/* JAITHON_JIT_DICT_ADD=0 turns the fused counting arm below off, for a
+ * one-binary A/B. */
+static bool jitDictAddFuse(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_ADD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* `d[k] = d.get(k, n) + c`, at the OP_INVOKE of the `get`: the bytecode is
+ *
+ *     GET d, GET k, GET d, GET k, <n>, INVOKE get 2, INT c, ADD, SET_INDEX
+ *
+ * and when the two loads of `d` and of `k` are of the same locals, the whole
+ * statement is jitDictAddStr. Emitted in FRONT of the get's own code: on
+ * success it branches past the SET_INDEX, to where the statement ends with
+ * the five entries consumed; on anything else it falls into the unfused
+ * sequence, which the walk goes on to emit exactly as before -- so a refusal
+ * costs one call, never an answer. The caller has guarded the receiver as a
+ * dict. True when the fused call was emitted. */
+bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
+                      unsigned ridx) {
+    if (!jitDictAddFuse() || !jitDictLeaf() || e->inlining) return false;
+    if (off + 12 > count || code[off + 7] != OP_INT ||
+        code[off + 10] != OP_ADD || code[off + 11] != OP_SET_INDEX) {
+        return false;
+    }
+    if (ridx < 2 || e->depth != ridx + 3 || e->valueDepth < 5) return false;
+    for (unsigned i = ridx - 2; i < ridx + 2; i++) {
+        if (e->stack[i] != SLOT_OBJ) return false;
+    }
+    if (e->stack[ridx + 2] != SLOT_INT) return false;
+    /* The same dict and the same key, read from the same locals: nothing
+     * between the two loads can have written either. */
+    if (e->stackLocal[ridx - 2] < 0 ||
+        e->stackLocal[ridx - 2] != e->stackLocal[ridx] ||
+        e->stackLocal[ridx - 1] < 0 ||
+        e->stackLocal[ridx - 1] != e->stackLocal[ridx + 1]) {
+        return false;
+    }
+    unsigned vd = e->valueDepth;
+    unsigned rDict = valueXReg(e, vd - 3);
+    unsigned rKey = valueXReg(e, vd - 2);
+    unsigned rDef = valueXReg(e, vd - 1);
+    if (!leafRegOk(rDict) || !leafRegOk(rKey) || !leafRegOk(rDef)) {
+        return false;
+    }
+    fpSyncAll(e);
+    settleAll(e);
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emit(e, jaiA64MovX(2, rDef));
+    emitConst64(e, 3, (int64_t)jaiReadI16(code + off + 8));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitDictAddStr);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    /* Done: past the SET_INDEX, where the statement leaves the stack five
+     * entries shallower than it is here. */
+    branchToDepth(e, (uint32_t)(off + 12), JAI_A64_EQ,
+                  stackSignatureAt(e, e->depth - 5));
+    e->wroteHeap = true;
+    return true;
+}
+
 /* Where the descriptor call begins: both "can't" branches land here. */
 void leafSlowHere(Emit *e, LeafFix *fx) {
     if (!fx->on || e->count > JIT_MAX_INSTS) return;

@@ -1303,6 +1303,14 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                 break;
             }
 
+            /* `d[k] = d.get(k, n) + c` as one leaf, when the statement is
+             * exactly that; the unfused code below stays as its fallback.
+             * See emitDictAddFused. */
+            if (OBJ_TYPE(oseen) == OBJ_DICT && argc == 2 && !odiscarded &&
+                AS_STRING(oname)->length == 3 &&
+                memcmp(AS_STRING(oname)->chars, "get", 3) == 0) {
+                (void)emitDictAddFused(e, code, off, count, ridx);
+            }
             /* `d.get(k)` / `d.get(k, default)` with a string key: the leaf
              * answers in place and this descriptor call stays behind it as
              * the slow path. See emitDictLeafGet. */

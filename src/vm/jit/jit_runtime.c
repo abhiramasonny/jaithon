@@ -535,6 +535,71 @@ int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
     return dictSetStrSlow(d, key, tag, payload);
 }
 
+/* The insert half of jitDictAddStr, and its typed-dict check, out of line so
+ * the update of a key already present -- every iteration of a counting loop
+ * but the first for each key -- is a leaf with no frame. */
+static JAI_NOINLINE int64_t dictAddStrSlow(ObjDict *d, ObjString *key,
+                                           int64_t defPayload,
+                                           int64_t addend) {
+    if (d->keyKind != FIELD_KIND_ANY || d->valKind != FIELD_KIND_ANY) {
+        if (!jaiKindAccepts(d->keyKind, OBJ_VAL(key)) ||
+            !jaiKindAccepts(d->valKind, INT_VAL(0))) {
+            return 1;
+        }
+    }
+    JaiEntry *e = jaiTableFindStr(&d->table, key);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    int64_t base = defPayload;
+    if (e != NULL) {
+        if (e->value.type != VAL_INT) return 1;
+        base = e->value.as.integer;
+    }
+    int64_t sum;
+    if (__builtin_add_overflow(base, addend, &sum)) return 1;
+    if (e != NULL) {
+        e->value = INT_VAL(sum);
+        ++d->table.version;
+        return 0;
+    }
+    (void)jaiTableSetHashed(&d->table, OBJ_VAL(key), jaiStringHash(key),
+                            INT_VAL(sum));
+    return 0;
+}
+
+/* `d[k] = d.get(k, n) + c` -- the counting idiom, `counts[w] =
+ * counts.get(w, 0) + 1` -- in one leaf, for an int default and an int
+ * constant step: the entry's int value (or the default, for an absent key)
+ * plus the step, stored back. One probe where the unfused form makes two, and
+ * one call where it makes two, with the read, the add and the store between
+ * them done here.
+ *
+ * Returns 0 done, and 1 having written nothing whenever the unfused sequence
+ * would do something else: a key that is not a string, a value that is not an
+ * int, an add that overflows (which raises), a typed dict that refuses, a
+ * probe the quick form cannot settle. The caller then runs that sequence.
+ * Leaf-safe for the reasons jitDictSetStr gives: nothing here runs user code,
+ * raises, or allocates an object. */
+int64_t jitDictAddStr(ObjDict *d, Obj *keyObj, int64_t defPayload,
+                      int64_t addend) {
+    if (JAI_UNLIKELY(keyObj->type != OBJ_STRING)) return 1;
+    ObjString *key = (ObjString *)keyObj;
+    if (JAI_LIKELY(d->keyKind == FIELD_KIND_ANY &&
+                   d->valKind == FIELD_KIND_ANY)) {
+        JaiEntry *e = jaiTableFindStrQuick(&d->table, key);
+        if (JAI_LIKELY(e != NULL && e != JAI_TABLE_SLOW &&
+                       e->value.type == VAL_INT)) {
+            int64_t sum;
+            if (__builtin_add_overflow(e->value.as.integer, addend, &sum)) {
+                return 1;
+            }
+            e->value.as.integer = sum;
+            ++d->table.version;
+            return 0;
+        }
+    }
+    return dictAddStrSlow(d, key, defPayload, addend);
+}
+
 /* `k in d` and `k not in d` with a string `k`, as a leaf for the reason
  * jitDictGetStr gives. The container is only predicted to be a dict, so the
  * leaf checks both kinds itself, and anything else -- a list, a set, a class

@@ -801,6 +801,8 @@ int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
                       int64_t payload);
 int64_t jitDictHasStr(Obj *container, Obj *needle, Value *result,
                       int64_t negate);
+int64_t jitDictAddStr(ObjDict *d, Obj *keyObj, int64_t defPayload,
+                      int64_t addend);
 typedef struct {
     int      slow[2];   /* the branches to the descriptor path, or -1 */
     unsigned cond[2];   /* the condition each of them branches on */
@@ -811,6 +813,8 @@ void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
                      SlotKind defKind, bool absentSlow, LeafFix *fx);
 void emitDictLeafHas(Emit *e, unsigned rDict, unsigned rKey, bool negate,
                      LeafFix *fx);
+bool emitDictAddFused(Emit *e, const uint8_t *code, int off, int count,
+                      unsigned ridx);
 bool leafRegOk(unsigned r);
 bool jitLeafInReg(void);
 void leafSlowHere(Emit *e, LeafFix *fx);
