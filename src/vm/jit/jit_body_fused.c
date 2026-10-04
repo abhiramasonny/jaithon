@@ -119,7 +119,7 @@ bool emitAddBind(Emit *e, const uint8_t *code, int *offp) {
                 return false;
             }
             unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
-            unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+            unsigned db = fpOperandReread(e, ib), da = fpOperandReread(e, ia);
             unsigned rx; SlotKind kx;
             if (!popValueRaw(e, &rx, &kx)) return false;
             if (!popValueRaw(e, &rx, &kx)) return false;
@@ -321,7 +321,7 @@ bool emitMulBind(Emit *e, const uint8_t *code, int *offp) {
                 return false;
             }
             unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
-            unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+            unsigned db = fpOperandReread(e, ib), da = fpOperandReread(e, ia);
             unsigned rx; SlotKind kx;
             if (!popValueRaw(e, &rx, &kx)) return false;
             if (!popValueRaw(e, &rx, &kx)) return false;
@@ -378,7 +378,7 @@ bool emitSubBind(Emit *e, const uint8_t *code, int *offp) {
                 return false;
             }
             unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
-            unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+            unsigned db = fpOperandReread(e, ib), da = fpOperandReread(e, ia);
             unsigned rx; SlotKind kx;
             if (!popValueRaw(e, &rx, &kx)) return false;
             if (!popValueRaw(e, &rx, &kx)) return false;

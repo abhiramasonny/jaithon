@@ -372,6 +372,10 @@ static void forgetFieldKindsOfLocal(Emit *e, unsigned slot) {
  * in those two places is what makes "this slot does not change inside that
  * loop" a fact about the emitter rather than a re-reading of the bytecode. */
 static void noteSlotWrite(Emit *e, unsigned slot) {
+    /* Any local written retires every fpSrc entry's claim to still equal its
+     * local -- see fpOperandReread. Coarser than per slot, and that is the
+     * point: nothing has to prove which home a write reached. */
+    e->localEpoch++;
     /* Above the range check on purpose: the memo is keyed on the same slot
      * numbers, so a slot too high to record is still one to retire. */
     if (e->knownCount != 0) forgetFieldKindsOfLocal(e, slot);
@@ -809,6 +813,7 @@ void fpSyncOne(Emit *e, unsigned idx) {
 /* A local's d register is about to be written, so every entry borrowing it
  * takes a copy of its own first. */
 void fpReleaseHome(Emit *e, unsigned reg) {
+    e->localEpoch++;        /* a home is about to change: see fpOperandReread */
     if (e->fpBorrow == 0 || reg == 0) return;
     for (unsigned i = 0; i < 32u; i++) {
         if ((e->fpBorrow & (1u << i)) == 0) continue;
@@ -846,11 +851,64 @@ unsigned fpOperand(Emit *e, unsigned idx) {
     return d;
 }
 
+/* JAITHON_JIT_FP_REREAD: a float operator reads a still-current float local
+ * from its d home rather than through the X copy OP_GET_LOCAL took. See
+ * Emit::fpSrc. */
+bool jitFpReread(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FP_REREAD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Entry `idx` was just pushed as an X copy of float local `slot`. */
+void fpSrcNote(Emit *e, unsigned idx, unsigned slot) {
+    if (idx >= 32u || slot > JIT_MAX_SLOTS || !jitFpReread()) return;
+    e->fpSrc |= 1u << idx;
+    e->fpSrcSlot[idx]  = (uint8_t)slot;
+    e->fpSrcEpoch[idx] = e->localEpoch;
+}
+
+/* fpOperand for a float operator's operand. An entry that is still an
+ * untouched copy of a float local is answered with the local's d home, so the
+ * operator never waits on an `fmov d,x` of a value the home already holds.
+ *
+ * Why it is worth an arm: the copy is taken when the local is PUSHED, which for
+ * an accumulator is before everything on the right-hand side -- `sum += f(i) *
+ * v[j]` pushes `sum`, then the call, then the subscript. Anything there outside
+ * the FP whitelist moves the bank to X, so the add read `sum` back through
+ * `fmov d,x` and wrote it out through `fmov x,d`: two cross-register-file moves
+ * on the loop-carried chain, about ten cycles against the add's three on this
+ * machine. Reading the home here makes the chain the add alone.
+ *
+ * Sound because nothing but localOut/localOutFp (via noteSlotWrite) and
+ * fpReleaseHome writes a d home, and each bumps localEpoch; a join clears
+ * fpSrc outright (compileBody), and so does anything that rewrites an entry in
+ * place. In the measuring pass the read is credited to the FP ledger -- the
+ * bank this saves in -- so the plan gives the local a d home at all. */
+unsigned fpOperandReread(Emit *e, unsigned idx) {
+    if (idx < 32u && (e->fpSrc & (1u << idx)) != 0 &&
+        (e->fpLive & (1u << idx)) == 0 && !e->fpOff &&
+        e->fpSrcEpoch[idx] == e->localEpoch) {
+        unsigned slot = e->fpSrcSlot[idx];
+        if (slot <= JIT_MAX_SLOTS && e->localKind[slot] == SLOT_FLOAT &&
+            !e->dynamicLocal[slot]) {
+            noteSlotCost(e, slot, 0u, 3u);
+            unsigned home = (e->osr || e->spilled) ? e->slotFpReg[slot] : 0u;
+            if (home != 0) return home;
+        }
+    }
+    return fpOperand(e, idx);
+}
+
 /* Entry `idx` has just been computed into v(16 + idx); its X register is now
  * stale until something asks for it. */
 void fpClaim(Emit *e, unsigned idx) {
     e->fpLive |= 1u << idx;
     e->fpBorrow &= ~(1u << idx);
+    e->fpSrc &= ~(1u << idx);
 }
 
 void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
@@ -1034,6 +1092,7 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stack[e->depth++] = kind;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
+    e->fpSrc    &= ~(1u << e->valueDepth);
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
@@ -1131,6 +1190,7 @@ bool popValueRaw(Emit *e, unsigned *reg, SlotKind *kind) {
     e->valueDepth--;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
+    e->fpSrc    &= ~(1u << e->valueDepth);
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);
@@ -1155,6 +1215,9 @@ bool popValue(Emit *e, unsigned *reg, SlotKind *kind) {
  * no register, so copying the result's entry down over it and shortening the
  * stack leaves the result on top, still in the register it was computed into. */
 void dropCalleeEntry(Emit *e) {
+    /* Every caller has just rewritten the top entry in place (a builtin's
+     * result in its argument's register), so it no longer copies a local. */
+    if (e->valueDepth > 0) e->fpSrc &= ~(1u << (e->valueDepth - 1));
     e->stack[e->depth - 2]      = e->stack[e->depth - 1];
     e->stackShape[e->depth - 2] = 0;
     e->stackClass[e->depth - 2] = NULL;

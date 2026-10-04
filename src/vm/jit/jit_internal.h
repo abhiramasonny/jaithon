@@ -668,6 +668,17 @@ typedef struct {
     int64_t   kKnownVal[32];
     uint32_t  xBorrow;
     uint8_t   xBorrowReg[32];
+    /* Entries that are an X-side copy of a float LOCAL, taken by OP_GET_LOCAL when no float consumer was
+     * in reach (`sum += f(i) * v[j]` pushes `sum` before the call). While no local has been written and no
+     * join crossed since the read (localEpoch unchanged), the local's own d home still holds exactly those
+     * bits, so the float operator that finally consumes the entry reads the home instead of moving the copy
+     * back across register files -- which is what took the loop-carried `fmov d,x; fadd; fmov x,d` off the
+     * accumulator's chain. See fpOperandReread and JAITHON_JIT_FP_REREAD. Cleared with every other
+     * per-entry mask on push and pop, and by fpClaim and the in-place rewrites. */
+    uint32_t  fpSrc;
+    uint8_t   fpSrcSlot[32];
+    uint32_t  fpSrcEpoch[32];
+    uint32_t  localEpoch;
     /* Which entries are known to be a LOCAL plus a constant, and which local
      * and what constant. Not a value like kKnown -- a shape. It exists so a
      * subscript can say "this index is the loop counter, minus one" and have
@@ -877,6 +888,9 @@ void fpReleaseHome(Emit *e, unsigned reg);
 void fpReleaseAll(Emit *e);
 void fpSyncAll(Emit *e);
 unsigned fpOperand(Emit *e, unsigned idx);
+bool jitFpReread(void);
+void fpSrcNote(Emit *e, unsigned idx, unsigned slot);
+unsigned fpOperandReread(Emit *e, unsigned idx);
 void fpClaim(Emit *e, unsigned idx);
 void fpBorrowLocal(Emit *e, unsigned idx, unsigned reg);
 unsigned fpBindDest(Emit *e, unsigned slot, unsigned bank);

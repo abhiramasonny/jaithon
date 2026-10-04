@@ -28,6 +28,7 @@ bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
                 unsigned r = pushReg(e) - 1;
                 emit(e, jaiA64ScvtfDX(JIT_FSCRATCH_A, r));
                 emit(e, jaiA64FmovXD(r, JIT_FSCRATCH_A));
+                e->fpSrc &= ~(1u << (e->valueDepth - 1));
                 e->stack[e->depth - 1]      = SLOT_FLOAT;
                 e->stackShape[e->depth - 1] = 0;
                 e->stackClass[e->depth - 1] = NULL;

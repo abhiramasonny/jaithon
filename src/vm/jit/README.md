@@ -455,6 +455,7 @@ this table complete in both directions.
 | `JAITHON_JIT_RETURN_KNOWN` | on | Require a direct callee's walk to have reached a return. |
 | `JAITHON_JIT_ANY_GUARD` | on | Guard an `any`-typed value rather than refusing it. |
 | `JAITHON_JIT_FDIV_GUARD` | on | Raise on float `/` by zero, as the interpreter does. |
+| `JAITHON_JIT_FP_REREAD` | on | A float operator reads a float local's d home instead of the X copy `OP_GET_LOCAL` took, while no local has been written and no join crossed since (`fpOperandReread`). Takes the accumulator of `sum += f(i) * v[j]` off a `fmov d,x`/`fmov x,d` round trip on its loop-carried chain: spectral 1.72x. |
 | `JAITHON_JIT_CONCAT_LOCALS` | on | String concatenation into locals. |
 | `JAITHON_JIT_STRCMP` | on | String ordering comparisons. |
 | `JAITHON_JIT_STRCMP_EQ` | on | String equality. |

@@ -61,6 +61,9 @@ bool emitGetLocal(Emit *e, const uint8_t *code, int *offp, int stop) {
                 unsigned src = localIn(e, slot, dst);
                 if (src != dst) emit(e, jaiA64MovX(dst, src));
             }
+            if (e->localKind[slot] == SLOT_FLOAT && !e->dynamicLocal[slot]) {
+                fpSrcNote(e, e->valueDepth - 1, slot);
+            }
         }
         off += 3;
         break;
@@ -122,6 +125,10 @@ bool emitGetLocal2(Emit *e, const uint8_t *code, int *offp, int stop) {
                     unsigned dst = pushReg(e) - 1;
                     unsigned src = localIn(e, slot, dst);
                     if (src != dst) emit(e, jaiA64MovX(dst, src));
+                }
+                if (e->localKind[slot] == SLOT_FLOAT &&
+                    !e->dynamicLocal[slot]) {
+                    fpSrcNote(e, e->valueDepth - 1, slot);
                 }
             }
         }

@@ -186,6 +186,8 @@ static void swapPopEntry(Emit *e) {
     e->valueDepth--;
     e->fpLive   &= ~(1u << e->valueDepth);
     e->fpBorrow &= ~(1u << e->valueDepth);
+    /* Both: the entry that moved down is no longer where its claim was made. */
+    e->fpSrc    &= ~(3u << (e->valueDepth > 0 ? e->valueDepth - 1 : 0));
     e->kPend    &= ~(1u << e->valueDepth);
     e->kKnown   &= ~(1u << e->valueDepth);
     e->xBorrow  &= ~(1u << e->valueDepth);

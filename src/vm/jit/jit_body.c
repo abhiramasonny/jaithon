@@ -544,6 +544,13 @@ bool compileBody(Emit *e, ObjClosure *closure) {
              popSkipTarget(e, (uint32_t)off))) {
             clearStackProofs(e);
         }
+        /* "Still equals its local" is a claim about one edge, the same as a
+         * stack proof: a join may arrive from a path that wrote the local. */
+        if (e->fpSrc != 0 &&
+            (!fellIn || offsetIsBranchTarget(&fn->chunk, (uint32_t)off) ||
+             popSkipTarget(e, (uint32_t)off))) {
+            e->fpSrc = 0;
+        }
         /* A field-kind memo is good along the same one edge, and goes for the
          * same reason -- see forgetFieldKinds. `fn` is whichever body is being
          * walked, so an inlined one is measured against its own chunk. */

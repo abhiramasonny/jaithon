@@ -18,7 +18,7 @@ bool emitMul(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
         if (e->depth >= 2 && e->stack[e->depth - 1] == SLOT_FLOAT &&
             e->stack[e->depth - 2] == SLOT_FLOAT) {
             unsigned ib = e->valueDepth - 1, ia = e->valueDepth - 2;
-            unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+            unsigned db = fpOperandReread(e, ib), da = fpOperandReread(e, ia);
             if (!popValueRaw(e, &rb, &kb)) return false;
             if (!popValueRaw(e, &ra, &ka)) return false;
             if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
@@ -176,7 +176,7 @@ bool emitAddSubDiv(Emit *e, ObjFunction *fn, uint8_t op, const uint8_t *code,
                 emit(e, jaiA64FcmpDZero(fpOperand(e, ib)));
                 branchOnDeopt(e, JAI_A64_EQ);
             }
-            unsigned db = fpOperand(e, ib), da = fpOperand(e, ia);
+            unsigned db = fpOperandReread(e, ib), da = fpOperandReread(e, ia);
             if (!popValueRaw(e, &rb, &kb)) return false;
             if (!popValueRaw(e, &ra, &ka)) return false;
             if (!pushValue(e, SLOT_FLOAT, 0, NULL)) return false;
