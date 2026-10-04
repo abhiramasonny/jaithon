@@ -186,6 +186,7 @@ pub class SigLoader {
         sig.program = program
         if program != null and program.kind == NodeKind.Program {
             _collect(sig, program.child_list("stmts"))
+            if not _KEEP_SIG_BODIES { _strip_bodies(program.child_list("stmts")) }
         }
 
         self._cache[resolved] = sig
@@ -368,6 +369,38 @@ pub fn default_search_path(exec_dir: str? = null) -> list[str] {
         _add_package_dirs(dirs, fixed)
     }
     return dirs
+}
+
+#: Whether a loaded signature keeps its functions' bodies. `JAITHON_SIG_BODIES=1`
+#: keeps them, as before.
+let _KEEP_SIG_BODIES: bool = (__prim__.os_env("JAITHON_SIG_BODIES") ?? "0") != "0"
+
+#: A signature is read for what its functions take and return, never for what
+#: they do -- the one question asked of a body is whether there is one, which
+#: is what makes a method abstract. So each top-level function's and method's
+#: block is swapped for an empty one over the same span once the declarations
+#: are collected. The whole file was still parsed, so a file that does not
+#: parse answers exactly as before; what changes is that every loaded module
+#: stopped keeping its every statement alive for the rest of the run, where
+#: each collection traced it again.
+fn _strip_bodies(stmts: list[Node]) -> void {
+    for node in stmts {
+        if node.kind == NodeKind.FnDecl {
+            _strip_body(node)
+        } elif node.kind == NodeKind.ClassDecl {
+            for method in node.child_list("methods") { _strip_body(method) }
+            for method in node.child_list("getters") { _strip_body(method) }
+            for method in node.child_list("setters") { _strip_body(method) }
+        } elif node.kind == NodeKind.TraitDecl or node.kind == NodeKind.EnumDecl {
+            for method in node.child_list("methods") { _strip_body(method) }
+        }
+    }
+}
+
+fn _strip_body(fn_node: Node) -> void {
+    let body = fn_node.child("body")
+    if body is null or body.kind != NodeKind.Block { return }
+    fn_node.set("body", Node(NodeKind.Block, {"stmts": []}, body.span))
 }
 
 fn _collect(sig: ModuleSig, stmts: list[Node]) -> void {
