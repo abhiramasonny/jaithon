@@ -397,6 +397,34 @@ bool feedbackSlotKind(uint8_t fb, SlotKind *k, unsigned *tag,
  * costs far more than the work itself (list_ops spent all its time on the
  * call). A full list goes out to the `grow` stubs' realloc helper and comes
  * straight back; see there for why this used to be a deopt and what it cost. */
+/* JAITHON_JIT_GROW_KEEPS_LOOPS=0 lets an append outside every loop keep the
+ * registers too. On by default.
+ *
+ * What a keeping grow stub buys is a loop: a hoisted header or a pinned
+ * storage that would otherwise die at the append's call. An append that sits
+ * in no loop of its body -- the third field of a record built by push -- has
+ * nothing hoisted across it, and each list it builds grows once, so the stub
+ * saving every register costs the whole difference on every call. There the
+ * grow is an ordinary call again, exactly as it was before the stub kept
+ * anything. Measured where the walk measures everything else: the caller's
+ * own offset for an inlined body, so an inlined builder called from a loop
+ * still keeps. */
+static bool jitGrowKeepsLoopsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_GROW_KEEPS_LOOPS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static bool growKeepsHere(const Emit *e) {
+    if (!jitGrowKeepsLoopsOn() || e->osr) return true;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    return e->loopDepth != NULL && at < e->loopDepthCount &&
+           e->loopDepth[at] > 0;
+}
+
 bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
                           int slot, int target) {
     unsigned vtag = vk == SLOT_INT   ? VAL_INT
@@ -438,7 +466,7 @@ bool emitListStore(Emit *e, SlotKind vk, unsigned rList, unsigned rVal,
     /* With the grow stub keeping the registers the append is not a clobber:
      * it is recorded as what it is -- a write to one list's header -- so a
      * hoist over it can prove it is not that list. See jitGrowKeeps. */
-    bool keeps = jitGrowKeeps();
+    bool keeps = jitGrowKeeps() && growKeepsHere(e);
     if (keeps) {
         notePushTarget(e, target);
     } else {
