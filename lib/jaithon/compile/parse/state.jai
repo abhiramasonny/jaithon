@@ -277,6 +277,10 @@ pub class Parser {
     #: The span from token `start_index` to the last token taken, newlines
     #: trimmed: `_join` of the two tokens' spans, built from their offsets
     #: without making either span first.
+    #:
+    #: Each `Span` is built here rather than through `_span_of`: the REPL's
+    #: file id is -1, so in a file that call is never made, and a call that has
+    #: never returned is one the compiled tier will not make.
     pub fn _span_since(self, start_index: int) -> Span {
         var end_index = self.current - 1
         while end_index > start_index and self._token_at(end_index).kind == TokenKind.Newline {
@@ -285,14 +289,14 @@ pub class Parser {
         if end_index < start_index { end_index = start_index }
         let first = self._token_at(start_index)
         let last = self._token_at(end_index)
-        if self.file_id < 0 { return self._span_of(last) }
+        if self.file_id < 0 { return Span(self.file_id, last.start, last.end) }
         let start = min(first.start, last.start)
         return Span(self.file_id, start, max(start, max(first.end, last.end)))
     }
 
     #: `_join(first, token.span)`, without making the token's span first.
     pub fn _join_token(self, first: Span, token: Token) -> Span {
-        if first.file < 0 { return self._span_of(token) }
+        if first.file < 0 { return Span(self.file_id, token.start, token.end) }
         if self.file_id < 0 or first.file != self.file_id { return first }
         let start = min(first.start, token.start)
         return Span(self.file_id, start, max(start, max(first.end, token.end)))
