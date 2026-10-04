@@ -56,6 +56,7 @@ bool emitGetLocal(Emit *e, const uint8_t *code, int *offp, int stop) {
                 /* The copy this used to always emit is the whole cost of reading a local (six of them in `fib`) --
                  * borrowing defers it; if nothing consumes the value before an instruction that can't read a borrow, the settle there emits exactly the same mov, so this never costs more. */
                 xBorrowLocal(e, e->valueDepth - 1, home);
+                noteLocalBorrowed(e, slot);
             } else {
                 unsigned dst = pushReg(e) - 1;
                 unsigned src = localIn(e, slot, dst);
@@ -121,6 +122,7 @@ bool emitGetLocal2(Emit *e, const uint8_t *code, int *offp, int stop) {
                 unsigned home = localHomeX(e, slot);
                 if (home != 0) {            /* see OP_GET_LOCAL */
                     xBorrowLocal(e, e->valueDepth - 1, home);
+                    noteLocalBorrowed(e, slot);
                 } else {
                     unsigned dst = pushReg(e) - 1;
                     unsigned src = localIn(e, slot, dst);

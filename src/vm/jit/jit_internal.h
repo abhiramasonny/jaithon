@@ -950,6 +950,7 @@ void settleAll(Emit *e);
  * untouched -- the two copies now agree, and marking the X copy stale when it isn't would cost a needless sync. */
 unsigned xHeldIn(Emit *e, unsigned idx);
 unsigned localHomeX(const Emit *e, unsigned slot);
+void noteLocalBorrowed(Emit *e, unsigned slot);
 void xBorrowLocal(Emit *e, unsigned idx, unsigned reg);
 void kPendLocal(Emit *e, unsigned idx, int64_t k);
 bool pendingImm12(const Emit *e, unsigned idx, int64_t *out);

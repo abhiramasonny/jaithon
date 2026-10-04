@@ -1072,6 +1072,21 @@ unsigned localHomeX(const Emit *e, unsigned slot) {
     return localReg(e, slot);
 }
 
+/* JAITHON_JIT_BORROW_CREDIT: a read of a local that is satisfied by
+ * borrowing its register still counts towards the register it borrowed. The
+ * function tier's measuring pass runs with every local in a fixed register,
+ * so every read there is a borrow -- and none of them was credited: a list
+ * subscripted every iteration ranked at zero and was planned into the frame,
+ * one `ldr` per access (nbody's `bodies`), and a loop could never hoist it. */
+void noteLocalBorrowed(Emit *e, unsigned slot) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_BORROW_CREDIT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    if (cached) noteSlotCost(e, slot, 1u, 0u);
+}
+
 void xBorrowLocal(Emit *e, unsigned idx, unsigned reg) {
     e->xBorrow |= 1u << idx;
     e->xBorrowReg[idx] = (uint8_t)reg;
