@@ -1056,6 +1056,11 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
  * re-compiles that form once more of the site's ways have become usable.
  * JAITHON_JIT_PIC_UPGRADE=0 turns the re-compile off. */
 void jitOsrPicShort(int siteCache, unsigned ways, SlotKind rkind);
+/* An OSR compile met a call to `cfn`, which has no compiled form yet but is
+ * being called and will reach the threshold soon. True means: decline this
+ * compile and look again on a later tick, rather than build a form that calls
+ * it the slow way for the rest of the run (jit_osr.c). */
+bool jitOsrColdWait(Emit *e, const ObjFunction *cfn);
 bool jitPicUpgradeOn(void);
 bool offsetIsBranchTarget(const Chunk *c, uint32_t off);
 bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,

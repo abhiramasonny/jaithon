@@ -974,6 +974,9 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                 if (e->failed) return false;   /* it had started emitting */
                 e->whyNot = saved;
             }
+            /* The descriptor below is for the life of a loop form; a method
+             * about to compile is worth one more tick of waiting. */
+            if (mfn->jitFunc == NULL && jitOsrColdWait(e, mfn)) return false;
 
             if (!emitDescriptor(e, method, ridx, argc + 1,
                                 (void *)&jitInvokeMethod)) {

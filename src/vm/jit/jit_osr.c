@@ -333,6 +333,78 @@ static void osrShortDrop(OsrShortForm *s) {
     sShortCount--;
 }
 
+/* ---- A callee that is about to compile --------------------------------------
+ *
+ * The same race from the other side. A loop whose tick lands in its first few
+ * dozen iterations meets callees that are being called every iteration and
+ * have not yet reached the function tier's threshold. The form compiled then
+ * reaches them the slow way -- a method through jitInvokeMethod and C glue, a
+ * global by interpreting from the call onward every iteration -- and keeps
+ * doing so for the rest of the run, because a loop that never exits is never
+ * entered again to be replaced. Measured: object_dispatch 918M cycles under
+ * JAITHON_JIT_TICK_US=50 against ~450M, and a probe loop calling one method
+ * and one global 1.20G against 0.32G, the slow outcome in about one default
+ * run in ten as well.
+ *
+ * So the compile waits instead: it declines, and the interpreter runs the loop
+ * until the next tick, by which time a callee called every iteration has
+ * compiled. Only a callee that is plainly on its way -- called at least once,
+ * below its threshold, not refused -- is waited for, a head waits at most
+ * OSR_COLD_WAITS times, and a wait is not charged to the head's compile
+ * attempts. JAITHON_JIT_OSR_COLD_WAIT=0 compiles the slow form at once. */
+#define OSR_COLD_WAITS 24
+#define OSR_COLD_HEADS 32
+
+typedef struct {
+    const ObjFunction *fn;   /* identity only, never dereferenced */
+    uint32_t           top;
+    uint8_t            waits;
+} OsrColdHead;
+
+static OsrColdHead sColdHeads[OSR_COLD_HEADS];
+static unsigned    sColdNext;
+/* Set by an arm that chose to wait; read by the compile driver. */
+static bool        sColdWaited;
+/* Cleared for an attempt whose head has spent its waits. */
+static bool        sColdMayWait;
+
+static bool osrColdWaitOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_OSR_COLD_WAIT");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+bool jitOsrColdWait(Emit *e, const ObjFunction *cfn) {
+    if (!e->osr || e->inlining || !sColdMayWait || cfn == NULL) return false;
+    if (cfn->jitFunc != NULL || cfn->jitRefused) return false;
+    /* The compile is attempted on the call AFTER the count reaches the
+     * threshold, so a count at the threshold with no attempt yet is the
+     * closest a callee gets to compiling, not a sign it never will. */
+    if (cfn->entryCount == 0) return false;
+    if (cfn->entryCount >= jaiJitThreshold(cfn) && cfn->jitAttempts != 0) {
+        return false;
+    }
+    sColdWaited = true;
+    e->whyNot = "a callee still on its way to compiling";
+    return true;
+}
+
+static OsrColdHead *osrColdHead(const ObjFunction *fn, uint32_t top) {
+    for (unsigned i = 0; i < OSR_COLD_HEADS; i++) {
+        if (sColdHeads[i].fn == fn && sColdHeads[i].top == top) {
+            return &sColdHeads[i];
+        }
+    }
+    OsrColdHead *h = &sColdHeads[sColdNext++ % OSR_COLD_HEADS];
+    h->fn = fn;
+    h->top = top;
+    h->waits = 0;
+    return h;
+}
+
 /* How many of a site's ways a compile could take NOW: the cheap half of
  * emitInvokePic1's filter, the half that changes with time. A way that passes
  * this and then fails jitPic1Admissible costs one wasted compile, which the
@@ -423,14 +495,17 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
 static bool compileOsrAny(ObjClosure *closure, uint32_t top, Value *slots,
                           uint8_t iterKind, Value elemSample, bool elemMixed,
                           uint8_t elemStg) {
-    return compileOsr(closure, top, slots, iterKind, elemSample, elemMixed,
-                      elemStg, true, false) ||
-           compileOsr(closure, top, slots, iterKind, elemSample, elemMixed,
-                      elemStg, true, true) ||
-           compileOsr(closure, top, slots, iterKind, elemSample, elemMixed,
-                      elemStg, false, false) ||
-           compileOsr(closure, top, slots, iterKind, elemSample, elemMixed,
-                      elemStg, false, true);
+    /* A wait ends the attempt: every other variant would meet the same
+     * callee, and the point is to come back once it has compiled. */
+    sColdWaited = false;
+    for (int v = 0; v < 4; v++) {
+        if (compileOsr(closure, top, slots, iterKind, elemSample, elemMixed,
+                       elemStg, v < 2, (v & 1) != 0)) {
+            return true;
+        }
+        if (sColdWaited) return false;
+    }
+    return false;
 }
 
 static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
@@ -1341,8 +1416,18 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
          * exactly that shape. So the prefix stays as the fallback: some of the
          * loop compiled beats none of it. */
         sPendingRetries = 0;
-        if (!compileOsrAny(closure, top, frame->slots, iterKind, elemSample,
-                           elemMixed, elemStg)) {
+        OsrColdHead *cold = osrColdWaitOn() ? osrColdHead(fn, top) : NULL;
+        sColdMayWait = cold != NULL && cold->waits < OSR_COLD_WAITS;
+        bool built = compileOsrAny(closure, top, frame->slots, iterKind,
+                                   elemSample, elemMixed, elemStg);
+        bool waited = !built && sColdWaited;
+        sColdMayWait = false;
+        sColdWaited = false;
+        if (waited) {
+            cold->waits++;
+            return osrNo(fn, top, "waiting for a callee to compile");
+        }
+        if (!built) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
             if (miss == fn->osrMissCount && miss < osrFormCap()) {
@@ -1392,6 +1477,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             if (idx != last) fn->osrForms[idx] = fn->osrForms[last];
             fn->osrCount--;
             sPendingRetries = (uint8_t)(tries + 1u);
+            sColdMayWait = false;
             bool ok = compileOsrAny(closure, top, frame->slots, iterKind,
                                     elemSample, elemMixed, elemStg);
             sPendingRetries = 0;
