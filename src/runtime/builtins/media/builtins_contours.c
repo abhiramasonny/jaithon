@@ -219,9 +219,32 @@ JAI_INLINE int64_t borderNextStart(const uint8_t *g, int64_t c, int64_t limit, b
                                    int64_t *lastMark) {
 #if defined(__aarch64__)
     const uint8x16_t one = vdupq_n_u8(CELL_SET);
+    const uint8x16_t markBit = vdupq_n_u8(0xFE);
     int64_t markAt = -1;
     uint64_t markBits = 0;
     while (c + 16 <= limit) {
+        /* Sixty-four cells at a go first. A run of identical clear or set
+         * cells is nothing to the scan -- no mark, and no cell differs from
+         * the one before it, which is where every start is -- so the block
+         * only has to be read closely if some cell differs from its western
+         * neighbour (or, for holes, the last from its eastern one) or carries
+         * a mark. In a frame of large shapes that is a small minority of
+         * blocks, and this test is a handful of instructions a block. */
+        while (c + 64 <= limit) {
+            const uint8x16_t h0 = vld1q_u8(g + c);
+            const uint8x16_t h1 = vld1q_u8(g + c + 16);
+            const uint8x16_t h2 = vld1q_u8(g + c + 32);
+            const uint8x16_t h3 = vld1q_u8(g + c + 48);
+            uint8x16_t any = vorrq_u8(veorq_u8(h0, vld1q_u8(g + c - 1)),
+                                      veorq_u8(h1, vld1q_u8(g + c + 15)));
+            any = vorrq_u8(any, vorrq_u8(veorq_u8(h2, vld1q_u8(g + c + 31)),
+                                         veorq_u8(h3, vld1q_u8(g + c + 47))));
+            if (holes) any = vorrq_u8(any, veorq_u8(h3, vld1q_u8(g + c + 49)));
+            any = vorrq_u8(any, vandq_u8(vorrq_u8(vorrq_u8(h0, h1), vorrq_u8(h2, h3)), markBit));
+            if (vmaxvq_u8(any) != 0) break;
+            c += 64;
+        }
+        if (c + 16 > limit) break;
         const uint8x16_t here = vld1q_u8(g + c);
         const uint8x16_t westClear = vceqzq_u8(vld1q_u8(g + c - 1));
         const uint8x16_t isSet = vceqq_u8(here, one);
@@ -265,6 +288,93 @@ JAI_INLINE int64_t borderNextStart(const uint8_t *g, int64_t c, int64_t limit, b
         if (holes && (here == CELL_SET || here == CELL_MARKED) && g[c + 1] == CELL_CLEAR) return c;
     }
     return limit;
+}
+
+/* The first marked cell in [c, limit), or `limit`. */
+JAI_INLINE int64_t borderNextMark(const uint8_t *g, int64_t c, int64_t limit) {
+#if defined(__aarch64__)
+    const uint8x16_t one = vdupq_n_u8(CELL_SET);
+    /* Clear and set are 0 and 1, so a block of them ORs to at most 1. */
+    while (c + 64 <= limit) {
+        const uint8x16_t both = vorrq_u8(vorrq_u8(vld1q_u8(g + c), vld1q_u8(g + c + 16)),
+                                         vorrq_u8(vld1q_u8(g + c + 32), vld1q_u8(g + c + 48)));
+        if (vmaxvq_u8(both) > CELL_SET) break;
+        c += 64;
+    }
+    while (c + 16 <= limit) {
+        const uint64_t marked = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(
+            vreinterpretq_u16_u8(vcgtq_u8(vld1q_u8(g + c), one)), 4)), 0);
+        if (marked != 0) return c + (int64_t)(__builtin_ctzll(marked) >> 2);
+        c += 16;
+    }
+#endif
+    for (; c < limit; c++) {
+        if (g[c] > CELL_SET) return c;
+    }
+    return limit;
+}
+
+/* The first cell in [c, limit) that is marked, or set with its western
+ * neighbour clear. */
+JAI_INLINE int64_t borderNextEdge(const uint8_t *g, int64_t c, int64_t limit) {
+#if defined(__aarch64__)
+    const uint8x16_t one = vdupq_n_u8(CELL_SET);
+    const uint8x16_t markBit = vdupq_n_u8(0xFE);
+    while (c + 16 <= limit) {
+        /* As in `borderNextStart`: a block where no cell differs from its
+         * western neighbour and none is marked has nothing in it. */
+        while (c + 64 <= limit) {
+            const uint8x16_t h0 = vld1q_u8(g + c);
+            const uint8x16_t h1 = vld1q_u8(g + c + 16);
+            const uint8x16_t h2 = vld1q_u8(g + c + 32);
+            const uint8x16_t h3 = vld1q_u8(g + c + 48);
+            uint8x16_t any = vorrq_u8(veorq_u8(h0, vld1q_u8(g + c - 1)),
+                                      veorq_u8(h1, vld1q_u8(g + c + 15)));
+            any = vorrq_u8(any, vorrq_u8(veorq_u8(h2, vld1q_u8(g + c + 31)),
+                                         veorq_u8(h3, vld1q_u8(g + c + 47))));
+            any = vorrq_u8(any, vandq_u8(vorrq_u8(vorrq_u8(h0, h1), vorrq_u8(h2, h3)), markBit));
+            if (vmaxvq_u8(any) != 0) break;
+            c += 64;
+        }
+        if (c + 16 > limit) break;
+        const uint8x16_t here = vld1q_u8(g + c);
+        const uint8x16_t edge = vorrq_u8(vandq_u8(vceqq_u8(here, one), vceqzq_u8(vld1q_u8(g + c - 1))),
+                                         vcgtq_u8(here, one));
+        const uint64_t bits = vget_lane_u64(
+            vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(edge), 4)), 0);
+        if (bits != 0) return c + (int64_t)(__builtin_ctzll(bits) >> 2);
+        c += 16;
+    }
+#endif
+    for (; c < limit; c++) {
+        const uint8_t here = g[c];
+        if (here > CELL_SET || (here == CELL_SET && g[c - 1] == CELL_CLEAR)) return c;
+    }
+    return limit;
+}
+
+/* The next outer border in [c, limit) that the frame encloses directly, for
+ * RETR_EXTERNAL; see `primGridBorders` for why the last mark decides it.
+ *
+ * Two states. After an unnegated mark the scan is inside a shape already
+ * walked, or in one of its holes, and nothing it meets can be a top-level
+ * start until a mark says otherwise -- so it looks for the next mark and for
+ * nothing else, which a vector does sixty-four cells at a time. Otherwise it
+ * stops at the next mark or the next set cell with a clear cell to its west,
+ * and the second is a start. A frame of large shapes, however many holes they
+ * have, is two or three stops a row. */
+JAI_INLINE int64_t borderNextTopStart(const uint8_t *g, int64_t c, int64_t limit, int64_t *lastMark) {
+    for (;;) {
+        if (*lastMark >= 0 && g[*lastMark] == CELL_MARKED) {
+            c = borderNextMark(g, c, limit);
+        } else {
+            c = borderNextEdge(g, c, limit);
+        }
+        if (c >= limit) return limit;
+        if (g[c] == CELL_SET) return c;
+        *lastMark = c;
+        c++;
+    }
 }
 
 /* --- the walk ------------------------------------------------------ */
@@ -559,7 +669,8 @@ static bool primGridBorders(int argc, Value *args, Value *out) {
         int64_t lastMark = -1;
         int64_t c = row;
         for (;;) {
-            c = borderNextStart(g, c, limit, holes, &lastMark);
+            c = holes ? borderNextStart(g, c, limit, true, &lastMark)
+                      : borderNextTopStart(g, c, limit, &lastMark);
             if (c >= limit) break;
             const uint8_t here = g[c];
             const bool outer = here == CELL_SET && g[c - 1] == CELL_CLEAR;
@@ -569,10 +680,6 @@ static bool primGridBorders(int argc, Value *args, Value *out) {
                 const int64_t ancestor = kinds->items[(lastNbd - 1) * 2 + 1];
                 if (kinds->items[(lastNbd - 1) * 2] != 0) parent = outer ? ancestor : lastNbd;
                 else parent = outer ? lastNbd : ancestor;
-            } else if (lastMark >= 0 && g[lastMark] == CELL_MARKED) {
-                /* Inside a shape already walked, or one of its holes. */
-                c++;
-                continue;
             }
 
             nbd++;
