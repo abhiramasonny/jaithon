@@ -1063,6 +1063,11 @@ bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
                                  int calleeReg);
 bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                            unsigned nargs, void *helper);
+bool emitDescriptorFull(Emit *e, Value calleeVal, unsigned first,
+                        unsigned nargs, void *helper, bool ownStatus,
+                        int calleeReg, bool noRoots);
+int jitFormatLeaf(JitCallDesc *d);
+bool jitFormatLeafOn(void);
 bool concatOperands(const Emit *e, Value *sample);
 bool emitStringConcat(Emit *e, Value sample);
 bool nullLiteralPair(const Emit *e, uint8_t op, SlotKind ka, SlotKind kb);

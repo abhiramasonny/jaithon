@@ -389,6 +389,43 @@ int jitMakeEnumIter(JitCallDesc *d) {
     return 0;
 }
 
+/* JAITHON_JIT_FORMAT_LEAF=0 formats every f-string through the rooted
+ * jitFormat descriptor again. */
+bool jitFormatLeafOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FORMAT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* jitFormat without the roots: 0 with d->result set, or 2 to decline. It
+ * declines when a collection is wanted, and for any part that is not a
+ * string, an int, a float, a bool or null -- every other part is rendered by
+ * code that may call into the program. What is left is jaiValueFormat's own
+ * fast path, which makes at most the one result string: with no collection
+ * wanted that allocation cannot collect, so nothing the body holds needs
+ * rooting. The rooted descriptor stores one word per live object in the body
+ * and pushes them, per f-string. */
+int jitFormatLeaf(JitCallDesc *d) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return 2;
+    const int count = (int)d->argc;
+    if (count <= 0 || count > JAI_FMT_MAX_PARTS) return 2;
+    for (int i = 0; i < count; i++) {
+        const Value v = d->args[i];
+        if (IS_OBJ(v) ? !IS_STRING(v)
+                      : !(IS_INT(v) || IS_FLOAT(v) || IS_BOOL(v) ||
+                          IS_NULL(v))) {
+            return 2;
+        }
+    }
+    ObjString *formatted = jaiValueFormat(d->args, count);
+    if (formatted == NULL) return 2;
+    d->result = OBJ_VAL(formatted);
+    return 0;
+}
+
 /* f-string: the interpreter's parts, read off the operand stack, land here contiguously in args[].
  * Builtin path only -- compiler checks at compile time that the module hasn't rebound `str`; a rebind retires this form. */
 int jitFormat(JitCallDesc *d) {
