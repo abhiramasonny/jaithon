@@ -522,6 +522,10 @@ typedef struct {
     uint32_t  slotWriteHi[JIT_MAX_SLOTS + 1];
     uint32_t  slotIndexLo[JIT_MAX_SLOTS + 1];
     uint32_t  slotIndexHi[JIT_MAX_SLOTS + 1];
+    /* The same bounds for the subscripts that STORE into the slot's list --
+     * the ones a hoist could give a version register. */
+    uint32_t  slotStoreLo[JIT_MAX_SLOTS + 1];
+    uint32_t  slotStoreHi[JIT_MAX_SLOTS + 1];
     unsigned  slotIndexUse[JIT_MAX_SLOTS + 1];
     /* Loop-invariant list headers. See planHoists. */
     struct {
@@ -542,6 +546,18 @@ typedef struct {
          * See JAITHON_JIT_HOIST_STG. */
         bool     stgPin;
         uint8_t  stg;
+        /* Whether countReg holds the count. A lean hoist (JAITHON_JIT_HOIST_LEAN)
+         * keeps only `items`: every subscript the head's guard covers needs no
+         * count, and one it does not cover loads its own header. */
+        bool     hasCount;
+        /* The version the list's stores in [top, end) write, already bumped:
+         * loaded once where the header is, so a store is one `str` instead of
+         * a load-add-store whose load waits on the previous iteration's store.
+         * Sound because the region is call-free -- no iterator can be made in
+         * it, so every snapshot was taken before the load, and any store moves
+         * the version past all of them, which is all an iterator asks. */
+        bool     hasVer;
+        uint8_t  verReg;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
@@ -1001,6 +1017,9 @@ void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
                            unsigned rCount);
 int hoistFor(const Emit *e, int slot);
 bool jitHoistStg(void);
+bool jitIndexReg(void);
+bool jitHoistLean(void);
+void noteSlotStored(Emit *e, int slot);
 unsigned jitCarryLimit(void);
 unsigned jitHomeEarlyLimit(void);
 bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,

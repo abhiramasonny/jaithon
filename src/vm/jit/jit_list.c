@@ -263,6 +263,29 @@ bool jitHoistStg(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_INDEX_REG: a subscript whose header is hoisted and whose
+ * bounds and storage are proved loads through `[items, idx, lsl #n]`. */
+/* JAITHON_JIT_HOIST_LEAN: a hoist takes one register for `items`, a list
+ * stored into takes one for its bumped version, and counts get the rest. See
+ * Emit::hoist. */
+bool jitHoistLean(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_LEAN");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+bool jitIndexReg(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_INDEX_REG");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 int hoistFor(const Emit *e, int slot) {
     if (slot < 0 || e->inlining) return -1;
     for (unsigned i = 0; i < e->hoistCount; i++) {
@@ -377,18 +400,33 @@ void planHoists(Emit *e, ObjFunction *fn) {
         ncand++;
     }
 
+    /* Lean: every candidate gets its items register first, then a list that
+     * the loop stores into gets its version register, and only what is left
+     * goes to counts -- busiest first each time. A stencil's four rows need
+     * eight registers the old way and the pool has seven, so the row being
+     * WRITTEN went without, which is the one whose per-element load-add-store
+     * of `version` became the loop's critical path once everything else was
+     * hoisted. */
+    bool lean = jitHoistLean();
+    unsigned need = lean ? 1u : 2u;
     while (e->hoistCount < JIT_MAX_HOIST &&
-           e->hoistPoolCount - e->hoistTaken >= 2u) {
+           e->hoistPoolCount - e->hoistTaken >= need) {
         unsigned pick = ncand, bestUse = 0;
         for (unsigned i = 0; i < ncand; i++) {
             if (cand[i].use > bestUse) { bestUse = cand[i].use; pick = i; }
         }
         if (pick == ncand) break;
+        unsigned pickUse = cand[pick].use;
         cand[pick].use = 0;                  /* taken */
         unsigned rI = e->hoistPool[e->hoistTaken++];
-        unsigned rC = e->hoistPool[e->hoistTaken++];
+        unsigned rC = 0;
+        if (!lean) rC = e->hoistPool[e->hoistTaken++];
         if (rI < e->scratchRoom) e->scratchRoom = rI;
-        if (rC < e->scratchRoom) e->scratchRoom = rC;
+        if (!lean && rC < e->scratchRoom) e->scratchRoom = rC;
+        e->hoist[e->hoistCount].hasCount = !lean;
+        e->hoist[e->hoistCount].hasVer   = false;
+        e->hoist[e->hoistCount].verReg   = 0;
+        (void)pickUse;
         e->hoist[e->hoistCount].top      = cand[pick].top;
         e->hoist[e->hoistCount].end      = cand[pick].end;
         e->hoist[e->hoistCount].slot     = cand[pick].slot;
@@ -417,6 +455,35 @@ void planHoists(Emit *e, ObjFunction *fn) {
             e->hoist[e->hoistCount].rEnd = jaiReadU16(c->code + ht + 7);
         }
         e->hoistCount++;
+    }
+    if (!lean) return;
+    /* Versions, for lists stored into inside their own region. */
+    for (unsigned h = 0; h < e->hoistCount; h++) {
+        if (e->hoistPoolCount - e->hoistTaken < 1u) break;
+        unsigned sl = e->hoist[h].slot;
+        if (e->slotStoreLo[sl] > e->slotStoreHi[sl]) continue;
+        if (e->slotStoreLo[sl] < e->hoist[h].top) continue;
+        if (e->slotStoreHi[sl] >= e->hoist[h].end) continue;
+        unsigned rV = e->hoistPool[e->hoistTaken++];
+        if (rV < e->scratchRoom) e->scratchRoom = rV;
+        e->hoist[h].hasVer = true;
+        e->hoist[h].verReg = (uint8_t)rV;
+    }
+    /* Counts, busiest first, with whatever is left. */
+    for (;;) {
+        if (e->hoistPoolCount - e->hoistTaken < 1u) break;
+        int pick = -1;
+        unsigned bestUse = 0;
+        for (unsigned h = 0; h < e->hoistCount; h++) {
+            if (e->hoist[h].hasCount) continue;
+            unsigned use = e->slotIndexUse[e->hoist[h].slot];
+            if (pick < 0 || use > bestUse) { pick = (int)h; bestUse = use; }
+        }
+        if (pick < 0) break;
+        unsigned rC = e->hoistPool[e->hoistTaken++];
+        if (rC < e->scratchRoom) e->scratchRoom = rC;
+        e->hoist[pick].countReg = (uint8_t)rC;
+        e->hoist[pick].hasCount = true;
     }
 }
 
@@ -480,8 +547,21 @@ void emitHoistsAt(Emit *e, uint32_t off) {
         if (!e->osr) {
             emitListBoxedGuard(e, e->slotXReg[e->hoist[i].slot], JIT_SCRATCH_A);
         }
-        emitListHeader(e, e->slotXReg[e->hoist[i].slot],
-                       e->hoist[i].itemsReg, e->hoist[i].countReg);
+        unsigned hList = e->slotXReg[e->hoist[i].slot];
+        /* The count for the guard below: its own register when it has one,
+         * otherwise a scratch that is dead once the guard is past. */
+        unsigned hCount = e->hoist[i].hasCount ? e->hoist[i].countReg
+                                               : JIT_SCRATCH_D;
+        if (e->hoist[i].hasCount) {
+            emitListHeader(e, hList, e->hoist[i].itemsReg, hCount);
+        } else {
+            emitListHeader(e, hList, e->hoist[i].itemsReg, JIT_SCRATCH_D);
+        }
+        if (e->hoist[i].hasVer) {
+            unsigned rv = e->hoist[i].verReg;
+            emit(e, jaiA64LdrW(rv, hList, (unsigned)offsetof(ObjList, version)));
+            emit(e, jaiA64AddXImm(rv, rv, 1));
+        }
         /* The storage this loop's accesses were emitted against. A list that
          * arrives with another resumes at the head, in the interpreter, which
          * is where the bounds guard below goes too. */
@@ -532,7 +612,7 @@ void emitHoistsAt(Emit *e, uint32_t off) {
 
         emitAddSubImm(e, JIT_SCRATCH_A, rEnd, (int64_t)e->spanHi[sl] - 1,
                       false);
-        emit(e, jaiA64SubsXUxtw(31, JIT_SCRATCH_A, e->hoist[i].countReg));
+        emit(e, jaiA64SubsXUxtw(31, JIT_SCRATCH_A, hCount));
         branchOnDeoptAt(e, JAI_A64_HS, off, false);
 
         if (empty < e->count && e->count <= JIT_MAX_INSTS) {

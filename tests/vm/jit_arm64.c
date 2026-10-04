@@ -394,6 +394,32 @@ int main(void) {
       check("fsqrt 2", runWith(w, 7, d), dbits(1.4142135623730951));
       check("fsqrt 15129", dbits(d[2]), dbits(123.0)); }
 
+    /* The register-offset forms a hoisted subscript uses: the index is
+     * scaled by eight for an X or a D element and taken as it is for a
+     * byte. Index registers above 15 again, for the same lost-top-bit
+     * reason as below, and an index of 2 so an unscaled form would read the
+     * wrong element rather than the right one by accident. */
+    { double d[4] = { 1.0, 2.0, 7.5, 0.0 };
+      const uint32_t w[] = { jaiA64MovzX(17, 2, 0),
+                             jaiA64LdrDIdx(20, 0, 17),        /* d20 = d[2] */
+                             jaiA64MovzX(16, 3, 0),
+                             jaiA64StrDIdx(20, 0, 16),        /* d[3] = d20 */
+                             jaiA64LdrXIdx(1, 0, 17),         /* bits of d[2] */
+                             jaiA64MovzX(16, 1, 0),
+                             jaiA64StrXIdx(1, 0, 16),         /* d[1] = bits */
+                             jaiA64MovX(0, 1), jaiA64Ret() };
+      check("ldr x [n, m, lsl 3]", runWith(w, 9, d), dbits(7.5));
+      check("str d [n, m, lsl 3]", dbits(d[3]), dbits(7.5));
+      check("str x [n, m, lsl 3]", dbits(d[1]), dbits(7.5)); }
+    { uint8_t b[8] = { 0, 0, 0, 9, 0, 0, 0, 0 };
+      const uint32_t w[] = { jaiA64MovzX(17, 3, 0),
+                             jaiA64LdrByteIdx(1, 0, 17),      /* b[3] */
+                             jaiA64MovzX(16, 5, 0),
+                             jaiA64StrByteIdx(1, 0, 16),      /* b[5] = b[3] */
+                             jaiA64MovX(0, 1), jaiA64Ret() };
+      check("ldrb [n, m]", runWith(w, 6, b), 9);
+      check("strb [n, m]", b[5], 9); }
+
     /* fmov Dd, Dn through registers above 15, so a register field that had
      * lost its top bit would show up as the wrong source. */
     { double d[2] = { 6.25, 0.0 };

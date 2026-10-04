@@ -462,6 +462,14 @@ void noteSlotIndexed(Emit *e, int slot) {
     if (e->curOffset > e->slotIndexHi[slot]) e->slotIndexHi[slot] = e->curOffset;
 }
 
+void noteSlotStored(Emit *e, int slot) {
+    if (!e->measuring || e->inlining || slot < 0 || slot > (int)JIT_MAX_SLOTS) {
+        return;
+    }
+    if (e->curOffset < e->slotStoreLo[slot]) e->slotStoreLo[slot] = e->curOffset;
+    if (e->curOffset > e->slotStoreHi[slot]) e->slotStoreHi[slot] = e->curOffset;
+}
+
 void localOut(Emit *e, unsigned slot, unsigned src) {
     noteSlotWrite(e, slot);
     xHomeWritten(e, e->osr ? e->slotXReg[slot]

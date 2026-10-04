@@ -282,6 +282,36 @@ uint32_t jaiA64LdrD(unsigned rt, unsigned rn, unsigned offset) {
     return 0xfd400000u | ((offset / 8u) << 10) | (rn << 5) | rt;
 }
 
+/* ldr Xt, [Xn, Xm, lsl #3] */
+uint32_t jaiA64LdrXIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xf8607800u | (rm << 16) | (rn << 5) | rt;
+}
+
+/* ldr Dt, [Xn, Xm, lsl #3] */
+uint32_t jaiA64LdrDIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xfc607800u | (rm << 16) | (rn << 5) | rt;
+}
+
+/* str Xt, [Xn, Xm, lsl #3] */
+uint32_t jaiA64StrXIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xf8207800u | (rm << 16) | (rn << 5) | rt;
+}
+
+/* str Dt, [Xn, Xm, lsl #3] */
+uint32_t jaiA64StrDIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xfc207800u | (rm << 16) | (rn << 5) | rt;
+}
+
+/* ldrb Wt, [Xn, Xm] */
+uint32_t jaiA64LdrByteIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0x38606800u | (rm << 16) | (rn << 5) | rt;
+}
+
+/* strb Wt, [Xn, Xm] */
+uint32_t jaiA64StrByteIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0x38206800u | (rm << 16) | (rn << 5) | rt;
+}
+
 /* str Dt, [Xn, #offset] */
 uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset) {
     return 0xfd000000u | ((offset / 8u) << 10) | (rn << 5) | rt;

@@ -147,6 +147,14 @@ uint32_t jaiA64ScvtfDX(unsigned rd, unsigned rn);
 uint32_t jaiA64FcvtzsXD(unsigned rd, unsigned rn);
 /* ldr Dt, [Xn, #offset] -- byte offset, must be 8-aligned, 0..32760 */
 uint32_t jaiA64LdrD(unsigned rt, unsigned rn, unsigned offset);
+/* Register-offset forms, the index scaled by the element: `[Xn, Xm, lsl #3]`
+ * for eight bytes, `[Xn, Xm]` for one. */
+uint32_t jaiA64LdrXIdx(unsigned rt, unsigned rn, unsigned rm);
+uint32_t jaiA64LdrDIdx(unsigned rt, unsigned rn, unsigned rm);
+uint32_t jaiA64StrXIdx(unsigned rt, unsigned rn, unsigned rm);
+uint32_t jaiA64StrDIdx(unsigned rt, unsigned rn, unsigned rm);
+uint32_t jaiA64LdrByteIdx(unsigned rt, unsigned rn, unsigned rm);
+uint32_t jaiA64StrByteIdx(unsigned rt, unsigned rn, unsigned rm);
 /* str Dt, [Xn, #offset] -- same constraints */
 uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset);
 

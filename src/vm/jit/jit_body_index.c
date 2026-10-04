@@ -322,11 +322,41 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
         }
         unsigned gItems = JIT_SCRATCH_C, gCount = JIT_SCRATCH_A;
         int gh = hoistFor(e, e->stackLocal[e->depth - 2]);
-        if (gh >= 0) {
+        /* A lean hoist has no count: a site the head's guard covers never
+         * reads one, and one it does not cover loads its own header. */
+        if (gh >= 0 && (e->hoist[gh].hasCount || gHoisted)) {
             gItems = e->hoist[gh].itemsReg;
-            gCount = e->hoist[gh].countReg;
+            gCount = e->hoist[gh].hasCount ? e->hoist[gh].countReg
+                                           : JIT_SCRATCH_A;
         } else {
             emitListHeader(e, rList, gItems, gCount);
+            gh = -1;
+        }
+        /* Hoisted header, bounds proved at the head, one storage: nothing is
+         * left but the load, and the index register can address it directly
+         * -- `ldr [items, idx, lsl #3]` -- instead of a copy, an add and a
+         * load. See JAITHON_JIT_INDEX_REG. */
+        bool gDirect = gHoisted && gh >= 0 && !gAcc.dynamic &&
+                       gAcc.stg != LIST_STORE_BOXED && jitIndexReg();
+        if (gDirect) {
+            unsigned d1, d2;
+            if (!popValue(e, &d1, NULL)) return false;
+            if (!popValue(e, &d2, NULL)) return false;
+            if (!pushValue3(e, kind, elemShape, elemClass, elem, -1)) {
+                return false;
+            }
+            if (kind == SLOT_BOOL) {
+                emit(e, jaiA64LdrByteIdx(pushReg(e) - 1, gItems, rIdx));
+            } else if (kind == SLOT_FLOAT &&
+                       fpWorthLoading(e, code, off + 1, stop)) {
+                unsigned idx = e->valueDepth - 1;
+                emit(e, jaiA64LdrDIdx(fpRegAt(e, idx), gItems, rIdx));
+                fpClaim(e, idx);
+            } else {
+                emit(e, jaiA64LdrXIdx(pushReg(e) - 1, gItems, rIdx));
+            }
+            off += 1;
+            break;
         }
         if (gHoisted) {
             /* The head proved it. Only the normalisation copy is left, and
@@ -466,6 +496,7 @@ bool emitSetIndex(Emit *e, int *offp) {
         unsigned rList = valueXReg(e, e->valueDepth - 3);
 
         noteSlotIndexed(e, e->stackLocal[e->depth - 3]);
+        noteSlotStored(e, e->stackLocal[e->depth - 3]);
         bool sHoisted;
         {
             int32_t sOff = 0;
@@ -490,12 +521,27 @@ bool emitSetIndex(Emit *e, int *offp) {
         }
         unsigned sItems = JIT_SCRATCH_C, sCount = JIT_SCRATCH_A;
         int sh = hoistFor(e, e->stackLocal[e->depth - 3]);
-        if (sh >= 0) {
+        if (sh >= 0 && (e->hoist[sh].hasCount || sHoisted)) {
             sItems = e->hoist[sh].itemsReg;
-            sCount = e->hoist[sh].countReg;
+            sCount = e->hoist[sh].hasCount ? e->hoist[sh].countReg
+                                           : JIT_SCRATCH_A;
         } else {
             emitListHeader(e, rList, sItems, sCount);
+            sh = -1;
         }
+        /* The store itself through `[items, idx, lsl #3]` when nothing is
+         * left to check -- see OP_GET_INDEX's direct arm. The value is in
+         * its X register: this opcode is outside the FP whitelist, so the
+         * walk synced the bank before it. */
+        bool sDirect = sHoisted && sh >= 0 && !sAcc.dynamic &&
+                       sAcc.stg != LIST_STORE_BOXED && jitIndexReg();
+        if (sDirect) {
+            if (sAcc.stg == LIST_STORE_U8) {
+                emit(e, jaiA64StrByteIdx(rVal, sItems, rIdx));
+            } else {
+                emit(e, jaiA64StrXIdx(rVal, sItems, rIdx));
+            }
+        } else {
         if (sHoisted) {
             emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
         } else {
@@ -509,13 +555,20 @@ bool emitSetIndex(Emit *e, int *offp) {
             emitElemStoreAt(e, sAcc.alt, sItems, JIT_SCRATCH_B, vtag, rVal);
             listDispatchEnd(e, sJoin);
         }
+        }
         /* jaiListTouch: the count has not changed, so only the version
-         * tells an iterator that the list moved under it. */
-        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
-                           (unsigned)offsetof(ObjList, version)));
-        emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
-        emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
-                           (unsigned)offsetof(ObjList, version)));
+         * tells an iterator that the list moved under it. A hoist that holds
+         * the bumped version writes it with no load -- see Emit::hoist. */
+        if (sh >= 0 && e->hoist[sh].hasVer) {
+            emit(e, jaiA64StrW(e->hoist[sh].verReg, rList,
+                               (unsigned)offsetof(ObjList, version)));
+        } else {
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, rList,
+                               (unsigned)offsetof(ObjList, version)));
+            emit(e, jaiA64AddXImm(JIT_SCRATCH_A, JIT_SCRATCH_A, 1));
+            emit(e, jaiA64StrW(JIT_SCRATCH_A, rList,
+                               (unsigned)offsetof(ObjList, version)));
+        }
         e->wroteHeap = true;
 
         unsigned d1, d2, d3;

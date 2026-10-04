@@ -391,6 +391,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             probe.slotWriteLo[i] = UINT32_MAX;
             probe.slotIndexLo[i] = UINT32_MAX;
+            probe.slotStoreLo[i] = UINT32_MAX;
             probe.spanLo[i]   = INT32_MAX;
             probe.spanHi[i]   = INT32_MIN;
             probe.spanOk[i]   = true;
@@ -445,6 +446,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 e.slotWriteHi[i]  = probe.slotWriteHi[i];
                 e.slotIndexLo[i]  = probe.slotIndexLo[i];
                 e.slotIndexHi[i]  = probe.slotIndexHi[i];
+                e.slotStoreLo[i]  = probe.slotStoreLo[i];
+                e.slotStoreHi[i]  = probe.slotStoreHi[i];
                 e.slotIndexUse[i] = probe.slotIndexUse[i];
                 e.spanLo[i]       = probe.spanLo[i];
                 e.spanHi[i]       = probe.spanHi[i];
@@ -542,11 +545,19 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                                 : e.splitAt != 0 ? "split" : "callee-saved",
                 JIT_MAX_SAVED, e.bodyCalls ? "calls" : "call-free");
         for (unsigned i = 0; i < e.hoistCount; i++) {
+            char cnt[8] = "-", ver[16] = "";
+            if (e.hoist[i].hasCount) {
+                snprintf(cnt, sizeof cnt, "x%u", e.hoist[i].countReg);
+            }
+            if (e.hoist[i].hasVer) {
+                snprintf(ver, sizeof ver, ", version x%u", e.hoist[i].verReg);
+            }
             fprintf(stderr,
                     "[jit] osr at %u hoists slot %u's header out of %u..%u "
-                    "into x%u/x%u\n",
+                    "into x%u/%s%s%s\n",
                     top, e.hoist[i].slot, e.hoist[i].top, e.hoist[i].end,
-                    e.hoist[i].itemsReg, e.hoist[i].countReg);
+                    e.hoist[i].itemsReg, cnt, ver,
+                    e.hoist[i].stgPin ? ", storage pinned" : "");
         }
     }
 
