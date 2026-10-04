@@ -4,7 +4,12 @@
 
 #include "vm/gc.h"
 
+#include <stdlib.h>
 #include <string.h>
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 bool pushSlice(ObjList *list, const char *chars, size_t length) {
     ObjString *piece = jaiStringNew(chars, length);
@@ -153,6 +158,51 @@ static bool splitWhitespace(ObjString *s, int64_t maxsplit, bool fromRight,
     return true;
 }
 
+/* JAITHON_SPLIT_SIMD=0 sends a one-byte separator back through the general
+ * search, one memchr call per piece. Read once. */
+static bool splitSimd(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_SPLIT_SIMD");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* `s.split(",")`: every piece of a one-byte split, found sixteen bytes at a
+ * time. The general loop calls memchr once per piece, and for the short
+ * fields a CSV line or a joined list is made of, the call and its set-up cost
+ * more than the scan -- `string_build` splits two million ten-byte fields.
+ * Here one compare per block yields every separator in it at once. Pieces come
+ * out in order and the last one is whatever follows the last separator,
+ * exactly as the general loop leaves them. */
+static bool splitOneByte(const char *base, size_t total, unsigned char c,
+                         ObjList *list) {
+    size_t pos = 0;
+    size_t i = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    const uint8x16_t vc = vdupq_n_u8(c);
+    for (; i + 16 <= total; i += 16) {
+        uint8x16_t eq = vceqq_u8(vld1q_u8((const uint8_t *)base + i), vc);
+        uint64_t mask = vget_lane_u64(
+            vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+        while (mask != 0) {
+            unsigned lane = (unsigned)__builtin_ctzll(mask) >> 2;
+            size_t at = i + lane;
+            if (!pushSlice(list, base + pos, at - pos)) return false;
+            pos = at + 1;
+            mask &= ~((uint64_t)0xF << (lane * 4u));
+        }
+    }
+#endif
+    for (; i < total; i++) {
+        if ((unsigned char)base[i] != c) continue;
+        if (!pushSlice(list, base + pos, i - pos)) return false;
+        pos = i + 1;
+    }
+    return pushSlice(list, base + pos, total - pos);
+}
+
 static bool splitSeparator(ObjString *s, ObjString *sep, int64_t maxsplit,
                            bool fromRight, Value *out) {
     ObjList *list = jaiListNew(0);
@@ -161,7 +211,9 @@ static bool splitSeparator(ObjString *s, ObjString *sep, int64_t maxsplit,
     const char *base = s->chars;
     size_t total = s->length;
 
-    if (!fromRight) {
+    if (!fromRight && maxsplit < 0 && sep->length == 1 && splitSimd()) {
+        ok = splitOneByte(base, total, (unsigned char)sep->chars[0], list);
+    } else if (!fromRight) {
         size_t pos = 0;
         int64_t splits = 0;
         while (ok && (maxsplit < 0 || splits < maxsplit)) {
