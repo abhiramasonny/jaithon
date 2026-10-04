@@ -203,7 +203,12 @@ let _KEYWORDS: dict[str, TokenKind] = {
 #: keyword_lookup("fns") == TokenKind.Ident    # true
 #: ```
 pub fn keyword_lookup(text: str) -> TokenKind {
-    return _KEYWORDS.get(text, TokenKind.Ident)
+    # A test and an index rather than `.get(text, default)`: `get` answers a
+    # value the checker cannot type, so the return needed a `TokenKind` guard
+    # the tier refuses -- and a call to an uncompiled function cuts the
+    # compiled walk of its caller short, which was the lexer's identifier scan.
+    if text in _KEYWORDS { return _KEYWORDS[text] }
+    return TokenKind.Ident
 }
 #: The C name of each kind, as `jaiTokenKindName` in `src/lang/token.c` spells
 #: it. `jaithon tokens` prints these, and the spelling is not derivable from the
@@ -466,17 +471,22 @@ pub class Token {
     pub let span: Span
     #: The source text the token covers, verbatim.
     pub let text: str
-    #: The cooked value, or null when the kind carries no value.
-    pub let value: any
+    #: The cooked value, or null when the kind carries no value. The lexer
+    #: sets it after construction, on the literal kinds that carry one.
+    pub var value: any
     #: `TokenFlags` bits.
     pub let flags: int
 
     #: Record one token; only the lexer builds these.
-    pub fn init(self, kind: TokenKind, span: Span, text: str, value: any = null, flags: int = 0) {
+    #:
+    #: The value is not a parameter. A parameter that is an int on one call,
+    #: a string on the next and null on most has no kind the tier can give it,
+    #: and that one parameter kept every token's construction interpreted.
+    pub fn init(self, kind: TokenKind, span: Span, text: str, flags: int = 0) {
         self.kind = kind
         self.span = span
         self.text = text
-        self.value = value
+        self.value = null
         self.flags = flags
     }
 

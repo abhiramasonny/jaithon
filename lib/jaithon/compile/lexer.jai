@@ -140,7 +140,9 @@ pub class Lexer {
     #: Whether every byte is ASCII, so that a byte offset is also a `str` index.
     let ascii: bool
     #: When the source is not ASCII: the `str` index of each byte offset, and
-    #: of the end. Empty otherwise.
+    #: of the end. Otherwise `[0]` and never read -- but not empty, because an
+    #: empty list gives the tier no element to learn from and it then refused
+    #: the whole of `_text`, which every token goes through.
     let scalar_of: list[int]
     let length: int
     var tokens: list[Token]
@@ -160,7 +162,7 @@ pub class Lexer {
         self.bytes = bytes
         self.length = bytes.len()
         self.ascii = self.length == source.len()
-        self.scalar_of = if self.ascii { [] } else { _scalar_offsets(bytes) }
+        self.scalar_of = if self.ascii { [0] } else { _scalar_offsets(bytes) }
         self.tokens = []
         self.pos = 0
         self.line = 1
@@ -320,7 +322,7 @@ pub class Lexer {
     fn _push_text(self, kind: TokenKind, start: int, end: int, text: str) -> void {
         var flags = 0
         if self.at_line_start { flags = TokenFlags.AFTER_NEWLINE }
-        self.tokens.push(Token(kind, Span(self.file_id, start, end), text, null, flags))
+        self.tokens.push(Token(kind, Span(self.file_id, start, end), text, flags))
         self.at_line_start = false
     }
 
@@ -328,9 +330,9 @@ pub class Lexer {
     fn _push_value(self, kind: TokenKind, start: int, end: int, value: any, flags: int) -> void {
         var all_flags = flags
         if self.at_line_start { all_flags = all_flags | TokenFlags.AFTER_NEWLINE }
-        self.tokens.push(
-            Token(kind, Span(self.file_id, start, end), self._text(start, end), value, all_flags)
-        )
+        let token = Token(kind, Span(self.file_id, start, end), self._text(start, end), all_flags)
+        token.value = value
+        self.tokens.push(token)
         self.at_line_start = false
     }
 
@@ -1241,11 +1243,16 @@ pub class Lexer {
             return
         }
 
-        if _is_digit(character) {
+        # Spelled out rather than `_is_digit` and `_is_ident_start`: a call to a
+        # function that has not compiled yet ends the compiled walk of this
+        # body there, and which one compiles first depends on the file.
+        if character >= _C_ZERO and character <= _C_NINE {
             self._scan_number()
             return
         }
-        if _is_ident_start(character) {
+        if character >= _C_LOWER_A and character <= _C_LOWER_Z or
+            character >= _C_UPPER_A and character <= _C_UPPER_Z or
+            character == _C_UNDERSCORE {
             self._scan_identifier()
             return
         }
