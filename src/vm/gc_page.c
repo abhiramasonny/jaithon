@@ -181,8 +181,13 @@ void *jaiPageRefill(JaiPageCursor *pc) {
                     /* Nothing reads a block before writing it, so nothing
                      * pulls the next ones into the cache ahead of the stores
                      * the way the old free-list link load did: ask for them
-                     * gPrefetch words ahead. -3% cycles on alloc_churn at 2;
-                     * DC ZVA of a wholly free word instead measured +3%. */
+                     * gPrefetch words ahead. -3% cycles on alloc_churn at 2
+                     * while every allocation was a call; since compiled code
+                     * pops the mask inline it measures inside the noise.
+                     * Tried and worse: DC ZVA of a wholly free word (+3%), a
+                     * prefetch per allocation (+4%), and aiming at the next
+                     * words that have free blocks rather than at w + 2 (+4%
+                     * binary_trees, +7% alloc_churn). */
                     if (gPrefetch != 0 && w + gPrefetch < JAI_PAGE_WORDS) {
                         const char *ahead = pc->wordBase + ((size_t)gPrefetch << 10);
                         for (unsigned l = 0; l < 1024u; l += 128u)
