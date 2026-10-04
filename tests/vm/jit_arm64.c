@@ -237,6 +237,16 @@ int main(void) {
       check("stp offset wrote", scratch[2], 3);
       check("stp offset wrote 2", scratch[3], 4); }
 
+    /* The range a pair offset can name, and what lies past it: 512 encodes as
+     * -512, which is why a field at instance+512 must not be a pair store. */
+    check("pair offset 504 fits", jaiA64PairOffFits(504), 1);
+    check("pair offset 512 does not", jaiA64PairOffFits(512), 0);
+    check("pair offset -512 fits", jaiA64PairOffFits(-512), 1);
+    check("pair offset 12 does not", jaiA64PairOffFits(12), 0);
+    check("stp offset wraps at 512",
+          (int64_t)jaiA64StpOff(1, 2, 0, 512),
+          (int64_t)jaiA64StpOff(1, 2, 0, -512));
+
     /* The uxtw extended-register forms, which is how one `ldp` can stand in for
      * an `ldr x items` plus an `ldr w count`: the pair's second half arrives as
      * `count | capacity << 32` and every use has to see only the low half.

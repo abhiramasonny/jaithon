@@ -554,7 +554,7 @@ bool emitCallOut(Emit *e, unsigned argc) {
          * field -- an allocation that does not zero what they are about to
          * overwrite. JAITHON_JIT_BARE_ALLOC=0 puts both back. */
         const bool whole = jitBareAllocOn();
-        bool bare = whole && argc == cls->fieldCount && argc <= 64u;
+        bool bare = whole && haveFast && argc == cls->fieldCount && argc <= 64u;
         if (bare) {
             uint64_t seen = 0;
             for (unsigned i = 0; i < argc; i++) {
@@ -574,7 +574,8 @@ bool emitCallOut(Emit *e, unsigned argc) {
         const unsigned grains = 2u + (unsigned)cls->fieldCount;
         const bool inl = haveFast && jitInlineAllocOn() &&
                          jaiPageKind[OBJ_INSTANCE] != 0 &&
-                         grains <= JAI_SMALL_CLASSES && cls->fieldCount <= 0xffffu;
+                         grains <= JAI_SMALL_CLASSES && cls->fieldCount <= 0xffffu &&
+                         jaiA64PairOffFits((int32_t)(16u * grains) - 16);
         unsigned skipInline = 0;
         if (haveFast) {
             /* Before any of x0..x8 is written: it is what proves they hold
@@ -657,9 +658,12 @@ bool emitCallOut(Emit *e, unsigned argc) {
             /* SCRATCH_C holds the instance, so the dynamic tag needs two
              * other scratches. */
             emitTagFor(e, kinds[i], regs[i], JIT_SCRATCH_A, JIT_SCRATCH_B);
-            if (whole) {
+            if (whole && jaiA64PairOffFits((int32_t)at)) {
                 /* emitTagFor builds the tag with movz, so its high half is
-                 * zero: one pair store writes the whole Value, padding too. */
+                 * zero: one pair store writes the whole Value, padding too.
+                 * Only to slot 29: a pair's offset tops out at 504, and a
+                 * wider class (never `bare`: it is too big for the fast
+                 * path, so the descriptor zeroed it) takes the two stores. */
                 emit(e, jaiA64StpOff(JIT_SCRATCH_A, regs[i], JIT_SCRATCH_C, (int32_t)at));
             } else {
                 emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, at));

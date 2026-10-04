@@ -69,8 +69,15 @@ uint32_t jaiA64Bl(int32_t instructions);
 uint32_t jaiA64StpPre(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
 /* ldp Xt1, Xt2, [Xn], #imm   (post-index, writes back) */
 uint32_t jaiA64LdpPost(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
-/* stp Xt1, Xt2, [Xn, #imm]   (signed offset) */
+/* stp Xt1, Xt2, [Xn, #imm]   (signed offset) -- imm must pass
+ * jaiA64PairOffFits; an offset outside it wraps, it does not fail */
 uint32_t jaiA64StpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
+/* A pair's signed offset is a 7-bit field scaled by 8: -512..504. Past +504
+ * the encoders above wrap to a NEGATIVE offset -- a store at instance+512
+ * becomes one at instance-512, into a neighbouring block. */
+static inline bool jaiA64PairOffFits(int32_t imm) {
+    return imm >= -512 && imm <= 504 && (imm & 7) == 0;
+}
 /* ldp Xt1, Xt2, [Xn, #imm]   (signed offset) */
 uint32_t jaiA64LdpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
 /* ldr Xt, <label> -- PC-relative literal load, offset in instructions */
