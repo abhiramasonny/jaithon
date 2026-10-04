@@ -131,6 +131,10 @@ typedef struct JaiPage {
 typedef struct {
     uint64_t freeMask;   /* block starts in the current word not yet handed out */
     char    *wordBase;   /* address of the current word's first grain */
+    /* jaiGCEpoch << 32: the high half of an object's first header word, so
+     * compiled code builds `type | isMarked` from one load it already has the
+     * base for (emitCallOut). */
+    uint64_t epochHi;
     JaiPage *page;       /* the page the current word belongs to */
     JaiPage *nextPage;   /* the next page of `pages` to look in */
     JaiPage *pages;      /* every page of this class */
@@ -185,6 +189,11 @@ JAI_INLINE void jaiPageMark(const Obj *obj) {
     unsigned g = (unsigned)((a >> 4) & (JAI_PAGE_GRAINS - 1));
     pg->mark[g >> 6] |= (uint64_t)1 << (g & 63u);
 }
+
+/* Blocks handed to the fast paths and not yet popped. vm.allocCount is
+ * charged a word at a time like jaiHeapBytes, so a count read between
+ * collections subtracts these. */
+uint64_t jaiPageUnpopped(void);
 
 /* Frees what a dead finalizing-page object owns (object.c). */
 void jaiObjFinalize(Obj *obj);

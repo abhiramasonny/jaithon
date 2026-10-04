@@ -105,8 +105,7 @@ static inline Obj *allocObj(size_t size, ObjType type) {
             obj->isMarked = jaiGCEpoch;
             obj->subFlag = false;
             obj->subFlag2 = false;
-            vm.allocCount++;
-            return obj;
+            return obj;   /* counted in vm.allocCount by the refill */
         }
         /* jaiSmallNew is the bins-and-slab half of jaiRealloc with the size
          * class already known, so this is the same block from the same place

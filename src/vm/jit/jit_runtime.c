@@ -374,7 +374,7 @@ JAI_INLINE ObjInstance *instanceAllocFast(ObjClass *cls, bool zero) {
                            offsetof(ObjInstance, fields) == 32,
                            "an instance is written as words");
             _Static_assert(VAL_NULL == 0, "NULL_VAL is all zero bits");
-            w[0] = (uint64_t)OBJ_INSTANCE | ((uint64_t)jaiGCEpoch << 32);
+            w[0] = (uint64_t)OBJ_INSTANCE | pc->epochHi;
             w[1] = 0;
             w[2] = (uint64_t)(uintptr_t)cls;
             w[3] = count;
@@ -389,8 +389,7 @@ JAI_INLINE ObjInstance *instanceAllocFast(ObjClass *cls, bool zero) {
                     f += 2;
                 }
             }
-            vm.allocCount++;
-            return (ObjInstance *)(void *)w;
+            return (ObjInstance *)(void *)w;   /* counted by the refill */
         }
     }
     return jitInstanceAllocSlow(cls);
@@ -443,9 +442,9 @@ static JAI_NOINLINE ObjInstance *jitInstanceAllocSlow(ObjClass *cls) {
     if (!paged) {
         obj->next = g->objects;
         g->objects = obj;
+        vm.allocCount++;   /* a paged block was counted by its refill */
     }
 
-    vm.allocCount++;
     return inst;
 }
 

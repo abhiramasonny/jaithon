@@ -7,6 +7,7 @@
 
 #include "vm/gc.h"
 #include "vm/object/object.h"
+#include "vm/vm.h"
 
 /* The reserved range. Address space only: a page is touched, and so costs
  * memory, when the allocator first carves it. 32 GiB of small objects is far
@@ -155,6 +156,7 @@ static void *handOut(JaiPageCursor *pc, uint64_t m) {
     unsigned n = (unsigned)__builtin_popcountll(take);
     pc->handedOut += n;
     jaiHeapBytes += (size_t)n * cls * 16u;
+    vm.allocCount += n;
     pc->freeMask = take & (take - 1u);
     return pc->wordBase + ((size_t)__builtin_ctzll(take) << 4);
 }
@@ -209,8 +211,16 @@ void *jaiPageRefill(JaiPageCursor *pc) {
     }
 }
 
+uint64_t jaiPageUnpopped(void) {
+    uint64_t n = 0;
+    if (jaiPageSpan == 0) return 0;
+    FOR_EACH_CURSOR(pc) n += (uint64_t)__builtin_popcountll(pc->freeMask);
+    return n;
+}
+
 static void resetCursor(JaiPageCursor *pc) {
     pc->freeMask = 0;
+    pc->epochHi = (uint64_t)jaiGCEpoch << 32;
     pc->stash = 0;
     pc->wordBase = NULL;
     pc->page = NULL;
@@ -231,6 +241,7 @@ void jaiPageCollectBegin(void) {
         inUse += (size_t)used * cls * 16u;
         /* Charged when the word was handed out, never allocated. */
         jaiHeapAccountFreed((size_t)unused * cls * 16u);
+        vm.allocCount -= unused;
         /* No allocation from here until the sweep is done: refill declines
          * while jaiGCInCollect, and this makes every allocation reach it. */
         pc->freeMask = 0;
