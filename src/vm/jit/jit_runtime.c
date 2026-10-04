@@ -342,7 +342,55 @@ int jitListGrow(ObjList *list, uint64_t tag, int64_t payload) {
 
 /* Safe because jaiGCWanted()==false is gc.c's own proof no collection can happen here (collections begin
  * only in jaiGCMaybeCollect), and the object is fully built before being linked in. NULL means "declined": caller falls back to the descriptor path, which roots and may collect. */
+static JAI_NOINLINE ObjInstance *jitInstanceAllocSlow(ObjClass *cls);
+
+/* The page-space fast path, written so it needs no frame: everything that
+ * could call out -- a refill, the bins, the slab -- is in the slow half, which
+ * this tail-calls. The full-word stores matter too: every byte of the block is
+ * written, `next` and the padding included, so no store has to wait for the
+ * block's old contents to arrive before it can merge. */
 ObjInstance *jitInstanceAlloc(ObjClass *cls) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    const unsigned count = cls->fieldCount;
+    const unsigned c = 2u + count;   /* grains: a 32-byte header, 16 a field */
+    if (JAI_LIKELY(c <= JAI_SMALL_CLASSES)) {
+        JaiPageCursor *pc = &jaiPageCursor[c];
+        uint64_t m = pc->freeMask;
+        if (JAI_LIKELY(m != 0)) {
+            pc->freeMask = m & (m - 1);
+            uint64_t *w = (uint64_t *)(void *)(pc->wordBase +
+                                               ((size_t)__builtin_ctzll(m) << 4));
+            jaiHeapBytes += (size_t)c << 4;
+            _Static_assert(offsetof(Obj, type) == 0 && offsetof(Obj, isMarked) == 4 &&
+                           offsetof(Obj, subFlag) == 5 && offsetof(Obj, subFlag2) == 6 &&
+                           offsetof(Obj, next) == 8,
+                           "the header is written as two words");
+            _Static_assert(offsetof(ObjInstance, klass) == 16 &&
+                           offsetof(ObjInstance, fieldCount) == 24 &&
+                           offsetof(ObjInstance, fields) == 32,
+                           "an instance is written as words");
+            _Static_assert(VAL_NULL == 0, "NULL_VAL is all zero bits");
+            w[0] = (uint64_t)OBJ_INSTANCE | ((uint64_t)jaiGCEpoch << 32);
+            w[1] = 0;
+            w[2] = (uint64_t)(uintptr_t)cls;
+            w[3] = count;
+            /* The empty asm keeps this a loop of paired stores: as a plain
+             * loop it became a call to bzero, and the call needed a frame. */
+            uint64_t *f = w + 4;
+            for (unsigned i = 0; i < count; i++) {
+                __asm__("" : "+r"(f));
+                f[0] = 0;
+                f[1] = 0;
+                f += 2;
+            }
+            vm.allocCount++;
+            return (ObjInstance *)(void *)w;
+        }
+    }
+    return jitInstanceAllocSlow(cls);
+}
+
+static JAI_NOINLINE ObjInstance *jitInstanceAllocSlow(ObjClass *cls) {
     if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
 
     GCState *g = jaiGCActive;
