@@ -833,6 +833,38 @@ bool jaiInvokeMethodByName(ObjString *name, Value *argsWithReceiver, int count,
                     jaiTypeNameStatic(receiver), name->chars);
 }
 
+/* Fill one way of an OP_INVOKE site's cache for an instance receiver, exactly
+ * as the interpreter's miss does: a real method (not a callable field), its
+ * visibility recheck in `payload`, and no result kind yet.
+ *
+ * For compiled code whose site runs past its inline cache: a loop compiled
+ * while the site had seen one class goes round jaiInvokeMethodByName for every
+ * other, and without this the cache never learns that they exist -- which is
+ * what a later re-compile of the loop reads to decide its ways. It only ever
+ * ADDS a way; a full cache is left as it is rather than declared megamorphic,
+ * since that is the interpreter's call to make. */
+void jaiInvokeCacheLearn(InlineCache *ic, Value receiver, ObjString *name) {
+    if (ic == NULL || name == NULL || !IS_INSTANCE(receiver)) return;
+    if (ic->state == IC_MEGA || ic->count >= JAI_IC_WAYS) return;
+    ObjClass *klass = AS_INSTANCE(receiver)->klass;
+    if (klass == NULL) return;
+    /* A way is only usable by the tier once its shape resolves to a class. */
+    jaiClassRememberShape(klass);
+    for (int w = 0; w < ic->count; w++) {
+        if (ic->shapeId[w] == klass->shapeId) return;
+    }
+    Value method;
+    if (!findMethod(klass, name, &method)) return;
+    MethodInfo restricted;
+    uint32_t recheck = jaiClassRestrictedMethod(klass, name, &restricted) ? 1u : 0u;
+    ic->shapeId[ic->count]    = klass->shapeId;
+    ic->payload[ic->count]    = recheck;
+    ic->cached[ic->count]     = method;
+    ic->resultKind[ic->count] = JAI_FB_NONE;
+    ic->count++;
+    ic->state = (ic->count == 1) ? IC_MONO : IC_POLY;
+}
+
 /* ------------------------------------------------------------------ */
 /* Keyword and spread calls                                             */
 /* ------------------------------------------------------------------ */

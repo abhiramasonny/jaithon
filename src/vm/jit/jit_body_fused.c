@@ -213,7 +213,8 @@ bool emitCmpLocalConstLt(Emit *e, const uint8_t *code, int *offp) {
     return true;
 }
 
-bool emitAddIntConst(Emit *e, const uint8_t *code, int *offp) {
+bool emitAddIntConst(Emit *e, const ObjFunction *fn, const uint8_t *code,
+                     int *offp) {
     int off = *offp;
     do {
         unsigned slot = jaiReadU16(code + off + 1);
@@ -237,7 +238,11 @@ bool emitAddIntConst(Emit *e, const uint8_t *code, int *offp) {
                 emit(e, jaiA64AddsX(dst, cur, JIT_SCRATCH_A));
             }
         }
-        branchOnOverflow(e, 0u, JAI_A64_VS);
+        /* A comparison every path here made can rule the overflow out (see
+         * jit_range.c). */
+        if (!jitSlotAddSafe(e, fn, (uint32_t)off, slot, imm)) {
+            branchOnOverflow(e, 0u, JAI_A64_VS);
+        }
         off += 5;
         break;
     } while (0);
@@ -245,7 +250,8 @@ bool emitAddIntConst(Emit *e, const uint8_t *code, int *offp) {
     return true;
 }
 
-bool emitSubIntConst(Emit *e, const uint8_t *code, int *offp) {
+bool emitSubIntConst(Emit *e, const ObjFunction *fn, const uint8_t *code,
+                     int *offp) {
     int off = *offp;
     do {
         unsigned slot = jaiReadU16(code + off + 1);
@@ -266,7 +272,10 @@ bool emitSubIntConst(Emit *e, const uint8_t *code, int *offp) {
                 emit(e, jaiA64SubsXReg(dst, cur, JIT_SCRATCH_A));
             }
         }
-        branchOnOverflow(e, 1u, JAI_A64_VS);
+        /* `n - k` is `n + (-k)`, and an i16 negates without overflow. */
+        if (!jitSlotAddSafe(e, fn, (uint32_t)off, slot, -(int64_t)imm)) {
+            branchOnOverflow(e, 1u, JAI_A64_VS);
+        }
         off += 5;
         break;
     } while (0);
@@ -419,7 +428,8 @@ bool emitSubBind(Emit *e, const uint8_t *code, int *offp) {
     return true;
 }
 
-bool emitIncLocal(Emit *e, const uint8_t *code, int *offp) {
+bool emitIncLocal(Emit *e, const ObjFunction *fn, const uint8_t *code,
+                  int *offp) {
     int off = *offp;
     do {
         unsigned slot = jaiReadU16(code + off + 1);
@@ -440,7 +450,9 @@ bool emitIncLocal(Emit *e, const uint8_t *code, int *offp) {
             /* The guard is taken before the home is written, not after: it
              * resumes at this instruction inside a `try` (ovfDest), and
              * neither fpSyncAll nor a b.cond disturbs V or `dst`. */
-            branchOnOverflow(e, 0u, JAI_A64_VS);
+            if (!jitSlotAddSafe(e, fn, (uint32_t)off, slot, imm)) {
+                branchOnOverflow(e, 0u, JAI_A64_VS);
+            }
             localOut(e, slot, dst);
         }
         off += 4;

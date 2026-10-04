@@ -230,6 +230,264 @@ static bool osrNoB(ObjFunction *fn, uint32_t top, const char *why) {
     return false;
 }
 
+/* ---- A form compiled before its polymorphic site was ready ----------------
+ *
+ * The loop tier compiles on a timer tick, and a polymorphic site's inline
+ * cache can only offer a way whose callee has compiled (emitInvokePic1). The
+ * callees compile by CALL COUNT, so whether the tick lands before or after
+ * them is a race: on tests/bench/poly_dispatch the same program compiled its
+ * loop with 8 ways in some runs and 1 or 0 in others, and since a head's form
+ * is kept for the rest of the run, those runs paid the descriptor on 7 calls
+ * in 8 -- 400-490M cycles against 120-155M.
+ *
+ * So a form whose site came up short for a reason time can mend (a callee not
+ * compiled, a class not yet on record) is remembered here, keyed by its entry
+ * address -- unique for the life of the process, since the code arena is never
+ * freed -- and re-compiled in place on a later entry, once more of the site's
+ * ways have become usable. The check runs on loop ENTRY, not per iteration,
+ * and only while some form is still short. Bounded: a form is re-compiled at
+ * most OSR_UPGRADE_RETRIES times, so a site whose stragglers never compile
+ * costs one count per entry and then nothing. */
+#define OSR_UPGRADE_SITES   4
+#define OSR_UPGRADE_FORMS   32
+#define OSR_UPGRADE_RETRIES 3
+
+typedef struct {
+    int      site;      /* index of the InlineCache in the body's chunk */
+    uint8_t  ways;      /* ways the form took */
+    uint8_t  rkind;     /* the result kind every way had to return */
+} OsrShortSite;
+
+typedef struct {
+    const uint8_t *code;   /* NULL: free */
+    uint8_t        retries;
+    uint8_t        nsites;
+    uint16_t       entries;   /* entries checked since the form was compiled */
+    OsrShortSite   sites[OSR_UPGRADE_SITES];
+} OsrShortForm;
+
+/* Entries after which a gain is taken even though the site's cache still
+ * holds ways that are not usable (a callee the function tier refuses can stay
+ * uncompiled for ever), and after which a record that never gained is let go
+ * so that a stable form stops paying for the look. */
+#define OSR_UPGRADE_PATIENCE 64
+#define OSR_UPGRADE_GIVE_UP  4096
+
+static OsrShortForm sShortForms[OSR_UPGRADE_FORMS];
+static unsigned     sShortCount;     /* live entries, for the free fast path */
+/* What the compile in progress has noted; attached to the form it installs. */
+static OsrShortSite sPending[OSR_UPGRADE_SITES];
+static unsigned     sPendingCount;
+static uint8_t      sPendingRetries;
+
+bool jitPicUpgradeOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_PIC_UPGRADE");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+void jitOsrPicShort(int siteCache, unsigned ways, SlotKind rkind) {
+    if (!jitPicUpgradeOn()) return;
+    /* The measuring pass and the real one both get here; the last word wins. */
+    for (unsigned i = 0; i < sPendingCount; i++) {
+        if (sPending[i].site == siteCache) {
+            sPending[i].ways  = (uint8_t)ways;
+            sPending[i].rkind = (uint8_t)rkind;
+            return;
+        }
+    }
+    if (sPendingCount >= OSR_UPGRADE_SITES) return;
+    sPending[sPendingCount].site  = siteCache;
+    sPending[sPendingCount].ways  = (uint8_t)ways;
+    sPending[sPendingCount].rkind = (uint8_t)rkind;
+    sPendingCount++;
+}
+
+static void osrShortAttach(const uint8_t *code) {
+    if (sPendingCount == 0 || sPendingRetries >= OSR_UPGRADE_RETRIES) return;
+    for (unsigned i = 0; i < OSR_UPGRADE_FORMS; i++) {
+        if (sShortForms[i].code != NULL) continue;
+        sShortForms[i].code    = code;
+        sShortForms[i].entries = 0;
+        sShortForms[i].retries = sPendingRetries;
+        sShortForms[i].nsites  = (uint8_t)sPendingCount;
+        memcpy(sShortForms[i].sites, sPending,
+               sizeof sPending[0] * sPendingCount);
+        sShortCount++;
+        return;
+    }
+}
+
+static OsrShortForm *osrShortFind(const uint8_t *code) {
+    for (unsigned i = 0; i < OSR_UPGRADE_FORMS; i++) {
+        if (sShortForms[i].code == code) return &sShortForms[i];
+    }
+    return NULL;
+}
+
+static void osrShortDrop(OsrShortForm *s) {
+    s->code = NULL;
+    sShortCount--;
+}
+
+/* ---- A callee that is about to compile --------------------------------------
+ *
+ * The same race from the other side. A loop whose tick lands in its first few
+ * dozen iterations meets callees that are being called every iteration and
+ * have not yet reached the function tier's threshold. The form compiled then
+ * reaches them the slow way -- a method through jitInvokeMethod and C glue, a
+ * global by interpreting from the call onward every iteration -- and keeps
+ * doing so for the rest of the run, because a loop that never exits is never
+ * entered again to be replaced. Measured: object_dispatch 918M cycles under
+ * JAITHON_JIT_TICK_US=50 against ~450M, and a probe loop calling one method
+ * and one global 1.20G against 0.32G, the slow outcome in about one default
+ * run in ten as well.
+ *
+ * So the compile waits instead: it declines, and the interpreter runs the loop
+ * until the next tick, by which time a callee called every iteration has
+ * compiled. Only a callee that is plainly on its way -- called at least once,
+ * below its threshold, not refused -- is waited for, a head waits at most
+ * OSR_COLD_WAITS times, and a wait is not charged to the head's compile
+ * attempts. JAITHON_JIT_OSR_COLD_WAIT=0 compiles the slow form at once. */
+#define OSR_COLD_WAITS 24
+#define OSR_COLD_HEADS 32
+
+typedef struct {
+    const ObjFunction *fn;       /* identity only, never dereferenced */
+    uint32_t           top;
+    uint8_t            waits;
+    const ObjFunction *callee;   /* what the last wait was for: identity only */
+    uint16_t           lastCount;   /* its entryCount then */
+} OsrColdHead;
+
+static OsrColdHead sColdHeads[OSR_COLD_HEADS];
+static unsigned    sColdNext;
+/* Set by an arm that chose to wait; read by the compile driver. */
+static bool        sColdWaited;
+/* The head the compile in progress belongs to, for the arm to consult. */
+static OsrColdHead *sColdCur;
+/* Cleared for an attempt whose head has spent its waits. */
+static bool        sColdMayWait;
+
+static bool osrColdWaitOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_OSR_COLD_WAIT");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+bool jitOsrColdWait(Emit *e, const ObjFunction *cfn) {
+    if (!e->osr || e->inlining || !sColdMayWait || cfn == NULL) return false;
+    if (cfn->jitFunc != NULL || cfn->jitRefused) return false;
+    /* The compile is attempted on the call AFTER the count reaches the
+     * threshold, so a count at the threshold with no attempt yet is the
+     * closest a callee gets to compiling, not a sign it never will. */
+    if (cfn->entryCount == 0) return false;
+    uint32_t thr = jaiJitThreshold(cfn);
+    if (cfn->entryCount >= thr && cfn->jitAttempts != 0) {
+        return false;
+    }
+    /* A wait is a whole compile attempt thrown away, so it is only worth
+     * paying while the callee is plainly about to cross its threshold: after
+     * the first two waits -- free, because the first iterations of a loop
+     * are slow while its callees' caches fill and they compile, so two ticks
+     * can land inside one -- the calls it made since the last look have to
+     * cover what is left in about two more ticks. A callee called once per iteration of a loop
+     * whose iterations are slow -- dict_iter's, each summing a dict -- would
+     * otherwise be waited for tick after tick while the loop runs
+     * interpreted. */
+    OsrColdHead *h = sColdCur;
+    if (h != NULL) {
+        if (h->waits >= 2 && h->callee == cfn) {
+            unsigned now  = cfn->entryCount;
+            unsigned made = now > h->lastCount ? now - h->lastCount : 0;
+            unsigned left = thr > now ? thr - now : 0;
+            if (left > 2u * made + 2u) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] osr: not waiting for %s: %u calls "
+                            "since the last look, %u to go\n",
+                            cfn->name ? cfn->name->chars : "?", made, left);
+                }
+                return false;
+            }
+        }
+        h->callee = cfn;
+        h->lastCount = cfn->entryCount;
+    }
+    sColdWaited = true;
+    e->whyNot = "a callee still on its way to compiling";
+    return true;
+}
+
+static OsrColdHead *osrColdHead(const ObjFunction *fn, uint32_t top) {
+    for (unsigned i = 0; i < OSR_COLD_HEADS; i++) {
+        if (sColdHeads[i].fn == fn && sColdHeads[i].top == top) {
+            return &sColdHeads[i];
+        }
+    }
+    OsrColdHead *h = &sColdHeads[sColdNext++ % OSR_COLD_HEADS];
+    h->fn = fn;
+    h->top = top;
+    h->waits = 0;
+    h->callee = NULL;
+    h->lastCount = 0;
+    return h;
+}
+
+/* How many of a site's ways a compile could take NOW: the cheap half of
+ * emitInvokePic1's filter, the half that changes with time. A way that passes
+ * this and then fails jitPic1Admissible costs one wasted compile, which the
+ * retry bound caps. */
+static unsigned osrSiteUsableWays(const ObjFunction *fn, const OsrShortSite *s,
+                                  unsigned *recorded) {
+    *recorded = 0;
+    if (fn->chunk.caches == NULL || s->site < 0 || s->site >= fn->chunk.cacheCount) {
+        return 0;
+    }
+    const InlineCache *ic = &fn->chunk.caches[s->site];
+    *recorded = (unsigned)ic->count;
+    unsigned n = 0;
+    for (int w = 0; w < ic->count && w < JAI_IC_WAYS; w++) {
+        if (ic->payload[w] != 0) continue;
+        Value cv = ic->cached[w];
+        if (!IS_CLOSURE(cv)) continue;
+        ObjFunction *cf = AS_CLOSURE(cv)->fn;
+        if (cf->jitFunc == NULL) continue;
+        if (cf->jitReturnKind != s->rkind || cf->jitReturnShape != 0) continue;
+        ObjClass *cc = NULL;
+        if (!jaiClassForShape(ic->shapeId[w], &cc) || cc == NULL) continue;
+        n++;
+    }
+    return n;
+}
+
+/* The record for `form` if it is short and worth compiling again now; NULL
+ * otherwise. A site that has gained ways is taken at once when every way its
+ * cache records is usable -- the cache filled and its callees caught up --
+ * and otherwise only after OSR_UPGRADE_PATIENCE entries, so a warm-up that
+ * lands the stragglers one at a time costs one re-compile, not one each. */
+static OsrShortForm *osrShortReady(const ObjFunction *fn, const JaiOsrForm *form) {
+    if (sShortCount == 0) return NULL;
+    OsrShortForm *s = osrShortFind(form->code);
+    if (s == NULL) return NULL;
+    if (s->entries < UINT16_MAX) s->entries++;
+    bool gained = false, settled = true;
+    for (unsigned i = 0; i < s->nsites; i++) {
+        unsigned recorded = 0;
+        unsigned usable = osrSiteUsableWays(fn, &s->sites[i], &recorded);
+        if (usable > s->sites[i].ways) gained = true;
+        if (usable < recorded) settled = false;
+    }
+    if (gained && (settled || s->entries >= OSR_UPGRADE_PATIENCE)) return s;
+    if (s->entries >= OSR_UPGRADE_GIVE_UP) osrShortDrop(s);
+    return NULL;
+}
+
 static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            uint8_t iterKind, Value elemSample, bool elemMixed,
                            uint8_t elemStg,
@@ -266,6 +524,24 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
     return false;
 }
 
+/* The whole body first, then just the part before the first `continue`,
+ * each with inlining and then without -- see jaiJitEnterOsr for why. */
+static bool compileOsrAny(ObjClosure *closure, uint32_t top, Value *slots,
+                          uint8_t iterKind, Value elemSample, bool elemMixed,
+                          uint8_t elemStg) {
+    /* A wait ends the attempt: every other variant would meet the same
+     * callee, and the point is to come back once it has compiled. */
+    sColdWaited = false;
+    for (int v = 0; v < 4; v++) {
+        if (compileOsr(closure, top, slots, iterKind, elemSample, elemMixed,
+                       elemStg, v < 2, (v & 1) != 0)) {
+            return true;
+        }
+        if (sColdWaited) return false;
+    }
+    return false;
+}
+
 static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            uint8_t iterKind, Value elemSample, bool elemMixed,
                            uint8_t elemStg,
@@ -275,6 +551,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     bool hasIter = iterKind != 0;
     ObjFunction *fn = closure->fn;
     jitBranchTargetsReset();
+    sPendingCount = 0;   /* notes belong to the attempt that installs a form */
     if (!isInstructionStart(&fn->chunk, top))
         return osrNoB(fn, top, "the loop head is not an instruction boundary");
     uint32_t end = findLoopEnd(&fn->chunk, top, wholeBody);
@@ -296,9 +573,11 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     int *chunkDepth = chunkDepthTable(fn);
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
 
+    jitRangeReset();
     static Emit e;
     jitEmitReset(&e);
     e.osr = true;
+    e.litPool = jitLitPoolOn();
     e.loopDepth = gLoopDepth;
     e.loopDepthCount = loopDepthTable(&fn->chunk);
     e.hasIter = hasIter;
@@ -371,6 +650,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     {
         static Emit probe;
         jitEmitReset(&probe);
+        probe.litPool = jitLitPoolOn();
         probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
         probe.iterKind = iterKind; probe.elemSample = elemSample;
         probe.elemMixed = elemMixed;
@@ -810,11 +1090,14 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         int rel = target - f->instIndex;
         uint32_t word = e.code[f->instIndex];
         if ((word & 0xfc000000u) == 0x94000000u) e.code[f->instIndex] = jaiA64Bl(rel);
+        else if (f->conditional && jaiA64IsCbz(word))
+            e.code[f->instIndex] = jaiA64CbzRetarget(word, rel);
         else if (f->conditional) e.code[f->instIndex] = jaiA64BCond(word & 0xfu, rel);
         else e.code[f->instIndex] = jaiA64B(rel);
     }
     jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
 
+    if (!emitLiteralPool(&e)) return false;
     if (!jaiCodeArenaUnseal(arena)) return false;
     /* Same 32-alignment as the function tier above, for the same two reasons. */
     uint8_t *entry = arenaEmit(arena, e.code, e.count);
@@ -830,6 +1113,12 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     if (fn->osrForms == NULL)
         fn->osrForms = JAI_ALLOC_ZEROED(JaiOsrForm, JAI_OSR_MAX);
     JaiOsrForm *form = &fn->osrForms[fn->osrCount];
+    /* Start from a clean record. The in-place re-compile in jaiJitEnterOsr
+     * compiles into a slot another head's form just vacated, and a field left
+     * over from it -- `declines` at JAI_OSR_GIVE_UP above all -- made the new
+     * form one the back edge would never enter again: poly_dispatch's inner
+     * loop ran interpreted for the rest of the run once it was "replaced". */
+    *form = (JaiOsrForm){0};
     form->code  = entry;
     form->top   = top;
     form->slots = (uint8_t)e.locals;
@@ -874,6 +1163,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     }
 
     fn->osrCount++;
+    osrShortAttach(entry);
     fn->osrHot = true;
     fn->jitOsrModuleVersion = fn->module != NULL ? fn->module->version : 0;
     if (getenv("JAI_JIT_WHY")) {
@@ -1186,14 +1476,21 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
          * declines and NOTHING is compiled. tests/bench's contour follower is
          * exactly that shape. So the prefix stays as the fallback: some of the
          * loop compiled beats none of it. */
-        if (!compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, elemStg, true, false) &&
-            !compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, elemStg, true, true) &&
-            !compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, elemStg, false, false) &&
-            !compileOsr(closure, top, frame->slots, iterKind, elemSample,
-                        elemMixed, elemStg, false, true)) {
+        sPendingRetries = 0;
+        OsrColdHead *cold = osrColdWaitOn() ? osrColdHead(fn, top) : NULL;
+        sColdMayWait = cold != NULL && cold->waits < OSR_COLD_WAITS;
+        sColdCur = cold;
+        bool built = compileOsrAny(closure, top, frame->slots, iterKind,
+                                   elemSample, elemMixed, elemStg);
+        bool waited = !built && sColdWaited;
+        sColdMayWait = false;
+        sColdCur = NULL;
+        sColdWaited = false;
+        if (waited) {
+            cold->waits++;
+            return osrNo(fn, top, "waiting for a callee to compile");
+        }
+        if (!built) {
             /* Inlining widens live ranges; a loop that will not fit with it
              * may fit without, and a compiled call beats no compile at all. */
             if (miss == fn->osrMissCount && miss < osrFormCap()) {
@@ -1228,6 +1525,41 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             return 0;
         }
         form = &fn->osrForms[fn->osrCount - 1];
+    } else {
+        OsrShortForm *shortf = osrShortReady(fn, form);
+        if (shortf != NULL) {
+            /* Re-compile in place: the new form takes the old one's index, so
+             * a caller holding `form` (the back edge in vm.c) still names
+             * this head's form, and on failure the old one is put back
+             * exactly as it was. Either way the old record is spent. */
+            uint8_t tries = shortf->retries;
+            osrShortDrop(shortf);
+            unsigned idx  = (unsigned)(form - fn->osrForms);
+            unsigned last = (unsigned)fn->osrCount - 1u;
+            JaiOsrForm old = *form;
+            if (idx != last) fn->osrForms[idx] = fn->osrForms[last];
+            fn->osrCount--;
+            sPendingRetries = (uint8_t)(tries + 1u);
+            sColdMayWait = false;
+            bool ok = compileOsrAny(closure, top, frame->slots, iterKind,
+                                    elemSample, elemMixed, elemStg);
+            sPendingRetries = 0;
+            if (ok) {
+                JaiOsrForm fresh = fn->osrForms[last];
+                if (idx != last) fn->osrForms[last] = fn->osrForms[idx];
+                fn->osrForms[idx] = fresh;
+            } else {
+                if (idx != last) fn->osrForms[last] = fn->osrForms[idx];
+                fn->osrForms[idx] = old;
+                fn->osrCount++;
+            }
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] osr %s at %u re-compiled for a site that "
+                        "gained ways: %s\n", jitFnLabel(fn), top,
+                        ok ? "replaced" : "kept the old form");
+            }
+            form = &fn->osrForms[idx];
+        }
     }
     if (fn->module == NULL || fn->module->version != fn->jitOsrModuleVersion)
         return osrNo(fn, top, "the form was compiled against an older module");

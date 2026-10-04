@@ -1055,6 +1055,7 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
     e->stackPinned[e->depth] = false;
+    e->stackMixed[e->depth] = false;   /* OP_GET_ITER sets it after the push */
     e->stackObjType[e->depth] = 0;
     e->stackElem[e->depth] = NULL_VAL;
     e->stackElemDecl[e->depth] =
@@ -1127,6 +1128,7 @@ bool pushSelf(Emit *e) {
     e->stackNullLit[e->depth] = false;
     e->stackUnit[e->depth]  = false;
     e->stackPinned[e->depth] = false;
+    e->stackMixed[e->depth] = false;   /* OP_GET_ITER sets it after the push */
     e->stackObjType[e->depth] = 0;
     e->stackElem[e->depth] = NULL_VAL;
     e->stackElemDecl[e->depth] = 0;

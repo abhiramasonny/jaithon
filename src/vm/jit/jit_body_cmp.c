@@ -592,7 +592,7 @@ bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
             branchOnDeopt(e, JAI_A64_EQ);
             }
-            emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(k));
+            emitConstCmp(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(k));
             emit(e, jaiA64SubsXReg(31, rs, JIT_SCRATCH_B));
             branchTo(e, (uint32_t)((int32_t)next + jump), true, cond);
             off += 9;

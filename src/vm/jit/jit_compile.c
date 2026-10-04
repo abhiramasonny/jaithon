@@ -58,7 +58,7 @@ static uintptr_t stackLimit(void) {
 /* The kinds of the parameters, read off the arguments this call was made with.
  * Everything downstream is specialised to them, and the entry guard re-checks
  * them on every later call. */
-static bool seedLocals(Emit *e, Value *slotBase) {
+static bool seedLocals(Emit *e, Value *slotBase, uint32_t unpin) {
     e->observed = slotBase;
     for (unsigned i = 0; i < e->base + e->locals; i++) {
         e->localKind[i]   = SLOT_INT;
@@ -79,6 +79,13 @@ static bool seedLocals(Emit *e, Value *slotBase) {
                                                    : SLOT_INST;
             e->localClass[i] = AS_INSTANCE(v)->klass;
             e->localShape[i] = AS_INSTANCE(v)->klass->shapeId;
+            /* A parameter calls pass several classes through: no class, so
+             * its methods dispatch through their site's cache and the entry
+             * check asks only for an instance (jitPolyParamMask). */
+            if (i >= 1 && i < 32 && (unpin & (1u << i)) != 0) {
+                e->localClass[i] = NULL;
+                e->localShape[i] = 0;
+            }
         } else if (IS_LIST(v)) {
             e->localKind[i] = SLOT_LIST;
         } else if (IS_OBJ(v)) {
@@ -328,7 +335,14 @@ void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
  * Every exit from here re-seals. */
 uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
                           unsigned count) {
-    while ((arena->used & 31u) != 0) {
+    static unsigned alignMask;
+    if (alignMask == 0) {
+        const char *v = getenv("JAITHON_JIT_ALIGN");
+        unsigned a = v != NULL ? (unsigned)atoi(v) : 32u;
+        if (a < 32u || (a & (a - 1u)) != 0 || a > 4096u) a = 32u;
+        alignMask = a - 1u;
+    }
+    while ((arena->used & alignMask) != 0) {
         uint32_t pad = jaiA64Nop();
         if (jaiCodeArenaWrite(arena, &pad, sizeof pad) == NULL) {
             jaiCodeArenaSeal(arena);
@@ -498,6 +512,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     /* Static, not automatic: at this size two of them would be a large stack
      * frame, and compilation is not reentrant -- nothing it calls compiles
      * anything. */
+    jitRangeReset();
     static Emit e;
     jitEmitReset(&e);
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
@@ -510,6 +525,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     e.chunkDepthCount = fn->chunk.count + 1;
     e.limitLiteral = -1;
     e.bailBlock    = -1;
+    e.litPool      = jitLitPoolOn();
 
     /* The prologue can't be emitted first: its save set depends on how deep the operand stack gets,
      * which only the body knows. So the body goes into the buffer at a fixed offset and the prologue is written in front of it afterwards, with every instruction index shifted by the same amount. */
@@ -526,6 +542,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     body.usesUpvalues = fn->upvalueCount > 0;
     body.callsOut     = true;      /* the measuring pass may emit one */
     body.measuring    = true;
+    body.litPool      = jitLitPoolOn();
     body.descOffset   = 16u;
     body.offsetToInst = map;
     body.offsetToDepth = depths;
@@ -535,7 +552,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * nested the site is. Without it every site in the function counts the
      * same and `n`, read once to set the loop up, outranks nothing. */
     body.loopDepth = loopDepthFor(&fn->chunk, &body.loopDepthCount);
-    if (!seedLocals(&body, slotBase)) {
+    if (!seedLocals(&body, slotBase, jitPolyParamMask(fn))) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: %s\n",
                     jitFnLabel(fn),
@@ -752,8 +769,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * so that runaway recursion still becomes a RecursionError. */
     int guardLoad = (int)e.count;
     emit(&e, jaiA64LdrLit(JIT_SCRATCH_A, 0));         /* patched below */
-    emit(&e, jaiA64AddXImm(JIT_SCRATCH_B, 31, 0));    /* mov x10, sp */
-    emit(&e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_A));
+    emit(&e, jaiA64CmpSpX(JIT_SCRATCH_A));            /* every call pays it */
     unsigned guardBranch = e.count;
     emit(&e, jaiA64BCond(JAI_A64_LO, 0));             /* patched below */
 
@@ -764,7 +780,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     e.offsetToDepth = depths;
     e.chunkDepth = chunkDepth;
     e.chunkDepthCount = fn->chunk.count + 1;
-    if (!seedLocals(&e, slotBase)) {
+    if (!seedLocals(&e, slotBase, jitPolyParamMask(fn))) {
         if (getenv("JAI_JIT_WHY")) {
             fprintf(stderr, "[jit] %s stopped: its locals could not be seeded on the real pass\n",
                     jitFnLabel(fn));
@@ -1165,11 +1181,23 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         uint32_t word = e.code[f->instIndex];
         if ((word & 0xfc000000u) == 0x94000000u) {
             e.code[f->instIndex] = jaiA64Bl(rel);
+        } else if (f->conditional && jaiA64IsCbz(word)) {
+            e.code[f->instIndex] = jaiA64CbzRetarget(word, rel);
         } else if (f->conditional) {
             e.code[f->instIndex] = jaiA64BCond(word & 0xfu, rel);
         } else {
             e.code[f->instIndex] = jaiA64B(rel);
         }
+    }
+    /* After every branch is patched and before anything reads the words --
+     * the dump below included, so what it shows is what runs. */
+    if (!emitLiteralPool(&e)) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: no room for its constants\n",
+                    jitFnLabel(fn));
+        }
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+        return false;
     }
     /* JAI_JIT_DUMP=<function> writes that function's words to jit_<function>.bin and prints the
      * bytecode-offset-to-instruction map, so the code can be read back with `llvm-mc --disassemble --triple=aarch64` on the file's bytes. Reading the code is how the register plan gets checked at all -- three of this tier's bugs were found no other way. */

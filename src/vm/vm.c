@@ -1986,6 +1986,10 @@ static JaiRunResult runLoop(int baseFrameCount) {
                 uint32_t recheck =
                     jaiClassRestrictedMethod(klass, name, &restricted) ? 1u : 0u;
                 if (ic->count < JAI_IC_WAYS) {
+                    /* The compiled tier can only take a way whose shape
+                     * resolves to a class (emitInvokePic1), and nothing else
+                     * records one for a class whose constructor ran compiled. */
+                    jaiClassRememberShape(klass);
                     ic->shapeId[ic->count] = klass->shapeId;
                     ic->payload[ic->count] = recheck;
                     ic->cached[ic->count] = method;

@@ -57,8 +57,10 @@ static inline bool jitArgIn(ObjClosure *closure, const Value *slotBase,
             if (IS_NULL(v)) { *out = 0; break; }
             if (!IS_INSTANCE(v)) return false;
             ObjInstance *mi = AS_INSTANCE(v);
+            /* Shape 0: bound unpinned (jitPolyParamMask), any class. */
             if (mi->klass == NULL ||
-                mi->klass->shapeId != fn->jitParamShape[i]) {
+                (fn->jitParamShape[i] != 0 &&
+                 mi->klass->shapeId != fn->jitParamShape[i])) {
                 return false;
             }
             *out = (int64_t)(uintptr_t)mi;
@@ -70,7 +72,8 @@ static inline bool jitArgIn(ObjClosure *closure, const Value *slotBase,
             if (!IS_INSTANCE(v)) return false;
             ObjInstance *inst = AS_INSTANCE(v);
             if (inst->klass == NULL ||
-                inst->klass->shapeId != fn->jitParamShape[i]) {
+                (fn->jitParamShape[i] != 0 &&
+                 inst->klass->shapeId != fn->jitParamShape[i])) {
                 return false;
             }
             *out = (int64_t)(uintptr_t)inst;
@@ -287,6 +290,125 @@ static JAI_NOINLINE void jitRecompileBlocked(ObjClosure *closure,
     }
 }
 
+/* ---- A parameter several classes pass through -----------------------------
+ *
+ * `fn weighted(s: Shape, k: float) -> float { return s.area() * k }` compiles
+ * on the call that crosses the threshold, specialised to the class THAT call
+ * passed -- and every later call passing another class is declined at entry
+ * and runs interpreted, whole. Measured on a probe walking twelve shapes of
+ * three classes: two calls in three interpreted, 156 cycles a call.
+ *
+ * Nothing about a parameter of instance kind needs the class except the field
+ * reads and calls in the body, and a call can dispatch through its site's
+ * cache instead (emitInvokePic1). So when a form keeps declining because a
+ * parameter holds another class, the body is compiled again with that
+ * parameter unpinned -- jitArgIn then asks only for an instance -- and the
+ * old form is restored if the new one will not compile (a field read off the
+ * parameter, say, which an unpinned receiver cannot do). Once per function.
+ * The receiver of a method is never unpinned: everything it touches is laid
+ * out by its class. JAITHON_JIT_POLY_PARAM=0 keeps every parameter pinned. */
+#define POLY_PARAM_DECLINES 32
+#define POLY_PARAM_FNS      64
+
+typedef struct {
+    const ObjFunction *fn;   /* identity: what to compare a call against */
+    uint32_t           mask;      /* parameters to bind unpinned */
+    uint16_t           declines;
+    bool               tried;     /* the recompile has been attempted */
+} PolyParamFn;
+
+static PolyParamFn sPolyFns[POLY_PARAM_FNS];
+static unsigned    sPolyNext;
+
+static bool polyParamOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_POLY_PARAM");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static PolyParamFn *polyFind(const ObjFunction *fn) {
+    for (unsigned i = 0; i < POLY_PARAM_FNS; i++) {
+        if (sPolyFns[i].fn == fn) return &sPolyFns[i];
+    }
+    return NULL;
+}
+
+uint32_t jitPolyParamMask(const ObjFunction *fn) {
+    if (!polyParamOn()) return 0;
+    const PolyParamFn *p = polyFind(fn);
+    return p != NULL ? p->mask : 0;
+}
+
+/* Argument `i` was declined; if it was an instance of the wrong class at a
+ * pinned instance parameter often enough, compile again with it unpinned. */
+static JAI_NOINLINE void polyParamDecline(ObjClosure *closure, ObjFunction *fn,
+                                         unsigned i, Value *slotBase) {
+    if (!polyParamOn()) return;
+    unsigned slot = fn->jitArgBase + i;
+    if (slot < 1 || slot >= 32) return;
+    SlotKind k = (SlotKind)fn->jitParamKind[i];
+    if (k != SLOT_INST) return;   /* a nullable one keeps its narrower arms */
+    if (fn->jitParamShape[i] == 0) return;
+    Value v = slotBase[slot];
+    if (!IS_INSTANCE(v)) return;
+    PolyParamFn *p = polyFind(fn);
+    if (p == NULL) {
+        p = &sPolyFns[sPolyNext++ % POLY_PARAM_FNS];
+        p->fn = fn;
+        p->mask = 0;
+        p->declines = 0;
+        p->tried = false;
+    }
+    if (p->tried) return;
+    if (++p->declines < POLY_PARAM_DECLINES) return;
+    p->tried = true;
+
+    /* The same save/compile/restore jitRecompileBlocked makes. */
+    uint8_t *old       = fn->jitFunc;
+    uint8_t  oldArgC   = fn->jitArgCount;
+    uint8_t  oldArgB   = fn->jitArgBase;
+    uint8_t  oldRet    = fn->jitReturnKind;
+    bool     oldRetK   = fn->jitReturnKnown;
+    uint32_t oldRetS   = fn->jitReturnShape;
+    bool     oldNoWr   = fn->jitFuncNoWrite;
+    uint32_t oldVer    = fn->jitFuncModuleVersion;
+    ObjFunction *oldBlk = fn->jitBlockedOn;
+    uint8_t  oldKind[8];
+    uint32_t oldShape[8];
+    memcpy(oldKind,  fn->jitParamKind,  sizeof oldKind);
+    memcpy(oldShape, fn->jitParamShape, sizeof oldShape);
+
+    p->mask |= 1u << slot;
+    fn->jitFunc = NULL;
+    if (jaiJitCompileFunc(closure, slotBase)) {
+        fn->jitFuncModuleVersion = fn->module->version;
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] recompiled %s with parameter %u unpinned\n",
+                    jitFnLabel(fn), slot);
+        }
+        return;
+    }
+    p->mask &= ~(1u << slot);
+    fn->jitFunc              = old;
+    fn->jitArgCount          = oldArgC;
+    fn->jitArgBase           = oldArgB;
+    fn->jitReturnKind        = oldRet;
+    fn->jitReturnKnown       = oldRetK;
+    fn->jitReturnShape       = oldRetS;
+    fn->jitFuncNoWrite       = oldNoWr;
+    fn->jitFuncModuleVersion = oldVer;
+    fn->jitBlockedOn         = oldBlk;
+    memcpy(fn->jitParamKind,  oldKind,  sizeof oldKind);
+    memcpy(fn->jitParamShape, oldShape, sizeof oldShape);
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] %s would not compile with parameter %u "
+                "unpinned -- old form kept\n", jitFnLabel(fn), slot);
+    }
+}
+
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
@@ -318,14 +440,14 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     /* Unrolled rather than a loop over `int64_t a[JIT_MAX_ARITY]` -- measured, not tidiness: an array of
      * int64 makes clang add a stack-protector prologue/epilogue and sends every argument out to the frame and back on its way to the register the call reads it from. This function sits on the path of every interpreted call into a compiled body, so both costs are paid per call. */
     if (arity > JIT_MAX_ARITY) return JAI_JIT_DECLINED;
-    if (arity > 0 && !jitArgIn(closure, slotBase, 0, &a0)) return JAI_JIT_DECLINED;
-    if (arity > 1 && !jitArgIn(closure, slotBase, 1, &a1)) return JAI_JIT_DECLINED;
-    if (arity > 2 && !jitArgIn(closure, slotBase, 2, &a2)) return JAI_JIT_DECLINED;
-    if (arity > 3 && !jitArgIn(closure, slotBase, 3, &a3)) return JAI_JIT_DECLINED;
-    if (arity > 4 && !jitArgIn(closure, slotBase, 4, &a4)) return JAI_JIT_DECLINED;
-    if (arity > 5 && !jitArgIn(closure, slotBase, 5, &a5)) return JAI_JIT_DECLINED;
-    if (arity > 6 && !jitArgIn(closure, slotBase, 6, &a6)) return JAI_JIT_DECLINED;
-    if (arity > 7 && !jitArgIn(closure, slotBase, 7, &a7)) return JAI_JIT_DECLINED;
+    if (arity > 0 && !jitArgIn(closure, slotBase, 0, &a0)) goto declined0;
+    if (arity > 1 && !jitArgIn(closure, slotBase, 1, &a1)) goto declined1;
+    if (arity > 2 && !jitArgIn(closure, slotBase, 2, &a2)) goto declined2;
+    if (arity > 3 && !jitArgIn(closure, slotBase, 3, &a3)) goto declined3;
+    if (arity > 4 && !jitArgIn(closure, slotBase, 4, &a4)) goto declined4;
+    if (arity > 5 && !jitArgIn(closure, slotBase, 5, &a5)) goto declined5;
+    if (arity > 6 && !jitArgIn(closure, slotBase, 6, &a6)) goto declined6;
+    if (arity > 7 && !jitArgIn(closure, slotBase, 7, &a7)) goto declined7;
 
     JitResult r;
     switch (arity) {
@@ -340,6 +462,22 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     default: r = ((Fn8)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3, a4, a5, a6, a7); break;
     }
     return jitResultOut(fn, r, slotBase);
+
+    /* Declined at entry. Always DECLINED -- this call runs interpreted
+     * whatever happens next -- but an argument of the wrong class may earn
+     * the NEXT call a form that takes it. */
+    unsigned bad;
+declined0: bad = 0; goto declined;
+declined1: bad = 1; goto declined;
+declined2: bad = 2; goto declined;
+declined3: bad = 3; goto declined;
+declined4: bad = 4; goto declined;
+declined5: bad = 5; goto declined;
+declined6: bad = 6; goto declined;
+declined7: bad = 7; goto declined;
+declined:
+    polyParamDecline(closure, fn, bad, slotBase);
+    return JAI_JIT_DECLINED;
 }
 
 /* See vm.h. Everything jaiCallValue1 and jaiJitEnterFunc do for one argument,

@@ -160,7 +160,7 @@ static void emitEnumTypeGuard(Emit *e, unsigned rSubj, ObjEnum *type,
     branchTo(e, miss, true, JAI_A64_NE);
     emit(e, jaiA64LdrX(JIT_SCRATCH_A, rSubj,
                        (unsigned)offsetof(ObjEnumVal, type)));
-    emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)type);
+    emitConstCmp(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)type);
     emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
     branchTo(e, miss, true, JAI_A64_NE);
 }

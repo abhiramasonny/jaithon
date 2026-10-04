@@ -35,7 +35,10 @@ bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
             e->whyNot = "a direct call argument is not the parameter's kind";
             return false;
         }
+        /* Shape 0 is a parameter the callee bound unpinned: any instance
+         * will do, and it relies on no class (jitPolyParamMask). */
         if ((want == SLOT_INST || want == SLOT_MAYBE_INST) &&
+            cfn->jitParamShape[i] != 0 &&
             e->stackShape[idx] != cfn->jitParamShape[i]) {
             e->whyNot = "a direct call passing a different class";
             return false;
@@ -295,14 +298,13 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
             e->failed = true;
             return false;
         }
-        emit(e, jaiA64SubsXImm(31, 1, 0));
         if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
         e->fixups[e->fixupCount].instIndex    = (int)e->count;
         e->fixups[e->fixupCount].targetOffset = FIXUP_SELFSLOW - si;
         e->fixups[e->fixupCount].conditional  = true;
         e->fixups[e->fixupCount].depth        = -1;
         e->fixupCount++;
-        emit(e, jaiA64BCond(JAI_A64_NE, 0));
+        emit(e, jaiA64CbnzX(1, 0));   /* the stub re-reads x1 itself */
     } else {
         /* Verdict 2 is a pending exception: the interpreter owns it and this
          * call must not run again. */

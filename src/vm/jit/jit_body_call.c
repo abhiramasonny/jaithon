@@ -199,7 +199,7 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
              * it is known too, and that is the whole licence to inline. */
             emit(e, jaiA64LdrX(JIT_SCRATCH_A, rCallee0,
                                (unsigned)offsetof(ObjClosure, fn)));
-            emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
+            emitConstCmp(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
             emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
             branchOnDeopt(e, JAI_A64_NE);
 
@@ -368,7 +368,9 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
                     e->whyNot = "a self-call argument is not the parameter's kind";
                     return false;
                 }
+                /* A parameter bound unpinned (no class) takes any. */
                 if ((pk == SLOT_INST || pk == SLOT_MAYBE_INST) &&
+                    e->localClass[pslot] != NULL &&
                     e->stackClass[aidx] != e->localClass[pslot]) {
                     e->whyNot = "a self-call passing a different class";
                     return false;
@@ -481,14 +483,15 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             return false;
         }
 
-        emit(e, jaiA64SubsXImm(31, 1, 0));
+        /* One word: the stub re-reads x1 for itself, so nothing here needs
+         * the flags a compare would leave. */
         if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
         e->fixups[e->fixupCount].instIndex    = (int)e->count;
         e->fixups[e->fixupCount].targetOffset = FIXUP_SELFSLOW - si;
         e->fixups[e->fixupCount].conditional  = true;
         e->fixups[e->fixupCount].depth        = -1;
         e->fixupCount++;
-        emit(e, jaiA64BCond(JAI_A64_NE, 0));
+        emit(e, jaiA64CbnzX(1, 0));
         emit(e, jaiA64MovX(resultReg, 0));
         e->selfSlow[si].returnTo = (int)e->count;
 
@@ -803,8 +806,24 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                     }
                 }
 
+                /* A loop form can be re-compiled for more ways (see
+                 * jitOsrPicShort), but only if the site's cache keeps
+                 * learning classes -- and once this form runs, every class
+                 * it does not hold comes through here rather than through
+                 * the interpreter's miss. So the call out carries the cache
+                 * in `aux` and fills a way on the interpreter's behalf. */
+                bool learn = e->osr && jitPicUpgradeOn() &&
+                             fn->chunk.caches != NULL &&
+                             (int)invokeCache < fn->chunk.cacheCount;
+                if (learn) {
+                    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)
+                                &fn->chunk.caches[invokeCache]);
+                    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31, e->descOffset +
+                                       (unsigned)offsetof(JitCallDesc, aux)));
+                }
                 if (!emitDescriptor(e, mname, ridx, argc + 1,
-                                    (void *)&jitInvokeByName)) {
+                                    learn ? (void *)&jitInvokeByNameLearn
+                                          : (void *)&jitInvokeByName)) {
                     return false;
                 }
                 for (unsigned i = 0; i <= argc; i++) {
@@ -855,6 +874,16 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                 return false;
             }
             if (!IS_CLOSURE(method)) return false;
+            /* The wider inliner, for a body inlineMethod's own walker does
+             * not speak -- a constant, a modulo, a field read off a copy of
+             * `self`. Same licence as the direct call below: the receiver's
+             * class is pinned, so the method is known. */
+            if (inlineMethodCall(e, fn, AS_CLOSURE(method), argc,
+                                 (uint32_t)off)) {
+                off += 7;
+                break;
+            }
+            if (e->failed) return false;
             ObjFunction *mfn = AS_CLOSURE(method)->fn;
             /* The callee's own compiled form states its return kind exactly; without one the
              * interpreter's record of what it has been returning stands in. That case is not exotic --
@@ -948,6 +977,9 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                 if (e->failed) return false;   /* it had started emitting */
                 e->whyNot = saved;
             }
+            /* The descriptor below is for the life of a loop form; a method
+             * about to compile is worth one more tick of waiting. */
+            if (mfn->jitFunc == NULL && jitOsrColdWait(e, mfn)) return false;
 
             if (!emitDescriptor(e, method, ridx, argc + 1,
                                 (void *)&jitInvokeMethod)) {

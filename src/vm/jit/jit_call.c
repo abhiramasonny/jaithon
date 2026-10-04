@@ -469,7 +469,7 @@ bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,
     }
 
     if (fr->lazy) {
-        emitConst64(e, JIT_SCRATCH_B, (int64_t)(uint64_t)fr->sentinel);
+        emitConstCmp(e, JIT_SCRATCH_B, (int64_t)(uint64_t)fr->sentinel);
         emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
         skipSlow = e->count;
         emit(e, jaiA64BCond(JAI_A64_NE, 0));      /* patched below */

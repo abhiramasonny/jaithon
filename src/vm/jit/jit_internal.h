@@ -30,6 +30,10 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 #define JIT_MAX_ARITY    8u   /* arguments arrive in x0..x7 */
 /* Deopt stubs dominate this size: each writes out every local and live stack entry. `merge` silently needed 512 -- hence the diagnostics. */
 #define JIT_MAX_INSTS 20000u
+/* Distinct pooled constants, and loads of them, one body may carry. Past
+ * either a constant is simply materialised in registers instead. */
+#define JIT_MAX_LITS     64u
+#define JIT_MAX_LIT_USES 256u
 #define JIT_MAX_FIXUPS 6000u
 /* How many links of a refusal chain JAI_JIT_CHAIN will walk out. Each costs one
  * extra compile of the body, and a chain longer than this is not a backlog item
@@ -251,6 +255,12 @@ typedef struct {
      * SLOT_OBJ rather than taking a SlotKind of its own: the kind is 4 bits
      * and full. */
     bool      stackPinned[JIT_MAX_STACK];
+    /* On a list iterator (SLOT_ITER shape 1) only, written by OP_GET_ITER's
+     * list arm and read by OP_FOR_ITER_BIND's: the live list holds instances
+     * of more than one class, so the loop variable is bound unpinned and its
+     * calls dispatch through the site's cache. Meaningless on any other
+     * entry, and nothing else reads it. */
+    bool      stackMixed[JIT_MAX_STACK];
     bool      stackNullLit[JIT_MAX_STACK];
     struct { int local; uint16_t field; SlotKind kind; } known[16];
     unsigned  knownCount;
@@ -654,6 +664,17 @@ typedef struct {
     int       limitLiteral;
     int       bailBlock;
 
+    /* 64-bit constants loaded from a pool after the code (emitConst64), and
+     * every `ldr` that names one. Only a tier that lays the pool out
+     * (emitLiteralPool) sets `litPool`; without it every constant is
+     * materialised with movz/movk as before. */
+    bool      litPool;
+    unsigned  litCount;
+    uint64_t  litVal[JIT_MAX_LITS];
+    unsigned  litUseCount;
+    int       litUseInst[JIT_MAX_LIT_USES];
+    uint8_t   litUseIdx[JIT_MAX_LIT_USES];
+
     SlotKind  returnKind;
     uint32_t  returnShape;
     bool      sawReturn;
@@ -797,6 +818,7 @@ extern JitDeoptRecord gDeopt;
 void jitThrowOverflow(int64_t which);
 int jitInvokeMethod(JitCallDesc *d);
 int jitInvokeByName(JitCallDesc *d);
+int jitInvokeByNameLearn(JitCallDesc *d);
 int jitInvokeNative(JitCallDesc *d);
 int jitBuildList(JitCallDesc *d);
 int jitContains(JitCallDesc *d);
@@ -848,6 +870,11 @@ uint8_t localStgOf(const Emit *e, unsigned slot);
 unsigned valueBankReg(const Emit *e, unsigned idx);
 unsigned fpRegAt(const Emit *e, unsigned idx);
 void emitConst64(Emit *e, unsigned rd, int64_t value);
+bool jitLitPoolOn(void);
+void emitConstCmp(Emit *e, unsigned rd, int64_t value);
+/* Lays out the constants emitConst64 pooled, after everything else, and
+ * points each load at its constant. False if the code buffer filled. */
+bool emitLiteralPool(Emit *e);
 void emitSaveRestore(Emit *e, bool save);
 void emitFrameEnter(Emit *e);
 void emitFpSaveRestore(Emit *e, bool save);
@@ -1108,12 +1135,32 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
                            unsigned argc, uint32_t callOff, uint32_t after,
                            int siteCache, bool havePrediction, SlotKind rkind,
                            int *toEnd);
+/* An OSR compile's polymorphic site took `ways` of the ways its cache holds,
+ * short because a way's callee had not compiled yet (or its class was not on
+ * record). jit_osr.c attaches the note to the form it installs, and
+ * re-compiles that form once more of the site's ways have become usable.
+ * JAITHON_JIT_PIC_UPGRADE=0 turns the re-compile off. */
+void jitOsrPicShort(int siteCache, unsigned ways, SlotKind rkind);
+/* An OSR compile met a call to `cfn`, which has no compiled form yet but is
+ * being called and will reach the threshold soon. True means: decline this
+ * compile and look again on a later tick, rather than build a form that calls
+ * it the slow way for the rest of the run (jit_osr.c). */
+bool jitOsrColdWait(Emit *e, const ObjFunction *cfn);
+bool jitPicUpgradeOn(void);
+/* Parameters of `fn` the whole-function tier should bind unpinned -- an
+ * instance of no class in particular -- because its pinned form kept
+ * declining calls that passed another class there (jit_entry.c). Bit i is
+ * slot i. */
+uint32_t jitPolyParamMask(const ObjFunction *fn);
+
 bool offsetIsBranchTarget(const Chunk *c, uint32_t off);
 bool literalIntOperand(const ObjFunction *fn, int prevOff, int off,
                               int64_t *out);
 void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
                            bool signKnown, int64_t divisor, uint32_t fixup);
 bool powerOfTwoShift(int64_t k, unsigned *shift);
+bool inlineMethodCall(Emit *e, ObjFunction *caller, ObjClosure *method,
+                      unsigned argc, uint32_t callOff);
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg);
 bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
@@ -1256,12 +1303,19 @@ JitArmResult emitUnaryPlus(Emit *e, int *offp);
 bool emitAddLocals(Emit *e, const uint8_t *code, int *offp);
 bool emitAddBind(Emit *e, const uint8_t *code, int *offp);
 bool emitCmpLocalConstLt(Emit *e, const uint8_t *code, int *offp);
-bool emitAddIntConst(Emit *e, const uint8_t *code, int *offp);
-bool emitSubIntConst(Emit *e, const uint8_t *code, int *offp);
+bool emitAddIntConst(Emit *e, const ObjFunction *fn, const uint8_t *code, int *offp);
+bool emitSubIntConst(Emit *e, const ObjFunction *fn, const uint8_t *code, int *offp);
 bool emitMulIntConst(Emit *e, const uint8_t *code, int *offp);
 bool emitMulBind(Emit *e, const uint8_t *code, int *offp);
 bool emitSubBind(Emit *e, const uint8_t *code, int *offp);
-bool emitIncLocal(Emit *e, const uint8_t *code, int *offp);
+bool emitIncLocal(Emit *e, const ObjFunction *fn, const uint8_t *code, int *offp);
+/* jit_range.c: whether a comparison every path to offset `q` made proves
+ * `slot + k` cannot overflow there. */
+bool jitSlotAddSafe(const Emit *e, const ObjFunction *fn, uint32_t q,
+                    unsigned slot, int64_t k);
+/* Forget the control-flow graph jit_range.c keeps for the compile in
+ * progress; called as each compile starts. */
+void jitRangeReset(void);
 bool emitModIntConst(Emit *e, const uint8_t *code, int *offp);
 
 #endif /* arm64 */

@@ -4,10 +4,39 @@
 #include "vm/jit/jit_field_read.h"
 
 #include <stddef.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
+
+/* JAITHON_JIT_POLY_LOOP: a non-head `for x in xs` over a list of several
+ * classes binds `x` unpinned rather than pinning the first element's class
+ * and deoptimising on every other. */
+static bool jitPolyLoopOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_POLY_LOOP");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* Whether the first elements of `xs` are instances of more than one class --
+ * the same question jitListHeadSample asks for an OSR loop head, asked here
+ * for a loop the whole-function tier walks. Bounded the same way. */
+static bool listHoldsSeveralClasses(const ObjList *xs) {
+    if (!jitPolyLoopOn() || xs->count < 2) return false;
+    Value first = jaiListGet(xs, 0);
+    if (!IS_INSTANCE(first) || AS_INSTANCE(first)->klass == NULL) return false;
+    const ObjClass *k0 = AS_INSTANCE(first)->klass;
+    int scan = xs->count < 1024 ? xs->count : 1024;
+    for (int i = 1; i < scan; i++) {
+        Value v = jaiListGet(xs, i);
+        if (IS_INSTANCE(v) && AS_INSTANCE(v)->klass != k0) return true;
+    }
+    return false;
+}
 
 bool emitGetIter(Emit *e, int *offp) {
     int off = *offp;
@@ -123,6 +152,8 @@ bool emitGetIter(Emit *e, int *offp) {
              * head on every call and ran interpreted. */
             if (!pushValue3(e, SLOT_ITER, strIter ? 5u : 1u, NULL, sample, -1))
                 return false;
+            e->stackMixed[e->depth - 1] =
+                !strIter && IS_LIST(srcv) && listHoldsSeveralClasses(AS_LIST(srcv));
             emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
             e->wroteHeap = true;
             off += 1;
@@ -488,6 +519,20 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                     esh = ecl->shapeId;
                 } else { e->whyNot = "element kind unknown"; return false; }
 
+                /* Several classes in the list: pinning the first would
+                 * deoptimise on every element of any other, which for a
+                 * function called once per traversal is a deopt on every
+                 * call. Unpinned, the calls in the body dispatch through
+                 * their site's cache (emitInvokePic1). Only for a loop
+                 * variable this is the FIRST binding of, so nothing compiled
+                 * earlier was specialised to the class being dropped -- the
+                 * condition the OSR head's own widening rests on. */
+                if (ek == SLOT_INST && e->stackMixed[e->depth - 1] &&
+                    !e->localTyped[fslot] && !e->dynamicLocal[fslot]) {
+                    esh = 0;
+                    ecl = NULL;
+                }
+
                 if (!adoptLocalKindSeen(e, fslot, ek, esh, ecl, sample)) {
                     return subWhy(e, "loop variable in local %u has kind "
                                      "%s, not %s", fslot,
@@ -581,13 +626,17 @@ bool emitForIterBind(Emit *e, const uint8_t *code, int *offp) {
                                        (unsigned)offsetof(Obj, type)));
                     emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, OBJ_INSTANCE));
                     branchOnDeopt(e, JAI_A64_NE);
-                    emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_B,
-                                       (unsigned)offsetof(ObjInstance, klass)));
-                    emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_B,
-                                       (unsigned)offsetof(ObjClass, shapeId)));
-                    emitConst64(e, JIT_SCRATCH_D, (int64_t)esh);
-                    emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_D));
-                    branchOnDeopt(e, JAI_A64_NE);
+                    /* No class to check for an unpinned loop variable: that
+                     * it is an instance is all a dispatched call needs. */
+                    if (esh != 0) {
+                        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                           (unsigned)offsetof(ObjInstance, klass)));
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_B,
+                                           (unsigned)offsetof(ObjClass, shapeId)));
+                        emitConst64(e, JIT_SCRATCH_D, (int64_t)esh);
+                        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_B, JIT_SCRATCH_D));
+                        branchOnDeopt(e, JAI_A64_NE);
+                    }
                 } else if (ek == SLOT_LIST) {
                     /* Same contract as OP_GET_INDEX's own SLOT_LIST arm:
                      * VAL_OBJ is every heap object, not specifically a

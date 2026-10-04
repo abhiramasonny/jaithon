@@ -439,6 +439,14 @@ this table complete in both directions.
 | `JAITHON_JIT_MAYBE_OBJ_STACK` | **off** | Let `SLOT_MAYBE_OBJ` reach the operand stack. Off until every site that reads an entry's kind is shown to exclude or handle it; `1` turns it on. |
 | `JAITHON_JIT_PAIR_LIST` | on | Let a pair loop over a **list of 2-tuples** be an OSR loop head (iterKind 4), not only a dict-items view. The step is not new -- it is `emitForIterPair`'s non-dict tail, which the function tier already reaches; only `jaiJitEnterOsr`'s head gate refused it. Off restores that gate. |
 | `JAITHON_JIT_PIC` | on | The polymorphic inline-cache arm at an invoke. |
+| `JAITHON_JIT_LIT_POOL` | on | Load a 64-bit constant a guard compares against -- a closure's function, a callee, an enum type, an object an `is` names -- from a pool after the body (`emitConstCmp`): one `ldr` for three or four `movz`/`movk`. Guards only, because a compare feeds nothing but a predicted branch; pooling every three-word constant cost `object_dispatch` 7%, where the hot ones are an address the allocator call waits on. 8% on `closure_calls` under `JAITHON_JIT_ALIGN=64`, 3% at the default alignment. |
+| `JAITHON_JIT_RANGE_FACTS` | on | Drop the overflow check on `i += k`, `n + k` and `n - k` of an int local when a comparison every path to it made already rules the overflow out (`jit_range.c`): `while i < n { ...; i += 1 }`, and both subtractions after `if n < 2 { return n }`. Read off the bytecode's own control-flow graph, never the emitter's model. 2.8% on `closure_calls` (its loop is decode-bound, so one instruction is ~4%); nothing on `fib_recursive`, where a not-taken `b.vs` was free. |
+| `JAITHON_JIT_INLINE_METHODS` | on | Inline a straight-line method body at a call whose receiver class is known -- a pinned invoke, or one way of a polymorphic cache -- through the same walker a global function is inlined with (`inlineMethodCall`), field reads off the receiver included. Off restores the narrow `inlineMethodWalk` alone. 2.15x on a getter-per-iteration probe; `poly_dispatch` loses 31% of its instructions and almost none of its cycles (mispredicts and `sdiv` latency). |
+| `JAITHON_JIT_OSR_COLD_WAIT` | on | An OSR compile that meets a call to a callee still on its way to the function tier's threshold (called, not refused, no compiled form yet) declines and looks again on a later tick, at most 24 times a head and never charged to its compile attempts (`jitOsrColdWait`). Otherwise a tick landing in a loop's first iterations built a form that called the callee the slow way for the rest of the run: `object_dispatch` 918M cycles against ~440M under `JAITHON_JIT_TICK_US=50`, and the slow outcome in about one default run in ten. |
+| `JAITHON_JIT_POLY_LOOP` | on | A `for x in xs` the walk meets away from an OSR head, over a live list whose first elements are instances of more than one class, binds `x` unpinned (the first binding of that local only) so calls on it dispatch through `emitInvokePic1`, instead of pinning element 0's class and deoptimising on every other -- once per call, for a function that walks the list. 1.87x on a 12-shape `area()` loop called 400k times. Makes the polymorphic cache reachable from the whole-function tier, which before this it was not (see "The gate is one NULL"). |
+| `JAITHON_JIT_PIC_INLINE_ONLY` | on | Keep a polymorphic way whose callee cannot be called directly -- not compiled yet, or compiled to a specialisation this site cannot pass (`jitPic1Admissible`) -- when its body can be inlined instead, which needs neither; the interpreter's record of its return kind must match the site's. A way whose body the inliner then cannot speak is left empty, both edges of its compare falling to the next way. A loop compiled by an early tick now inlines its ways rather than going round the descriptor for them. |
+| `JAITHON_JIT_POLY_PARAM` | on | A function whose compiled form keeps declining calls at entry because an instance parameter holds another class (32 declines) is compiled once more with that parameter unpinned -- `jitArgIn` then asks only for an instance, shape 0 -- so its calls dispatch through `emitInvokePic1`; the old form is restored if the new one will not compile (a field read off the parameter). Never a method's receiver. 3.94x on a probe passing three shape classes through `fn weighted(s: Shape, k: float)`, where two calls in three had been running interpreted. |
+| `JAITHON_JIT_PIC_UPGRADE` | on | Re-compile a loop form whose polymorphic site came up short of ways because the timer tick beat its callees' compiles (`jitOsrPicShort`), and let that form's miss path keep teaching the site's cache (`jitInvokeByNameLearn`). On `poly_dispatch` the form was 0-, 1- or 8-way by the race, 400-490M cycles against 120M; under `JAITHON_JIT_TICK_US=50` it was always short, and this is worth 3.48x there. |
 | `JAITHON_JIT_CLASS_CALLS` | on | Direct calls to a class constructor. |
 | `JAITHON_JIT_MODULE_CALLS` | on | Calls through a module member. |
 | `JAITHON_JIT_MODULE_NATIVE` | on | Native calls through a module member. |
@@ -496,6 +504,7 @@ this table complete in both directions.
 | switch | default | what it does |
 | --- | --- | --- |
 | `JAITHON_JIT_ARENA_MB` | 4 | Capacity of **both** code arenas, in mebibytes, clamped to 1..64. At the old default of 1 the tier declined **70 distinct bodies** on `check lib/jaithon` with "the code arena is full" -- more than any missing opcode arm -- and 4 takes that to zero, 301 compiled bodies to 369, and interpreted instructions down 13%. |
+| `JAITHON_JIT_ALIGN` | 32 | Byte alignment of every compiled body in the code arena, a power of two from 32 to 4096. **A measurement tool first**: at 32 a body's offset modulo 64 still depends on the size of everything compiled before it, so a change that shrinks one body moves every later one and the A/B reads a layout shift as an effect -- `object_dispatch` moved 5% between two settings that changed no instruction of its own, and 0.01% at 64. Set it to 64 on both sides of an A/B. As a default it was not a clean win (fib_recursive +13%, queens +10%, heat_2d -4%, nbody -3% on one loaded-machine sweep), so it is not one. |
 | `JAITHON_JIT_ARENA_WINDOW` | on | Limit unseal/seal and the instruction-cache invalidation to the range that changed. Off flips the whole mapping on every compile and invalidates everything written so far. **Not a measured speedup** -- five interleaved pairs on `check lib/jaithon` disagreed in sign, so on this workload the mprotect and the invalidate are not hot. It is kept for the shape: the invalidation is O(bytes written) rather than O(all code emitted so far), and the window cannot leave the back catalogue unexecutable. |
 | `JAITHON_JIT_ROOT_LIMIT` | `JIT_MAX_ROOTS` | Roots one call descriptor may carry. |
 | `JAITHON_JIT_SHAPE_LIMIT` | `JAI_OSR_SHAPES` | Shapes one site may pin. |
@@ -684,9 +693,13 @@ sampled element's. The head arm then discards the shape and class it would
 have pinned, clears `localTyped` for the loop variable, and the slot becomes
 "an instance, of no class in particular". Nothing else here does that.
 
-**The arm is therefore OSR-only, and loop-head-only.** The whole-function tier
-cannot reach it at all, and neither can a list loop sitting *inside* an OSR
-body -- that one takes the ordinary arm and pins.
+**The arm was therefore OSR-only, and loop-head-only.** It no longer is:
+`JAITHON_JIT_POLY_LOOP` lets the ordinary (non-head) arm bind a loop
+variable unpinned too, when OP_GET_ITER's live list holds several classes
+(`Emit::stackMixed`) and this is that local's first binding -- so a function
+the whole-function tier compiles reaches the cache as well. A list loop inside
+an OSR body still usually pins, because its loop variable was already typed
+from the frame when the form was entered.
 
 ### The shape
 
@@ -850,6 +863,16 @@ Reaching the arm is not the same as finding anything in it. 1,800 programs x 6
 configurations after the change -- 300 at the default seeds and 1,500 more from
 seed 5000 -- report no disagreements. The arm is covered now; it is not yet
 known to be wrong anywhere.
+
+Four later changes moved the same census, seeds 1..60: 77% default, 85% under
+`JAITHON_JIT_TICK_US=50` (was 43% and 26% on the first hundred). A way whose
+callee cannot be called directly is inlined instead (`JAITHON_JIT_PIC_INLINE_ONLY`),
+a form compiled short of ways is compiled again once the stragglers arrive
+(`JAITHON_JIT_PIC_UPGRADE` -- which is what the tick configuration was losing
+to), and the whole-function tier reaches the arm through a mixed list
+(`JAITHON_JIT_POLY_LOOP`) and through a parameter several classes pass
+(`JAITHON_JIT_POLY_PARAM`). The ways themselves are mostly inlined now
+(`JAITHON_JIT_INLINE_METHODS`): poly_dispatch's eight all are.
 
 ### One gap, recorded rather than fixed
 

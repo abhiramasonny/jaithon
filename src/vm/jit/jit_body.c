@@ -114,6 +114,97 @@ static bool pushCopyOfEntry(Emit *e, unsigned idx) {
     return true;
 }
 
+/* A field read inside an inlined body. OP_GET_FIELD_LOCAL names a callee
+ * slot, which is a CALLER entry here (inlSlot), so it becomes a copy of that
+ * entry plus an OP_GET_FIELD -- the arm written for a receiver on the operand
+ * stack, fed a synthetic instruction with the same name and the callee's code
+ * after it, so its look-ahead (fpWorthLoading) still sees what follows.
+ * inlineFieldsReadable proved every read resolvable before the inline began;
+ * the refusals below are its backstop. */
+static bool inlineFieldRead(Emit *e, ObjFunction *fn, const uint8_t *code,
+                            int off, int stop) {
+    uint8_t synth[160];
+    int len = instructionLength(&fn->chunk, off);
+    if (len <= 0) return false;
+    int rest = stop - (off + len);
+    if (rest < 0 || 6 + rest > (int)sizeof synth) {
+        e->whyNot = "an inlined field read in a body too long to re-read";
+        return false;
+    }
+    synth[0] = OP_GET_FIELD;
+    if (code[off] == OP_GET_FIELD_LOCAL) {
+        unsigned a = jaiReadU16(code + off + 1);
+        if (a > JIT_MAX_SLOTS || e->inlSlot[a] < 0) {
+            e->whyNot = "an inlined body reading a local it never bound";
+            return false;
+        }
+        if (!pushCopyOfEntry(e, (unsigned)e->inlSlot[a])) return false;
+        memcpy(synth + 1, code + off + 3, 5);   /* u24 name, u16 cache */
+    } else {
+        memcpy(synth + 1, code + off + 1, 5);
+    }
+    memcpy(synth + 6, code + off + len, (size_t)rest);
+    unsigned top = e->depth - 1;
+    if (e->depth == 0 || e->stack[top] != SLOT_INST ||
+        e->stackClass[top] == NULL) {
+        e->whyNot = "an inlined field read off something not a pinned instance";
+        return false;
+    }
+    /* The arm classifies the field off the entry's sample. A sample of some
+     * other class -- what a polymorphic site's receiver carries into each of
+     * its ways -- would describe a different field, so the declaration speaks
+     * instead. */
+    Value seen = e->stackSeen[top];
+    if (IS_INSTANCE(seen) && AS_INSTANCE(seen)->klass != e->stackClass[top]) {
+        e->stackSeen[top] = NULL_VAL;
+    }
+    int soff = 0;
+    if (!emitGetField(e, fn, synth, &soff, 6 + rest)) return false;
+    return soff == 6;
+}
+
+/* `x + k`, `x - k` and `x * k` fused with the read of local `x`, inside an
+ * inlined body: a copy of the slot's entry, then the operation on that copy
+ * in place, with the same overflow test the out-of-line arms make. */
+static bool inlineIntConstOp(Emit *e, const uint8_t *code, int off) {
+    uint8_t op = code[off];
+    unsigned a = jaiReadU16(code + off + 1);
+    int16_t k = jaiReadI16(code + off + 3);
+    if (a > JIT_MAX_SLOTS || e->inlSlot[a] < 0) {
+        e->whyNot = "an inlined body reading a local it never bound";
+        return false;
+    }
+    unsigned src = (unsigned)e->inlSlot[a];
+    if (src >= e->depth || e->stack[src] != SLOT_INT) {
+        e->whyNot = "an inlined fused constant op on a local that is not an int";
+        return false;
+    }
+    if (!pushCopyOfEntry(e, src)) return false;
+    unsigned rd = pushReg(e) - 1;
+    e->stackSeen[e->depth - 1] = NULL_VAL;   /* no longer the local's value */
+    if (op == OP_MUL_INT_CONST) {
+        emitConst64(e, JIT_SCRATCH_D, k);
+        emit(e, jaiA64SmulhX(JIT_SCRATCH_A, rd, JIT_SCRATCH_D));
+        emit(e, jaiA64MulX(rd, rd, JIT_SCRATCH_D));
+        emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
+        branchOnOverflow(e, 2u, JAI_A64_NE);
+        return true;
+    }
+    /* `x - k` is `x + (-k)` in value; the operator is kept so the overflow
+     * stub names the right one. */
+    int64_t addend = op == OP_SUB_INT_CONST ? -(int64_t)k : (int64_t)k;
+    if (addend >= 0 && addend <= 4095) {
+        emit(e, jaiA64AddsXImm(rd, rd, (unsigned)addend));
+    } else if (addend < 0 && addend >= -4095) {
+        emit(e, jaiA64SubsXImm(rd, rd, (unsigned)(-addend)));
+    } else {
+        emitConst64(e, JIT_SCRATCH_A, addend);
+        emit(e, jaiA64AddsX(rd, rd, JIT_SCRATCH_A));
+    }
+    branchOnOverflow(e, op == OP_SUB_INT_CONST ? 1u : 0u, JAI_A64_VS);
+    return true;
+}
+
 /* Answered against the inlined body's own frame -- the CALLER's operand stack: a parameter is the
  * argument entry already sitting there, a bind pins whatever's on top. Reading these through the main switch would read the CALLER's local of the same number, a different variable entirely. */
 static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
@@ -642,6 +733,17 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             off += instructionLength(&fn->chunk, off);
             continue;
         }
+        if (e->inlining && (op == OP_GET_FIELD_LOCAL || op == OP_GET_FIELD)) {
+            if (!inlineFieldRead(e, fn, code, off, stop)) return false;
+            off += instructionLength(&fn->chunk, off);
+            continue;
+        }
+        if (e->inlining && (op == OP_ADD_INT_CONST || op == OP_SUB_INT_CONST ||
+                            op == OP_MUL_INT_CONST)) {
+            if (!inlineIntConstOp(e, code, off)) return false;
+            off += instructionLength(&fn->chunk, off);
+            continue;
+        }
         if (e->inlining && op == OP_RETURN) {
             /* The result is on top and stays there; the caller's driver takes
              * it from the model. */
@@ -735,11 +837,11 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
 
         case OP_ADD_INT_CONST:
-            if (!emitAddIntConst(e, code, &off)) return false;
+            if (!emitAddIntConst(e, fn, code, &off)) return false;
             break;
 
         case OP_SUB_INT_CONST:
-            if (!emitSubIntConst(e, code, &off)) return false;
+            if (!emitSubIntConst(e, fn, code, &off)) return false;
             break;
 
         case OP_MUL_INT_CONST:
@@ -759,7 +861,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
 
         case OP_INC_LOCAL:
-            if (!emitIncLocal(e, code, &off)) return false;
+            if (!emitIncLocal(e, fn, code, &off)) return false;
             break;
 
         case OP_EQ: case OP_NE:

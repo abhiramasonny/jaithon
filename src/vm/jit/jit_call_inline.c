@@ -20,6 +20,17 @@
  * are -- compilation is not reentrant, nothing it calls compiles anything. */
 bool gInlineFailed;
 
+/* JAITHON_JIT_INLINE_METHODS=0 restores the narrow method inliner alone
+ * (inlineMethodWalk), and keeps field reads out of every inlined body. */
+static bool jitInlineMethodsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_INLINE_METHODS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 /* Structural check, answered before anything is emitted (a half-inlined body can't be taken back):
  * no branches (no offset map, no join, no fixup naming a callee offset in the caller's table); exactly one RETURN, last; locals only via the four opcodes the inline frame understands, and only slots this callee actually has; globals only for the two builtins the tier emits inline (else a global VALUE load would bake a JaiEntry from the callee's own table, needing its own guard); nothing that stores (a guard inside re-executes the WHOLE call, so an earlier store would run twice). What's left is straight-line register arithmetic -- the main walker already speaks it, so no second emitter is needed. `evalA` in spectral is fifteen instructions of exactly this shape. */
 static bool inlinableBody(ObjClosure *callee, unsigned argc,
@@ -55,6 +66,21 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
             if (slot > maxSlot) maxSlot = slot;
             if (slot2 > maxSlot) maxSlot = slot2;
             break;
+        /* A field read is a load, and the walker's own OP_GET_FIELD arm is
+         * written against an operand-stack receiver, which is exactly what
+         * an inlined body has: compileBody reads OP_GET_FIELD_LOCAL as a copy
+         * of the slot's entry plus that arm (inlineFieldLocal), and refuses
+         * any receiver that is not an instance of a pinned class. Every
+         * guard in it deoptimises to the call, which is sound for the same
+         * reason the arithmetic is: nothing here has stored anything. */
+        case OP_GET_FIELD_LOCAL:
+            if (!jitInlineMethodsOn()) return false;
+            slot = jaiReadU16(c->code + off + 1);
+            if (slot > maxSlot) maxSlot = slot;
+            break;
+        case OP_GET_FIELD:
+            if (!jitInlineMethodsOn()) return false;
+            break;
         /* An upvalue is reached through the closure that is actually being
          * called, which is a register the call site has to supply -- so this
          * is only inlinable where that register exists. OP_SET_UPVALUE is not
@@ -79,6 +105,32 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
             /* The only callee that can be on the stack here is one of the two
              * builtins above, and the tier emits those as one instruction. */
             if (c->code[off + 1] != 1) return false;
+            break;
+        /* `x % k` with a small literal k, fused: it pops and pushes the top
+         * entry and names no local, so it reads the inlined body's own
+         * operand stack exactly as OP_MOD does. */
+        case OP_MOD_INT_CONST:
+            if (!jitInlineMethodsOn()) return false;
+            break;
+        /* `x + k`, `x - k`, `x * k` fused with the read of `x`: the slot is
+         * a parameter or a bound local of this body, read through inlSlot
+         * like any other (inlineIntConstOp), and refused up front unless it
+         * is an int (inlineFieldsReadable). `return n - 1` is the commonest
+         * body there is, and this is what it compiles to. */
+        case OP_ADD_INT_CONST:
+        case OP_SUB_INT_CONST:
+        case OP_MUL_INT_CONST:
+            if (!jitInlineMethodsOn()) return false;
+            slot = jaiReadU16(c->code + off + 1);
+            if (slot > maxSlot) maxSlot = slot;
+            break;
+        /* A predicate -- `return self.pos >= self.len` -- is a compare and a
+         * `cset`: straight-line, and emitCompare reads its operands through
+         * xHeldIn/fpOperand, so the inlined bank is where it looks. Its
+         * string and object-equality arms, the two that call out, already
+         * refuse inside an inline. */
+        case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+            if (!jitInlineMethodsOn()) return false;
             break;
         case OP_CONST: case OP_INT: case OP_TRUE: case OP_FALSE:
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
@@ -105,8 +157,126 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
 
 /* Inlines the callee's body: slot 1+i IS entry cidx+1+i already on the stack, so nothing is copied in;
  * a bound slot pins one more entry underneath what's pushed after it, sound only because the body is straight-line. Callee's module must be the caller's, and its baked builtins are retired by the CALLER's own module-version check (the callee's is never run). `calleeReg`: needed only if the body reads an upvalue, since `callee` is a SAMPLE closure at an indirect site -- one ObjFunction, many closures (`|x| x + step`), so its captured cells aren't necessarily the next call's. Constants/globals are safe from the sample since they belong to the function/module, not the closure. */
+static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
+                         unsigned argc, uint32_t callOff, int calleeReg,
+                         bool method);
+
+/* Whether the entry an inlined body's slot names is a receiver whose field
+ * `name` the OP_GET_FIELD arm can read: an instance of a pinned class, a
+ * plain instance field, and a kind for it -- off the entry's own sample when
+ * that is of the same class, else from the declaration. */
+static bool inlineFieldOf(const Emit *e, int idx, const ObjFunction *cfn,
+                          uint32_t nameIdx) {
+    if (idx < 0 || (unsigned)idx >= e->depth) return false;
+    if (e->stack[idx] != SLOT_INST) return false;
+    ObjClass *klass = e->stackClass[idx];
+    if (klass == NULL) return false;
+    if (nameIdx >= (uint32_t)cfn->chunk.constants.count) return false;
+    Value nv = cfn->chunk.constants.data[nameIdx];
+    if (!IS_STRING(nv)) return false;
+    const FieldInfo *fi = jaiClassFieldInfo(klass, AS_STRING(nv));
+    if (fi == NULL || fi->isStatic) return false;
+    Value seen = e->stackSeen[idx];
+    if (IS_INSTANCE(seen) && AS_INSTANCE(seen)->klass == klass) {
+        if (fi->slot >= AS_INSTANCE(seen)->fieldCount) return false;
+        Value fv = AS_INSTANCE(seen)->fields[fi->slot];
+        return IS_INT(fv) || IS_FLOAT(fv) || IS_BOOL(fv);
+    }
+    SlotKind dk;
+    unsigned dtag;
+    return jitDeclaredFieldKindEnabled() &&
+           declaredScalarFieldKind(fi->typeId, &dk, &dtag);
+}
+
+/* Every field read of the body, against the slot mapping just made. An
+ * OP_GET_FIELD is only admitted straight after the local read that put its
+ * receiver on top, which is the shape the compiler emits for `p.x`; anything
+ * else (a chain, a field of a call's result) is refused here rather than met
+ * half-way. */
+static bool inlineFieldsReadable(const Emit *e, ObjClosure *callee) {
+    const ObjFunction *cfn = callee->fn;
+    const Chunk *c = &cfn->chunk;
+    int lastSlot = -1;   /* the slot the previous instruction left on top */
+    for (int off = 0; off < c->count;) {
+        uint8_t op = c->code[off];
+        int len = instructionLength(c, off);
+        if (len <= 0) return false;
+        int top = -1;
+        switch (op) {
+        case OP_GET_LOCAL:
+            top = (int)jaiReadU16(c->code + off + 1);
+            break;
+        case OP_GET_LOCAL2:
+            top = (int)jaiReadU16(c->code + off + 3);
+            break;
+        case OP_GET_FIELD_LOCAL: {
+            unsigned slot = jaiReadU16(c->code + off + 1);
+            if (slot > JIT_MAX_SLOTS) return false;
+            if (!inlineFieldOf(e, e->inlSlot[slot], cfn,
+                               jaiReadU24(c->code + off + 3))) {
+                return false;
+            }
+            break;
+        }
+        case OP_GET_FIELD:
+            if (lastSlot < 0 || lastSlot > (int)JIT_MAX_SLOTS) return false;
+            if (!inlineFieldOf(e, e->inlSlot[lastSlot], cfn,
+                               jaiReadU24(c->code + off + 1))) {
+                return false;
+            }
+            break;
+        case OP_ADD_INT_CONST:
+        case OP_SUB_INT_CONST:
+        case OP_MUL_INT_CONST: {
+            /* A bound local's entry does not exist yet, and the arm checks
+             * it again when it does; a parameter's is checked here. */
+            unsigned slot = jaiReadU16(c->code + off + 1);
+            if (slot > JIT_MAX_SLOTS) return false;
+            int idx = e->inlSlot[slot];
+            if (idx >= 0 && ((unsigned)idx >= e->depth ||
+                             e->stack[idx] != SLOT_INT)) {
+                return false;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        lastSlot = top;
+        off += len;
+    }
+    return true;
+}
+
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg) {
+    return inlineCallAt(e, caller, callee, argc, callOff, calleeReg, false);
+}
+
+/* A method's body where the call is, through the same walker a global
+ * function's is inlined with: slot 0 is the receiver entry, already on the
+ * operand stack, rather than a callee entry that holds no register. The
+ * receiver's class must be pinned (the caller resolved `method` against it),
+ * and its field reads are emitted against that class with a tag guard each.
+ *
+ * Wider than inlineMethodWalk, which it backs up: that one speaks field
+ * reads off parameters and + - * only, so `(x + self.k) % M` -- a constant,
+ * a modulo, a field read off a copy of `self` -- went through a full direct
+ * call, prologue, stack check, root fill and verdict, for four instructions
+ * of work. */
+bool inlineMethodCall(Emit *e, ObjFunction *caller, ObjClosure *method,
+                      unsigned argc, uint32_t callOff) {
+    if (!jitInlineMethodsOn()) return false;
+    if (e->depth < argc + 1u) return false;
+    unsigned ridx = e->depth - argc - 1u;
+    if (e->stack[ridx] != SLOT_INST || e->stackClass[ridx] == NULL) return false;
+    if (method->fn->upvalueCount != 0) return false;
+    return inlineCallAt(e, caller, method, argc, callOff, -1, true);
+}
+
+static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
+                         unsigned argc, uint32_t callOff, int calleeReg,
+                         bool method) {
     if (e->noInline) return false;
     /* An inlined body's entries want x0..x8 (inlineOwnBank) and a split bank
      * is already using them, so the plan withholds the split from a body the
@@ -133,15 +303,27 @@ bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     }
 
     /* Every argument has to be in a register, since that is where the body
-     * will read its parameters from. */
+     * will read its parameters from -- and for a method, the receiver too. */
     for (unsigned i = 0; i < argc; i++) {
         if (!holdsRegister(e->stack[cidx + 1u + i])) return false;
     }
+    if (method && !holdsRegister(e->stack[cidx])) return false;
 
     int savedSlot[JIT_MAX_SLOTS + 1];
     memcpy(savedSlot, e->inlSlot, sizeof savedSlot);
     for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) e->inlSlot[i] = -1;
     for (unsigned i = 0; i < argc; i++) e->inlSlot[1u + i] = (int)(cidx + 1u + i);
+    /* A plain function's slot 0 is its own closure, which no opcode the
+     * whitelist admits can read; a method's is the receiver. */
+    if (method) e->inlSlot[0] = (int)cidx;
+    /* A field read that fails half-way through an inlined body cannot be
+     * taken back, and the price of that is the whole compile retried with
+     * inlining OFF -- every other call this body inlined goes with it. So
+     * each one is proved readable before a word is emitted. */
+    if (!inlineFieldsReadable(e, callee)) {
+        memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
+        return false;
+    }
 
     /* No noteScratchClobber here. An inlined body cannot call -- inlinableBody
      * admits nothing that does -- so it destroys x0..x8 only by USING them,
