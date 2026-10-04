@@ -281,22 +281,39 @@ static bool jitFormatIntLeaf(void) {
  *
  * The leaf never collects, so the parts are written as plain arguments and
  * nothing is rooted: no root fill, no root-range push and pop, no wrapper.
- * Emitted only when every part is something formatShort renders itself or may
+ * Emitted only when every part is something formatShortInto renders or may
  * be (an int, a bool, an object that may be a string), since a part it cannot
  * render would take the slow path every time and pay for both. */
 static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
     fx->on = false;
     fx->slow[0] = fx->slow[1] = fx->done = -1;
-    if (!jitFormatLeaf() || e->inlining) return;
+    if (!jitFormatLeaf() || !jaiValueFormatShortOn() || e->inlining) return;
     if (parts > JIT_MAX_ARGS_OUT || e->valueDepth < parts) return;
     unsigned first = e->depth - parts;
+    size_t seen = 0;
     for (unsigned i = 0; i < parts; i++) {
         SlotKind k = e->stack[first + i];
         if (k != SLOT_INT && k != SLOT_BOOL && k != SLOT_OBJ &&
             k != SLOT_MAYBE_OBJ) {
             return;
         }
+        /* A literal part's sample is the pool's own string (OP_CONST pushes
+         * it as one), so its length is a fact; a local's is the value it held
+         * when the body was compiled, a prediction. An int is at least one
+         * digit. */
+        Value v = e->stackSeen[first + i];
+        if (IS_STRING(v)) {
+            seen += AS_STRING(v)->length;
+        } else if (k == SLOT_INT) {
+            seen += 1;
+        }
     }
+    /* A result already past the short limit on what the compiler can see:
+     * the leaf would copy up to the limit, give up and leave the work to the
+     * descriptor path, every time -- the log line, the message, the path
+     * built with an f-string. A site whose samples were long and whose later
+     * values are short loses only the leaf, never an answer. */
+    if (seen > JAI_INTERN_MAX) return;
     unsigned vfirst = e->valueDepth - parts;
     for (unsigned i = 0; i < parts; i++) {
         if (!leafRegOk(valueXReg(e, vfirst + i))) return;

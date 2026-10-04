@@ -148,6 +148,9 @@ bool jaiCallMethodWithReceiver(Value method, Value *argsWithReceiver,
                                int count, Value *out);
 bool jaiInvokeNativeWithReceiver(Value native, Value *argsWithReceiver,
                                  int count, Value *out);
+/* JAITHON_FMT_SHORT: whether the short f-string path is on, which the
+ * compiled tier asks before it emits a leaf that is that path. */
+bool jaiValueFormatShortOn(void);
 /* An f-string's result for compiled code, or NULL when only jaiValueFormat
  * can make it. Never collects; see its definition in value.c. */
 ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count);

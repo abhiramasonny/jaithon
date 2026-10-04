@@ -6,7 +6,7 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it on call count alone; `JAITHON_NO_JIT=1` runs
 #: the same file, and every answer is the interpreter's.
-# jit-compiles: fmt_key, fmt_mixed, fmt_long, fmt_float, fmt_maybe, fmt_many, fmt_hole_shapes, str_of_int
+# jit-compiles: fmt_key, fmt_mixed, fmt_long, fmt_float, fmt_maybe, fmt_many, fmt_hole_shapes, str_of_int, fmt_path
 from std.test import assert_eq, assert_true
 
 let CALLS = 100
@@ -83,6 +83,30 @@ pub fn test_a_long_result_takes_the_general_path() -> void {
     }
     assert_eq(fmt_long(42), "a prefix long enough to pass the intern limit 42")
     assert_eq(total, 46 * CALLS + 10 + 90 * 2)
+}
+
+fn fmt_path(a: str, b: str, n: int) -> str {
+    return f"{a}/{b}/{n}"
+}
+
+pub fn test_parts_long_when_compiled_and_short_after() -> void {
+    #: Compiled while its string parts were long, the site has no leaf; the
+    #: short results that follow come from the descriptor path, which still
+    #: hands back the interned string.
+    let dir = "a directory name that is long"
+    var call = 0
+    while call < CALLS {
+        let p = if call < 70 { fmt_path(dir, "file", call) } else { fmt_path("d", "f", call % 3) }
+        if call < 70 {
+            assert_eq(p, f"{dir}/file/{call}")
+        } else {
+            assert_eq(p, f"d/f/{call % 3}")
+        }
+        call += 1
+    }
+    assert_true(fmt_path("d", "f", 1) is fmt_path("d", "f", 1), "interned")
+    assert_eq(fmt_path("", "", 0), "//0")
+    assert_eq(fmt_path(dir, dir, -1).len(), 2 * dir.len() + 4)
 }
 
 pub fn test_a_float_part_takes_the_general_path() -> void {

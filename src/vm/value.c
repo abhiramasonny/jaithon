@@ -586,9 +586,9 @@ JAI_INLINE void sinkReserve(ValSink *s, size_t n) {
 
 #define JAI_INT_DIGITS 24
 #define JAI_FLOAT_CHARS 32
-/* The longest f-string result formatShort builds itself: the longest
- * run-time string worth an intern probe. Past it the general path builds the
- * string in place. */
+/* The longest f-string result staged for an intern probe (formatShortRuns,
+ * the compiled tier's leaves): the longest run-time string worth one. Past it
+ * the general path builds the string in place. */
 #define JAI_STR_SHORT_MAX JAI_INTERN_MAX
 
 //magic sh*t
@@ -1243,7 +1243,9 @@ static ObjString *formatViaBuffer(const Value *parts, int count) {
     return out;
 }
 
-/* JAITHON_FMT_SHORT=0 turns formatShort off, for a one-binary A/B. */
+/* JAITHON_FMT_SHORT=0 turns the short path off, for a one-binary A/B: the
+ * finish in jaiValueFormat, and (through jaiValueFormatShortOn) the compiled
+ * tier's f-string and str(n) leaves, which are never emitted with it off. */
 static bool fmtShortOn(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -1253,19 +1255,19 @@ static bool fmtShortOn(void) {
     return cached != 0;
 }
 
+bool jaiValueFormatShortOn(void) { return fmtShortOn(); }
+
 /* The f-string whose result is short enough to take part in interning --
  * `f"k{i}"`, a key built once per iteration -- written straight into one
- * buffer and handed to jaiStringNew, which hashes it and probes the intern
- * table before anything is allocated.
- *
- * The general path below renders every part into its own scratch slot, keeps a
- * (pointer, length) run for each, and then jaiStringFromParts copies the runs a
- * second time into a staging buffer for that same probe. For a five-byte key
- * the bookkeeping was most of the work.
+ * buffer, hashed and probed against the intern table with no call, for the
+ * compiled tier's leaves. The interpreter's jaiValueFormat cannot know the
+ * length before it renders the parts, so it finishes a short result from its
+ * runs instead (formatShortRuns) rather than try this first and throw the
+ * attempt away on every long one.
  *
  * Only the kinds it renders itself, with no call out: ints, strings, bools and
- * null. Anything else, or a result past JAI_STR_SHORT_MAX, returns false having
- * produced nothing, and the caller starts the general path from the top. */
+ * null. Anything else, or a result past JAI_STR_SHORT_MAX, is -1 having
+ * produced nothing. */
 /* The bytes of a short f-string, written into `buf`: the length, or -1 for a
  * part it does not render itself or a result past JAI_STR_SHORT_MAX. `buf`
  * must hold FMT_SHORT_BUF bytes -- the limit, the widest int and eight to
@@ -1320,22 +1322,8 @@ JAI_INLINE ObjString *formatShortProbe(char *buf, size_t o) {
                                 jaiInternFingerprintPadded(buf, o), false);
 }
 
-JAI_INLINE bool formatShort(const Value *parts, int count, ObjString **out) {
-    char buf[FMT_SHORT_BUF];
-    const int64_t o = formatShortInto(parts, count, buf);
-    if (o < 0) return false;
-    ObjString *found = formatShortProbe(buf, (size_t)o);
-    if (found != NULL) {
-        *out = found;
-        return true;
-    }
-    /* A miss -- once per distinct string -- goes through jaiStringNew, which
-     * probes again and then allocates and interns. */
-    *out = o == 0 ? jaiStringIntern("", 0) : jaiStringNew(buf, (size_t)o);
-    return true;
-}
-
-/* formatShort for compiled code, called as a LEAF: no descriptor, no roots.
+/* The short f-string for compiled code, called as a LEAF: no descriptor, no
+ * roots.
  *
  * That is sound only while nothing here can collect, and the one thing that
  * can is the allocation a miss makes (jaiStringNew, then interning it). An
@@ -1345,16 +1333,10 @@ JAI_INLINE bool formatShort(const Value *parts, int count, ObjString **out) {
  * the operands, and a false one holds for the single allocation below. The
  * same argument jitInstanceAlloc rests on.
  *
- * NULL means "not answered": a part formatShort does not render itself, a
+ * NULL means "not answered": a part formatShortInto does not render, a
  * long result, or a collection due. The caller then makes the descriptor call
- * it would have made anyway. */
-static JAI_NOINLINE ObjString *formatLeafMiss(const Value *parts,
-                                              int64_t count) {
-    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
-    ObjString *made;
-    return formatShort(parts, (int)count, &made) ? made : NULL;
-}
-
+ * it would have made anyway -- and nothing here tries a second time, since
+ * the same parts fail the same way. */
 /* A miss whose bytes are already built: the string made from them, unless a
  * collection is due -- the one state in which its allocation could collect --
  * when NULL sends the caller to the descriptor path. Before this a miss
@@ -1369,7 +1351,7 @@ static JAI_NOINLINE ObjString *formatLeafBuilt(const char *buf, size_t o) {
 ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
     if (count <= 0 || count > JAI_FMT_MAX_PARTS || !fmtShortOn()) return NULL;
     /* An intern hit allocates nothing, so it needs no collection test; only
-     * the miss, which may allocate, goes through formatLeafMiss -- by a tail
+     * the miss, which may allocate, goes through formatLeafBuilt -- by a tail
      * call, so this path keeps no frame of its own. Words rather than chars
      * so that the buffer does not cost a stack-protector check per call. */
     uint64_t words[(FMT_SHORT_BUF + 7) / 8];
@@ -1380,7 +1362,7 @@ ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
         if (JAI_LIKELY(found != NULL)) return found;
         return formatLeafBuilt(buf, (size_t)o);
     }
-    return formatLeafMiss(parts, count);
+    return NULL;
 }
 
 /* The commonest f-string there is -- one int hole with at most a string run
@@ -1392,7 +1374,7 @@ ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count) {
  * f-string has none; anything other than a string there, or a result past the
  * short limit, is NULL back and the general path. The same no-collection
  * argument as jaiValueFormatLeaf: a hit allocates nothing, and a miss goes
- * through formatLeafMiss, which declines when a collection is due. */
+ * through formatLeafBuilt, which declines when a collection is due. */
 JAI_INLINE bool fmtRun(char *buf, size_t *o, const Obj *run) {
     if (run == NULL) return true;
     if (run->type != OBJ_STRING) return false;
@@ -1417,22 +1399,31 @@ ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
             return formatLeafBuilt(buf, o);
         }
     }
-    Value parts[3];
-    int count = 0;
-    if (pre != NULL) parts[count++] = OBJ_VAL(pre);
-    parts[count++] = INT_VAL(n);
-    if (post != NULL) parts[count++] = OBJ_VAL(post);
-    return formatLeafMiss(parts, count);
+    return NULL;
+}
+
+/* A short f-string's runs, already rendered, staged where formatShortProbe
+ * hashes and probes them with no call, and only a miss -- once per distinct
+ * string -- going on to jaiStringNew, which probes again, allocates and
+ * interns. `total` is at most JAI_STR_SHORT_MAX. */
+JAI_INLINE ObjString *formatShortRuns(const char *const *runs,
+                                      const uint32_t *lens, int count,
+                                      size_t total) {
+    uint64_t words[(FMT_SHORT_BUF + 7) / 8];
+    char *buf = (char *)words;
+    size_t o = 0;
+    for (int i = 0; i < count; i++) {
+        const char *const src = runs[i];
+        for (uint32_t j = 0, n = lens[i]; j < n; ++j) buf[o++] = src[j];
+    }
+    ObjString *found = formatShortProbe(buf, total);
+    if (found != NULL) return found;
+    return total == 0 ? jaiStringIntern("", 0) : jaiStringNew(buf, total);
 }
 
 ObjString *jaiValueFormat(const Value *parts, int count) {
     if (count <= 0) return jaiStringIntern("", 0);
     if (count > JAI_FMT_MAX_PARTS) return formatViaBuffer(parts, count);
-
-    if (fmtShortOn()) {
-        ObjString *made;
-        if (formatShort(parts, count, &made)) return made;
-    }
 
     char        scratch[JAI_FMT_MAX_PARTS][JAI_FLOAT_CHARS];
     const char *runs[JAI_FMT_MAX_PARTS];
@@ -1451,7 +1442,7 @@ ObjString *jaiValueFormat(const Value *parts, int count) {
             lens[i] = AS_BOOL(v) ? 4u : 5u;
             break;
         case VAL_INT:
-            lens[i] = (uint32_t)writeInt64(scratch[i], AS_INT(v));
+            lens[i] = (uint32_t)writeInt64Inline(scratch[i], AS_INT(v));
             runs[i] = scratch[i];
             break;
         case VAL_FLOAT:
@@ -1468,6 +1459,13 @@ ObjString *jaiValueFormat(const Value *parts, int count) {
             return formatViaBuffer(parts, count);
         }
         total += lens[i];
+    }
+    /* The short result is finished here rather than tried first: an attempt
+     * made before the lengths are known has to be thrown away on every long
+     * one -- the log line, the message, the path -- and that cost a long
+     * f-string 7-12% in the interpreter. */
+    if (total <= JAI_STR_SHORT_MAX && fmtShortOn()) {
+        return formatShortRuns(runs, lens, count, total);
     }
     return jaiStringFromParts(runs, lens, count, total);
 }
