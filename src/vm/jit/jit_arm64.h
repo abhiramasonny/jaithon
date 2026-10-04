@@ -79,6 +79,9 @@ uint32_t jaiA64LdpOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);
 uint32_t jaiA64LdrXIdx(unsigned rt, unsigned rn, unsigned rm);
 uint32_t jaiA64LdrDIdx(unsigned rt, unsigned rn, unsigned rm);
 uint32_t jaiA64LdrByteIdx(unsigned rt, unsigned rn, unsigned rm);
+/* And the stores: str Xt, [Xn, Xm, lsl #3]; strb Wt, [Xn, Xm]. */
+uint32_t jaiA64StrXIdx(unsigned rt, unsigned rn, unsigned rm);
+uint32_t jaiA64StrByteIdx(unsigned rt, unsigned rn, unsigned rm);
 /* stp Dt1, Dt2, [Xn, #imm] / ldp Dt1, Dt2, [Xn, #imm] -- the 64-bit FP pair
  * forms, signed offset, 8-aligned, -512..504 */
 uint32_t jaiA64StpDOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm);

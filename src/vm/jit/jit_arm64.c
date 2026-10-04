@@ -160,6 +160,16 @@ uint32_t jaiA64LdrByteIdx(unsigned rt, unsigned rn, unsigned rm) {
     return 0x38606800u | (rm << 16) | (rn << 5) | rt;
 }
 
+/* str Xt, [Xn, Xm, lsl #3] -- store (register), option 011, S=1. */
+uint32_t jaiA64StrXIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0xf8207800u | (rm << 16) | (rn << 5) | rt;
+}
+
+/* strb Wt, [Xn, Xm] -- option 011, S=0. */
+uint32_t jaiA64StrByteIdx(unsigned rt, unsigned rn, unsigned rm) {
+    return 0x38206800u | (rm << 16) | (rn << 5) | rt;
+}
+
 /* stp Dt1, Dt2, [Xn, #imm] -- opc 01 of the SIMD&FP pair, signed offset. */
 uint32_t jaiA64StpDOff(unsigned rt, unsigned rt2, unsigned rn, int32_t imm) {
     uint32_t imm7 = (uint32_t)((imm / 8) & 0x7f);

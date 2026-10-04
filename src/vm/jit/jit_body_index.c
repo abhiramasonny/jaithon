@@ -530,6 +530,23 @@ bool emitSetIndex(Emit *e, int *offp) {
         } else {
             emitListHeader(e, rList, sItems, sCount);
         }
+        if (!sAcc.dynamic && sAcc.stg != LIST_STORE_BOXED &&
+            jitIndexedLoadOn()) {
+            /* The store half of the single-load read: static unboxed storage
+             * needs no tag and its stride is the access width, so the
+             * element is one register-offset store off the index. A double
+             * is stored from its X register, as emitElemStoreAt does. */
+            unsigned rI = rIdx;
+            if (!(sHoisted && sh >= 0)) {
+                emitBoundsNormalise(e, rIdx, sCount, JIT_SCRATCH_B, true);
+                rI = JIT_SCRATCH_B;
+            }
+            if (sAcc.stg == LIST_STORE_U8) {
+                emit(e, jaiA64StrByteIdx(rVal, sItems, rI));
+            } else {
+                emit(e, jaiA64StrXIdx(rVal, sItems, rI));
+            }
+        } else {
         if (sHoisted) {
             emit(e, jaiA64MovX(JIT_SCRATCH_B, rIdx));
         } else {
@@ -542,6 +559,7 @@ bool emitSetIndex(Emit *e, int *offp) {
             int sJoin = listDispatchElse(e, sSkip);
             emitElemStoreAt(e, sAcc.alt, sItems, JIT_SCRATCH_B, vtag, rVal);
             listDispatchEnd(e, sJoin);
+        }
         }
         /* jaiListTouch: the count has not changed, so only the version
          * tells an iterator that the list moved under it. */
