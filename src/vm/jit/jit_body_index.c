@@ -9,6 +9,133 @@
 
 #if (defined(__aarch64__) || defined(__arm64__))
 
+/* ------------------------------------------------------------------ */
+/* The string-keyed dict leaf                                           */
+/* ------------------------------------------------------------------ */
+
+/* A string-keyed probe placed in FRONT of a dict arm's descriptor call, which
+ * stays where it was as the slow path:
+ *
+ *        key not a string ----------------------------\
+ *        x0..x4 <- dict, key, ...;  blr leaf            |
+ *        leaf said "can't" -------------------------\   |
+ *        b done                                      |   |
+ *   slow: <the descriptor call, unchanged>  <-------/---/
+ *   done: <whatever followed the call>
+ *
+ * Both paths meet with a read's answer in the descriptor's result slot, where
+ * the code after the call already looks, and a store done; so nothing after
+ * the call changes and a deopt that reads the result from the descriptor
+ * still finds it there.
+ *
+ * The leaf clobbers x0..x17 and the slow path after it still reads the
+ * operands, so every operand must be in a callee-saved register. A site that
+ * calls is planned that way already (noteScratchClobber); an operand anywhere
+ * else -- an inlined body's own bank -- emits no leaf at all, which leaves the
+ * site exactly as it was. */
+static bool dictLeafReg(unsigned r) {
+    return r >= JIT_FIRST_SAVED && r < JIT_FIRST_SAVED + JIT_MAX_SAVED;
+}
+
+static bool dictLeafValueKind(SlotKind k) {
+    return k == SLOT_INT || k == SLOT_FLOAT || k == SLOT_BOOL ||
+           k == SLOT_INST || k == SLOT_LIST || k == SLOT_OBJ ||
+           k == SLOT_MAYBE_INST || k == SLOT_MAYBE_OBJ;
+}
+
+/* The key must really be a string; anything else takes the slow path, which
+ * is not a deopt, so a dict keyed by ints at this site costs one compare. */
+static void dictLeafKeyGuard(Emit *e, unsigned rKey, DictLeafFix *fx) {
+    emit(e, jaiA64LdrW(JIT_SCRATCH_A, rKey, (unsigned)offsetof(Obj, type)));
+    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_STRING));
+    fx->slow[0] = (int)e->count;
+    emit(e, jaiA64BCond(JAI_A64_NE, 0));
+}
+
+static void dictLeafCall(Emit *e, void *helper, DictLeafFix *fx) {
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)helper);
+    noteScratchClobber(e);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64SubsXImm(31, 0, 0));
+    fx->slow[1] = (int)e->count;
+    emit(e, jaiA64BCond(JAI_A64_NE, 0));
+    fx->done = (int)e->count;
+    emit(e, jaiA64B(0));
+    fx->on = true;
+}
+
+void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
+                     SlotKind defKind, bool absentSlow, DictLeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitDictLeaf() || e->inlining) return;
+    if (!dictLeafReg(rDict) || !dictLeafReg(rKey)) return;
+    if (e->descOffset + (unsigned)offsetof(JitCallDesc, result) > 4095u) return;
+    unsigned rDef = 0;
+    if (defIdx >= 0) {
+        if (!dictLeafValueKind(defKind)) return;
+        rDef = valueXReg(e, (unsigned)defIdx);
+        if (!dictLeafReg(rDef)) return;
+    }
+    fpSyncAll(e);
+    settleAll(e);
+
+    dictLeafKeyGuard(e, rKey, fx);
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emit(e, jaiA64AddXImm(2, 31, e->descOffset +
+                                     (unsigned)offsetof(JitCallDesc, result)));
+    if (absentSlow) {
+        emit(e, jaiA64MovzX(3, JIT_DICT_ABSENT_SLOW, 0));
+        emit(e, jaiA64MovzX(4, 0, 0));
+    } else if (defIdx < 0) {
+        emit(e, jaiA64MovzX(3, VAL_NULL, 0));
+        emit(e, jaiA64MovzX(4, 0, 0));
+    } else {
+        emitTagFor(e, defKind, rDef, 3, JIT_SCRATCH_A);
+        emit(e, jaiA64MovX(4, rDef));
+    }
+    dictLeafCall(e, (void *)&jitDictGetStr, fx);
+}
+
+void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey, unsigned rVal,
+                     SlotKind vk, DictLeafFix *fx) {
+    fx->on = false;
+    fx->slow[0] = fx->slow[1] = fx->done = -1;
+    if (!jitDictLeaf() || e->inlining) return;
+    if (!dictLeafValueKind(vk)) return;
+    if (!dictLeafReg(rDict) || !dictLeafReg(rKey) || !dictLeafReg(rVal)) {
+        return;
+    }
+    fpSyncAll(e);
+    settleAll(e);
+
+    dictLeafKeyGuard(e, rKey, fx);
+    emit(e, jaiA64MovX(0, rDict));
+    emit(e, jaiA64MovX(1, rKey));
+    emitTagFor(e, vk, rVal, 2, JIT_SCRATCH_A);
+    emit(e, jaiA64MovX(3, rVal));
+    dictLeafCall(e, (void *)&jitDictSetStr, fx);
+}
+
+/* Where the descriptor call begins: both "can't" branches land here. */
+void dictLeafSlowHere(Emit *e, DictLeafFix *fx) {
+    if (!fx->on || e->count > JIT_MAX_INSTS) return;
+    for (unsigned i = 0; i < 2; i++) {
+        int at = fx->slow[i];
+        if (at < 0 || at >= (int)e->count) continue;
+        e->code[at] = jaiA64BCond(JAI_A64_NE, (int32_t)((int)e->count - at));
+    }
+}
+
+/* Just past the descriptor call: the leaf's answered path rejoins here. */
+void dictLeafDoneHere(Emit *e, DictLeafFix *fx) {
+    if (!fx->on || e->count > JIT_MAX_INSTS) return;
+    int at = fx->done;
+    if (at < 0 || at >= (int)e->count) return;
+    e->code[at] = jaiA64B((int32_t)((int)e->count - at));
+}
+
 bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
     int off = *offp;
     do {
@@ -153,10 +280,22 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
             branchOnDeopt(e, JAI_A64_NE);
 
+            /* A string key is answered by the leaf; a miss, or anything it
+             * cannot settle, falls through to this same descriptor call,
+             * which raises the KeyError a miss is owed. */
+            DictLeafFix gfx;
+            gfx.on = false;
+            if (e->stack[e->depth - 1] == SLOT_OBJ) {
+                emitDictLeafGet(e, valueXReg(e, e->valueDepth - 2),
+                                valueXReg(e, e->valueDepth - 1), -1,
+                                SLOT_NULL, true, &gfx);
+            }
+            dictLeafSlowHere(e, &gfx);
             if (!emitDescriptor(e, NULL_VAL, dsidx, 2,
                                 (void *)&jitGetIndexDict)) {
                 return false;
             }
+            dictLeafDoneHere(e, &gfx);
             for (unsigned i = 0; i < 2; i++) {
                 unsigned drop;
                 if (!popValue(e, &drop, NULL)) return false;
@@ -439,10 +578,21 @@ bool emitSetIndex(Emit *e, int *offp) {
                                (unsigned)offsetof(Obj, type)));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_DICT));
             branchOnDeopt(e, JAI_A64_NE);
+            DictLeafFix sfx;
+            sfx.on = false;
+            if (e->stack[e->depth - 2] == SLOT_OBJ &&
+                holdsRegister(e->stack[e->depth - 1])) {
+                emitDictLeafSet(e, valueXReg(e, e->valueDepth - 3),
+                                valueXReg(e, e->valueDepth - 2),
+                                valueXReg(e, e->valueDepth - 1),
+                                e->stack[e->depth - 1], &sfx);
+            }
+            dictLeafSlowHere(e, &sfx);
             if (!emitDescriptor(e, NULL_VAL, sidx, 3,
                                 (void *)&jitSetIndexDict)) {
                 return false;
             }
+            dictLeafDoneHere(e, &sfx);
             for (unsigned i = 0; i < 3; i++) {
                 unsigned r;
                 if (!popValue(e, &r, NULL)) return false;

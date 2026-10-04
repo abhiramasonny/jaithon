@@ -418,6 +418,81 @@ int jitSetIndexDict(JitCallDesc *d) {
     return vm.hasException ? 1 : 0;
 }
 
+/* JAITHON_JIT_DICT_LEAF=0 sends every dict read and store back through its
+ * descriptor call, for a one-binary A/B of the leaves below. */
+bool jitDictLeaf(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* `d.get(k)`, `d.get(k, default)` and `d[k]` with a string key, called as a
+ * LEAF: no descriptor, no root range, no native dispatch. jaiTableFindStr runs
+ * no user code, allocates nothing and cannot raise, so nothing here can
+ * collect and the operands need no rooting -- the same argument
+ * jitInstanceAlloc and jaiStringOrder rest on.
+ *
+ * What it replaces is not the probe but everything around it: the descriptor's
+ * stores and root fill, a root-range push and pop, and
+ * jitInvokeNative -> callNativeAt -> dictGet -> jaiTableGet, each re-checking
+ * what the guards in front of this call already proved. That was ~200
+ * instructions around a ~20-instruction probe.
+ *
+ * Returns 0 with `*result` written, and 1 -- having written nothing -- when
+ * only the descriptor path can answer: a stored key whose hash matches and
+ * which is not a string, or an absent key when `defTag` is
+ * JIT_DICT_ABSENT_SLOW (`d[k]`, whose miss raises the interpreter's own
+ * KeyError). An absent key otherwise answers the default the caller passed as
+ * a tag and payload. */
+int64_t jitDictGetStr(ObjDict *d, ObjString *key, Value *result,
+                      uint64_t defTag, int64_t defPayload) {
+    JaiEntry *e = jaiTableFindStr(&d->table, key);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    if (e != NULL) {
+        *result = e->value;
+        return 0;
+    }
+    if (defTag == JIT_DICT_ABSENT_SLOW) return 1;
+    Value v;
+    v.type = (ValueType)defTag;
+    v.as.integer = defPayload;
+    *result = v;
+    return 0;
+}
+
+/* `d[k] = v` with a string key, as a leaf for the reason jitDictGetStr gives.
+ * A typed dict goes back to the descriptor path, since jaiCheckKind can raise.
+ * An insert can grow the table, but only through JAI_ALLOC, which never
+ * collects (collections begin only in jaiGCMaybeCollect). Returns 0 stored,
+ * 1 untouched. */
+int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
+                      int64_t payload) {
+    if (JAI_UNLIKELY(d->keyKind != FIELD_KIND_ANY ||
+                     d->valKind != FIELD_KIND_ANY)) {
+        return 1;
+    }
+    JaiEntry *e = jaiTableFindStr(&d->table, key);
+    if (JAI_UNLIKELY(e == JAI_TABLE_SLOW)) return 1;
+    Value v;
+    v.type = (ValueType)tag;
+    v.as.integer = payload;
+    if (e != NULL) {
+        /* insertAt's update half: the value and the version, nothing else. */
+        e->value = v;
+        ++d->table.version;
+        return 0;
+    }
+    /* Through jaiStringHash, never `key->hash`: an empty table answers NULL
+     * before the probe has forced the lazy hash, and a long run-time string
+     * still holds zero there -- filing it under 0 made the next lookup of an
+     * equal key miss and insert a second copy. */
+    (void)jaiTableSetHashed(&d->table, OBJ_VAL(key), jaiStringHash(key), v);
+    return 0;
+}
+
 int jitCallOut(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);

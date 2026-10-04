@@ -1303,10 +1303,29 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
                 break;
             }
 
+            /* `d.get(k)` / `d.get(k, default)` with a string key: the leaf
+             * answers in place and this descriptor call stays behind it as
+             * the slow path. See emitDictLeafGet. */
+            DictLeafFix ofx;
+            ofx.on = false;
+            if (OBJ_TYPE(oseen) == OBJ_DICT && (argc == 1 || argc == 2) &&
+                AS_STRING(oname)->length == 3 &&
+                memcmp(AS_STRING(oname)->chars, "get", 3) == 0 &&
+                e->stack[ridx + 1] == SLOT_OBJ &&
+                holdsRegister(e->stack[ridx + argc])) {
+                unsigned vd = e->valueDepth;
+                emitDictLeafGet(e, valueXReg(e, vd - argc - 1),
+                                valueXReg(e, vd - argc),
+                                argc == 2 ? (int)(vd - 1) : -1,
+                                argc == 2 ? e->stack[ridx + 2] : SLOT_NULL,
+                                false, &ofx);
+            }
+            dictLeafSlowHere(e, &ofx);
             if (!emitDescriptor(e, onative, ridx, argc + 1,
                                 (void *)&jitInvokeNative)) {
                 return false;
             }
+            dictLeafDoneHere(e, &ofx);
             for (unsigned i = 0; i <= argc; i++) {
                 unsigned r;
                 if (!popValue(e, &r, NULL)) return false;

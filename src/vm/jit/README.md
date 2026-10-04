@@ -472,6 +472,7 @@ this table complete in both directions.
 | `JAITHON_JIT_NULL_PAIR` | on | The null-compare pair fusion. |
 | `JAITHON_JIT_FUSED_DISCARD` | on | Fuse a call whose result is discarded. |
 | `JAITHON_JIT_MEMBERSHIP` | on | `in` against a container. |
+| `JAITHON_JIT_DICT_LEAF` | on | String-keyed `d.get(k)`, `d[k]` and `d[k] = v` through a leaf call in front of the descriptor call. |
 | `JAITHON_JIT_NEGATE` | on | Arithmetic negation. |
 | `JAITHON_JIT_TUPLE` | on | Tuple construction and unpacking. |
 | `JAITHON_LAZY_ENUMERATE` | on | `for (i, x) in xs.enumerate()` over a list. Read by the **interpreter** (`jaiLazyEnumerateOn`, vm.c) as well as this tier: `OP_INVOKE` replaces the eager `list.enumerate()` -- N 2-tuples and a list, all taken apart again by the pair head -- with an `ITER_LIST_ENUM` over one boxed snapshot when the next instruction is the `GET_ITER`, and both tiers arm that head (`emitForIterPairEnum`; OSR iterKind **5**, which takes a plain list head's prologue, reserved registers and index write-back -- not iterKind 4's, that being the list-of-2-tuples head, which shares the dict head's instead). A snapshot, not a view: the eager call copied the elements too, so a loop mutating `xs` sees what it always saw. Off restores the eager call and the refusal "a pair loop over something other than a live dict view or a list of 2-tuples", which is 96 of the 106 pair-loop sites in `lib/jaithon`. |
@@ -1048,6 +1049,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_ITER_STG` | `jitIterStorage` | the storage dispatch at a NESTED `for x in <list>` (`emitForIterBind`'s shape-1 arm). Off, that arm emits `emitListBoxedGuard` alone, which is what it did until 2026-09-07: a `push`-built `list[int]` is `LIST_STORE_I64`, so the guard failed on every loop entry and the inner loop ran interpreted. Worth 3.6x on a nested-loop probe and 2x on `graph_bfs`. The switch exists to price it in one binary. |
 | `JAITHON_JIT_CONCAT_LOCALS` | `jitConcatLocals` | `a + b` on two `SLOT_OBJ` locals. |
 | `JAITHON_JIT_MEMBERSHIP` | `jitMembership` | `in`. |
+| `JAITHON_JIT_DICT_LEAF` | `jitDictLeaf` | the string-keyed dict leaves, `jitDictGetStr` and `jitDictSetStr`, placed in FRONT of the dict read, `dict.get` and dict store descriptor calls, which stay behind them as the slow path. A leaf runs no user code and cannot allocate, so it needs no descriptor, no roots and no native dispatch -- ~200 instructions around a ~20-instruction probe. Worth 1.47x in cycles on `dict_ops`, and 2.2x on a get-then-set loop. Anything the leaf cannot settle -- a key that is not a string, a miss under `d[k]`, a stored key of another kind whose hash matches, a typed dict -- takes the descriptor call, which is not a deopt. |
 | `JAITHON_JIT_TUPLE` | `jitTuple` | building and unpacking tuples. |
 | `JAITHON_JIT_NEGATE` | `jitNegate` | `OP_NEG`. |
 | `JAITHON_JIT_COLLECT_CLASHES` | `jitCollectClashes` | collecting every clashing local in one measuring pass instead of one retry per clash. |

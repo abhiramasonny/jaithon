@@ -483,6 +483,43 @@ bool jaiTableSetInterned(JaiTable *t, ObjString *key, Value value) {
     return jaiTableSetInternedPrev(t, key, value, NULL);
 }
 
+/* findExisting for a string key, answered without anything that can run user
+ * code, allocate or raise -- which is what lets compiled code call it as a
+ * leaf, with no roots pushed (see jitDictGetStr).
+ *
+ * keyMatches can reach jaiValuesEqual, and through it a user `__eq__`, only
+ * when the stored key is not a string; a string against a string is the
+ * pointer test and then jaiStringEquals, both pure. So a stored key that
+ * matches the hash and is NOT a string is handed back as JAI_TABLE_SLOW for the
+ * caller's general path to settle, rather than settled here. Forcing the
+ * key's lazy hash writes the field it caches into, which every reader of it
+ * would have done anyway. */
+JaiEntry *jaiTableFindStr(JaiTable *t, ObjString *key) {
+    if (t->count == 0) return NULL;
+
+    const uint64_t hash = jaiStringHash(key);
+    const uint32_t mask = (uint32_t)t->capacity - 1;
+    uint32_t index = (uint32_t)hash & mask;
+    JaiEntry *const entries = t->entries;
+
+    for (;;) {
+        JaiEntry *const e = entries + index;
+        const int state = e->order;
+
+        if (state == ENTRY_EMPTY_ORDER) return NULL;
+        if (state >= 0 && e->hash == hash) {
+            const Value stored = e->key;
+            if (jaiValueType(stored) != VAL_OBJ) return JAI_TABLE_SLOW;
+            Obj *const o = AS_OBJ(stored);
+            if (o == (Obj *)key) return e;
+            if (o->type != OBJ_STRING) return JAI_TABLE_SLOW;
+            if (jaiStringEquals((const ObjString *)o, key)) return e;
+        }
+
+        index = (index + 1) & mask;
+    }
+}
+
 JaiEntry *jaiTableFindEntryInterned(JaiTable *t, ObjString *key) {
     if (t->count == 0) return NULL;
     return findExistingInterned(t->entries, t->capacity, key);

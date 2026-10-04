@@ -45,6 +45,10 @@ int  jaiTableFindIndex(JaiTable *t, Value key);
 
 JaiEntry *jaiTableFindEntryInterned(JaiTable *t, ObjString *key);
 
+/* jaiTableFindStr's third answer, besides an entry and NULL (absent). */
+#define JAI_TABLE_SLOW ((JaiEntry *)(uintptr_t)1)
+JaiEntry *jaiTableFindStr(JaiTable *t, ObjString *key);
+
 bool jaiTableNext(const JaiTable *t, int *i, Value *outKey, Value *outValue);
 
 void jaiTableMark(JaiTable *t);

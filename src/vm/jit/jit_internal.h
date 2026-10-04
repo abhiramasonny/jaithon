@@ -791,6 +791,25 @@ int jitNewInstance(JitCallDesc *d);
 int jitGetSlice(JitCallDesc *d);
 int jitGetIndexDict(JitCallDesc *d);
 int jitSetIndexDict(JitCallDesc *d);
+
+/* The string-keyed dict leaves and the arm that calls them; see jitDictGetStr. */
+#define JIT_DICT_ABSENT_SLOW 0xFFFFu
+bool jitDictLeaf(void);
+int64_t jitDictGetStr(ObjDict *d, ObjString *key, Value *result,
+                      uint64_t defTag, int64_t defPayload);
+int64_t jitDictSetStr(ObjDict *d, ObjString *key, uint64_t tag,
+                      int64_t payload);
+typedef struct {
+    int  slow[2];   /* the two branches to the descriptor path */
+    int  done;      /* the branch over it */
+    bool on;        /* a leaf was emitted at all */
+} DictLeafFix;
+void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, int defIdx,
+                     SlotKind defKind, bool absentSlow, DictLeafFix *fx);
+void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey, unsigned rVal,
+                     SlotKind vk, DictLeafFix *fx);
+void dictLeafSlowHere(Emit *e, DictLeafFix *fx);
+void dictLeafDoneHere(Emit *e, DictLeafFix *fx);
 int jitCallOut(JitCallDesc *d);
 
 /* Defined in jit_osr.c. */
