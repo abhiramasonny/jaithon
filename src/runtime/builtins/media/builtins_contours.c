@@ -713,6 +713,132 @@ static bool primGridBorders(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* --- points --------------------------------------------------------- */
+
+/* Element `i` of a list of ints, whatever its storage. False when it is not
+ * an int. */
+JAI_INLINE bool borderInt(const ObjList *list, int i, int64_t *out) {
+    if ((ListStore)list->stg == LIST_STORE_I64) {
+        *out = ((const int64_t *)list->items)[i];
+        return true;
+    }
+    const Value v = jaiListGet(list, i);
+    if (!IS_INT(v)) return false;
+    *out = AS_INT(v);
+    return true;
+}
+
+/* `grid_border_points(klass, meta, xy, chosen, dx, dy)` -- the contours
+ * `find_contours` hands back, built here: for each border index in `chosen`,
+ * in that order, a list of `klass` objects, one a point of that border as
+ * `grid_borders` wrote it, moved by (dx, dy).
+ *
+ * A point is made the way `__prim__.obj_new` and two field stores make one:
+ * an instance of `klass` with `x` and `y` set and nothing else run. That is
+ * only the same object `klass(x, y)` makes when the class is nothing but
+ * those two integer fields and its `init` assigns them, which is what jaicv's
+ * `Point` is -- so a class with any other field is refused, and `types.jai`
+ * says beside `Point` that its `init` has to stay that way. Null for a class
+ * this does not take; the caller then builds the points itself.
+ *
+ * Why. A frame of blobs is a few thousand contours and a couple of hundred
+ * thousand points, and building each point through the class call was most of
+ * `find_contours`: 178660 points over 3600 contours took 8.3 ms of a 10.3 ms
+ * call, against 2 ms for the scan, the walk and everything else. */
+static bool primGridBorderPoints(int argc, Value *args, Value *out) {
+    (void)argc;
+    if (!IS_CLASS(args[0])) {
+        return jaiThrow(vm.cTypeError, "grid_border_points(): the first argument must be a class");
+    }
+    ObjClass *klass = AS_CLASS(args[0]);
+    ObjList *meta, *xy, *chosen;
+    int64_t dx, dy;
+    if (!jaiArgList(args[1], 2, "grid_border_points", &meta)) return false;
+    if (!jaiArgList(args[2], 3, "grid_border_points", &xy)) return false;
+    if (!jaiArgList(args[3], 4, "grid_border_points", &chosen)) return false;
+    if (!jaiStrWantInt(args[4], "grid_border_points", "the x offset", &dx)) return false;
+    if (!jaiStrWantInt(args[5], "grid_border_points", "the y offset", &dy)) return false;
+    *out = NULL_VAL;
+
+    const int slotX = jaiClassFieldSlot(klass, jaiStringInternC("x"));
+    const int slotY = jaiClassFieldSlot(klass, jaiStringInternC("y"));
+    if (klass->fieldCount != 2 || slotX < 0 || slotY < 0) return true;
+
+    /* Every range checked before anything is made. */
+    const int borders = meta->count / 3;
+    const int pairs = xy->count / 2;
+    const int count = chosen->count;
+    for (int c = 0; c < count; c++) {
+        int64_t index, start = 0, stop;
+        if (!borderInt(chosen, c, &index) || index < 0 || index >= borders) {
+            return jaiThrow(vm.cValueError, "grid_border_points(): border %d is out of range", c);
+        }
+        if (index > 0 && !borderInt(meta, (int)index * 3 - 1, &start)) start = -1;
+        if (!borderInt(meta, (int)index * 3 + 2, &stop)) stop = -1;
+        if (start < 0 || stop < start || stop > pairs) {
+            return jaiThrow(vm.cValueError, "grid_border_points(): border %lld's points are out of range",
+                            (long long)index);
+        }
+    }
+
+    ObjList *contours = jaiListNew(count);
+    if (contours == NULL) return false;
+    jaiGCPushRoot(OBJ_VAL(contours));
+    contours->elemKind = FIELD_KIND_LIST;
+    bool ok = jaiListReserveExact(contours, count);
+    for (int c = 0; ok && c < count; c++) {
+        int64_t index, start = 0, stop;
+        borderInt(chosen, c, &index);
+        if (index > 0) borderInt(meta, (int)index * 3 - 1, &start);
+        borderInt(meta, (int)index * 3 + 2, &stop);
+        const int length = (int)(stop - start);
+
+        ObjList *points = jaiListNew(length);
+        if (points == NULL) {
+            ok = false;
+            break;
+        }
+        /* Reachable from `contours` before anything else is allocated. */
+        jaiListBox(contours)[c] = OBJ_VAL(points);
+        contours->count = c + 1;
+        if (!jaiListReserveExact(points, length)) {
+            ok = false;
+            break;
+        }
+        /* The collector does not move anything, so the array stays put while
+         * the points below are allocated. */
+        Value *slots = length > 0 ? jaiListBox(points) : NULL;
+        for (int i = 0; i < length; i++) {
+            int64_t x, y;
+            const int at = (int)start + i;
+            if (!borderInt(xy, at * 2, &x) || !borderInt(xy, at * 2 + 1, &y)) {
+                jaiGCPopRoot();
+                return jaiThrow(vm.cTypeError, "grid_border_points(): a point is not a pair of ints");
+            }
+            if (__builtin_add_overflow(x, dx, &x) || __builtin_add_overflow(y, dy, &y)) {
+                jaiGCPopRoot();
+                return jaiThrow(vm.cOverflowError, "grid_border_points(): integer overflow");
+            }
+            ObjInstance *point = jaiInstanceNew(klass);
+            if (point == NULL) {
+                ok = false;
+                break;
+            }
+            point->fields[slotX] = INT_VAL(x);
+            point->fields[slotY] = INT_VAL(y);
+            slots[i] = OBJ_VAL(point);
+            points->count = i + 1;
+        }
+        jaiListTouch(points);
+    }
+    jaiGCPopRoot();
+    if (!ok) return jaiThrow(vm.cRuntimeError, "grid_border_points(): out of memory");
+    jaiListTouch(contours);
+    *out = OBJ_VAL(contours);
+    return true;
+}
+
 void jaiContoursRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "grid_borders", primGridBorders, 9, 9);
+    jaiStrDefinePrim(ns, "grid_border_points", primGridBorderPoints, 6, 6);
 }

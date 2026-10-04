@@ -518,6 +518,12 @@ fn relate(parents: list[int]) -> list[Hierarchy] {
 #: frame of large shapes almost none are.
 let _native_borders = (env("JAICV_NATIVE_BORDERS") ?? "1") != "0"
 
+#: Whether `find_contours` has `__prim__.grid_border_points` make its points
+#: rather than calling `Point` for each. Read once; `JAICV_NATIVE_POINTS=0`
+#: makes them here. A frame of 3600 blobs is 178660 points, and making them
+#: one class call at a time was most of the call.
+let _native_points = (env("JAICV_NATIVE_POINTS") ?? "1") != "0"
+
 #: For each border in `order`, the position in `order` of the one enclosing
 #: it, or -1. `parents_of` over the flat records `grid_borders` writes, three
 #: ints a border: outer or not, the enclosing border's number, and where its
@@ -646,8 +652,19 @@ fn native_contours(
 
     let shift_x = offset.x
     let shift_y = offset.y
+    #: The points made in C, a `Point` at a time with its two fields set, which
+    #: is what `Point(x, y)` makes; null if `Point` ever stops being only its
+    #: two fields, and then they are made below.
     var contours: list[list[Point]] = []
-    for index in chosen {
+    var pending = chosen
+    if _native_points {
+        let built = __prim__.grid_border_points(Point, meta, xy, chosen, shift_x, shift_y)
+        if built is not null {
+            contours = built
+            pending = []
+        }
+    }
+    for index in pending {
         let start = if index > 0 { meta[index * 3 - 1] } else { 0 }
         let stop = meta[index * 3 + 2]
         var points: list[Point] = []

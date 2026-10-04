@@ -139,3 +139,62 @@ fn test_bad_arguments_throw() -> void {
     assert_throws(TypeError, fn() -> void { __prim__.grid_borders(src, 0, 5, 5, 5, 1, 0, meta, 7) })
     assert_true(meta.len() == 0)
 }
+
+class Spot {
+    pub var x: int
+    pub var y: int
+
+    pub fn init(self, x: int, y: int) {
+        self.x = x
+        self.y = y
+    }
+}
+
+class Tagged {
+    pub var x: int
+    pub var y: int
+    pub var tag: str
+
+    pub fn init(self, x: int, y: int) {
+        self.x = x
+        self.y = y
+        self.tag = "made"
+    }
+}
+
+#: The borders' points made as objects, in the order asked for and moved by
+#: the offset -- the same objects `Spot(x, y)` makes.
+fn test_border_points_are_the_objects_the_class_makes() -> void {
+    let got = borders(square_with_hole(), 0, 5, 5, 5, 1, 0)
+    let meta = got[0]
+    let xy = got[1]
+    let made = __prim__.grid_border_points(Spot, meta, xy, [1, 0], 10, -1)
+    assert_true(made is not null)
+    assert_eq(made.len(), 2)
+    let order = [1, 0]
+    for slot in 0..2 {
+        let index = order[slot]
+        let start = if index > 0 { meta[index * 3 - 1] } else { 0 }
+        var want: list[int] = []
+        for at in start..meta[index * 3 + 2] {
+            want.push(xy[at * 2] + 10)
+            want.push(xy[at * 2 + 1] - 1)
+        }
+        var flat: list[int] = []
+        for spot in made[slot] {
+            assert_true(spot is Spot)
+            flat.push(spot.x)
+            flat.push(spot.y)
+        }
+        assert_eq(flat, want)
+    }
+}
+
+#: A class with more to it than `x` and `y` is refused rather than half made.
+fn test_border_points_refuse_a_class_with_other_fields() -> void {
+    let got = borders(square_with_hole(), 0, 5, 5, 5, 1, 0)
+    assert_true(__prim__.grid_border_points(Tagged, got[0], got[1], [0], 0, 0) == null)
+    assert_throws(ValueError, fn() -> void {
+        __prim__.grid_border_points(Spot, got[0], got[1], [7], 0, 0)
+    })
+}
