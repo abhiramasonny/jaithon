@@ -597,6 +597,40 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
         emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, cType));
         branchOnDeopt(e, JAI_A64_NE);
 
+        /* A string cut by int bounds with no step: the leaf first (see
+         * jitStrSliceLeaf), the descriptor only when it declines. Operands
+         * go through scratch so no move reads a register an earlier move
+         * wrote; both paths leave the result in JIT_SCRATCH_C. */
+        unsigned skipSlow = 0;
+        bool leaf = cType == OBJ_STRING && (flags & 4u) == 0 &&
+                    flags != 0 && jitSliceLeafOn() && !e->inlining;
+        for (unsigned i = 1; leaf && i < nargs; i++) {
+            if (e->stack[cidx + i] != SLOT_INT) leaf = false;
+        }
+        if (leaf) {
+            unsigned vbase = e->valueDepth - nargs;
+            emit(e, jaiA64MovX(JIT_SCRATCH_A, xHeldIn(e, vbase)));
+            emit(e, jaiA64MovX(JIT_SCRATCH_B, xHeldIn(e, vbase + 1)));
+            if (nargs > 2) {
+                emit(e, jaiA64MovX(JIT_SCRATCH_C, xHeldIn(e, vbase + 2)));
+            }
+            emit(e, jaiA64MovX(0, JIT_SCRATCH_A));
+            if ((flags & 1u) != 0) {
+                emit(e, jaiA64MovX(1, JIT_SCRATCH_B));
+                if (nargs > 2) emit(e, jaiA64MovX(2, JIT_SCRATCH_C));
+            } else {
+                emit(e, jaiA64MovX(2, JIT_SCRATCH_B));
+            }
+            emit(e, jaiA64MovzX(3, flags, 0));
+            emitConst64(e, JIT_SCRATCH_A,
+                        (int64_t)(uintptr_t)&jitStrSliceLeaf);
+            noteScratchClobber(e);
+            emit(e, jaiA64Blr(JIT_SCRATCH_A));
+            emit(e, jaiA64MovX(JIT_SCRATCH_C, 0));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, 0));
+            skipSlow = e->count;
+            emit(e, jaiA64BCond(JAI_A64_NE, 0));   /* patched below */
+        }
         emit(e, jaiA64MovzX(JIT_SCRATCH_A, flags, 0));
         emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
                            e->descOffset +
@@ -604,6 +638,13 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
         if (!emitDescriptorStatus(e, NULL_VAL, cidx, nargs,
                                   (void *)&jitGetSlice, false, -1)) {
             return false;
+        }
+        emit(e, jaiA64LdrX(JIT_SCRATCH_C, 31,
+                           e->descOffset +
+                               (unsigned)offsetof(JitCallDesc, result) + 8));
+        if (leaf && skipSlow < e->count && e->count <= JIT_MAX_INSTS) {
+            e->code[skipSlow] =
+                jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
         }
         for (unsigned i = 0; i < nargs; i++) {
             unsigned r;
@@ -614,9 +655,7 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
          * every element read re-checks its own tag, so this is a hint and
          * not an assumption. */
         if (!pushValue3(e, sliceKind, 0, NULL, cseen, -1)) return false;
-        emit(e, jaiA64LdrX(pushReg(e) - 1, 31,
-                           e->descOffset +
-                               (unsigned)offsetof(JitCallDesc, result) + 8));
+        emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_C));
         /* Deliberately not e->wroteHeap: the only effect is a fresh object
          * and an interpreted re-run would make another. Setting it would
          * decline the next self-call, which is the shape `sort` has. */

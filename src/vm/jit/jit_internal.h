@@ -823,6 +823,9 @@ int jitListGrow(ObjList *list, uint64_t tag, int64_t payload);
 ObjInstance *jitInstanceAlloc(ObjClass *cls);
 ObjIter *jitIterAlloc(Obj *source);
 bool jitIterAllocOn(void);
+ObjString *jitStrSliceLeaf(ObjString *s, int64_t start, int64_t stop,
+                           int64_t flags);
+bool jitSliceLeafOn(void);
 int jitNewInstance(JitCallDesc *d);
 int jitGetSlice(JitCallDesc *d);
 int jitGetIndexDict(JitCallDesc *d);

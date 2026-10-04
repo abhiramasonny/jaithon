@@ -513,6 +513,45 @@ ObjIter *jitIterAlloc(Obj *source) {
 #endif
 }
 
+/* JAITHON_JIT_SLICE_LEAF=0 cuts every string slice through the jitGetSlice
+ * descriptor again. */
+bool jitSliceLeafOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SLICE_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* `s[a:b]`, `s[a:]` and `s[:b]` on a string whose every scalar is one byte,
+ * as a leaf: NULL whenever the general path is needed -- a collection is
+ * wanted (so nothing here may allocate through one), the scalar count is not
+ * known to equal the byte count, or the slice is empty. The bounds are
+ * clamped exactly as jaiSliceGet's sliceBounds and sliceCount do for step 1,
+ * and the result is what jaiStringSlice returns for the same ASCII case: the
+ * table singleton for one character, jaiStringNew otherwise -- which, with no
+ * collection wanted, allocates without collecting. A token cut out of a line
+ * paid the descriptor's stores, a root push and three Value unpackings for a
+ * few bytes of copy. */
+ObjString *jitStrSliceLeaf(ObjString *s, int64_t start, int64_t stop,
+                           int64_t flags) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    if (s == NULL || s->scalars != s->length) return NULL;
+    const int64_t n = (int64_t)s->length;
+    if ((flags & 1) == 0) start = 0;
+    if ((flags & 2) == 0) stop = n;
+    if (n <= 0) return NULL;
+    if (start < 0) start = start < -n ? 0 : start + n;
+    else if (start > n) start = n;
+    if (stop < 0) stop = stop < -n ? 0 : stop + n;
+    else if (stop > n) stop = n;
+    if (stop <= start) return NULL;
+    const int64_t count = stop - start;
+    if (count == 1) return jaiStringChar((unsigned char)s->chars[start]);
+    return jaiStringNew(s->chars + start, (size_t)count);
+}
+
 int jitNewInstance(JitCallDesc *d) {
     jaiGCPushRootRange(d->roots, (int)d->nroots);
     ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));
