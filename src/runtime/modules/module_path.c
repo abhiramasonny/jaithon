@@ -19,6 +19,11 @@
 
 #include <stdlib.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/attr.h>
+#include <sys/vnode.h>
+#include <unistd.h>
+#endif
 
 #include "runtime/runtime.h"
 #include "runtime/modules/module_internal.h"
@@ -62,13 +67,15 @@ static bool dirListHas(const DirList *list, const char *dir) {
     return false;
 }
 
+static void noteCanonicalDir(const char *dir);
+
 static void dirListAdd(DirList *list, const char *dir) {
     if (dir == NULL || dir[0] == '\0') return;
 
     char absolute[JAI_MAX_PATH];
-    const char *entry = jaiPathAbsolute(absolute, sizeof absolute, dir)
-                            ? absolute
-                            : dir;
+    bool canonical = jaiPathAbsolute(absolute, sizeof absolute, dir);
+    const char *entry = canonical ? absolute : dir;
+    if (canonical) noteCanonicalDir(absolute);
     if (dirListHas(list, entry)) return;
 
     char *copy = jaiStrdup(entry);
@@ -278,6 +285,126 @@ static void memoClear(Memo *m) {
     m->count = 0;
 }
 
+/* Directories known to be canonical: every search-path directory realpath
+ * accepted, and the directory of every path realpath produced (each prefix of
+ * a canonical path is canonical). Never cleared -- it records facts about the
+ * filesystem, not about the search path. */
+static Memo sCanonicalDirs;
+
+static void noteCanonicalDir(const char *dir) {
+    if (dir[0] == '\0') return;
+    size_t len = strlen(dir);
+    uint32_t hash = memoHash(dir, len);
+    if (memoFind(&sCanonicalDirs, dir, len, hash) == NULL)
+        memoInsert(&sCanonicalDirs, dir, len, hash, "");
+}
+
+static void noteCanonicalFile(const char *path) {
+    char dir[JAI_MAX_PATH];
+    jaiPathDirname(dir, sizeof dir, path);
+    noteCanonicalDir(dir);
+}
+
+static bool isCanonicalDir(const char *dir) {
+    size_t len = strlen(dir);
+    return memoFind(&sCanonicalDirs, dir, len, memoHash(dir, len)) != NULL;
+}
+
+static bool envOn(const char *name, bool fallback) {
+    const char *v = getenv(name);
+    if (v == NULL || v[0] == '\0') return fallback;
+    return strcmp(v, "0") != 0;
+}
+
+#ifdef __APPLE__
+/* realpath of `dir`/`rest`, for a `dir` already canonical and a `rest` of
+ * plain names, at one getattrlist per component of `rest` instead of one per
+ * component of the whole path. macOS's realpath is exactly that loop run from
+ * the root: ATTR_CMN_NAME is where it gets each component's case as stored.
+ * A module file under lib/std is ~14 components deep and two of them are
+ * `rest`, so this is ~2 calls where realpath makes ~14.
+ *
+ * It answers only when the answer cannot differ from realpath's. A symlink,
+ * a name the filesystem spells with different bytes than ASCII case allows --
+ * another Unicode normalisation, or a volume root reporting its volume name
+ * -- or anything unexpected returns false, and the caller runs realpath.
+ * JAITHON_RESOLVE_VERIFY=1 runs realpath anyway and reports any difference. */
+static bool canonicalUnder(const char *dir, const char *rest, char *out,
+                           size_t outSize) {
+    size_t at = strlen(dir);
+    if (at == 0 || dir[at - 1] == '/' || at + 1 >= outSize) return false;
+    memcpy(out, dir, at + 1);
+
+    const char *p = rest;
+    while (*p != '\0') {
+        const char *slash = strchr(p, '/');
+        size_t n = slash != NULL ? (size_t)(slash - p) : strlen(p);
+        if (n == 0 || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.'))
+            return false;
+        if (at + 1 + n + 1 > outSize) return false;
+        out[at] = '/';
+        memcpy(out + at + 1, p, n);
+        out[at + 1 + n] = '\0';
+
+        struct attrlist request;
+        memset(&request, 0, sizeof request);
+        request.bitmapcount = ATTR_BIT_MAP_COUNT;
+        request.commonattr = ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
+        struct {
+            uint32_t        length;
+            attrreference_t name;
+            fsobj_type_t    type;
+            char            bytes[3 * 255 + 1];
+        } __attribute__((aligned(4), packed)) reply;
+        if (getattrlist(out, &request, &reply, sizeof reply, FSOPT_NOFOLLOW) != 0)
+            return false;
+        if (reply.type == VLNK) return false;
+        const char *name = (const char *)&reply.name + reply.name.attr_dataoffset;
+        const char *end = (const char *)&reply + sizeof reply;
+        if (reply.name.attr_length == 0 || name < (const char *)&reply ||
+            name + reply.name.attr_length > end)
+            return false;
+        size_t got = strnlen(name, reply.name.attr_length);
+        if (got != n || strncasecmp(name, p, n) != 0) return false;
+        for (size_t i = 0; i < n; i++)   /* ASCII case only; other bytes must match */
+            if ((unsigned char)name[i] >= 0x80 && name[i] != p[i]) return false;
+        memcpy(out + at + 1, name, n);
+        at += 1 + n;
+        p = slash != NULL ? slash + 1 : p + n;
+    }
+    return true;
+}
+#endif
+
+/* `candidate` is `dir`/`leaf` and names a file that exists. */
+static bool storeResolvedUnder(const char *dir, const char *leaf,
+                               const char *candidate, char *out, size_t outSize) {
+#ifdef __APPLE__
+    static int fast = -1;
+    static int verify = -1;
+    if (fast < 0) {
+        fast = memoEnabled() && envOn("JAITHON_CANONICAL_SUFFIX", true);
+        verify = envOn("JAITHON_RESOLVE_VERIFY", false);
+    }
+    if (fast && isCanonicalDir(dir) && canonicalUnder(dir, leaf, out, outSize)) {
+        if (verify) {
+            char check[JAI_MAX_PATH];
+            if (!jaiPathAbsolute(check, sizeof check, candidate) || strcmp(check, out) != 0) {
+                fprintf(stderr, "jaithon: resolve-verify: %s gave %s, realpath %s\n",
+                        candidate, out, check);
+                return storeResolved(out, outSize, candidate);
+            }
+        }
+        noteCanonicalFile(out);
+        return true;
+    }
+#else
+    (void)dir;
+    (void)leaf;
+#endif
+    return storeResolved(out, outSize, candidate);
+}
+
 static bool lazyModulePath(void);
 static void completePath(void);
 
@@ -459,6 +586,7 @@ bool storeResolved(char *out, size_t outSize, const char *candidate) {
         }
         if (jaiPathAbsolute(out, outSize, candidate)) {
             memoInsert(&sCanonical, candidate, len, hash, out);
+            noteCanonicalFile(out);
             return true;
         }
     } else if (jaiPathAbsolute(out, outSize, candidate)) {
@@ -481,13 +609,15 @@ static bool tryDirectory(const char *dir, const char *relative, char *out,
     int n = snprintf(leaf, sizeof leaf, "%s%s", relative, JAI_MODULE_EXT);
     if (n > 0 && (size_t)n < sizeof leaf) {
         jaiPathJoin(candidate, sizeof candidate, dir, leaf);
-        if (isRegularFile(candidate)) return storeResolved(out, outSize, candidate);
+        if (isRegularFile(candidate))
+            return storeResolvedUnder(dir, leaf, candidate, out, outSize);
     }
 
     n = snprintf(leaf, sizeof leaf, "%s/%s", relative, JAI_PACKAGE_FILE);
     if (n > 0 && (size_t)n < sizeof leaf) {
         jaiPathJoin(candidate, sizeof candidate, dir, leaf);
-        if (isRegularFile(candidate)) return storeResolved(out, outSize, candidate);
+        if (isRegularFile(candidate))
+            return storeResolvedUnder(dir, leaf, candidate, out, outSize);
     }
     return false;
 }
