@@ -917,14 +917,17 @@ static ObjBytes *selfHostedImage(const char *source, size_t length,
     if (IS_BYTES(produced)) {
         image = AS_BYTES(produced);
     } else if (instanceField(produced, "image", &field) && IS_LIST(field)) {
-        Value bag, errors;
+        Value bag, errors, body;
         if (AS_LIST(field)->count == 0 && !wantImage &&
+            instanceField(produced, "body", &body) && !IS_NULL(body) &&
             instanceField(produced, "diagnostics", &bag) &&
             instanceField(bag, "error_count", &errors) && IS_INT(errors) &&
             AS_INT(errors) == 0) {
             /* Asked for no image and no error was found: a clean check. Its
              * warnings stay unreported, exactly as they were when the image
-             * was built and loaded instead. */
+             * was built and loaded instead. A null `body` means the pipeline
+             * stopped before emitting, and with no error to say why that is
+             * the front-end bug the branch below reports, not a clean file. */
             if (clean != NULL) *clean = true;
         } else if (AS_LIST(field)->count == 0) {
             /* The front end's own diagnostics say why, in the bag the driver
