@@ -99,6 +99,14 @@ EXTRA_LDFLAGS ?=
 LIBS     += -lz
 
 ifeq ($(UNAME_S),Darwin)
+  # The driver's default SDK is the Command Line Tools one, which can be newer
+  # than the selected Xcode's linker understands: CLT's SDK 27 lists an
+  # `arm64e.x1` arch that clang 17's tapi rejects as a malformed .tbd, and every
+  # link fails. xcrun asks the selected toolchain for its own SDK instead.
+  # Exported so the C++ and Objective-C peers the bench scripts build agree.
+  ifeq ($(strip $(SDKROOT)),)
+    export SDKROOT := $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
+  endif
   LIBS   += -framework Cocoa -framework Metal -framework QuartzCore \
             -framework MetalKit -framework Foundation \
             -framework MetalPerformanceShaders \
