@@ -175,7 +175,7 @@ on unless set to `0`, so the two can be compared in one binary:
 |---|---|
 | `JAICV_NATIVE_BORDERS` | `find_contours`' raster scan and border walk (`grid_borders`) |
 | `JAICV_NATIVE_POINTS` | making `find_contours`' `Point`s (`grid_border_points`) |
-| `JAICV_NATIVE_STROKES` | `draw_contours` outlines, thick and one pixel wide |
+| `JAICV_NATIVE_STROKES` | `draw_contours` outlines, thick and one pixel wide (off, a hairline goes through `polylines`, so `JAICV_NATIVE_LINES=0` too to take it off the primitive) |
 | `JAICV_NATIVE_LINES` | `polylines`, hard-edged and anti-aliased |
 | `JAICV_NATIVE_FILL` | `fill_poly`, and so `draw_contours` with `FILLED` |
 | `JAICV_NATIVE_HULL` | `convex_hull` (`JAICV_HULL_COLUMNS=0` sorts instead of bucketing) |
