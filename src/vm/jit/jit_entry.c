@@ -586,7 +586,7 @@ int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
     Value *base = vm.stackTop;
     if (base > p->limit) return from;
     base[0] = p->callee;
-    base[1] = NULL_VAL;
+    base[1] = INT_VAL(0);
     vm.stackTop = base + 2;
 
     int i = from;
@@ -608,7 +608,9 @@ int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
         } else {
             break;
         }
-        base[1] = INT_VAL(a0);
+        /* The cell's tag was written INT once, above the loop; only the
+         * payload changes. */
+        base[1].as.integer = a0;
         int frameBase = vm.frameCount;
         JitResult r = ((Fn1)(uintptr_t)entry)(a0);
         Value mapped;
@@ -647,7 +649,19 @@ int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
             if (vm.hasException) *ok = false;
             return i + 1;
         }
-        if (JAI_LIKELY(dst->count < dst->capacity)) {
+        /* An int into the result, at whichever width it has, without
+         * jaiListPut's four-way switch: boxed is what jaiListNew made, and
+         * I64 is the only other storage an int can go into as it is. */
+        int at = dst->count;
+        if (JAI_LIKELY(at < dst->capacity &&
+                       dst->stg == (uint8_t)LIST_STORE_BOXED)) {
+            ((Value *)dst->items)[at] = mapped;
+            dst->count = at + 1;
+        } else if (at < dst->capacity &&
+                   dst->stg == (uint8_t)LIST_STORE_I64) {
+            ((int64_t *)dst->items)[at] = r.value;
+            dst->count = at + 1;
+        } else if (at < dst->capacity) {
             jaiListPut(dst, dst->count++, mapped);
         } else {
             jaiListPush(dst, mapped);
