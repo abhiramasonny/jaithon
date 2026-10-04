@@ -531,6 +531,35 @@ void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
     emit(e, always ? jaiA64B(0) : jaiA64BCond(cond, 0));
 }
 
+/* The record branchOnDeopt takes, without the branch: the index of a deopt
+ * record describing the model as it stands, for a branch to it emitted
+ * somewhere else -- an out-of-line arm that runs in this same machine state
+ * (see emitBoundsNormalise). -1, with nothing recorded, where branchOnDeopt
+ * would have failed the compile; the caller then takes the inline form, which
+ * fails it the same way. */
+/* For a branch to a deopt record emitted outside this file. */
+bool jitDeoptStressOn(void) {
+    return jitDeoptStress();
+}
+
+int deoptRecordNow(Emit *e) {
+    if (e->fpBorrow != 0 || anyDeferred(e)) return -1;
+    if (e->deoptCount >= JIT_MAX_DEOPT) return -1;
+    unsigned k = e->deoptCount;
+    if (!deoptSite(e, e->curOffset, &e->deopt[k].ip, &e->deopt[k].depth,
+                   &e->deopt[k].valueDepth)) {
+        return -1;
+    }
+    e->deoptCount++;
+    e->deopt[k].lastFromDesc = false;
+    e->deopt[k].fpLive     = e->fpLive;
+    for (unsigned i = 0; i < e->deopt[k].depth; i++) {
+        e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].classes[i] = e->stackClass[i];
+    }
+    return (int)k;
+}
+
 void branchOnDeopt(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
     if (e->fpBorrow != 0) {          /* see deoptRecordAt */

@@ -628,6 +628,34 @@ void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
     emit(e, jaiA64MovX(rOut, rIdx));
     emit(e, countW ? jaiA64SubsXUxtw(31, rOut, rCount)
                    : jaiA64SubsXReg(31, rOut, rCount));
+    /* In range is the common case, and below it was a TAKEN branch -- the
+     * `b.lo` over the negative-index arm -- on every list access the loop
+     * head had not proved. Out of line instead (jitBoundsColdOn): in range
+     * falls through, and only a negative or out-of-range index leaves for the
+     * arm, which adds the count, checks again, and comes back or deoptimises
+     * from the record taken here. */
+    if (jitBoundsColdOn() && e->coldCount < JIT_MAX_COLD &&
+        e->fixupCount < JIT_MAX_FIXUPS) {
+        int k = deoptRecordNow(e);
+        if (k >= 0) {
+            unsigned ci = e->coldCount++;
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_COLD - ci;
+            e->fixups[e->fixupCount].conditional  = true;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, jaiA64BCond(JAI_A64_HS, 0));
+            e->cold[ci].stub     = -1;
+            e->cold[ci].returnTo = (int)e->count;
+            e->cold[ci].insn     = 0;
+            e->cold[ci].kind     = 1;
+            e->cold[ci].rOut     = (uint8_t)rOut;
+            e->cold[ci].rCount   = (uint8_t)rCount;
+            e->cold[ci].countW   = countW;
+            e->cold[ci].deoptK   = k;
+            return;
+        }
+    }
     /* Skip length used to be hand-counted (four instructions) -- branchOnDeopt may itself emit an FP-
      * borrow release, and one extra instruction inside the span turned the skip into a jump onto the bail branch (same matrix_mul `sum`-from-nothing bug as deoptRecordAt). Measured with `e->count`, so it can't rot. */
     unsigned skip = e->count;

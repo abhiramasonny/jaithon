@@ -160,7 +160,7 @@ _Static_assert(SLOT_DYNAMIC == SLOT_MAYBE_OBJ + 1 && SLOT_DYNAMIC == 16,
 #define FIXUP_EXIT     (FIXUP_DEOPT - JIT_MAX_DEOPT)         /* minus an exit index */
 #define FIXUP_SELFSLOW (FIXUP_EXIT - JIT_MAX_EXIT)           /* minus a self-call index */
 #define FIXUP_GROW     (FIXUP_SELFSLOW - JIT_MAX_SELF_SLOW)  /* minus a growth index */
-#define JIT_MAX_COLD      16u
+#define JIT_MAX_COLD      48u
 #define FIXUP_COLD     (FIXUP_GROW - JIT_MAX_GROW)           /* minus a cold index */
 
 /* Every sentinel range must stay above any offset a real chunk can have. A
@@ -666,6 +666,13 @@ typedef struct {
         int      stub;
         int      returnTo;
         uint32_t insn;
+        /* 0: `insn` and back. 1: a bounds check's negative-index arm (see
+         * emitBoundsNormalise): add the count, re-check, deopt to record
+         * `deoptK` or come back. */
+        uint8_t  kind;
+        uint8_t  rOut, rCount;
+        bool     countW;
+        int      deoptK;
     } cold[JIT_MAX_COLD];
     unsigned  coldCount;
     uint32_t  curOffset;
@@ -1131,6 +1138,9 @@ void emitFloorFixup(Emit *e, unsigned rrem, unsigned rd,
                            bool signKnown, int64_t divisor, uint32_t fixup);
 bool powerOfTwoShift(int64_t k, unsigned *shift);
 bool emitColdFixup(Emit *e, unsigned rrem, uint32_t insn);
+int deoptRecordNow(Emit *e);
+bool jitDeoptStressOn(void);
+bool jitBoundsColdOn(void);
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg);
 bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,

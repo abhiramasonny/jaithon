@@ -108,6 +108,18 @@ static bool floorColdOn(void) {
  * table is full; the caller then emits the inline form. `insn` must touch only
  * registers, and nothing it reads may change between here and the stub --
  * which is immediate, since the stub is the branch's only successor. */
+/* JAITHON_JIT_BOUNDS_COLD=0 keeps a bounds check's negative-index arm inline,
+ * behind a `b.lo` taken by every in-range index. On by default; see
+ * emitBoundsNormalise. */
+bool jitBoundsColdOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_BOUNDS_COLD");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 bool emitColdFixup(Emit *e, unsigned rrem, uint32_t insn) {
     if (!floorColdOn()) return false;
     if (e->coldCount >= JIT_MAX_COLD) return false;
@@ -123,6 +135,7 @@ bool emitColdFixup(Emit *e, unsigned rrem, uint32_t insn) {
     e->cold[ci].stub     = -1;
     e->cold[ci].returnTo = (int)e->count;
     e->cold[ci].insn     = insn;
+    e->cold[ci].kind     = 0;
     return true;
 }
 

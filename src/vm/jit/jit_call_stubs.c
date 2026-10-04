@@ -224,7 +224,24 @@ void emitGrowStubs(Emit *e) {
      * to the instruction after its branch. */
     for (unsigned ci = 0; ci < e->coldCount; ci++) {
         e->cold[ci].stub = (int)e->count;
-        emit(e, e->cold[ci].insn);
+        if (e->cold[ci].kind == 1) {
+            unsigned ro = e->cold[ci].rOut, rc = e->cold[ci].rCount;
+            bool w = e->cold[ci].countW;
+            emit(e, w ? jaiA64AddXUxtw(ro, ro, rc) : jaiA64AddX(ro, ro, rc));
+            emit(e, w ? jaiA64SubsXUxtw(31, ro, rc)
+                      : jaiA64SubsXReg(31, ro, rc));
+            if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
+            bool always = jitDeoptStressOn();
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset =
+                FIXUP_DEOPT - (unsigned)e->cold[ci].deoptK;
+            e->fixups[e->fixupCount].conditional  = !always;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, always ? jaiA64B(0) : jaiA64BCond(JAI_A64_HS, 0));
+        } else {
+            emit(e, e->cold[ci].insn);
+        }
         emit(e, jaiA64B((int32_t)(e->cold[ci].returnTo - (int)e->count)));
     }
 }
