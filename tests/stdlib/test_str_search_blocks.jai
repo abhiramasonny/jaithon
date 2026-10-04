@@ -55,6 +55,17 @@ pub fn test_every_offset_across_two_blocks() -> void {
     }
 }
 
+pub fn test_one_byte_needles() -> void {
+    # `count` of one byte is a tally of its own, not the search loop.
+    for pad in 0..40 {
+        let hay = ",x" * pad + ",,"
+        check(hay, ",")
+        check(hay, "x")
+        check(hay, "q")
+        assert_eq(hay.count(",", pad), ref_count(hay[pad:], ","), f"count from {pad}")
+    }
+}
+
 pub fn test_a_first_byte_that_is_everywhere() -> void {
     let hay = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab" * 5
     check(hay, "aab")

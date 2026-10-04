@@ -69,6 +69,19 @@ bool strCount(int argc, Value *args, Value *out) {
         return true;
     }
 
+    /* One byte: every match counts and none can overlap another, so this is
+     * a plain tally -- written over locals so it vectorises. `text.count(" ")`
+     * otherwise made one memchr call per space. */
+    if (sub->length == 1) {
+        const unsigned char c = (unsigned char)sub->chars[0];
+        const unsigned char *const p = (const unsigned char *)s->chars + from;
+        const size_t n = to - from;
+        int64_t tally = 0;
+        for (size_t i = 0; i < n; i++) tally += p[i] == c;
+        *out = INT_VAL(tally);
+        return true;
+    }
+
     int64_t found = 0;
     size_t pos = from;
     while (pos <= to) {
