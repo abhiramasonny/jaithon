@@ -215,6 +215,10 @@ typedef struct {
     /* See emitUnarmedDeopt: the opcode and offset the walk stopped at, so the
      * fixup pass can name the cause and not just the symptom. */
     uint8_t   unarmedOp;
+    /* The FIRST unarmed stop of the walk (unarmedAt is the last), and
+     * whether there was one. See earlyUnarmedDecline. */
+    uint32_t  firstUnarmedAt;
+    bool      haveFirstUnarmed;
     uint32_t  unarmedAt;
     /* Offsets this walk branched to across an OP_POP it never emitted; see
      * matchMissResume. Nothing in the BYTECODE branches there, so every test in

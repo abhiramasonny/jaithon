@@ -410,6 +410,66 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
 
 bool gJitColdDecline;
 
+/* JAITHON_JIT_EARLY_UNARMED=0 installs a body whose walk stopped on the
+ * straight-line path from its entry, as the tier always did. */
+static bool jitEarlyUnarmed(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_EARLY_UNARMED");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* A body whose walk stopped -- emitUnarmedDeopt -- before its first branch
+ * deoptimises on EVERY call: there is no path through it that avoids the
+ * stop. Compiled, each call enters the body, runs a few instructions, writes
+ * a deopt record and has the interpreter rebuild the frame and run the rest;
+ * not compiled, the interpreter just runs it. With a short prefix the second
+ * is far cheaper. `check --no-cache parser.jai` was making about 110,000 such
+ * deopts, ten thousand apiece in the expression-precedence chain:
+ * `_peek_compare_op` stopped at `_compare_op` 13 bytes in and never recompiled
+ * because that callee never compiled either.
+ *
+ * Declined as a COLD decline when the stop is a call to a function with no
+ * compiled form yet, so the attempt budget is not spent waiting for it; any
+ * other stop declines as usual. Only straight-line prefixes of fewer than
+ * EARLY_UNARMED_MAX instructions are refused -- past that, the compiled prefix
+ * is worth the deopt. */
+enum { EARLY_UNARMED_MAX = 24 };
+
+static bool earlyUnarmedDecline(Emit *e, ObjFunction *fn, ObjClosure *closure) {
+    if (!jitEarlyUnarmed() || !e->haveFirstUnarmed) return false;
+    const Chunk *c = &fn->chunk;
+    uint32_t stopAt = e->firstUnarmedAt;
+    unsigned n = 0;
+    for (int at = 0; at < (int)stopAt;) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return false;
+        if (jaiOpBranchOperandAt(c->code[at]) >= 0) return false;
+        if (at > 0 && offsetIsBranchTarget(c, (uint32_t)at)) return false;
+        if (++n >= EARLY_UNARMED_MAX) return false;
+        at += len;
+    }
+    if (stopAt > 0 && offsetIsBranchTarget(c, stopAt)) return false;
+    if (fn->exceptionCount != 0) return false;   /* a `try` anywhere: leave it be */
+    bool cold = false;
+    if (c->code[stopAt] == OP_GET_GLOBAL &&
+        (size_t)stopAt + 4 <= (size_t)c->count) {
+        Value gv;
+        ObjFunction *gfn =
+            globalFunction(closure, jaiReadU24(c->code + stopAt + 1), &gv);
+        cold = gfn != NULL && gfn != fn && gfn->jitFunc == NULL;
+    }
+    gJitColdDecline = cold;
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] %s stopped: the walk stops at %u, %u "
+                "instructions in and before any branch -- every call would "
+                "deopt there\n", jitFnLabel(fn), stopAt, n);
+    }
+    return true;
+}
+
 static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *dynamic, bool *needDynamic,
                             const bool *nullable, bool *needNullable,
@@ -721,6 +781,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     }
     if (e.failed || e.whyNot != NULL) {
         gJitColdDecline = e.coldCallee && !e.failed;
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+        return false;
+    }
+    if (earlyUnarmedDecline(&e, fn, closure)) {
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }

@@ -333,6 +333,10 @@ bool emitUnarmedDeopt(Emit *e, const Chunk *c, int *off, int stop) {
      * without it the reader has a bytecode offset and no idea why. */
     e->unarmedOp = e->lastOp;
     e->unarmedAt = e->curOffset;
+    if (!e->haveFirstUnarmed && !e->inlining) {
+        e->haveFirstUnarmed = true;
+        e->firstUnarmedAt = e->curOffset;
+    }
     if (e->inlining) {
         /* Half an inlined body cannot be taken back, and the caller reads the
          * result out of the model -- past a deopt there is none. */
