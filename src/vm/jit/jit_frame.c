@@ -734,6 +734,17 @@ bool jitStrCmpEqOn(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_ONE_BYTE_LOCAL_K=0 sends `local < "x"` (a one-byte literal)
+ * back to the jaiStringOrder leaf call. Default on. */
+bool jitOneByteLocalK(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_ONE_BYTE_LOCAL_K");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 /* JAITHON_JIT_CONST_ASCII=0 stops a one-character ASCII literal being marked
  * as the ASCII table's own singleton (see OP_CONST), so every comparison
  * against one goes back to guarding the literal at run time. Default on. */

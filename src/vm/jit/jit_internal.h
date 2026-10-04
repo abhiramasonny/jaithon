@@ -976,6 +976,7 @@ void emitOneByteString(Emit *e, unsigned at, unsigned reg, unsigned dst);
 bool jitStrCmpOn(void);
 bool jitStrCmpEqOn(void);
 bool jitConstAscii(void);
+bool jitOneByteLocalK(void);
 bool preferLeafEquality(const Emit *e, unsigned da, unsigned db);
 void emitStringOrder(Emit *e);
 void emitListBoxedGuard(Emit *e, unsigned rList, unsigned scratch);
