@@ -503,6 +503,22 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                     e.hoistPool[e.hoistPoolCount++] =
                         (uint8_t)(JIT_INL_BANK + r);
                 }
+            } else if (e.splitAt != 0 && jitSplitHoistsOn() &&
+                       probe.maxValue >= e.splitAt) {
+                /* A split bank holds entries `splitAt` and up in x0.., so the
+                 * top of the scratch bank is as free as it is under
+                 * scratchValues -- nothing is inlined (a split is never chosen
+                 * for a body that inlines), and a hoist only ever lives in a
+                 * loop with no call to clobber it. valueBankRoom honours the
+                 * scratchRoom the hoists lower, for the reason it does in the
+                 * scratchValues case. A stencil's outer loop calls (it builds
+                 * a row), which is exactly what makes it split -- and it is
+                 * where three rows want hoisting and x13..x17 holds two. */
+                for (unsigned r = probe.maxValue - e.splitAt;
+                     r < JIT_SCRATCH_BANK_COUNT; r++) {
+                    e.hoistPool[e.hoistPoolCount++] =
+                        (uint8_t)(JIT_INL_BANK + r);
+                }
             }
         } else {
             memcpy(needNullable, probe.needNullable, sizeof probe.needNullable);

@@ -863,6 +863,7 @@ void emitReturnLeave(Emit *e, SlotKind k);
 bool jitSplitStress(void);
 bool jitGrowKeeps(void);
 bool jitHoistPinOn(void);
+bool jitSplitHoistsOn(void);
 void notePushTarget(Emit *e, int slot);
 void noteStorageStamp(Emit *e);
 bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi);

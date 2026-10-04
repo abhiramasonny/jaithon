@@ -681,10 +681,24 @@ unsigned valueBankRoom(const Emit *e) {
      * the answer is that smaller number, so the push declines rather than
      * running off the end of the bank. */
     if (e->splitAt != 0) {
-        return saved < e->splitAt ? saved
-                                  : e->splitAt + JIT_SCRATCH_BANK_COUNT;
+        /* Less, in the loop tier, by whatever the hoists took off the top of
+         * the scratch bank (see jitSplitHoistsOn). */
+        unsigned room = JIT_SCRATCH_BANK_COUNT;
+        if (e->osr && e->scratchRoom < room) room = e->scratchRoom;
+        return saved < e->splitAt ? saved : e->splitAt + room;
     }
     return saved;
+}
+
+/* JAITHON_JIT_SPLIT_HOISTS=0 keeps a split body's hoists to x13..x17. On by
+ * default; see the pool in compileOsr. */
+bool jitSplitHoistsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_SPLIT_HOISTS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
 }
 
 /* JAITHON_JIT_GROW_KEEPS=0 puts the list-grow stub back to an ordinary call
