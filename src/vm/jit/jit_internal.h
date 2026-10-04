@@ -558,6 +558,10 @@ typedef struct {
          * proves the pointers differ before the loop runs. */
         uint8_t  aliasCount;
         uint8_t  aliasSlot[JIT_MAX_HOIST_ALIAS];
+        /* The storage this hoist proves at the head, so every access inside
+         * the loop is emitted at it with no test (see jitHoistPinOn). */
+        bool     stgPin;
+        uint8_t  stg;
     } hoist[JIT_MAX_HOIST];
     unsigned  hoistCount;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
@@ -858,6 +862,7 @@ void emitEpilogueKeepX1(Emit *e);
 void emitReturnLeave(Emit *e, SlotKind k);
 bool jitSplitStress(void);
 bool jitGrowKeeps(void);
+bool jitHoistPinOn(void);
 void notePushTarget(Emit *e, int slot);
 void noteStorageStamp(Emit *e);
 bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi);

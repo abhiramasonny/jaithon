@@ -709,6 +709,27 @@ bool jitGrowKeeps(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_HOIST_PIN=0 leaves a hoisted header's element accesses
+ * dispatching on the list's storage. On by default.
+ *
+ * A storage pin is proved once, at OSR entry, and only for a slot the whole
+ * region never writes. The rows of a stencil are written by the OUTER loop
+ * (`let up = board[r - 1]`), so they were never pinned, and every one of a
+ * cell's eight reads paid a load, a compare and a branch to learn a storage
+ * that cannot change for the length of the inner loop: nothing in it writes
+ * the slot, calls out, or stamps a storage (planHoists and regionStamps say
+ * so). The hoist already runs once per entry to that loop, so it proves the
+ * storage there -- the one the slot held when the form was compiled -- and
+ * deoptimises to the loop head if a later entry brings another. */
+bool jitHoistPinOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_PIN");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 /* An append to the list held in local `slot` (or JIT_PUSH_UNKNOWN /
  * JIT_PUSH_FRESH) is about to be emitted. See Emit::pushOff. */
 void notePushTarget(Emit *e, int slot) {

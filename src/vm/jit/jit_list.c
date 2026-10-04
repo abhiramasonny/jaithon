@@ -104,6 +104,17 @@ ListAccess listAccessFor(Emit *e, unsigned rList, int slot,
         a.dynamic = false;
         return a;
     }
+    /* PINNED AT THE HOIST. Not proved at entry, but at the head of the loop
+     * this access sits in, by emitHoistsAt -- see jitHoistPinOn. */
+    {
+        int h = hoistFor(e, slot);
+        if (h >= 0 && e->hoist[h].stgPin) {
+            a.stg = e->hoist[h].stg;
+            a.alt = a.stg;
+            a.dynamic = false;
+            return a;
+        }
+    }
     a.alt = listAltFor(vk);
     a.stg = (uint8_t)LIST_STORE_BOXED;
     a.dynamic = a.alt != LIST_STORE_BOXED;
@@ -436,6 +447,22 @@ void planHoists(Emit *e, ObjFunction *fn) {
         e->hoist[e->hoistCount].aliasCount = cand[pick].aliasCount;
         memcpy(e->hoist[e->hoistCount].aliasSlot, cand[pick].alias,
                sizeof cand[pick].alias);
+        /* Only where there is a live list to read the storage off -- a slot
+         * holding anything else predicts BOXED, which every entry would then
+         * refute -- and only over a loop nothing in which can change a
+         * storage: no call (planHoists required that already), and no
+         * OP_ELEM_KIND stamping an empty list. */
+        e->hoist[e->hoistCount].stgPin = false;
+        e->hoist[e->hoistCount].stg = (uint8_t)LIST_STORE_BOXED;
+        {
+            unsigned hs = cand[pick].slot;
+            if (jitHoistPinOn() && !e->localStgPin[hs] &&
+                e->observed != NULL && IS_LIST(e->observed[hs]) &&
+                !regionStamps(e, cand[pick].top, cand[pick].end)) {
+                e->hoist[e->hoistCount].stgPin = true;
+                e->hoist[e->hoistCount].stg = AS_LIST(e->observed[hs])->stg;
+            }
+        }
         uint32_t ht = cand[pick].top;
         if (ht + 9u <= (uint32_t)c->count && c->code[ht] == OP_FOR_RANGE_BIND) {
             e->hoist[e->hoistCount].rangeOk = true;
@@ -518,6 +545,12 @@ void emitHoistsAt(Emit *e, uint32_t off) {
                                      JIT_SCRATCH_B);
             emit(e, jaiA64SubsXReg(31, e->slotXReg[e->hoist[i].slot], other));
             branchOnDeoptAt(e, JAI_A64_EQ, off, false);
+        }
+        if (e->hoist[i].stgPin) {
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_A, e->slotXReg[e->hoist[i].slot],
+                                  (unsigned)offsetof(ObjList, stg)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, e->hoist[i].stg));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
         }
         emitListHeader(e, e->slotXReg[e->hoist[i].slot],
                        e->hoist[i].itemsReg, e->hoist[i].countReg);
