@@ -328,7 +328,14 @@ void planSlotRegisters(Emit *e, const Emit *m, unsigned availX,
  * Every exit from here re-seals. */
 uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
                           unsigned count) {
-    while ((arena->used & 31u) != 0) {
+    static unsigned alignMask;
+    if (alignMask == 0) {
+        const char *v = getenv("JAITHON_JIT_ALIGN");
+        unsigned a = v != NULL ? (unsigned)atoi(v) : 32u;
+        if (a < 32u || (a & (a - 1u)) != 0 || a > 4096u) a = 32u;
+        alignMask = a - 1u;
+    }
+    while ((arena->used & alignMask) != 0) {
         uint32_t pad = jaiA64Nop();
         if (jaiCodeArenaWrite(arena, &pad, sizeof pad) == NULL) {
             jaiCodeArenaSeal(arena);
@@ -449,6 +456,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     e.chunkDepthCount = fn->chunk.count + 1;
     e.limitLiteral = -1;
     e.bailBlock    = -1;
+    e.litPool      = jitLitPoolOn();
 
     /* The prologue can't be emitted first: its save set depends on how deep the operand stack gets,
      * which only the body knows. So the body goes into the buffer at a fixed offset and the prologue is written in front of it afterwards, with every instruction index shifted by the same amount. */
@@ -465,6 +473,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     body.usesUpvalues = fn->upvalueCount > 0;
     body.callsOut     = true;      /* the measuring pass may emit one */
     body.measuring    = true;
+    body.litPool      = jitLitPoolOn();
     body.descOffset   = 16u;
     body.offsetToInst = map;
     body.offsetToDepth = depths;
@@ -1105,6 +1114,16 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         } else {
             e.code[f->instIndex] = jaiA64B(rel);
         }
+    }
+    /* After every branch is patched and before anything reads the words --
+     * the dump below included, so what it shows is what runs. */
+    if (!emitLiteralPool(&e)) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s stopped: no room for its constants\n",
+                    jitFnLabel(fn));
+        }
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+        return false;
     }
     /* JAI_JIT_DUMP=<function> writes that function's words to jit_<function>.bin and prints the
      * bytecode-offset-to-instruction map, so the code can be read back with `llvm-mc --disassemble --triple=aarch64` on the file's bytes. Reading the code is how the register plan gets checked at all -- three of this tier's bugs were found no other way. */

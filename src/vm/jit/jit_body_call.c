@@ -199,7 +199,7 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
              * it is known too, and that is the whole licence to inline. */
             emit(e, jaiA64LdrX(JIT_SCRATCH_A, rCallee0,
                                (unsigned)offsetof(ObjClosure, fn)));
-            emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
+            emitConstCmp(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
             emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
             branchOnDeopt(e, JAI_A64_NE);
 

@@ -632,7 +632,7 @@ bool emitClassCall(Emit *e, ObjClass *klass, JaiEntry *slot,
     branchOnDeopt(e, JAI_A64_NE);
     emit(e, jaiA64LdrX(JIT_SCRATCH_C, JIT_SCRATCH_D,
                        (unsigned)offsetof(JaiEntry, value) + 8u));
-    emitConst64(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(calleeVal));
+    emitConstCmp(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)AS_OBJ(calleeVal));
     emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
     branchOnDeopt(e, JAI_A64_NE);
 

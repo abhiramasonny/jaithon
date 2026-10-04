@@ -30,6 +30,10 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 #define JIT_MAX_ARITY    8u   /* arguments arrive in x0..x7 */
 /* Deopt stubs dominate this size: each writes out every local and live stack entry. `merge` silently needed 512 -- hence the diagnostics. */
 #define JIT_MAX_INSTS 20000u
+/* Distinct pooled constants, and loads of them, one body may carry. Past
+ * either a constant is simply materialised in registers instead. */
+#define JIT_MAX_LITS     64u
+#define JIT_MAX_LIT_USES 256u
 #define JIT_MAX_FIXUPS 6000u
 /* How many links of a refusal chain JAI_JIT_CHAIN will walk out. Each costs one
  * extra compile of the body, and a chain longer than this is not a backlog item
@@ -620,6 +624,17 @@ typedef struct {
     int       limitLiteral;
     int       bailBlock;
 
+    /* 64-bit constants loaded from a pool after the code (emitConst64), and
+     * every `ldr` that names one. Only a tier that lays the pool out
+     * (emitLiteralPool) sets `litPool`; without it every constant is
+     * materialised with movz/movk as before. */
+    bool      litPool;
+    unsigned  litCount;
+    uint64_t  litVal[JIT_MAX_LITS];
+    unsigned  litUseCount;
+    int       litUseInst[JIT_MAX_LIT_USES];
+    uint8_t   litUseIdx[JIT_MAX_LIT_USES];
+
     SlotKind  returnKind;
     uint32_t  returnShape;
     bool      sawReturn;
@@ -810,6 +825,11 @@ uint8_t localStgOf(const Emit *e, unsigned slot);
 unsigned valueBankReg(const Emit *e, unsigned idx);
 unsigned fpRegAt(const Emit *e, unsigned idx);
 void emitConst64(Emit *e, unsigned rd, int64_t value);
+bool jitLitPoolOn(void);
+void emitConstCmp(Emit *e, unsigned rd, int64_t value);
+/* Lays out the constants emitConst64 pooled, after everything else, and
+ * points each load at its constant. False if the code buffer filled. */
+bool emitLiteralPool(Emit *e);
 void emitSaveRestore(Emit *e, bool save);
 void emitFrameEnter(Emit *e);
 void emitFpSaveRestore(Emit *e, bool save);

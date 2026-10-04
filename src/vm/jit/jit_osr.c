@@ -541,6 +541,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     static Emit e;
     memset(&e, 0, sizeof e);
     e.osr = true;
+    e.litPool = jitLitPoolOn();
     e.loopDepth = gLoopDepth;
     e.loopDepthCount = loopDepthTable(&fn->chunk);
     e.hasIter = hasIter;
@@ -613,6 +614,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     {
         static Emit probe;
         memset(&probe, 0, sizeof probe);
+        probe.litPool = jitLitPoolOn();
         probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
         probe.iterKind = iterKind; probe.elemSample = elemSample;
         probe.elemMixed = elemMixed;
@@ -1044,6 +1046,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     }
     jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
 
+    if (!emitLiteralPool(&e)) return false;
     if (!jaiCodeArenaUnseal(arena)) return false;
     /* Same 32-alignment as the function tier above, for the same two reasons. */
     uint8_t *entry = arenaEmit(arena, e.code, e.count);

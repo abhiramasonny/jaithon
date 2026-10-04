@@ -19,6 +19,76 @@
 /* Constants                                                            */
 /* ------------------------------------------------------------------ */
 
+/* JAITHON_JIT_LIT_POOL=0 materialises every constant with movz/movk. */
+bool jitLitPoolOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_LIT_POOL");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* A constant that takes three or four movz/movk, loaded from a pool after the
+ * body instead: one `ldr` in place of three or four instructions. What that
+ * saves is front-end bandwidth, and a tight compiled loop on this core is
+ * decode-bound -- closure_calls's inlined call runs at 7.4 instructions a
+ * cycle against a width of eight, so each word is roughly an eighth of a
+ * cycle. See emitConstCmp for which constants it is used for. */
+static bool poolConst64(Emit *e, unsigned rd, uint64_t bits) {
+    if (!e->litPool || e->litUseCount >= JIT_MAX_LIT_USES) return false;
+    unsigned idx = e->litCount;
+    for (unsigned i = 0; i < e->litCount; i++) {
+        if (e->litVal[i] == bits) { idx = i; break; }
+    }
+    if (idx == e->litCount) {
+        if (e->litCount >= JIT_MAX_LITS) return false;
+        e->litVal[e->litCount++] = bits;
+    }
+    e->litUseInst[e->litUseCount] = (int)e->count;
+    e->litUseIdx[e->litUseCount]  = (uint8_t)idx;
+    e->litUseCount++;
+    emit(e, jaiA64LdrLit(rd, 0));   /* pointed at its constant by emitLiteralPool */
+    return true;
+}
+
+/* A constant a guard compares against -- a closure's function, a callee, an
+ * enum type, a heap object an `is` names. Only these are pooled: a compare
+ * feeds nothing but a predicted branch, so the load's latency is hidden,
+ * where an address that feeds a load or a call would wait on it. Measured
+ * under JAITHON_JIT_ALIGN=64 (so no body moves for the change to be blamed
+ * on): pooling EVERY three-word constant was +6.5% on closure_calls and -7%
+ * on object_dispatch, whose hot constants are a class handed to the
+ * allocator and the helper it calls. */
+void emitConstCmp(Emit *e, unsigned rd, int64_t value) {
+    uint64_t bits = (uint64_t)value;
+    unsigned words = 0;
+    for (unsigned shift = 0; shift < 4; shift++) {
+        if (((bits >> (16 * shift)) & 0xffffu) != 0) words++;
+    }
+    if (words >= 3 && rd != 31 && poolConst64(e, rd, bits)) return;
+    emitConst64(e, rd, value);
+}
+
+bool emitLiteralPool(Emit *e) {
+    if (e->litUseCount == 0) return !e->failed;
+    if ((e->count & 1u) != 0) emit(e, jaiA64Nop());   /* 8-aligned words */
+    int at[JIT_MAX_LITS];
+    for (unsigned i = 0; i < e->litCount; i++) {
+        at[i] = (int)e->count;
+        emit(e, (uint32_t)e->litVal[i]);
+        emit(e, (uint32_t)(e->litVal[i] >> 32));
+    }
+    if (e->failed || e->count > JIT_MAX_INSTS) return false;
+    for (unsigned u = 0; u < e->litUseCount; u++) {
+        int inst = e->litUseInst[u];
+        if (inst < 0 || (unsigned)inst >= e->count) return false;
+        unsigned rt = e->code[inst] & 0x1fu;
+        e->code[inst] = jaiA64LdrLit(rt, at[e->litUseIdx[u]] - inst);
+    }
+    return true;
+}
+
 void emitConst64(Emit *e, unsigned rd, int64_t value) {
     if (value >= 0 && value <= 0xffff) {
         emit(e, jaiA64MovzX(rd, (unsigned)value, 0));
@@ -33,6 +103,7 @@ void emitConst64(Emit *e, unsigned rd, int64_t value) {
     uint64_t bits = (uint64_t)value;
     unsigned first = 0;
     while (first < 3 && ((bits >> (16 * first)) & 0xffffu) == 0) first++;
+
     emit(e, jaiA64MovzX(rd, (unsigned)((bits >> (16 * first)) & 0xffffu), first));
     for (unsigned shift = first + 1; shift < 4; shift++) {
         unsigned part = (unsigned)((bits >> (16 * shift)) & 0xffffu);
