@@ -66,6 +66,15 @@ static bool simpleInitFields(ObjClass *cls, unsigned argc, uint16_t *slots) {
     return off < n && c[off] == OP_RETURN_NULL;
 }
 
+static bool jitBareAllocOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_BARE_ALLOC");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 bool isClassCallee(const Emit *e, unsigned argc) {
     return e->depth >= argc + 1u &&
            e->stack[e->depth - argc - 1] == SLOT_CLASS;
@@ -529,10 +538,26 @@ bool emitCallOut(Emit *e, unsigned argc) {
             sizeof(ObjInstance) + sizeof(Value) * (size_t)cls->fieldCount;
         unsigned skipSlow = 0;
         bool haveFast = jaiSmallServes(instBytes);
+        /* Whole-Value field stores, and -- when the arguments cover every
+         * field -- an allocation that does not zero what they are about to
+         * overwrite. JAITHON_JIT_BARE_ALLOC=0 puts both back. */
+        const bool whole = jitBareAllocOn();
+        bool bare = whole && argc == cls->fieldCount && argc <= 64u;
+        if (bare) {
+            uint64_t seen = 0;
+            for (unsigned i = 0; i < argc; i++) {
+                if (fslots[i] >= 64u || (seen & ((uint64_t)1 << fslots[i]))) {
+                    bare = false;
+                    break;
+                }
+                seen |= (uint64_t)1 << fslots[i];
+            }
+        }
         if (haveFast) {
             emitConst64(e, 0, (int64_t)(uintptr_t)cls);
             emitConst64(e, JIT_SCRATCH_A,
-                        (int64_t)(uintptr_t)&jitInstanceAlloc);
+                        bare ? (int64_t)(uintptr_t)&jitInstanceAllocBare
+                             : (int64_t)(uintptr_t)&jitInstanceAlloc);
             noteScratchClobber(e);
             emit(e, jaiA64Blr(JIT_SCRATCH_A));
             emit(e, jaiA64MovX(JIT_SCRATCH_C, 0));
@@ -570,8 +595,14 @@ bool emitCallOut(Emit *e, unsigned argc) {
             /* SCRATCH_C holds the instance, so the dynamic tag needs two
              * other scratches. */
             emitTagFor(e, kinds[i], regs[i], JIT_SCRATCH_A, JIT_SCRATCH_B);
-            emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, at));
-            emit(e, jaiA64StrX(regs[i], JIT_SCRATCH_C, at + 8));
+            if (whole) {
+                /* emitTagFor builds the tag with movz, so its high half is
+                 * zero: one pair store writes the whole Value, padding too. */
+                emit(e, jaiA64StpOff(JIT_SCRATCH_A, regs[i], JIT_SCRATCH_C, (int32_t)at));
+            } else {
+                emit(e, jaiA64StrW(JIT_SCRATCH_A, JIT_SCRATCH_C, at));
+                emit(e, jaiA64StrX(regs[i], JIT_SCRATCH_C, at + 8));
+            }
         }
         emit(e, jaiA64MovX(rinst, JIT_SCRATCH_C));
         e->wroteHeap = true;

@@ -348,8 +348,11 @@ static JAI_NOINLINE ObjInstance *jitInstanceAllocSlow(ObjClass *cls);
  * could call out -- a refill, the bins, the slab -- is in the slow half, which
  * this tail-calls. The full-word stores matter too: every byte of the block is
  * written, `next` and the padding included, so no store has to wait for the
- * block's old contents to arrive before it can merge. */
-ObjInstance *jitInstanceAlloc(ObjClass *cls) {
+ * block's old contents to arrive before it can merge.
+ *
+ * `zero` is false only for jitInstanceAllocBare, whose caller stores every
+ * field before anything else runs. */
+JAI_INLINE ObjInstance *instanceAllocFast(ObjClass *cls, bool zero) {
     if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
     const unsigned count = cls->fieldCount;
     const unsigned c = 2u + count;   /* grains: a 32-byte header, 16 a field */
@@ -374,20 +377,34 @@ ObjInstance *jitInstanceAlloc(ObjClass *cls) {
             w[1] = 0;
             w[2] = (uint64_t)(uintptr_t)cls;
             w[3] = count;
-            /* The empty asm keeps this a loop of paired stores: as a plain
-             * loop it became a call to bzero, and the call needed a frame. */
-            uint64_t *f = w + 4;
-            for (unsigned i = 0; i < count; i++) {
-                __asm__("" : "+r"(f));
-                f[0] = 0;
-                f[1] = 0;
-                f += 2;
+            if (zero) {
+                /* The empty asm keeps this a loop of paired stores: as a plain
+                 * loop it became a call to bzero, and the call needed a frame. */
+                uint64_t *f = w + 4;
+                for (unsigned i = 0; i < count; i++) {
+                    __asm__("" : "+r"(f));
+                    f[0] = 0;
+                    f[1] = 0;
+                    f += 2;
+                }
             }
             vm.allocCount++;
             return (ObjInstance *)(void *)w;
         }
     }
     return jitInstanceAllocSlow(cls);
+}
+
+ObjInstance *jitInstanceAlloc(ObjClass *cls) {
+    return instanceAllocFast(cls, true);
+}
+
+/* For a caller that writes every field, whole Values, before anything else can
+ * run: zeroing them first was two paired stores a field on alloc_churn's hot
+ * path for nothing (-3% cycles, -60M instructions without it). The slow half
+ * still zeroes, which costs nothing it did not cost before. */
+ObjInstance *jitInstanceAllocBare(ObjClass *cls) {
+    return instanceAllocFast(cls, false);
 }
 
 static JAI_NOINLINE ObjInstance *jitInstanceAllocSlow(ObjClass *cls) {
