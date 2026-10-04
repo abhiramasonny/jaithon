@@ -254,6 +254,10 @@ bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out);
 int  jaiMapPreparedFn1Ints(JaiPreparedFn1 *prepared, ObjList *src, int from,
                            ObjList *dst, bool *ok);
 bool jaiMapRunOn(void);
+/* The same run for list.filter: a flat callee taking an int or a float and
+ * returning a bool; each element it keeps is appended to `dst`. */
+int  jaiFilterPreparedFn1(JaiPreparedFn1 *prepared, ObjList *src, int from,
+                          ObjList *dst, bool *ok);
 
 /* Finish, in the interpreter, a one-argument compiled call that deoptimised
  * part-way: the body already ran and may have written, so it must not be

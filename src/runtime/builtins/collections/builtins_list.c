@@ -555,7 +555,19 @@ static bool listFilter(int argc, Value *args, Value *out) {
     JaiPreparedFn1 keeper;
     jaiPrepareFn1(args[1], &keeper);
     bool ok = true;
+    bool runs = jaiMapRunOn();
     for (int i = 0; i < self->count; i++) {
+        /* A run of elements in one call while the predicate is flat; the
+         * element it stops at goes the ordinary way below. */
+        if (runs && keeper.flat) {
+            bool runOk;
+            i = jaiFilterPreparedFn1(&keeper, self, i, result, &runOk);
+            if (!runOk) {
+                ok = false;
+                break;
+            }
+            if (i >= self->count) break;
+        }
         Value item = jaiListGet(self, i);
         bool keep;
         if (!callPredicate(&keeper, item, "list.filter", &keep)) {

@@ -677,7 +677,112 @@ int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
     return i;
 }
 
+/* See vm.h. The same run for list.filter: a flat callee that takes an int or
+ * a float and returns a bool, every per-callee check and the stack window
+ * hoisted out of the loop, and the element itself appended when the verdict is
+ * true -- through jaiListPush, which is what listFilter's own loop calls, so
+ * the result is built the same way (and given the same storage) as before.
+ * Anything else stops the run; a call that comes back with a non-zero verdict
+ * is finished as jaiCallPreparedFn1 finishes it and its answer checked as
+ * callPredicate checks it. */
+int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
+                         ObjList *dst, bool *ok) {
+    *ok = true;
+    if (!p->flat || p->nargs != 1 ||
+        p->returnKind != (uint8_t)SLOT_BOOL) {
+        return from;
+    }
+    ObjFunction *fn = p->fn;
+    if (fn->jitArgBase != 1) return from;
+    SlotKind pk = (SlotKind)fn->jitParamKind[0];
+    if (pk != SLOT_INT && pk != SLOT_FLOAT) return from;
+    void *entry = p->entry;
+    uint32_t mv = p->moduleVersion;
+    Value *base = vm.stackTop;
+    if (base > p->limit) return from;
+    base[0] = p->callee;
+    base[1] = pk == SLOT_INT ? INT_VAL(0) : FLOAT_VAL(0.0);
+    vm.stackTop = base + 2;
+
+    int i = from;
+    for (; i < src->count; i++) {
+        if (JAI_UNLIKELY(fn->jitFunc != entry ||
+                         fn->module->version != mv)) {
+            break;
+        }
+        Value item;
+        int64_t a0;
+        uint8_t stg = src->stg;
+        if (stg == (uint8_t)LIST_STORE_BOXED) {
+            item = ((const Value *)src->items)[i];
+            if (pk == SLOT_INT ? !IS_INT(item) : !IS_FLOAT(item)) break;
+        } else if (stg == (uint8_t)LIST_STORE_I64 && pk == SLOT_INT) {
+            item = INT_VAL(((const int64_t *)src->items)[i]);
+        } else if (stg == (uint8_t)LIST_STORE_F64 && pk == SLOT_FLOAT) {
+            item = FLOAT_VAL(((const double *)src->items)[i]);
+        } else {
+            break;
+        }
+        /* An int's payload, or a double's bits: what the compiled body
+         * takes in its argument register either way (jitArgIn). */
+        memcpy(&a0, &item.as, sizeof a0);
+        base[1].as.integer = a0;
+        int frameBase = vm.frameCount;
+        JitResult r = ((Fn1)(uintptr_t)entry)(a0);
+        bool keep;
+        if (JAI_LIKELY(r.bailed == 0)) {
+            keep = r.value != 0;
+        } else {
+            Value verdict;
+            JaiJitOutcome outcome = jitResultOut(fn, r, base);
+            bool good;
+            if (outcome == JAI_JIT_DONE) {
+                verdict = base[0];
+                good = true;
+            } else if (outcome == JAI_JIT_ERROR) {
+                good = false;
+            } else if (outcome == JAI_JIT_DEOPT) {
+                good = jaiFinishJitDeopt1(p->closure, base, frameBase,
+                                          &verdict);
+            } else {
+                good = callFn1Rerun(base, &verdict);
+            }
+            vm.stackTop = base;
+            if (good && !IS_BOOL(verdict)) {
+                (void)jaiThrow(vm.cTypeError,
+                               "list.filter(): the predicate must return "
+                               "bool, not %s", jaiTypeNameStatic(verdict));
+                good = false;
+            }
+            if (!good) {
+                *ok = false;
+                return i;
+            }
+            if (AS_BOOL(verdict)) jaiListPush(dst, item);
+            if (vm.hasException) *ok = false;
+            return i + 1;
+        }
+        if (keep) {
+            jaiListPush(dst, item);
+            if (JAI_UNLIKELY(vm.hasException)) {
+                vm.stackTop = base;
+                *ok = false;
+                return i + 1;
+            }
+        }
+    }
+    vm.stackTop = base;
+    return i;
+}
+
 #else
+
+int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
+                         ObjList *dst, bool *ok) {
+    (void)p; (void)src; (void)dst;
+    *ok = true;
+    return from;
+}
 
 int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
                           ObjList *dst, bool *ok) {
