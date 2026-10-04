@@ -105,6 +105,69 @@ fn ints_across(xs: list[int], n: int) -> int {
     return t + out.len()
 }
 
+fn graph(n: int, deg: int) -> list[list[int]] {
+    var g: list[list[int]] = []
+    var s = 11
+    for _i in 0..n {
+        var adj: list[int] = []
+        for _d in 0..deg {
+            s = (s * 1103515245 + 12345) % 2147483648
+            adj.push(s % n)
+        }
+        g.push(adj)
+    }
+    return g
+}
+
+# `dist` is subscripted outside the inner loop as well as inside it, so its
+# header is hoisted out of the inner loop only. In the second the queue IS
+# `dist`, and the inner loop's appends move the very header that was hoisted.
+fn bfs_plain(g: list[list[int]], n: int) -> int {
+    var dist: list[int] = []
+    for _i in 0..n { dist.push(-1) }
+    var queue: list[int] = []
+    queue.push(0)
+    dist[0] = 0
+    var head = 0
+    var total = 0
+    while head < queue.len() {
+        let node = queue[head]
+        head += 1
+        let d = dist[node]
+        total += d
+        for nb in g[node] {
+            if dist[nb] < 0 {
+                dist[nb] = d + 1
+                queue.push(nb)
+            }
+        }
+    }
+    return total + queue.len()
+}
+
+fn bfs_alias(g: list[list[int]], n: int) -> int {
+    var dist: list[int] = []
+    for _i in 0..n { dist.push(-1) }
+    var queue = dist
+    queue.push(0)
+    dist[0] = 0
+    var head = n
+    var total = 0
+    while head < queue.len() {
+        let node = queue[head]
+        head += 1
+        let d = dist[node]
+        total += d
+        for nb in g[node] {
+            if dist[nb] < 0 {
+                dist[nb] = d + 1
+                queue.push(nb)
+            }
+        }
+    }
+    return total + queue.len()
+}
+
 fn main() -> int {
     let w = 400
     var same: list[list[int]] = []
@@ -146,5 +209,15 @@ fn main() -> int {
     let src = row_ints(5001, 9)
     for _k in 0..70 { i1 = ints_across(src, 5000) }
     print(i1)
+
+    let g = graph(3000, 5)
+    var b1 = 0
+    var b2 = 0
+    for _k in 0..70 {
+        b1 = bfs_plain(g, 3000)
+        b2 = bfs_alias(g, 3000)
+    }
+    print(b1)
+    print(b2)
     return 0
 }

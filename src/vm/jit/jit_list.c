@@ -362,6 +362,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
     struct {
         uint32_t top, end, use; uint8_t slot;
         uint8_t aliasCount; uint8_t alias[JIT_MAX_HOIST_ALIAS];
+        bool inside;
     } cand[JIT_MAX_SLOTS + 1];
     unsigned ncand = 0;
 
@@ -373,6 +374,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
         uint8_t bestAlias[JIT_MAX_HOIST_ALIAS];
         uint8_t bestAliasCount = 0;
         bool bestCovers = false;
+        bool bestInside = false;
         for (int at = (int)e->osrTop; at < (int)e->osrEnd;) {
             int len = instructionLength(c, at);
             if (len <= 0) break;
@@ -380,8 +382,19 @@ void planHoists(Emit *e, ObjFunction *fn) {
             uint32_t le = loopBodyEnd(c, lt);
             at += len;
             if (le == 0 || le <= lt || le > e->osrEnd) continue;
-            /* Every subscript of this slot inside the loop... */
-            if (e->slotIndexLo[s] < lt || e->slotIndexHi[s] >= le) continue;
+            /* Every subscript of this slot inside the loop -- or, with
+             * jitHoistPartialOn, at least some: a site outside the hoist's
+             * range never asks for it (hoistFor checks the range) and reloads
+             * the header itself, so `let d = dist[node]` above an inner loop
+             * that subscripts `dist` per element no longer costs the inner
+             * loop its hoist. Only a hoist with every subscript inside proves
+             * bounds at its head, because the span it would prove is the
+             * slot's over ALL its subscripts. */
+            bool inside = e->slotIndexLo[s] >= lt && e->slotIndexHi[s] < le;
+            if (!inside) {
+                if (!jitHoistPartialOn()) continue;
+                if (e->slotIndexHi[s] < lt || e->slotIndexLo[s] >= le) continue;
+            }
             /* ...and no write to it anywhere in the loop. */
             if (e->slotWriteHi[s] >= lt && e->slotWriteLo[s] < le) continue;
             /* ...and nothing in the loop that could resize the list or take
@@ -402,7 +415,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
              * rather than its `k` loop saves one header load per `j` and
              * puts a compare and branch back on every `b[k]`. A loop whose
              * head can prove the bounds outranks any that cannot. */
-            bool covers = jitGrowKeeps() &&
+            bool covers = jitGrowKeeps() && inside &&
                           lt + 9u <= (uint32_t)c->count &&
                           c->code[lt] == OP_FOR_RANGE_BIND &&
                           e->spanSeen[s] && e->spanOk[s] &&
@@ -412,6 +425,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
                 (covers == bestCovers && le - lt > bestEnd - bestTop)) {
                 bestTop = lt; bestEnd = le;
                 bestCovers = covers;
+                bestInside = inside;
                 bestAliasCount = aliasCount;
                 memcpy(bestAlias, alias, sizeof alias);
             }
@@ -423,6 +437,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
         cand[ncand].slot = (uint8_t)s;
         cand[ncand].aliasCount = bestAliasCount;
         memcpy(cand[ncand].alias, bestAlias, sizeof bestAlias);
+        cand[ncand].inside = bestInside;
         ncand++;
     }
 
@@ -444,6 +459,7 @@ void planHoists(Emit *e, ObjFunction *fn) {
         e->hoist[e->hoistCount].itemsReg = (uint8_t)rI;
         e->hoist[e->hoistCount].countReg = (uint8_t)rC;
         e->hoist[e->hoistCount].rangeOk  = false;
+        e->hoist[e->hoistCount].inside   = cand[pick].inside;
         e->hoist[e->hoistCount].aliasCount = cand[pick].aliasCount;
         memcpy(e->hoist[e->hoistCount].aliasSlot, cand[pick].alias,
                sizeof cand[pick].alias);
@@ -511,7 +527,7 @@ bool boundsCoveredAtHead(const Emit *e, int slot, unsigned vidx,
     if (e->measuring) return true;
     if (!e->spanOk[slot] || e->spanLo[slot] > e->spanHi[slot]) return false;
     int h = hoistFor(e, slot);
-    if (h < 0 || !e->hoist[h].rangeOk) return false;
+    if (h < 0 || !e->hoist[h].rangeOk || !e->hoist[h].inside) return false;
     /* The guard is emitted at THIS hoist's loop head, so it is that loop's
      * variable the index has to be measured against. */
     if (e->hoist[h].rVar != base) return false;
@@ -566,7 +582,7 @@ void emitHoistsAt(Emit *e, uint32_t off) {
          * loop would hand the whole rest of the function to the interpreter
          * for no reason. */
         unsigned sl = e->hoist[i].slot;
-        if (!e->osr || !e->hoist[i].rangeOk) continue;
+        if (!e->osr || !e->hoist[i].rangeOk || !e->hoist[i].inside) continue;
         if (!e->spanOk[sl] || e->spanLo[sl] > e->spanHi[sl]) continue;
         if (!e->spanSeen[sl] || e->spanBase[sl] != e->hoist[i].rVar) continue;
         /* localIn, not localHomeX: the counter and the end are temporaries the

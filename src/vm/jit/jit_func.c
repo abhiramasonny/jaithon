@@ -701,6 +701,17 @@ bool jitSplitHoistsOn(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_HOIST_PARTIAL=0 hoists a list header only out of a loop that
+ * holds every subscript of its slot. On by default; see planHoists. */
+bool jitHoistPartialOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_HOIST_PARTIAL");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 /* JAITHON_JIT_GROW_KEEPS=0 puts the list-grow stub back to an ordinary call
  * out. On by default.
  *

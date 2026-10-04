@@ -553,6 +553,9 @@ typedef struct {
          * where every subscript actually happens. */
         bool     rangeOk;
         uint16_t rVar, rCur, rEnd;
+        /* Every subscript of the slot lies inside this loop, so the slot's
+         * span is this loop's and the head may prove its bounds. */
+        bool     inside;
         /* The locals the loop appends to. Not this slot (planHoists refused
          * that), but possibly the same LIST under another name, so the hoist
          * proves the pointers differ before the loop runs. */
@@ -864,6 +867,7 @@ bool jitSplitStress(void);
 bool jitGrowKeeps(void);
 bool jitHoistPinOn(void);
 bool jitSplitHoistsOn(void);
+bool jitHoistPartialOn(void);
 void notePushTarget(Emit *e, int slot);
 void noteStorageStamp(Emit *e);
 bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi);
