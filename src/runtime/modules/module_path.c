@@ -29,7 +29,6 @@
 #include "runtime/modules/module_internal.h"
 #include "native/native.h"
 
-#define JAI_PACKAGE_FILE "mod.jai"
 #define JAI_PROJECT_MANIFEST "jaithon.package.json"
 
 /* Directories listed in an E0800 note before the list is elided. */

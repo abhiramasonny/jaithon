@@ -5,6 +5,7 @@
 #include "runtime/runtime.h"
 
 #define JAI_MODULE_EXT ".jai"
+#define JAI_PACKAGE_FILE "mod.jai"
 
 /* -- module.c, used by module_path.c --------------------------------- */
 
