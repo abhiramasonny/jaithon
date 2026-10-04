@@ -494,6 +494,10 @@ static bool listCopy(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* Elements a map or filter takes the ordinary way after a native run took
+ * none, before it asks for another. */
+#define RUN_IDLE 64
+
 static bool listMap(int argc, Value *args, Value *out) {
     (void)argc;
     ObjList *self;
@@ -506,19 +510,27 @@ static bool listMap(int argc, Value *args, Value *out) {
     jaiPrepareFn1(args[1], &mapper);
     bool ok = true;
     bool runs = jaiMapRunOn();
+    int idle = 0;
     for (int i = 0; i < self->count; i++) {
         /* As many elements as the flat run will take at once, and the
          * element it stops at the ordinary way below. A callee that has not
          * compiled yet is not flat, so the first sixty-four go the long way
-         * and the run picks up once jaiCallPreparedFn1 has re-prepared. */
-        if (runs && mapper.flat && result->count > 0) {
+         * and the run picks up once jaiCallPreparedFn1 has re-prepared.
+         * A run that takes nothing (a capturing lambda, a parameter kind it
+         * does not take) is not asked again for the next RUN_IDLE elements:
+         * asking cost a call per element, 7% of a captured-lambda map. */
+        if (idle > 0) {
+            idle--;
+        } else if (runs && mapper.flat && result->count > 0) {
             bool runOk;
+            int from = i;
             i = jaiMapPreparedFn1Run(&mapper, self, i, result, &runOk);
             if (!runOk) {
                 ok = false;
                 break;
             }
             if (i >= self->count) break;
+            if (i == from) idle = RUN_IDLE;
         }
         Value arg = jaiListGet(self, i), mapped;
         if (!jaiCallPreparedFn1(&mapper, arg, &mapped)) {
@@ -556,17 +568,23 @@ static bool listFilter(int argc, Value *args, Value *out) {
     jaiPrepareFn1(args[1], &keeper);
     bool ok = true;
     bool runs = jaiMapRunOn();
+    int idle = 0;
     for (int i = 0; i < self->count; i++) {
         /* A run of elements in one call while the predicate is flat; the
-         * element it stops at goes the ordinary way below. */
-        if (runs && keeper.flat) {
+         * element it stops at goes the ordinary way below. One that takes
+         * nothing rests for RUN_IDLE elements, as in listMap. */
+        if (idle > 0) {
+            idle--;
+        } else if (runs && keeper.flat) {
             bool runOk;
+            int from = i;
             i = jaiFilterPreparedFn1(&keeper, self, i, result, &runOk);
             if (!runOk) {
                 ok = false;
                 break;
             }
             if (i >= self->count) break;
+            if (i == from) idle = RUN_IDLE;
         }
         Value item = jaiListGet(self, i);
         bool keep;
