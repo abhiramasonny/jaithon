@@ -264,6 +264,16 @@ bool fpWorthLoading(const Emit *e, const uint8_t *code, int next,
 /* Inside a `try`: an entry of the function's own static exception table covers
  * this offset. Linear over the table because a function has one or two entries,
  * never a table worth indexing. */
+/* JAITHON_JIT_BREAK_ITER: see OP_POP's `break` arm. */
+static bool jitBreakIter(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_BREAK_ITER");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 static bool offsetIsProtected(const ObjFunction *fn, uint32_t off) {
     for (uint16_t i = 0; i < fn->exceptionCount; i++) {
         const ExceptionEntry *x = &fn->exceptions[i];
@@ -835,6 +845,65 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                 unsigned idx = e->valueDepth - 1;
                 e->kPend   &= ~(1u << idx);
                 e->xBorrow &= ~(1u << idx);
+            }
+            /* `break` out of a for-in: drop the iterator, jump to the exit.
+             * The jump is unconditional, so the walk goes on at the offset
+             * after it -- which only the loop body's own branches reach, and
+             * they arrive WITH the iterator. Restating the model from the
+             * entry just popped (same index, so the same register, which
+             * nothing on that path wrote) is what lets the walk continue
+             * there; without it the walk stopped, the loop's exit was never
+             * emitted, and every function holding such a loop declined
+             * outright. Only when a branch already recorded for that offset
+             * names exactly the restored stack. */
+            /* The same `break` out of the loop an OSR region is compiled for:
+             * that iterator lives below the model (depth 0 here is the head's
+             * depth), and the exit stub for the iterator's own exit already
+             * tells the interpreter to drop it -- so a jump to exactly that
+             * exit is the whole of the `break`. Any other target keeps the
+             * old stop. */
+            if (jitBreakIter() && e->osr && e->hasIter && !e->inlining &&
+                e->depth == 0 && off + 4 <= stop && code[off + 1] == OP_JUMP) {
+                int16_t jump = jaiReadI16(code + off + 2);
+                uint32_t target = (uint32_t)((int32_t)(off + 4) + jump);
+                if (target == e->iterExit) {
+                    branchTo(e, target, false, 0);
+                    off += 4;
+                    break;
+                }
+            }
+            if (jitBreakIter() && !e->inlining && e->depth > 0 &&
+                e->stack[e->depth - 1] == SLOT_ITER && off + 4 <= stop &&
+                code[off + 1] == OP_JUMP) {
+                uint32_t after = (uint32_t)(off + 4);
+                int64_t want = stackSignatureAt(e, e->depth);
+                bool reached = false;
+                for (unsigned f = 0; f < e->fixupCount && !reached; f++) {
+                    reached = e->fixups[f].targetOffset == after &&
+                              e->fixups[f].depth == want;
+                }
+                if (reached) {
+                    unsigned t = e->depth - 1;
+                    SlotKind k = e->stack[t];
+                    uint32_t shape = e->stackShape[t];
+                    ObjClass *cls = e->stackClass[t];
+                    Value seen = e->stackSeen[t];
+                    int fromLocal = e->stackLocal[t];
+                    uint8_t objType = e->stackObjType[t];
+                    Value elem = e->stackElem[t];
+                    uint8_t elemDecl = e->stackElemDecl[t];
+                    if (!popValue(e, &r, NULL)) return false;
+                    int16_t jump = jaiReadI16(code + off + 2);
+                    branchTo(e, (uint32_t)((int32_t)(off + 4) + jump), false, 0);
+                    if (!pushValue3(e, k, shape, cls, seen, fromLocal)) {
+                        return false;
+                    }
+                    e->stackObjType[e->depth - 1] = objType;
+                    e->stackElem[e->depth - 1] = elem;
+                    e->stackElemDecl[e->depth - 1] = elemDecl;
+                    off += 4;
+                    break;
+                }
             }
             if (!popValue(e, &r, NULL)) return false;
             off += 1;

@@ -139,6 +139,37 @@ fn test_recursion_inside_the_loop() -> void {
     }
 }
 
+#: `break` out of a for-in drops the iterator and jumps to the exit; the walk
+#: has to carry on after that jump with the iterator back on its model, or the
+#: whole function declines (JAITHON_JIT_BREAK_ITER). Nested, with work after
+#: the break, and with a break that is never taken.
+fn find_pair(rows: list[list[int]], want: int) -> int {
+    var found = -1
+    var r = 0
+    for row in rows {
+        for v in row {
+            if v == want {
+                found = r
+                break
+            }
+            if v < 0 { break }
+        }
+        if found >= 0 { break }
+        r += 1
+    }
+    return found * 100 + r
+}
+
+fn test_break_out_of_nested_for_in() -> void {
+    let rows = [[1, 2, 3], [4, -1, 9], [7, 8, 9], [10]]
+    for _round in 0..300 {
+        assert_eq(find_pair(rows, 8), 202, "found in row 2")
+        assert_eq(find_pair(rows, 9), 202, "the -1 hides row 1's 9")
+        assert_eq(find_pair(rows, 42), -100 + 4, "never found")
+        assert_eq(broken([1, 2, 3], 7), 3, "break never taken")
+    }
+}
+
 #: The iterator's index lives in a register for a loop that calls nothing
 #: (JAITHON_JIT_ITER_IDX_REG) and is stored back after every step, so a
 #: `continue`, a deopt part-way and a store under the iterator must all still
@@ -173,5 +204,68 @@ fn test_an_index_held_in_a_register() -> void {
         assert_eq(odd_total(long), 500000, "long continue")
         assert_eq(store_under([1, 2, 3, 4, 5]), 1003, "store under the iterator")
         assert_eq(mixed([5, 6, "x", 8]), 103, "deopt part-way")
+    }
+}
+
+#: A `break` out of the very loop an OSR region was compiled for: the iterator
+#: is not on that region's model, so the break is a jump to the iterator's own
+#: exit, whose stub has the interpreter drop it. One long first call so the
+#: loop is entered compiled, over each head kind the region can have.
+fn index_of_first(xs: list[int], limit: int) -> int {
+    var i = 0
+    for x in xs {
+        if x >= limit { break }
+        i += 1
+    }
+    return i
+}
+
+fn range_until(n: int, stop: int) -> int {
+    var t = 0
+    for i in 0..n {
+        if i == stop { break }
+        t += i
+    }
+    return t
+}
+
+fn items_until(d: dict[str, int], stop: int) -> int {
+    var t = 0
+    for (_k, v) in d.items() {
+        if v == stop { break }
+        t += v
+    }
+    return t
+}
+
+fn enumerate_until(xs: list[int], stop: int) -> int {
+    var t = 0
+    for (i, x) in xs.enumerate() {
+        if x == stop { break }
+        t += i * x
+    }
+    return t
+}
+
+fn test_break_out_of_an_osr_region() -> void {
+    var long: list[int] = []
+    for k in 0..300000 { long.push(k % 1000) }
+    long.push(5000)
+    var d: dict[str, int] = {}
+    for k in 0..50000 { d[f"k{k}"] = k }
+    var small: list[int] = []
+    for k in 0..200000 { small.push(k % 7) }
+    small.push(99)
+    var want = 0
+    for k in 0..200000 { want += k * (k % 7) }
+    for _round in 0..3 {
+        assert_eq(index_of_first(long, 5000), 300000, "list, break at the end")
+        assert_eq(index_of_first(long, 999), 999, "list, break early")
+        assert_eq(index_of_first(long, 6000), 300001, "list, never")
+        assert_eq(range_until(1000000, 400000), 79999800000, "range")
+        assert_eq(range_until(10, 400000), 45, "range, never")
+        assert_eq(items_until(d, 40000), 799980000, "items")
+        assert_eq(enumerate_until(small, 99), want, "enumerate")
+        assert_eq(enumerate_until(small, 6), 55, "enumerate early")
     }
 }
