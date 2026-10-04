@@ -97,8 +97,7 @@ pub fn test_a_grid() -> void {
     }
     #: i = 0..5 lands on [i % 3][i % 2]: [0][0] 0, [1][1] 1, [2][0] 2,
     #: [0][1] 3, [1][0] 4, [2][1] 5.
-    assert_eq(grid, [[0, -3 * CALLS], [-4 * CALLS, -1 * CALLS],
-                     [-2 * CALLS, -5 * CALLS]])
+    assert_eq(grid, [[0, -3 * CALLS], [-4 * CALLS, -1 * CALLS], [-2 * CALLS, -5 * CALLS]])
 }
 
 pub fn test_a_field() -> void {
@@ -118,8 +117,6 @@ pub fn test_an_overflow_still_raises() -> void {
         dup_hist(hist, [1, 2])
         call += 1
     }
-    assert_throws(OverflowError, fn() -> void {
-        dup_hist(hist, [4])
-    }, "`+=` past the largest int")
+    assert_throws(OverflowError, fn() -> void { dup_hist(hist, [4]) }, "`+=` past the largest int")
     assert_eq(hist[0], 9223372036854775807)
 }

@@ -103,7 +103,7 @@ pub fn test_values_and_keys_the_leaf_leaves_alone() -> void {
     }
     assert_eq(counts["n"], CALLS)
     assert_eq(counts[4], CALLS)
-    assert_eq(counts[(1, 2)], CALLS)
+    assert_eq(counts[1, 2], CALLS)
     #: A float value takes the ordinary add, which keeps it a float.
     count_any(counts, ["f"])
     assert_eq(counts["f"], 2.5)
@@ -169,9 +169,7 @@ pub fn test_augmented_add() -> void {
     assert_eq(counts["a"], 10 * CALLS)
     assert_eq(counts["b"], 1 + 5 * CALLS)
     #: An absent key is the read's KeyError, and nothing is inserted.
-    assert_throws(KeyError, fn() -> void {
-        bump_aug(counts, ["nope"])
-    }, "`+=` on a missing key")
+    assert_throws(KeyError, fn() -> void { bump_aug(counts, ["nope"]) }, "`+=` on a missing key")
     assert_true("nope" not in counts, "nothing inserted")
     #: A float value, a non-string key and a list all take the unfused code.
     counts["f"] = 0.5

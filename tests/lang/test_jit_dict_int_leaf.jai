@@ -118,9 +118,7 @@ pub fn test_augmented_add() -> void {
     }
     assert_eq(d[5], 6 * CALLS)
     assert_eq(d[6], 1 + 3 * CALLS)
-    assert_throws(KeyError, fn() -> void {
-        int_aug(d, [7])
-    }, "`+=` on a missing int key")
+    assert_throws(KeyError, fn() -> void { int_aug(d, [7]) }, "`+=` on a missing int key")
 }
 
 pub fn test_a_float_key_equal_to_the_int() -> void {

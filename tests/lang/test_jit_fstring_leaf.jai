@@ -117,17 +117,21 @@ pub fn test_one_int_hole_shapes() -> void {
         let n = call * 7919 - 300000
         let o: any = if call % 3 == 0 { [1, 2] } else { "o" }
         let ns = str(n)
-        assert_eq(fmt_hole_shapes(n, "ab", o),
-                  [ns, ns + "px", "k" + ns, "<" + ns + ">", "ab" + ns,
-                   ns + "ab", str(o) + ns])
-        assert_eq(fmt_hole_shapes(n, long, "o"),
-                  [ns, ns + "px", "k" + ns, "<" + ns + ">", long + ns,
-                   ns + long, "o" + ns])
+        assert_eq(
+            fmt_hole_shapes(n, "ab", o),
+            [ns, ns + "px", "k" + ns, "<" + ns + ">", "ab" + ns, ns + "ab", str(o) + ns]
+        )
+        assert_eq(
+            fmt_hole_shapes(n, long, "o"),
+            [ns, ns + "px", "k" + ns, "<" + ns + ">", long + ns, ns + long, "o" + ns]
+        )
         call += 1
     }
     let m = "-9223372036854775808"
-    assert_eq(fmt_hole_shapes(-9223372036854775807 - 1, "", "o"),
-              [m, m + "px", "k" + m, "<" + m + ">", m, m, "o" + m])
+    assert_eq(
+        fmt_hole_shapes(-9223372036854775807 - 1, "", "o"),
+        [m, m + "px", "k" + m, "<" + m + ">", m, m, "o" + m]
+    )
 }
 
 fn str_of_int(n: int) -> str {

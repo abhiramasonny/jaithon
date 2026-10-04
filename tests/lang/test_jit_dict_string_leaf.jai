@@ -225,7 +225,7 @@ pub fn test_object_keys_that_are_not_strings_take_the_slow_path() -> void {
     }
     assert_eq(d.len(), 3)
     assert_eq(d["s"], 2 * CALLS)
-    assert_eq(d[(1, 2)], CALLS)
+    assert_eq(d[1, 2], CALLS)
     assert_eq(d[twin], CALLS)
     #: First call: 1000 + 1000 + 1000 + 1 (the second "s" sees the first's
     #: store). Call c after that: (2c-2) + (c-1) + (c-1) + (2c-1) = 6c - 5.
