@@ -299,8 +299,14 @@ bool emitInvokePic1(Emit *e, ObjFunction *fn, unsigned ridx,
      * what this site did for every receiver before any of this. */
     int armMiss[JAI_IC_WAYS];
     for (unsigned w = 0; w < ways; w++) {
-        emitConst64(e, JIT_SCRATCH_B, (int64_t)wayShape[w]);
-        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        /* Shape ids come from a counter, so nearly all fit an imm12 and the
+         * compare needs no register -- one word a way, eight ways a chain. */
+        if (wayShape[w] <= 4095u) {
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, wayShape[w]));
+        } else {
+            emitConst64(e, JIT_SCRATCH_B, (int64_t)wayShape[w]);
+            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        }
         armMiss[w] = (int)e->count;
         emit(e, jaiA64BCond(JAI_A64_NE, 0));
 
