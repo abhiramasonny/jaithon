@@ -37,7 +37,8 @@ vm        tests/vm          layer 1 (the bytecode verifier) plus C binaries
 
 Layer 1, the verifier, is also where `tests/vm` gets exercised: `run_tests.sh`
 invokes the `verify_chunk` binary and the `tests/vm/*.sh` scripts
-(`field_kind_disasm.sh`, `sidecar.sh`, `cache_corrupt.sh`) directly. The rest
+(`field_kind_disasm.sh`, `sidecar.sh`, `cache_corrupt.sh`,
+`osr_replace.sh`) directly. The rest
 of `tests/vm/*.c` (`crc32_equiv.c`, `chunk_caches.c`, `linetable_ltv1.c`,
 `jit_arena.c`, `jit_arm64.c`, `field_natives.c`, `invoke_result_kind.c`) is
 built by its own named Makefile target (e.g. `make jit-test`) and not run

@@ -120,6 +120,17 @@ if [[ -x "$ROOT/tests/vm/cache_corrupt.sh" ]]; then
     done <<< "$corrupt_output"
 fi
 
+if [[ -x "$ROOT/tests/vm/osr_replace.sh" ]]; then
+    replace_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/osr_replace.sh" 2>&1)"
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)   name="osr_replace: ${line#ok }"
+                      matches_filter "$name" && record_pass "$name" 0 ;;
+            "FAIL "*) record_fail "osr_replace: ${line#FAIL }" "" ;;
+        esac
+    done <<< "$replace_output"
+fi
+
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 
