@@ -672,7 +672,7 @@ JitArmResult emitMembership(Emit *e, const uint8_t *code, int *offp) {
         LeafFix mfx;
         mfx.on = false;
         if (e->stack[e->depth - 1] == SLOT_OBJ &&
-            dictLeafKeyKind(e->stack[e->depth - 2]) &&
+            dictLeafKeyAt(e, e->depth - 2) &&
             JIT_SEEN_OR_PREDICTED_DICT(e, e->depth - 1)) {
             emitDictLeafHas(e, valueXReg(e, e->valueDepth - 1),
                             valueXReg(e, e->valueDepth - 2),

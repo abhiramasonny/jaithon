@@ -1330,7 +1330,7 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             if (OBJ_TYPE(oseen) == OBJ_DICT && (argc == 1 || argc == 2) &&
                 AS_STRING(oname)->length == 3 &&
                 memcmp(AS_STRING(oname)->chars, "get", 3) == 0 &&
-                dictLeafKeyKind(e->stack[ridx + 1]) &&
+                dictLeafKeyAt(e, ridx + 1) &&
                 holdsRegister(e->stack[ridx + argc])) {
                 unsigned vd = e->valueDepth;
                 emitDictLeafGet(e, valueXReg(e, vd - argc - 1),

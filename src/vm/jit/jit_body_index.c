@@ -60,6 +60,23 @@ bool dictLeafKeyKind(SlotKind k) {
     return k == SLOT_OBJ || k == SLOT_INT;
 }
 
+/* dictLeafKeyKind for stack entry `idx`, minus the object keys the compiler
+ * can already see are not strings: a tuple built in the body, or a local whose
+ * value was one when this compiled. The leaves would only guard or call and
+ * come back unanswered, every time -- a dict keyed by `(x, y)` paid ~25
+ * instructions an access for nothing. A prediction, so a key that turns out
+ * to be a string is merely not answered by a leaf. */
+bool dictLeafKeyAt(const Emit *e, unsigned idx) {
+    SlotKind k = e->stack[idx];
+    if (k == SLOT_INT) return true;
+    if (k != SLOT_OBJ) return false;
+    uint8_t ot = e->stackObjType[idx];
+    if (ot != 0 && ot != (uint8_t)(OBJ_STRING + 1)) return false;
+    Value v = e->stackSeen[idx];
+    if (IS_OBJ(v) && AS_OBJ(v) != NULL && !IS_STRING(v)) return false;
+    return true;
+}
+
 /* The key must really be a string; anything else takes the slow path, which
  * is not a deopt, so a dict keyed by tuples at this site costs one compare.
  * An int key needs no guard: its kind is the register's. */
@@ -277,7 +294,8 @@ bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
         return false;
     }
     SlotKind keyKind = e->stack[ridx + 1];
-    if (!dictLeafKeyKind(keyKind) || e->stack[ridx - 1] != keyKind) {
+    if (!dictLeafKeyAt(e, ridx + 1) || !dictLeafKeyAt(e, ridx - 1) ||
+        e->stack[ridx - 1] != keyKind) {
         return false;
     }
     if (e->stack[ridx + 2] != SLOT_INT) return false;
@@ -340,7 +358,7 @@ bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
     }
     if (e->depth < 2 || e->valueDepth < 2) return false;
     SlotKind keyKind = e->stack[e->depth - 1];
-    if (e->stack[e->depth - 2] != SLOT_OBJ || !dictLeafKeyKind(keyKind) ||
+    if (e->stack[e->depth - 2] != SLOT_OBJ || !dictLeafKeyAt(e, e->depth - 1) ||
         !JIT_SEEN_OR_PREDICTED_DICT(e, e->depth - 2)) {
         return false;
     }
@@ -535,7 +553,7 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
              * which raises the KeyError a miss is owed. */
             LeafFix gfx;
             gfx.on = false;
-            if (dictLeafKeyKind(e->stack[e->depth - 1])) {
+            if (dictLeafKeyAt(e, e->depth - 1)) {
                 emitDictLeafGet(e, valueXReg(e, e->valueDepth - 2),
                                 valueXReg(e, e->valueDepth - 1),
                                 e->stack[e->depth - 1], -1, SLOT_NULL, true,
@@ -831,7 +849,7 @@ bool emitSetIndex(Emit *e, int *offp) {
             branchOnDeopt(e, JAI_A64_NE);
             LeafFix sfx;
             sfx.on = false;
-            if (dictLeafKeyKind(e->stack[e->depth - 2]) &&
+            if (dictLeafKeyAt(e, e->depth - 2) &&
                 holdsRegister(e->stack[e->depth - 1])) {
                 emitDictLeafSet(e, valueXReg(e, e->valueDepth - 3),
                                 valueXReg(e, e->valueDepth - 2),
