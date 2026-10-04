@@ -148,13 +148,14 @@ static int growKeepOffset(unsigned reg) {
     return -1;
 }
 
-static void growKeepSave(Emit *e, bool save) {
+static void growKeepSave(Emit *e, bool save, bool fp) {
     static const unsigned gp[14] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17};
     for (unsigned i = 0; i < 14; i += 2) {
         int at = growKeepOffset(gp[i]);
         emit(e, save ? jaiA64StpOff(gp[i], gp[i + 1], 31, at)
                      : jaiA64LdpOff(gp[i], gp[i + 1], 31, at));
     }
+    if (!fp) return;
     unsigned at = 112u;
     for (unsigned d = 0; d < 8; d += 2, at += 16u) {
         emit(e, save ? jaiA64StpDOff(d, d + 1, 31, (int32_t)at)
@@ -164,6 +165,37 @@ static void growKeepSave(Emit *e, bool save) {
         emit(e, save ? jaiA64StpDOff(d, d + 1, 31, (int32_t)at)
                      : jaiA64LdpDOff(d, d + 1, 31, (int32_t)at));
     }
+}
+
+/* JAITHON_JIT_GROW_KEEP_FP=0 has a keeping grow stub save the FP registers
+ * in every body. On by default.
+ *
+ * The keeping stub's twenty D registers are half its cost, and a body that
+ * never runs an FP instruction holds nothing in any of them: floats ride in X
+ * registers (fploc), and the only way a value reaches a D register is an
+ * instruction in the SIMD-and-FP encoding space -- a load or store with V set,
+ * or SIMD/FP data processing, which are exactly the words with bits 27 and 26
+ * both set. So the body as emitted so far (everything a grow stub can return
+ * into: the prologue, every inlined callee, the self-call stubs) is scanned
+ * for one, and a body with none skips them. A word that only looks like one
+ * (a literal, an immediate) costs the saves, never a register. Each grow on a
+ * list that is fresh per call or per iteration -- a record built by push -- is
+ * where this is paid, once a list. */
+static bool jitGrowKeepFpOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_GROW_KEEP_FP");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static bool codeTouchesFp(const Emit *e) {
+    if (!jitGrowKeepFpOn()) return true;
+    for (unsigned i = 0; i < e->count; i++) {
+        if ((e->code[i] & 0x0C000000u) == 0x0C000000u) return true;
+    }
+    return false;
 }
 
 /* An argument out of the register it lives in, or -- if that register is one
@@ -210,6 +242,7 @@ void emitGrowStubs(Emit *e) {
             }
         }
     }
+    bool fp = e->growCount > 0 && codeTouchesFp(e);
     for (unsigned gi = 0; gi < e->growCount; gi++) {
         e->grow[gi].stub = (int)e->count;
         if (e->grow[gi].keeps) {
@@ -218,7 +251,7 @@ void emitGrowStubs(Emit *e) {
             _Static_assert(GROW_KEEP_BYTES % 16u == 0u,
                            "sp stays 16-aligned across the call");
             emit(e, jaiA64SubXImm(31, 31, GROW_KEEP_BYTES));
-            growKeepSave(e, true);
+            growKeepSave(e, true, fp);
             growKeepArg(e, 0, e->grow[gi].listReg);
             growKeepArg(e, 2, e->grow[gi].valReg);
             emit(e, jaiA64MovzX(1, e->grow[gi].tag, 0));
@@ -228,7 +261,7 @@ void emitGrowStubs(Emit *e) {
             /* x10 is not in the save area, so the verdict survives the
              * restore. */
             emit(e, jaiA64MovX(JIT_SCRATCH_B, 0));
-            growKeepSave(e, false);
+            growKeepSave(e, false, fp);
             emit(e, jaiA64AddXImm(31, 31, GROW_KEEP_BYTES));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, 0));
             emit(e, jaiA64BCond(JAI_A64_NE,
