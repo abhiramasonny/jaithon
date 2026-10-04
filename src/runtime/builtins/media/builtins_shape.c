@@ -1157,23 +1157,19 @@ static bool primPointsFitLine(int argc, Value *args, Value *out) {
  *
  * Returns a new list of seven floats, or null when a point is not an object
  * with integer `x` and `y`. */
-static bool primPointsHu(int argc, Value *args, Value *out) {
-    (void)argc;
-    ObjList *contour;
-    if (!jaiArgList(args[0], 1, "points_hu", &contour)) return false;
-    *out = NULL_VAL;
+static bool contourHu(ObjList *contour, double hu[7]) {
     const int count = contour->count;
-    if (count == 0) return true;
+    if (count == 0) return false;
     JaiPointReader reader;
     jaiPointReaderInit(&reader);
     int64_t ix, iy;
-    if (!jaiReadPoint(&reader, jaiListGet(contour, count - 1), &ix, &iy)) return true;
+    if (!jaiReadPoint(&reader, jaiListGet(contour, count - 1), &ix, &iy)) return false;
     double a00 = 0.0, a10 = 0.0, a01 = 0.0, a20 = 0.0, a11 = 0.0;
     double a02 = 0.0, a30 = 0.0, a21 = 0.0, a12 = 0.0, a03 = 0.0;
     double px = (double)ix, py = (double)iy;
     double px2 = px * px, py2 = py * py;
     for (int index = 0; index < count; index++) {
-        if (!jaiReadPoint(&reader, jaiListGet(contour, index), &ix, &iy)) return true;
+        if (!jaiReadPoint(&reader, jaiListGet(contour, index), &ix, &iy)) return false;
         const double x = (double)ix, y = (double)iy;
         const double x2 = x * x, y2 = y * y;
         const double cross = px * y - x * py;
@@ -1249,7 +1245,7 @@ static bool primPointsHu(int argc, Value *args, Value *out) {
     const double d = n20 - n02;
     const double sum0 = q0 - 3.0 * q1;
     const double sum1 = 3.0 * q0 - q1;
-    const double hu[7] = {
+    const double values[7] = {
         s,
         d * d + n4 * n11,
         (n30 - 3.0 * n12) * (n30 - 3.0 * n12) + (3.0 * n21 - n03) * (3.0 * n21 - n03),
@@ -1258,12 +1254,83 @@ static bool primPointsHu(int argc, Value *args, Value *out) {
         d * (q0 - q1) + n4 * t0 * t1,
         (3.0 * n21 - n03) * t0 * sum0 - (n30 - 3.0 * n12) * t1 * sum1,
     };
+    for (int i = 0; i < 7; i++) hu[i] = values[i];
+    return true;
+}
+
+static bool primPointsHu(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *contour;
+    if (!jaiArgList(args[0], 1, "points_hu", &contour)) return false;
+    *out = NULL_VAL;
+    double hu[7];
+    if (!contourHu(contour, hu)) return true;
     ObjList *made = jaiListNew(7);
     if (made == NULL) return false;
     jaiGCPushRoot(OBJ_VAL(made));
     for (int i = 0; i < 7; i++) jaiListPush(made, FLOAT_VAL(hu[i]));
     jaiGCPopRoot();
     *out = OBJ_VAL(made);
+    return true;
+}
+
+/* `math.log10` as std.math writes it: the natural logarithm over LN_10,
+ * snapped to the integer when that is within 1e-10 and ten to it is exactly
+ * the argument, because two roundings leave exact powers of ten just short.
+ * Only ever asked of a finite argument over 1e-30 here, or a NaN or an
+ * infinity, which pass through as std.math passes them. */
+static double shapeLog10(double x) {
+    if (x != x) return x;
+    if (isinf(x)) return x;
+    const double approximate = log(x) / 2.302585092994046;
+    const double nearest = round(approximate);
+    if (fabs(approximate - nearest) < 1e-10 && !(fabs(nearest) > 22.0) && pow(10.0, nearest) == x) {
+        return nearest;
+    }
+    return approximate;
+}
+
+/* `std.math.fabs`, which turns a negative zero positive and passes a NaN. */
+static double shapeFabs(double x) {
+    if (x < 0.0) return -x;
+    if (x == 0.0) return 0.0;
+    return x;
+}
+
+/* `points_match(a, b, method)` -- `match_shapes`: the two contours' Hu
+ * invariants compared through their signed log magnitudes, by reciprocals
+ * (1), differences (2) or the largest relative difference (3), each step the
+ * Jaithon's. Null when either contour is empty or has a point that is not an
+ * object with integer `x` and `y`. */
+static bool primPointsMatch(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *a, *b;
+    int64_t method;
+    if (!jaiArgList(args[0], 1, "points_match", &a)) return false;
+    if (!jaiArgList(args[1], 2, "points_match", &b)) return false;
+    if (!jaiStrWantInt(args[2], "points_match", "the method", &method)) return false;
+    *out = NULL_VAL;
+    double ha[7], hb[7];
+    if (!contourHu(a, ha) || !contourHu(b, hb)) return true;
+    double total = 0.0, worst = 0.0;
+    for (int i = 0; i < 7; i++) {
+        const double ma = shapeFabs(ha[i]);
+        const double mb = shapeFabs(hb[i]);
+        if (ma <= 1e-30 || mb <= 1e-30) continue;
+        const double sa = ha[i] < 0.0 ? -1.0 : 1.0;
+        const double sb = hb[i] < 0.0 ? -1.0 : 1.0;
+        const double la = sa * shapeLog10(ma);
+        const double lb = sb * shapeLog10(mb);
+        if (method == 1) {
+            total += shapeFabs(1.0 / la - 1.0 / lb);
+        } else if (method == 2) {
+            total += shapeFabs(la - lb);
+        } else {
+            const double relative = shapeFabs((la - lb) / la);
+            if (relative > worst) worst = relative;
+        }
+    }
+    *out = FLOAT_VAL(method == 3 ? worst : total);
     return true;
 }
 
@@ -1277,4 +1344,5 @@ void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_fit_ellipse", primPointsFitEllipse, 2, 2);
     jaiStrDefinePrim(ns, "points_fit_line", primPointsFitLine, 3, 3);
     jaiStrDefinePrim(ns, "points_hu", primPointsHu, 1, 1);
+    jaiStrDefinePrim(ns, "points_match", primPointsMatch, 3, 3);
 }

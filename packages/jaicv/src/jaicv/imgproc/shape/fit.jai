@@ -39,6 +39,12 @@ fn hu_of(points: list[Point]) -> list[float] {
 
 #: Compare two shapes by their Hu moments.
 pub fn match_shapes(a: list[Point], b: list[Point], method: int = CONTOURS_MATCH_I1) -> float {
+    #: The whole comparison from `__prim__.points_match`, the logarithms and
+    #: all, for contours whose points it can read; null otherwise.
+    if _native_hu {
+        let score = __prim__.points_match(a, b, method)
+        if score is not null { return score }
+    }
     let ha = hu_of(a)
     let hb = hu_of(b)
     var total = 0.0
