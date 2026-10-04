@@ -352,7 +352,18 @@ ObjInstance *jitInstanceAlloc(ObjClass *cls) {
     const size_t size = sizeof(ObjInstance) + sizeof(Value) * (size_t)count;
     if (JAI_UNLIKELY(!jaiSmallServes(size))) return NULL;
 
-    ObjInstance *inst = (ObjInstance *)jaiSmallNew(size);
+    /* The page space first (gc.h): no free-list link to load out of the block,
+     * and nothing to link into GCState.objects. */
+    const unsigned c = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
+    ObjInstance *inst = NULL;
+    if (JAI_LIKELY(jaiPageKind[OBJ_INSTANCE]))
+        inst = (ObjInstance *)jaiPageNew(c);
+    const bool paged = inst != NULL;
+    if (paged) {
+        jaiHeapBytes += (size_t)c * JAI_SMALL_GRAIN;
+    } else {
+        inst = (ObjInstance *)jaiSmallNew(size);
+    }
     Obj *obj = (Obj *)inst;
 
     obj->type = OBJ_INSTANCE;
@@ -367,8 +378,10 @@ ObjInstance *jitInstanceAlloc(ObjClass *cls) {
     for (uint16_t i = 0; i < count; ++i) inst->fields[i] = NULL_VAL;
 
     /* Linked last: a mid-collection isMarked state can't arise here, since a collection in progress makes jaiGCLimit zero and the first line above would already have declined. */
-    obj->next = g->objects;
-    g->objects = obj;
+    if (!paged) {
+        obj->next = g->objects;
+        g->objects = obj;
+    }
 
     vm.allocCount++;
     return inst;

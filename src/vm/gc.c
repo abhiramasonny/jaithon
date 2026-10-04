@@ -132,6 +132,7 @@ void jaiGCInit(GCState *gc) {
     vm.gc = gc;
     jaiGCInCollect = false;
     jaiGCSyncLimit();
+    jaiPageSpaceInit();
 }
 
 void jaiGCFree(GCState *gc) {
@@ -144,6 +145,9 @@ void jaiGCFree(GCState *gc) {
         object = next;
     }
     gc->objects = NULL;
+    /* Page objects own nothing but their blocks, so there is nothing to free
+     * one by one: every page goes back to the pool. */
+    jaiHeapAccountFreed(jaiPageSpaceReset());
 
     JAI_FREE_ARRAY(Value, gc->tempRoots, gc->tempRootCapacity);
     gc->tempRoots = NULL;
@@ -198,6 +202,7 @@ double   jaiGCRootSec, jaiGCTraceSec;
 void jaiGCMarkObject(Obj *obj) {
     if (obj == NULL || obj->isMarked == jaiGCEpoch) return;
     obj->isMarked = jaiGCEpoch;
+    if (jaiInPageSpace(obj)) jaiPageMark(obj);
 #ifdef JAI_ALLOC_CENSUS
     jaiGCMarked++;
 #endif
@@ -564,6 +569,7 @@ void jaiGCCollect(void) {
 
     /* Everything allocated so far now reads white. */
     jaiGCEpoch = !jaiGCEpoch;
+    jaiPageCollectBegin();
 
 #ifdef JAI_ALLOC_CENSUS
     double t0 = jaiClockMonotonic();
@@ -587,6 +593,7 @@ void jaiGCCollect(void) {
 #endif
 
     int freedObjects = sweep(g);
+    jaiHeapAccountFreed(jaiPageCollectEnd());
 #ifdef JAI_ALLOC_CENSUS
     double t3 = jaiClockMonotonic();
     jaiGCMarkSec += t1 - t0;

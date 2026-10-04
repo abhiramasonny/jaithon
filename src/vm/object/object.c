@@ -90,14 +90,31 @@ static inline Obj *allocObj(size_t size, ObjType type) {
      * that stopped being true. */
     if (JAI_UNLIKELY(jaiGCWanted())) jaiGCMaybeCollect();
 
-    /* jaiSmallNew is the bins-and-slab half of jaiRealloc with the size class
-     * already known, so this is the same block from the same place minus the
-     * call and five branches sorting resize/free/unserved classes. Measured
-     * 10% of alloc_churn for two calls per object. */
-    Obj *obj = (Obj *)(JAI_LIKELY(jaiSmallServes(size)) ? jaiSmallNew(size)
-                                                        : jaiRealloc(NULL, 0, size));
+    Obj *obj;
+    if (JAI_LIKELY(jaiSmallServes(size))) {
+        /* A kind that owns nothing but its block goes to the page space, where
+         * the collector frees it without visiting it and nothing links it into
+         * GCState.objects (gc.h). */
+        unsigned cls = (unsigned)((size + (JAI_SMALL_GRAIN - 1u)) >> 4);
+        if (JAI_LIKELY(jaiPageKind[type]) &&
+            JAI_LIKELY((obj = (Obj *)jaiPageNew(cls)) != NULL)) {
+            jaiHeapBytes += (size_t)cls * JAI_SMALL_GRAIN;
+            obj->type = type;
+            obj->isMarked = jaiGCEpoch;
+            obj->subFlag = false;
+            obj->subFlag2 = false;
+            vm.allocCount++;
+            return obj;
+        }
+        /* jaiSmallNew is the bins-and-slab half of jaiRealloc with the size
+         * class already known, so this is the same block from the same place
+         * minus the call and five branches sorting resize/free/unserved
+         * classes. Measured 10% of alloc_churn for two calls per object. */
+        obj = (Obj *)jaiSmallNew(size);
+    } else {
+        obj = (Obj *)jaiRealloc(NULL, 0, size);
+    }
     obj->type = type;
-    obj->isMarked = false;
     obj->next = NULL;
     jaiGCTrackObject(obj);
     vm.allocCount++;
