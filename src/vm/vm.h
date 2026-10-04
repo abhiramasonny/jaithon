@@ -244,6 +244,17 @@ void jaiPrepareFn1(Value callee, JaiPreparedFn1 *prepared);
  * including every fallback it makes. */
 bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out);
 
+/* A run of jaiCallPreparedFn1 over `src` from element `from`, appending each
+ * result to `dst` -- for a flat callee that takes an int and returns one, with
+ * every per-callee check and the stack window hoisted out of the loop. Stops
+ * at the first element it cannot take that way and returns its index (`from`
+ * itself when it took none); the caller takes that element the ordinary way
+ * and may call again. `*ok` false means the callee raised, and the caller must
+ * stop. JAITHON_MAP_RUN=0 turns it off (jaiMapRunOn). */
+int  jaiMapPreparedFn1Ints(JaiPreparedFn1 *prepared, ObjList *src, int from,
+                           ObjList *dst, bool *ok);
+bool jaiMapRunOn(void);
+
 /* Finish, in the interpreter, a one-argument compiled call that deoptimised
  * part-way: the body already ran and may have written, so it must not be
  * re-entered from the top. `base` is the two-cell window [closure, argument]

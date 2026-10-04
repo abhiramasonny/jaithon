@@ -7,6 +7,7 @@
 /* For jaiBuiltinMethod: resolving `xs.len()` to a native needs the runtime's name table. */
 /* For jaiOpBranchOperandAt: says which opcodes carry a branch target. */
 #include "vm/vm.h"
+#include "vm/gc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -544,7 +545,133 @@ bool jaiCallPreparedFn1(JaiPreparedFn1 *p, Value arg, Value *out) {
     return callFn1Rerun(base, out);
 }
 
+/* JAITHON_MAP_RUN=0 sends every element of a map back through
+ * jaiCallPreparedFn1 one call at a time. On by default. */
+bool jaiMapRunOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_MAP_RUN");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* See vm.h. jaiCallPreparedFn1's int-to-int path, with the loop moved inside
+ * it.
+ *
+ * Per element, jaiCallPreparedFn1 is a non-inlined call with five callee-saved
+ * pairs to save and restore, a staleness test of four loads, a window set up
+ * and torn down, and then the caller boxes the element out of the source and
+ * back into the result through two storage switches. None of that depends on
+ * the element. Here the window is built once and the staleness test is the two
+ * compares that CAN change between elements -- a body that bails or recompiles
+ * moves fn->jitFunc, and one that defines a global moves the module version --
+ * so what is left per element is the load, the call and the store.
+ *
+ * Anything off the int-to-int path is not handled here at all: it stops the
+ * run, and the caller takes that element the ordinary way. The one exception
+ * is a call that comes back with a non-zero verdict, which has already
+ * happened and so cannot be handed back; it is finished exactly as
+ * jaiCallPreparedFn1 would finish it. */
+int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
+                          ObjList *dst, bool *ok) {
+    *ok = true;
+    if (!p->flat || !p->intArg || p->nargs != 1 ||
+        p->returnKind != (uint8_t)SLOT_INT) {
+        return from;
+    }
+    ObjFunction *fn = p->fn;
+    void *entry = p->entry;
+    uint32_t mv = p->moduleVersion;
+    Value *base = vm.stackTop;
+    if (base > p->limit) return from;
+    base[0] = p->callee;
+    base[1] = NULL_VAL;
+    vm.stackTop = base + 2;
+
+    int i = from;
+    for (; i < src->count; i++) {
+        if (JAI_UNLIKELY(fn->jitFunc != entry ||
+                         fn->module->version != mv)) {
+            break;
+        }
+        int64_t a0;
+        /* Re-read every time: the callee may push onto, box, or shrink the
+         * very list being mapped, and the loop bound above is live for the
+         * same reason. */
+        if (src->stg == (uint8_t)LIST_STORE_I64) {
+            a0 = ((const int64_t *)src->items)[i];
+        } else if (src->stg == (uint8_t)LIST_STORE_BOXED) {
+            Value v = ((const Value *)src->items)[i];
+            if (JAI_UNLIKELY(!IS_INT(v))) break;
+            a0 = AS_INT(v);
+        } else {
+            break;
+        }
+        base[1] = INT_VAL(a0);
+        int frameBase = vm.frameCount;
+        JitResult r = ((Fn1)(uintptr_t)entry)(a0);
+        Value mapped;
+        if (JAI_LIKELY(r.bailed == 0)) {
+            mapped = INT_VAL(r.value);
+        } else {
+            JaiJitOutcome outcome = jitResultOut(fn, r, base);
+            bool good;
+            if (outcome == JAI_JIT_DONE) {
+                mapped = base[0];
+                good = true;
+            } else if (outcome == JAI_JIT_ERROR) {
+                good = false;
+            } else if (outcome == JAI_JIT_DEOPT) {
+                good = jaiFinishJitDeopt1(p->closure, base, frameBase,
+                                          &mapped);
+            } else {
+                good = callFn1Rerun(base, &mapped);
+            }
+            vm.stackTop = base;
+            if (!good) {
+                *ok = false;
+                return i;
+            }
+            /* Not an int, perhaps, and the window is gone: store it the
+             * ordinary way and hand the rest back to the caller, which will
+             * prepare again before the next run. */
+            if (JAI_LIKELY(dst->count < dst->capacity)) {
+                jaiListPut(dst, dst->count++, mapped);
+            } else {
+                jaiGCPushRoot(mapped);
+                jaiListPush(dst, mapped);
+                jaiGCPopRoot();
+            }
+            dst->version++;
+            if (vm.hasException) *ok = false;
+            return i + 1;
+        }
+        if (JAI_LIKELY(dst->count < dst->capacity)) {
+            jaiListPut(dst, dst->count++, mapped);
+        } else {
+            jaiListPush(dst, mapped);
+        }
+        dst->version++;
+        if (JAI_UNLIKELY(vm.hasException)) {
+            vm.stackTop = base;
+            *ok = false;
+            return i + 1;
+        }
+    }
+    vm.stackTop = base;
+    return i;
+}
+
 #else
+
+int jaiMapPreparedFn1Ints(JaiPreparedFn1 *p, ObjList *src, int from,
+                          ObjList *dst, bool *ok) {
+    (void)p; (void)src; (void)dst;
+    *ok = true;
+    return from;
+}
+bool jaiMapRunOn(void) { return false; }
 
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return JAI_JIT_DECLINED;
