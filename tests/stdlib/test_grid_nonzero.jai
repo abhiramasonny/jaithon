@@ -132,6 +132,18 @@ fn test_a_non_number_in_the_source_is_refused() -> void {
     }, "a string among the values")
 }
 
+fn test_a_list_of_bools_built_by_push_is_refused() -> void {
+    #: Ten bools pushed onto an untyped list grow it past eight, which gives it
+    #: one-byte storage (jaiListShapeOnGrow). It is still a list of bools, not
+    #: of numbers, and is refused as the same list held boxed always was.
+    var flags = []
+    for k in 0..10 { flags.push(k % 3 == 0) }
+    assert_throws(TypeError, fn() -> void {
+        var got = __prim__.list_filled(64, 0)
+        __prim__.grid_nonzero(got, flags, 2, 5, 5, 0)
+    }, "bools pushed onto an untyped list")
+}
+
 fn test_an_empty_picture_writes_nothing() -> void {
     var got = __prim__.list_filled(4, 5)
     __prim__.grid_nonzero(got, [], 0, 0, 0, 0)
