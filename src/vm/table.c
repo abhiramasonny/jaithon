@@ -613,24 +613,36 @@ JaiTable *jaiInternTable(void) {
     return &internTable;
 }
 
-static inline uint64_t internFingerprint(const char *chars, size_t length) {
-    uint64_t fp = (uint64_t)(length > 255 ? 255 : length) << 56;
-    const size_t n = length < 7 ? length : 7;
-
-    for (size_t i = 0; i < n; ++i)
-        fp |= (uint64_t)(uint8_t)chars[i] << (i * 8);
-
-    return fp;
+/* Equal bytes, without a call: the run-time strings interning sees are at
+ * most JAI_INTERN_MAX bytes, and a memcmp anywhere in the probe loop made
+ * jaiInternTableFindFp save six register pairs on every probe, hit or miss,
+ * for a compare most probes never reach. */
+static inline bool internBytesEqual(const char *a, const char *b, size_t n) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t x, y;
+        memcpy(&x, a + i, 8);
+        memcpy(&y, b + i, 8);
+        if (x != y) return false;
+    }
+    for (; i < n; ++i) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
 }
 
-ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
+#define INTERN_SHORT_COMPARE 64
+
+/* The probe. `viaMemcmp` is a constant at both call sites below, so each gets
+ * its own copy: the short one with no call in it at all. */
+JAI_INLINE ObjString *internProbe(const char *chars, size_t length,
+                                  uint64_t hash, uint64_t fp, bool viaMemcmp) {
     JaiTable *const t = &internTable;
     if (t->count == 0) return NULL;
 
     const uint32_t mask = (uint32_t)t->capacity - 1;
     uint32_t index = (uint32_t)hash & mask;
     JaiEntry *const entries = t->entries;
-    const uint64_t fp = internFingerprint(chars, length);
 
     for (;;) {
         JaiEntry *const e = entries + index;
@@ -643,15 +655,37 @@ ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
             JAI_ASSERT(IS_STRING(e->key), "intern table holds only strings");
             ObjString *const s = (ObjString *)AS_OBJ(e->key);
 
+            /* The fingerprint holds the length and every byte of a string
+             * this short, and the hash agrees: nothing left to compare. */
             if (length <= 7) return s;
 
             if ((size_t)s->length == length &&
-                memcmp(s->chars, chars, length) == 0)
+                (viaMemcmp ? memcmp(s->chars, chars, length) == 0
+                           : internBytesEqual(s->chars, chars, length)))
                 return s;
         }
 
         index = (index + 1) & mask;
     }
+}
+
+/* Names and other long strings, out of line so that the short probe stays a
+ * leaf. */
+static JAI_NOINLINE ObjString *internFindLong(const char *chars, size_t length,
+                                              uint64_t hash, uint64_t fp) {
+    return internProbe(chars, length, hash, fp, true);
+}
+
+ObjString *jaiInternTableFindFp(const char *chars, size_t length,
+                                uint64_t hash, uint64_t fp) {
+    if (length > INTERN_SHORT_COMPARE)
+        return internFindLong(chars, length, hash, fp);
+    return internProbe(chars, length, hash, fp, false);
+}
+
+ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash) {
+    return jaiInternTableFindFp(chars, length, hash,
+                                jaiInternFingerprint(chars, length));
 }
 
 void jaiInternTableAdd(ObjString *s) {
@@ -662,5 +696,5 @@ void jaiInternTableAdd(ObjString *s) {
 
     (void)jaiTableSetInterned(
         &internTable, s,
-        INT_VAL((int64_t)internFingerprint(s->chars, s->length)));
+        INT_VAL((int64_t)jaiInternFingerprint(s->chars, s->length)));
 }

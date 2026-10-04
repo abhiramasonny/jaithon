@@ -57,12 +57,45 @@ void jaiTableRemoveWhite(JaiTable *t);
 //String intern table
 
 ObjString *jaiInternTableFind(const char *chars, size_t length, uint64_t hash);
+
+/* What an intern entry keeps in its value slot: the length in the top byte
+ * and the first seven bytes below it. A probe compares this before it touches
+ * the string at all, and for a string of seven bytes or fewer it is the whole
+ * string, so a hit costs no load from the string object. */
+static inline uint64_t jaiInternFingerprint(const char *chars, size_t length) {
+    uint64_t fp = (uint64_t)(length > 255 ? 255 : length) << 56;
+    const size_t n = length < 7 ? length : 7;
+
+    for (size_t i = 0; i < n; ++i)
+        fp |= (uint64_t)(uint8_t)chars[i] << (i * 8);
+
+    return fp;
+}
+
+/* The same fingerprint from one load, for a caller that guarantees eight
+ * readable, initialised bytes at `chars` whatever `length` is, and a length
+ * of at most 255. Little-endian, as the byte loop above is by construction. */
+static inline uint64_t jaiInternFingerprintPadded(const char *chars,
+                                                  size_t length) {
+    uint64_t w;
+    memcpy(&w, chars, sizeof w);
+    const size_t n = length < 7 ? length : 7;
+    return ((uint64_t)length << 56) | (w & ((UINT64_C(1) << (n * 8)) - 1));
+}
+
+/* jaiInternTableFind with the fingerprint already in hand. */
+ObjString *jaiInternTableFindFp(const char *chars, size_t length,
+                                uint64_t hash, uint64_t fp);
 void       jaiInternTableAdd(ObjString *s);
 void       jaiInternTableInit(void);
 void       jaiInternTableFree(void);
 JaiTable  *jaiInternTable(void);
 
 extern JaiTable jaiInternTableStorage;
+
+/* The run-time interning policy's two numbers; object_string.c explains them. */
+#define JAI_INTERN_MAX      32        /* longest run-time string worth a probe */
+#define JAI_INTERN_SOFT_CAP (1 << 15) /* entries, past which run-time strings stop */
 static inline int jaiInternTableCount(void) { return jaiInternTableStorage.count; }
 
 #endif /* JAI_TABLE_H */

@@ -51,8 +51,10 @@
  * The cap has to clear the names as well, since they share the table; the
  * stdlib interns about 2,500. jaiStringCanonical is the way in for the few
  * reflective entry points that need identity for a string the caller built. */
-#define JAI_INTERN_MAX      32        /* longest run-time string worth a probe */
-#define JAI_INTERN_SOFT_CAP (1 << 15) /* entries, past which run-time strings stop */
+/* JAI_INTERN_MAX (the longest run-time string worth a probe) and
+ * JAI_INTERN_SOFT_CAP (entries, past which run-time strings stop) live in
+ * table.h, so that a caller building a short string somewhere else -- the
+ * f-string formatter in value.c -- can apply this same policy itself. */
 
 /* ------------------------------------------------------------------ */
 /* Strings                                                              */
@@ -78,6 +80,30 @@ static ObjString *allocString(size_t length) {
     return s;
 }
 
+/* memcpy for the lengths run-time strings mostly have, without the call:
+ * two overlapping loads and stores cover anything from four to sixteen bytes.
+ * A key or a formatted number is a handful of bytes, and the call into
+ * _platform_memmove costs several times the copy (see jaiStringFromParts). */
+JAI_INLINE void copyChars(char *dst, const char *src, size_t n) {
+    if (n >= 8 && n <= 16) {
+        uint64_t a, b;
+        memcpy(&a, src, 8);
+        memcpy(&b, src + n - 8, 8);
+        memcpy(dst, &a, 8);
+        memcpy(dst + n - 8, &b, 8);
+    } else if (n >= 4 && n < 8) {
+        uint32_t a, b;
+        memcpy(&a, src, 4);
+        memcpy(&b, src + n - 4, 4);
+        memcpy(dst, &a, 4);
+        memcpy(dst + n - 4, &b, 4);
+    } else if (n > 16) {
+        memcpy(dst, src, n);
+    } else {
+        for (size_t i = 0; i < n; ++i) dst[i] = src[i];
+    }
+}
+
 /* Adds `s` to the intern table. The table may grow, so `s` is rooted across
  * the insertion. */
 static inline void internString(ObjString *s) {
@@ -99,7 +125,7 @@ ObjString *jaiStringIntern(const char *chars, size_t length) {
     if (found != NULL) return found;
 
     ObjString *s = allocString(length);
-    if (length != 0) memcpy(s->chars, chars, length);
+    copyChars(s->chars, chars, length);
     s->hash = hash;
     internString(s);
     return s;
@@ -204,7 +230,7 @@ ObjString *jaiStringNew(const char *chars, size_t length) {
     }
 
     ObjString *s = allocString(length);
-    if (length != 0) memcpy(s->chars, chars, length);
+    copyChars(s->chars, chars, length);
     s->hash = hash;
     if (insert) internString(s);
     return s;
@@ -238,7 +264,7 @@ ObjString *jaiStringTake(char *chars, size_t length) {
     }
 
     ObjString *s = allocString(length);
-    if (length != 0) memcpy(s->chars, chars, length);
+    copyChars(s->chars, chars, length);
     s->hash = hash;
     (void)jaiRealloc(chars, length + 1, 0);
     if (insert) internString(s);
