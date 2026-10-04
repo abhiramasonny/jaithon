@@ -75,6 +75,11 @@ bool emitGetIter(Emit *e, int *offp) {
             if (IS_NULL(sample)) sample = e->stackElem[e->depth - 1];
             if (IS_NULL(sample)) {
                 e->whyNot = "iterating a list with nothing to look at";
+                /* Nothing has been emitted for this instruction, so it can
+                 * be handed to the interpreter instead -- see iterSoft. */
+                if (jitIterSoft() && !e->osr && !e->inlining) {
+                    e->iterUnarmed = true;
+                }
                 return false;
             }
             if (!emitDescriptor(e, NULL_VAL, e->depth - 1, 1,
@@ -1203,6 +1208,9 @@ bool emitForIterPair(Emit *e, const uint8_t *code, int *offp) {
                 !firstLiveEntry(&AS_DICT(psample)->table,
                                 &pseen[0], &pseen[1])) {
                 e->whyNot = "iterating a dict with nothing to look at";
+                if (jitIterSoft() && !e->osr && !e->inlining) {
+                    e->iterUnarmed = true;
+                }
                 return false;
             }
         } else {

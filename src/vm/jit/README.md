@@ -464,6 +464,8 @@ this table complete in both directions.
 | `JAITHON_JIT_CONST_ASCII` | on | Mark a one-character ASCII string literal as the ASCII table's own singleton at `OP_CONST`, so `==` and the one-byte ordering arm stop guarding the literal at run time. |
 | `JAITHON_JIT_STR_FACTS` | on | Prove once at an OSR loop head, with no register, that a loop-invariant string local is a string, all one-byte (for `s[i]`) and/or interned (for `==`), so the per-iteration guards go even in a loop that calls. Off restores them. |
 | `JAITHON_JIT_FIELD_DICT` | on | Predict a declared `dict[K, V]` field read off a receiver with no live sample (an instance the body built itself): tag and `OBJ_DICT` guarded, sampled by an empty exemplar dict so `d[k] = v` and the dict methods can compile. Off restores the decline. |
+| `JAITHON_JIT_ITER_SOFT` | on | Function tier: a list or dict loop whose sampled container is empty ("iterating a list/dict with nothing to look at") is left to the interpreter from that instruction instead of declining the whole body. Off restores the decline. |
+| `JAITHON_JIT_ITER_EMPTY_SKIP` | on | In front of a soft iterate refusal on a list, branch straight to the loop exit when the list is empty at run time, so only a non-empty list deopts. |
 | `JAITHON_JIT_STR_HOIST` | on | Hoist a loop-invariant string local's header (`chars`, `length`) and its string and all-one-byte proofs to the loop head, so `s[i]` inside a call-free OSR loop is a bounds check and a byte load. Off restores the per-character guards. |
 | `JAITHON_JIT_COMP_ACC` | on | A list comprehension's append, through the frame. |
 | `JAITHON_JIT_BUILTIN_CLASS` | on | Resolve a builtin class (every exception type). |

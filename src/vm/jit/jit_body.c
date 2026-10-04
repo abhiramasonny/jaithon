@@ -1167,7 +1167,36 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
 
         case OP_GET_ITER:
-            if (!emitGetIter(e, &off)) return false;
+            if (!emitGetIter(e, &off)) {
+                if (e->iterUnarmed) {
+                    e->iterUnarmed = false;
+                    e->whyNot = NULL;
+                    /* A list that is EMPTY at run time runs no iteration at
+                     * all, so it can skip straight to the loop's exit in
+                     * compiled code: building the iterator and finding it
+                     * exhausted has no effect the program can see. Only a
+                     * list with something in it is handed to the
+                     * interpreter. Without this a function that usually
+                     * loops over nothing -- `for g in generics` -- would pay
+                     * a deopt on every call for a loop it never runs, which
+                     * measured slower than not compiling it at all. */
+                    if (jitIterEmptySkip() && e->depth >= 1 &&
+                        e->stack[e->depth - 1] == SLOT_LIST &&
+                        off + 6 <= stop && code[off + 1] == OP_FOR_ITER_BIND) {
+                        int16_t fj = jaiReadI16(code + off + 2);
+                        uint32_t exitAt = (uint32_t)((int32_t)(off + 1 + 5) + fj);
+                        settleAll(e);
+                        unsigned rl = xHeldIn(e, e->valueDepth - 1);
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rl,
+                                           (unsigned)offsetof(ObjList, count)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, 0));
+                        branchToDepth(e, exitAt, JAI_A64_EQ,
+                                      stackSignatureAt(e, e->depth - 1));
+                    }
+                    goto unarmedOpcode;
+                }
+                return false;
+            }
             break;
 
         case OP_ITER_RANGE:
@@ -1187,7 +1216,14 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             break;
 
         case OP_FOR_ITER_PAIR:
-            if (!emitForIterPair(e, code, &off)) return false;
+            if (!emitForIterPair(e, code, &off)) {
+                if (e->iterUnarmed) {
+                    e->iterUnarmed = false;
+                    e->whyNot = NULL;
+                    goto unarmedOpcode;
+                }
+                return false;
+            }
             break;
 
         case OP_GET_INDEX:

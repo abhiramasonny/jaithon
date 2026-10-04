@@ -48,6 +48,33 @@ bool jitFieldDict(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_ITER_SOFT=0 makes a list or dict loop whose container had no
+ * element to sample decline the whole function again, rather than leave the
+ * loop to the interpreter and compile the rest. The sampled container is
+ * whatever the call that crossed the threshold happened to pass: a tree walk
+ * that recurses through leaves samples an empty child list nearly every time,
+ * and declined five attempts out of five for it. */
+bool jitIterSoft(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_SOFT");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_ITER_EMPTY_SKIP=0 drops the empty-list exit in front of a soft
+ * iterate refusal (see OP_GET_ITER), so every entry to such a loop deopts,
+ * empty or not. */
+bool jitIterEmptySkip(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_EMPTY_SKIP");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 void jaiJitMarkFrames(void) {
     for (JitCallDesc *f = gJitFrames; f != NULL; f = f->link) {
         for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);

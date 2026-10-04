@@ -550,6 +550,10 @@ typedef struct {
         bool     ascii, interned;
     } strFact[JIT_MAX_STR_FACTS];
     unsigned  strFactCount;
+    /* Set by an iterate arm that found no element to sample and emitted
+     * nothing, asking the walk to interpret from that instruction rather
+     * than decline the body. Function tier only; see jitIterSoft. */
+    bool      iterUnarmed;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -989,6 +993,8 @@ bool jitStrHoist(void);
 bool jitStrFacts(void);
 ObjDict *jitDictExemplar(void);
 bool jitFieldDict(void);
+bool jitIterSoft(void);
+bool jitIterEmptySkip(void);
 void planStrFacts(Emit *e, ObjFunction *fn);
 bool strFactAscii(const Emit *e, int slot);
 bool strFactInterned(const Emit *e, int slot);
