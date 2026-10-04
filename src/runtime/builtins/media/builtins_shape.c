@@ -333,7 +333,193 @@ static bool primPointsMinBox(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* --- curves --------------------------------------------------------- */
+
+/* The points of `curve` as doubles, `float(point.x)` and `float(point.y)` in
+ * Jaithon. NULL, having set `*readable` false, when a point is not one. */
+static double *curveFloats(ObjList *curve, bool *readable) {
+    const int count = curve->count;
+    *readable = true;
+    double *xy = (double *)malloc((size_t)(count > 0 ? count : 1) * 2 * sizeof(double));
+    if (xy == NULL) return NULL;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    for (int i = 0; i < count; i++) {
+        int64_t x, y;
+        if (!jaiReadPoint(&reader, jaiListGet(curve, i), &x, &y)) {
+            *readable = false;
+            free(xy);
+            return NULL;
+        }
+        xy[i * 2] = (double)x;
+        xy[i * 2 + 1] = (double)y;
+    }
+    return xy;
+}
+
+/* `furthest_from` in approx.jai: the point furthest from `origin`, the
+ * earliest of a tie. */
+static int curveFurthest(const double *xy, int count, int origin) {
+    const double ox = xy[origin * 2];
+    const double oy = xy[origin * 2 + 1];
+    int far = 0;
+    double furthest = -1.0;
+    for (int index = 0; index < count; index++) {
+        const double dx = xy[index * 2] - ox;
+        const double dy = xy[index * 2 + 1] - oy;
+        const double span = dx * dx + dy * dy;
+        if (span > furthest) {
+            furthest = span;
+            far = index;
+        }
+    }
+    return far;
+}
+
+/* `douglas_peucker` in approx.jai, appending the kept points' positions in
+ * `curve` to `kept`. The recursion is the same and so is the order of the
+ * points it keeps. */
+static void curveSimplify(const double *xy, int count, int start, int first, int last,
+                          int32_t *kept, int *keptCount, double epsilon) {
+    if (last <= first + 1) return;
+    int here = start + first;
+    if (here >= count) here -= count;
+    const double ax = xy[here * 2];
+    const double ay = xy[here * 2 + 1];
+    here = start + last;
+    if (here >= count) here -= count;
+    const double dx = xy[here * 2] - ax;
+    const double dy = xy[here * 2 + 1] - ay;
+    const double squared = dx * dx + dy * dy;
+    double worst = 0.0;
+    int worstAt = first;
+    for (int index = first + 1; index < last; index++) {
+        here = start + index;
+        if (here >= count) here -= count;
+        const double px = xy[here * 2];
+        const double py = xy[here * 2 + 1];
+        double gap = (px - ax) * (px - ax) + (py - ay) * (py - ay);
+        if (squared > 1e-12) {
+            const double dot = (px - ax) * dx + (py - ay) * dy;
+            if (dot > 0.0) {
+                double t = 1.0;
+                if (dot < squared) t = dot / squared;
+                const double cx = ax + t * dx;
+                const double cy = ay + t * dy;
+                gap = (px - cx) * (px - cx) + (py - cy) * (py - cy);
+            }
+        }
+        if (gap > worst) {
+            worst = gap;
+            worstAt = index;
+        }
+    }
+    if (sqrt(worst) <= epsilon) return;
+    curveSimplify(xy, count, start, first, worstAt, kept, keptCount, epsilon);
+    here = start + worstAt;
+    if (here >= count) here -= count;
+    kept[(*keptCount)++] = here;
+    curveSimplify(xy, count, start, worstAt, last, kept, keptCount, epsilon);
+}
+
+/* `points_approx(curve, epsilon, closed)` -- `approx_poly_dp` for a curve of
+ * three or more points and a tolerance that is not negative, which the caller
+ * has checked: the curve cut at OpenCV's two furthest points if it is closed,
+ * each half simplified by Douglas and Peucker, the result made of the
+ * caller's own points in OpenCV's rotation. Null when a point is not an
+ * object with integer `x` and `y`. */
+static bool primPointsApprox(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *curve;
+    if (!jaiArgList(args[0], 1, "points_approx", &curve)) return false;
+    if (!IS_FLOAT(args[1]) || !IS_BOOL(args[2])) {
+        return jaiThrow(vm.cTypeError, "points_approx(): wants a float tolerance and a bool");
+    }
+    const double epsilon = AS_FLOAT(args[1]);
+    const bool closed = AS_BOOL(args[2]);
+    const int count = curve->count;
+    *out = NULL_VAL;
+    if (count < 3 || !(epsilon >= 0.0)) return true;
+    bool readable;
+    double *xy = curveFloats(curve, &readable);
+    if (xy == NULL) {
+        return readable ? jaiThrow(vm.cRuntimeError, "points_approx(): out of memory") : true;
+    }
+    int32_t *kept = (int32_t *)malloc((size_t)(count + 2) * sizeof(int32_t));
+    if (kept == NULL) {
+        free(xy);
+        return jaiThrow(vm.cRuntimeError, "points_approx(): out of memory");
+    }
+    int start = 0;
+    if (closed) start = curveFurthest(xy, count, curveFurthest(xy, count, 0));
+    const int last = closed ? count : count - 1;
+    int keptCount = 0;
+    kept[keptCount++] = start;
+    /* Recursion depth is at most the number of points between the ends. */
+    curveSimplify(xy, count, start, 0, last, kept, &keptCount, epsilon);
+    if (!closed) kept[keptCount++] = count - 1;
+    free(xy);
+
+    ObjList *made = jaiListNew(keptCount);
+    if (made == NULL) {
+        free(kept);
+        return false;
+    }
+    jaiGCPushRoot(OBJ_VAL(made));
+    const bool reserved = jaiListReserveExact(made, keptCount);
+    jaiGCPopRoot();
+    if (!reserved) {
+        free(kept);
+        return jaiThrow(vm.cRuntimeError, "points_approx(): out of memory");
+    }
+    Value *slots = jaiListBox(made);
+    for (int i = 0; i < keptCount; i++) slots[i] = jaiListGet(curve, kept[i]);
+    free(kept);
+    made->count = keptCount;
+    jaiListTouch(made);
+    *out = OBJ_VAL(made);
+    return true;
+}
+
+/* `points_arc_length(curve, closed)` -- `arc_length` for a curve of two or
+ * more points: each step's length, `float` of the integer differences, summed
+ * in order. Null when a point is not one, or when a difference overflows,
+ * which Jaithon reports itself. */
+static bool primPointsArcLength(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *curve;
+    if (!jaiArgList(args[0], 1, "points_arc_length", &curve)) return false;
+    if (!IS_BOOL(args[1])) {
+        return jaiThrow(vm.cTypeError, "points_arc_length(): closed must be a bool");
+    }
+    const bool closed = AS_BOOL(args[1]);
+    const int count = curve->count;
+    *out = NULL_VAL;
+    if (count <= 1) return true;
+    JaiPointReader reader;
+    jaiPointReaderInit(&reader);
+    int64_t px, py;
+    if (!jaiReadPoint(&reader, jaiListGet(curve, closed ? count - 1 : 0), &px, &py)) return true;
+    double total = 0.0;
+    for (int index = closed ? 0 : 1; index < count; index++) {
+        int64_t x, y, dx, dy;
+        if (!jaiReadPoint(&reader, jaiListGet(curve, index), &x, &y) ||
+            __builtin_sub_overflow(x, px, &dx) || __builtin_sub_overflow(y, py, &dy)) {
+            return true;
+        }
+        const double fx = (double)dx;
+        const double fy = (double)dy;
+        total += sqrt(fx * fx + fy * fy);
+        px = x;
+        py = y;
+    }
+    *out = FLOAT_VAL(total);
+    return true;
+}
+
 void jaiShapeRegisterPrimitives(ObjModule *ns) {
     jaiStrDefinePrim(ns, "points_hull",    primPointsHull,   2, 2);
     jaiStrDefinePrim(ns, "points_min_box", primPointsMinBox, 2, 2);
+    jaiStrDefinePrim(ns, "points_approx", primPointsApprox, 3, 3);
+    jaiStrDefinePrim(ns, "points_arc_length", primPointsArcLength, 2, 2);
 }

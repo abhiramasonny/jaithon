@@ -1,5 +1,6 @@
 #: Where a point falls against a contour, and the simplification of a curve.
 import std.math
+from std.os import env
 from ...core.types import Point, Point2f
 from .moments import EPSILON
 
@@ -222,12 +223,24 @@ fn douglas_peucker(
     douglas_peucker(curve, count, start, worst_at, last, out, epsilon)
 }
 
+#: Whether `approx_poly_dp` asks `__prim__.points_approx` first. Read once;
+#: `JAICV_NATIVE_APPROX=0` keeps the Jaithon above, which it is checked
+#: against. A 74-point frame contour took 3.3 microseconds against OpenCV's
+#: 1.6, nearly all of it calls and the guards around each point read.
+let _native_approx = (env("JAICV_NATIVE_APPROX") ?? "1") != "0"
+
 #: Simplify a curve, dropping points that sit within `epsilon` of the line
 #: through their neighbours.
 pub fn approx_poly_dp(curve: list[Point], epsilon: float, closed: bool) -> list[Point] {
     let count = curve.len()
     if count < 3 { return curve }
     if epsilon < 0.0 { throw ValueError("an approximation tolerance cannot be negative") }
+    #: All of the below in `__prim__.points_approx`, operation for operation.
+    #: Null for a curve whose points it cannot read, which goes on below.
+    if _native_approx {
+        let kept = __prim__.points_approx(curve, epsilon, closed)
+        if kept is not null { return kept }
+    }
 
     #: A closed curve has no natural ends, so two are made: the point furthest
     #: from the first, and then the point furthest from that one. The curve is
