@@ -83,10 +83,104 @@ static void hullSort(HullPoint *items, HullPoint *spare, size_t count) {
     if (from != items) memcpy(items, from, count * sizeof(HullPoint));
 }
 
+/* Columns, kept between calls, for putting points in order without sorting
+ * them. A bit a column says whether any point landed there, and for each
+ * column that has one, its lowest and its highest point -- the earliest of
+ * any that tie, which is the one a stable sort keeps. Only the bits are
+ * cleared afterwards; a column's two points are written fresh by the first
+ * point to land in it. */
+typedef struct {
+    uint64_t *occupied;
+    HullPoint *lowest;
+    HullPoint *highest;
+    size_t width;
+} HullColumns;
+
+static _Thread_local HullColumns tColumns;
+
+static bool hullColumnsReserve(HullColumns *c, size_t width) {
+    if (c->width >= width) return true;
+    const size_t words = (width + 63) / 64;
+    uint64_t *occupied = (uint64_t *)calloc(words, sizeof(uint64_t));
+    HullPoint *lowest = (HullPoint *)malloc(width * sizeof(HullPoint));
+    HullPoint *highest = (HullPoint *)malloc(width * sizeof(HullPoint));
+    if (occupied == NULL || lowest == NULL || highest == NULL) {
+        free(occupied);
+        free(lowest);
+        free(highest);
+        return false;
+    }
+    free(c->occupied);
+    free(c->lowest);
+    free(c->highest);
+    c->occupied = occupied;
+    c->lowest = lowest;
+    c->highest = highest;
+    c->width = width;
+    return true;
+}
+
+/* The points in sorted order with every point strictly between the lowest and
+ * the highest of its column left out, written to `items`; returns how many.
+ *
+ * Why leaving them out changes nothing. The chain below meets a column's
+ * points from the lowest up: each one above the lowest is pushed straight
+ * after it, the next one up is collinear with the two before and pops it, and
+ * the first point of the next column turns clockwise from the column's top
+ * and pops whatever is above the lowest. So no point strictly inside a
+ * column's span is ever on the chain when anything else is decided, and the
+ * stack the next column meets is the one it meets without them; the chain
+ * above is the same argument turned round. The two kept are the earliest of
+ * any ties, as `sorted_unique` keeps them. */
+static int hullByColumns(const HullPoint *read, int count, int64_t left, size_t width,
+                         HullPoint *items) {
+    HullColumns *c = &tColumns;
+    for (int i = 0; i < count; i++) {
+        const HullPoint *p = &read[i];
+        const size_t column = (size_t)(p->x - left);
+        uint64_t *word = &c->occupied[column >> 6];
+        const uint64_t bit = (uint64_t)1 << (column & 63);
+        if ((*word & bit) == 0) {
+            *word |= bit;
+            c->lowest[column] = *p;
+            c->highest[column] = *p;
+            continue;
+        }
+        /* Points come in by index, so the first of a tie is already held. */
+        if (p->y < c->lowest[column].y) c->lowest[column] = *p;
+        if (p->y > c->highest[column].y) c->highest[column] = *p;
+    }
+    int at = 0;
+    const size_t words = (width + 63) / 64;
+    for (size_t w = 0; w < words; w++) {
+        uint64_t bits = c->occupied[w];
+        c->occupied[w] = 0;
+        while (bits != 0) {
+            const size_t column = w * 64 + (size_t)__builtin_ctzll(bits);
+            bits &= bits - 1;
+            items[at++] = c->lowest[column];
+            if (c->highest[column].y != c->lowest[column].y) items[at++] = c->highest[column];
+        }
+    }
+    return at;
+}
+
 /* The sign of the turn o -> a -> b; `cross_sign` in hull.jai. */
 JAI_INLINE int hullTurn(const HullPoint *o, const HullPoint *a, const HullPoint *b) {
     const int64_t value = (a->x - o->x) * (b->y - o->y) - (a->y - o->y) * (b->x - o->x);
     return (value > 0) - (value < 0);
+}
+
+/* Whether the hull puts points in order by column rather than by sorting.
+ * Read once; JAICV_HULL_COLUMNS=0 sorts every time, which the column order is
+ * checked against. */
+static bool jaiHullColumnsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAICV_HULL_COLUMNS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on == 1;
 }
 
 /* The hull of `points` as positions in `items`, which comes back sorted, in
@@ -112,6 +206,7 @@ static int hullRing(ObjList *points, bool clockwise, HullPoint **itemsOut, int32
 
     JaiPointReader reader;
     jaiPointReaderInit(&reader);
+    int64_t left = 0, right = 0;
     for (int i = 0; i < count; i++) {
         int64_t x, y;
         if (!jaiReadPoint(&reader, jaiListGet(points, i), &x, &y) ||
@@ -119,17 +214,31 @@ static int hullRing(ObjList *points, bool clockwise, HullPoint **itemsOut, int32
             y <= -JAI_HULL_COORD_LIMIT || y >= JAI_HULL_COORD_LIMIT) {
             return 0;
         }
+        if (i == 0 || x < left) left = x;
+        if (i == 0 || x > right) right = x;
         items[i].x = x;
         items[i].y = y;
         items[i].index = i;
     }
-    hullSort(items, spare, (size_t)count);
 
-    /* Duplicates out, keeping the first of each: `sorted_unique`. */
-    int unique = 1;
-    for (int i = 1; i < count; i++) {
-        if (items[i].x == items[unique - 1].x && items[i].y == items[unique - 1].y) continue;
-        items[unique++] = items[i];
+    /* By column when the span is narrow enough to hold -- a contour's always
+     * is, being pixels -- and by sorting otherwise. Sorting was half of what
+     * a 74-point frame contour cost; the columns of that one are 1920 bits to
+     * walk. */
+    int unique;
+    const size_t width = (size_t)(right - left) + 1;
+    if (jaiHullColumnsOn() && width <= (size_t)count * 64 + 8192 &&
+        hullColumnsReserve(&tColumns, width)) {
+        memcpy(spare, items, (size_t)count * sizeof(HullPoint));
+        unique = hullByColumns(spare, count, left, width, items);
+    } else {
+        hullSort(items, spare, (size_t)count);
+        /* Duplicates out, keeping the first of each: `sorted_unique`. */
+        unique = 1;
+        for (int i = 1; i < count; i++) {
+            if (items[i].x == items[unique - 1].x && items[i].y == items[unique - 1].y) continue;
+            items[unique++] = items[i];
+        }
     }
     if (unique < 3) return 0;
 
