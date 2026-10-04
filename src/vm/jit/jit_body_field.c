@@ -22,6 +22,29 @@ static bool jitStrGuard(void) {
     return cached != 0;
 }
 
+/* Whether the module rebinds a builtin type name to a class, trait or enum.
+ * valueMatchesType (vm_class.c) resolves a guard's name through the frame's
+ * module before it falls back to the value's own type name, so `class dict`
+ * at module level makes `-> dict` reject a builtin dict; every arm below that
+ * reasons from the NAME would wave it through. Checked at compile time only:
+ * defining or rebinding such a global bumps ObjModule::version, which retires
+ * this form. */
+static bool builtinTypeNameShadowed(const ObjFunction *fn, const char *tn) {
+    static const char *const names[] = {"int", "float", "bool",
+                                        "str", "list", "dict"};
+    bool builtin = false;
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        if (strcmp(tn, names[i]) == 0) builtin = true;
+    }
+    if (!builtin) return false;
+    if (fn->module == NULL) return true;
+    ObjString *iname = jaiStringIntern(tn, strlen(tn));
+    if (iname == NULL) return true;
+    Value bound;
+    if (!jaiModuleGet(fn->module, iname, &bound)) return false;
+    return IS_CLASS(bound) || IS_TRAIT(bound) || IS_ENUM(bound);
+}
+
 bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
 {
     int off = *offp;
@@ -35,6 +58,9 @@ bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
         if (e->depth == 0) return false;
         const char *tn = AS_STRING(t)->chars;
         SlotKind k = e->stack[e->depth - 1];
+        if (builtinTypeNameShadowed(fn, tn)) {
+            return subWhy(e, "the module binds its own %s", tn);
+        }
         if (strcmp(tn, "float") == 0) {
             if (k == SLOT_INT) {
                 unsigned r = pushReg(e) - 1;
@@ -98,10 +124,9 @@ bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
              * (value.c), which is the name this guard compares against, so
              * there is nothing left to check.
              *
-             * Same exposure as the `float`/`int`/`bool` cases above and no
-             * more: all four reason from the type NAME, and a module global
-             * shadowing one of those names with a class would change what
-             * the interpreter does. That is the arm's existing contract. */
+             * All of these arms reason from the type NAME, which is why
+             * builtinTypeNameShadowed declines up front when the module
+             * binds that name to a class of its own. */
         } else if (jitAnyGuard() && k == SLOT_INST &&
                    e->stackClass[e->depth - 1] != NULL &&
                    e->stackClass[e->depth - 1]->name != NULL &&
@@ -130,9 +155,8 @@ bool emitTypeGuard(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp)
              * because that is a PREDICTION -- an invoke's from its site's
              * feedback -- and a guard is a semantic check, not a hint; only
              * a character from the ASCII table, which is a string by
-             * construction, skips it. Same name-based contract as `list`: a
-             * module that rebinds `str` or `dict` to a class changes what the
-             * interpreter does here. */
+             * construction, skips it. A module that rebinds `str` or `dict`
+             * to a class has already declined, in builtinTypeNameShadowed. */
             const bool isStr = tn[0] == 's';
             const unsigned want = isStr ? OBJ_STRING : OBJ_DICT;
             unsigned sd = e->depth - 1;
