@@ -26,7 +26,7 @@ from jaithon.ast import Node, NodeKind, Span, Visibility
 from jaithon.compile.diag import Code, Diagnostic, DiagnosticBag
 from jaithon.compile.lexer import Lexer
 from jaithon.compile.token import Token, TokenKind, kind_text
-from jaithon.compile.parse.node_build import _join, _node
+from jaithon.compile.parse.node_build import _node
 from jaithon.compile.parse.predicate import _is_reserved_name, _starts_declaration
 from jaithon.compile.parse.predicate import _starts_expression_kind
 
@@ -47,6 +47,10 @@ pub class Parser {
     pub var had_error: bool
 
     pub let lexer: Lexer
+    #: The file id of every token's `Span`, kept here so that building one is
+    #: three reads of plain fields: the compiled tier cannot follow
+    #: `token.source.file`, a field of an object read out of a field.
+    let file_id: int
     pub var current: int
     pub var panic_mode: bool
     pub var expr_depth: int
@@ -59,6 +63,7 @@ pub class Parser {
     #: Tokenize `lexer` and prepare to parse the tokens it produced.
     pub fn init(self, lexer: Lexer) {
         self.lexer = lexer
+        self.file_id = lexer.file_id
         self.tokens = lexer.tokenize()
         self.diagnostics = lexer.diagnostics
         self.had_error = false
@@ -94,8 +99,8 @@ pub class Parser {
             self._skip_newlines()
         }
 
-        let eof = self.tokens[self.tokens.len() - 1].span
-        let program = _node(NodeKind.Program, Span(eof.file, 0, eof.end), {"stmts": stmts})
+        let eof = self.tokens[self.tokens.len() - 1]
+        let program = _node(NodeKind.Program, Span(self.file_id, 0, eof.end), {"stmts": stmts})
         if self.had_error { return null }
         return program
     }
@@ -261,35 +266,61 @@ pub class Parser {
     }
 
     pub fn _cur_span(self) -> Span {
-        return self._peek().span
+        return self._span_of(self._peek())
     }
 
+    #: `token.span`, without the getter: a new `Span` on every call.
+    pub fn _span_of(self, token: Token) -> Span {
+        return Span(self.file_id, token.start, token.end)
+    }
+
+    #: The span from token `start_index` to the last token taken, newlines
+    #: trimmed: `_join` of the two tokens' spans, built from their offsets
+    #: without making either span first.
+    #:
+    #: Each `Span` is built here rather than through `_span_of`: the REPL's
+    #: file id is -1, so in a file that call is never made, and a call that has
+    #: never returned is one the compiled tier will not make.
     pub fn _span_since(self, start_index: int) -> Span {
         var end_index = self.current - 1
         while end_index > start_index and self._token_at(end_index).kind == TokenKind.Newline {
             end_index -= 1
         }
         if end_index < start_index { end_index = start_index }
-        return _join(self._token_at(start_index).span, self._token_at(end_index).span)
+        let first = self._token_at(start_index)
+        let last = self._token_at(end_index)
+        if self.file_id < 0 { return Span(self.file_id, last.start, last.end) }
+        let start = min(first.start, last.start)
+        return Span(self.file_id, start, max(start, max(first.end, last.end)))
+    }
+
+    #: `_join(first, token.span)`, without making the token's span first.
+    pub fn _join_token(self, first: Span, token: Token) -> Span {
+        if first.file < 0 { return Span(self.file_id, token.start, token.end) }
+        if self.file_id < 0 or first.file != self.file_id { return first }
+        let start = min(first.start, token.start)
+        return Span(self.file_id, start, max(start, max(first.end, token.end)))
     }
 
     pub fn _ident_text(self, offset: int, text: str) -> bool {
         let token = self._token_at(self.current + offset)
-        return token.kind == TokenKind.Ident and token.text == text
+        return token.kind == TokenKind.Ident and token.word == text
     }
 
     pub fn _label_name(self, token: Token) -> str {
-        if token.text.len() > 0 and token.text[0] == "'" { return token.text[1:token.text.len()] }
-        return token.text
+        let text = token.slice_text()
+        if text.len() > 0 and text[0] == "'" { return text[1:text.len()] }
+        return text
     }
 
     # --- diagnostics -----------------------------------------------------
     pub fn _describe(self, token: Token) -> str {
         if token.kind == TokenKind.Eof { return "end of file" }
         if token.kind == TokenKind.Newline { return "a newline" }
-        if token.text.len() == 0 { return f"`{kind_text(token.kind)}`" }
-        if token.text.len() > 32 { return f"`{token.text[0:32]}`" }
-        return f"`{token.text}`"
+        let text = token.slice_text()
+        if text.len() == 0 { return f"`{kind_text(token.kind)}`" }
+        if text.len() > 32 { return f"`{text[0:32]}`" }
+        return f"`{text}`"
     }
 
     pub fn _error_at(
@@ -347,7 +378,7 @@ pub class Parser {
 
     pub fn _unclosed(self, open_index: int, close_text: str, what: str) -> void {
         let found = self._describe(self._peek())
-        let open_span = self._token_at(open_index).span
+        let open_span = self._span_of(self._token_at(open_index))
         let diag = self._error_at(
             open_span,
             Code.E0107_UNCLOSED_DELIMITER,
@@ -363,7 +394,7 @@ pub class Parser {
     }
 
     pub fn _expect_ident_name(self, what: str) -> str? {
-        if self._check(TokenKind.Ident) { return self._advance().text }
+        if self._check(TokenKind.Ident) { return self._advance().word }
         if self._check(TokenKind.Underscore) {
             self._advance()
             return "_"
@@ -458,10 +489,10 @@ pub class Parser {
         )
     }
 
-    pub fn _check_reserved_type_name(self, name: str?, span: Span) -> void {
+    pub fn _check_reserved_type_name(self, name: str?, name_token: Token) -> void {
         if name != "Self" { return }
         self._error_recovered(
-            span,
+            self._span_of(name_token),
             Code.E0114_RESERVED_IDENTIFIER,
             "`Self` is reserved: it names the implementing type",
             help: "`Self` is already in scope inside every class, trait and enum body"

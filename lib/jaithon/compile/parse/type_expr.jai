@@ -77,7 +77,7 @@ pub fn _parse_primary_type(p: Parser) -> TypeExpr {
     }
     if p._check(TokenKind.Int) {
         let token = p._advance()
-        return _type(TypeKind.Const, p._span_since(start_index), name: token.text)
+        return _type(TypeKind.Const, p._span_since(start_index), name: token.slice_text())
     }
 
     if not p._check(TokenKind.Ident) {
@@ -89,10 +89,10 @@ pub fn _parse_primary_type(p: Parser) -> TypeExpr {
         return _type(TypeKind.Infer, p._cur_span())
     }
 
-    var name = p._advance().text
+    var name = p._advance().word
     while p._check(TokenKind.Dot) and p._kind_at(1) == TokenKind.Ident {
         p._advance()
-        name = name + "." + p._advance().text
+        name = name + "." + p._advance().word
     }
 
     if not p._check(TokenKind.LBracket) {

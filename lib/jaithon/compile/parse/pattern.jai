@@ -16,7 +16,7 @@ from jaithon.ast import Node, NodeKind, OpKind
 from jaithon.compile.diag import Code
 from jaithon.compile.token import TokenKind
 from jaithon.compile.parse.state import Parser
-from jaithon.compile.parse.node_build import _join, _node, _nulls, _pat_bind, _pat_class, _pat_seq, _unary
+from jaithon.compile.parse.node_build import _node, _nulls, _pat_bind, _pat_class, _pat_seq, _unary
 from jaithon.compile.parse.predicate import _starts_pattern_literal
 from jaithon.compile.parse.primary import _close_sequence, _parse_primary
 from jaithon.compile.parse.expr import _parse_neg_magnitude
@@ -42,7 +42,7 @@ pub fn _parse_pattern_list(
                 var rest = _node(NodeKind.PatWildcard, rest_span)
                 if p._check(TokenKind.Ident) {
                     let name_token = p._advance()
-                    rest = _pat_bind(_join(rest_span, name_token.span), name_token.text)
+                    rest = _pat_bind(p._join_token(rest_span, name_token), name_token.word)
                 }
                 if rest_index >= 0 {
                     p._error_at(
@@ -129,7 +129,7 @@ pub fn _parse_pattern_primary(p: Parser) -> Node {
     }
 
     if p._check(TokenKind.Ident) {
-        let name = p._advance().text
+        let name = p._advance().word
 
         if p._match(TokenKind.Dot) {
             let variant = p._expect_ident_name("an enum variant name")
@@ -204,7 +204,7 @@ pub fn _parse_class_pattern(p: Parser, name: str, start_index: int) -> Node {
             let field_token = p._peek()
             let field = p._expect_ident_name("a field name in a class pattern")
             if field == null { break }
-            var sub = _pat_bind(field_token.span, field)
+            var sub = _pat_bind(p._span_of(field_token), field)
             if p._match(TokenKind.Colon) { sub = _parse_pattern(p) }
             fields.push(field)
             subs.push(sub)

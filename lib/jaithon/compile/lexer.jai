@@ -15,8 +15,10 @@
 #: position it keeps is a byte offset -- which is also what a `Span` records,
 #: so a span needs no conversion. It used to walk a `list[str]` of one-character
 #: strings with a parallel table of byte offsets: one object per character
-#: before the first token, and a loop the JIT could not compile. Only a token's
-#: text goes back to `str`, through `_text`.
+#: before the first token, and a loop the JIT could not compile. A token keeps
+#: its byte offsets and the shared `Source`, and its text goes back to `str`
+#: only when a reader asks -- except a word's, which is cut here anyway for the
+#: keyword lookup and kept.
 #:
 #: ```
 #: let tokens = Lexer("x = 1").tokenize()
@@ -27,7 +29,7 @@
 from jaithon.ast import Span
 from std.str import StringBuilder
 from jaithon.compile.diag import Code, Diagnostic, DiagnosticBag
-from jaithon.compile.token import TokenKind, TokenFlags, Token
+from jaithon.compile.token import TokenKind, TokenFlags, Token, Source
 from jaithon.compile.token import keyword_lookup, kind_name, kind_text
 
 #: How deep f-string interpolations may nest before `E0009`.
@@ -144,6 +146,9 @@ pub class Lexer {
     #: empty list gives the tier no element to learn from and it then refused
     #: the whole of `_text`, which every token goes through.
     let scalar_of: list[int]
+    #: What every token this lexer makes points at to answer `span` and
+    #: `text`: one per file, so a token carries neither.
+    pub let origin: Source
     let length: int
     var tokens: list[Token]
     var pos: int
@@ -164,6 +169,7 @@ pub class Lexer {
         self.length = bytes.len()
         self.ascii = self.length == source.len()
         self.scalar_of = if self.ascii { [0] } else { _scalar_offsets(bytes) }
+        self.origin = Source(file_id, source, self.ascii, self.scalar_of)
         self.tokens = []
         self.pos = 0
         self.line = 1
@@ -310,20 +316,23 @@ pub class Lexer {
         return self.tokens[self.tokens.len() - 1].kind
     }
 
-    #: Record a token that carries no value: punctuation, a keyword, a name.
+    #: Record a token that carries no value and is not a word: punctuation, a
+    #: label, a newline, the end of file.
     #:
     #: Kept apart from `_push_value` because a parameter that is sometimes an
     #: int, sometimes a string and usually null has no kind the tier can give
     #: it, and that alone kept every token push interpreted.
     fn _push(self, kind: TokenKind, start: int, end: int) -> void {
-        self._push_text(kind, start, end, self._text(start, end))
+        self._push_text(kind, start, end, "")
     }
 
-    #: `_push` for a caller that already sliced the token's text.
-    fn _push_text(self, kind: TokenKind, start: int, end: int, text: str) -> void {
+    #: `_push` for a word, whose text the scan already cut to look it up as a
+    #: keyword: the token keeps it as `word` rather than the parser cutting it
+    #: again.
+    fn _push_text(self, kind: TokenKind, start: int, end: int, word: str) -> void {
         var flags = 0
         if self.at_line_start { flags = TokenFlags.AFTER_NEWLINE }
-        self.tokens.push(Token(kind, Span(self.file_id, start, end), text, flags))
+        self.tokens.push(Token(kind, self.origin, start, end, word, flags))
         self.at_line_start = false
     }
 
@@ -331,7 +340,7 @@ pub class Lexer {
     fn _push_value(self, kind: TokenKind, start: int, end: int, value: any, flags: int) -> void {
         var all_flags = flags
         if self.at_line_start { all_flags = all_flags | TokenFlags.AFTER_NEWLINE }
-        let token = Token(kind, Span(self.file_id, start, end), self._text(start, end), all_flags)
+        let token = Token(kind, self.origin, start, end, "", all_flags)
         token.value = value
         self.tokens.push(token)
         self.at_line_start = false
@@ -1472,7 +1481,7 @@ pub fn dump_tokens(source: str, file_id: int = 0) -> str {
     var line = 1
     var column = 1
     for token in tokens {
-        while at < bytes.len() and at < token.span.start {
+        while at < bytes.len() and at < token.start {
             let byte = bytes[at]
             if byte == _C_LF {
                 line += 1
@@ -1484,10 +1493,11 @@ pub fn dump_tokens(source: str, file_id: int = 0) -> str {
         }
 
         out.push(f"{index:>5}  {kind_name(token.kind):<22} {line:>4}:{column:<4} ")
-        if token.text.len() == 0 {
+        let text = token.slice_text()
+        if text.len() == 0 {
             out.push(kind_text(token.kind))
         } else {
-            for character in token.text {
+            for character in text {
                 if character == "\n" {
                     out.push("\\n")
                 } elif character == "\t" {

@@ -544,7 +544,7 @@ fn _names_used(lines: list[str]) -> set[str] {
     let lexer = Lexer("\n".join(lines) + "\n", 0, DiagnosticBag())
     for token in lexer.tokenize() {
         let member = previous == TokenKind.Dot or previous == TokenKind.QuestionDot
-        if token.kind == TokenKind.Ident and not member { used.add(token.text) }
+        if token.kind == TokenKind.Ident and not member { used.add(token.word) }
         previous = token.kind
     }
     return used
