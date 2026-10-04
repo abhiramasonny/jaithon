@@ -296,9 +296,9 @@ pub fn test_a_store_during_iteration_is_still_seen() -> void {
         }
         call += 1
     }
-    #: Whatever the interpreter says about storing into a dict mid-walk,
-    #: compiled code says the same every time: every round raised, or none.
-    assert_true(raised == 0 or raised == CALLS, "consistent across calls")
+    #: A store into a dict mid-walk bumps its version, so every round
+    #: raises -- in compiled code as in the interpreter.
+    assert_eq(raised, CALLS)
 }
 
 fn leaf_count_members(c: any, keys: list[str]) -> int {
