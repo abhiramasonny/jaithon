@@ -297,7 +297,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
 
     static Emit e;
-    memset(&e, 0, sizeof e);
+    jitEmitReset(&e);
     e.osr = true;
     e.loopDepth = gLoopDepth;
     e.loopDepthCount = loopDepthTable(&fn->chunk);
@@ -370,7 +370,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     bool probeRan = false;
     {
         static Emit probe;
-        memset(&probe, 0, sizeof probe);
+        jitEmitReset(&probe);
         probe.osr = true; probe.measuring = true; probe.hasIter = hasIter;
         probe.iterKind = iterKind; probe.elemSample = elemSample;
         probe.elemMixed = elemMixed;

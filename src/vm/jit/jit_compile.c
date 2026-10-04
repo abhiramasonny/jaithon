@@ -439,7 +439,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * frame, and compilation is not reentrant -- nothing it calls compiles
      * anything. */
     static Emit e;
-    memset(&e, 0, sizeof e);
+    jitEmitReset(&e);
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
     memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
     e.arity        = fn->arity;
@@ -454,7 +454,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     /* The prologue can't be emitted first: its save set depends on how deep the operand stack gets,
      * which only the body knows. So the body goes into the buffer at a fixed offset and the prologue is written in front of it afterwards, with every instruction index shifted by the same amount. */
     static Emit body;
-    memset(&body, 0, sizeof body);
+    jitEmitReset(&body);
     memcpy(body.dynamicLocal, dynamic, sizeof body.dynamicLocal);
     memcpy(body.nullableLocal, nullable, sizeof body.nullableLocal);
     body.arity        = fn->arity;

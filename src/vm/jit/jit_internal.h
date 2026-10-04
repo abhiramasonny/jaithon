@@ -889,6 +889,7 @@ bool holdsRegister(SlotKind k);
 unsigned localIn(Emit *e, unsigned slot, unsigned scratch);
 unsigned localDest(const Emit *e, unsigned slot);
 void forgetFieldKinds(Emit *e);
+void jitEmitReset(Emit *e);
 void noteIndexSpan(Emit *e, int slot, bool shaped, int32_t off,
                           uint8_t base);
 void noteSlotIndexed(Emit *e, int slot);
