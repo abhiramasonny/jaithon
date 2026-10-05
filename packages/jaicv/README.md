@@ -184,12 +184,13 @@ on unless set to `0`, so the two can be compared in one binary:
 | `JAICV_NATIVE_MEASURES` | `contour_area`, `moments`, `match_shapes` |
 | `JAICV_NATIVE_FIT` | `fit_ellipse`, `fit_line` |
 
-Two device paths are switched the same way:
+Three device paths are switched the same way:
 
 | Switch | What it does when on |
 |---|---|
 | `JAICV_CC_DEVICE_NUMBERING` | `connected_components` numbers its labels on the device; off, the roots are read back and sorted on the host |
 | `JAICV_GF_SELECT` | `good_features_to_track` ranks only the strongest candidates it can use; off, it ranks every one |
+| `JAICV_GF_SURVEY` | `good_features_to_track` finds its floor and its cut in one pass and one read back; off, `min_max` and then a count against the floor |
 
 ## Device memory
 
