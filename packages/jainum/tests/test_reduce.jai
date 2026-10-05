@@ -617,8 +617,8 @@ fn test_a_fold_down_wide_columns_is_each_columns_fold() -> void {
                 let gap = values[(row + start) * cols + column] - mean_value
                 squares += gap * gap
             }
-            if (spread[column] - squares / float(rows)) > 1.0e-3 { wrong += 1 }
-            if (squares / float(rows) - spread[column]) > 1.0e-3 { wrong += 1 }
+            if spread[column] - squares / float(rows) > 1.0e-3 { wrong += 1 }
+            if squares / float(rows) - spread[column] > 1.0e-3 { wrong += 1 }
         }
         assert_eq(wrong, 0, f"columns from row {start}")
     }

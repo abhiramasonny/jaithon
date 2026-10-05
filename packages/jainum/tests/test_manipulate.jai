@@ -167,7 +167,10 @@ fn test_a_transposed_copy_is_the_transpose_at_every_edge() -> void {
         defer { a.free() }
         let copied = transpose(a).copy()
         defer { copied.free() }
-        assert_eq(copied.to_list(), mapped([shape[1], shape[0]], shape, |index| [index[1], index[0]]))
+        assert_eq(
+            copied.to_list(),
+            mapped([shape[1], shape[0]], shape, |index| [index[1], index[0]])
+        )
     }
     let a = ramp([40, 37])
     defer { a.free() }

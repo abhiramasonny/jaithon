@@ -24,7 +24,10 @@ fn keyed_frames(rows: int) -> (DataFrame, DataFrame) {
         tags.push(float((399 - key) * 2 + 1))
     }
     let left = DataFrame(["key", "value"], [Column.from_floats(keys), Column.from_floats(values)])
-    let right = DataFrame(["key", "tag"], [Column.from_floats(right_keys), Column.from_floats(tags)])
+    let right = DataFrame(
+        ["key", "tag"],
+        [Column.from_floats(right_keys), Column.from_floats(tags)]
+    )
     return (left, right)
 }
 

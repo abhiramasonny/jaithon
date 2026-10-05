@@ -915,19 +915,21 @@ fn test_negative_zero_is_the_same_key_as_zero() -> void {
 #: The host's answer for a float key: missing rows at the `first_missing` end,
 #: present rows by value (down when `descending`), ties in row order.
 fn reference_order(values: list[float], descending: bool, first_missing: bool) -> list[int] {
-    var rows: list[int] = []
-    for at in 0..values.len() { rows.push(at) }
     let count = float(values.len())
-    return rows.sort(key: fn(row: int) -> float {
-        let value = values[row]
+    let missing_end = if first_missing { -1.0e12 } else { 1.0e12 }
+    let sign = if descending { -1.0 } else { 1.0 }
+    var rows: list[int] = []
+    var ranks: list[float] = []
+    for (row, value) in values.enumerate() {
+        rows.push(row)
         if is_nan(value) {
-            return (if first_missing { -1.0e12 } else { 1.0e12 }) + float(row)
+            ranks.push(missing_end + float(row))
+            continue
         }
-        var signed = if descending { -value } else { value }
-        if signed > 1.0e6 { signed = 1000.0 }
-        if signed < -1.0e6 { signed = -1000.0 }
-        return signed * 4.0 * count + float(row)
-    })
+        let clamped = max(-1000.0, min(1000.0, value * sign))
+        ranks.push(clamped * 4.0 * count + float(row))
+    }
+    return rows.sort(key: |row| ranks[row])
 }
 
 #: A float key is a null lane in front of a value lane, and the sort folds the
@@ -958,11 +960,8 @@ fn test_a_float_key_with_missing_rows_matches_the_host_order() -> void {
     defer { column.free() }
     for descending in [false, true] {
         for first_missing in [false, true] {
-            let order = argsort(
-                [column],
-                [not descending],
-                na_position: if first_missing { "first" } else { "last" }
-            )
+            let end = if first_missing { "first" } else { "last" }
+            let order = argsort([column], [not descending], na_position: end)
             let read = order.download()
             order.free()
             let expected = reference_order(values, descending, first_missing)
@@ -992,12 +991,14 @@ fn test_a_minor_float_key_with_missing_rows_keeps_its_place() -> void {
     let read = order.download()
     var rows: list[int] = []
     for at in 0..40000 { rows.push(at) }
-    let expected = rows.sort(key: fn(row: int) -> float {
+    var ranks: list[float] = []
+    for row in 0..40000 {
         let missing = is_nan(values[row])
         let tail = if missing { 0.0 } else { 100.0 - values[row] }
         let flag = if missing { 1.0 } else { 0.0 }
-        return float(major[row]) * 1.0e10 + flag * 1.0e9 + tail * 1.0e6 + float(row)
-    })
+        ranks.push(float(major[row]) * 1.0e10 + flag * 1.0e9 + tail * 1.0e6 + float(row))
+    }
+    let expected = rows.sort(key: |row| ranks[row])
     var differs = 0
     for at in 0..40000 {
         if int(read[at]) != expected[at] { differs += 1 }

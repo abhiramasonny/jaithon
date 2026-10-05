@@ -651,7 +651,7 @@ pub fn copy_into(dst: NDArray, src: NDArray) -> void {
         let rows = dst.shape[0]
         let cols = dst.shape[1]
         let across = (cols + 31) // 32
-        let tiles = ((rows + 31) // 32) * across
+        let tiles = (rows + 31) // 32 * across
         kernel_of(_LOCAL, "nd_transpose_tile").dispatch_async(
             [dst.storage, source.storage],
             tiles * 256,

@@ -125,6 +125,7 @@ pub class KeyEncoding {
             let invert = not ups[self.owners[lane]]
             let folds = _FOLD_NULLS and lane > 0 and self.folds_null(lane)
             if folds {
+                let absent_digit = if na_position == "first" { 0 } else { mask }
                 kernel_for("key_lane_gather_folded").dispatch_async(
                     [self.packed, sorter.order, sorter.keys],
                     self.length,
@@ -133,7 +134,7 @@ pub class KeyEncoding {
                         lane * self.length,
                         (lane - 1) * self.length,
                         flag(invert),
-                        if na_position == "first" { 0 } else { mask },
+                        absent_digit,
                     ]
                 )
             } else {
@@ -266,7 +267,8 @@ pub class RadixSort {
     #: Sort by the low `width` bits of every key, stably. Bits above `width`
     #: must be zero: a digit is read whole, so they would sort too.
     pub fn sort_bits(self, width: int) -> void {
-        let scatter = kernel_for(if _VOTE_RANK { "key_radix_scatter_vote" } else { "key_radix_scatter" })
+        let entry = if _VOTE_RANK { "key_radix_scatter_vote" } else { "key_radix_scatter" }
+        let scatter = kernel_for(entry)
         var shift = 0
         while shift < width {
             kernel_for("key_radix_histogram").dispatch_async(

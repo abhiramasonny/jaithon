@@ -737,10 +737,12 @@ fn _sort_into(a: NDArray, at: int, descending: bool, out: NDArray, order: NDArra
         #: slots itself.
         let threads = 256
         let groups = (rows * padded + ROW_SORT_MAX - 1) // ROW_SORT_MAX
-        kernel_of(SOURCE, if carry { "nds_row_argsort" } else { "nds_row_sort" }).dispatch_async(
+        let entry = if carry { "nds_row_argsort" } else { "nds_row_sort" }
+        let down = if descending { 1 } else { 0 }
+        kernel_of(SOURCE, entry).dispatch_async(
             [work.storage, slots.storage],
             groups * threads,
-            [rows * padded, padded, if descending { 1 } else { 0 }],
+            [rows * padded, padded, down],
             group_size: threads
         )
     } else {
