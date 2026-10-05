@@ -1972,15 +1972,19 @@ class Gen:
                 f"    let r = f(x)\n"
                 f"    return r + 0\n"
                 f"}}")
+            # The second accumulator moves the register the arm misread
+            # onto one holding an int, where the load faulted every run.
             helpers.append(
-                f"fn {loop}(f: fn(int) -> int, k: int) -> int {{\n"
+                f"fn {loop}(f: fn(int) -> int, k: int, m: int) -> int {{\n"
                 f"    var t = 0\n"
+                f"    var u = 3\n"
                 f"    for i in 0..k {{\n"
-                f"        t = t +% {fwd}(f, i)\n"
+                f"        u = u +% m\n"
+                f"        t = t +% {fwd}(f, i) +% u\n"
                 f"    }}\n"
                 f"    return t\n"
                 f"}}")
-            lines.append(f"acc = acc +% {loop}({callee}, {arg})")
+            lines.append(f"acc = acc +% {loop}({callee}, {arg}, n)")
         else:
             # A parameter the callee never reads while it compiles: null on
             # every early call, and the read sits past a lambda, which the
