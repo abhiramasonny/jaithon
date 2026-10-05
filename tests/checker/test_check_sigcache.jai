@@ -156,7 +156,8 @@ fn test_the_cache_is_on_unless_switched_off() -> void {
     let front_end = __prim__.os_env("JAITHON_FRONT_END_ID") ?? ""
     let wanted = (__prim__.os_env("JAITHON_SIG_CACHE") ?? "1") != "0" and
         (__prim__.os_env("JAITHON_SIG_BODIES") ?? "0") == "0" and
-        front_end != "" and front_end != "none"
+        front_end != "" and
+        front_end != "none"
     assert_eq(signature_cache_enabled(), wanted)
 }
 
@@ -207,7 +208,10 @@ fn test_a_module_with_an_error_in_a_body_offers_nothing_and_is_never_kept() -> v
         assert_true(sig.program is null, "a module with a body error parsed")
         assert_eq(sig.decls.len(), 0)
     }
-    assert_true(not _exists(f"{dir}/__jaicache__/tricky.jsig"), "a module that does not parse was kept")
+    assert_true(
+        not _exists(f"{dir}/__jaicache__/tricky.jsig"),
+        "a module that does not parse was kept"
+    )
 }
 
 fn test_an_edited_module_is_read_again() -> void {
@@ -289,6 +293,7 @@ fn _edit_first_line(text: str, section: int, fix_crc: bool) -> str {
     }
     return "\n".join(lines)
 }
+
 fn _load_fresh(dir: str) -> ModuleSig {
     clear_shared_signatures()
     let sig = SigLoader().load("tricky", dir)
