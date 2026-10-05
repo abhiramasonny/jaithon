@@ -124,8 +124,35 @@ fn wanted(name: str) -> bool {
     return _only == "" or _only == name
 }
 
+#: Calls a row makes in leak mode instead of being timed, or zero to time it.
+#:
+#: Device memory is not garbage collected, so an intermediate an operation
+#: forgets to release grows the process by a frame a call and makes it slower
+#: as the allocator comes under pressure: good-features once leaked about 74 MB
+#: a call. `BENCH_LEAK_CALLS=100` prints, for each row, how many device buffers
+#: and float slots are still allocated after that many calls whose results were
+#: released; every row must print zero for both.
+let LEAK_CALLS = int(env_or("BENCH_LEAK_CALLS", "0"))
+
+fn report_growth(name: str, buffers: int, floats: int) -> void {
+    let grown_buffers = gpu.live_buffers() - buffers
+    let grown_floats = gpu.live_floats() - floats
+    let verdict = if grown_buffers == 0 and grown_floats == 0 { "ok" } else { "LEAK" }
+    print(f"leak\t{name}\t{grown_buffers}\t{grown_floats}\t{verdict}")
+}
+
 fn run_scalar(name: str, repeats: int, work: fn() -> float) -> void {
     if not wanted(name) { return }
+    if LEAK_CALLS > 0 {
+        let _ = work()
+        gpu.synchronize()
+        let buffers = gpu.live_buffers()
+        let floats = gpu.live_floats()
+        for _r in 0..LEAK_CALLS { let _ = work() }
+        gpu.synchronize()
+        report_growth(name, buffers, floats)
+        return
+    }
     let opening = Instant.now()
     for round in 0..WARM_MAX_ROUNDS {
         let _ = work()
@@ -166,6 +193,16 @@ fn warm(work: fn() -> Mat) -> void {
 
 fn run(name: str, repeats: int, work: fn() -> Mat) -> void {
     if not wanted(name) { return }
+    if LEAK_CALLS > 0 {
+        work().release()
+        gpu.synchronize()
+        let buffers = gpu.live_buffers()
+        let floats = gpu.live_floats()
+        for _r in 0..LEAK_CALLS { work().release() }
+        gpu.synchronize()
+        report_growth(name, buffers, floats)
+        return
+    }
     warm(work)
     let started = Instant.now()
     #: The latest result stays alive so the work cannot be elided, and every
