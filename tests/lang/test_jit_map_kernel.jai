@@ -5,7 +5,9 @@
 #: it was on, with the elements before it stored and the one after it never
 #: started. Each case maps enough elements, often enough, that the lambda has
 #: compiled and the kernel is the path actually taken.
+from std.io import Path, write_file
 from std.math import NAN
+from std.os import argv, pid, run, temp_dir
 from std.test import assert_eq, assert_throws, assert_true
 
 var SCALE = 2
@@ -116,4 +118,32 @@ fn test_short_lists() -> void {
         assert_eq([1, 2, 3].map(|x| x + 1), [2, 3, 4])
     }
     assert_true(true)
+}
+
+#: Kernels are cached per lambda, not per slot of a direct-mapped table. With
+#: 64 slots, 32 hot lambdas in rotation always had two sharing one, each run
+#: evicted the other's kernel and compiled it again, and since the code arena
+#: never frees, thousands of recompiles filled it and every later compile in
+#: the process was refused -- a hot loop after the maps ran interpreted. Run in
+#: a child with JAI_JIT_WHY so the compiles can be counted: at most one per
+#: lambda here, and the arena never fills.
+fn test_many_lambdas_compile_one_kernel_each() -> void {
+    var src = "fn hot(n: int) -> int {\n    var t = 0\n    for i in 0..n { t += (i * 7) % 13 }\n    return t\n}\n"
+    src += "fn main() -> int {\n    var xs: list[int] = []\n    for i in 0..32 { xs.push(i) }\n    var acc = 0\n"
+    src += "    for _r in 0..400 {\n"
+    for k in 0..32 { src += f"        acc += xs.map(|x| x * {k + 2} + {k})[5]\n" }
+    src += "    }\n    acc += hot(200_000)\n    print(acc)\n    return 0\n}\n"
+    let path = f"{temp_dir()}/jaithon_map_kernels_{pid()}.jai"
+    write_file(path, src)
+    defer { Path(path).remove() }
+    let ran = run(["sh", "-c", f"JAI_JIT_WHY=1 exec '{argv()[0]}' run --no-cache '{path}'"])
+    assert_eq(ran.exit_code, 0)
+    var compiled = 0
+    var full = 0
+    for line in ran.stderr.split("\n") {
+        if line.contains("map kernel for") and line.contains("compiled") { compiled += 1 }
+        if line.contains("the code arena is full") { full += 1 }
+    }
+    assert_true(compiled <= 64, f"{compiled} kernel compiles for 32 lambdas")
+    assert_eq(full, 0)
 }

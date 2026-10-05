@@ -770,35 +770,100 @@ static bool mapRunTightOn(void) {
  * popped every frame it pushed. The result's version is bumped once per run
  * rather than per store: nothing can be iterating a list map has not
  * returned yet. */
-/* Kernels by function, so a lambda mapped many times compiles one. Keyed on
- * the compiled form and the module version as well: a recompile or a new
- * global makes the kernel stale with it. The arena only ever grows, so a
- * function freed and another allocated at its address cannot also match on
- * `jitFunc`. A declined body is remembered as NULL and not asked again. */
+/* Kernels by function, so a lambda mapped many times compiles one. Keyed
+ * EXACTLY on (function, result kind), in a table that grows and never
+ * evicts: a direct-mapped cache let two hot lambdas that shared a slot evict
+ * each other on every run, and since the arena only ever grows, each of
+ * those recompiles was code space spent for good -- 24 rotating lambdas
+ * filled it and switched the JIT off for the rest of the process (0.07x on
+ * an unrelated hot loop; tests/lang/test_jit_map_kernel.jai).
+ *
+ * An entry also records the compiled form and module version it was built
+ * for: a recompile or a new global makes the kernel stale with it. A stale
+ * entry compiles again at most MAP_KERNEL_COMPILES times in all, and a
+ * declined body is remembered as NULL and not asked again until its form
+ * changes. The arena only ever grows, so a function freed and another
+ * allocated at its address cannot also match on `jitFunc`; it inherits the
+ * old entry's count, which can cost it a kernel, never an answer. */
 typedef struct {
     ObjFunction *fn;
     uint8_t     *jitFunc;
     uint8_t     *kernel;
     uint32_t     mv;
     uint8_t      kind;
+    uint8_t      compiles;
 } MapKernelSlot;
-static MapKernelSlot gMapKernels[64];
+static MapKernelSlot *gMapKernels;
+static uint32_t       gMapKernelCap;
+static uint32_t       gMapKernelCount;
+
+/* Compiles per (function, kind) over the life of the process, as the
+ * regular tier caps its attempts. */
+#define MAP_KERNEL_COMPILES 4
 
 /* Below this many elements a run calls the body per element: not worth a
  * compile for a short map, and a long one pays it once. */
 #define MAP_KERNEL_MIN 16
 
+static uint32_t mapKernelHash(const ObjFunction *fn, uint8_t kind) {
+    uint64_t h = ((uint64_t)(uintptr_t)fn >> 4) ^ ((uint64_t)kind << 56);
+    h *= 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(h >> 32);
+}
+
+/* The entry for (fn, kind), inserted empty when absent; NULL only when the
+ * table cannot grow. */
+static MapKernelSlot *mapKernelSlot(ObjFunction *fn, uint8_t kind) {
+    if ((gMapKernelCount + 1) * 2 > gMapKernelCap) {
+        uint32_t cap = gMapKernelCap ? gMapKernelCap * 2 : 64;
+        MapKernelSlot *t = calloc(cap, sizeof *t);
+        if (t == NULL) return NULL;
+        for (uint32_t i = 0; i < gMapKernelCap; i++) {
+            MapKernelSlot *o = &gMapKernels[i];
+            if (o->fn == NULL) continue;
+            uint32_t j = mapKernelHash(o->fn, o->kind) & (cap - 1);
+            while (t[j].fn != NULL) j = (j + 1) & (cap - 1);
+            t[j] = *o;
+        }
+        free(gMapKernels);
+        gMapKernels = t;
+        gMapKernelCap = cap;
+    }
+    uint32_t j = mapKernelHash(fn, kind) & (gMapKernelCap - 1);
+    for (;;) {
+        MapKernelSlot *s = &gMapKernels[j];
+        if (s->fn == fn && s->kind == kind) return s;
+        if (s->fn == NULL) {
+            s->fn = fn;
+            s->kind = kind;
+            s->jitFunc = NULL;
+            s->kernel = NULL;
+            s->compiles = 0;
+            s->mv = 0;
+            gMapKernelCount++;
+            return s;
+        }
+        j = (j + 1) & (gMapKernelCap - 1);
+    }
+}
+
 static uint8_t *mapKernelFor(JaiPreparedFn1 *p, Value *base, uint8_t kind) {
     ObjFunction *fn = p->fn;
-    MapKernelSlot *s = &gMapKernels[((uintptr_t)fn >> 4) & 63u];
-    if (s->fn == fn && s->jitFunc == fn->jitFunc && s->kind == kind &&
+    MapKernelSlot *s = mapKernelSlot(fn, kind);
+    if (s == NULL) return NULL;
+    if (s->compiles > 0 && s->jitFunc == fn->jitFunc &&
         s->mv == p->moduleVersion) {
         return s->kernel;
     }
-    uint8_t *k = jaiJitCompileMapKernel(p->closure, base, kind);
-    s->fn = fn;
+    uint8_t *k = NULL;
+    if (s->compiles < MAP_KERNEL_COMPILES) {
+        s->compiles++;
+        k = jaiJitCompileMapKernel(p->closure, base, kind);
+    } else if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] map kernel for %s: out of compiles\n",
+                jitFnLabel(fn));
+    }
     s->jitFunc = fn->jitFunc;
-    s->kind = kind;
     s->mv = p->moduleVersion;
     s->kernel = k;
     return k;

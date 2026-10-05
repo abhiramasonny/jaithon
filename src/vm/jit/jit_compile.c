@@ -480,6 +480,22 @@ uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
     }
     if (fn->upvalueCount != 0 || fn->arity != 1) return NULL;
     if (!eligible(fn)) return NULL;
+    /* A kernel is an extra -- the body it copies has a compiled form of its
+     * own -- so kernels share at most an eighth of the arena between them
+     * and none is compiled once it is three quarters full: however many
+     * lambdas a program maps, they cannot starve a body that has no other
+     * form. */
+    static size_t kernelBytes;
+    JaiCodeArena *arena = jaiJitArena();
+    if (arena == NULL || kernelBytes >= arena->capacity / 8 ||
+        arena->used >= arena->capacity / 4 * 3) {
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] map kernel for %s: out of arena budget\n",
+                    jitFnLabel(fn));
+        }
+        return NULL;
+    }
+    size_t usedBefore = arena->used;
 
     uint8_t *old       = fn->jitFunc;
     uint8_t  oldArgC   = fn->jitArgCount;
@@ -507,6 +523,7 @@ uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
                               needNull, false);
     gMapKernel = false;
     uint8_t *entry = ok ? gMapKernelEntry : NULL;
+    if (arena->used > usedBefore) kernelBytes += arena->used - usedBefore;
 
     fn->jitBlockedOn   = oldBlk;
     fn->jitFunc        = old;
