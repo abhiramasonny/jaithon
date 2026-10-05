@@ -173,6 +173,23 @@ start_unit_tests() {
     "$JAITHON" "${unit_args[@]}" > "$unit_file" 2>&1 &
     unit_pid=$!
 }
+# A job started with `&` in a script ignores SIGINT, so Ctrl-C on the gate left
+# the unit run going and its output file behind. Stop both on the way out.
+stop_unit_tests() {
+    if [[ -n "$unit_pid" ]]; then
+        pkill -TERM -P "$unit_pid" 2>/dev/null
+        kill -TERM "$unit_pid" 2>/dev/null
+        unit_pid=""
+    fi
+    [[ -n "$unit_file" ]] && rm -f "$unit_file"
+    local dir
+    for dir in "${golden_dir:-}" "${fuzz_dir:-}" "${repl_dir:-}"; do
+        [[ -n "$dir" ]] && rm -rf "$dir"
+    done
+    return 0
+}
+trap 'stop_unit_tests; exit 130' INT
+trap 'stop_unit_tests; exit 143' TERM
 [[ "${UNIT_OVERLAP:-1}" != "0" ]] && start_unit_tests
 
 # ---------------------------------------------------------------- 2. golden
@@ -229,6 +246,10 @@ def run(index):
         finally:
             if source is not None:
                 source.close()
+    # A job killed by a signal: report it as the shell would (128 + N), as
+    # the serial loop did, rather than Python's -N.
+    if status < 0:
+        status = 128 - status
     elapsed = int((time.time() - started) * 1000)
     with open(base + ".status", "w") as record:
         record.write(f"{status} {elapsed}\n")
@@ -409,6 +430,7 @@ printf '%sUnit tests%s\n' "$BOLD" "$RESET"
 [[ -z "$unit_pid" ]] && start_unit_tests
 wait "$unit_pid"
 unit_status=$?
+unit_pid=""
 unit_output="$(cat "$unit_file")"
 rm -f "$unit_file"
 unit_elapsed=$(( $(now_ms) - unit_start ))
