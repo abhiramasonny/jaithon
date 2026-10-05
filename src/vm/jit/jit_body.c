@@ -694,6 +694,17 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             e->fpSrc = 0;
             e->dynGuarded = 0;
         }
+        /* So are "this entry is the literal 2.0" and "this entry is the int
+         * k": an `if` expression's arms meet in one entry holding different
+         * values. Kept across the join, `1.0 * (if c { 7.0 } else { 2.0 })`
+         * took the else arm's 2.0 for both and compiled `x + x` -- 2.0 every
+         * call (tests/lang/test_jit_join_facts.jai). */
+        if ((e->fTwo != 0 || e->kKnown != 0) &&
+            (!fellIn || offsetIsBranchTarget(&fn->chunk, (uint32_t)off) ||
+             popSkipTarget(e, (uint32_t)off))) {
+            e->fTwo = 0;
+            e->kKnown = 0;
+        }
         /* A field-kind memo is good along the same one edge, and goes for the
          * same reason -- see forgetFieldKinds. `fn` is whichever body is being
          * walked, so an inlined one is measured against its own chunk. */
