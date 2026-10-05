@@ -216,10 +216,12 @@ pub fn layout_of(mat: Mat) -> list[int] {
     return [mat.rows, mat.cols, mat.channels(), mat.offset, mat.step_]
 }
 
-#: How many distinct small constant matrices `cached_weights` keeps.
+#: How many distinct small constant matrices one generation of the weights
+#: cache keeps.
 const WEIGHTS_CACHE_LIMIT = 256
 
 var _weights: dict[str, Mat] = {}
+var _retired: dict[str, Mat] = {}
 
 #: A small constant `CV_32F` matrix -- filter taps, a derivative row, a warp
 #: matrix -- kept on the device once made and shared between calls.
@@ -229,17 +231,46 @@ var _weights: dict[str, Mat] = {}
 #: the next call's upload lands in the recycled buffer and has to wait for the
 #: work still reading it, which puts a host stall in every filter. The returned
 #: matrix belongs to the cache and must never be released by the caller.
+#:
+#: The key is the values themselves, which costs a format of every value on
+#: every call; a caller with a cheaper name for its values uses `held_weights`
+#: and `keep_weights` and builds the values only on a miss.
 pub fn cached_weights(rows: int, cols: int, values: list[float]) -> Mat {
     let key = f"{rows}x{cols}:{values}"
+    let held = held_weights(key)
+    if held is not null { return held }
+    return keep_weights(key, rows, cols, values)
+}
+
+#: The shared weights matrix kept under `key`, or null if there is none.
+pub fn held_weights(key: str) -> Mat? {
     let held = _weights.get(key)
     if held is not null { return held }
+    let old = _retired.get(key)
+    if old is null { return null }
+    _retired.pop(key)
+    _admit(key, old)
+    return old
+}
+
+#: Upload `values` as a `rows` by `cols` weights matrix shared under `key`,
+#: which must name exactly these values.
+pub fn keep_weights(key: str, rows: int, cols: int, values: list[float]) -> Mat {
+    let made = Mat.from_list(rows, cols, CV_MAKETYPE(CV_32F, 1), values)
+    _admit(key, made)
+    return made
+}
+
+#: The cache holds two generations. When the young one fills, the old one is
+#: released and the young one takes its place. A matrix handed out is in the
+#: young generation, so it lives through at least one more turn over: a call
+#: that fetches its row taps and then its column taps never has the first
+#: freed by the second's miss, which releasing everything at once would do.
+fn _admit(key: str, mat: Mat) -> void {
     if _weights.len() >= WEIGHTS_CACHE_LIMIT {
-        #: Work already queued against these keeps its order on the device, so
-        #: freeing them here is safe; it only costs the next call an upload.
-        for old in _weights.values() { old.release() }
+        for old in _retired.values() { old.release() }
+        _retired = _weights
         _weights = {}
     }
-    let made = Mat.from_list(rows, cols, CV_MAKETYPE(CV_32F, 1), values)
-    _weights[key] = made
-    return made
+    _weights[key] = mat
 }
