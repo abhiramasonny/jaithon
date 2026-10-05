@@ -645,7 +645,10 @@ bool jaiCallValue(Value callee, int argc, Value *args, Value *out) {
     vm.stackTop += argc;
 
     int frameBase = vm.frameCount;
-    CallOutcome outcome = invokeCallable(callee, argc);
+    /* invokeCallable's closure arm, without its frame. */
+    CallOutcome outcome = IS_CLOSURE(callee)
+                              ? callClosure(AS_CLOSURE(callee), argc)
+                              : invokeCallable(callee, argc);
     if (outcome == CALL_ERROR) {
         vm.stackTop = base;
         return false;
