@@ -16,6 +16,10 @@ counts: a hit must be the very object the leaf would have returned.
 The last three configurations switch one mechanism off each, which says
 whether a disagreement is that mechanism or something older.
 
+Its teeth are established rather than assumed: with the collector's
+jaiFmtMemoClear removed (gc.c), so that an entry outlives the string it
+names, 46 of 120 programs disagree. `make dictfmt-fuzz` runs 400.
+
     python3 tests/fuzz/dictfmt_differential.py               # 100 programs
     python3 tests/fuzz/dictfmt_differential.py --count 300 --gc
     python3 tests/fuzz/dictfmt_differential.py --seed 17 --count 1 --keep

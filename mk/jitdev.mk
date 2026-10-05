@@ -153,6 +153,15 @@ jit-fuzz: $(TARGET)
 match-fuzz: $(TARGET)
 	@python3 tests/fuzz/match_differential.py --count $(MATCH_FUZZ_COUNT)
 
+# The f-string memo and inline dict differential: one-int-hole f-strings as
+# keys of dicts that are counted, read, stored and removed through, with `is`
+# on the results and collections in between, under eight configurations (nine
+# with --gc). Out of `make test` for the same reason; its header says how its
+# teeth were established.
+.PHONY: dictfmt-fuzz
+dictfmt-fuzz: $(TARGET)
+	@python3 tests/fuzz/dictfmt_differential.py --count $(DICTFMT_FUZZ_COUNT)
+
 # The control-flow differential: the SHAPES the other fuzzers never emit.
 #
 # kind_mutation and iter_mutation hold the shape fixed and vary a kind;
