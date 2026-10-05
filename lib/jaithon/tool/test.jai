@@ -450,26 +450,30 @@ let _FORK_WORKERS: bool = (env("JAITHON_TEST_FORK") ?? "1") != "0"
 fn _run_forked(exe: str, paths: list[str], options: _Options, limit: int) -> list[TestResult] {
     _warm_for_children()
     let scratch = _scratch_dir()
+    let history = _History.load(paths)
+    let order = history.slowest_first(paths)
     var captured: dict[str, str] = {}
     var noise: dict[str, str] = {}
     var failures: dict[str, int] = {}
     var running: dict[int, int] = {}
+    var started: dict[int, int] = {}
     var spawned: set[int] = set()
     var again: list[int] = []
-    var next_path = 0
-    while next_path < paths.len() or again.len() > 0 or running.len() > 0 {
-        while running.len() < limit and again.len() > 0 {
-            let index = again.pop()
+    var next_order = 0
+    while next_order < order.len() or again.len() > 0 or running.len() > 0 {
+        while running.len() < limit and (again.len() > 0 or next_order < order.len()) {
+            let from_queue = again.len() == 0
+            let index = if from_queue { order[next_order] } else { again.pop() }
+            if from_queue { next_order += 1 }
             let base = f"{scratch}/{index}"
-            let command = _worker_command(exe, paths[index])
-            let child = __prim__.os_spawn_to(command, base + ".out", base + ".err")
-            running[child] = index
-            spawned.add(index)
-        }
-        while running.len() < limit and next_path < paths.len() {
-            let index = next_path
-            next_path += 1
-            let base = f"{scratch}/{index}"
+            started[index] = __prim__.time_mono()
+            if not from_queue or history.needs_exec(paths[index]) {
+                let command = _worker_command(exe, paths[index])
+                let child = __prim__.os_spawn_to(command, base + ".out", base + ".err")
+                running[child] = index
+                spawned.add(index)
+                continue
+            }
             let child = __prim__.os_fork_to(base + ".out", base + ".err")
             if child == 0 { _run_child(paths[index], options) }
             running[child] = index
@@ -484,12 +488,121 @@ fn _run_forked(exe: str, paths: list[str], options: _Options, limit: int) -> lis
         }
         let path = paths[index]
         let base = f"{scratch}/{index}"
+        history.record(path, __prim__.time_mono() - (started.get(index) ?? 0), index in spawned)
         captured[path] = _take_file(base + ".out")
         noise[path] = _take_file(base + ".err")
         if done[1] != 0 { failures[path] = done[1] }
     }
     _remove_quietly(Path(scratch), true)
+    history.save()
     return _report_shards(paths, captured, noise, failures, options)
+}
+
+#: How long each test file took last time, and whether it had to run in a
+#: process of its own, kept beside the files in `__jaicache__/test_times`.
+#:
+#: Only a hint: it orders the work, never what is reported. Starting the
+#: longest file first keeps it off the end of the run, where it would leave
+#: every other core idle; and a file already known to load a native framework
+#: skips the forked attempt that would only exit with _NEEDS_EXEC.
+class _History {
+    var times: dict[str, int]
+    var exec_only: set[str]
+    var dirs: dict[str, bool]
+
+    pub fn init(self) {
+        self.times = {}
+        self.exec_only = set()
+        self.dirs = {}
+    }
+
+    pub static fn load(paths: list[str]) -> _History {
+        let history = _History()
+        for path in paths {
+            let dir = Path(path).parent().text
+            if dir in history.dirs { continue }
+            history.dirs[dir] = false
+            try {
+                let file = Path(_History.file_of(dir))
+                if not file.exists() { continue }
+                for line in file.read_text().split("\n") {
+                    let fields = line.split("\t")
+                    if fields.len() != 3 { continue }
+                    let full = dir + "/" + fields[2]
+                    history.times[full] = int(fields[0])
+                    if fields[1] == "x" { history.exec_only.add(full) }
+                }
+            } catch _error: Error { }
+        }
+        return history
+    }
+
+    static fn file_of(dir: str) -> str { return Path(dir).join("__jaicache__").join("test_times").text }
+
+    #: Path indexes, longest recorded first; files with no record keep their
+    #: place ahead of every recorded one, so a first run is in path order.
+    pub fn slowest_first(self, paths: list[str]) -> list[int] {
+        let unknown: list[int] = []
+        let by_time: dict[int, list[int]] = {}
+        for index in 0..paths.len() {
+            let took = self.times.get(_History.key(paths[index]))
+            if took is null {
+                unknown.push(index)
+                continue
+            }
+            let same = by_time.get(took)
+            if same is null { by_time[took] = [index] } else { same.push(index) }
+        }
+        let order = unknown
+        let times = by_time.keys().sorted()
+        var at = times.len() - 1
+        while at >= 0 {
+            order.extend(by_time[times[at]])
+            at -= 1
+        }
+        return order
+    }
+
+    pub fn needs_exec(self, path: str) -> bool { return _History.key(path) in self.exec_only }
+
+    #: Built the same way from a path as from a record, so the two always
+    #: match however the path was spelled (`a//b`, `./a`).
+    static fn key(path: str) -> str {
+        let file = Path(path)
+        return file.parent().text + "/" + file.name()
+    }
+
+    pub fn record(self, path: str, nanos: int, exec_only: bool) -> void {
+        let key = _History.key(path)
+        self.times[key] = nanos
+        if exec_only { self.exec_only.add(key) } else { self.exec_only.discard(key) }
+        self.dirs[Path(path).parent().text] = true
+    }
+
+    #: Rewrite each directory's record that this run touched. Written to a
+    #: temporary name and renamed over, so a concurrent run reads either the
+    #: old record or the new one.
+    pub fn save(self) -> void {
+        for (dir, touched) in self.dirs.items() {
+            if not touched { continue }
+            let lines: list[str] = []
+            for (key, nanos) in self.times.items() {
+                if not key.starts_with(dir + "/") { continue }
+                let name = key[dir.len() + 1:]
+                if name.contains("/") { continue }
+                let flag = if key in self.exec_only { "x" } else { "-" }
+                lines.push(f"{nanos}\t{flag}\t{name}")
+            }
+            try {
+                let cache = Path(dir).join("__jaicache__")
+                cache.mkdir(false, true)
+                let target = _History.file_of(dir)
+                let staging = target + "." + str(__prim__.time_wall())
+                Path(staging).write_text("\n".join(lines.sorted()) + "\n")
+                __prim__.io_rename(staging, target)
+            } catch _error: Error { }
+        }
+    }
 }
 
 #: The status a forked child exits with when it was about to load a native

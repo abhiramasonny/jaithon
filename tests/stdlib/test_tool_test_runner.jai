@@ -3,6 +3,7 @@
 #: Each case writes a small suite to a fresh directory and runs the real binary
 #: over it, because what is being checked is the parent's bookkeeping: which
 #: worker a result came from, and what it does when a worker dies.
+from std.io import Path
 from std.test import assert_eq, assert_true
 
 fn _suite(name: str, files: dict[str, str]) -> str {
@@ -17,10 +18,8 @@ fn _suite(name: str, files: dict[str, str]) -> str {
     return root
 }
 
-fn _drop(root: str, files: dict[str, str]) -> void {
-    for file in files.keys() { __prim__.io_remove(root + "/" + file) }
-    __prim__.io_remove(root)
-}
+#: Recursive: the runner leaves its timing record in `__jaicache__` there.
+fn _drop(root: str) -> void { Path(root).remove(true) }
 
 fn _run_test(arguments: list[str]) -> dict[str, any] {
     let command = [__prim__.os_argv()[0], "test"]
@@ -52,7 +51,7 @@ fn test_a_worker_that_exits_early_is_reported_not_dropped() -> void {
     }
     let root = _suite("dies", files)
     let result = _run_test(["--jobs=2", root])
-    _drop(root, files)
+    _drop(root)
     assert_eq(result["exit_code"], 1)
     let out: str = result["stdout"]
     assert_true(out.contains("test_dies"), out)
@@ -69,7 +68,7 @@ fn test_parallel_output_matches_the_sequential_runner() -> void {
     let root = _suite("same", files)
     let sequential = _run_test(["--jobs=1", "--verbose", root])
     let parallel = _run_test(["--jobs=3", "--verbose", root])
-    _drop(root, files)
+    _drop(root)
     assert_eq(parallel["exit_code"], 0)
     assert_eq(_untimed(parallel["stdout"]), _untimed(sequential["stdout"]))
     assert_eq(parallel["stderr"], sequential["stderr"])
@@ -84,6 +83,24 @@ fn test_a_test_reading_stdin_sees_end_of_input() -> void {
     }
     let root = _suite("stdin", files)
     let result = _run_test(["--jobs=2", root])
-    _drop(root, files)
+    _drop(root)
     assert_eq(result["exit_code"], 0, result["stdout"])
+}
+
+#: The second run starts files in the order the first one's timings suggest;
+#: what it prints must not depend on that order.
+fn test_a_run_ordered_by_recorded_times_prints_the_same() -> void {
+    let files = {
+        "test_one.jai": PASSING,
+        "test_two.jai": PASSING,
+        "test_three.jai": PASSING,
+    }
+    let root = _suite("again", files)
+    let first = _run_test(["--jobs=3", "--verbose", root])
+    let recorded = Path(root).join("__jaicache__").join("test_times").exists()
+    let second = _run_test(["--jobs=3", "--verbose", root])
+    _drop(root)
+    #: JAITHON_TEST_FORK=0 reaches the inner run too, and that runner keeps no record.
+    if (__prim__.os_env("JAITHON_TEST_FORK") ?? "1") != "0" { assert_true(recorded) }
+    assert_eq(_untimed(second["stdout"]), _untimed(first["stdout"]))
 }
