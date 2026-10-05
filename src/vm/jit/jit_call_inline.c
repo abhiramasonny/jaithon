@@ -793,6 +793,11 @@ static bool inlinableLoopBody(ObjClosure *callee, unsigned argc,
         case OP_RETURN:
             break;
         default:
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] loop inline of %s refused at %s\n",
+                        cfn->name ? cfn->name->chars : "<anon>",
+                        jaiOpName((OpCode)op));
+            }
             return false;
         }
         if (s1 > maxSlot) maxSlot = s1;

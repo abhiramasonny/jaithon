@@ -1280,11 +1280,11 @@ unsigned xHeldIn(Emit *e, unsigned idx) {
 /* X register a local permanently lives in, or 0 when it lives nowhere a stack entry could borrow
  * (a spilled frame slot, or an OSR slot the register plan left in memory). */
 /* JAITHON_JIT_SPILL_BORROW=0: a function-tier body on the per-slot plan
- * (`spilled`) copies every local it reads, as it always did. On, a slot the
- * plan gave an X register is borrowed exactly as the OSR tier borrows its
- * slotXReg homes -- the plan is the same one. A loop-bearing inline is what
- * made this matter: its homes push the caller onto the per-slot plan, and the
- * inlined loop then paid a `mov` for every local it read. */
+ * (`spilled`) copies every home of a loop-bearing inline it reads, as it does
+ * its own locals. On, a home the plan gave an X register is borrowed exactly
+ * as the OSR tier borrows its slotXReg homes -- the plan is the same one. The
+ * homes are what push the caller onto the per-slot plan, and the inlined loop
+ * then paid a `mov` for every local it read. */
 static bool jitSpillBorrowOn(void) {
     static int on = -1;
     if (on < 0) {
@@ -1297,8 +1297,12 @@ static bool jitSpillBorrowOn(void) {
 unsigned localHomeX(const Emit *e, unsigned slot) {
     if (e->osr) return e->slotXReg[slot];
     if (e->spilled) {
+        /* Only an inline's homes: on the caller's own locals the same
+         * borrow measured 1.4% MORE instructions on life and nothing on
+         * nbody, json_parse or object_dispatch. */
         if (!jitSpillBorrowOn() || slot > JIT_MAX_SLOTS ||
-            e->dynamicLocal[slot]) {
+            e->dynamicLocal[slot] || e->inlHomeLo == 0 ||
+            slot < e->inlHomeLo) {
             return 0u;
         }
         return e->slotXReg[slot];
