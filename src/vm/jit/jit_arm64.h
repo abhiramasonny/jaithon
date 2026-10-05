@@ -192,6 +192,22 @@ uint32_t jaiA64StrDIdx(unsigned rt, unsigned rn, unsigned rm);
 /* str Dt, [Xn, #offset] -- same constraints */
 uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset);
 
+/* Two doubles at once, for the vectoriser (jit_vector.c). Each lane of the
+ * vector forms rounds exactly as the scalar instruction does, under the same
+ * FPCR, so a lane is bit-identical to the scalar result -- which is the only
+ * reason the tier may use them. There is deliberately no fmla: a fused
+ * multiply-add rounds once where Jaithon rounds twice. */
+/* ldur Qt, [Xn, #simm9] -- unscaled byte offset, -256..255 */
+uint32_t jaiA64LdurQ(unsigned rt, unsigned rn, int32_t simm9);
+/* stur Qt, [Xn, #simm9] */
+uint32_t jaiA64SturQ(unsigned rt, unsigned rn, int32_t simm9);
+/* fadd / fsub / fmul Vd.2D, Vn.2D, Vm.2D */
+uint32_t jaiA64Fadd2D(unsigned rd, unsigned rn, unsigned rm);
+uint32_t jaiA64Fsub2D(unsigned rd, unsigned rn, unsigned rm);
+uint32_t jaiA64Fmul2D(unsigned rd, unsigned rn, unsigned rm);
+/* dup Vd.2D, Xn -- both lanes get the general register's 64 bits */
+uint32_t jaiA64Dup2DX(unsigned rd, unsigned rn);
+
 /* Condition codes, named for the ones this uses. */
 /* The zero register. As the destination of a `subs` it turns the
  * subtraction into a bare compare; as an operand it reads zero. */

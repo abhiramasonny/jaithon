@@ -977,6 +977,15 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
             gNoNullableFb = false;
             if (ok) return true;
         }
+        /* And for the vector blocks, which only the real pass emits: one
+         * that outgrew the buffer must not cost the body its scalar form. */
+        if (gVectorUsed && !gNoVector) {
+            gNoVector = true;
+            bool ok = compileFuncOnce(closure, slotBase, dynamic, need,
+                                      nullable, needNull, false);
+            gNoVector = false;
+            if (ok) return true;
+        }
         if (jitKeepRetryNeeds()) {
             for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
                 need[i]     = need[i] || firstNeed[i];
@@ -1068,6 +1077,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     gInlineFailed   = false;
     gMatchUsed      = false;
     gNullableFbUsed = false;
+    gVectorUsed     = false;
     gJitColdDecline = false;
 
     if (getenv("JAI_JIT_WHY")) {

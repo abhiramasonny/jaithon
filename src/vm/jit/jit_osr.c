@@ -539,6 +539,24 @@ static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                            needNullable, dynamic, needDynamic)) {
             return true;
         }
+        /* A real pass with a vector block in it that failed: once more
+         * without, keeping what the first attempt learned. See gVectorUsed. */
+        if (gVectorUsed && !gNoVector) {
+            bool keepNull[JIT_MAX_SLOTS + 1], keepDyn[JIT_MAX_SLOTS + 1];
+            memcpy(keepNull, needNullable, sizeof keepNull);
+            memcpy(keepDyn, needDynamic, sizeof keepDyn);
+            gNoVector = true;
+            bool ok = compileOsrOnce(closure, top, slots, iterKind, elemSample,
+                                     elemMixed, elemStg, wholeBody, noInline,
+                                     nullable, needNullable, dynamic,
+                                     needDynamic);
+            gNoVector = false;
+            if (ok) return true;
+            for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+                needNullable[i] = needNullable[i] || keepNull[i];
+                needDynamic[i] = needDynamic[i] || keepDyn[i];
+            }
+        }
         bool grew = false;
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
             if (needNullable[i] && !nullable[i]) { nullable[i] = true; grew = true; }
@@ -577,6 +595,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     ObjFunction *fn = closure->fn;
     jitBranchTargetsReset();
     sPendingCount = 0;   /* notes belong to the attempt that installs a form */
+    gVectorUsed = false;
     if (!isInstructionStart(&fn->chunk, top))
         return osrNoB(fn, top, "the loop head is not an instruction boundary");
     uint32_t end = findLoopEnd(&fn->chunk, top, wholeBody);

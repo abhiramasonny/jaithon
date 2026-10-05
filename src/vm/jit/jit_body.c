@@ -809,6 +809,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         /* Above the offset map on purpose: a back edge to `off` must land on
          * the loop head, not on the loads that were hoisted out of it. */
         emitHoistsAt(e, (uint32_t)off);
+        /* Above the map for the same reason: it runs on entry, never on a
+         * back edge. See jit_vector.c. */
+        if (op == OP_FOR_RANGE_BIND) emitVectorHead(e, fn, (uint32_t)off);
         e->offsetToInst[off]  = (int)e->count;
         e->offsetToDepth[off] = stackSignature(e);
         e->lastOp = op;

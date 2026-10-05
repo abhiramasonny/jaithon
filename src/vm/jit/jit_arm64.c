@@ -354,6 +354,33 @@ uint32_t jaiA64StrD(unsigned rt, unsigned rn, unsigned offset) {
     return 0xfd000000u | ((offset / 8u) << 10) | (rn << 5) | rt;
 }
 
+/* LDUR/STUR (SIMD&FP) with size=00, opc=11/10: the 128-bit forms. */
+uint32_t jaiA64LdurQ(unsigned rt, unsigned rn, int32_t simm9) {
+    return 0x3cc00000u | (((uint32_t)simm9 & 0x1ffu) << 12) | (rn << 5) | rt;
+}
+
+uint32_t jaiA64SturQ(unsigned rt, unsigned rn, int32_t simm9) {
+    return 0x3c800000u | (((uint32_t)simm9 & 0x1ffu) << 12) | (rn << 5) | rt;
+}
+
+/* Vector FADD/FSUB/FMUL with Q=1 and sz=1: two double lanes. */
+uint32_t jaiA64Fadd2D(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x4e60d400u | (rm << 16) | (rn << 5) | rd;
+}
+
+uint32_t jaiA64Fsub2D(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x4ee0d400u | (rm << 16) | (rn << 5) | rd;
+}
+
+uint32_t jaiA64Fmul2D(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x6e60dc00u | (rm << 16) | (rn << 5) | rd;
+}
+
+/* DUP (general), imm5 = 0b01000: a 64-bit element, Q=1. */
+uint32_t jaiA64Dup2DX(unsigned rd, unsigned rn) {
+    return 0x4e080c00u | (rn << 5) | rd;
+}
+
 /* str Wt, [Xn, #offset] -- 4-aligned, 0..16380. The counterpart to jaiA64LdrW:
  * a Value's tag is 32 bits, so writing one takes this and a 64-bit store. */
 uint32_t jaiA64StrW(unsigned rt, unsigned rn, unsigned offset) {
