@@ -46,8 +46,9 @@ run fmt --check lib/jaithon
 run run --no-cache examples/hello.jai
 
 echo "  PGO     training: suites"
-run test tests/lang tests/stdlib tests/checker
-run test packages/jainum/tests packages/jaiframe/tests
+# One process per file: forked test workers exit without writing a .profraw.
+JAITHON_TEST_FORK=0 run test tests/lang tests/stdlib tests/checker
+JAITHON_TEST_FORK=0 run test packages/jainum/tests packages/jaiframe/tests
 
 PROFDATA="$(command -v llvm-profdata || echo "xcrun llvm-profdata")"
 $PROFDATA merge -o boot/jaithon.profdata "$RAW"/*.profraw
