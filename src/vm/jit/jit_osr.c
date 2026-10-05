@@ -1358,6 +1358,13 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         fprintf(stderr, "[jit] osr %s at %u: %u instructions iter=%u\n",
                 jitFnLabel(fn), top, e.count,
                 (unsigned)iterKind);
+        /* Counted by tests/fuzz/pic_rate.py --sink: the plan line alone
+         * says nothing, since a plan that fails is compiled again without. */
+        if (e.sinkCount != 0) {
+            fprintf(stderr, "[jit] osr %s at %u keeps %u local%s sunk\n",
+                    jitFnLabel(fn), top, e.sinkCount,
+                    e.sinkCount == 1 ? "" : "s");
+        }
         /* Same reason as the function tier's line: a loop that walked two
          * instructions and interpreted the other forty reported success. */
         if (e.unarmedOp != 0) {

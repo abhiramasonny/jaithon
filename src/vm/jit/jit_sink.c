@@ -155,6 +155,13 @@ static bool refFeedsInvoke(const Chunk *c, int off, unsigned after,
     return false;
 }
 
+static void skipWhy(uint32_t top, unsigned slot, const char *why) {
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] osr at %u does not sink local %u: %s\n", top,
+                slot, why);
+    }
+}
+
 void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
                const Value *slots, const bool *byRef) {
     e->sinkCount = 0;
@@ -258,6 +265,10 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
             break;
         default:
             /* An instruction whose local operands this does not read. */
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] osr at %u plans no sink: %s at %d\n",
+                        top, jaiOpName((OpCode)op), off);
+            }
             return;
         }
         prevOff = off;
@@ -267,9 +278,18 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
 
     if (byRef == NULL) return;   /* the captures could not be decoded */
 
+    /* Why a local bound from a construction is not sunk, for JAI_JIT_WHY.
+     * A bare block, not do/while(0): `continue` must reach the for loop. */
+#define SKIP(why_)                                                           \
+    {                                                                        \
+        skipWhy(top, s, (why_));                                             \
+        continue;                                                            \
+    }
+
     for (unsigned s = 0; s < e->locals && e->sinkCount < JIT_MAX_SINK; s++) {
-        if ((use[s] & USE_BIND) == 0 || (use[s] & USE_OTHER) != 0) continue;
-        if (byRef[s]) continue;
+        if ((use[s] & USE_BIND) == 0) continue;
+        if ((use[s] & USE_OTHER) != 0) SKIP("a use other than a field read");
+        if (byRef[s]) SKIP("captured by a closure");
         /* Read before it is bound: the object it holds at entry is unpacked
          * there, so no dominance is needed -- the homes always hold the
          * local's current fields. */
@@ -291,11 +311,11 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
             }
             off += len;
         }
-        if (!dominated) continue;
+        if (!dominated) SKIP("a branch skips its bind");
     planned_dominance:;
 
         Value v = slots[s];
-        if (!IS_INSTANCE(v)) continue;
+        if (!IS_INSTANCE(v)) SKIP("not holding an instance at entry");
         ObjInstance *inst = AS_INSTANCE(v);
         ObjClass *cls = inst->klass;
         int argc = bindArgc[s];
@@ -303,10 +323,12 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
         if (cls == NULL || argc <= 0 || (unsigned)argc > JIT_SINK_FIELDS ||
             cls->fieldCount != (unsigned)argc ||
             inst->fieldCount != (unsigned)argc) {
-            continue;
+            SKIP("a field count the construction does not fill");
         }
         uint16_t map[JIT_MAX_ARGS_OUT];
-        if (!jitSimpleInitSlots(cls, (unsigned)argc, map)) continue;
+        if (!jitSimpleInitSlots(cls, (unsigned)argc, map)) {
+            SKIP("an init that does more than store its arguments");
+        }
         bool ok = true;
         uint32_t seenSlots = 0;
         unsigned j = e->sinkCount;
@@ -322,7 +344,7 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
             else ok = false;
             e->sink[j].argSlot[i] = map[i];
         }
-        if (!ok) continue;
+        if (!ok) SKIP("a field that is not an int or a float");
         e->sink[j].cls = cls;
         e->sink[j].local = s;
         e->sink[j].nfields = (unsigned)argc;
@@ -335,6 +357,7 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
                     cls->name ? cls->name->chars : "?");
         }
     }
+#undef SKIP
 }
 
 /* A read of sunk local `slot`: an entry that names the sink, in no register. */
