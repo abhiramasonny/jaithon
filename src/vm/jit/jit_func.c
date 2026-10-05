@@ -454,6 +454,13 @@ static void noteSlotWrite(Emit *e, unsigned slot) {
             e->whyNot = "a pushed list's local was written after all";
             e->failed = true;
         }
+        for (unsigned i = 0; i < e->closHoistCount; i++) {
+            if (e->closHoist[i].slot != (uint8_t)slot) continue;
+            if (e->curOffset < e->closHoist[i].top) continue;
+            if (e->curOffset >= e->closHoist[i].end) continue;
+            e->whyNot = "a hoisted closure's local was written after all";
+            e->failed = true;
+        }
         return;
     }
     if (e->inlining) return;
