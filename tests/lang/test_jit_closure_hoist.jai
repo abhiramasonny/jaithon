@@ -171,3 +171,32 @@ fn test_the_enclosing_frame_keeps_the_cell() -> void {
     }
     assert_eq(acc, 1200000)
 }
+
+#: Bodies that compute on the parameter rather than pass it through: a fused
+#: constant op reads the argument's register in place, `^` reads a borrowed
+#: operand, and `%` puts a cold fix-up join inside the inlined body. The last
+#: once made the function tier decline the caller -- the inlined body's own
+#: offsets were checked against the caller's branch targets.
+fn test_bodies_that_compute_on_the_parameter() -> void {
+    let d = 3
+    let f = |x| x + 1 + d
+    let g = |x| (x + 1) % 65521 + d
+    let h = |x| x ^ d
+    let m = |x| (x * 3 + d) % 1000003
+    var a = 0
+    var b = 0
+    var c = 5
+    var q = 1
+    var i = 0
+    while i < 300001 {
+        a = f(a)
+        b = g(b)
+        c = h(c)
+        q = m(q)
+        i += 1
+    }
+    assert_eq(a, 1200004)
+    assert_eq(b, 20626)
+    assert_eq(c, 6)
+    assert_eq(q, 77203)
+}

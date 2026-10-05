@@ -8,7 +8,8 @@
 # a site in an arm taken once in 100000 passes, each call with a different
 # closure or a global of another kind ran wholly interpreted: 180M
 # interpreted instructions here instead of ~1M, with the right answer, so no
-# output check could see it.
+# output check could see it. Also: an inlined body with a `%` once declined
+# its caller's function tier when its closure guard was hoisted.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -75,6 +76,31 @@ fn main() -> int {
 }
 JAI
 
+cat > "$work/mod_body.jai" <<'JAI'
+fn adder(step: int) -> fn(int) -> int {
+    return |x| (x + 1) % 65521 + step
+}
+
+fn apply_n(f: fn(int) -> int, start: int, times: int) -> int {
+    var acc = start
+    var i = 0
+    while i < times {
+        acc = f(acc)
+        i += 1
+    }
+    return acc
+}
+
+fn main() -> int {
+    var total = 0
+    for k in 0..300 {
+        total = (total + apply_n(adder(k), 0, 5000)) % 1000000007
+    }
+    print(total)
+    return 0
+}
+JAI
+
 fail=0
 note() { echo "$1 $2"; [ "$1" = "FAIL" ] && fail=1; return 0; }
 
@@ -96,4 +122,10 @@ for case in "rare_closure 45147900" "rare_global 89998950"; do
     fi
 done
 
+why=$(env $clear JAI_JIT_WHY=1 "$JAITHON" run "$work/mod_body.jai" 2>&1)
+if printf '%s\n' "$why" | grep -q "compiled __main__.apply_n "; then
+    note ok "a hoisted closure with a % body keeps the function tier"
+else
+    note FAIL "apply_n declined: $(printf '%s\n' "$why" | grep 'apply_n stopped' | head -1)"
+fi
 exit $fail

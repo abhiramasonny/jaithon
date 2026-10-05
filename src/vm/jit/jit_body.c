@@ -204,13 +204,26 @@ static bool inlineIntConstOp(Emit *e, const uint8_t *code, int off) {
         e->whyNot = "an inlined fused constant op on a local that is not an int";
         return false;
     }
-    if (!pushCopyOfEntry(e, src)) return false;
+    /* Read straight out of the entry's register into the new one, not
+     * copied there first and operated on in place: on a loop that inlines
+     * the body, the copy was a second `mov` on the caller's accumulator
+     * chain right after the argument's own, and a chain of eliminated movs
+     * is not free on this core -- `|x| x + 7` under a hoisted closure guard
+     * ran 15% slower than with the guard per-site. The entry itself is never
+     * written. */
+    if (!holdsRegister(e->stack[src])) return false;
+    unsigned svi = valueIndexOf(e, src);
+    fpSyncOne(e, svi);
+    unsigned rs = xHeldIn(e, svi);
+    if (!pushValue3(e, e->stack[src], e->stackShape[src], e->stackClass[src],
+                    NULL_VAL, -1)) {
+        return false;
+    }
     unsigned rd = pushReg(e) - 1;
-    e->stackSeen[e->depth - 1] = NULL_VAL;   /* no longer the local's value */
     if (op == OP_MUL_INT_CONST) {
         emitConst64(e, JIT_SCRATCH_D, k);
-        emit(e, jaiA64SmulhX(JIT_SCRATCH_A, rd, JIT_SCRATCH_D));
-        emit(e, jaiA64MulX(rd, rd, JIT_SCRATCH_D));
+        emit(e, jaiA64SmulhX(JIT_SCRATCH_A, rs, JIT_SCRATCH_D));
+        emit(e, jaiA64MulX(rd, rs, JIT_SCRATCH_D));
         emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
         branchOnOverflow(e, 2u, JAI_A64_NE);
         return true;
@@ -219,12 +232,12 @@ static bool inlineIntConstOp(Emit *e, const uint8_t *code, int off) {
      * stub names the right one. */
     int64_t addend = op == OP_SUB_INT_CONST ? -(int64_t)k : (int64_t)k;
     if (addend >= 0 && addend <= 4095) {
-        emit(e, jaiA64AddsXImm(rd, rd, (unsigned)addend));
+        emit(e, jaiA64AddsXImm(rd, rs, (unsigned)addend));
     } else if (addend < 0 && addend >= -4095) {
-        emit(e, jaiA64SubsXImm(rd, rd, (unsigned)(-addend)));
+        emit(e, jaiA64SubsXImm(rd, rs, (unsigned)(-addend)));
     } else {
         emitConst64(e, JIT_SCRATCH_A, addend);
-        emit(e, jaiA64AddsX(rd, rd, JIT_SCRATCH_A));
+        emit(e, jaiA64AddsX(rd, rs, JIT_SCRATCH_A));
     }
     branchOnOverflow(e, op == OP_SUB_INT_CONST ? 1u : 0u, JAI_A64_VS);
     return true;
@@ -367,6 +380,8 @@ static bool deferSurvives(uint8_t op) {
     case OP_INT: case OP_CONST:
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
     case OP_SHL: case OP_SHR:
+    /* Cannot fail, so no record: both operands are read through popValue. */
+    case OP_BAND: case OP_BOR: case OP_BXOR:
     /* Its arm settles both operands itself on every path that reads a register
      * for them, and takes no deopt record before doing so. */
     case OP_FLOORDIV:
@@ -756,7 +771,13 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                    closUpHoisted(e, closure, code[off + 1]))) ||
                 e->deferCarryCount >= jitCarryLimit()) {
                 settleAll(e);
-            } else {
+            } else if (!e->inlining) {
+                /* An inlined body's offsets are its OWN chunk's, and the
+                 * landing map below is the caller's: recorded, a callee
+                 * offset that happened to equal a caller's loop head
+                 * declined the whole body. Nothing can land inside an
+                 * inlined body -- it has no branches, and the caller's
+                 * reach it only at the call's own offset. */
                 e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
             }
         }
