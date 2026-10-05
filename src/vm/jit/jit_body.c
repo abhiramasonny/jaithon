@@ -750,7 +750,10 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         /* A borrow ends here unless the instruction is one of the few it is
          * allowed to live across. The top of an instruction is the one place
          * the release is guaranteed to be on the executed path. */
-        if (e->fpBorrow != 0 && (e->inProtected || !fpBorrowSurvives(op))) {
+        if (e->fpBorrow != 0 &&
+            (e->inProtected ||
+             !(fpBorrowSurvives(op) ||
+               (op == OP_GET_INDEX && jitBorrowGuardsOn())))) {
             fpReleaseAll(e);
         }
         e->curOffset = (uint32_t)off;

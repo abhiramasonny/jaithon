@@ -724,6 +724,11 @@ typedef struct {
          * it lives in the descriptor rather than a register. */
         bool     lastFromDesc;
         uint32_t fpLive;
+        /* Live entries that are still a borrow of a local's d home, and
+         * which home: the stub writes those out of the home, since nothing
+         * was ever written to their own bank register (jitBorrowGuardsOn). */
+        uint32_t fpBorrow;
+        uint8_t  fpBorrowReg[32];
         int      stub;
     } deopt[JIT_MAX_DEOPT];
     unsigned  deoptCount;
@@ -1173,6 +1178,9 @@ unsigned fpHeldIn(const Emit *e, unsigned idx);
 void fpSyncOne(Emit *e, unsigned idx);
 void fpReleaseHome(Emit *e, unsigned reg);
 void fpReleaseAll(Emit *e);
+bool jitBorrowGuardsOn(void);
+void noteDeoptBorrows(Emit *e, unsigned k);
+unsigned deoptFpSource(const Emit *e, unsigned k, unsigned valueIdx);
 void fpSyncAll(Emit *e);
 unsigned fpOperand(Emit *e, unsigned idx);
 bool jitFTwo(void);

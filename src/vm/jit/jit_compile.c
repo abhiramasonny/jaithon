@@ -1278,7 +1278,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
              * still holds whatever it held there. Moving it here rather than
              * before the guard is what keeps the hot path free of it. */
             if (e.deopt[k].fpLive & (1u << valueSeen)) {
-                emit(&e, jaiA64FmovXD(reg0, fpRegAt(&e, valueSeen)));
+                emit(&e, jaiA64FmovXD(reg0, deoptFpSource(&e, k, valueSeen)));
             }
             /* Both nullable kinds, not just the instance one. The ladder
              * below hands anything it does not name an unconditional VAL_OBJ,
