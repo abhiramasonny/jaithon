@@ -189,7 +189,8 @@ printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 # A job is its fields joined by \x1f -- the working directory (empty: this
 # one), a file to read stdin from (empty: none), KEY=VALUE pairs separated by
 # spaces, then the command's own words -- and jobs are separated by \x1e, since
-# a word can hold a newline (`--eval=$'...\n...'`).
+# a word can hold a newline (`--eval=$'...\n...'`). JOB_MERGE_STDERR=1 among
+# the pairs sends stderr to the .out file too, as `2>&1` would.
 parallel_jobs=()
 queue_job() {
     local IFS=$'\x1f'
@@ -211,15 +212,20 @@ def run(index):
     fields = jobs[index].split("\x1f")
     cwd, stdin, envset, command = fields[0] or None, fields[1], fields[2], fields[3:]
     env = dict(os.environ)
+    merged = False
     for pair in envset.split():
         key, _, value = pair.partition("=")
+        if key == "JOB_MERGE_STDERR":
+            merged = value == "1"
+            continue
         env[key] = value
     base = os.path.join(directory, str(index))
     started = time.time()
     with open(base + ".out", "wb") as out, open(base + ".err", "wb") as err:
         source = open(stdin, "rb") if stdin else None
         try:
-            status = subprocess.call(command, cwd=cwd, stdin=source, stdout=out, stderr=err, env=env)
+            status = subprocess.call(command, cwd=cwd, stdin=source, stdout=out,
+                                     stderr=subprocess.STDOUT if merged else err, env=env)
         finally:
             if source is not None:
                 source.close()
@@ -339,33 +345,64 @@ parallel_jobs=()
 # enforce the interpreter's frame limit. See "The one divergence that is
 # deliberate" in src/vm/jit/README.md.
 printf '%sFuzzer bug repros%s\n' "$BOLD" "$RESET"
+# Six runs per program, all independent: on the parallel job runner too.
+fuzz_configs=("" "JAITHON_JIT_TICK_US=50" "JAITHON_JIT_DEOPT_STRESS=1" \
+              "JAITHON_JIT_THRESHOLD=1" "JAITHON_JIT_SPLIT_STRESS=1")
+fuzz_names=()
+fuzz_first=()
 for src in "$ROOT"/tests/fuzz/found/*.jai; do
     name="fuzz/$(basename "$src" .jai)"
     matches_filter "$name" || continue
     if sed -n 's/^#: *differential-exempt: *\(yes\).*/\1/p' "$src" | head -1 \
        | grep -q yes; then
+        fuzz_names+=("$name")
+        fuzz_first+=(-1)
+        continue
+    fi
+    fuzz_names+=("$name")
+    fuzz_first+=(${#parallel_jobs[@]})
+    queue_job "" "" "JOB_MERGE_STDERR=1 JAITHON_NO_JIT=1" "$JAITHON" run "$src"
+    for cfg in "${fuzz_configs[@]}"; do
+        queue_job "" "" "JOB_MERGE_STDERR=1 $cfg" "$JAITHON" run "$src"
+    done
+done
+fuzz_dir="$(mktemp -d "${TMPDIR:-/tmp}/jai_fuzz.XXXXXX")"
+run_parallel_jobs "$fuzz_dir"
+index=0
+while [[ $index -lt ${#fuzz_names[@]} ]]; do
+    name="${fuzz_names[$index]}"
+    first="${fuzz_first[$index]}"
+    index=$((index + 1))
+    if [[ $first -lt 0 ]]; then
         record_skip "$name" "differential-exempt (deliberate divergence)"
         continue
     fi
-    start=$(now_ms)
-    reference="$(JAITHON_NO_JIT=1 "$JAITHON" run "$src" 2>&1)"
+    reference="$(cat "$fuzz_dir/$first.out")"
     bad=""
-    for cfg in "" "JAITHON_JIT_TICK_US=50" "JAITHON_JIT_DEOPT_STRESS=1" \
-               "JAITHON_JIT_THRESHOLD=1" "JAITHON_JIT_SPLIT_STRESS=1"; do
-        actual="$(env $cfg "$JAITHON" run "$src" 2>&1)"
-        if [[ "$actual" != "$reference" ]]; then
-            bad+="under ${cfg:-default}:
+    elapsed=0
+    job=$first
+    for cfg in "" "${fuzz_configs[@]}"; do
+        took=0
+        [[ -f "$fuzz_dir/$job.status" ]] && read -r _ took < "$fuzz_dir/$job.status"
+        elapsed=$((elapsed + took))
+        if [[ $job -ne $first ]]; then
+            actual="$(cat "$fuzz_dir/$job.out")"
+            if [[ "$actual" != "$reference" ]]; then
+                bad+="under ${cfg:-default}:
 $(diff <(printf '%s\n' "$reference") <(printf '%s\n' "$actual") | head -20)
 "
+            fi
         fi
+        job=$((job + 1))
     done
-    elapsed=$(( $(now_ms) - start ))
     if [[ -z "$bad" ]]; then
         record_pass "$name" "$elapsed"
     else
         record_fail "$name" "$bad"
     fi
 done
+rm -rf "$fuzz_dir"
+parallel_jobs=()
 
 # ------------------------------------------------------------------ 3. unit
 printf '%sUnit tests%s\n' "$BOLD" "$RESET"
