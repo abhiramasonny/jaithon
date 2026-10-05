@@ -368,7 +368,9 @@ kernel void corner_emit(device const float* response [[buffer(0)]],
  * same grain as the thousand slices the count used between floor and peak.
  * The strongest is kept as an order-preserving key, which for a positive
  * float is its bits with the sign bit set and for a negative one the
- * complement, so an unsigned maximum is the float maximum. */
+ * complement, so an unsigned maximum is the float maximum. A NaN is skipped,
+ * as the reduction it replaces skips it, and the tests are on the bits because
+ * fast math may fold a float comparison with a NaN either way. */
 kernel void corner_survey(device const float* response [[buffer(0)]],
                           device const float* mask [[buffer(1)]],
                           device atomic_uint* top [[buffer(2)]],
@@ -387,7 +389,9 @@ kernel void corner_survey(device const float* response [[buffer(0)]],
         uint y = id / cols;
         uint x = id - y * cols;
         uint bits = as_type<uint>(response[r_off + y * r_step + x]);
-        key = (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+        if ((bits & 0x7FFFFFFFu) <= 0x7F800000u) {
+            key = (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+        }
     }
     uint best = simd_max(key);
     if (lane == 0u) atomic_fetch_max_explicit(top, best, memory_order_relaxed);
@@ -397,12 +401,17 @@ kernel void corner_survey(device const float* response [[buffer(0)]],
     }
     uint y = id / cols;
     uint x = id - y * cols;
-    float here = response[r_off + y * r_step + x];
-    if (here <= 0.0f) return;
-    atomic_fetch_add_explicit(&counts[as_type<uint>(here) >> 16], 1u, memory_order_relaxed);
+    /* Only a positive response is counted: zero, a negative and a NaN of
+     * either sign all fall outside 1 to 0x7F800000, which keeps the slice
+     * inside the 32768 counts. */
+    uint here = as_type<uint>(response[r_off + y * r_step + x]);
+    if (here - 1u >= 0x7F800000u) return;
+    atomic_fetch_add_explicit(&counts[here >> 16], 1u, memory_order_relaxed);
 }
 
-/* The survey's counts as floats, and its strongest decoded, at the end. */
+/* The survey's counts as floats, and its strongest decoded, at the end. A key
+ * no pixel raised -- an empty frame, or one of NaNs -- reads as zero, which
+ * is no corner at all. */
 kernel void corner_survey_read(device const uint* top [[buffer(0)]],
                                device const uint* counts [[buffer(1)]],
                                device float* out [[buffer(2)]],
@@ -414,7 +423,7 @@ kernel void corner_survey_read(device const uint* top [[buffer(0)]],
     }
     if (id != slices) return;
     uint key = top[0];
-    uint bits = (key & 0x80000000u) != 0u ? (key & 0x7FFFFFFFu) : ~key;
+    uint bits = key == 0u ? 0u : (key & 0x80000000u) != 0u ? (key & 0x7FFFFFFFu) : ~key;
     out[slices] = as_type<float>(bits);
 }
 
@@ -621,7 +630,11 @@ pub fn match_template(image: Mat, templ: Mat, method: int = TM_CCOEFF_NORMED) ->
     if spread < 0.0 { spread = 0.0 }
     #: Shared, not made per call: a matrix dropped here was a device buffer
     #: leaked on every match.
-    let stats = cached_weights(1, 6, [sums[0], sums[1], sums[2], sums[3], energy, math.sqrt(spread)])
+    let stats = cached_weights(
+        1,
+        6,
+        [sums[0], sums[1], sums[2], sums[3], energy, math.sqrt(spread)]
+    )
 
     kernel_for("feature_match").dispatch_async(
         [image.storage, templ.storage, out.storage, stats.storage],
@@ -674,7 +687,11 @@ fn structure_tensor(src: Mat, block_size: int, aperture_size: int) -> Mat {
     #: Not zeroed: the covariance kernel writes every element.
     let cov = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 3))
     let count = src.rows * src.cols
-    if count == 0 { return cov }
+    if count == 0 {
+        dx.release()
+        dy.release()
+        return cov
+    }
     kernel_for("feature_covariance").dispatch_async(
         [dx.storage, dy.storage, cov.storage],
         count,
@@ -712,7 +729,10 @@ pub fn corner_harris(
     let cov = structure_tensor(src, block_size, aperture_size)
     let out = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
     let count = src.rows * src.cols
-    if count == 0 { return out }
+    if count == 0 {
+        cov.release()
+        return out
+    }
     kernel_for("feature_harris").dispatch_async(
         [cov.storage, out.storage],
         count,
@@ -731,7 +751,10 @@ pub fn corner_min_eigen_val(src: Mat, block_size: int = 3, aperture_size: int = 
     let cov = structure_tensor(src, block_size, aperture_size)
     let out = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
     let count = src.rows * src.cols
-    if count == 0 { return out }
+    if count == 0 {
+        cov.release()
+        return out
+    }
     kernel_for("feature_min_eigen").dispatch_async(
         [cov.storage, out.storage],
         count,
@@ -968,6 +991,10 @@ pub fn good_features_to_track(
     }
     let rows = response.rows
     let cols = response.cols
+    if rows * cols == 0 {
+        response.release()
+        return []
+    }
     response.flush()
     let mask_image = mask
     if mask_image is not null { mask_image.flush() }
@@ -991,7 +1018,9 @@ pub fn good_features_to_track(
         let (_low, high) = min_max(response)
         strongest = high
     }
-    if strongest <= 0.0 {
+    #: A quality level above one puts the floor above the strongest, which
+    #: leaves nothing, as it does in OpenCV.
+    if strongest <= 0.0 or quality_level > 1.0 and strongest * quality_level > strongest {
         let surveyed = survey
         if surveyed is not null { surveyed.free() }
         response.release()
@@ -1031,7 +1060,8 @@ pub fn good_features_to_track(
             }
         }
         if cut > 0 {
-            emit_bits = (low_slice + cut) << 16
+            let cut_slice = low_slice + cut
+            emit_bits = cut_slice << 16
             room = running
             whole_frame = false
         }
