@@ -112,7 +112,7 @@ pub class ModuleSig {
     #: decoded: parse, keep the signature on disk, collect, strip.
     pub fn parse_source(self, raw: any, text: str) -> void {
         let program = parse(text, self.file_id)
-        if _SIG_CACHE and program != null and program.kind == NodeKind.Program {
+        if program != null and program.kind == NodeKind.Program and _sig_cache_on() {
             _keep_signature(self.path, raw, program)
         }
         self._fill(program)
@@ -263,7 +263,7 @@ pub class SigLoader {
 
         let raw = _read_bytes(resolved)
         if raw is null { return null }
-        let kept = if _SIG_CACHE { _read_kept(resolved, raw) } else { null }
+        let kept = if _sig_cache_on() { _read_kept(resolved, raw) } else { null }
         var text: str? = null
         if kept is null {
             text = _decode(raw)
@@ -761,8 +761,11 @@ fn _decode(raw: any) -> str? {
 #: nothing about the tree's shape is frozen into the file.
 #:
 #: The key is the source itself, compared byte for byte -- a memcmp, cheaper
-#: than any hash and with nothing to collide -- plus the build and
-#: `_SIG_CACHE_VERSION`. A signature depends on its own module's bytes and
+#: than any hash and with nothing to collide -- plus the build, the front end
+#: (`JAITHON_FRONT_END_ID`, which the runtime derives from the seed: a reseed
+#: moves it where the build id does not) and `_SIG_CACHE_VERSION`. With no
+#: front-end identity -- the compiler running from anything but the binary's
+#: seed -- nothing is read or written. A signature depends on its own module's bytes and
 #: nothing else: a re-export is recorded by name and followed through that
 #: module's own signature. One is written only for a module that parsed, so
 #: whether a module parses is always the full parser's answer: a module with
@@ -794,7 +797,25 @@ pub fn signature_text(source: str, file_id: int = 1) -> str? {
 
 #: Whether signatures are being kept on disk in this process.
 pub fn signature_cache_enabled() -> bool {
-    return _SIG_CACHE
+    return _sig_cache_on()
+}
+
+#: The front end's identity, read the first time it is needed: the runtime
+#: exports it once the front end has loaded, which is after this module's own
+#: top level ran. "" when there is none to key on.
+var _front_end_id: str? = null
+
+fn _front_end() -> str {
+    let known = _front_end_id
+    if known is not null { return known }
+    var found = __prim__.os_env("JAITHON_FRONT_END_ID") ?? ""
+    if found == "none" or found.contains(" ") { found = "" }
+    _front_end_id = found
+    return found
+}
+
+fn _sig_cache_on() -> bool {
+    return _SIG_CACHE and _front_end() != ""
 }
 
 #: `src/__jaicache__/util.jsig` for `src/util.jai`, beside its `.jaic`.
@@ -821,7 +842,7 @@ class _Kept {
 
 #: The kept signature for `raw`, the bytes just read from `path`, or null.
 #:
-#: The file is one line `jsig VERSION BUILD LENGTH META_LENGTH META_CRC`, then
+#: The file is one line `jsig VERSION BUILD FRONT_END LENGTH META_LENGTH META_CRC`, then
 #: META_LENGTH bytes of `E start end dotted` and `B start end` lines, then the
 #: LENGTH bytes of source it was made from.
 fn _read_kept(path: str, raw: any) -> _Kept? {
@@ -833,19 +854,20 @@ fn _read_kept(path: str, raw: any) -> _Kept? {
         let header = _decode(__prim__.bytes_slice(kept, 0, newline))
         if header is null { return null }
         let fields = header.split(" ")
-        if fields.len() != 6 or fields[0] != "jsig" { return null }
+        if fields.len() != 7 or fields[0] != "jsig" { return null }
         if int(fields[1]) != _SIG_CACHE_VERSION { return null }
         if int(fields[2]) != __prim__.jaic_build_id() { return null }
+        if fields[3] != _front_end() { return null }
         let length = __prim__.bytes_len(raw)
-        if int(fields[3]) != length { return null }
-        let meta_length = int(fields[4])
+        if int(fields[4]) != length { return null }
+        let meta_length = int(fields[5])
         let meta_start = newline + 1
         let source_start = meta_start + meta_length
         if meta_length < 0 or __prim__.bytes_len(kept) != source_start + length { return null }
         let copy = __prim__.bytes_slice(kept, source_start, source_start + length)
         if __prim__.bytes_cmp(copy, raw) != 0 { return null }
         let meta = __prim__.bytes_slice(kept, meta_start, source_start)
-        if __prim__.crc32(meta) != int(fields[5]) { return null }
+        if __prim__.crc32(meta) != int(fields[6]) { return null }
         let lines = _decode(meta)
         if lines is null { return null }
 
@@ -897,7 +919,9 @@ fn _keep_signature(path: str, raw: any, program: Node) -> void {
         let length = __prim__.bytes_len(raw)
         let build = __prim__.jaic_build_id()
         let meta_length = __prim__.bytes_len(meta)
-        let header = f"jsig {_SIG_CACHE_VERSION} {build} {length} {meta_length} {__prim__.crc32(meta)}\n"
+        let front = _front_end()
+        let crc = __prim__.crc32(meta)
+        let header = f"jsig {_SIG_CACHE_VERSION} {build} {front} {length} {meta_length} {crc}\n"
         __prim__.io_write(handle, header)
         __prim__.io_write(handle, meta)
         __prim__.io_write(handle, raw)
