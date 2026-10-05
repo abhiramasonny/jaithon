@@ -775,6 +775,12 @@ static bool loopWritesCapturedLocal(const Emit *e, const Chunk *c,
     return false;
 }
 
+/* A truncated OSR walk ("walked only to OP_CLOSURE") never sees a write to
+ * the local in the loop's uncompiled tail, so slotWriteLo/Hi can call the
+ * local unwritten when it is not. That stays sound only because compiled
+ * code never resumes mid-loop: every re-entry from the interpreter comes
+ * through the head, and so through the head's guard. Anything that lets
+ * compiled code resume past the head must ask for a complete walk here. */
 static void planClosureHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds,
                               uint32_t regionLo, uint32_t regionHi) {
     e->closHoistCount = 0;
