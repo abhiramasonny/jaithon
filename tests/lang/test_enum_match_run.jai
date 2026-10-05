@@ -55,8 +55,18 @@ fn every_letter(v: any) -> int {
 
 fn _letters() -> list[Letter] {
     return [
-        Letter.A, Letter.B, Letter.C, Letter.D, Letter.E, Letter.F,
-        Letter.G, Letter.H, Letter.I, Letter.J, Letter.K, Letter.L,
+        Letter.A,
+        Letter.B,
+        Letter.C,
+        Letter.D,
+        Letter.E,
+        Letter.F,
+        Letter.G,
+        Letter.H,
+        Letter.I,
+        Letter.J,
+        Letter.K,
+        Letter.L,
     ]
 }
 

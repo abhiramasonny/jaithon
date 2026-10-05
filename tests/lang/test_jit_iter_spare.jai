@@ -10,7 +10,7 @@ fn rows(n: int, w: int) -> list[list[int]] {
     var out: list[list[int]] = []
     for i in 0..n {
         var r: list[int] = []
-        for j in 0..(w + i % 3) { r.push(i * 10 + j) }
+        for j in 0..w + i % 3 { r.push(i * 10 + j) }
         out.push(r)
     }
     return out

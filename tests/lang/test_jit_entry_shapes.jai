@@ -94,8 +94,9 @@ fn test_a_body_that_bails_after_entry() {
     var s = 0
     for i in 0..300 { s = s + bump(i) }
     assert_eq(s, 45150)
-    assert_throws(OverflowError, fn() -> void { bump(9223372036854775807) },
-                  "an add past the largest int, inside a compiled body")
+    assert_throws(OverflowError, fn() -> void {
+        bump(9223372036854775807)
+    }, "an add past the largest int, inside a compiled body")
     let ints = [1, 2, 3, 4]
     var t = 0
     for i in 0..300 { t = t + add_up(ints, 4) }
@@ -104,7 +105,8 @@ fn test_a_body_that_bails_after_entry() {
     #: changes, so the body leaves through a deopt, not a decline at entry.
     let mixed: list = [1, 2, 3, 4]
     mixed[2] = "x"
-    assert_throws(TypeError, fn() -> void { add_up(mixed, 4) },
-                  "an element that is no longer an int")
+    assert_throws(TypeError, fn() -> void {
+        add_up(mixed, 4)
+    }, "an element that is no longer an int")
     assert_eq(add_up(mixed, 2), 3)
 }

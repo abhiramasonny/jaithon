@@ -8,13 +8,13 @@ from std.test import assert_eq, assert_throws, assert_true
 
 fn ints(n: int) -> list[int] {
     var xs: list[int] = []
-    for i in 0..n { xs.push((i * 7919) % 1000 - 300) }
+    for i in 0..n { xs.push(i * 7919 % 1000 - 300) }
     return xs
 }
 
 fn floats(n: int) -> list[float] {
     var xs: list[float] = []
-    for i in 0..n { xs.push(float((i * 7919) % 1000) / 7.0) }
+    for i in 0..n { xs.push(float(i * 7919 % 1000) / 7.0) }
     return xs
 }
 
@@ -82,7 +82,7 @@ fn test_result_takes_any_element() -> void {
 #: empty one is still a list.
 fn test_a_sparse_result_shrinks_and_still_grows() -> void {
     var xs: list[int] = []
-    for i in 0..5000 { xs.push((i * 7919) % 10007) }
+    for i in 0..5000 { xs.push(i * 7919 % 10007) }
     for _round in 0..30 {
         var ys = xs.filter(|x| x < 5)
         let none = xs.filter(|x| x < 0)

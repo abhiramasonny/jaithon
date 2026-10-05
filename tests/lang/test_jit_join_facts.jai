@@ -7,9 +7,13 @@
 from std.test import assert_eq
 
 fn scaled(x: float) -> float { return 1.0 * (if x <= 0.5 { 7.0 } else { 2.0 }) }
+
 fn squared_or_doubled(x: float) -> float { return x * (if x <= 0.5 { x } else { 2.0 }) }
-fn negated(x: float) -> float { return (-x) * (if x <= 0.5 { 7.0 } else { 2.0 }) }
+
+fn negated(x: float) -> float { return -x * (if x <= 0.5 { 7.0 } else { 2.0 }) }
+
 fn shifted(x: float, k: float) -> float { return (x + 1.0) * (if x < k { x } else { 2.0 }) }
+
 fn picked(x: int) -> int { return 3 * (if x <= 5 { 7 } else { 2 }) }
 
 fn ranged(c: bool, n: int) -> int {
