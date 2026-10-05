@@ -520,9 +520,12 @@ void noteSlotStored(Emit *e, int slot) {
 
 void localOut(Emit *e, unsigned slot, unsigned src) {
     noteSlotWrite(e, slot);
+    /* A spilled body borrows only an inline's homes (localHomeX). */
     xHomeWritten(e, e->osr ? e->slotXReg[slot]
-                           : (e->spilled ? e->slotXReg[slot]
-                                         : localReg(e, slot)));
+                           : (e->spilled
+                                  ? (e->inlHomeLo != 0 && slot >= e->inlHomeLo
+                                         ? e->slotXReg[slot] : 0u)
+                                  : localReg(e, slot)));
     if (e->osr) {
         /* The memory arm below is three instructions -- the tag built, the tag
          * stored, the payload stored -- against one `mov` into an X home or one
