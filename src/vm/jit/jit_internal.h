@@ -1701,7 +1701,6 @@ bool jitSlotAddSafe(const Emit *e, const ObjFunction *fn, uint32_t q,
 void jitRangeReset(void);
 /* jit_vector.c: a two-lane NEON run of a `for j in a..b` whose body is one
  * float store, emitted at the loop head on entry only (JAITHON_JIT_VECTOR). */
-bool jitVectorOn(void);
 void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off);
 /* jit_range.c: whether the instruction at `off` may write local `slot`. */
 bool jitOpWritesSlot(const Chunk *c, int off, unsigned slot);

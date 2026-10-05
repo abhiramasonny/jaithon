@@ -45,7 +45,7 @@
 
 #if (defined(__aarch64__) || defined(__arm64__))
 
-bool jitVectorOn(void) {
+static bool jitVectorOn(void) {
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("JAITHON_JIT_VECTOR");
@@ -551,7 +551,6 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
 }
 
 #else
-bool jitVectorOn(void) { return false; }
 void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     (void)e; (void)fn; (void)off;
 }
