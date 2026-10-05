@@ -44,6 +44,9 @@
 #include <string.h>
 #include "vm/jit/jit_internal.h"
 
+bool gVectorUsed;
+bool gNoVector;
+
 #if (defined(__aarch64__) || defined(__arm64__))
 
 static bool jitVectorOn(void) {
@@ -496,11 +499,15 @@ static void vecBody(Emit *e, const VecPlan *p, const uint8_t *dense,
 }
 
 void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
-    if (!jitVectorOn() || e->measuring || e->inlining || e->failed) return;
+    if (!jitVectorOn() || gNoVector || e->measuring || e->inlining ||
+        e->failed) {
+        return;
+    }
     if (e->depth != 0 || e->valueDepth != 0) return;
-    /* A few hundred words per loop. A body already a quarter of the way to
-     * JIT_MAX_INSTS has its deopt stubs still to come, and outgrowing the
-     * buffer declines the WHOLE body -- far worse than a scalar loop. */
+    /* A few hundred words per loop, which the measuring pass never sees. A
+     * body already a quarter of the way to JIT_MAX_INSTS has its deopt stubs
+     * still to come; outgrowing the buffer would cost a second compile without
+     * the vector blocks (gNoVector), so a large body keeps its loops scalar. */
     if (e->count > JIT_MAX_INSTS / 4u) return;
     VecPlan p;
     p.failAt = -1;
@@ -724,6 +731,7 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
         vecPatch(e, skips[i], skipCond[i], e->count);
     }
 #undef VEC_SKIP
+    gVectorUsed = true;
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s %s at %u: vectorised %u lists, %u streams "
                 "x %u lanes\n", e->osr ? "osr" : "func", jitFnLabel(fn), off,

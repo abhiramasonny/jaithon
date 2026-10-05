@@ -1702,6 +1702,12 @@ void jitRangeReset(void);
 /* jit_vector.c: a two-lane NEON run of a `for j in a..b` whose body is one
  * float store, emitted at the loop head on entry only (JAITHON_JIT_VECTOR). */
 void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off);
+/* Set when the real pass emitted a vector block. The measuring pass never
+ * emits one, so it cannot price them: a real pass that then fails is tried
+ * once more with gNoVector set, and compiles exactly as without the
+ * vectoriser. Both tiers reset gVectorUsed as each attempt starts. */
+extern bool gVectorUsed;
+extern bool gNoVector;
 /* jit_range.c: whether the instruction at `off` may write local `slot`. */
 bool jitOpWritesSlot(const Chunk *c, int off, unsigned slot);
 bool emitModIntConst(Emit *e, const uint8_t *code, int *offp);
