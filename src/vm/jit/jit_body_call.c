@@ -238,6 +238,17 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             }
             if (e->failed) return false;
 
+            /* The verdict check below sends a callee's raise to the exception
+             * exit, which leaves with the exception pending and no frame of
+             * this body for the unwinder to search -- so inside a `try` the
+             * handler was skipped and the raise escaped to the caller. Every
+             * other call arm asks this; this one stopped when its bail became
+             * a deopt, and an inlined body above needs no answer because its
+             * guards resume at the call. See Emit::inProtected. */
+            if (!raiseExitAllowed(e, "a call that can raise inside a try")) {
+                return false;
+            }
+
             /* The same two things the direct global call checks, and for
              * the same reasons: a raw payload is only sound if the callee
              * was specialised to that kind and shape, and the caller's
