@@ -432,7 +432,23 @@ void emitMapKernelNext(Emit *e, SlotKind k) {
         e->whyNot = "a map kernel returning another kind";
         return;
     }
-    unsigned rI = e->mapKernelReg, rG = rI + 2u;
+    unsigned rI = e->mapKernelReg, rG = rI + 2u, rJ = rI + 3u;
+    if (k == SLOT_BOOL) {
+        /* A filter: element `i` of the source goes to element `j` of the
+         * result when the verdict is true. Both are eight bytes wide. */
+        emit(e, jaiA64SubsXImm(31, 0, 0));
+        emit(e, jaiA64BCond(JAI_A64_EQ, 6));
+        emit(e, jaiA64LdrX(JIT_SCRATCH_C, rG,
+                           (unsigned)offsetof(JitMapRun, src)));
+        emit(e, jaiA64LdrXRegLsl3(JIT_SCRATCH_D, JIT_SCRATCH_C, rI));
+        emit(e, jaiA64LdrX(JIT_SCRATCH_C, rG,
+                           (unsigned)offsetof(JitMapRun, dst)));
+        emit(e, jaiA64StrXIdx(JIT_SCRATCH_D, JIT_SCRATCH_C, rJ));
+        emit(e, jaiA64AddXImm(rJ, rJ, 1));
+        emit(e, jaiA64AddXImm(rI, rI, 1));
+        emit(e, jaiA64B(e->mapKernelHead - (int)e->count));
+        return;
+    }
     emit(e, jaiA64LdrX(JIT_SCRATCH_C, rG, (unsigned)offsetof(JitMapRun, dst)));
     emit(e, jaiA64StrXIdx(0, JIT_SCRATCH_C, rI));
     emit(e, jaiA64AddXImm(rI, rI, 1));
@@ -451,13 +467,17 @@ bool jaiJitMapKernelOn(void) {
 }
 
 /* See above. `slotBase` is the run's window, its argument the first element;
- * `kind` the result kind every return must have, an int or a float. The
+ * `kind` the result kind every return must have: an int or a float for a
+ * map, a bool for a filter (each true verdict copies the element). The
  * function's own compiled form and everything recorded about it are left
  * exactly as they were. NULL when the body does not qualify. */
 uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
                                 uint8_t kind) {
     ObjFunction *fn = closure->fn;
-    if (kind != (uint8_t)SLOT_INT && kind != (uint8_t)SLOT_FLOAT) return NULL;
+    if (kind != (uint8_t)SLOT_INT && kind != (uint8_t)SLOT_FLOAT &&
+        kind != (uint8_t)SLOT_BOOL) {
+        return NULL;
+    }
     if (fn->upvalueCount != 0 || fn->arity != 1) return NULL;
     if (!eligible(fn)) return NULL;
 
@@ -843,12 +863,13 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     /* A kernel keeps its index, its bound and &gJitMapRun in the three
      * callee-saved registers above everything the body was planned into. */
     if (gMapKernel) {
-        if (saved + 3u > JIT_MAX_SAVED) {
+        unsigned want = gMapKernelKind == (uint8_t)SLOT_BOOL ? 4u : 3u;
+        if (saved + want > JIT_MAX_SAVED) {
             jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
             return false;
         }
         e.mapKernelReg = JIT_FIRST_SAVED + saved;
-        saved += 3u;
+        saved += want;
     }
     e.savedCount = saved;
     e.callsOut   = body.callsOut;
@@ -907,12 +928,21 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         emitConst64(&e, rG, (int64_t)(uintptr_t)&gJitMapRun);
         emit(&e, jaiA64LdrX(rI, rG, (unsigned)offsetof(JitMapRun, i)));
         emit(&e, jaiA64LdrX(rN, rG, (unsigned)offsetof(JitMapRun, n)));
+        bool filter = gMapKernelKind == (uint8_t)SLOT_BOOL;
+        if (filter) {
+            emit(&e, jaiA64LdrX(rI + 3u, rG,
+                                (unsigned)offsetof(JitMapRun, j)));
+        }
         e.mapKernelHead = (int)e.count;
         emit(&e, jaiA64SubsX(31, rI, rN));
         e.mapKernelExit = (int)e.count;
         emit(&e, jaiA64BCond(JAI_A64_GE, 0));          /* patched below */
         /* Where every way out but the last says which element it was on. */
         emit(&e, jaiA64StrX(rI, rG, (unsigned)offsetof(JitMapRun, i)));
+        if (filter) {
+            emit(&e, jaiA64StrX(rI + 3u, rG,
+                                (unsigned)offsetof(JitMapRun, j)));
+        }
         emit(&e, jaiA64LdrX(JIT_SCRATCH_C, rG,
                             (unsigned)offsetof(JitMapRun, src)));
         emit(&e, jaiA64LdrXRegLsl3(0, JIT_SCRATCH_C, rI));
@@ -1115,6 +1145,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
             jaiA64BCond(JAI_A64_GE, done - e.mapKernelExit);
         emit(&e, jaiA64StrX(e.mapKernelReg, e.mapKernelReg + 2u,
                             (unsigned)offsetof(JitMapRun, i)));
+        if (gMapKernelKind == (uint8_t)SLOT_BOOL) {
+            emit(&e, jaiA64StrX(e.mapKernelReg + 3u, e.mapKernelReg + 2u,
+                                (unsigned)offsetof(JitMapRun, j)));
+        }
         emit(&e, jaiA64MovzX(0, 0, 0));
         emitEpilogue(&e, 0);
     }

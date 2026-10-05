@@ -416,7 +416,8 @@ typedef struct {
     uint8_t   mapKernelKind;
     int       mapKernelHead;
     int       mapKernelExit;
-    /* x(reg) the index, x(reg+1) the bound, x(reg+2) &gJitMapRun. */
+    /* x(reg) the index, x(reg+1) the bound, x(reg+2) &gJitMapRun, and for
+     * a filter kernel (mapKernelKind SLOT_BOOL) x(reg+3) the count kept. */
     unsigned  mapKernelReg;
     /* Inlined callee: its locals are operand-stack entries of the CALLER's frame (slots 1..n are the
      * already-present argument entries); nothing is copied, no frame appears -- but the interpreter has no idea, so every guard inside deoptimises to `inlIp` (the caller's OP_CALL) with the model as of `inlDepth`. */
@@ -1133,6 +1134,9 @@ typedef struct {
     void       *dst;
     int64_t     i;
     int64_t     n;
+    /* A filter kernel's count of elements kept, in a register as `i` is and
+     * written back beside it. */
+    int64_t     j;
 } JitMapRun;
 extern JitMapRun gJitMapRun;
 void emitMapKernelNext(Emit *e, SlotKind k);

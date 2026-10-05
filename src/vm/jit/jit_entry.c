@@ -1045,6 +1045,97 @@ int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
  * Anything else stops the run; a call that comes back with a non-zero verdict
  * is finished as jaiCallPreparedFn1 finishes it and its answer checked as
  * callPredicate checks it. */
+/* A filter call that came back with a non-zero verdict: finished as
+ * jaiCallPreparedFn1 finishes it, its answer checked as callPredicate checks
+ * it, and `item` kept on a true one. The rest goes back to the caller. */
+static JAI_NOINLINE int filterRunBailed(JaiPreparedFn1 *p, ObjList *dst,
+                                        JitResult r, Value *base,
+                                        int frameBase, int i, Value item,
+                                        bool *ok) {
+    Value verdict;
+    JaiJitOutcome outcome = jitResultOut(p->fn, r, base);
+    bool good;
+    if (outcome == JAI_JIT_DONE) {
+        verdict = base[0];
+        good = true;
+    } else if (outcome == JAI_JIT_ERROR) {
+        good = false;
+    } else if (outcome == JAI_JIT_DEOPT) {
+        good = jaiFinishJitDeopt1(p->closure, base, frameBase, &verdict);
+    } else {
+        good = callFn1Rerun(base, &verdict);
+    }
+    vm.stackTop = base;
+    if (good && !IS_BOOL(verdict)) {
+        (void)jaiThrow(vm.cTypeError,
+                       "list.filter(): the predicate must return "
+                       "bool, not %s", jaiTypeNameStatic(verdict));
+        good = false;
+    }
+    if (!good) {
+        *ok = false;
+        return i;
+    }
+    if (AS_BOOL(verdict)) jaiListPush(dst, item);
+    if (vm.hasException) *ok = false;
+    return i + 1;
+}
+
+/* The filter run through a kernel (jaiJitCompileMapKernel with a bool
+ * result): every element whose verdict is true copied into the result in one
+ * call, the result first given the source's own storage and room for every
+ * element left, since it can keep no more than that. As for a map, the body
+ * calls nothing, so neither list changes under it, and an element the kernel
+ * stops on with a verdict is that element's call, finished as any bailed
+ * call is. */
+static int filterRunKernel(JaiPreparedFn1 *p, ObjList *src, int from,
+                           ObjList *dst, bool *ok, Value *base,
+                           SlotKind pk, bool *took) {
+    *took = false;
+    uint8_t want = pk == SLOT_INT ? (uint8_t)LIST_STORE_I64
+                                  : (uint8_t)LIST_STORE_F64;
+    if (src->stg != want || src->count - from < MAP_KERNEL_MIN ||
+        p->fn->jitFunc != p->entry ||
+        p->fn->module->version != p->moduleVersion ||
+        !jaiJitMapKernelOn()) {
+        return from;
+    }
+    uint8_t *kernel = mapKernelFor(p, base, (uint8_t)SLOT_BOOL);
+    if (kernel == NULL) return from;
+    /* May allocate, and so collect: the window is on the VM stack, the
+     * source is the receiver and the result is rooted by listFilter. */
+    if (!jaiListShapeFor(dst, want)) return from;
+    int need = dst->count + (src->count - from);
+    if (need > dst->capacity) jaiListReserve(dst, need);
+    if (dst->capacity < need || dst->stg != want) return from;
+    *took = true;
+    int frameBase = vm.frameCount;
+    gJitMapRun.src = src->items;
+    gJitMapRun.dst = dst->items;
+    gJitMapRun.i = from;
+    gJitMapRun.n = src->count;
+    gJitMapRun.j = dst->count;
+    JitResult r = ((Fn1)(uintptr_t)kernel)(0);
+    int at = (int)gJitMapRun.i;
+    dst->count = (int)gJitMapRun.j;
+    dst->version++;
+    if (JAI_LIKELY(r.bailed == 0)) {
+        vm.stackTop = base;
+        return at;
+    }
+    int64_t bits = ((const int64_t *)src->items)[at];
+    Value item;
+    if (pk == SLOT_INT) {
+        item = INT_VAL(bits);
+    } else {
+        double d;
+        memcpy(&d, &bits, sizeof d);
+        item = FLOAT_VAL(d);
+    }
+    base[1].as.integer = bits;
+    return filterRunBailed(p, dst, r, base, frameBase, at, item, ok);
+}
+
 int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
                          ObjList *dst, bool *ok) {
     *ok = true;
@@ -1063,6 +1154,12 @@ int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
     base[0] = p->callee;
     base[1] = pk == SLOT_INT ? INT_VAL(0) : FLOAT_VAL(0.0);
     vm.stackTop = base + 2;
+
+    if (mapRunTightOn()) {
+        bool took;
+        int k = filterRunKernel(p, src, from, dst, ok, base, pk, &took);
+        if (took) return k;
+    }
 
     int i = from;
     for (; i < src->count; i++) {
@@ -1093,34 +1190,7 @@ int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
         if (JAI_LIKELY(r.bailed == 0)) {
             keep = r.value != 0;
         } else {
-            Value verdict;
-            JaiJitOutcome outcome = jitResultOut(fn, r, base);
-            bool good;
-            if (outcome == JAI_JIT_DONE) {
-                verdict = base[0];
-                good = true;
-            } else if (outcome == JAI_JIT_ERROR) {
-                good = false;
-            } else if (outcome == JAI_JIT_DEOPT) {
-                good = jaiFinishJitDeopt1(p->closure, base, frameBase,
-                                          &verdict);
-            } else {
-                good = callFn1Rerun(base, &verdict);
-            }
-            vm.stackTop = base;
-            if (good && !IS_BOOL(verdict)) {
-                (void)jaiThrow(vm.cTypeError,
-                               "list.filter(): the predicate must return "
-                               "bool, not %s", jaiTypeNameStatic(verdict));
-                good = false;
-            }
-            if (!good) {
-                *ok = false;
-                return i;
-            }
-            if (AS_BOOL(verdict)) jaiListPush(dst, item);
-            if (vm.hasException) *ok = false;
-            return i + 1;
+            return filterRunBailed(p, dst, r, base, frameBase, i, item, ok);
         }
         if (keep) {
             jaiListPush(dst, item);
