@@ -261,32 +261,29 @@ kernel void cc_union(device atomic_uint* labels [[buffer(0)]],
     }
 }
 
+/* Point every pixel straight at its root, and note against the root the
+ * earliest place the scan meets its component.
+ *
+ * The joining is finished before this runs, so the root each pixel finds is
+ * final, and the earliest place can be kept here rather than in a pass of its
+ * own over the flattened labels. */
 kernel void cc_flatten(device atomic_uint* labels [[buffer(0)]],
-                       constant uint& count [[buffer(1)]],
+                       device atomic_uint* first [[buffer(1)]],
+                       constant uint& count [[buffer(2)]],
+                       constant uint& cols [[buffer(3)]],
+                       constant uint& connectivity [[buffer(4)]],
                        uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     uint mine = atomic_load_explicit(&labels[id], memory_order_relaxed);
     if (mine == 0u) return;
     uint root = cc_find(labels, mine);
     if (root != mine) atomic_store_explicit(&labels[id], root, memory_order_relaxed);
-}
-
-
-/* The earliest place each component is met, kept against its root. */
-kernel void cc_first_seen(device const uint* labels [[buffer(0)]],
-                          device atomic_uint* first [[buffer(1)]],
-                          constant uint& count [[buffer(2)]],
-                          constant uint& cols [[buffer(3)]],
-                          constant uint& connectivity [[buffer(4)]],
-                          uint id [[thread_position_in_grid]]) {
-    if (id >= count) return;
-    uint mine = labels[id];
-    if (mine == 0u) return;
     uint y = id / cols;
     uint x = id - y * cols;
-    atomic_fetch_min_explicit(&first[mine - 1u], scan_position(y, x, cols, connectivity),
+    atomic_fetch_min_explicit(&first[root - 1u], scan_position(y, x, cols, connectivity),
                               memory_order_relaxed);
 }
+
 
 /* One entry per component: which pixel is its root, and where it was first
  * met. Only these travel to the host, and there are as many of them as there
@@ -793,12 +790,11 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
         [rows, cols, image.offset, image.step_, connectivity, across],
         group_size: CC_GROUP
     )
-    kernel_for("cc_flatten").dispatch_async([labels], count, [count])
+    kernel_for("cc_flatten").dispatch_async([labels, first], count, [count, cols, connectivity])
 
     #: The partition is settled; what remains is the numbering, and OpenCV
     #: numbers by where a component was first met. Only one entry per
     #: component travels for that, not one per pixel.
-    kernel_for("cc_first_seen").dispatch_async([labels, first], count, [count, cols, connectivity])
     if _CC_DEVICE_NUMBERING {
         let numbered = _number_on_device(labels, first, out, rows, cols, connectivity)
         labels.free()
