@@ -96,6 +96,15 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
  * x0..x8, the bank a call-free body's operand stack uses. */
 #define JIT_SCRATCH_BANK_COUNT 9u
 #define JIT_MAX_ARGS_OUT 12
+/* Locals an OSR form may keep as fields only, and the fields each may have
+ * (see jit_sink.c). */
+#define JIT_MAX_SINK    2u
+#define JIT_SINK_FIELDS 4u
+/* Added to everything an OSR form that sank a local returns (a resume offset,
+ * -1 or -2), so jaiJitEnterOsr learns from x0 alone whether there are objects
+ * to build: a resume offset is a uint32_t, and every other form's x0 stays
+ * where it was. */
+#define JIT_OSR_SUNK_RET ((int64_t)1 << 40)
 
 /* Values first in JitCallDesc so every field is 8-aligned and the emitted stores can use scaled forms. */
 typedef struct JitCallDesc {
@@ -117,10 +126,26 @@ typedef struct {
     int64_t skipLocals;
     Value   locals[JIT_MAX_SLOTS + 1];
     Value   stack[JIT_MAX_STACK + 1];
+    /* Sunk instances (jit_sink.c): an OSR form that keeps a local's object
+     * as its fields alone writes them here on every way out, and
+     * jaiJitEnterOsr allocates the object once the frame and stack are back
+     * in the interpreter's hands. `sinkStackMask` names the stack entries
+     * that are such an object; their payload is the sink's index. */
+    int64_t sinkCount;
+    int64_t sinkStackMask;
+    struct {
+        int64_t   local;
+        int64_t   live;
+        ObjClass *cls;
+        int64_t   nfields;
+        Value     fields[JIT_SINK_FIELDS];
+    } sinks[JIT_MAX_SINK];
 } JitDeoptRecord;
 
 _Static_assert(JIT_MAX_SLOTS <= 64,
                "skipLocals is one bit per local slot");
+_Static_assert(JIT_MAX_STACK + 1 <= 32 && JIT_MAX_SINK <= 2,
+               "sinkStackMask is 32 bits of stack entries per sink");
 
 /* A `self` entry (the callee of a recursive call) occupies no register; register numbers are
  * derived from the count of value entries below an entry, not from its depth. */
@@ -145,7 +170,12 @@ typedef enum {
     SLOT_OBJ,     /* Heap object of a type this tier doesn't model, held raw: may only be read, passed, stored and rooted. */
     SLOT_LIST,    /* ObjList *, raw -- safe for the same reason an instance is: nothing moves, and a call spills it as a root first. */
     SLOT_MAYBE_OBJ,
-    SLOT_DYNAMIC
+    SLOT_DYNAMIC,
+    /* A reference to a sunk instance (jit_sink.c): no register, no object --
+     * its fields are in the frame. Only ever on the operand stack between a
+     * local read and the inlined call that consumes it; never a local's kind,
+     * never at a join, never in a stack signature. */
+    SLOT_VREF
 } SlotKind;
 
 #define JIT_RET_TAG_SHIFT 8u
@@ -799,6 +829,31 @@ typedef struct {
     SlotKind  inlRetKind;
     uint32_t  inlRetShape;
     ObjClass *inlRetClass;
+    /* Sunk locals (jit_sink.c): sinkOf[slot] is a sink's index + 1. Each
+     * sink keeps its fields at frame offset homeOff + 8 * field slot, and
+     * whether the local holds one of them yet at homeOff + 8 * nfields. */
+    uint8_t   sinkOf[JIT_MAX_SLOTS + 1];
+    unsigned  sinkCount;
+    struct {
+        ObjClass *cls;
+        unsigned  local;
+        unsigned  nfields;
+        SlotKind  kind[JIT_SINK_FIELDS];
+        uint16_t  argSlot[JIT_SINK_FIELDS];
+        unsigned  homeOff;
+        /* Read in the loop before it is bound: the object the loop is
+         * entered with is unpacked into the homes at entry, and stays the
+         * local's value until the first bind. */
+        bool      entryLive;
+        /* A float field's home in v8..v15 (beside the float locals, saved
+         * and restored with them), or 0 for its frame slot. */
+        uint8_t   fpHome[JIT_SINK_FIELDS];
+    } sink[JIT_MAX_SINK];
+    /* Inside an inlined body: the caller binds its result straight into this
+     * sunk local (+ 1), so the construction it ends with is sunk too. */
+    unsigned  inlSinkBind;
+    /* Per operand-stack entry: the sink an SLOT_VREF entry names, + 1. */
+    uint8_t   stackSunk[JIT_MAX_STACK];
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -843,6 +898,7 @@ typedef struct {
         unsigned valueDepth;
         SlotKind kinds[JIT_MAX_STACK + 1];
         ObjClass *classes[JIT_MAX_STACK + 1];
+        uint8_t  sunk[JIT_MAX_STACK + 1];
         /* The topmost entry is the result of a call that already happened, so
          * it lives in the descriptor rather than a register. */
         bool     lastFromDesc;
@@ -1663,6 +1719,26 @@ bool emitFormat(Emit *e, ObjClosure *closure, const uint8_t *code, int *offp);
 /* Defined in jit_body_local.c. */
 bool emitGetLocal(Emit *e, const uint8_t *code, int *offp, int stop);
 bool emitGetLocal2(Emit *e, const uint8_t *code, int *offp, int stop);
+/* jit_sink.c */
+bool jitSinkOn(void);
+void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
+               const Value *slots, const bool *byRef);
+bool sinkPushRef(Emit *e, unsigned slot);
+bool sinkFieldRead(Emit *e, unsigned sink, const ObjFunction *fn,
+                   uint32_t nameIdx, const uint8_t *code, int next, int stop);
+int  sinkConstructs(Emit *e, const uint8_t *code, int off);
+int  sinkConstructInline(Emit *e, unsigned argc);
+unsigned sinkBindAfter(const Emit *e, const ObjFunction *caller,
+                       uint32_t callOff);
+bool sinkBindResult(Emit *e, unsigned slot);
+bool sinkHasEntryLive(const Emit *e);
+bool sinkFpFast(const Emit *e, const uint8_t *code, int off, uint8_t op);
+void sinkPlanFpHomes(Emit *e);
+JitArmResult sinkInvoke(Emit *e, ObjFunction *fn, const uint8_t *code,
+                        int *offp);
+void sinkEmitSync(Emit *e);
+void sinkEmitEntry(Emit *e);
+bool jitSimpleInitSlots(ObjClass *cls, unsigned argc, uint16_t *slots);
 bool emitSetLocal(Emit *e, const uint8_t *code, int *offp);
 bool emitBind(Emit *e, const uint8_t *code, int *offp);
 bool emitGetUpvalue(Emit *e, ObjFunction *fn, ObjClosure *closure,

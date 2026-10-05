@@ -46,6 +46,7 @@ const char *slotKindName(SlotKind k) {
     case SLOT_NULL:       return "null";
     case SLOT_OBJ:        return "object";
     case SLOT_LIST:       return "list";
+    case SLOT_VREF:       return "sunk instance";
     case SLOT_DYNAMIC:    return "dynamic";
     }
     return "an unnamed kind";
@@ -53,7 +54,7 @@ const char *slotKindName(SlotKind k) {
 
 bool holdsRegister(SlotKind k) {
     return k != SLOT_SELF && k != SLOT_CLASS && k != SLOT_FUNC &&
-           k != SLOT_NATIVE;
+           k != SLOT_NATIVE && k != SLOT_VREF;
 }
 
 void emit(Emit *e, uint32_t word) {
@@ -895,6 +896,12 @@ void noteScratchClobber(Emit *e) {
      * The whitelist admits nothing that does; this makes it a fact. */
     if (e->inlHomes) {
         e->whyNot = "a call inside an inlined loop";
+        e->failed = true;
+    }
+    /* An entry-live sink's homes are a copy of an object something else may
+     * still reach, and a call could write it (jit_sink.c). */
+    if (sinkHasEntryLive(e)) {
+        e->whyNot = "a call out in a loop whose sunk local entered holding an object";
         e->failed = true;
     }
     /* The one place every call out passes through, which makes it the one

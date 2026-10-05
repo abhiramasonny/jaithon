@@ -520,6 +520,11 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                            const bool *nullable, bool *needNullable,
                            const bool *dynamic, bool *needDynamic);
 
+/* Whether this attempt may sink allocations, and whether the last one did
+ * plan a sink (jit_sink.c). Compilation is not reentrant. */
+static bool sSinkAllowed;
+static bool sSinkPlanned;
+
 static bool compileOsr(ObjClosure *closure, uint32_t top, Value *slots,
                        uint8_t iterKind, Value elemSample, bool elemMixed,
                        uint8_t elemStg,
@@ -576,10 +581,20 @@ static bool compileOsrAny(ObjClosure *closure, uint32_t top, Value *slots,
      * callee, and the point is to come back once it has compiled. */
     sColdWaited = false;
     for (int v = 0; v < 4; v++) {
-        if (compileOsr(closure, top, slots, iterKind, elemSample, elemMixed,
-                       elemStg, v < 2, (v & 1) != 0)) {
-            return true;
+        /* With sinking first; a form that planned a sink and failed is tried
+         * again without, so a site the plan could not foresee costs a
+         * compile rather than the loop (see jit_sink.c). */
+        sSinkAllowed = jitSinkOn();
+        bool ok = compileOsr(closure, top, slots, iterKind, elemSample,
+                             elemMixed, elemStg, v < 2, (v & 1) != 0);
+        if (!ok && sSinkPlanned && !sColdWaited) {
+            sSinkAllowed = false;
+            ok = compileOsr(closure, top, slots, iterKind, elemSample,
+                            elemMixed, elemStg, v < 2, (v & 1) != 0);
         }
+        sSinkAllowed = false;
+        sSinkPlanned = false;
+        if (ok) return true;
         if (sColdWaited) return false;
     }
     return false;
@@ -686,6 +701,20 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         }
     }
 
+    /* Allocation sinking (jit_sink.c): a sunk local has no value of its own
+     * in this form, so nothing loads, checks, roots or writes it back. */
+    if (sSinkAllowed && !noInline) {
+        bool sinkByRef[JIT_MAX_SLOTS + 1];
+        bool decoded = chunkByRefCaptures(&fn->chunk, sinkByRef, e.locals);
+        planSinks(&e, fn, top, end, slots, decoded ? sinkByRef : NULL);
+        for (unsigned j = 0; j < e.sinkCount; j++) {
+            e.localKind[e.sink[j].local]  = SLOT_OPAQUE;
+            e.localTyped[e.sink[j].local] = false;
+            e.localClass[e.sink[j].local] = NULL;
+        }
+    }
+    sSinkPlanned = e.sinkCount != 0;
+
     unsigned probeMaxValue = 0;
     unsigned probeMaxValueAll = 0;
     unsigned probeStranded = 0;
@@ -725,6 +754,9 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         }
         memcpy(probe.nullableLocal, nullable, sizeof probe.nullableLocal);
         memcpy(probe.dynamicLocal, dynamic, sizeof probe.dynamicLocal);
+        probe.sinkCount = e.sinkCount;
+        memcpy(probe.sinkOf, e.sinkOf, sizeof probe.sinkOf);
+        memcpy(probe.sink, e.sink, sizeof probe.sink);
         for (unsigned i = 0; i < e.locals; i++) {
             probe.localKind[i]  = e.localKind[i];
             probe.localShape[i] = e.localShape[i];
@@ -878,12 +910,17 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
     }
 
+    sinkPlanFpHomes(&e);
     unsigned frame = 16u + 8u * JIT_MAX_SAVED + (unsigned)sizeof(JitCallDesc);
     e.descOffset = 16u + 8u * JIT_MAX_SAVED;
     e.iterFrameOffset = (frame + 7u) & ~7u;
     frame = e.iterFrameOffset + 16u;
     e.fpSaveOffset = frame;
     frame += 8u * JIT_FP_MAX_SAVED;
+    for (unsigned j = 0; j < e.sinkCount; j++) {
+        e.sink[j].homeOff = frame;
+        frame += 8u * (e.sink[j].nfields + 1u);
+    }
     e.frameBytes = (frame + 15u) & ~15u;
 
     emitFrameEnter(&e);
@@ -925,6 +962,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         }
     }
 
+    sinkEmitEntry(&e);
     planHoists(&e, fn, e.localKind);
     planStrFacts(&e, fn);
     if (getenv("JAI_JIT_WHY")) {
@@ -1076,15 +1114,20 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 emit(&e, jaiA64StrX(rp, JIT_SLOTS_REG, li * 16u + 8u));        \
             }                                                                  \
         }                                                                      \
+        sinkEmitSync(&e);                                                      \
     } while (0)
+
+    /* Every value the form returns carries this when it sank a local, so
+     * jaiJitEnterOsr builds the objects without asking gDeopt. */
+    const int64_t sunkRet = e.sinkCount != 0 ? JIT_OSR_SUNK_RET : 0;
 
     e.bailBlock = (int)e.count;
     OSR_SYNC_ITER();
-    emitConst64(&e, 0, (int64_t)-1);          /* -1: could not continue */
+    emitConst64(&e, 0, (int64_t)-1 + sunkRet);   /* -1: could not continue */
     emitEpilogue(&e, 0);
     e.exceptionExit = (int)e.count;
     OSR_SYNC_ITER();
-    emitConst64(&e, 0, (int64_t)-2);          /* -2: an exception is pending */
+    emitConst64(&e, 0, (int64_t)-2 + sunkRet);   /* -2: an exception is pending */
     emitEpilogue(&e, 0);
 
     for (unsigned i = 0; i < 3; i++) {
@@ -1094,7 +1137,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         emit(&e, jaiA64MovzX(0, i, 0));
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitThrowOverflow);
         emit(&e, jaiA64Blr(JIT_SCRATCH_A));
-        emitConst64(&e, 0, (int64_t)-2);
+        emitConst64(&e, 0, (int64_t)-2 + sunkRet);
         emitEpilogue(&e, 0);
     }
 
@@ -1112,7 +1155,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         emitConst64(&e, JIT_SCRATCH_B,
                     (e.hasIter && e.exitOffset[i] == e.iterExit) ? 1 : 0);
         emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-        emitConst64(&e, 0, (int64_t)e.exitOffset[i]);
+        emitConst64(&e, 0, (int64_t)e.exitOffset[i] + sunkRet);
         emitEpilogue(&e, 0);
     }
 
@@ -1125,10 +1168,23 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         OSR_SYNC_ITER();
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gDeopt);
         unsigned valueSeen = 0;
+        uint64_t sinkMask = 0;
         for (unsigned i = 0; i < e.deopt[k].depth; i++) {
             SlotKind kind = e.deopt[k].kinds[i];
             unsigned at = (unsigned)offsetof(JitDeoptRecord, stack) +
                           i * (unsigned)sizeof(Value);
+            /* A sunk instance: no register, and no object yet. A null here,
+             * and a bit saying which sink jaiJitEnterOsr puts in its place
+             * once it has built the object (jit_sink.c). */
+            if (kind == SLOT_VREF) {
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_B, VAL_NULL, 0));
+                emit(&e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+                emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
+                emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8));
+                sinkMask |= (uint64_t)1
+                            << (i + 32u * (e.deopt[k].sunk[i] - 1u));
+                continue;
+            }
             if (kind == SLOT_CLASS || kind == SLOT_SELF ||
                 kind == SLOT_FUNC || kind == SLOT_NATIVE) {
                 uintptr_t pv = kind != SLOT_SELF
@@ -1184,6 +1240,12 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         emit(&e, jaiA64MovzX(JIT_SCRATCH_B, 0, 0));
         emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
                             (unsigned)offsetof(JitDeoptRecord, base)));
+        if (sinkMask != 0) {
+            emitConst64(&e, JIT_SCRATCH_B, (int64_t)sinkMask);
+            emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A,
+                                (unsigned)offsetof(JitDeoptRecord,
+                                                   sinkStackMask)));
+        }
 #ifdef JAI_ALLOC_CENSUS
         /* Which guard actually fires. A stub that resumes at the same ip as
          * three others says nothing on its own; this makes each one countable,
@@ -1192,7 +1254,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         jaiDeoptHitEmit(&e, closure->fn->name ? closure->fn->name->chars : "?",
                         top, k, (uint32_t)e.deopt[k].ip);
 #endif
-        emitConst64(&e, 0, (int64_t)e.deopt[k].ip);
+        emitConst64(&e, 0, (int64_t)e.deopt[k].ip + sunkRet);
         emitEpilogue(&e, 0);
     }
 #undef OSR_SYNC_ITER
@@ -1319,6 +1381,13 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         fprintf(stderr, "[jit] osr %s at %u: %u instructions iter=%u\n",
                 jitFnLabel(fn), top, e.count,
                 (unsigned)iterKind);
+        /* Counted by tests/fuzz/pic_rate.py --sink: the plan line alone
+         * says nothing, since a plan that fails is compiled again without. */
+        if (e.sinkCount != 0) {
+            fprintf(stderr, "[jit] osr %s at %u keeps %u local%s sunk\n",
+                    jitFnLabel(fn), top, e.sinkCount,
+                    e.sinkCount == 1 ? "" : "s");
+        }
         /* Same reason as the function tier's line: a loop that walked two
          * instructions and interpreted the other forty reported success. */
         if (e.unarmedOp != 0) {
@@ -1386,6 +1455,36 @@ static bool osrFormStorageFits(const JaiOsrForm *form, const Value *slots,
         }
     }
     return true;
+}
+
+/* The objects an OSR form kept as fields only (jit_sink.c), built now that
+ * everything the form handed back is in the frame and on the stack, where the
+ * collector can see it. A sink's fields are ints and floats, so the record
+ * holds nothing it has to. Called only for a form that returned
+ * JIT_OSR_SUNK_RET, and out of line, so no other loop pays for it. */
+__attribute__((noinline))
+static void osrMaterializeSinks(Value *slots, Value *stack, unsigned nstack) {
+    int64_t n = gDeopt.sinkCount;
+    gDeopt.sinkCount = 0;
+    for (int64_t j = 0; j < n && j < (int64_t)JIT_MAX_SINK; j++) {
+        if (gDeopt.sinks[j].live == 0) continue;
+        ObjInstance *inst = jaiInstanceNew(gDeopt.sinks[j].cls);
+        for (int64_t f = 0; f < gDeopt.sinks[j].nfields &&
+                            f < (int64_t)inst->fieldCount; f++) {
+            inst->fields[f] = gDeopt.sinks[j].fields[f];
+        }
+        slots[gDeopt.sinks[j].local] = OBJ_VAL(inst);
+    }
+    uint64_t mask = (uint64_t)gDeopt.sinkStackMask;
+    gDeopt.sinkStackMask = 0;
+    if (stack == NULL) return;
+    for (unsigned i = 0; i < nstack && i < 32u; i++) {
+        for (unsigned j = 0; j < JIT_MAX_SINK; j++) {
+            if ((mask >> (i + 32u * j)) & 1u) {
+                stack[i] = slots[gDeopt.sinks[j].local];
+            }
+        }
+    }
 }
 
 int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
@@ -1804,11 +1903,30 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
      * function-tier stub's behind for whoever reads the record next. */
     gDeopt.skipLocals = 0;
     int64_t at = ((OsrFnIter)(uintptr_t)form->code)(frame->slots, iter);
-    if (at == -1)
-        return osrNo(fn, top, "the compiled loop bailed out at entry");
-    if (at == -2) return 2;              /* an exception is pending */
+    /* One compare for all three rare cases: -1, -2, and a form that sank a
+     * local (JIT_OSR_SUNK_RET on whatever it returns). A loop that sinks
+     * nothing pays nothing more per exit than it did before sinking existed;
+     * a clear of the record before every entry and a scan after every exit
+     * had cost such a loop ~36 instructions an exit, and one that leaves its
+     * region every iteration pays that millions of times. */
+    bool sunk = false;
+    if (JAI_UNLIKELY((uint64_t)at > (uint64_t)UINT32_MAX)) {
+        if (at > 0) {
+            sunk = true;
+            at -= JIT_OSR_SUNK_RET;
+        }
+        if (at == -1 || at == -2) {
+            if (sunk) osrMaterializeSinks(frame->slots, NULL, 0);
+            if (at == -1)
+                return osrNo(fn, top, "the compiled loop bailed out at entry");
+            return 2;                    /* an exception is pending */
+        }
+    }
     if (gDeopt.base != 0) vm.stackTop--;   /* the exhausted iterator */
+    Value *pushed = vm.stackTop;
     for (int64_t i = 0; i < gDeopt.nstack; i++) *vm.stackTop++ = gDeopt.stack[i];
+    if (JAI_UNLIKELY(sunk))
+        osrMaterializeSinks(frame->slots, pushed, (unsigned)gDeopt.nstack);
     *resumeAt = (uint32_t)at;
     return 1;
 }

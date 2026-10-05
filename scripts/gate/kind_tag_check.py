@@ -91,6 +91,9 @@ MANIFEST = ROOT / "tests/vm/jit_kind_tag.manifest"
 TAG = re.compile(r"\bVAL_(?:INT|FLOAT|BOOL|NULL|OBJ)\b"
                  r"|\b(?:INT|FLOAT|BOOL|NULL|OBJ)_VAL\b")
 KIND = re.compile(r"\bSLOT_[A-Z_]+\b")
+#: A two-armed ladder names only ONE kind -- `k == SLOT_FLOAT ? VAL_FLOAT :
+#: VAL_INT` -- and the two-kinds rule below let jit_sink.c's pair through.
+BINARY = re.compile(r"[=!]=\s*SLOT_[A-Z_]+\s*\?")
 #: A definition opens at column 0 in this tree, which is what makes the
 #: enclosing function findable without parsing C. Naming the function rather
 #: than a line is deliberate: this file gets reshaped constantly, and a pin on a
@@ -193,8 +196,9 @@ def target_of(stmt):
 
 def ladder_sites(path):
     """Conditional ladders: one statement naming two or more kinds and two or
-    more tags. Statements are cut at `;{}`, so a switch body cannot merge into
-    one and an array initialiser is cut per row."""
+    more tags, or a ternary on one kind with two tags. Statements are cut at
+    `;{}`, so a switch body cannot merge into one and an array initialiser is
+    cut per row."""
     code = strip_comments(path.read_text())
     lines = code.splitlines()
     sites = []
@@ -202,7 +206,9 @@ def ladder_sites(path):
     for m in re.finditer(r"[;{}]", code):
         stmt, off, start = code[start:m.end()], start, m.end()
         kinds, tags = set(KIND.findall(stmt)), set(TAG.findall(stmt))
-        if len(kinds) < 2 or len(tags) < 2:
+        if len(tags) < 2:
+            continue
+        if len(kinds) < 2 and not (kinds and BINARY.search(stmt)):
             continue
         line_no = code[:off].count("\n") + 1
         sites.append({

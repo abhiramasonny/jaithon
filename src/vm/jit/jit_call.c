@@ -70,6 +70,12 @@ static bool simpleInitFields(ObjClass *cls, unsigned argc, uint16_t *slots) {
 /* Whether `cls(...)` with `argc` arguments is an allocation and stores into
  * the new object's own fields, nothing more -- the construction an inlined
  * body may end with (see inlinableBody). */
+/* The same question, with the field slot each argument is stored into. */
+bool jitSimpleInitSlots(ObjClass *cls, unsigned argc, uint16_t *slots) {
+    if (argc > JIT_MAX_ARGS_OUT) return false;
+    return simpleInitFields(cls, argc, slots);
+}
+
 bool jitSimpleInitClass(ObjClass *cls, unsigned argc) {
     uint16_t slots[JIT_MAX_ARGS_OUT];
     if (argc > JIT_MAX_ARGS_OUT) return false;
