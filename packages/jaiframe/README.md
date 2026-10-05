@@ -81,3 +81,4 @@ bit-identical either way; only the time changes.
 | `JAIFRAME_RADIX_VOTE` | the per-thread walk of the tile for a scatter rank, instead of simdgroup ballots |
 | `JAIFRAME_FOLD_NULLS` | a radix pass of its own for a float key's null lane, instead of folding it into the value pass |
 | `JAIFRAME_DEVICE_TOTAL` | a download of the scan total on every bit of a join's radix order |
+| `JAIFRAME_JOIN_DIGITS` | a one-bit-a-pass radix order for a join's bucket and pair lanes, instead of the frame sort's eight-bit passes |

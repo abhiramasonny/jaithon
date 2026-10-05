@@ -9,6 +9,13 @@ from ..column import Column, Dtype, MAX_ROWS
 from ..column import cached_kernel, concat_columns, iota, prefix_sum, scan_offsets, unify_levels
 from .kernels import MIN_BUCKETS, flag, kernel_for, require_device
 from .types import How
+from ..keys.encode import RadixSort
+from std.os import env_or
+
+#: `JAIFRAME_JOIN_DIGITS=0` sorts a join's lanes one bit a pass, for an A/B
+#: against eight-bit digits. Both are stable LSD sorts of the same keys, so
+#: the permutation is the same. Read once.
+let _BYTE_DIGITS = env_or("JAIFRAME_JOIN_DIGITS", "1") != "0"
 
 #: How many bits it takes to write `value`.
 pub fn bit_width(value: int) -> int {
@@ -76,6 +83,14 @@ pub fn radix_order(order_in: Buffer, keys_in: Buffer, count: int, bits: int) -> 
     copy_lane(order_in, order_front, count)
     copy_uint(keys_in, keys_front, count)
     if count <= 1 or bits <= 0 { return (order_front, keys_front) }
+    if _BYTE_DIGITS {
+        #: Every caller sizes `bits` from the range its keys span, so the bits
+        #: above it are zero and a whole eight-bit digit sorts the same rows.
+        let sorter = RadixSort(keys_front, order_front, count)
+        sorter.sort_bits(bits)
+        sorter.free_spares()
+        return (sorter.order, sorter.keys)
+    }
     var order_back = Buffer(count)
     var keys_back = Buffer(count)
     let flags = Buffer(count)

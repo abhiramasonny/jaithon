@@ -113,19 +113,10 @@ pub class KeyEncoding {
             throw ValueError(f"na_position must be first or last, not {na_position}")
         }
         let ups = spread_flags(ascending, self.columns)
-        var forward = iota(self.length)
+        let forward = iota(self.length)
         if self.length == 0 { return forward }
 
-        let blocks = (self.length + RADIX_GROUP - 1) // RADIX_GROUP
-        var keys = Buffer(self.length)
-        var spare_keys = Buffer(self.length)
-        var spare = Buffer(self.length)
-        let counts = Buffer(blocks * RADIX_SIZE)
-        let parallel = _PARALLEL_OFFSETS and blocks >= PARALLEL_OFFSETS_BLOCKS
-        let per = (blocks + RADIX_SIZE - 1) // RADIX_SIZE
-        let parts = (blocks + per - 1) // per
-        let partial = Buffer(if parallel { parts * RADIX_SIZE } else { 0 })
-        let scatter = kernel_for(if _VOTE_RANK { "key_radix_scatter_vote" } else { "key_radix_scatter" })
+        let sorter = RadixSort(Buffer(self.length), forward, self.length)
 
         var lane = self.lane_count() - 1
         while lane >= 0 {
@@ -135,7 +126,7 @@ pub class KeyEncoding {
             let folds = _FOLD_NULLS and lane > 0 and self.folds_null(lane)
             if folds {
                 kernel_for("key_lane_gather_folded").dispatch_async(
-                    [self.packed, forward, keys],
+                    [self.packed, sorter.order, sorter.keys],
                     self.length,
                     [
                         self.length,
@@ -148,68 +139,17 @@ pub class KeyEncoding {
             } else {
                 let flips = if self.null_lanes[lane] { na_position == "first" } else { invert }
                 kernel_for("key_lane_gather").dispatch_async(
-                    [self.packed, forward, keys],
+                    [self.packed, sorter.order, sorter.keys],
                     self.length,
                     [self.length, lane * self.length, mask, flag(flips)]
                 )
             }
-            var shift = 0
-            while shift < width {
-                kernel_for("key_radix_histogram").dispatch_async(
-                    [keys, counts],
-                    blocks * RADIX_GROUP,
-                    [self.length, shift],
-                    group_size: RADIX_GROUP
-                )
-                if parallel {
-                    kernel_for("key_offsets_partial").dispatch_async(
-                        [counts, partial],
-                        parts * RADIX_SIZE,
-                        [blocks, per],
-                        group_size: RADIX_SIZE
-                    )
-                    kernel_for("key_offsets_scan").dispatch_async(
-                        [partial],
-                        RADIX_SIZE,
-                        [parts],
-                        group_size: RADIX_SIZE
-                    )
-                    kernel_for("key_offsets_apply").dispatch_async(
-                        [counts, partial],
-                        parts * RADIX_SIZE,
-                        [blocks, per],
-                        group_size: RADIX_SIZE
-                    )
-                } else {
-                    kernel_for("key_radix_offsets").dispatch_async(
-                        [counts],
-                        RADIX_GROUP,
-                        [blocks],
-                        group_size: RADIX_GROUP
-                    )
-                }
-                scatter.dispatch_async(
-                    [keys, forward, spare_keys, spare, counts],
-                    blocks * RADIX_GROUP,
-                    [self.length, shift],
-                    group_size: RADIX_GROUP
-                )
-                let swapped_keys = keys
-                keys = spare_keys
-                spare_keys = swapped_keys
-                let swapped = forward
-                forward = spare
-                spare = swapped
-                shift += RADIX_BITS
-            }
+            sorter.sort_bits(width)
             lane -= if folds { 2 } else { 1 }
         }
-        keys.free()
-        spare_keys.free()
-        spare.free()
-        counts.free()
-        partial.free()
-        return forward
+        sorter.keys.free()
+        sorter.free_spares()
+        return sorter.order
     }
 
     #: 1.0 where a row starts a run of equal keys along `positions`.
@@ -285,6 +225,104 @@ pub class KeyEncoding {
 
     fn check_live(self) -> void {
         if self.freed { throw RuntimeError("this KeyEncoding has already been released") }
+    }
+}
+
+#: A stable LSD radix sort of a uint key lane carrying a positions lane, in
+#: digits of RADIX_BITS, with the scratch it needs held between calls.
+#:
+#: `keys` and `order` are the live pair; each pass scatters them into the
+#: spares and swaps, so after `sort_bits` they hold the sorted keys and the
+#: permutation that sorted them. The caller owns those two; `free_spares`
+#: releases the rest. A multi-key sort fills `keys` again between calls and
+#: relies on each pass being stable, as `KeyEncoding.order` does.
+pub class RadixSort {
+    pub var keys: Buffer
+    pub var order: Buffer
+    var spare_keys: Buffer
+    var spare: Buffer
+    var counts: Buffer
+    var partial: Buffer
+    var length: int
+    var blocks: int
+    var per: int
+    var parts: int
+    var parallel: bool
+
+    pub fn init(self, keys: Buffer, order: Buffer, length: int) {
+        self.keys = keys
+        self.order = order
+        self.length = length
+        self.blocks = (length + RADIX_GROUP - 1) // RADIX_GROUP
+        self.spare_keys = Buffer(length)
+        self.spare = Buffer(length)
+        self.counts = Buffer(self.blocks * RADIX_SIZE)
+        self.parallel = _PARALLEL_OFFSETS and self.blocks >= PARALLEL_OFFSETS_BLOCKS
+        self.per = (self.blocks + RADIX_SIZE - 1) // RADIX_SIZE
+        self.parts = if self.per > 0 { (self.blocks + self.per - 1) // self.per } else { 0 }
+        self.partial = Buffer(if self.parallel { self.parts * RADIX_SIZE } else { 0 })
+    }
+
+    #: Sort by the low `width` bits of every key, stably. Bits above `width`
+    #: must be zero: a digit is read whole, so they would sort too.
+    pub fn sort_bits(self, width: int) -> void {
+        let scatter = kernel_for(if _VOTE_RANK { "key_radix_scatter_vote" } else { "key_radix_scatter" })
+        var shift = 0
+        while shift < width {
+            kernel_for("key_radix_histogram").dispatch_async(
+                [self.keys, self.counts],
+                self.blocks * RADIX_GROUP,
+                [self.length, shift],
+                group_size: RADIX_GROUP
+            )
+            if self.parallel {
+                kernel_for("key_offsets_partial").dispatch_async(
+                    [self.counts, self.partial],
+                    self.parts * RADIX_SIZE,
+                    [self.blocks, self.per],
+                    group_size: RADIX_SIZE
+                )
+                kernel_for("key_offsets_scan").dispatch_async(
+                    [self.partial],
+                    RADIX_SIZE,
+                    [self.parts],
+                    group_size: RADIX_SIZE
+                )
+                kernel_for("key_offsets_apply").dispatch_async(
+                    [self.counts, self.partial],
+                    self.parts * RADIX_SIZE,
+                    [self.blocks, self.per],
+                    group_size: RADIX_SIZE
+                )
+            } else {
+                kernel_for("key_radix_offsets").dispatch_async(
+                    [self.counts],
+                    RADIX_GROUP,
+                    [self.blocks],
+                    group_size: RADIX_GROUP
+                )
+            }
+            scatter.dispatch_async(
+                [self.keys, self.order, self.spare_keys, self.spare, self.counts],
+                self.blocks * RADIX_GROUP,
+                [self.length, shift],
+                group_size: RADIX_GROUP
+            )
+            let swapped_keys = self.keys
+            self.keys = self.spare_keys
+            self.spare_keys = swapped_keys
+            let swapped = self.order
+            self.order = self.spare
+            self.spare = swapped
+            shift += RADIX_BITS
+        }
+    }
+
+    pub fn free_spares(self) -> void {
+        self.spare_keys.free()
+        self.spare.free()
+        self.counts.free()
+        self.partial.free()
     }
 }
 
