@@ -275,6 +275,8 @@ pub class CascadeClassifier {
                     resize(image, size: Size(width, height))
                 }
                 let (integral, squared) = integrals(level)
+                #: The first level is the caller's image; the rest are ours.
+                if factor != 1.0 { level.release() }
                 let stride = width + 1
                 #: OpenCV steps two pixels at a time until the window is large
                 #: enough that one pixel of the level is two of the original.
