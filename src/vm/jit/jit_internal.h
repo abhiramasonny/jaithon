@@ -555,6 +555,11 @@ typedef struct {
          * store still goes to the entry, so a deopt or an exit finds memory
          * current and nothing is ever written back. */
         uint8_t   reg;
+        /* The loop allocates (an allocation-only call, Emit::clobberAlloc):
+         * `reg` is one of x13..x17, which the inline allocation never names,
+         * and each allocation's slow path reloads it from the entry after
+         * its call (emitPromotedReload). */
+        bool      allocs;
     } tagProof[JIT_MAX_TAG_PROOF];
     unsigned  tagProofCount;
     /* Every list append the body makes, when the grow stub keeps the
@@ -1341,6 +1346,7 @@ bool jitInlineBorrow(void);
 void noteGlobalAccess(Emit *e, JaiEntry *slot, SlotKind kind, bool write);
 bool globalTagProven(const Emit *e, JaiEntry *slot, SlotKind kind);
 int globalPromotedReg(const Emit *e, JaiEntry *slot, SlotKind kind);
+void emitPromotedReload(Emit *e);
 bool jitSimpleInitClass(ObjClass *cls, unsigned argc);
 bool closUpHoisted(const Emit *e, ObjClosure *closure, unsigned index);
 void noteClosureSite(Emit *e, int slot, uint32_t off, ObjClosure *sample);

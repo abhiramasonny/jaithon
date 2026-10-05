@@ -936,6 +936,7 @@ void noteScratchClobber(Emit *e) {
         for (unsigned i = 0; i < e->tagProofCount; i++) {
             if (e->tagProof[i].reg == 0) continue;
             if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+            if (e->allocOnlyCall && e->tagProof[i].allocs) continue;
             e->whyNot = "a call reached a loop a global was promoted over";
             e->failed = true;
             return;

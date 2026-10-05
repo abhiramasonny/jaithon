@@ -663,6 +663,9 @@ static bool emitCallOutInner(Emit *e, unsigned argc) {
             e->code[skipSlow] =
                 jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
         }
+        /* Both slow paths called out; the inline pop did not, and jumps
+         * past this. */
+        emitPromotedReload(e);
         if (inl && skipInline < e->count && e->count <= JIT_MAX_INSTS)
             e->code[skipInline] = jaiA64B((int32_t)(e->count - skipInline));
         for (unsigned i = 0; i < argc; i++) {

@@ -939,6 +939,27 @@ int globalPromotedReg(const Emit *e, JaiEntry *slot, SlotKind kind) {
     return -1;
 }
 
+/* After an allocation's slow path has called out: every promoted global of
+ * a loop around this site is reloaded from its entry, which writing through
+ * keeps current. Nothing else is in x13..x17 in such a loop. JIT_SCRATCH_C
+ * holds the new instance and is left alone. */
+void emitPromotedReload(Emit *e) {
+    if (e->measuring) return;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    for (unsigned i = 0; i < e->tagProofCount; i++) {
+        if (e->tagProof[i].reg == 0) continue;
+        if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+        emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)e->tagProof[i].slot);
+        if ((SlotKind)e->tagProof[i].kind == SLOT_BOOL) {
+            emit(e, jaiA64LdrByte(e->tagProof[i].reg, JIT_SCRATCH_D,
+                                  (unsigned)offsetof(JaiEntry, value) + 8u));
+        } else {
+            emit(e, jaiA64LdrX(e->tagProof[i].reg, JIT_SCRATCH_D,
+                               (unsigned)offsetof(JaiEntry, value) + 8u));
+        }
+    }
+}
+
 /* JAITHON_JIT_GLOBAL_TAG_PROOF: see Emit::tagProof. Default on. */
 static bool jitGlobalTagProof(void) {
     static int cached = -1;
@@ -1013,16 +1034,30 @@ static void planTagProofs(Emit *e) {
             e->tagProof[e->tagProofCount].slot = slot;
             e->tagProof[e->tagProofCount].kind = (uint8_t)k;
             e->tagProof[e->tagProofCount].reg = 0;
+            e->tagProof[e->tagProofCount].allocs = false;
             /* A module-scope loop's counters and accumulators are carried
              * from one iteration to the next THROUGH their entries, so each
              * one is a store and a load on the loop's critical path. In a
              * loop with no call at all the value can sit in a hoist register
-             * instead; the store stays, off the chain. */
-            if (jitGlobalPromote() && !regionCalls(e, lt, le) &&
-                e->hoistPoolCount - e->hoistTaken >= 1u) {
-                unsigned r = e->hoistPool[e->hoistTaken++];
-                if (r < e->scratchRoom) e->scratchRoom = r;
-                e->tagProof[e->tagProofCount].reg = (uint8_t)r;
+             * instead; the store stays, off the chain. A loop whose only
+             * calls are allocations (regionRebinds already said nothing else
+             * calls) takes x13..x17 alone and reloads after each slow path. */
+            if (jitGlobalPromote()) {
+                bool calls = regionCalls(e, lt, le);
+                for (unsigned q = e->hoistTaken; q < e->hoistPoolCount; q++) {
+                    unsigned r = e->hoistPool[q];
+                    if (calls && (r < JIT_FREE_FIRST ||
+                                  r >= JIT_FREE_FIRST + JIT_FREE_COUNT)) {
+                        continue;
+                    }
+                    /* Taken out of the pool in place: swap to the front. */
+                    e->hoistPool[q] = e->hoistPool[e->hoistTaken];
+                    e->hoistPool[e->hoistTaken++] = (uint8_t)r;
+                    if (r < e->scratchRoom) e->scratchRoom = r;
+                    e->tagProof[e->tagProofCount].reg = (uint8_t)r;
+                    e->tagProof[e->tagProofCount].allocs = calls;
+                    break;
+                }
             }
             e->tagProofCount++;
         }
