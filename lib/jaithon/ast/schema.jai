@@ -345,6 +345,54 @@ fn _build_list_slots() -> dict[NodeKind, list[int]] {
     return lists
 }
 
+# The tags whose values can never hold a node, a list or a record: scalars, a
+# `TypeExpr` (which is not a `Node`), and lists of strings, types or operators.
+let _LEAF_TAGS: list[str] = [
+    "str",
+    "int",
+    "float",
+    "bool",
+    "op",
+    "vis",
+    "vdk",
+    "compk",
+    "type",
+    "strs",
+    "str[]",
+    "types",
+    "ops",
+]
+
+# The slots a walk looking for nodes has to enter, ending in -1 as `_LIST_SLOTS`
+# rows do and for the same reason.
+fn _build_walk_slots() -> dict[NodeKind, list[int]] {
+    let walks: dict[NodeKind, list[int]] = {}
+    for kind in _KINDS {
+        let slots: list[int] = []
+        var slot = 0
+        for (_name, tag) in _SCHEMAS[_KIND_INDEX[kind]] {
+            if tag not in _LEAF_TAGS { slots.push(slot) }
+            slot = slot + 1
+        }
+        slots.push(-1)
+        walks[kind] = slots
+    }
+    return walks
+}
+
+#: The slots of `kind` that can hold a node, a list of them or a record, in slot
+#: order and ending in -1; every other slot holds a scalar, a `TypeExpr`, or a
+#: list of strings, types or operators.
+#:
+#: A walk that only wants the nodes reads these rather than every slot: most of
+#: a node's slots are names, flags and operators, and visiting each one was a
+#: call that tested it three ways and found nothing.
+#:
+#: ```
+#: _WALK_SLOTS[NodeKind.Binary]   # [1, 2, -1] -- `left` and `right`, not `op`
+#: ```
+pub let _WALK_SLOTS: dict[NodeKind, list[int]] = _build_walk_slots()
+
 #: The slot each field of `kind` occupies, keyed by the name `fields_of` lists.
 #:
 #: A table rather than a `field_index(kind)` in front of it, and `pub` for the

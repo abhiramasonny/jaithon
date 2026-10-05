@@ -4,6 +4,7 @@
 #: annotation to semantic type, the type-name scope that resolves against, and
 #: the program-level passes that run before anything is checked.
 from jaithon.ast import Node, NodeKind, Span, TypeExpr, TypeKind
+from jaithon.ast.schema import _WALK_SLOTS
 from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
 from jaithon.compile.check.expr import E0410_UNKNOWN_MEMBER
@@ -403,6 +404,10 @@ class _DeclSites {
     }
 }
 
+#: A node's own slots are read through `_WALK_SLOTS`, which leaves out the ones
+#: whose tag says they hold a name, a flag, an operator or a type -- the walk
+#: used to call itself on each of those only to find nothing. The order of the
+#: visit, and so of every list in `sites`, is unchanged.
 fn _collect_sites(sites: _DeclSites, node: any, in_record: bool) -> void {
     if node is Node {
         let kind = node.kind
@@ -415,7 +420,11 @@ fn _collect_sites(sites: _DeclSites, node: any, in_record: bool) -> void {
         } elif kind == NodeKind.FnDecl {
             sites.functions.push(node)
         }
-        for value in node.fields { _collect_sites(sites, value, in_record) }
+        let fields = node.fields
+        for slot in _WALK_SLOTS[kind] {
+            if slot < 0 { break }
+            _collect_sites(sites, fields[slot], in_record)
+        }
     } elif node is list {
         for item in node { _collect_sites(sites, item, in_record) }
     } elif node is dict {
