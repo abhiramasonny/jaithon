@@ -159,41 +159,65 @@ bool jaiValueFormatShortOn(void);
 ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count);
 /* The same for an f-string of one int hole between optional string runs. */
 ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post);
-/* The same for a caller that probed jaiFmtMemo and missed: an intern hit
- * comes back with bit 0 of the pointer set, to be stripped and filed with
+/* The same for a caller that probed its memo site and missed: an intern
+ * hit comes back with bit 0 of the pointer set, to be stripped and filed with
  * jaiFmtMemoFill. See value.c. */
 ObjString *jaiValueFormatIntLeafMemo(Obj *pre, int64_t n, Obj *post);
 /* What jaiValueFormatIntLeaf answered from the intern table, by (pre, n,
- * post), weak and direct-mapped; compiled code probes it inline in front of
- * the call. value.c says why an entry is sound. The JIT loads `entries` and
- * `mask` as one pair, so they stay first and adjacent, and an entry is the
- * four words in this order. */
+ * post), weak and direct-mapped, one table per compiled call site; compiled
+ * code probes its site's table inline in front of the call. value.c says why
+ * an entry is sound and when a site turns its probe off. An entry is the four
+ * words in this order, and the JIT reads a site's first four words at these
+ * offsets: `entries` and `mask` as one pair, then `budget` and `leaf`. */
 typedef struct {
     Obj       *pre;
     Obj       *post;
     int64_t    n;
     ObjString *s;
 } JaiFmtMemoEntry;
-typedef struct {
-    JaiFmtMemoEntry *entries;
-    uint64_t         mask;
-    uint64_t         fills;
-    bool             dirty;
-} JaiFmtMemo;
-extern JaiFmtMemo jaiFmtMemo;
+typedef struct JaiFmtSite {
+    JaiFmtMemoEntry   *entries;   /* what the probe reads; NULL while off */
+    uint64_t           mask;
+    int64_t            budget;    /* probe misses left with no intern hit */
+    void              *leaf;      /* jaiValueFormatIntLeafMemo */
+    JaiFmtMemoEntry   *table;     /* kept while off; NULL until a first fill */
+    uint64_t           fills;     /* since the last growth or collection */
+    struct JaiFmtSite *nextOwner; /* the sites holding a table */
+    bool               dirty;     /* filed into since the last collection */
+} JaiFmtSite;
+#define JAI_FMT_SITE_ENTRIES 0
+#define JAI_FMT_SITE_BUDGET  16
+#define JAI_FMT_SITE_LEAF    24
 #define JAI_FMT_MEMO_EMPTY ((Obj *)(uintptr_t)1)
+/* The slot for (pre, n, post) in a table of mask + 1 entries: n plus a CRC32C
+ * of the runs that are there (an absent one adds nothing), so one site's
+ * dense ints fill consecutive slots and two runs at nearby addresses still
+ * land far apart. The JIT emits the same sum with crc32cx. */
 static inline uint64_t jaiFmtMemoIndex(const Obj *pre, int64_t n,
                                        const Obj *post, uint64_t mask) {
-    return ((uint64_t)n ^ ((uintptr_t)pre >> 4) ^ ((uintptr_t)post >> 5)) &
-           mask;
+    uint32_t c = 0;
+#if defined(__ARM_FEATURE_CRC32)
+    if (pre != NULL) c = __builtin_arm_crc32cd(c, (uint64_t)(uintptr_t)pre);
+    if (post != NULL) c = __builtin_arm_crc32cd(c, (uint64_t)(uintptr_t)post);
+#else
+    if (pre != NULL) c = (uint32_t)(((uintptr_t)pre * 0x9e3779b97f4a7c15ull) >> 32);
+    if (post != NULL) c ^= (uint32_t)(((uintptr_t)post * 0xbf58476d1ce4e5b9ull) >> 32);
+#endif
+    return ((uint64_t)n + c) & mask;
 }
-/* Every entry dropped; the collector calls it, since an entry holds its
- * strings weakly. */
+/* A new site, off and with no table, for the JIT to embed; NULL past the
+ * cap on sites, when the site goes without a memo. Never freed. */
+JaiFmtSite *jaiFmtSiteNew(void);
+/* Every entry of every site dropped, and the tables of sites nothing was
+ * filed into since the last call given back; the collector calls it, since
+ * an entry holds its strings weakly, and so does the intern table at its
+ * soft cap. */
 void jaiFmtMemoClear(void);
-/* Files `s`, an interned string, as the answer for (pre, n, post), growing
- * the table when it has been refilled twice over; returns `s`. Never
- * collects. */
-ObjString *jaiFmtMemoFill(Obj *pre, int64_t n, Obj *post, ObjString *s);
+/* Files `s`, an interned string, as the answer for (pre, n, post) at `site`,
+ * turning the site's probe on and growing its table when it has been
+ * refilled twice over; returns `s`. Never collects. */
+ObjString *jaiFmtMemoFill(JaiFmtSite *site, Obj *pre, int64_t n, Obj *post,
+                          ObjString *s);
 /* `s[a:b]` for compiled code, or NULL when only jaiSliceGet can make it.
  * Never allocates; see its definition in object_string.c. */
 ObjString *jaiStringSliceLeaf(ObjString *s, int64_t start, int64_t stop,

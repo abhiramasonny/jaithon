@@ -1400,29 +1400,55 @@ JAI_INLINE bool fmtRun(char *buf, size_t *o, const Obj *run) {
  *    hand back again. Past the cap the leaf builds a fresh string on every
  *    call, so `a is b` on two of them is false in the interpreter; an entry
  *    filed before the cap would make it true in compiled code. So the intern
- *    table empties the memo when it reaches its cap (jaiInternTableAdd), and
- *    nothing is filed again until a collection takes it back under.
+ *    table empties the memo when it reaches its cap (jaiInternTableAdd),
+ *    and nothing is filed again until a collection takes it back under.
  *  - pre and post are keys by identity. Strings never change their bytes
  *    (length and chars are written once, at creation), so while both are
  *    alive their identity is their content.
- *  - Objects are freed only by a collection, and jaiFmtMemoClear empties the
- *    table in every one of them. No entry outlives a string it names, and no
- *    address is reused while an entry still holds it. The table is weak.
+ *  - Objects are freed only by a collection, and jaiFmtMemoClear empties
+ *    every table in every one of them. No entry outlives a string it names,
+ *    and no address is reused while an entry still holds it. The tables are
+ *    weak.
  *
+ * One table per compiled site (jaiFmtSiteNew, embedded by the JIT), indexed
+ * by n plus a CRC of the runs (jaiFmtMemoIndex): one site's ints fill
+ * consecutive slots, so `f"user:{n}"` and `f"order:{n}"` over the same ints
+ * no longer evict each other on every call, as they did in one shared table
+ * indexed by n ^ pre >> 4, where the two runs' nearby addresses mapped both
+ * sites onto the same slots.
+ *
+ * A site starts OFF: its probe is one load and a branch, and the call goes
+ * straight to the leaf. The first intern hit the leaf reports turns it on
+ * with a table of FMT_SITE_FIRST entries; FMT_SITE_BUDGET probe misses in a
+ * row with no intern hit turn it off again (the compiled code stores NULL
+ * over `entries`), so a site formatting a stream of distinct strings --
+ * string_build's `f"item-{i}"` -- stops paying for a probe that never hits.
  * An empty entry's pre is JAI_FMT_MEMO_EMPTY, an address no object has, so
- * the all-NULL key of `f"{n}"` (pre and post absent) cannot match a cleared
- * slot. It starts at 256 entries and doubles whenever twice its size in fills
- * have gone in since it last grew -- a loop cycling through more keys than it
- * holds misses on every one of them, so a table smaller than the cycle is
- * worth nothing -- up to the intern soft cap, which bounds how many distinct
- * answers there can be. */
-#define FMT_MEMO_FIRST 256u
-#define FMT_MEMO_MAX   ((uint64_t)JAI_INTERN_SOFT_CAP)
+ * the all-absent key of `f"{n}"` cannot match a cleared slot. A table
+ * doubles whenever twice its size in fills have gone in since it last grew
+ * or was cleared, up to the intern soft cap per site and FMT_MEMO_TOTAL
+ * entries over all of them; a site nothing was filed into between two
+ * collections gives its table back (it was empty since the first of them)
+ * and is off until its next intern hit, so the sites of a phase a program
+ * has finished do not keep the memory a later one needs. */
+#define FMT_SITE_FIRST  64u
+#define FMT_SITE_BUDGET 256
+#define FMT_SITE_MAX    ((uint64_t)JAI_INTERN_SOFT_CAP)
+#define FMT_MEMO_TOTAL  ((uint64_t)1 << 16)
+#define FMT_SITE_CAP    16384u
 
-static JaiFmtMemoEntry fmtMemoFirst[FMT_MEMO_FIRST] = {
-    [0 ... FMT_MEMO_FIRST - 1] = {.pre = JAI_FMT_MEMO_EMPTY},
-};
-JaiFmtMemo jaiFmtMemo = {fmtMemoFirst, FMT_MEMO_FIRST - 1u, 0, false};
+static JaiFmtSite *fmtOwners;     /* sites holding a table */
+static uint64_t    fmtEntries;    /* table entries allocated, all sites */
+static unsigned    fmtSites;
+
+JaiFmtSite *jaiFmtSiteNew(void) {
+    if (fmtSites >= FMT_SITE_CAP) return NULL;
+    JaiFmtSite *site = calloc(1, sizeof *site);
+    if (site == NULL) return NULL;
+    site->leaf = (void *)&jaiValueFormatIntLeafMemo;
+    fmtSites++;
+    return site;
+}
 
 static void fmtMemoEmpty(JaiFmtMemoEntry *entries, uint64_t count) {
     for (uint64_t i = 0; i < count; i++) {
@@ -1434,38 +1460,64 @@ static void fmtMemoEmpty(JaiFmtMemoEntry *entries, uint64_t count) {
 }
 
 void jaiFmtMemoClear(void) {
-    if (!jaiFmtMemo.dirty) return;
-    fmtMemoEmpty(jaiFmtMemo.entries, jaiFmtMemo.mask + 1u);
-    jaiFmtMemo.dirty = false;
+    JaiFmtSite **link = &fmtOwners;
+    while (*link != NULL) {
+        JaiFmtSite *site = *link;
+        site->fills = 0;
+        if (site->dirty) {
+            fmtMemoEmpty(site->table, site->mask + 1u);
+            site->dirty = false;
+            link = &site->nextOwner;
+            continue;
+        }
+        *link = site->nextOwner;
+        site->nextOwner = NULL;
+        fmtEntries -= site->mask + 1u;
+        free(site->table);
+        site->table = NULL;
+        site->entries = NULL;
+        site->mask = 0;
+    }
 }
 
-/* A table twice the size, empty: the entries it held are refilled by the
- * misses that follow, which is cheaper than rehashing them here. malloc and
- * never the collector's allocator -- this runs inside a leaf. Failing to grow
- * keeps the table it has. */
-static JAI_NOINLINE void fmtMemoGrow(void) {
-    const uint64_t count = (jaiFmtMemo.mask + 1u) * 2u;
-    JaiFmtMemoEntry *grown = malloc(count * sizeof *grown);
-    if (grown == NULL) return;
-    fmtMemoEmpty(grown, count);
-    if (jaiFmtMemo.entries != fmtMemoFirst) free(jaiFmtMemo.entries);
-    jaiFmtMemo.entries = grown;
-    jaiFmtMemo.mask = count - 1u;
-    jaiFmtMemo.fills = 0;
+/* A table of `count` entries, empty, in place of the site's own: the entries
+ * it held are refilled by the misses that follow, which is cheaper than
+ * rehashing them here. malloc and never the collector's allocator -- this
+ * runs inside a leaf. Failing to allocate keeps what the site has. */
+static JAI_NOINLINE void fmtSiteResize(JaiFmtSite *site, uint64_t count) {
+    const uint64_t had = site->table == NULL ? 0 : site->mask + 1u;
+    if (fmtEntries - had + count > FMT_MEMO_TOTAL) return;
+    JaiFmtMemoEntry *table = malloc(count * sizeof *table);
+    if (table == NULL) return;
+    fmtMemoEmpty(table, count);
+    free(site->table);
+    fmtEntries = fmtEntries - had + count;
+    site->table = table;
+    site->mask = count - 1u;
+    site->fills = 0;
 }
 
-ObjString *jaiFmtMemoFill(Obj *pre, int64_t n, Obj *post, ObjString *s) {
+ObjString *jaiFmtMemoFill(JaiFmtSite *site, Obj *pre, int64_t n, Obj *post,
+                          ObjString *s) {
+    if (JAI_UNLIKELY(site->table == NULL)) {
+        fmtSiteResize(site, FMT_SITE_FIRST);
+        if (site->table == NULL) return s;
+        site->nextOwner = fmtOwners;
+        fmtOwners = site;
+    } else if (JAI_UNLIKELY(site->fills > 2u * (site->mask + 1u)) &&
+               site->mask + 1u < FMT_SITE_MAX) {
+        fmtSiteResize(site, (site->mask + 1u) * 2u);
+    }
     JaiFmtMemoEntry *e =
-        &jaiFmtMemo.entries[jaiFmtMemoIndex(pre, n, post, jaiFmtMemo.mask)];
+        &site->table[jaiFmtMemoIndex(pre, n, post, site->mask)];
     e->pre = pre;
     e->post = post;
     e->n = n;
     e->s = s;
-    jaiFmtMemo.dirty = true;
-    if (JAI_UNLIKELY(++jaiFmtMemo.fills > 2u * (jaiFmtMemo.mask + 1u)) &&
-        jaiFmtMemo.mask + 1u < FMT_MEMO_MAX) {
-        fmtMemoGrow();
-    }
+    site->fills++;
+    site->entries = site->table;
+    site->budget = FMT_SITE_BUDGET;
+    site->dirty = true;
     return s;
 }
 

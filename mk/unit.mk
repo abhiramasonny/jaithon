@@ -48,6 +48,16 @@ $(BUILD)/chunk_caches: $(VERIFY_OBJS) tests/vm/chunk_caches.c | $(CC_STAMP)
 chunk-caches-test: $(BUILD)/chunk_caches
 	@$(BUILD)/chunk_caches
 
+# The f-string memo's hit rate, which no program can see: a memo that misses
+# on every probe still gives the right answer, slower than none at all.
+$(BUILD)/fmt_memo: $(VERIFY_OBJS) tests/vm/fmt_memo.c | $(CC_STAMP)
+	@echo "  CC      tests/vm/fmt_memo.c"
+	@$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/vm/fmt_memo.c \
+	    $(VERIFY_OBJS) $(LIBS)
+
+fmt-memo-test: $(BUILD)/fmt_memo
+	@$(BUILD)/fmt_memo
+
 # The line table's encoding, at the edges a corpus does not reliably contain:
 # backwards span deltas, zero-length spans, u32 extremes, truncated streams.
 $(BUILD)/linetable_ltv1: $(VERIFY_OBJS) tests/vm/linetable_ltv1.c | $(CC_STAMP)

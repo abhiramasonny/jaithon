@@ -1,11 +1,11 @@
-#: The f-string memo: compiled code probes jaiFmtMemo for (pre, n, post)
-#: before it calls jaiValueFormatIntLeafMemo, and a hit is the string the leaf
-#: answered last time. The memo is weak -- every collection empties it -- and
-#: keys its runs by identity, so these check the cases where a stale or
-#: confused entry would show: the all-absent key of `f"{n}"` against an empty
-#: slot, two sites sharing one int, a run that is a different string on each
-#: call, runs freed and their addresses reused across collections, and the
-#: intern table's soft cap, past which every call is a new string.
+#: The f-string memo: compiled code probes its site's table for (pre, n,
+#: post) before it calls jaiValueFormatIntLeafMemo, and a hit is the string
+#: the leaf answered last time. The memo is weak -- every collection empties
+#: it -- and keys its runs by identity, so these check the cases where a stale
+#: or confused entry would show: the all-absent key of `f"{n}"` against an
+#: empty slot, two sites sharing one int, a run that is a different string on
+#: each call, runs freed and their addresses reused across collections, and
+#: the intern table's soft cap, past which every call is a new string.
 #:
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it; `JAITHON_NO_JIT=1` runs the same file, and

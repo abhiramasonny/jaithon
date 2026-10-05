@@ -1049,12 +1049,20 @@ bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
                       unsigned ridx);
 bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count);
 bool leafRegOk(unsigned r);
-/* Defined in jit_body_build.c: the inline probe of jaiFmtMemo. */
-int emitFmtMemoProbe(Emit *e, unsigned rPre, unsigned rN, unsigned rPost);
+/* Defined in jit_body_build.c: the inline probe of a site's f-string memo.
+ * `hit` is the probe's b.eq, -1 when the site has no memo. */
+typedef struct {
+    int         hit;
+    JaiFmtSite *site;
+} FmtMemoFix;
+void emitFmtMemoProbe(Emit *e, unsigned rPre, unsigned rN, unsigned rPost,
+                      FmtMemoFix *fix);
+void emitFmtMemoCall(Emit *e, const FmtMemoFix *fix);
 void fmtMemoHitHere(Emit *e, int at);
-int emitFmtMemoFillTest(Emit *e, int memoHit);
-void emitFmtMemoFillStub(Emit *e, int test, int answered, unsigned rPre,
-                         unsigned rN, unsigned rPost);
+int emitFmtMemoFillTest(Emit *e, const FmtMemoFix *fix);
+void emitFmtMemoFillStub(Emit *e, int test, int answered,
+                         const FmtMemoFix *fix, unsigned rPre, unsigned rN,
+                         unsigned rPost);
 bool jitLeafInReg(void);
 void leafSlowHere(Emit *e, LeafFix *fx);
 void leafDoneHere(Emit *e, LeafFix *fx);
