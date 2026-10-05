@@ -142,6 +142,22 @@ JaiJitOutcome jaiJitEnter(ObjClosure *closure, Value *slotBase) {
     if (fn->jitFunc != NULL) return jaiJitEnterFunc(closure, slotBase);
 
     if (fn->jitCode == NULL) {
+        /* The same attempt again, on the same inputs, fails the same way:
+         * charge it like the failure it would be, without the walk. */
+        uint64_t print = 0;
+        if (jitNegCacheOn()) {
+            print = jitAttemptPrint(fn, slotBase, 1u + fn->arity);
+            if (jitAttemptSeen(fn, print)) {
+                if (getenv("JAI_JIT_WHY")) {
+                    fprintf(stderr, "[jit] %s not retried: nothing its last "
+                                    "attempt read has changed\n",
+                            jitFnLabel(fn));
+                }
+                if (++fn->jitAttempts >= 5) fn->jitRefused = true;
+                else fn->entryCount = 0;
+                return JAI_JIT_DECLINED;
+            }
+        }
         if (jaiJitCompileFunc(closure, slotBase)) {
             fn->jitFuncModuleVersion = fn->module->version;
             return jaiJitEnterFunc(closure, slotBase);
@@ -175,6 +191,8 @@ JaiJitOutcome jaiJitEnter(ObjClosure *closure, Value *slotBase) {
                 fn->entryCount = 0;
                 return JAI_JIT_DECLINED;
             }
+            /* Not for a cold decline above: that one is waiting on purpose. */
+            if (print != 0) jitAttemptNote(fn, print);
             if (++fn->jitAttempts >= 5) fn->jitRefused = true;
             else fn->entryCount = 0;
             return JAI_JIT_DECLINED;

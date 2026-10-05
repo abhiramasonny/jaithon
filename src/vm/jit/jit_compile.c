@@ -202,34 +202,38 @@ bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
     return adoptLocalKindSeen(e, slot, kind, shape, klass, NULL_VAL);
 }
 
-/* ---- The verifier's depth table, once per function ----------------------
+/* ---- What the tier remembers about a function between attempts -----------
  *
- * chunkDepthTable used to run the whole verifier (jaiChunkStackDepths ->
- * verifyChunk) on EVERY attempt: each function-tier attempt, each retry
- * inside jaiJitCompileFunc, and each OSR variant. On `check --no-cache
- * lib/jaithon` that was 5156 runs for about 700 bodies and 28% of all compile
- * time. Bytecode is immutable once loaded and the table depends on nothing
- * else (the chunk and its constants), so it is computed once and kept until
- * the function is freed (jaiJitForgetFunction, called from freeObject).
+ * Two things, both kept in one side table keyed on the function and freed
+ * with it (jaiJitForgetFunction, called from freeObject). A side table rather
+ * than ObjFunction fields: object.h is part of JAI_BUILD_ID, and a field there
+ * would invalidate every seeded image. Open addressing on the pointer, with
+ * tombstones.
  *
- * A side table rather than an ObjFunction field: object.h is part of
- * JAI_BUILD_ID, and a field there would invalidate every seeded image. Open
- * addressing on the pointer, with tombstones. The verifier's "no answer" is
- * remembered too, as DEPTH_NONE: a chunk that does not verify never will.
+ * 1. The verifier's depth table. chunkDepthTable used to run the whole
+ *    verifier (jaiChunkStackDepths -> verifyChunk) on EVERY attempt: each
+ *    function-tier attempt, each retry inside jaiJitCompileFunc, and each OSR
+ *    variant -- 5070 runs for 709 bodies on `check --no-cache lib/jaithon`,
+ *    32ms of CPU. Bytecode is immutable once loaded and the table depends on
+ *    nothing else (the chunk and its constants), so it is computed once. The
+ *    verifier's "no answer" is remembered too, as DEPTH_NONE: a chunk that
+ *    does not verify never will. JAITHON_JIT_DEPTH_MEMO=0 recomputes it.
  *
- * JAITHON_JIT_DEPTH_MEMO=0 recomputes per attempt, as before. */
+ * 2. A print of what the function tier's last declined walk read. See
+ *    jitAttemptPrint. */
 typedef struct {
-    const ObjFunction *fn;    /* NULL empty, DEPTH_TOMB deleted */
-    int               *depth; /* DEPTH_NONE: the verifier had no answer */
-} DepthMemo;
+    const ObjFunction *fn;     /* NULL empty, MEMO_TOMB deleted */
+    int               *depth;  /* NULL not asked yet, DEPTH_NONE no answer */
+    uint64_t           print;  /* 0: no decline recorded */
+} FnMemo;
 
-#define DEPTH_TOMB ((const ObjFunction *)(uintptr_t)1)
+#define MEMO_TOMB  ((const ObjFunction *)(uintptr_t)1)
 #define DEPTH_NONE ((int *)(uintptr_t)1)
 
-static DepthMemo *sDepthMemo;
-static size_t     sDepthCap;    /* power of two, or 0 */
-static size_t     sDepthUsed;   /* live entries plus tombstones */
-static size_t     sDepthLive;
+static FnMemo *sMemo;
+static size_t  sMemoCap;    /* power of two, or 0 */
+static size_t  sMemoUsed;   /* live entries plus tombstones */
+static size_t  sMemoLive;
 
 static bool depthMemoOn(void) {
     static int on = -1;
@@ -240,48 +244,62 @@ static bool depthMemoOn(void) {
     return on != 0;
 }
 
-static size_t depthHash(const ObjFunction *fn, size_t mask) {
+static size_t memoHash(const ObjFunction *fn, size_t mask) {
     uint64_t h = ((uint64_t)(uintptr_t)fn >> 4) * 0x9E3779B97F4A7C15ull;
     return (size_t)(h >> 24) & mask;
 }
 
-static bool depthMemoGrow(void) {
-    size_t cap = sDepthCap == 0 ? 256 : sDepthCap * 2;
+static bool memoGrow(void) {
+    size_t cap = sMemoCap == 0 ? 256 : sMemoCap * 2;
     /* Mostly tombstones: rebuild at the same size instead. */
-    if (sDepthCap != 0 && sDepthLive * 4 < sDepthCap) cap = sDepthCap;
-    DepthMemo *t = calloc(cap, sizeof *t);
+    if (sMemoCap != 0 && sMemoLive * 4 < sMemoCap) cap = sMemoCap;
+    FnMemo *t = calloc(cap, sizeof *t);
     if (t == NULL) return false;
-    for (size_t i = 0; i < sDepthCap; i++) {
-        const ObjFunction *k = sDepthMemo[i].fn;
-        if (k == NULL || k == DEPTH_TOMB) continue;
-        size_t j = depthHash(k, cap - 1);
+    for (size_t i = 0; i < sMemoCap; i++) {
+        const ObjFunction *k = sMemo[i].fn;
+        if (k == NULL || k == MEMO_TOMB) continue;
+        size_t j = memoHash(k, cap - 1);
         while (t[j].fn != NULL) j = (j + 1) & (cap - 1);
-        t[j] = sDepthMemo[i];
+        t[j] = sMemo[i];
     }
-    free(sDepthMemo);
-    sDepthMemo = t;
-    sDepthCap  = cap;
-    sDepthUsed = sDepthLive;
+    free(sMemo);
+    sMemo     = t;
+    sMemoCap  = cap;
+    sMemoUsed = sMemoLive;
     return true;
 }
 
-static DepthMemo *depthMemoFind(const ObjFunction *fn) {
-    if (sDepthCap == 0) return NULL;
-    size_t mask = sDepthCap - 1;
-    for (size_t j = depthHash(fn, mask);; j = (j + 1) & mask) {
-        if (sDepthMemo[j].fn == fn) return &sDepthMemo[j];
-        if (sDepthMemo[j].fn == NULL) return NULL;
+/* The record for `fn`, or NULL. With `create`, a fresh zeroed record is made
+ * when there is none (NULL only if memory runs out). The pointer is good until
+ * the next create. */
+static FnMemo *memoFor(const ObjFunction *fn, bool create) {
+    if (sMemoCap != 0) {
+        size_t mask = sMemoCap - 1;
+        for (size_t j = memoHash(fn, mask);; j = (j + 1) & mask) {
+            if (sMemo[j].fn == fn) return &sMemo[j];
+            if (sMemo[j].fn == NULL) break;
+        }
     }
+    if (!create) return NULL;
+    if ((sMemoUsed + 1) * 4 > sMemoCap * 3 && !memoGrow()) return NULL;
+    size_t mask = sMemoCap - 1;
+    size_t j = memoHash(fn, mask);
+    while (sMemo[j].fn != NULL && sMemo[j].fn != MEMO_TOMB) j = (j + 1) & mask;
+    if (sMemo[j].fn == NULL) sMemoUsed++;
+    memset(&sMemo[j], 0, sizeof sMemo[j]);
+    sMemo[j].fn = fn;
+    sMemoLive++;
+    return &sMemo[j];
 }
 
 void jaiJitForgetFunction(const ObjFunction *fn) {
-    if (sDepthLive == 0) return;
-    DepthMemo *m = depthMemoFind(fn);
+    if (sMemoLive == 0) return;
+    FnMemo *m = memoFor(fn, false);
     if (m == NULL) return;
-    if (m->depth != DEPTH_NONE) free(m->depth);
-    m->fn = DEPTH_TOMB;
-    m->depth = NULL;
-    sDepthLive--;
+    if (m->depth != NULL && m->depth != DEPTH_NONE) free(m->depth);
+    memset(m, 0, sizeof *m);
+    m->fn = MEMO_TOMB;
+    sMemoLive--;
 }
 
 /* Every caller hands what chunkDepthTable returned to jitFree; with the memo
@@ -305,30 +323,162 @@ int *chunkDepthTable(const ObjFunction *fn) {
         }
         return d;
     }
-    DepthMemo *m = depthMemoFind(fn);
-    if (m != NULL) return m->depth == DEPTH_NONE ? NULL : m->depth;
+    FnMemo *m = memoFor(fn, true);
+    if (m == NULL) return NULL;
+    if (m->depth != NULL) return m->depth == DEPTH_NONE ? NULL : m->depth;
 
-    /* Room first, so nothing below can fail after the verifier has run. An
-     * allocation failure is not a fact about the chunk, so it is not
-     * remembered: the next attempt asks again. */
-    if ((sDepthUsed + 1) * 4 > sDepthCap * 3 && !depthMemoGrow()) return NULL;
     /* Plain malloc, not JAI_ALLOC: the table outlives the attempt and is
      * freed from inside the sweep, so it stays out of the collector's
-     * accounting altogether. */
+     * accounting altogether. An allocation failure is not a fact about the
+     * chunk, so it is not remembered: the next attempt asks again. */
     int *d = malloc(((size_t)fn->chunk.count + 1) * sizeof *d);
     if (d == NULL) return NULL;
     if (!jaiChunkStackDepths(fn, d)) { free(d); d = NULL; }
-
-    size_t mask = sDepthCap - 1;
-    size_t j = depthHash(fn, mask);
-    while (sDepthMemo[j].fn != NULL && sDepthMemo[j].fn != DEPTH_TOMB) {
-        j = (j + 1) & mask;
-    }
-    if (sDepthMemo[j].fn == NULL) sDepthUsed++;
-    sDepthMemo[j].fn = fn;
-    sDepthMemo[j].depth = d != NULL ? d : DEPTH_NONE;
-    sDepthLive++;
+    m->depth = d != NULL ? d : DEPTH_NONE;
     return d;
+}
+
+/* ---- Not repeating an attempt whose inputs have not changed -------------
+ *
+ * A body the function tier declines is walked again on each of its next four
+ * attempts, and those repeats are most of what the tier spends producing
+ * nothing: 9ms of a cold `run --no-cache json_parse` (3% of it), 16ms of
+ * `check --no-cache lib/jaithon`. Almost all of them stop where the last one
+ * did, because nothing the walk reads has moved.
+ *
+ * So a decline records a print of what the walk reads, and the next attempt
+ * is skipped -- charged to the budget exactly as the failure it would be, so
+ * a body retires on the same call it always did -- while the print is the
+ * same. The print is per body, not a global epoch: a global count of
+ * compiles or of feedback changes moves between almost any two attempts, and
+ * skipped a tenth of them. It covers
+ *
+ *   - every inline cache in the body's own chunk: its state and ways, each
+ *     way's shape and observed result kind, and for a way holding a closure
+ *     the facts the walk asks of a callee -- whether it has compiled, its
+ *     compiled and observed return kinds and shape;
+ *   - for a cache naming a global (OP_GET_GLOBAL keeps the table index), the
+ *     same facts of the closure the global holds now, so a plain call's
+ *     callee compiling or first returning is seen;
+ *   - the kind of every argument it is seeded from, with an instance's
+ *     shape, a list's storage and emptiness, an iterator's kind and a
+ *     closure's function.
+ *
+ * A cold-callee decline is never recorded: it has its own retry budget.
+ * JAITHON_JIT_NEG_CACHE=0 attempts every time, as before. */
+bool jitNegCacheOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_NEG_CACHE");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static uint64_t printMix(uint64_t h, uint64_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
+/* What a walk asks of a callee it meets. */
+static uint64_t calleePrint(Value v) {
+    if (!IS_CLOSURE(v)) return 0;
+    const ObjFunction *c = AS_CLOSURE(v)->fn;
+    /* And whether its return shape names a class yet: "a method whose return
+     * class is not on record" resolves when some compile or return records
+     * the class (jaiClassRememberShape), with nothing about the callee
+     * itself changing. */
+    ObjClass *rc = NULL;
+    uint64_t known =
+        (c->obsReturnShape != 0 && jaiClassForShape(c->obsReturnShape, &rc) &&
+         rc != NULL) |
+        ((uint64_t)(c->jitReturnShape != 0 &&
+                    jaiClassForShape(c->jitReturnShape, &rc) && rc != NULL)
+         << 1);
+    return printMix((uint64_t)(uintptr_t)c,
+                    ((uint64_t)(c->jitFunc != NULL) << 63) ^
+                    (known << 56) ^
+                    ((uint64_t)c->jitReturnKind << 48) ^
+                    ((uint64_t)c->obsReturnKind << 40) ^
+                    ((uint64_t)c->obsReturnShape << 8) ^ c->jitReturnShape);
+}
+
+/* A live value as the walk sees one: its kind, an instance's shape, a list's
+ * storage and whether it is empty (an empty list has no exemplar to sample),
+ * an iterator's kind, a closure's callee facts -- and, one level down, the
+ * same of each field of an instance, which is where `self.items` lives. */
+static uint64_t valuePrint(Value v, int depth) {
+    uint64_t k = (uint64_t)v.type;
+    if (!IS_OBJ(v)) return k;
+    Obj *o = AS_OBJ(v);
+    k |= (uint64_t)o->type << 8;
+    switch (o->type) {
+    case OBJ_INSTANCE: {
+        ObjInstance *in = (ObjInstance *)o;
+        k ^= (uint64_t)(in->klass != NULL ? in->klass->shapeId : 0) << 16;
+        if (depth == 0) {
+            for (unsigned f = 0; f < in->fieldCount; f++)
+                k = printMix(k, valuePrint(in->fields[f], 1));
+        }
+        break;
+    }
+    case OBJ_LIST: {
+        ObjList *l = (ObjList *)o;
+        k ^= ((uint64_t)l->stg << 16) | ((uint64_t)(l->count == 0) << 24);
+        break;
+    }
+    case OBJ_ITER:
+        k ^= (uint64_t)((ObjIter *)o)->kind << 16;
+        break;
+    case OBJ_CLOSURE:
+        k = printMix(k, calleePrint(v));
+        break;
+    default:
+        break;
+    }
+    return k;
+}
+
+uint64_t jitAttemptPrint(const ObjFunction *fn, const Value *slots,
+                         unsigned count) {
+    uint64_t h = 0x243F6A8885A308D3ull;
+    const Chunk *c = &fn->chunk;
+    const ObjModule *mod = fn->module;
+    if (c->caches != NULL) {
+        for (int i = 0; i < c->cacheCount; i++) {
+            const InlineCache *ic = &c->caches[i];
+            uint64_t k = (uint64_t)ic->state | ((uint64_t)ic->count << 8);
+            unsigned ways = ic->count <= JAI_IC_WAYS ? ic->count : JAI_IC_WAYS;
+            for (unsigned w = 0; w < ways; w++) {
+                k = printMix(k, ((uint64_t)ic->shapeId[w] << 8) |
+                                ic->resultKind[w]);
+                k = printMix(k, calleePrint(ic->cached[w]));
+            }
+            /* A global's cache keeps its table index and no value, so the
+             * value is read from the table. Any other cache that reads as one
+             * only adds a fact that cannot matter -- which costs a skip,
+             * never a wrong one. */
+            if (ic->state == IC_MONO && mod != NULL &&
+                mod->globals.capacity > 0 &&
+                ic->payload[0] < (uint32_t)mod->globals.capacity) {
+                const JaiEntry *e = &mod->globals.entries[ic->payload[0]];
+                k = printMix(k, valuePrint(e->value, 1));
+            }
+            h = printMix(h, k);
+        }
+    }
+    for (unsigned i = 0; i < count; i++) h = printMix(h, valuePrint(slots[i], 0));
+    return h | 1u;   /* never 0, which means "nothing recorded" */
+}
+
+bool jitAttemptSeen(const ObjFunction *fn, uint64_t print) {
+    FnMemo *m = memoFor(fn, false);
+    return m != NULL && m->print == print;
+}
+
+void jitAttemptNote(const ObjFunction *fn, uint64_t print) {
+    FnMemo *m = memoFor(fn, true);
+    if (m != NULL) m->print = print;
 }
 
 static bool eligible(ObjFunction *fn) {
