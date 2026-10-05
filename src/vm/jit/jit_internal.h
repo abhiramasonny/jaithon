@@ -1052,6 +1052,9 @@ bool leafRegOk(unsigned r);
 /* Defined in jit_body_build.c: the inline probe of jaiFmtMemo. */
 int emitFmtMemoProbe(Emit *e, unsigned rPre, unsigned rN, unsigned rPost);
 void fmtMemoHitHere(Emit *e, int at);
+int emitFmtMemoFillTest(Emit *e, int memoHit);
+void emitFmtMemoFillStub(Emit *e, int test, int answered, unsigned rPre,
+                         unsigned rN, unsigned rPost);
 bool jitLeafInReg(void);
 void leafSlowHere(Emit *e, LeafFix *fx);
 void leafDoneHere(Emit *e, LeafFix *fx);

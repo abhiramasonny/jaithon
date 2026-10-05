@@ -251,12 +251,15 @@ int emitNativeResultCall(Emit *e, Value cv, const char *nm,
         sfx.slow[0] = (int)e->count;
         sfx.cond[0] = JAI_A64_EQ;
         emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+        int fillTest = emitFmtMemoFillTest(e, memoHit);
+        int answered = (int)e->count;
         fmtMemoHitHere(e, memoHit);
         emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
         emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
         emit(e, jaiA64StrX(0, 31, rat + 8));
         sfx.done = (int)e->count;
         emit(e, jaiA64B(0));
+        emitFmtMemoFillStub(e, fillTest, answered, 31u, rN, 31u);
         sfx.on = true;
     }
     leafSlowHere(e, &sfx);

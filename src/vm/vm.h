@@ -159,7 +159,9 @@ bool jaiValueFormatShortOn(void);
 ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count);
 /* The same for an f-string of one int hole between optional string runs. */
 ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post);
-/* The same, filing an intern hit in jaiFmtMemo; see value.c. */
+/* The same for a caller that probed jaiFmtMemo and missed: an intern hit
+ * comes back with bit 0 of the pointer set, to be stripped and filed with
+ * jaiFmtMemoFill. See value.c. */
 ObjString *jaiValueFormatIntLeafMemo(Obj *pre, int64_t n, Obj *post);
 /* What jaiValueFormatIntLeaf answered from the intern table, by (pre, n,
  * post), weak and direct-mapped; compiled code probes it inline in front of
@@ -188,6 +190,10 @@ static inline uint64_t jaiFmtMemoIndex(const Obj *pre, int64_t n,
 /* Every entry dropped; the collector calls it, since an entry holds its
  * strings weakly. */
 void jaiFmtMemoClear(void);
+/* Files `s`, an interned string, as the answer for (pre, n, post), growing
+ * the table when it has been refilled twice over; returns `s`. Never
+ * collects. */
+ObjString *jaiFmtMemoFill(Obj *pre, int64_t n, Obj *post, ObjString *s);
 /* `s[a:b]` for compiled code, or NULL when only jaiSliceGet can make it.
  * Never allocates; see its definition in object_string.c. */
 ObjString *jaiStringSliceLeaf(ObjString *s, int64_t start, int64_t stop,

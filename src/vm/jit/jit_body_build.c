@@ -326,6 +326,37 @@ int emitFmtMemoProbe(Emit *e, unsigned rPre, unsigned rN, unsigned rPost) {
     return at;
 }
 
+/* After a call to jaiValueFormatIntLeafMemo has returned a non-NULL x0: an
+ * answer marked as an intern hit (bit 0) goes out of line to be filed --
+ *
+ *         tbnz x0, #0, fill
+ *   ...   <the caller's answered path, then its branch over the slow path>
+ *   fill: sub x0, x0, #1;  jaiFmtMemoFill(pre, n, post, x0);  b answered
+ *
+ * emitFmtMemoFillTest places the test and returns its index (-1 for none);
+ * emitFmtMemoFillStub, called once the caller has emitted its branch over
+ * the slow path, places the stub and aims the test at it, rejoining at
+ * `answered`. pre, n and post are still in their callee-saved registers. */
+int emitFmtMemoFillTest(Emit *e, int memoHit) {
+    if (memoHit < 0) return -1;
+    int at = (int)e->count;
+    emit(e, jaiA64Tbnz(0, 0, 0));
+    return at;
+}
+
+void emitFmtMemoFillStub(Emit *e, int test, int answered, unsigned rPre,
+                         unsigned rN, unsigned rPost) {
+    if (test < 0 || e->count > JIT_MAX_INSTS) return;
+    e->code[test] = jaiA64Tbnz(0, 0, (int32_t)((int)e->count - test));
+    emit(e, jaiA64SubXImm(3, 0, 1));
+    emit(e, jaiA64MovX(0, rPre));
+    emit(e, jaiA64MovX(1, rN));
+    emit(e, jaiA64MovX(2, rPost));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jaiFmtMemoFill);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64B((int32_t)(answered - (int)e->count)));
+}
+
 /* Aims a probe's hit branch at the current instruction. */
 void fmtMemoHitHere(Emit *e, int at) {
     if (at < 0 || at >= (int)e->count || e->count > JIT_MAX_INSTS) return;
@@ -393,6 +424,7 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
      * parts out for the general leaf. */
     int hole = -1;
     int memoHit = -1;
+    unsigned fmtPre = 31u, fmtN = 31u, fmtPost = 31u;
     bool oneIntHole = parts <= 3 && jitFormatIntLeaf();
     for (unsigned i = 0; i < parts && oneIntHole; i++) {
         SlotKind k = e->stack[first + i];
@@ -411,6 +443,9 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
                              ? valueXReg(e, vfirst + (unsigned)hole + 1)
                              : 31u;
         memoHit = emitFmtMemoProbe(e, rPre, rN, rPost);
+        fmtPre = rPre;
+        fmtN = rN;
+        fmtPost = rPost;
         /* `mov x, xzr` is the NULL for an absent run; register 31 here is
          * the zero register, which jaiA64MovX encodes as `orr x, xzr, xzr`. */
         emit(e, jaiA64MovX(0, rPre));
@@ -440,7 +475,10 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
     fx->slow[0] = (int)e->count;
     fx->cond[0] = JAI_A64_EQ;
     emit(e, jaiA64BCond(JAI_A64_EQ, 0));
-    /* A memo hit joins here with its string already in x0. */
+    /* An intern hit to file goes out of line; a memo hit joins after the
+     * test, with its string already in x0. */
+    int fillTest = emitFmtMemoFillTest(e, memoHit);
+    int answered = (int)e->count;
     fmtMemoHitHere(e, memoHit);
     /* Straight into the register the result will occupy -- the first part's,
      * once the parts are popped and the string pushed -- and past the load
@@ -457,6 +495,7 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
     }
     fx->done = (int)e->count;
     emit(e, jaiA64B(0));
+    emitFmtMemoFillStub(e, fillTest, answered, fmtPre, fmtN, fmtPost);
     fx->on = true;
 }
 

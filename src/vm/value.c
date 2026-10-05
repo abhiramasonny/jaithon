@@ -1420,7 +1420,6 @@ static JaiFmtMemoEntry fmtMemoFirst[FMT_MEMO_FIRST] = {
 };
 JaiFmtMemo jaiFmtMemo = {fmtMemoFirst, FMT_MEMO_FIRST - 1u, 0, false};
 
-
 static void fmtMemoEmpty(JaiFmtMemoEntry *entries, uint64_t count) {
     for (uint64_t i = 0; i < count; i++) {
         entries[i].pre = JAI_FMT_MEMO_EMPTY;
@@ -1451,10 +1450,7 @@ static JAI_NOINLINE void fmtMemoGrow(void) {
     jaiFmtMemo.fills = 0;
 }
 
-/* Reached by a tail call from the leaf, so the leaf itself keeps no frame
- * for the growth call in here. Returns `s`. */
-static JAI_NOINLINE ObjString *fmtMemoKeep(Obj *pre, int64_t n, Obj *post,
-                                           ObjString *s) {
+ObjString *jaiFmtMemoFill(Obj *pre, int64_t n, Obj *post, ObjString *s) {
     JaiFmtMemoEntry *e =
         &jaiFmtMemo.entries[jaiFmtMemoIndex(pre, n, post, jaiFmtMemo.mask)];
     e->pre = pre;
@@ -1469,10 +1465,13 @@ static JAI_NOINLINE ObjString *fmtMemoKeep(Obj *pre, int64_t n, Obj *post,
     return s;
 }
 
-/* The leaf's body, instantiated twice so that the copy compiled code calls
- * while the memo is off is the leaf as it was, instruction for instruction:
- * keeping pre, n and post alive to the fill reshapes the register plan of
- * the whole function, and that cost ~11 instructions a call on its own. */
+/* The leaf's body, instantiated twice. The memo's copy does not file the
+ * hit itself: keeping pre, n and post alive to a fill in here reshaped the
+ * register plan of the whole function and cost ~11 instructions on EVERY
+ * call, the misses of a stream of distinct strings included. It marks the
+ * answer instead -- bit 0 of the pointer, which no object has set -- and the
+ * compiled caller, which still holds pre, n and post in callee-saved
+ * registers, makes the fill call out of line (emitFmtMemoFillStub). */
 JAI_INLINE ObjString *formatIntLeaf(Obj *pre, int64_t n, Obj *post,
                                     bool memo) {
     uint64_t words[(FMT_SHORT_BUF + 7) / 8];
@@ -1483,7 +1482,7 @@ JAI_INLINE ObjString *formatIntLeaf(Obj *pre, int64_t n, Obj *post,
         if (JAI_LIKELY(o <= JAI_STR_SHORT_MAX && fmtRun(buf, &o, post))) {
             ObjString *found = formatShortProbe(buf, o);
             if (JAI_LIKELY(found != NULL)) {
-                if (memo) return fmtMemoKeep(pre, n, post, found);
+                if (memo) return (ObjString *)((uintptr_t)found | 1u);
                 return found;
             }
             return formatLeafBuilt(buf, o);
@@ -1496,8 +1495,9 @@ ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
     return formatIntLeaf(pre, n, post, false);
 }
 
-/* jaiValueFormatIntLeaf that also files an intern hit in the memo: what
- * compiled code calls when its inline probe of the memo misses. */
+/* jaiValueFormatIntLeaf for a caller that probed the memo and missed: an
+ * intern hit comes back with bit 0 set, for the caller to strip and to file
+ * with jaiFmtMemoFill. */
 ObjString *jaiValueFormatIntLeafMemo(Obj *pre, int64_t n, Obj *post) {
     return formatIntLeaf(pre, n, post, true);
 }
