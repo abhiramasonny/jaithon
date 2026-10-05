@@ -21,7 +21,10 @@ let SOURCE = """#include <metal_stdlib>
 using namespace metal;
 
 constexpr constant uint RADIX_SIZE = 256;
+constexpr constant uint RADIX_BITS = 8;
 constexpr constant uint RADIX_GROUP = 256;
+/* Apple GPUs run 32-wide simdgroups, so a block of 256 is eight of them. */
+constexpr constant uint RADIX_SIMDS = RADIX_GROUP / 32u;
 constexpr constant uint REDUCE_GROUP = 256;
 constexpr constant uint WIDE_SCALE = 16777216u;
 constexpr constant float FLOAT_CEILING = 3.402823e+38f;
@@ -469,6 +472,73 @@ kernel void key_radix_offsets(device uint* counts [[buffer(0)]],
     for (uint b = 0u; b < blocks; ++b) counts[b * RADIX_SIZE + lid] += base;
 }
 
+/* The same offsets for a long sort, in three dispatches instead of one
+ * threadgroup.
+ *
+ * `key_radix_offsets` is 256 threads walking every block twice, which at two
+ * million rows is 7813 dependent steps a thread and 70% of the sort. Here the
+ * blocks are cut into `parts` partitions of `per` blocks: one thread per
+ * (partition, digit) totals its slice, one group scans the totals, and one
+ * thread per (partition, digit) walks its slice again from that base. The
+ * walks are `per` long, never more than 256 apart. The answer is the same
+ * exclusive scan, digit-major, so the scatter cannot tell which one ran; the
+ * extra dispatches only pay once there are enough blocks to share out, which
+ * is why the driver keeps the single group for a short sort. */
+kernel void key_offsets_partial(device const uint* counts [[buffer(0)]],
+                                device uint* partial [[buffer(1)]],
+                                constant uint& blocks [[buffer(2)]],
+                                constant uint& per [[buffer(3)]],
+                                uint gid [[thread_position_in_grid]]) {
+    uint part = gid / RADIX_SIZE;
+    uint digit = gid - part * RADIX_SIZE;
+    uint lo = part * per;
+    uint hi = min(blocks, lo + per);
+    uint sum = 0u;
+    for (uint b = lo; b < hi; ++b) sum += counts[b * RADIX_SIZE + digit];
+    partial[gid] = sum;
+}
+
+kernel void key_offsets_scan(device uint* partial [[buffer(0)]],
+                             constant uint& parts [[buffer(1)]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup uint scratch[RADIX_SIZE];
+    uint running = 0u;
+    for (uint p = 0u; p < parts; ++p) {
+        uint at = p * RADIX_SIZE + lid;
+        uint here = partial[at];
+        partial[at] = running;
+        running += here;
+    }
+    scratch[lid] = running;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < RADIX_SIZE; stride <<= 1) {
+        uint add = (lid >= stride) ? scratch[lid - stride] : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scratch[lid] += add;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint base = scratch[lid] - running;
+    for (uint p = 0u; p < parts; ++p) partial[p * RADIX_SIZE + lid] += base;
+}
+
+kernel void key_offsets_apply(device uint* counts [[buffer(0)]],
+                              device const uint* partial [[buffer(1)]],
+                              constant uint& blocks [[buffer(2)]],
+                              constant uint& per [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]]) {
+    uint part = gid / RADIX_SIZE;
+    uint digit = gid - part * RADIX_SIZE;
+    uint lo = part * per;
+    uint hi = min(blocks, lo + per);
+    uint running = partial[gid];
+    for (uint b = lo; b < hi; ++b) {
+        uint at = b * RADIX_SIZE + digit;
+        uint here = counts[at];
+        counts[at] = running;
+        running += here;
+    }
+}
+
 /* The stable placement. Every thread needs its rank among the earlier
  * elements of its own block that share its digit, which is the only part of a
  * radix sort that is not a scan -- and the part that decides whether the sort
@@ -513,6 +583,84 @@ kernel void key_radix_scatter(device const uint* keys_in [[buffer(0)]],
     uint at = counts[wid * RADIX_SIZE + digit] + rank;
     keys_out[at] = key;
     order_out[at] = order_in[gid];
+}
+
+inline uint ballot32(bool predicate) {
+    return (uint)((simd_vote::vote_t)simd_ballot(predicate));
+}
+
+/* The same stable placement with the rank found by votes, not by a walk.
+ *
+ * Eight ballots, one per digit bit, intersect to the lanes of this simdgroup
+ * that hold the thread's digit; the ones below it are its rank inside the
+ * simdgroup. The lowest of them writes how many there are into a table of
+ * (simdgroup, digit) counts, and the rank inside the block is that plus the
+ * counts of the simdgroups before it -- at most seven reads, where the walk
+ * above is up to 64 quad compares. Lanes are numbered in thread order and a
+ * simdgroup is 32 consecutive threads, so "below" is "earlier in the block"
+ * and the placement is exactly the walk's: the stability every multi-key sort
+ * depends on is unchanged. */
+kernel void key_radix_scatter_vote(device const uint* keys_in [[buffer(0)]],
+                                   device const float* order_in [[buffer(1)]],
+                                   device uint* keys_out [[buffer(2)]],
+                                   device float* order_out [[buffer(3)]],
+                                   device const uint* counts [[buffer(4)]],
+                                   constant uint& count [[buffer(5)]],
+                                   constant uint& shift [[buffer(6)]],
+                                   uint gid [[thread_position_in_grid]],
+                                   uint lid [[thread_index_in_threadgroup]],
+                                   uint wid [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]],
+                                   uint simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint tally[RADIX_SIMDS * RADIX_SIZE];
+    for (uint i = lid; i < RADIX_SIMDS * RADIX_SIZE; i += RADIX_GROUP) tally[i] = 0u;
+    bool live = gid < count;
+    uint key = live ? keys_in[gid] : 0u;
+    uint digit = (key >> shift) & (RADIX_SIZE - 1u);
+    /* A lane past the end is in nobody's peer set, so it adds to no rank. */
+    uint peers = ballot32(live);
+    for (uint b = 0u; b < RADIX_BITS; ++b) {
+        bool set = ((digit >> b) & 1u) != 0u;
+        uint vote = ballot32(set);
+        peers &= set ? vote : ~vote;
+    }
+    uint below = peers & ((1u << lane) - 1u);
+    uint rank = popcount(below);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (live && below == 0u) tally[simd * RADIX_SIZE + digit] = popcount(peers);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!live) return;
+    for (uint s = 0u; s < simd; ++s) rank += tally[s * RADIX_SIZE + digit];
+    uint at = counts[wid * RADIX_SIZE + digit] + rank;
+    keys_out[at] = key;
+    order_out[at] = order_in[gid];
+}
+
+/* A float lane's digits with its column's null lane folded in, so the null
+ * lane needs no radix pass of its own.
+ *
+ * `order_bits` of a present float is never 0 and never all ones -- the ends
+ * are NaN patterns, and NaN is missing -- and inverting a lane maps that range
+ * onto itself. So a missing row can take either end without tying any present
+ * row: `absent_digit` is all ones for `na_position: last` and 0 for first,
+ * absolute the way the null lane is, and never flipped with the column. One
+ * stable pass over this lane orders exactly as the value pass followed by the
+ * null pass did: present rows by value, missing rows after (or before) them in
+ * the order they arrived. */
+kernel void key_lane_gather_folded(device const uint* packed [[buffer(0)]],
+                                   device const float* order [[buffer(1)]],
+                                   device uint* out [[buffer(2)]],
+                                   constant uint& count [[buffer(3)]],
+                                   constant uint& lane_at [[buffer(4)]],
+                                   constant uint& null_at [[buffer(5)]],
+                                   constant uint& invert [[buffer(6)]],
+                                   constant uint& absent_digit [[buffer(7)]],
+                                   uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    uint row = (uint)order[gid];
+    uint digit = packed[lane_at + row];
+    if (invert != 0u) digit = ~digit;
+    out[gid] = (packed[null_at + row] != 0u) ? absent_digit : digit;
 }
 
 /* Where a run of equal keys starts, read along a finished order. Ranking and
