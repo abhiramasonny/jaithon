@@ -259,6 +259,37 @@ class Vec2 {
     pub fn dot(self, other: Vec2) -> float {
         return self.x * other.x + self.y * other.y
     }
+
+    pub fn swapped(self) -> Vec2 {
+        return Vec2(self.y, self.x)
+    }
+}
+
+#: Each new object is built from the fields of the one it replaces, in the
+#: other order: every argument must be read before any field is written.
+fn swaps(n: int) -> Vec2 {
+    var p = Vec2(1.0, 2.0)
+    for _ in 0..n {
+        p = p.swapped()
+    }
+    return p
+}
+
+fn swaps_direct(n: int) -> Vec2 {
+    var p = Vec2(1.0, 2.0)
+    var i = 0
+    while i < n {
+        p = Vec2(p.y, p.x)
+        i += 1
+    }
+    return p
+}
+
+fn test_a_construction_from_the_object_it_replaces() -> void {
+    assert_eq(swaps(20000).x, 1.0)
+    assert_eq(swaps(20001).x, 2.0)
+    assert_eq(swaps_direct(20000).y, 2.0)
+    assert_eq(swaps_direct(20001).y, 1.0)
 }
 
 #: Loop-carried: the local is read before it is rebound, so the loop is

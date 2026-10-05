@@ -56,6 +56,49 @@ bool jitSinkOn(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_SINK_FP_HOMES=0 keeps every sunk float field in its frame
+ * slot. On, a float field lives in a callee-saved d register: a loop-carried
+ * object's chain (`acc = acc.add(step)`) is then an fadd and a move rather
+ * than a store and a reload per field per iteration. */
+bool jitSinkFpHomesOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_SINK_FP_HOMES");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* Once the float locals have their registers: the rest of v8..v15 to sunk
+ * float fields, in plan order. Counted into fpLocals, so the prologue saves
+ * and every epilogue restores them like any float local's home. */
+void sinkPlanFpHomes(Emit *e) {
+    if (!jitSinkFpHomesOn()) return;
+    for (unsigned j = 0; j < e->sinkCount; j++) {
+        for (unsigned f = 0; f < e->sink[j].nfields; f++) {
+            e->sink[j].fpHome[f] = 0;
+            if (e->sink[j].kind[f] != SLOT_FLOAT) continue;
+            if (e->fpLocals >= JIT_FP_MAX_SAVED) continue;
+            e->sink[j].fpHome[f] =
+                (uint8_t)(JIT_FP_FIRST_SAVED + e->fpLocals++);
+        }
+    }
+}
+
+/* A sunk construction reads its arguments out of the FP bank itself
+ * (storeConstruction), so the walker need not sync the bank to X before it:
+ * on a loop-carried object that sync was a round trip through X per field
+ * per iteration, on the chain. */
+bool sinkFpFast(const Emit *e, const uint8_t *code, int off, uint8_t op) {
+    if (e->sinkCount == 0) return false;
+    if (op == OP_TAIL_CALL) return e->inlining && e->inlSinkBind != 0;
+    if (op == OP_CALL && !e->inlining && code[off + 2] == OP_BIND) {
+        unsigned slot = jaiReadU16(code + off + 3);
+        return slot <= JIT_MAX_SLOTS && e->sinkOf[slot] != 0;
+    }
+    return false;
+}
+
 enum { USE_NONE = 0, USE_BIND = 1, USE_FIELD = 2, USE_REF = 4, USE_OTHER = 8 };
 
 /* Where a jump at `off` lands, or -1 if `op` is not a jump. */
@@ -329,6 +372,19 @@ bool sinkFieldRead(Emit *e, unsigned sink, const ObjFunction *fn,
     SlotKind kind = e->sink[sink].kind[fi->slot];
     unsigned at = e->sink[sink].homeOff + 8u * fi->slot;
     if (!pushValue(e, kind, 0, NULL)) return false;
+    /* A copy, never a borrow: the next construction writes the home, and a
+     * borrow still live then (`Vec2(p.y, p.x)`) would read the new value. */
+    unsigned fh = e->sink[sink].fpHome[fi->slot];
+    if (fh != 0) {
+        if (fpWorthLoading(e, code, next, stop)) {
+            unsigned idx = e->valueDepth - 1u;
+            emit(e, jaiA64FmovDD(fpRegAt(e, idx), fh));
+            fpClaim(e, idx);
+        } else {
+            emit(e, jaiA64FmovXD(pushReg(e) - 1u, fh));
+        }
+        return true;
+    }
     /* Straight to the FP bank when the consumer reads it there, as a heap
      * field read does. */
     if (kind == SLOT_FLOAT && fpWorthLoading(e, code, next, stop)) {
@@ -428,6 +484,11 @@ void sinkEmitEntry(Emit *e) {
             emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B, fo));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
             branchTo(e, FIXUP_BAIL, true, JAI_A64_NE);
+            if (e->sink[j].fpHome[f] != 0) {
+                emit(e, jaiA64LdrD(e->sink[j].fpHome[f], JIT_SCRATCH_B,
+                                   fo + 8u));
+                continue;
+            }
             emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B, fo + 8u));
             emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
                                e->sink[j].homeOff + 8u * f));
@@ -494,8 +555,13 @@ static bool storeConstruction(Emit *e, unsigned j, unsigned argc) {
             return false;
         }
     }
+    /* Every argument is in a register of its own before any home is
+     * written, since an argument may be a copy of a home (`Vec2(p.y, p.x)`):
+     * the copies are made at the reads, so the order of the writes below
+     * cannot matter. */
     for (unsigned n = argc; n-- > 0;) {
         unsigned at = home + 8u * e->sink[j].argSlot[n];
+        unsigned fh = e->sink[j].fpHome[e->sink[j].argSlot[n]];
         unsigned idx = e->valueDepth - 1u;
         if (e->stack[e->depth - 1u] == SLOT_FLOAT && !e->fpOff &&
             (e->fpLive & (1u << idx))) {
@@ -503,11 +569,12 @@ static bool storeConstruction(Emit *e, unsigned j, unsigned argc) {
             unsigned r2;
             SlotKind k2;
             if (!popValueRaw(e, &r2, &k2)) return false;
-            emit(e, jaiA64StrD(held, 31, at));
+            emit(e, fh != 0 ? jaiA64FmovDD(fh, held)
+                            : jaiA64StrD(held, 31, at));
         } else {
             unsigned r;
             if (!popValue(e, &r, NULL)) return false;
-            emit(e, jaiA64StrX(r, 31, at));
+            emit(e, fh != 0 ? jaiA64FmovDX(fh, r) : jaiA64StrX(r, 31, at));
         }
     }
     e->depth--;                                    /* the class */
@@ -576,6 +643,11 @@ void sinkEmitSync(Emit *e) {
             unsigned tag = e->sink[j].kind[f] == SLOT_FLOAT ? VAL_FLOAT : VAL_INT;
             emit(e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             emit(e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
+            if (e->sink[j].fpHome[f] != 0) {
+                emit(e, jaiA64StrD(e->sink[j].fpHome[f], JIT_SCRATCH_A,
+                                   at + 8u));
+                continue;
+            }
             emit(e, jaiA64LdrX(JIT_SCRATCH_B, 31, home + 8u * f));
             emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, at + 8u));
         }

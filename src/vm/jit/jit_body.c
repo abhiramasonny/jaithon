@@ -847,7 +847,8 @@ bool compileBody(Emit *e, ObjClosure *closure) {
              * under it is discarded unread. */
             if (e->inlining && op == OP_RETURN) {
                 /* handled below */
-            } else if (!fpFastOp(op) || e->inProtected) {
+            } else if ((!fpFastOp(op) && !sinkFpFast(e, code, off, op)) ||
+                       e->inProtected) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < jitCarryLimit()) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;

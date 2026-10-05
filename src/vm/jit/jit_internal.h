@@ -814,6 +814,9 @@ typedef struct {
          * entered with is unpacked into the homes at entry, and stays the
          * local's value until the first bind. */
         bool      entryLive;
+        /* A float field's home in v8..v15 (beside the float locals, saved
+         * and restored with them), or 0 for its frame slot. */
+        uint8_t   fpHome[JIT_SINK_FIELDS];
     } sink[JIT_MAX_SINK];
     /* Inside an inlined body: the caller binds its result straight into this
      * sunk local (+ 1), so the construction it ends with is sunk too. */
@@ -1672,6 +1675,9 @@ unsigned sinkBindAfter(const Emit *e, const ObjFunction *caller,
                        uint32_t callOff);
 bool sinkBindResult(Emit *e, unsigned slot);
 bool sinkHasEntryLive(const Emit *e);
+bool jitSinkFpHomesOn(void);
+bool sinkFpFast(const Emit *e, const uint8_t *code, int off, uint8_t op);
+void sinkPlanFpHomes(Emit *e);
 JitArmResult sinkInvoke(Emit *e, ObjFunction *fn, const uint8_t *code,
                         int *offp);
 void sinkEmitSync(Emit *e);

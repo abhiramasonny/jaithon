@@ -891,6 +891,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         for (int i = 0; i <= fn->chunk.count; i++) { map[i] = -1; depths[i] = -1; }
     }
 
+    sinkPlanFpHomes(&e);
     unsigned frame = 16u + 8u * JIT_MAX_SAVED + (unsigned)sizeof(JitCallDesc);
     e.descOffset = 16u + 8u * JIT_MAX_SAVED;
     e.iterFrameOffset = (frame + 7u) & ~7u;
