@@ -1130,11 +1130,13 @@ fn _fold_into(
     #: of two at or above that runs the same tree as a width of GROUP: the
     #: lanes past `chunks` hold the identity, and folding the identity into a
     #: partial that already started from it changes no bit. So the narrow
-    #: width is the same answer from a quarter of the groups or fewer.
+    #: width is the same answer from a quarter of the groups or fewer. It
+    #: stops at GROUP: `_chunks_for` allows up to `_TARGET_GROUPS` chunks, and
+    #: past GROUP of them each lane already walks several, as before.
     var width = GROUP
     if _FOLD_COLUMNS {
         width = 1
-        while width < plan.chunks { width *= 2 }
+        while width < plan.chunks and width < GROUP { width *= 2 }
     }
     let each = GROUP // width
     fold.dispatch_async(

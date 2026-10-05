@@ -624,6 +624,39 @@ fn test_a_fold_down_wide_columns_is_each_columns_fold() -> void {
     }
 }
 
+#: Shapes whose fold splits into more chunks than one group has lanes: the
+#: finish then walks several partials a lane. A flat run past 257 * 2048
+#: elements and a tall matrix folded down its columns both get there. Small
+#: whole numbers keep every partial exact, so the host's total is the device's.
+fn test_a_fold_with_more_chunks_than_lanes_still_finishes() -> void {
+    if not have_gpu() { return }
+    let count = 600000
+    var values = [0.0 for _at in 0..count]
+    for at in 0..count { values[at] = float(at % 7) - 3.0 }
+    let flat = holding([count], values)
+    defer { flat.free() }
+    var total = 0.0
+    for value in values { total += value }
+    assert_eq(sum(flat).to_list()[0], total, "a flat sum")
+    assert_eq(amax(flat).to_list()[0], 3.0, "a flat maximum")
+    assert_near(mean(flat).to_list()[0], total / float(count), 1.0e-9, "a flat mean")
+
+    let rows = 20000
+    let cols = 256
+    var grid = [0.0 for _at in 0..rows * cols]
+    for at in 0..grid.len() { grid[at] = float(at * 13 % 5) - 2.0 }
+    let tall = holding([rows, cols], grid)
+    defer { tall.free() }
+    let sums = sum(tall, 0).to_list()
+    var wrong = 0
+    for column in 0..cols {
+        var down = 0.0
+        for row in 0..rows { down += grid[row * cols + column] }
+        if sums[column] != down { wrong += 1 }
+    }
+    assert_eq(wrong, 0, f"{rows} rows of {cols} folded down the columns")
+}
+
 #: Enough rows that each is one group, which is where a dense last axis is
 #: staged in threadgroup memory: widths that do not fill the 256 threads
 #: evenly, one past a multiple of them, and a view that starts a row in, so
