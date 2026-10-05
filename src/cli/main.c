@@ -184,6 +184,11 @@ static void exportEnvironmentFlags(const JaiCliOptions *opts)
         (void)setenv("JAITHON_STRICT", "1", 1);
     if (opts->noPrelude)
         (void)setenv("JAITHON_NO_PRELUDE", "1", 1);
+    /* `--no-cache` promises everything is compiled from source, and that
+     * includes the imported-module signatures the checker keeps in
+     * __jaicache__ (lib/jaithon/compile/check/modsig.jai, `_SIG_CACHE`). */
+    if (!opts->run.useCache)
+        (void)setenv("JAITHON_SIG_CACHE", "0", 1);
 }
 
 static bool freeAtExit(void)
