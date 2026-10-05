@@ -1382,7 +1382,7 @@ bool emitSetIndex(Emit *e, int *offp) {
 }
 
 /* JAITHON_JIT_SLICE_LEAF=0 sends every string slice back through its
- * descriptor call, for a one-binary A/B of emitStringSliceLeaf. */
+ * descriptor call, for a one-binary A/B of the string half of emitSliceLeaf. */
 static bool jitSliceLeaf(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -1392,16 +1392,29 @@ static bool jitSliceLeaf(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_LIST_SLICE_LEAF=0 sends every list slice back through its
+ * descriptor call, for a one-binary A/B of the list half of emitSliceLeaf. */
+static bool jitListSliceLeaf(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_LIST_SLICE_LEAF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* `s[a:b]` on a string, through jaiStringSliceLeaf in front of the descriptor
- * call to jitGetSlice -- the layout emitDictLeafGet draws. The container's
- * type guard has already run; the bounds must be ints in registers, since the
- * leaf takes them as plain integers. The leaf allocates nothing, so nothing is
- * rooted, and every slice it does not answer is the descriptor call. */
-static void emitStringSliceLeaf(Emit *e, unsigned flags, unsigned nargs,
-                                LeafFix *fx) {
+ * call to jitGetSlice -- the layout emitDictLeafGet draws -- and `xs[a:b]` on a
+ * list the same way through jaiListSliceLeaf. The container's type guard has
+ * already run; the bounds must be ints in registers, since the leaf takes them
+ * as plain integers. Neither leaf can collect (the string one allocates
+ * nothing; the list one declines when a collection is due), so nothing is
+ * rooted, and every slice a leaf does not answer is the descriptor call. */
+static void emitSliceLeaf(Emit *e, unsigned flags, unsigned nargs,
+                          LeafFix *fx, void *leaf) {
     fx->on = false;
     fx->slow[0] = fx->slow[1] = fx->done = -1;
-    if (!jitSliceLeaf() || e->inlining) return;
+    if (e->inlining) return;
     unsigned first = e->depth - nargs;
     for (unsigned i = 1; i < nargs; i++) {
         if (e->stack[first + i] != SLOT_INT) return;
@@ -1428,7 +1441,7 @@ static void emitStringSliceLeaf(Emit *e, unsigned flags, unsigned nargs,
         emit(e, jaiA64MovzX(2, 0, 0));
     }
     emit(e, jaiA64MovzX(3, flags & 3u, 0));
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jaiStringSliceLeaf);
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)leaf);
     noteScratchClobber(e);
     emit(e, jaiA64Blr(JIT_SCRATCH_A));
     emit(e, jaiA64SubsXImm(31, 0, 0));
@@ -1495,8 +1508,11 @@ bool emitGetSlice(Emit *e, const uint8_t *code, int *offp) {
 
         LeafFix lfx;
         lfx.on = false;
-        if (cType == OBJ_STRING && (flags & 4u) == 0) {
-            emitStringSliceLeaf(e, flags, nargs, &lfx);
+        if (cType == OBJ_STRING && (flags & 4u) == 0 && jitSliceLeaf()) {
+            emitSliceLeaf(e, flags, nargs, &lfx, (void *)&jaiStringSliceLeaf);
+        } else if (cType == OBJ_LIST && (flags & 4u) == 0 &&
+                   jitListSliceLeaf()) {
+            emitSliceLeaf(e, flags, nargs, &lfx, (void *)&jaiListSliceLeaf);
         }
         leafSlowHere(e, &lfx);
         emit(e, jaiA64MovzX(JIT_SCRATCH_A, flags, 0));

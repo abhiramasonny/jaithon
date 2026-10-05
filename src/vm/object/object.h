@@ -327,6 +327,10 @@ bool     jaiListReserveExact(ObjList *list, int count);
  * nothing can be iterating it. */
 void     jaiListTouch(ObjList *list);
 ObjList *jaiListSlice(ObjList *list, int64_t start, int64_t stop, int64_t step);
+/* `xs[a:b]` for compiled code, or NULL when only jaiSliceGet can make it.
+ * Never collects; see its definition in object_collection.c. */
+ObjList *jaiListSliceLeaf(ObjList *list, int64_t start, int64_t stop,
+                          int64_t flags);
 ObjList *jaiListConcat(ObjList *a, ObjList *b);
 /* Normalises a possibly-negative index. Returns false if out of range. */
 bool     jaiNormalizeIndex(int64_t raw, int length, int *out);
