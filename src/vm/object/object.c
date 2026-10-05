@@ -78,7 +78,10 @@ void jaiAllocPrintCensus(FILE *out) {
 }
 #endif
 
-static inline Obj *allocObj(size_t size, ObjType type) {
+/* Forced inline: the two allocators below inline it anyway, and a caller the
+ * PGO profile has never seen (jaiListSliceLeaf, added after the last
+ * `make pgo-train`) otherwise gets a call to an outlined copy. */
+JAI_INLINE Obj *allocObj(size_t size, ObjType type) {
 #ifdef JAI_ALLOC_CENSUS
     jaiAllocByType[type]++;
     jaiAllocBytesByType[type] += size;
