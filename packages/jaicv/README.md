@@ -184,6 +184,23 @@ on unless set to `0`, so the two can be compared in one binary:
 | `JAICV_NATIVE_MEASURES` | `contour_area`, `moments`, `match_shapes` |
 | `JAICV_NATIVE_FIT` | `fit_ellipse`, `fit_line` |
 
+Two device paths are switched the same way:
+
+| Switch | What it does when on |
+|---|---|
+| `JAICV_CC_DEVICE_NUMBERING` | `connected_components` numbers its labels on the device; off, the roots are read back and sorted on the host |
+| `JAICV_GF_SELECT` | `good_features_to_track` ranks only the strongest candidates it can use; off, it ranks every one |
+
+## Device memory
+
+Device memory is not garbage collected, so every operation releases the
+intermediates it makes, and small constant matrices -- filter taps, a warp's
+inverse, the default structuring element -- are made once and shared
+(`cached_weights` in `imgproc/common.jai`). `std.gpu.live_buffers()` counts the
+buffers still allocated; `tests/test_releases.jai` holds operations to zero
+growth with it, and `BENCH_LEAK_CALLS=100 ./jaithon run
+tests/bench/jaicv/imgproc.jai` reports the growth of every bench row.
+
 ## Camera access
 
 macOS asks before a program may use the camera, and the ask is made of the
