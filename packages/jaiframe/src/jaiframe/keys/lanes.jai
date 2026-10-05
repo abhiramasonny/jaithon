@@ -50,8 +50,11 @@ inline uint hash_combine(uint accumulated, uint incoming) {
  * one radix pass sort a float lane without ever comparing floats. -0.0 folds
  * onto 0.0 first, so the two group and sort as the one value a reader means. */
 inline uint order_bits(float value) {
-    float v = (value == 0.0f) ? 0.0f : value;
-    uint bits = as_type<uint>(v);
+    /* The fold is on the bits: the shader library is built with fast math,
+     * which drops signed zeros and turns `value == 0 ? 0 : value` into
+     * `value`, so -0.0 used to sort below 0.0 and key apart from it. */
+    uint bits = as_type<uint>(value);
+    if ((bits << 1) == 0u) bits = 0u;
     return ((bits & 0x80000000u) != 0u) ? ~bits : (bits | 0x80000000u);
 }
 

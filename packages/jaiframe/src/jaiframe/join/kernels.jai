@@ -362,7 +362,8 @@ kernel void jn_sort_key_float(device const float* values [[buffer(0)]],
         keys[gid] = 0xFFFFFFFFu;
         return;
     }
-    uint bits = as_type<uint>(value == 0.0f ? 0.0f : value);
+    uint bits = as_type<uint>(value);
+    if ((bits << 1) == 0u) bits = 0u;   /* -0.0 is 0.0; fast math drops a float compare */
     keys[gid] = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 

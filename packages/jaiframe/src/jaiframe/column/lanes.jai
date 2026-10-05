@@ -67,10 +67,11 @@ inline uint hash_combine(uint accumulated, uint incoming) {
 /* -0.0 hashes as 0.0 and every NaN hashes alike, so a key column groups the
  * way a reader expects rather than the way the bit pattern happens to fall. */
 inline uint hash_slot(float value) {
-    float v = value;
-    if (v == 0.0f) v = 0.0f;
-    if (isnan(v)) return fmix32(0x7FC00000u);
-    return fmix32(as_type<uint>(v));
+    if (isnan(value)) return fmix32(0x7FC00000u);
+    /* On the bits, because fast math drops signed zeros: a float compare
+     * against 0.0 is folded away and -0.0 hashed apart from 0.0. */
+    uint bits = as_type<uint>(value);
+    return fmix32((bits << 1) == 0u ? 0u : bits);
 }
 
 kernel void col_iota(device float* out [[buffer(0)]],
