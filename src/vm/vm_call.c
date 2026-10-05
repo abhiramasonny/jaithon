@@ -249,7 +249,79 @@ bool bindCallArgsSlow(ObjClosure *closure, int argc, Value *slotBase) {
  * is how `xs.map(|x| x * 2)` came back holding an int instead of a list. The
  * interpreter's own OP_CALL never saw it, because LOAD_STATE reloads whatever
  * frame is on top and that happened to be the right one. */
+static JAI_NOINLINE CallOutcome callClosureFull(ObjClosure *closure, int argc);
+
+/* The arguments are bound and the body is past its threshold: ask the tier,
+ * exactly as callClosureFull does at the same point. */
+static JAI_NOINLINE CallOutcome callClosureTier(ObjClosure *closure,
+                                                Value *slotBase) {
+    JaiJitOutcome outcome = jaiJitEnter(closure, slotBase);
+    if (outcome == JAI_JIT_DONE) return CALL_DONE;
+    if (outcome == JAI_JIT_ERROR) return CALL_ERROR;
+    if (!pushFrame(closure, slotBase)) return CALL_ERROR;
+    if (outcome == JAI_JIT_DEOPT && !jaiJitApplyDeopt(closure, slotBase))
+        return CALL_ERROR;
+    return CALL_FRAME;
+}
+
+/* What follows a compiled entry that did not finish the call. The same three
+ * arms as callClosureFull's, for an untraced function. */
+static JAI_NOINLINE CallOutcome callClosureAfterEntry(ObjClosure *closure,
+                                                      int argc, Value *slotBase,
+                                                      JaiJitOutcome outcome) {
+    if (outcome == JAI_JIT_ERROR) return CALL_ERROR;
+    if (outcome == JAI_JIT_DEOPT) {
+        if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
+        if (!pushFrame(closure, slotBase)) return CALL_ERROR;
+        if (!jaiJitApplyDeopt(closure, slotBase)) return CALL_ERROR;
+        return CALL_FRAME;
+    }
+    /* Declined: exactly where callClosureFull goes after its entry branch,
+     * which is that function entered with the entry already tried -- so it is
+     * re-entered with the entry skipped. */
+    ObjFunction *fn = closure->fn;
+    if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
+    if (fn->entryCount < jaiJitThreshold(fn)) {
+        fn->entryCount++;
+    } else if (!fn->jitRefused && jaiJitEnabled()) {
+        return callClosureTier(closure, slotBase);
+    }
+    if (!pushFrame(closure, slotBase)) return CALL_ERROR;
+    return CALL_FRAME;
+}
+
+/* The call into a compiled body, in a frame that keeps only what the slow
+ * arms need. callClosureFull's prologue saved all twelve callee-saved
+ * registers on every call because its slow paths want them, and an
+ * interpreted call into a compiled body paid that here and again in
+ * jaiJitEnterFunc. A traced function, one with no compiled form and an arity
+ * mismatch all take callClosureFull unchanged. JAITHON_JIT_LEAN_ENTRY=0 sends
+ * everything there. */
 CallOutcome callClosure(ObjClosure *closure, int argc) {
+    ObjFunction *fn = closure->fn;
+    if (!gJitLeanEntry || (fn->flags & FN_TRACE) != 0)
+        return callClosureFull(closure, argc);
+    Value *slotBase = vm.stackTop - argc - 1;
+    if (fn->jitFunc != NULL) {
+        if (argc != (int)fn->arity) return callClosureFull(closure, argc);
+        JaiJitOutcome outcome = jaiJitEnterFunc(closure, slotBase);
+        if (JAI_LIKELY(outcome == JAI_JIT_DONE)) return CALL_DONE;
+        return callClosureAfterEntry(closure, argc, slotBase, outcome);
+    }
+    /* No compiled form: what callClosureFull does past its entry branch, with
+     * the tier's own arm -- reached once per threshold crossing, never in the
+     * steady state of a cold or refused body -- out of line. */
+    if (!bindCallArgs(closure, argc, slotBase)) return CALL_ERROR;
+    if (fn->entryCount < jaiJitThreshold(fn)) {
+        fn->entryCount++;
+    } else if (!fn->jitRefused && jaiJitEnabled()) {
+        return callClosureTier(closure, slotBase);
+    }
+    if (!pushFrame(closure, slotBase)) return CALL_ERROR;
+    return CALL_FRAME;
+}
+
+static JAI_NOINLINE CallOutcome callClosureFull(ObjClosure *closure, int argc) {
     Value *slotBase = vm.stackTop - argc - 1;
     ObjFunction *fn = closure->fn;
     bool traced = (fn->flags & FN_TRACE) != 0;
@@ -499,6 +571,9 @@ CallOutcome invokeCallable(Value callable, int argc) {
  * A native found in a class's method table is a built-in method and wants the
  * receiver as args[0], counted in argc, exactly as the OBJ_BOUND path does. */
 CallOutcome invokeMethodOnStack(Value callable, int argc) {
+    /* What invokeCallable's closure arm does, without its frame: it holds
+     * every callable shape and saves twelve registers to dispatch on them. */
+    if (IS_CLOSURE(callable)) return callClosure(AS_CLOSURE(callable), argc);
     if (!IS_NATIVE(callable)) return invokeCallable(callable, argc);
 
     Value *slot = vm.stackTop - argc - 1;

@@ -34,7 +34,7 @@ typedef JitResult (*Fn8)(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, i
 /* One incoming argument, converted from the Value the interpreter holds to the
  * raw payload the compiled prologue expects, with every check the compiled
  * body was allowed to assume. */
-static inline bool jitArgIn(ObjClosure *closure, const Value *slotBase,
+JAI_INLINE bool jitArgIn(ObjClosure *closure, const Value *slotBase,
                             unsigned i, int64_t *out) {
     const ObjFunction *fn = closure->fn;
     Value v = slotBase[fn->jitArgBase + i];
@@ -410,7 +410,51 @@ static JAI_NOINLINE void polyParamDecline(ObjClosure *closure, ObjFunction *fn,
     }
 }
 
+static JAI_NOINLINE JaiJitOutcome jitEnterFuncFull(ObjClosure *closure,
+                                                   Value *slotBase);
+
+/* JAITHON_JIT_LEAN_ENTRY=0 sends every entry through jitEnterFuncFull, as
+ * before. Read once by jaiJitStartSampling, which runs before anything can
+ * compile; until then nothing has a compiled form to enter. */
+bool gJitLeanEntry;
+
+void jitLeanEntryInit(void) {
+    const char *v = getenv("JAITHON_JIT_LEAN_ENTRY");
+    gJitLeanEntry = !(v != NULL && v[0] == '0');
+}
+
+/* The entry every interpreted call into a compiled body takes, for the
+ * commonest shape -- up to two arguments, nothing blocked -- in a frame that
+ * keeps only `fn` and `slotBase` across the call. jitEnterFuncFull holds eight
+ * argument values and every slow path in one function, and clang saved all
+ * twelve callee-saved registers on entry to it whatever the shape: 24 memory
+ * operations per crossing, on top of callClosure's own 24, for a body that is
+ * often under twenty instructions. Anything unusual -- a blocked body, more
+ * arguments, an argument that does not fit -- goes to jitEnterFuncFull, which
+ * redoes the same checks from the top and owns every decline. The checks here
+ * are side-effect free, so redoing them changes nothing. */
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
+    ObjFunction *fn = closure->fn;
+    if (!gJitLeanEntry || fn->jitBlockedOn != NULL || fn->jitArgCount > 2)
+        return jitEnterFuncFull(closure, slotBase);
+    if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
+    if (fn->module == NULL || fn->module->version != fn->jitFuncModuleVersion)
+        return JAI_JIT_DECLINED;
+    int64_t a0 = 0, a1 = 0;
+    unsigned arity = fn->jitArgCount;
+    if (arity > 0 && !jitArgIn(closure, slotBase, 0, &a0))
+        return jitEnterFuncFull(closure, slotBase);
+    if (arity > 1 && !jitArgIn(closure, slotBase, 1, &a1))
+        return jitEnterFuncFull(closure, slotBase);
+    JitResult r;
+    if (arity == 0)      r = ((Fn0)(uintptr_t)fn->jitFunc)();
+    else if (arity == 1) r = ((Fn1)(uintptr_t)fn->jitFunc)(a0);
+    else                 r = ((Fn2)(uintptr_t)fn->jitFunc)(a0, a1);
+    return jitResultOut(fn, r, slotBase);
+}
+
+static JAI_NOINLINE JaiJitOutcome jitEnterFuncFull(ObjClosure *closure,
+                                                   Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
 
@@ -931,6 +975,9 @@ int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
 }
 
 #else
+
+bool gJitLeanEntry;
+void jitLeanEntryInit(void) {}
 
 int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
                          ObjList *dst, bool *ok) {

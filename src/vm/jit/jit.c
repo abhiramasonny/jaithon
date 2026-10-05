@@ -213,6 +213,7 @@ static void jaiJitReadThresholdOverride(void) {
 
 void jaiJitStartSampling(void) {
     jaiJitReadThresholdOverride();
+    jitLeanEntryInit();
     static bool started;
     if (started || !jaiJitEnabled()) return;
     started = true;
