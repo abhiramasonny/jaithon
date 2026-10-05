@@ -212,6 +212,9 @@ static void jaiJitReadThresholdOverride(void) {
 }
 
 static bool sSamplerStarted;
+/* Set only once the SIGPROF handler is installed: arming the timer without
+ * it would let the first tick kill the process. */
+static bool sSamplerHandled;
 static void armSamplerTimer(void);
 
 void jaiJitStartSampling(void) {
@@ -224,13 +227,14 @@ void jaiJitStartSampling(void) {
     sa.sa_handler = onTick;
     sa.sa_flags = SA_RESTART;
     if (sigaction(SIGPROF, &sa, NULL) != 0) return;
+    sSamplerHandled = true;
     armSamplerTimer();
 }
 
 /* A forked child keeps the SIGPROF handler but not the interval timer, so
  * without this a child forked by `jaithon test` would never OSR a loop. */
 void jaiJitAfterFork(void) {
-    if (sSamplerStarted) armSamplerTimer();
+    if (sSamplerHandled) armSamplerTimer();
 }
 
 static void armSamplerTimer(void) {
