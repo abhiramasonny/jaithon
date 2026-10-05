@@ -347,6 +347,11 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
     bool readsUpvalue = false;
     bool constructs = false;
     if (!inlinableBody(callee, argc, &maxSlot, &readsUpvalue, &constructs)) {
+        /* Not straight-line: a direct call to a small body with loops in it
+         * may still stand where the call is, with its locals in homes. */
+        if (!method && calleeReg < 0) {
+            return inlineLoopCall(e, caller, callee, argc, callOff);
+        }
         return false;
     }
     /* A body that calls out cannot live in x0..x8, and a caller whose own
@@ -663,6 +668,428 @@ bool inlineMethod(Emit *e, ObjClosure *closure, uint32_t nameIdx,
      * entries are the caller's and their registers are gone. */
     if (e->depth != depth0) { e->failed = true; return false; }
     return false;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Loop-bearing callees                                                */
+/* ------------------------------------------------------------------ */
+
+/* JAITHON_JIT_INLINE_LOOPS=0 keeps every callee with a branch or a loop in
+ * it behind a real call, as before. */
+static bool jitInlineLoopsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_INLINE_LOOPS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* Bounds on code growth: the arena is shared, and a full one changes which
+ * tier compiles everything after it. A callee this small with a loop in it
+ * is the shape the call overhead dominates (queens' `safe` is 78 bytes);
+ * anything bigger pays its frame back over its own loop. */
+#define JIT_INLINE_LOOP_MAX_CODE  160
+#define JIT_INLINE_LOOP_MAX_SITES 4
+/* Highest home slot: the deopt stub's skip mask is one bit per local below
+ * 64, and every per-slot table is JIT_MAX_SLOTS + 1 wide. */
+#define JIT_INLINE_LOOP_MAX_SLOT  62u
+
+/* The opcodes a loop-bearing body may hold. Nothing that stores to the heap
+ * and nothing that calls: a guard anywhere in the body resumes at the
+ * caller's OP_CALL and runs the whole call again in the interpreter, which
+ * is sound only if the first, partial run left nothing behind -- and the
+ * body's locals live in homes no root fill names, so nothing in it may
+ * collect either (noteScratchClobber refuses any call that slips through).
+ * Writes to its OWN locals are fine: they are renumbered into homes the
+ * interpreter never sees. */
+static bool inlinableLoopBody(const ObjClosure *callee, unsigned argc,
+                              unsigned *maxSlotOut) {
+    const ObjFunction *cfn = callee->fn;
+    const Chunk *c = &cfn->chunk;
+    if (cfn->arity != argc || cfn->defaultCount != 0) return false;
+    if (cfn->flags & (FN_VARIADIC | FN_KWREST | FN_INIT)) return false;
+    if (cfn->upvalueCount != 0 || cfn->exceptionCount > 0) return false;
+    if (c->count <= 0 || c->count > JIT_INLINE_LOOP_MAX_CODE) return false;
+    if (c->code[c->count - 1] != OP_RETURN) return false;
+    unsigned maxSlot = argc;
+    bool branches = false;
+    for (int off = 0; off < c->count;) {
+        uint8_t op = c->code[off];
+        int len = instructionLength(c, off);
+        if (len <= 0 || off + len > c->count) return false;
+        unsigned s1 = 0, s2 = 0;
+        switch (op) {
+        case OP_GET_LOCAL: case OP_SET_LOCAL: case OP_BIND:
+        case OP_INC_LOCAL: case OP_ADD_INT_CONST: case OP_SUB_INT_CONST:
+        case OP_MUL_INT_CONST: case OP_CMP_LOCAL_CONST_LT:
+        case OP_ADD_BIND: case OP_SUB_BIND: case OP_MUL_BIND:
+            s1 = jaiReadU16(c->code + off + 1);
+            if (s1 == 0) return false;      /* the closure itself */
+            break;
+        case OP_GET_LOCAL2: case OP_ADD_LOCALS:
+            s1 = jaiReadU16(c->code + off + 1);
+            s2 = jaiReadU16(c->code + off + 3);
+            if (s1 == 0 || s2 == 0) return false;
+            break;
+        case OP_JUMP_IF_CMP_LOCAL_K:
+            s1 = jaiReadU16(c->code + off + 2);
+            if (s1 == 0) return false;
+            branches = true;
+            break;
+        case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
+        case OP_JUMP_IF_CMP_FALSE: case OP_LOOP:
+            branches = true;
+            break;
+        case OP_GET_INDEX:
+        case OP_CONST: case OP_INT: case OP_TRUE: case OP_FALSE:
+        case OP_POP:
+        case OP_ADD: case OP_SUB: case OP_MUL:
+        case OP_FLOORDIV: case OP_MOD: case OP_MOD_INT_CONST: case OP_NEG:
+        case OP_BAND: case OP_BOR: case OP_BXOR:
+        case OP_SHL: case OP_SHR: case OP_BNOT:
+        case OP_EQ: case OP_NE: case OP_LT: case OP_LE: case OP_GT: case OP_GE:
+        case OP_NOT:
+        case OP_RETURN:
+            break;
+        default:
+            return false;
+        }
+        if (s1 > maxSlot) maxSlot = s1;
+        if (s2 > maxSlot) maxSlot = s2;
+        off += len;
+    }
+    if (!branches) return false;
+    *maxSlotOut = maxSlot;
+    return true;
+}
+
+static void putU16(uint8_t *p, unsigned v) {
+    p[0] = (uint8_t)(v & 0xffu);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+/* The callee's code with every slot operand moved up by `hb`, so the
+ * ordinary local arms address its homes. Offsets are unchanged. */
+static uint8_t *renumberedCode(const Chunk *c, unsigned hb) {
+    uint8_t *buf = (uint8_t *)malloc((size_t)c->count);
+    if (buf == NULL) return NULL;
+    memcpy(buf, c->code, (size_t)c->count);
+    for (int off = 0; off < c->count;) {
+        uint8_t op = c->code[off];
+        int len = instructionLength(c, off);
+        int ats[2] = { -1, -1 };
+        switch (op) {
+        case OP_GET_LOCAL: case OP_SET_LOCAL: case OP_BIND:
+        case OP_INC_LOCAL: case OP_ADD_INT_CONST: case OP_SUB_INT_CONST:
+        case OP_MUL_INT_CONST: case OP_CMP_LOCAL_CONST_LT:
+        case OP_ADD_BIND: case OP_SUB_BIND: case OP_MUL_BIND:
+            ats[0] = off + 1; break;
+        case OP_GET_LOCAL2: case OP_ADD_LOCALS:
+            ats[0] = off + 1; ats[1] = off + 3; break;
+        case OP_JUMP_IF_CMP_LOCAL_K:
+            ats[0] = off + 2; break;
+        default: break;
+        }
+        for (int k = 0; k < 2; k++) {
+            if (ats[k] < 0) continue;
+            unsigned v = jaiReadU16(c->code + ats[k]) + hb;
+            putU16(buf + ats[k], v);
+            if (jaiReadU16(buf + ats[k]) != v) { free(buf); return NULL; }
+        }
+        off += len;
+    }
+    return buf;
+}
+
+/* Patches one branch word the way the final fixup pass does. */
+static void patchBranch(Emit *e, const Fixup *f, int target) {
+    int rel = target - f->instIndex;
+    uint32_t word = e->code[f->instIndex];
+    if ((word & 0xfc000000u) == 0x94000000u) {
+        e->code[f->instIndex] = jaiA64Bl(rel);
+    } else if (f->conditional && jaiA64IsCbz(word)) {
+        e->code[f->instIndex] = jaiA64CbzRetarget(word, rel);
+    } else if (f->conditional) {
+        e->code[f->instIndex] = jaiA64BCond(word & 0xfu, rel);
+    } else {
+        e->code[f->instIndex] = jaiA64B(rel);
+    }
+}
+
+/* An OP_RETURN of a loop-bearing inline: the result goes to the one entry
+ * every return agrees on -- just above the callee and its arguments, which
+ * stay on the stack for the guards' sake -- and all but the last branch to
+ * the exit. Popped again afterwards, so the walk past it starts from the
+ * callee's own empty stack, which is what the branch landing there holds. */
+bool inlineLoopReturn(Emit *e, bool last) {
+    if (e->depth != e->inlDepth + 1u ||
+        !holdsRegister(e->stack[e->depth - 1])) {
+        e->whyNot = "an inlined loop returning with more than its result";
+        return false;
+    }
+    unsigned vi = e->valueDepth - 1;
+    if (e->fpLive & (1u << vi)) fpSyncOne(e, vi);
+    settleAll(e);
+    SlotKind k = e->stack[e->depth - 1];
+    uint32_t shape = e->stackShape[e->depth - 1];
+    ObjClass *cls = e->stackClass[e->depth - 1];
+    if (!e->inlRetSet) {
+        e->inlRetSet = true;
+        e->inlRetKind = k;
+        e->inlRetShape = shape;
+        e->inlRetClass = cls;
+    } else if (k != e->inlRetKind || shape != e->inlRetShape ||
+               cls != e->inlRetClass) {
+        e->whyNot = "an inlined loop's returns disagree about the result";
+        return false;
+    }
+    if (last) return true;
+    branchTo(e, e->inlExitOff, false, 0);
+    unsigned r;
+    return popValueRaw(e, &r, NULL);
+}
+
+/* Inlines a small body that branches and loops. Its locals are renumbered
+ * into slots of the caller's frame above the interpreter's window (homes),
+ * so the register planner gives them registers or frame slots as it does
+ * the caller's own, and the walk uses the ordinary local arms. Its branches
+ * resolve against its own offset map before the caller's fixups come back,
+ * so the two numberings never meet in one table. */
+bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
+                    unsigned argc, uint32_t callOff) {
+    if (!jitInlineLoopsOn()) return false;
+    if (e->osr || e->inlHomeLo == 0 || e->mapKernel) return false;
+    if (e->inlLoopCount >= JIT_INLINE_LOOP_MAX_SITES) return false;
+    ObjFunction *cfn = callee->fn;
+    if (cfn == caller) return false;           /* recursion */
+    unsigned maxSlot = 0;
+    if (!inlinableLoopBody(callee, argc, &maxSlot)) return false;
+    unsigned hb = e->inlHomeNext != 0 ? e->inlHomeNext : e->inlHomeLo;
+    if (hb + maxSlot > JIT_INLINE_LOOP_MAX_SLOT) return false;
+    unsigned need = hb + maxSlot + 1u;         /* one past the highest home */
+    if (e->measuring) {
+        if (need > e->base + e->locals) e->locals = need - e->base;
+    } else if (need > e->base + e->locals) {
+        return false;      /* the measuring pass did not inline this one */
+    }
+    if (e->depth < argc + 1u) return false;
+    unsigned cidx = e->depth - argc - 1u;
+    for (unsigned i = 0; i < argc; i++) {
+        if (!holdsRegister(e->stack[cidx + 1u + i])) return false;
+    }
+
+    int count = cfn->chunk.count;
+    uint8_t *code = renumberedCode(&cfn->chunk, hb);
+    if (code == NULL) return false;
+    int *cmap = (int *)malloc(sizeof(int) * (size_t)(count + 1));
+    int64_t *cdepths = (int64_t *)malloc(sizeof(int64_t) * (size_t)(count + 1));
+    uint8_t *cloop = (uint8_t *)calloc((size_t)count + 1u, 1);
+    Fixup *saved = (Fixup *)malloc(sizeof(Fixup) * (e->fixupCount + 1u));
+    if (cmap == NULL || cdepths == NULL || cloop == NULL || saved == NULL) {
+        free(code); free(cmap); free(cdepths); free(cloop); free(saved);
+        return false;
+    }
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] inlining loop %s\n",
+                cfn->name ? cfn->name->chars : "<anon>");
+    }
+    for (int i = 0; i <= count; i++) { cmap[i] = -1; cdepths[i] = -1; }
+
+    /* Loop nesting for the slot ranking, on top of the call site's own. */
+    unsigned d0 = 0;
+    if (e->loopDepth != NULL && callOff < e->loopDepthCount) {
+        d0 = e->loopDepth[callOff];
+    }
+    for (int i = 0; i <= count; i++) cloop[i] = (uint8_t)d0;
+    for (int off = 0; off < count;) {
+        int len = instructionLength(&cfn->chunk, off);
+        if (cfn->chunk.code[off] == OP_LOOP) {
+            int top = off + 3 + jaiReadI16(cfn->chunk.code + off + 1);
+            for (int x = top; x <= off && x >= 0; x++) {
+                if (cloop[x] < 250) cloop[x]++;
+            }
+        }
+        off += len;
+    }
+
+    /* Every entry in its own X register, so each argument can be copied
+     * into its parameter's home and still stand where the guards need it. */
+    fpSyncAll(e);
+    settleAll(e);
+    for (unsigned s = hb; s <= hb + maxSlot; s++) {
+        e->localKind[s]     = SLOT_INT;
+        e->localShape[s]    = 0;
+        e->localClass[s]    = NULL;
+        e->localTyped[s]    = false;
+        e->localSeen[s]     = NULL_VAL;
+        e->localElemDecl[s] = 0;
+        e->localObjType[s]  = 0;
+    }
+    e->inlHomeNext  = need;
+    e->inlLoopCount++;
+
+    e->inlining      = true;
+    e->inlHomes      = true;
+    e->inlShared     = false;
+    e->inlDepth      = cidx + 1u + argc;
+    e->inlPinned     = 0;
+    e->inlValueBase  = e->valueDepth;
+    e->inlIp         = callOff;
+    e->inlClosureReg = -1;
+    e->inlExitOff    = (uint32_t)count;
+    e->inlRetSet     = false;
+
+    bool ok = true;
+    unsigned vi = 0;
+    for (unsigned idx = 0; idx < cidx + 1u + argc && ok; idx++) {
+        if (!holdsRegister(e->stack[idx])) continue;
+        unsigned v = vi++;
+        if (idx <= cidx) continue;
+        unsigned slot = hb + (idx - cidx);
+        if (!localInRange(e, slot) ||
+            !adoptLocalKindSeen(e, slot, e->stack[idx], e->stackShape[idx],
+                                e->stackClass[idx], e->stackSeen[idx])) {
+            ok = false;
+            break;
+        }
+        e->localElemDecl[slot] = e->stackElemDecl[idx];
+        e->localObjType[slot]  = e->stackObjType[idx];
+        localOut(e, slot, xHeldIn(e, v));
+    }
+
+    /* The walk sees only its own fixups. */
+    unsigned nCaller = e->fixupCount;
+    memcpy(saved, e->fixups, sizeof(Fixup) * nCaller);
+    e->fixupCount = 0;
+    unsigned fp0 = e->fpCarryCount, he0 = e->homeEarlyCount;
+    unsigned dc0 = e->deferCarryCount;
+    int *savedMap = e->offsetToInst;
+    int64_t *savedDepths = e->offsetToDepth;
+    const uint8_t *savedLoop = e->loopDepth;
+    unsigned savedLoopCount = e->loopDepthCount;
+    uint32_t savedCurOffset = e->curOffset;
+    unsigned savedInstDepth = e->instDepth;
+    unsigned savedInstValue = e->instValueDepth;
+    e->offsetToInst = cmap;
+    e->offsetToDepth = cdepths;
+    e->loopDepth = cloop;
+    e->loopDepthCount = (unsigned)count + 1u;
+
+    ObjFunction ffn = *cfn;
+    ffn.chunk.code = code;
+    /* The verifier behind the range facts' graph checks every slot operand
+     * against the window; the homes are the window now. */
+    ffn.maxSlots = (uint16_t)need;
+    ObjClosure fcl = *callee;
+    fcl.fn = &ffn;
+    /* The range-fact cache keys on the function pointer, and `ffn` is a
+     * stack copy whose address the next inline may reuse for another body. */
+    jitRangeReset();
+    if (ok) ok = compileBody(e, &fcl) && !e->failed;
+    jitRangeReset();
+    unsigned exitInst = e->count;
+    if (ok) {
+        cmap[count] = (int)exitInst;
+        cdepths[count] = stackSignature(e);
+    }
+
+    /* Resolve this body's own branches; keep the sentinels for the end. */
+    unsigned kept = 0;
+    if (ok) {
+        uint8_t *landed = (uint8_t *)calloc((size_t)count + 1u, 1);
+        if (landed == NULL) ok = false;
+        for (unsigned f = 0; ok && f < e->fixupCount; f++) {
+            uint32_t t = e->fixups[f].targetOffset;
+            if (t <= (uint32_t)count) landed[t] = 1;
+        }
+        for (unsigned i = fp0; ok && i < e->fpCarryCount; i++) {
+            if (e->fpCarry[i] <= (uint32_t)count && landed[e->fpCarry[i]]) ok = false;
+        }
+        for (unsigned i = he0; ok && i < e->homeEarlyCount; i++) {
+            if (e->homeEarly[i] <= (uint32_t)count && landed[e->homeEarly[i]]) ok = false;
+        }
+        for (unsigned i = dc0; ok && i < e->deferCarryCount; i++) {
+            if (e->deferCarry[i] <= (uint32_t)count && landed[e->deferCarry[i]]) ok = false;
+        }
+        free(landed);
+        if (!ok) e->whyNot = "a branch inside an inlined loop lands mid-expression";
+        for (unsigned f = 0; ok && f < e->fixupCount; f++) {
+            Fixup fx = e->fixups[f];
+            if (fx.targetOffset > (uint32_t)count) {
+                e->fixups[kept++] = fx;
+                continue;
+            }
+            int target = cmap[fx.targetOffset];
+            if (target < 0 ||
+                (fx.depth >= 0 && cdepths[fx.targetOffset] != fx.depth)) {
+                e->whyNot = "an inlined loop's branch has no consistent landing";
+                ok = false;
+                break;
+            }
+            patchBranch(e, &fx, target);
+        }
+        if (ok && nCaller + kept > JIT_MAX_FIXUPS) ok = false;
+    }
+    if (ok) {
+        memmove(&e->fixups[nCaller], &e->fixups[0], sizeof(Fixup) * kept);
+        memcpy(&e->fixups[0], saved, sizeof(Fixup) * nCaller);
+        e->fixupCount = nCaller + kept;
+    } else {
+        /* The compile is abandoned; the caller's table only has to be whole
+         * enough for nothing to read past it. */
+        memcpy(&e->fixups[0], saved, sizeof(Fixup) * nCaller);
+        e->fixupCount = nCaller;
+    }
+    e->fpCarryCount = fp0;
+    e->homeEarlyCount = he0;
+    e->deferCarryCount = dc0;
+    e->offsetToInst = savedMap;
+    e->offsetToDepth = savedDepths;
+    e->loopDepth = savedLoop;
+    e->loopDepthCount = savedLoopCount;
+    e->curOffset = savedCurOffset;
+    e->instDepth = savedInstDepth;
+    e->instValueDepth = savedInstValue;
+    /* The cache keys on the code pointer, which the next malloc may reuse
+     * for a different body. */
+    jitBranchTargetsReset();
+    free(code); free(cmap); free(cdepths); free(cloop); free(saved);
+
+    if (ok && (e->depth != e->inlDepth + 1u || !e->inlRetSet ||
+               e->count != exitInst)) {
+        e->whyNot = "an inlined loop ended without its result";
+        ok = false;
+    }
+    if (!ok) {
+        e->inlining = false;
+        e->inlHomes = false;
+        gInlineFailed = true;
+        e->failed = true;
+        return false;
+    }
+
+    unsigned rres;
+    SlotKind kres;
+    uint32_t rshape = e->stackShape[e->depth - 1];
+    ObjClass *rcls = e->stackClass[e->depth - 1];
+    if (!popValue(e, &rres, &kres)) { e->failed = true; return false; }
+    while (e->depth > cidx) {
+        if (holdsRegister(e->stack[e->depth - 1])) {
+            unsigned r;
+            if (!popValueRaw(e, &r, NULL)) { e->failed = true; return false; }
+        } else {
+            e->depth--;
+        }
+    }
+    e->inlining = false;
+    e->inlHomes = false;
+    if (!pushValue(e, kres, rshape, rcls)) { e->failed = true; return false; }
+    unsigned dst = pushReg(e) - 1;
+    if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+    e->inlined = true;
+    return true;
 }
 
 #endif /* __aarch64__ || __arm64__ */

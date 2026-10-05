@@ -763,7 +763,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
  * here (arriving with everything in its own register) skips the settle and only the fall-through pays -- both paths then agree, which a join requires. Forward branches are known here; backward ones checked at the end. */
         if (anyDeferred(e)) {
             bool joinsHere = false;
-            if (!e->inlining) {
+            /* A loop-bearing inline walks with the caller's fixups set aside
+             * (inlineLoopCall), so every one in the table is its own. */
+            if (!e->inlining || e->inlHomes) {
                 for (unsigned f = 0; f < e->fixupCount && !joinsHere; f++) {
                     joinsHere = (e->fixups[f].targetOffset == (uint32_t)off);
                 }
@@ -782,7 +784,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
                    closUpHoisted(e, closure, code[off + 1]))) ||
                 e->deferCarryCount >= jitCarryLimit()) {
                 settleAll(e);
-            } else if (!e->inlining) {
+            } else if (!e->inlining || e->inlHomes) {
                 /* An inlined body's offsets are its OWN chunk's, and the
                  * landing map below is the caller's: recorded, a callee
                  * offset that happened to equal a caller's loop head
@@ -799,7 +801,7 @@ bool compileBody(Emit *e, ObjClosure *closure) {
          * wrote. `if flag { a[i] } else { a[0] }` is the shape: one arm ends
          * at the jump with its value in X, the other flows into the OP_ADD
          * and leaves it in the bank. Settled here, both edges agree. */
-        if (e->fpLive != 0 && !e->inlining) {
+        if (e->fpLive != 0 && (!e->inlining || e->inlHomes)) {
             for (unsigned f = 0; f < e->fixupCount; f++) {
                 if (e->fixups[f].targetOffset != (uint32_t)off) continue;
                 fpSyncAll(e);
@@ -851,21 +853,35 @@ bool compileBody(Emit *e, ObjClosure *closure) {
 
         /* The four local opcodes an inlined body is allowed, answered against its own frame, before the main
          * switch reads them as the caller's slot numbers. */
-        if (e->inlining && (op == OP_GET_LOCAL || op == OP_GET_LOCAL2 ||
-                            op == OP_ADD_LOCALS || op == OP_BIND)) {
+        if (e->inlining && !e->inlHomes &&
+            (op == OP_GET_LOCAL || op == OP_GET_LOCAL2 ||
+             op == OP_ADD_LOCALS || op == OP_BIND)) {
             if (!inlineLocalOp(e, code, off)) return false;
             off += instructionLength(&fn->chunk, off);
             continue;
         }
-        if (e->inlining && (op == OP_GET_FIELD_LOCAL || op == OP_GET_FIELD)) {
+        if (e->inlining && !e->inlHomes &&
+            (op == OP_GET_FIELD_LOCAL || op == OP_GET_FIELD)) {
             if (!inlineFieldRead(e, fn, code, off, stop)) return false;
             off += instructionLength(&fn->chunk, off);
             continue;
         }
-        if (e->inlining && (op == OP_ADD_INT_CONST || op == OP_SUB_INT_CONST ||
-                            op == OP_MUL_INT_CONST)) {
+        if (e->inlining && !e->inlHomes &&
+            (op == OP_ADD_INT_CONST || op == OP_SUB_INT_CONST ||
+             op == OP_MUL_INT_CONST)) {
             if (!inlineIntConstOp(e, code, off)) return false;
             off += instructionLength(&fn->chunk, off);
+            continue;
+        }
+        if (e->inlHomes && op == OP_RETURN) {
+            /* Every return of a loop-bearing inline leaves its result in one
+             * entry and, unless it is the last instruction, branches to the
+             * inline's exit; the walk carries on past it from whatever
+             * branch lands on the next offset. */
+            bool last = off + 1 >= stop;
+            if (!inlineLoopReturn(e, last)) return false;
+            if (last) break;
+            off += 1;
             continue;
         }
         if (e->inlining && op == OP_RETURN) {

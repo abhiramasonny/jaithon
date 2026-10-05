@@ -33,6 +33,9 @@ static unsigned jitRootLimit(void) {
 bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
     unsigned nroots = 0;
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
+        /* An inline's home is dead outside the inline, and nothing inside
+         * one calls: never a root, and possibly stale. */
+        if (e->inlHomeLo != 0 && slot >= e->inlHomeLo) continue;
         if (e->localKind[slot] != SLOT_INST &&
             e->localKind[slot] != SLOT_LIST &&
             e->localKind[slot] != SLOT_OBJ &&

@@ -1132,6 +1132,7 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     unsigned ncand = 0;
 
     for (unsigned s = 0; s < e->base + e->locals && s <= JIT_MAX_SLOTS; s++) {
+        if (e->inlHomeLo != 0 && s >= e->inlHomeLo) break;   /* inline homes */
         /* A string local hoists for the same reasons a list does, and for one
          * more: a string never changes at all, so the only thing that can
          * make its header stale is a write to the LOCAL -- the same range

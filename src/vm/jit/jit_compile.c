@@ -1025,6 +1025,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
     memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
     e.arity        = fn->arity;
+    e.inlHomeLo    = jitFrameWindow(fn);
     e.noInline     = noInline;
     e.offsetToInst  = map;
     e.offsetToDepth = depths;
@@ -1041,6 +1042,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     memcpy(body.dynamicLocal, dynamic, sizeof body.dynamicLocal);
     memcpy(body.nullableLocal, nullable, sizeof body.nullableLocal);
     body.arity        = fn->arity;
+    body.inlHomeLo    = jitFrameWindow(fn);
     body.noInline     = noInline;
     /* The measuring pass runs with slot 0 available, purely to find out
      * whether the body reads it; the real pass then drops it if not. */
@@ -1582,6 +1584,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
              * frame, so the record must say "not mine" rather than null.
              * See JitDeoptRecord::skipLocals. */
             if (kind == SLOT_OPAQUE) {
+                skipLocals |= (uint64_t)1 << i;
+                continue;
+            }
+            /* A loop-bearing inline's home: every guard inside that inline
+             * resumes at the caller's OP_CALL, where the callee has not
+             * started, and none outside it can see one. Above the caller's
+             * maxSlots, so the interpreter's frame has no slot for it. */
+            if (e.inlHomeLo != 0 && slot >= e.inlHomeLo) {
                 skipLocals |= (uint64_t)1 << i;
                 continue;
             }
