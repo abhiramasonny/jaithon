@@ -1005,6 +1005,17 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         for (unsigned i = 0; i < body.clobberCount; i++) {
             e.clobberOff[i] = body.clobberOff[i];
         }
+        memcpy(e.clobberAlloc, body.clobberAlloc, sizeof e.clobberAlloc);
+        e.globalSiteCount = body.globalSiteCount;
+        e.globalSiteSpill = body.globalSiteSpill;
+        memcpy(e.globalOff, body.globalOff, sizeof e.globalOff);
+        /* The table the guards will name, so the head can name it before
+         * the walk reaches the first access. Both passes resolve the same
+         * names against the same table, so the walk agrees. */
+        if (e.globalsTable == NULL) {
+            e.globalsTable = body.globalsTable;
+            e.globalsKeyVersion = body.globalsKeyVersion;
+        }
         e.closSiteCount = body.closSiteCount;
         memcpy(e.closSite, body.closSite, sizeof e.closSite);
         e.hoistPoolCount = 0;
@@ -1033,6 +1044,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 fprintf(stderr, "[jit] %s keeps the iterator index of %u..%u "
                         "in x%u\n", jitFnLabel(fn), e.iterHoist[i].top,
                         e.iterHoist[i].end, e.iterHoist[i].reg);
+            }
+            for (unsigned i = 0; i < e.guardHoistCount; i++) {
+                fprintf(stderr, "[jit] %s proves the globals guard over "
+                        "%u..%u at the head\n", jitFnLabel(fn),
+                        e.guardHoist[i].top, e.guardHoist[i].end);
             }
             for (unsigned i = 0; i < e.closHoistCount; i++) {
                 fprintf(stderr, "[jit] %s proves slot %u's closure over "

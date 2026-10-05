@@ -761,6 +761,14 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 e.pushOff[i]  = probe.pushOff[i];
                 e.pushSlot[i] = probe.pushSlot[i];
             }
+            memcpy(e.clobberAlloc, probe.clobberAlloc, sizeof e.clobberAlloc);
+            e.globalSiteCount = probe.globalSiteCount;
+            e.globalSiteSpill = probe.globalSiteSpill;
+            memcpy(e.globalOff, probe.globalOff, sizeof e.globalOff);
+            if (e.globalsTable == NULL) {
+                e.globalsTable = probe.globalsTable;
+                e.globalsKeyVersion = probe.globalsKeyVersion;
+            }
             e.closSiteCount = probe.closSiteCount;
             memcpy(e.closSite, probe.closSite, sizeof e.closSite);
             e.stampCount = probe.stampCount;

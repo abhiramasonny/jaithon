@@ -79,6 +79,10 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 #define JIT_MAX_CLOS_SITES 8u
 #define JIT_MAX_CLOS_HOIST 2u
 #define JIT_MAX_CLOS_UP    2u
+/* Module-global accesses the measuring pass records, and the loops whose
+ * keyVersion guard is proved once at the head (see planGuardHoists). */
+#define JIT_MAX_GLOBAL_SITES 64u
+#define JIT_MAX_GUARD_HOIST   4u
 #define JIT_PUSH_UNKNOWN (-1)
 #define JIT_PUSH_FRESH   (-2)
 /* Distinct offsets the `match` arms may branch to across a discarded OP_POP
@@ -510,8 +514,21 @@ typedef struct {
      * which answers "yes, everywhere" -- the whole-body answer, so running out
      * of room costs a hoist and never a wrong one. */
     uint32_t  clobberOff[JIT_MAX_CLOBBER];
+    /* The site is an instance allocation of a class with a simple init
+     * (emitCallOut's whole path): it may collect, but runs no Jaithon code
+     * and so cannot add, remove or rehash a module global. */
+    bool      clobberAlloc[JIT_MAX_CLOBBER];
+    bool      allocOnlyCall;
     unsigned  clobberCount;
     bool      clobberSpill;
+    /* Where the measuring pass emitted a module-globals keyVersion guard. */
+    uint32_t  globalOff[JIT_MAX_GLOBAL_SITES];
+    unsigned  globalSiteCount;
+    bool      globalSiteSpill;
+    /* JAITHON_JIT_GLOBAL_GUARD_HOIST: loops whose every globals guard is
+     * proved once at the head instead. See planGuardHoists. */
+    struct { uint32_t top, end; } guardHoist[JIT_MAX_GUARD_HOIST];
+    unsigned  guardHoistCount;
     /* Every list append the body makes, when the grow stub keeps the
      * registers (jitGrowKeeps): such an append is no longer a clobber, so
      * regionCalls stops seeing it -- but it still moves ONE list's `items`

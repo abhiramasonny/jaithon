@@ -818,6 +818,89 @@ static void planClosureHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds,
     }
 }
 
+/* JAITHON_JIT_GLOBAL_GUARD_HOIST: see planGuardHoists. Default on. */
+static bool jitGlobalGuardHoist(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_GLOBAL_GUARD_HOIST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Can anything in [lo, hi) run Jaithon code -- and so define, delete or
+ * rehash a module global? Every such site is a clobber, but not every
+ * clobber is such a site: an instance allocation of a simple-init class
+ * calls only the allocator and, at worst, the collector, and the collector
+ * never touches a module's globals table (it prunes only the intern table). */
+static bool regionRebinds(const Emit *e, uint32_t lo, uint32_t hi) {
+    if (e->clobberSpill) return true;
+    for (unsigned i = 0; i < e->clobberCount; i++) {
+        if (e->clobberOff[i] < lo || e->clobberOff[i] >= hi) continue;
+        if (!e->clobberAlloc[i]) return true;
+    }
+    return false;
+}
+
+/* emitGlobalsGuard runs before EVERY module-global access: three loads and a
+ * compare against the table's keyVersion, which moves only when a key is
+ * added, removed or the table rehashed. A loop at module scope pays it for
+ * every read and write of its counters -- about a hundred of alloc_churn's
+ * 291 instructions an iteration went on global access. Over a loop that runs
+ * no Jaithon code (regionRebinds) and is entered only at its head, nothing
+ * can move the keys between the head and any access in it, so the guard is
+ * proved once at the head, the OUTERMOST such loop around each site. A miss
+ * resumes the interpreter at the head. The value is still loaded and its tag
+ * checked at every access; only the key check moves. */
+static void planGuardHoists(Emit *e, ObjFunction *fn, uint32_t regionLo,
+                            uint32_t regionHi) {
+    e->guardHoistCount = 0;
+    if (!jitGlobalGuardHoist() || e->globalsTable == NULL) return;
+    if (e->globalSiteSpill) return;
+    const Chunk *c = &fn->chunk;
+    for (unsigned i = 0; i < e->globalSiteCount; i++) {
+        uint32_t at = e->globalOff[i];
+        bool covered = false;
+        for (unsigned h = 0; h < e->guardHoistCount; h++) {
+            if (at >= e->guardHoist[h].top && at < e->guardHoist[h].end) {
+                covered = true;
+            }
+        }
+        if (covered) continue;
+        uint32_t bestTop = 0, bestEnd = 0;
+        for (int off = (int)regionLo; off < (int)regionHi;) {
+            int len = instructionLength(c, off);
+            if (len <= 0) break;
+            uint32_t lt = (uint32_t)off;
+            uint32_t le = loopBodyEnd(c, lt);
+            off += len;
+            if (le == 0 || le <= lt || le > regionHi) continue;
+            if (at < lt || at >= le) continue;
+            if (regionRebinds(e, lt, le)) continue;
+            if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
+                bestTop = lt; bestEnd = le;
+            }
+        }
+        if (bestEnd == 0) continue;
+        /* An inner loop chosen first for another site is swallowed by this
+         * one: drop it, so no head is guarded twice. */
+        unsigned k = 0;
+        for (unsigned h = 0; h < e->guardHoistCount; h++) {
+            if (e->guardHoist[h].top >= bestTop &&
+                e->guardHoist[h].end <= bestEnd) {
+                continue;
+            }
+            e->guardHoist[k++] = e->guardHoist[h];
+        }
+        e->guardHoistCount = k;
+        if (e->guardHoistCount >= JIT_MAX_GUARD_HOIST) return;
+        e->guardHoist[e->guardHoistCount].top = bestTop;
+        e->guardHoist[e->guardHoistCount].end = bestEnd;
+        e->guardHoistCount++;
+    }
+}
+
 void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     if (e->measuring) return;
     const Chunk *c = &fn->chunk;
@@ -1004,6 +1087,7 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     planPushHoists(e, c, kinds, regionLo, regionHi);
     planIterHoists(e, c, regionLo, regionHi);
     planClosureHoists(e, fn, kinds, regionLo, regionHi);
+    planGuardHoists(e, fn, regionLo, regionHi);
     if (!lean) return;
     /* Versions, for lists stored into inside their own region. */
     for (unsigned h = 0; h < e->hoistCount; h++) {
@@ -1125,6 +1209,21 @@ void emitHoistsAt(Emit *e, uint32_t off) {
         emit(e, jaiA64LdrX(e->iterHoist[i].reg, rIt,
                            (unsigned)offsetof(ObjIter, index)));
         e->iterHoist[i].live = true;
+    }
+    for (unsigned i = 0; i < e->guardHoistCount; i++) {
+        if (e->guardHoist[i].top != off) continue;
+        /* emitGlobalsGuard's own compare, resuming at the head. */
+        uint32_t kv = e->globalsKeyVersion;
+        emitConst64(e, JIT_SCRATCH_D,
+                    (int64_t)(uintptr_t)&e->globalsTable->keyVersion);
+        emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+        if (kv <= 0xfffu) {
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, kv));
+        } else {
+            emitConst64(e, JIT_SCRATCH_B, (int64_t)kv);
+            emit(e, jaiA64SubsX(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+        }
+        branchOnDeoptAt(e, JAI_A64_NE, off, false);
     }
     for (unsigned i = 0; i < e->closHoistCount; i++) {
         if (e->closHoist[i].top != off) continue;

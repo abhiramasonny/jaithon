@@ -894,6 +894,7 @@ void noteScratchClobber(Emit *e) {
          * over-report, not under-report, which is the safe direction. */
         uint32_t at = e->inlining ? e->inlIp : e->curOffset;
         if (e->clobberCount < JIT_MAX_CLOBBER) {
+            e->clobberAlloc[e->clobberCount] = e->allocOnlyCall;
             e->clobberOff[e->clobberCount++] = at;
         } else {
             e->clobberSpill = true;
@@ -915,6 +916,25 @@ void noteScratchClobber(Emit *e) {
         for (unsigned i = 0; i < e->hoistCount; i++) {
             if (at < e->hoist[i].top || at >= e->hoist[i].end) continue;
             e->whyNot = "a call reached a loop a header was hoisted out of";
+            e->failed = true;
+            return;
+        }
+    }
+    /* The same ratchet for the closure hoists (their upvalues sit in hoist
+     * registers) and, for any call that could run Jaithon code, the loops
+     * whose globals guard was proved at the head. */
+    if (!e->measuring &&
+        (e->closHoistCount > 0 || e->guardHoistCount > 0)) {
+        uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+        for (unsigned i = 0; i < e->closHoistCount; i++) {
+            if (at < e->closHoist[i].top || at >= e->closHoist[i].end) continue;
+            e->whyNot = "a call reached a loop a closure was hoisted over";
+            e->failed = true;
+            return;
+        }
+        for (unsigned i = 0; !e->allocOnlyCall && i < e->guardHoistCount; i++) {
+            if (at < e->guardHoist[i].top || at >= e->guardHoist[i].end) continue;
+            e->whyNot = "a call reached a loop a globals guard was hoisted over";
             e->failed = true;
             return;
         }

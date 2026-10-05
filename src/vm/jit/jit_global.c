@@ -188,6 +188,24 @@ JaiEntry *globalSlot(Emit *e, ObjClosure *closure, uint32_t nameIdx,
 /* Emitted before EVERY access, not hoisted: hoisting is sound only given a control-flow claim (no
  * call-out between a guard and a later access on a back edge) -- exactly the kind of reasoning this file has been bitten by before. Costs four instructions on a predictable branch. */
 void emitGlobalsGuard(Emit *e) {
+    /* Where the walk is in the CALLER's offsets, which is what every loop
+     * range is measured in. */
+    uint32_t site = e->inlining ? e->inlIp : e->curOffset;
+    if (e->measuring) {
+        if (e->globalSiteCount < JIT_MAX_GLOBAL_SITES) {
+            e->globalOff[e->globalSiteCount++] = site;
+        } else {
+            e->globalSiteSpill = true;
+        }
+    } else {
+        /* Proved at the head of a loop nothing in which can change the
+         * table's keys (planGuardHoists). */
+        for (unsigned i = 0; i < e->guardHoistCount; i++) {
+            if (site >= e->guardHoist[i].top && site < e->guardHoist[i].end) {
+                return;
+            }
+        }
+    }
     uint32_t at = e->globalsKeyVersion;
     emitConst64(e, JIT_SCRATCH_D,
                 (int64_t)(uintptr_t)&e->globalsTable->keyVersion);
