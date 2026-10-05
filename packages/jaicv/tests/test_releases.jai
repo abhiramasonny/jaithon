@@ -26,6 +26,8 @@ from jaicv.imgproc.threshold import adaptive_threshold
 from jaicv.photo.denoise import detail_enhance, edge_preserving_filter
 from jaicv.video.optflow import calc_optical_flow_farneback, calc_optical_flow_pyr_lk
 from jaicv.calib3d.stereo import StereoBM, StereoSGBM
+from jaicv.objdetect.cascade import CascadeClassifier
+from jaicv.objdetect.qr import qr_encode, QRCodeDetector
 from jaicv.features2d.detect import BRIEF, ORB, SimpleBlobDetector, SimpleBlobDetectorParams
 
 let ROWS = 48
@@ -167,6 +169,11 @@ fn test_detectors_flow_and_stereo_release_their_intermediates() -> void {
     assert_eq(growth(|| bm.compute(bytes, other)), 0)
     let sgbm = StereoSGBM()
     assert_eq(growth(|| sgbm.compute(bytes, other)), 0)
+    let cascade = CascadeClassifier("packages/jaicv/tests/oracle/synthetic_cascade.xml")
+    assert_eq(growth_of_points(|| cascade.detect_multi_scale(bytes, 1.1, 0).len()), 0)
+    let symbol = qr_encode("jaicv", 0, 2, 4)
+    let reader = QRCodeDetector()
+    assert_eq(growth_of_points(|| reader.detect_and_decode(symbol)[0].len()), 0)
     bytes.release()
     other.release()
 }
