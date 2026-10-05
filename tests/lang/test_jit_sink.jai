@@ -327,3 +327,35 @@ fn test_a_call_out_beside_an_entered_object() -> void {
     assert_eq(acc.x, 20000.0)
     assert_eq(g_seen, 200010000.0)
 }
+
+#: Leaving by `break`, and skipping the rest by `continue`: both ways out of
+#: an iteration see the object the iteration built.
+fn first_big(n: int) -> Point {
+    var p = Point(0, 0)
+    var i = 0
+    while i < n {
+        p = Point(i, i * i)
+        if p.y > 1000000 { break }
+        i += 1
+    }
+    return p
+}
+
+fn odd_sum(n: int) -> int {
+    var t = 0
+    var i = 0
+    while i < n {
+        i += 1
+        let p = Point(i, i % 2)
+        if p.y == 0 { continue }
+        t += p.x
+    }
+    return t
+}
+
+fn test_break_and_continue() -> void {
+    let p = first_big(5000)
+    assert_eq(p.x, 1001)
+    assert_eq(p.y, 1002001)
+    assert_eq(odd_sum(20000), 100000000)
+}
