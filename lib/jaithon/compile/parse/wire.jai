@@ -54,8 +54,8 @@ pub fn parse(source: str, file_id: int = 0, diagnostics: DiagnosticBag? = null) 
 #: each; a walk over the finished tree to find them was 10-15% of `fmt`.
 #:
 #: ```
-#: let tree = parse_spelled("let x = 0xFF\n")
-#: tree?.child_list("stmts")[0].child("init").text("name")    # "0xFF"
+#: let tree = parse_spelled("let x = 0xFF\n") ?? Node.ident("")
+#: tree.child_list("stmts")[0].child("init").text("name")    # "0xFF"
 #: ```
 pub fn parse_spelled(source: str, file_id: int = 0, diagnostics: DiagnosticBag? = null) -> Node? {
     let bag = diagnostics ?? DiagnosticBag()
