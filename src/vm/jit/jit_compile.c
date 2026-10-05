@@ -458,22 +458,89 @@ static bool fpHomeWanted(const Emit *m, unsigned base, unsigned locals) {
 
 /* JAITHON_JIT_FN_HOIST: hoist loop-invariant list headers in the
  * function tier as well as the loop tier. */
-/* JAITHON_JIT_SHRINK_WRAP=1: see emitEarlyReturnArm. Default OFF. The arm
- * wins 1.17-1.25x on fib, hanoi and `1 + tri(n-1) + tri(n-2)`, and loses
- * 5-11% on grid paths, binomial, collatz and `tri(n-1) + tri(n-2) + 1`: the
- * calls that build the frame take a branch at their first instruction, and
- * which shapes pay for it more than the leaves save is not something the
- * walk can see (moving the `+ 1` flips the sign). It is stable under
- * padding, so it is not a layout artefact. Laying the arm out after the
- * body instead made every result swing +/-11% with a 4-byte shift of the
- * body. */
-static bool jitShrinkWrap(void) {
+/* JAITHON_JIT_SHRINK_WRAP: see emitEarlyReturnArm. The arm wins 1.13-1.25x on
+ * fib, hanoi, a divide and conquer and `1 + tri(n-1) + tri(n-2)`, and on its
+ * own loses 5-11% on grid paths, binomial, collatz and
+ * `tri(n-1) + tri(n-2) + 1`: every call that builds the frame takes a branch
+ * at its first instruction, which pays only when most calls take the arm.
+ * Stable under padding, so not a layout artefact; laying the arm out after
+ * the body instead made every result swing +/-11% with a 4-byte shift.
+ *
+ * 0 never, 1 every body the idiom matches (what the switch used to opt into),
+ * and anything else -- the default -- only where earlyArmPays reads, from the
+ * bytecode, that the arm is taken by more than half of all calls. */
+static int jitShrinkWrap(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_SHRINK_WRAP");
-        cached = (v != NULL && v[0] == '1') ? 1 : 0;
+        cached = v == NULL ? 2 : v[0] == '0' ? 0 : v[0] == '1' ? 1 : 2;
     }
-    return cached != 0;
+    return cached;
+}
+
+/* Whether the early arm is taken by MORE THAN HALF of the calls that reach
+ * this body, decided from the bytecode after it: straight-line code -- no
+ * branch of any kind, so no loop, no second base case and no conditional
+ * call -- holding at least two references to the function's own global
+ * name. Then every call that does not take the arm makes at least two calls
+ * of its own, every internal node of the call tree has two or more children,
+ * and the leaves, which are exactly the calls that take the arm, outnumber
+ * the rest. That is the condition under which the arm pays: it saves a
+ * leaf the whole frame and costs every other call one taken branch.
+ *
+ * Measured with the arm forced on (JAITHON_JIT_SHRINK_WRAP=1): the shapes
+ * this admits won -- fib 1.25x, hanoi 1.12-1.18x, a `lo >= hi` divide and
+ * conquer 1.14-1.17x, binary_trees 1.06x -- and the ones it refuses lost or
+ * stayed flat: grid paths 0.93x and binomial 0.94x (a second base case the
+ * arm does not cover sends half the leaves through the frame AND the
+ * branch), collatz 0.95x (one call per level, so the arm runs once per
+ * chain), gcd and a linear `spread(lo + 1, hi) + 1` flat.
+ *
+ * One more condition, from the binary recursions that sit AT a half: at most
+ * one operation between the last call and the return. That stretch is what
+ * a parent runs after each of its leaf children, and each checked add puts
+ * another branch on it; `t(n-1) + t(n-2) + 1` 0.95-0.99x, `+ n` 0.97x,
+ * `h(n-1) + h(n-1) + 1` 1.00x -- where `1 + t(n-1) + t(n-2)` and
+ * `t(n-1) + 1 + t(n-2)`, the same work with the add moved before the last
+ * call, win 1.18-1.22x. Pushes (a literal, a local) are not counted. */
+static bool earlyArmPays(ObjFunction *fn, uint32_t target) {
+    const Chunk *c = &fn->chunk;
+    if (fn->name == NULL) return false;
+    unsigned selfRefs = 0;
+    unsigned tailOps = 0;     /* since the last call, before the return */
+    for (int at = (int)target; at < c->count;) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return false;
+        uint8_t op = c->code[at];
+        if (jaiOpBranchOperandAt(op) >= 0) return false;
+        switch (op) {
+        case OP_CALL: case OP_INVOKE: case OP_TAIL_CALL:
+            tailOps = 0;
+            break;
+        case OP_RETURN:
+        case OP_INT: case OP_CONST: case OP_NULL:
+        case OP_TRUE: case OP_FALSE:
+        case OP_GET_LOCAL: case OP_GET_LOCAL2:
+            break;
+        default:
+            tailOps++;
+            break;
+        }
+        if (op == OP_GET_GLOBAL && at + 4 <= c->count) {
+            uint32_t nameIdx = jaiReadU24(c->code + at + 1);
+            if (nameIdx < (uint32_t)c->constants.count) {
+                Value nm = c->constants.data[nameIdx];
+                if (IS_STRING(nm) &&
+                    AS_STRING(nm)->length == fn->name->length &&
+                    memcmp(AS_STRING(nm)->chars, fn->name->chars,
+                           fn->name->length) == 0) {
+                    selfRefs++;
+                }
+            }
+        }
+        at += len;
+    }
+    return selfRefs >= 2 && tailOps <= 1;
 }
 
 /* JAITHON_JIT_SHRINK_SKIP=0 keeps the body's own copy of a shrink-wrapped
@@ -634,6 +701,7 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     if (body->returnKind != rk) return false;
     uint32_t target = (uint32_t)ret + armLen;
     if (ret + rel != (int)target || target >= (uint32_t)c->count) return false;
+    if (jitShrinkWrap() != 1 && !earlyArmPays(fn, target)) return false;
     if (rs2 >= 0) emit(e, jaiA64SubsXReg(31, (unsigned)rs, (unsigned)rs2));
     else emit(e, jaiA64SubsXImm(31, (unsigned)rs, (unsigned)k));
     unsigned skip = e->count;
