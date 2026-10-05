@@ -27,6 +27,43 @@ fn _run_test(arguments: list[str]) -> dict[str, any] {
     return __prim__.os_spawn(command, {})
 }
 
+#: Run with JAITHON_TEST_FORK set, both ways: 0 starts a fresh process per
+#: file, the path a forked child that needs the GPU is sent down too.
+fn _run_both_ways(arguments: list[str]) -> list[dict[str, any]] {
+    let command = [__prim__.os_argv()[0], "test"]
+    command.extend(arguments)
+    let results: list[dict[str, any]] = []
+    for fork in ["0", "1"] {
+        let environment: dict[str, str] = __prim__.os_env()
+        environment["JAITHON_TEST_FORK"] = fork
+        results.push(__prim__.os_spawn(command, {"env": environment}))
+    }
+    return results
+}
+
+let EXAMPLES = "#: Add one.\n#:\n#: ```\n#: 1 + 1    # 2\n#: ```\npub fn bump(x: int) -> int { return x + 1 }\n"
+
+#: A worker's own command line is rebuilt from the parsed options: argv() is
+#: only the binary there, so `--doc` and `--filter` never reached a worker
+#: and a parallel `test --doc` reported "no tests found".
+fn test_doc_and_filter_reach_every_worker() -> void {
+    let files = {"first.jai": EXAMPLES, "second.jai": EXAMPLES}
+    let root = _suite("doc", files)
+    let docs = _run_both_ways(["--doc", "--jobs=2", root + "/first.jai", root + "/second.jai"])
+    let tests = {"test_a.jai": PASSING, "test_b.jai": PASSING + "fn test_other() -> void { }\n"}
+    let suite = _suite("filter", tests)
+    let filtered = _run_both_ways(["--jobs=2", "--filter=other", suite])
+    _drop(root)
+    _drop(suite)
+    for result in docs {
+        assert_eq(result["exit_code"], 0, result["stderr"])
+        assert_true(result["stdout"].contains("2 passed, 0 failed, 2 total"), result["stdout"])
+    }
+    for result in filtered {
+        assert_true(result["stdout"].contains("1 passed, 0 failed, 1 total"), result["stdout"])
+    }
+}
+
 #: Drop the timings, the one part of the output that differs run to run. Each
 #: is the last dimmed span on its line.
 fn _untimed(text: str) -> str {

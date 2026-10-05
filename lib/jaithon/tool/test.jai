@@ -339,7 +339,7 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
     var next_path = 0
 
     fn launch(path: str) -> void {
-        let process = spawn(_worker_command(exe, path))
+        let process = spawn(_worker_command(exe, path, options))
         #: Nothing is ever written to it; a test reading it gets end of input.
         process.close_stdin()
         running.push((path, process))
@@ -365,22 +365,25 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
 
 #: The command that runs `path` alone in a worker process.
 #:
-#: Everything the process was invoked with EXCEPT the paths, so a worker
-#: inherits flags this tool never parses -- `--gc-stress` is the one that
-#: matters, since it belongs to the CLI rather than to `test`, and a
-#: hand-built command silently dropped it. Rebuilding the command from
-#: argv() means a flag added later needs no change here.
-fn _worker_command(exe: str, path: str) -> list[str] {
+#: The tool's own flags come from `options`: argv() here is only the binary,
+#: so a worker rebuilt from it ran without `--doc` or `--filter` -- a parallel
+#: `test --doc` found no tests at all, and `--filter` filtered nothing. What
+#: argv() does carry past the binary is still passed on, so a CLI flag that
+#: ever shows up there reaches the worker too.
+fn _worker_command(exe: str, path: str, options: _Options) -> list[str] {
     let own = argv()
     var command = [exe, "test", "--_shard", "--jobs=1"]
+    if options.doc { command.push("--doc") }
+    let filter = options.filter
+    if filter is not null { command.push("--filter=" + filter) }
     var index = 1
     while index < own.len() {
         let argument = own[index]
-        #: `test` itself, the paths, and any --jobs the caller gave: all
-        #: replaced here.
+        #: `test` itself, the paths, and the flags rebuilt above.
         let is_path = not argument.starts_with("-")
         let is_jobs = argument.starts_with("--jobs") or argument.starts_with("-j")
-        if not is_path and not is_jobs { command.push(argument) }
+        let is_own = argument == "--doc" or argument.starts_with("--filter") or argument == "-k"
+        if not is_path and not is_jobs and not is_own { command.push(argument) }
         index += 1
     }
     command.push(path)
@@ -468,7 +471,7 @@ fn _run_forked(exe: str, paths: list[str], options: _Options, limit: int) -> lis
             let base = f"{scratch}/{index}"
             started[index] = __prim__.time_mono()
             if not from_queue or history.needs_exec(paths[index]) {
-                let command = _worker_command(exe, paths[index])
+                let command = _worker_command(exe, paths[index], options)
                 let child = __prim__.os_spawn_to(command, base + ".out", base + ".err")
                 running[child] = index
                 spawned.add(index)
