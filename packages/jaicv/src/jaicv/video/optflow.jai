@@ -19,7 +19,7 @@ import std.math
 from std.gpu import Buffer, Kernel
 from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_MAKETYPE, Point2f, Size, TermCriteria
-from ..imgproc.common import PRELUDE
+from ..imgproc.common import PRELUDE, cached_weights
 from ..imgproc.filter import gaussian_blur
 from ..imgproc.geometric import pyr_down, resize
 
@@ -350,7 +350,9 @@ fn shrink(image: Mat, width: int, height: int, scale: float) -> Mat {
     var window = int(math.floor(sigma * 5.0 + 0.5)) | 1
     if window < 3 { window = 3 }
     let smoothed = gaussian_blur(image, Size(window, window), sigma)
-    return resize(smoothed, size: Size(width, height))
+    let out = resize(smoothed, size: Size(width, height))
+    smoothed.release()
+    return out
 }
 
 fn build_pyramid(image: Mat, levels: int) -> list[Mat] {
@@ -487,7 +489,8 @@ fn gaussian_weights(radius: int, sigma: float) -> Mat {
         total += value
     }
     for index in 0..values.len() { values[index] /= total }
-    return Mat.from_list(1, values.len(), CV_MAKETYPE(CV_32F, 1), values)
+    #: Shared between calls, so a flow does not leak a buffer per expansion.
+    return cached_weights(1, values.len(), values)
 }
 
 #: The five quadratic coefficients fitted to every neighbourhood: the two
@@ -557,6 +560,9 @@ pub fn calc_optical_flow_farneback(
         #: precisely to be believed about motion.
         let a = shrink(previous, width, height, scale)
         let b = shrink(current, width, height, scale)
+        #: `shrink` hands the caller's own frame back when there is nothing to
+        #: shrink, and only a shrunk copy is ours to release.
+        let shrunk = width != previous.cols or height != previous.rows
 
         var here = Mat.zeros(a.rows, a.cols, CV_MAKETYPE(CV_32F, 2))
         let coarser = flow
@@ -565,9 +571,12 @@ pub fn calc_optical_flow_farneback(
             #: it has to grow with the image it now describes.
             let lifted = resize(coarser, size: Size(a.cols, a.rows))
             let values = lifted.to_list()
+            lifted.release()
             let factor = float(a.cols) / float(coarser.cols)
+            coarser.release()
             var scaled: list[float] = []
             for value in values { scaled.push(value * factor) }
+            here.release()
             here = Mat.from_list(a.rows, a.cols, CV_MAKETYPE(CV_32F, 2), scaled)
         }
 
@@ -582,7 +591,14 @@ pub fn calc_optical_flow_farneback(
                 [count, a.rows, a.cols, first.step_, here.step_, window // 2]
             )
             next.invalidate()
+            here.release()
             here = next
+        }
+        first.release()
+        second.release()
+        if shrunk {
+            a.release()
+            b.release()
         }
         flow = here
         level -= 1
