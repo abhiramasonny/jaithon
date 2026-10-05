@@ -1186,6 +1186,17 @@ static int filterRunKernel(JaiPreparedFn1 *p, ObjList *src, int from,
     dst->version++;
     if (JAI_LIKELY(r.bailed == 0)) {
         vm.stackTop = base;
+        /* The room for every element is a guess at the top: a filter that
+         * kept a few of a million would hold 8 MB for each result it
+         * returned, and the collector would count every byte of it. A
+         * shrink allocates nothing, so it cannot collect. */
+        if (dst->capacity - dst->count > 1024 &&
+            dst->capacity > 2 * dst->count) {
+            size_t w = jaiListStoreWidth(dst->stg);
+            dst->items = jaiRealloc(dst->items, w * (size_t)dst->capacity,
+                                    w * (size_t)dst->count);
+            dst->capacity = dst->count;
+        }
         return at;
     }
     int64_t bits = ((const int64_t *)src->items)[at];

@@ -4,7 +4,7 @@
 #: per-call path keeps, in order; a predicate that raises or deoptimises part
 #: way leaves the kernel on that element, with the ones before it kept.
 from std.math import NAN
-from std.test import assert_eq, assert_throws
+from std.test import assert_eq, assert_throws, assert_true
 
 fn ints(n: int) -> list[int] {
     var xs: list[int] = []
@@ -75,4 +75,30 @@ fn test_result_takes_any_element() -> void {
     ys.push("tail")
     assert_eq(ys[n], "tail")
     assert_eq(ys[0] > 0, true)
+}
+
+#: A result that kept few of many elements gives back the room it was
+#: reserved, and stays an ordinary list: it grows, takes any element, and an
+#: empty one is still a list.
+fn test_a_sparse_result_shrinks_and_still_grows() -> void {
+    var xs: list[int] = []
+    for i in 0..5000 { xs.push((i * 7919) % 10007) }
+    for _round in 0..30 {
+        var ys = xs.filter(|x| x < 5)
+        let none = xs.filter(|x| x < 0)
+        assert_eq(len(none), 0)
+        let n = len(ys)
+        for v in ys { assert_true(v < 5) }
+        ys.push(99)
+        ys.insert(0, -1)
+        ys.extend([7, 8])
+        ys.push(2.5)
+        assert_eq(len(ys), n + 5)
+        assert_eq(ys[0], -1)
+        assert_eq(ys[n + 1], 99)
+        assert_eq(ys[n + 4], 2.5)
+        var grown = none
+        for k in 0..100 { grown.push(k) }
+        assert_eq(grown[99], 99)
+    }
 }
