@@ -41,40 +41,50 @@ LITERALS = ["0.25", "-0.0", "0.0", "1.5", "-3.0", "1e308", "1e-310", "2.0"]
 LISTS = ["a", "b", "c"]
 
 
-def subscript(name, k):
+def subscript(name, k, based=False):
     idx = "j" if k == 0 else (f"j + {k}" if k > 0 else f"j - {-k}")
+    if based:
+        # Both spellings: `row + j` and `j + row`, the base first or last.
+        idx = f"row + {idx}" if k % 2 == 0 else f"{idx} + row"
     return f"{name}[{idx}]"
 
 
-def expr(rng, depth, dst, s):
+def expr(rng, depth, dst, s, sb):
     """Reads of the stored list stay rare: at any offset but its own they are
-    a recurrence the vectoriser refuses, so they would cost it its coverage."""
+    a recurrence the vectoriser refuses, so they would cost it its coverage.
+    A third of the subscripts take the int parameter `row` as a base."""
     if depth == 0 or rng.random() < 0.3:
         r = rng.random()
         if r < 0.7:
             name = rng.choice([x for x in LISTS if x != dst])
+            based = rng.random() < 0.33
             if rng.random() < 0.1:
                 name = dst
-                k = s if rng.random() < 0.5 else rng.randint(-2, 2)
+                if rng.random() < 0.5:
+                    k, based = s, sb
+                else:
+                    k = rng.randint(-2, 2)
             else:
                 k = rng.randint(-2, 2)
-            return subscript(name, k)
+            return subscript(name, k, based)
         if r < 0.85:
             return "f"
         return rng.choice(LITERALS)
     op = rng.choice(["+", "-", "*"])
-    return (f"({expr(rng, depth - 1, dst, s)} {op} "
-            f"{expr(rng, depth - 1, dst, s)})")
+    return (f"({expr(rng, depth - 1, dst, s, sb)} {op} "
+            f"{expr(rng, depth - 1, dst, s, sb)})")
 
 
 def kernel(rng, i):
     dst = rng.choice(["a", "b"])
     s = rng.randint(-2, 2)
+    sb = rng.random() < 0.33
     typed = rng.random() < 0.5
     params = ("a: list[float], b: list[float], c: list[float], f: float"
               if typed else "a, b, c, f: float")
-    return (f"fn k{i}({params}, lo: int, hi: int) -> void {{\n"
-            f"    for j in lo..hi {{ {subscript(dst, s)} = {expr(rng, 3, dst, s)} }}\n"
+    return (f"fn k{i}({params}, row: int, lo: int, hi: int) -> void {{\n"
+            f"    for j in lo..hi {{ {subscript(dst, s, sb)} = "
+            f"{expr(rng, 3, dst, s, sb)} }}\n"
             f"}}\n")
 
 
@@ -111,6 +121,7 @@ def program(rng, kernels, warm):
         hi = max(lo, n + rng.choice([-3, -2, -2, -1, 0, 1]))
         alias = rng.choice(["none", "none", "ab", "ac", "bc"])
         f = rng.choice(["0.5", "-0.0", "NAN", "3.25", "INF"])
+        row = rng.choice([0, 0, 1, 2, 3, -1, -2, -3, 5, 40])
         src.append(f"        var a{i} = specials({n}, round + {i})")
         src.append(f"        var b{i} = specials({n}, round + {i + 5})")
         src.append(f"        var c{i} = specials({n}, round + {i + 9})")
@@ -123,7 +134,7 @@ def program(rng, kernels, warm):
         src.append(f"        var raised{i} = false")
         typed = f"fn k{i}(a: list[float]" in "".join(src)
         src.append("        try {")
-        src.append(f"            k{i}(a{i}, b{i}, c{i}, {f}, {lo}, {hi})")
+        src.append(f"            k{i}(a{i}, b{i}, c{i}, {f}, {row}, {lo}, {hi})")
         src.append("        } catch _failure {")
         src.append(f"            raised{i} = true")
         src.append("        }")
@@ -136,7 +147,7 @@ def program(rng, kernels, warm):
             src.append(f"            var y{i} = boxed({n}, round + 1)")
             src.append(f"            var r2{i} = false")
             src.append("            try {")
-            src.append(f"                k{i}(x{i}, y{i}, x{i}, {f}, {lo}, {hi})")
+            src.append(f"                k{i}(x{i}, y{i}, x{i}, {f}, {row}, {lo}, {hi})")
             src.append("            } catch _failure {")
             src.append(f"                r2{i} = true")
             src.append("            }")

@@ -61,14 +61,21 @@ static bool jitVectorOn(void) {
 /* |offset| on a subscript. ldur's reach is -256..255 bytes, and the unrolled
  * copies add up to 48 to it. */
 #define VEC_MAX_OFF   12
+/* A list read or written at `j + base + k` for one int local `base` is a
+ * stream of its own: its own pointer register, its own bounds. */
+#define VEC_MAX_STREAMS 6u
+#define VEC_NO_BASE   0xffffu
 
-enum { VS_LIST, VS_IDX, VS_INT, VS_INV, VS_VEC };
+/* VS_IREF is an int local plus a constant, on its way to becoming the base of
+ * an index: `row + x`, `lo + i + 1`. */
+enum { VS_LIST, VS_IDX, VS_INT, VS_INV, VS_VEC, VS_IREF };
 
 typedef struct {
-    uint8_t kind;
-    uint8_t list;     /* VS_LIST: index into plan.lists */
-    uint8_t inv;      /* VS_INV: index into plan.inv */
-    int64_t k;        /* VS_IDX: the offset; VS_INT: the value */
+    uint8_t  kind;
+    uint8_t  list;    /* VS_LIST: index into plan.lists */
+    uint8_t  inv;     /* VS_INV: index into plan.inv */
+    uint16_t base;    /* VS_IDX, VS_IREF: the int local, or VEC_NO_BASE */
+    int64_t  k;       /* VS_IDX, VS_IREF: the offset; VS_INT: the value */
 } VecSym;
 
 enum { VO_LOAD, VO_ADD, VO_SUB, VO_MUL, VO_STORE };
@@ -77,6 +84,7 @@ typedef struct {
     uint8_t op;
     uint8_t dst;      /* stack position the result lands in (LOAD and arithmetic) */
     uint8_t list;     /* LOAD/STORE */
+    uint8_t stream;   /* LOAD/STORE */
     int8_t  off;      /* LOAD/STORE */
     /* Operands of the arithmetic, and the STORE's value: a stack position, or
      * an invariant when the matching *Inv flag is set. */
@@ -87,8 +95,11 @@ typedef struct {
 typedef struct {
     unsigned listCount;
     uint16_t listSlot[VEC_MAX_LISTS];
-    int      lo[VEC_MAX_LISTS], hi[VEC_MAX_LISTS];
-    bool     read[VEC_MAX_LISTS];       /* loaded at an offset other than the store's */
+    bool     read[VEC_MAX_LISTS];       /* a list other than the stored one, loaded */
+    unsigned streamCount;
+    uint8_t  streamList[VEC_MAX_STREAMS];
+    uint16_t streamBase[VEC_MAX_STREAMS];
+    int      lo[VEC_MAX_STREAMS], hi[VEC_MAX_STREAMS];
     unsigned invCount;
     bool     invIsLocal[VEC_MAX_INV];
     uint16_t invSlot[VEC_MAX_INV];
@@ -97,6 +108,7 @@ typedef struct {
     VecOp    ops[VEC_MAX_OPS];
     unsigned maxDepth;
     unsigned storeList;
+    uint16_t storeBase;
     int      storeOff;
     uint16_t var, cur, end;
     int      failAt;      /* the body offset the match gave up at, or -1 */
@@ -108,11 +120,38 @@ static bool vecListIndex(VecPlan *p, uint16_t slot, unsigned *out) {
     }
     if (p->listCount >= VEC_MAX_LISTS) return false;
     p->listSlot[p->listCount] = slot;
-    p->lo[p->listCount] = INT32_MAX;
-    p->hi[p->listCount] = INT32_MIN;
     p->read[p->listCount] = false;
     *out = p->listCount++;
     return true;
+}
+
+static bool vecStream(VecPlan *p, unsigned list, uint16_t base, int k,
+                      unsigned *out) {
+    unsigned i;
+    for (i = 0; i < p->streamCount; i++) {
+        if (p->streamList[i] == list && p->streamBase[i] == base) break;
+    }
+    if (i == p->streamCount) {
+        if (p->streamCount >= VEC_MAX_STREAMS) return false;
+        p->streamList[i] = (uint8_t)list;
+        p->streamBase[i] = base;
+        p->lo[i] = INT32_MAX;
+        p->hi[i] = INT32_MIN;
+        p->streamCount++;
+    }
+    if (k < p->lo[i]) p->lo[i] = k;
+    if (k > p->hi[i]) p->hi[i] = k;
+    *out = i;
+    return true;
+}
+
+/* An int local fit to be an index base: read-only in the body (nothing in it
+ * writes a local) and none of the loop's own three. */
+static bool vecIntBase(const Emit *e, const VecPlan *p, uint16_t slot) {
+    if (slot > JIT_MAX_SLOTS || slot >= e->base + e->locals) return false;
+    if (e->dynamicLocal[slot] || e->nullableLocal[slot]) return false;
+    if (slot == p->var || slot == p->cur || slot == p->end) return false;
+    return e->localKind[slot] == SLOT_INT;
 }
 
 static bool vecPushLocal(const Emit *e, VecPlan *p, VecSym *st, unsigned *d,
@@ -122,8 +161,13 @@ static bool vecPushLocal(const Emit *e, VecPlan *p, VecSym *st, unsigned *d,
     if (e->dynamicLocal[slot] || e->nullableLocal[slot]) return false;
     if (slot == p->cur || slot == p->end) return false;
     VecSym s = { 0 };
+    s.base = VEC_NO_BASE;
     if (slot == p->var) {
         s.kind = VS_IDX;
+        s.k = 0;
+    } else if (vecIntBase(e, p, slot)) {
+        s.kind = VS_IREF;
+        s.base = slot;
         s.k = 0;
     } else if (e->localKind[slot] == SLOT_LIST) {
         unsigned li;
@@ -184,7 +228,7 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
     VecSym st[VEC_MAX_DEPTH];
     unsigned d = 0;
     bool stored = false;
-    p->listCount = p->invCount = p->opCount = 0;
+    p->listCount = p->invCount = p->opCount = p->streamCount = 0;
     p->maxDepth = 0;
     p->failAt = -1;
     for (int32_t at = (int32_t)off + 9; at < loopAt;) {
@@ -211,13 +255,21 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
             break;
         case OP_ADD_INT_CONST:
         case OP_SUB_INT_CONST: {
-            /* `j + k` fused: u16 slot, i16 k. Only on the loop variable. */
+            /* `j + k` or `base + k` fused: u16 slot, i16 k. */
             if (len != 5 || d >= VEC_MAX_DEPTH) return false;
-            if (jaiReadU16(code + at + 1) != p->var) return false;
+            uint16_t ks = jaiReadU16(code + at + 1);
             int64_t k = jaiReadI16(code + at + 3);
             if (op == OP_SUB_INT_CONST) k = -k;
             if (k < -VEC_MAX_OFF || k > VEC_MAX_OFF) return false;
-            st[d].kind = VS_IDX;
+            if (ks == p->var) {
+                st[d].kind = VS_IDX;
+                st[d].base = VEC_NO_BASE;
+            } else if (vecIntBase(e, p, ks)) {
+                st[d].kind = VS_IREF;
+                st[d].base = ks;
+            } else {
+                return false;
+            }
             st[d].k = k;
             d++;
             break;
@@ -257,17 +309,33 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
         case OP_MUL: {
             if (d < 2) return false;
             VecSym *a = &st[d - 2], *b = &st[d - 1];
-            /* `j + k`, `j - k`, `k + j`: index arithmetic, folded. */
-            if (op != OP_MUL && a->kind == VS_IDX && b->kind == VS_INT) {
+            /* `j + k`, `j - k`, `k + j`, `base + j`, `j + base`, and the
+             * same with a base already in: index arithmetic, folded. */
+            bool aIx = a->kind == VS_IDX || a->kind == VS_IREF;
+            bool bIx = b->kind == VS_IDX || b->kind == VS_IREF;
+            if (op != OP_MUL && aIx && b->kind == VS_INT) {
                 int64_t k = op == OP_ADD ? a->k + b->k : a->k - b->k;
                 if (k < -VEC_MAX_OFF || k > VEC_MAX_OFF) return false;
                 a->k = k;
                 d--;
                 break;
             }
-            if (op == OP_ADD && a->kind == VS_INT && b->kind == VS_IDX) {
+            if (op == OP_ADD && a->kind == VS_INT && bIx) {
                 int64_t k = a->k + b->k;
                 if (k < -VEC_MAX_OFF || k > VEC_MAX_OFF) return false;
+                *a = *b;
+                a->k = k;
+                d--;
+                break;
+            }
+            if (op == OP_ADD &&
+                ((a->kind == VS_IDX && a->base == VEC_NO_BASE &&
+                  b->kind == VS_IREF) ||
+                 (a->kind == VS_IREF && b->kind == VS_IDX &&
+                  b->base == VEC_NO_BASE))) {
+                int64_t k = a->k + b->k;
+                if (k < -VEC_MAX_OFF || k > VEC_MAX_OFF) return false;
+                a->base = a->kind == VS_IREF ? a->base : b->base;
                 a->kind = VS_IDX;
                 a->k = k;
                 d--;
@@ -296,12 +364,13 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
             if (l->kind != VS_LIST || ix->kind != VS_IDX) return false;
             unsigned li = l->list;
             int k = (int)ix->k;
-            if (k < p->lo[li]) p->lo[li] = k;
-            if (k > p->hi[li]) p->hi[li] = k;
+            unsigned si;
+            if (!vecStream(p, li, ix->base, k, &si)) return false;
             VecOp *o = &p->ops[p->opCount++];
             o->op = VO_LOAD;
             o->dst = (uint8_t)(d - 2);
             o->list = (uint8_t)li;
+            o->stream = (uint8_t)si;
             o->off = (int8_t)k;
             l->kind = VS_VEC;
             d--;
@@ -316,15 +385,17 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
             if (v->kind != VS_VEC && v->kind != VS_INV) return false;
             unsigned li = l->list;
             int k = (int)ix->k;
-            if (k < p->lo[li]) p->lo[li] = k;
-            if (k > p->hi[li]) p->hi[li] = k;
+            unsigned si;
+            if (!vecStream(p, li, ix->base, k, &si)) return false;
             VecOp *o = &p->ops[p->opCount++];
             o->op = VO_STORE;
             o->list = (uint8_t)li;
+            o->stream = (uint8_t)si;
             o->off = (int8_t)k;
             o->aInv = v->kind == VS_INV;
             o->a = o->aInv ? v->inv : 2u;
             p->storeList = li;
+            p->storeBase = ix->base;
             p->storeOff = k;
             stored = true;
             d = 0;
@@ -345,7 +416,11 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
     for (unsigned i = 0; i < p->opCount; i++) {
         const VecOp *o = &p->ops[i];
         if (o->op != VO_LOAD) continue;
-        if (o->list == p->storeList && o->off != p->storeOff) return false;
+        if (o->list == p->storeList &&
+            (o->off != p->storeOff ||
+             p->streamBase[o->stream] != p->storeBase)) {
+            return false;
+        }
         if (o->list != p->storeList) p->read[o->list] = true;
     }
     return true;
@@ -394,7 +469,7 @@ static void vecBody(Emit *e, const VecPlan *p, const uint8_t *dense,
             unsigned rb = o->bInv ? 31u - o->b : VREG(o->b, u);
             switch (o->op) {
             case VO_LOAD:
-                emit(e, jaiA64LdurQ(VREG(o->dst, u), xP[o->list], at));
+                emit(e, jaiA64LdurQ(VREG(o->dst, u), xP[o->stream], at));
                 break;
             case VO_ADD:
                 emit(e, jaiA64Fadd2D(VREG(o->dst, u), ra, rb));
@@ -406,7 +481,7 @@ static void vecBody(Emit *e, const VecPlan *p, const uint8_t *dense,
                 emit(e, jaiA64Fmul2D(VREG(o->dst, u), ra, rb));
                 break;
             case VO_STORE:
-                emit(e, jaiA64SturQ(ra, xP[o->list], at));
+                emit(e, jaiA64SturQ(ra, xP[o->stream], at));
                 break;
             }
         }
@@ -448,14 +523,20 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
 
     uint8_t freeX[16];
     unsigned nFree = vecFreeX(e, freeX);
-    if (nFree < p.listCount + 3u) return;
+    bool anyBase = false, anyPlain = false;
+    for (unsigned si = 0; si < p.streamCount; si++) {
+        if (p.streamBase[si] != VEC_NO_BASE) anyBase = true;
+        else anyPlain = true;
+    }
+    if (nFree < p.streamCount + 3u + (anyBase ? 1u : 0u)) return;
     const unsigned tA = JIT_SCRATCH_A, tB = JIT_SCRATCH_B;
     unsigned fi = 0;
     unsigned xC = freeX[fi++], xE = freeX[fi++], xN = freeX[fi++];
-    unsigned xP[VEC_MAX_LISTS];
-    for (unsigned l = 0; l < p.listCount; l++) xP[l] = freeX[fi++];
+    unsigned xS = anyBase ? freeX[fi++] : 0u;
+    unsigned xP[VEC_MAX_STREAMS];
+    for (unsigned si = 0; si < p.streamCount; si++) xP[si] = freeX[fi++];
 
-    unsigned skips[4 + 3 * VEC_MAX_LISTS + VEC_MAX_LISTS];
+    unsigned skips[6 + 7 * VEC_MAX_STREAMS + VEC_MAX_LISTS];
     unsigned nSkip = 0;
 #define VEC_SKIP(cond)                                                       \
     do {                                                                     \
@@ -470,37 +551,61 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     r = localIn(e, p.end, xE);
     if (r != xE) emit(e, jaiA64MovX(xE, r));
 
-    /* Every index is cur + lo or more: cur >= -minLo. */
-    int minLo = 0;
-    for (unsigned l = 0; l < p.listCount; l++) {
-        if (p.lo[l] < minLo) minLo = p.lo[l];
-    }
-    emit(e, jaiA64SubsXImm(31, xC, (unsigned)(-minLo)));
-    VEC_SKIP(JAI_A64_LT);
-    /* At least one whole group. end > cur >= 0, so end - cur cannot wrap. */
+    /* At least one whole group: end > cur, and end - cur neither wraps nor
+     * falls short of 2U. */
     emit(e, jaiA64SubsXReg(31, xE, xC));
     VEC_SKIP(JAI_A64_LE);
-    emit(e, jaiA64SubX(xN, xE, xC));
+    emit(e, jaiA64SubsX(xN, xE, xC));
+    VEC_SKIP(JAI_A64_VS);
     emit(e, jaiA64SubsXImm(31, xN, 2u * U));
     VEC_SKIP(JAI_A64_LT);
+    /* Every plain index is cur + lo or more: cur >= -minLo. */
+    if (anyPlain) {
+        int minLo = 0;
+        for (unsigned si = 0; si < p.streamCount; si++) {
+            if (p.streamBase[si] == VEC_NO_BASE && p.lo[si] < minLo) {
+                minLo = p.lo[si];
+            }
+        }
+        emit(e, jaiA64SubsXImm(31, xC, (unsigned)(-minLo)));
+        VEC_SKIP(JAI_A64_LT);
+    }
 
-    for (unsigned l = 0; l < p.listCount; l++) {
-        unsigned rl = localIn(e, p.listSlot[l], tA);
+    for (unsigned si = 0; si < p.streamCount; si++) {
+        unsigned rl = localIn(e, p.listSlot[p.streamList[si]], tA);
         emit(e, jaiA64LdrByte(tB, rl, (unsigned)offsetof(ObjList, stg)));
         emit(e, jaiA64SubsXImm(31, tB, LIST_STORE_F64));
         VEC_SKIP(JAI_A64_NE);
-        /* The last index reached is end - 1 + hi < count, i.e.
-         * end <= count - hi. count is a non-negative int and |hi| <= 12. */
+        /* The last index reached is end - 1 + base + hi < count, i.e.
+         * end + base <= count - hi. count is a non-negative int and
+         * |hi| <= 12, so the right side cannot wrap. */
         emit(e, jaiA64LdrW(tB, rl, (unsigned)offsetof(ObjList, count)));
-        if (p.hi[l] > 0) {
-            emit(e, jaiA64SubXImm(tB, tB, (unsigned)p.hi[l]));
-        } else if (p.hi[l] < 0) {
-            emit(e, jaiA64AddXImm(tB, tB, (unsigned)(-p.hi[l])));
+        if (p.hi[si] > 0) {
+            emit(e, jaiA64SubXImm(tB, tB, (unsigned)p.hi[si]));
+        } else if (p.hi[si] < 0) {
+            emit(e, jaiA64AddXImm(tB, tB, (unsigned)(-p.hi[si])));
         }
-        emit(e, jaiA64SubsXReg(31, xE, tB));
+        emit(e, jaiA64LdrX(xP[si], rl, (unsigned)offsetof(ObjList, items)));
+        if (p.streamBase[si] == VEC_NO_BASE) {
+            emit(e, jaiA64SubsXReg(31, xE, tB));
+            VEC_SKIP(JAI_A64_GT);
+            emit(e, jaiA64AddXLsl(xP[si], xP[si], xC, 3));
+            continue;
+        }
+        /* A base: end + base and cur + base must not wrap, and the first
+         * index reached, cur + base + lo, must not be negative -- a negative
+         * index wraps to the far end, which is the scalar loop's business. */
+        unsigned rb = localIn(e, p.streamBase[si], tA);
+        emit(e, jaiA64AddsX(xS, xE, rb));
+        VEC_SKIP(JAI_A64_VS);
+        emit(e, jaiA64SubsXReg(31, xS, tB));
         VEC_SKIP(JAI_A64_GT);
-        emit(e, jaiA64LdrX(xP[l], rl, (unsigned)offsetof(ObjList, items)));
-        emit(e, jaiA64AddXLsl(xP[l], xP[l], xC, 3));
+        emit(e, jaiA64AddsX(xS, xC, rb));
+        VEC_SKIP(JAI_A64_VS);
+        emit(e, jaiA64SubsXImm(31, xS,
+                               p.lo[si] < 0 ? (unsigned)(-p.lo[si]) : 0u));
+        VEC_SKIP(JAI_A64_LT);
+        emit(e, jaiA64AddXLsl(xP[si], xP[si], xS, 3));
     }
     /* The stored list must be no list read at another offset. */
     for (unsigned l = 0; l < p.listCount; l++) {
@@ -528,8 +633,8 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
 
     unsigned top = e->count;
     vecBody(e, &p, dense, U, U, xP);
-    for (unsigned l = 0; l < p.listCount; l++) {
-        emit(e, jaiA64AddXImm(xP[l], xP[l], 16u * U));
+    for (unsigned si = 0; si < p.streamCount; si++) {
+        emit(e, jaiA64AddXImm(xP[si], xP[si], 16u * U));
     }
     emit(e, jaiA64SubsXImm(xN, xN, 1));
     emit(e, jaiA64BCond(JAI_A64_NE, (int32_t)top - (int32_t)e->count));
@@ -547,8 +652,8 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
         emit(e, jaiA64AddXLsl(xC, xC, xN, 1));
         unsigned pairTop = e->count;
         vecBody(e, &p, dense, U, 1, xP);
-        for (unsigned l = 0; l < p.listCount; l++) {
-            emit(e, jaiA64AddXImm(xP[l], xP[l], 16u));
+        for (unsigned si = 0; si < p.streamCount; si++) {
+            emit(e, jaiA64AddXImm(xP[si], xP[si], 16u));
         }
         emit(e, jaiA64SubsXImm(xN, xN, 1));
         emit(e, jaiA64BCond(JAI_A64_NE,
@@ -575,9 +680,9 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     }
 #undef VEC_SKIP
     if (getenv("JAI_JIT_WHY")) {
-        fprintf(stderr, "[jit] %s %s at %u: vectorised %u lists x %u lanes\n",
-                e->osr ? "osr" : "func", jitFnLabel(fn), off, p.listCount,
-                2u * U);
+        fprintf(stderr, "[jit] %s %s at %u: vectorised %u lists, %u streams "
+                "x %u lanes\n", e->osr ? "osr" : "func", jitFnLabel(fn), off,
+                p.listCount, p.streamCount, 2u * U);
     }
 }
 

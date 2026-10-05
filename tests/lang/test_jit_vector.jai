@@ -191,3 +191,92 @@ fn test_lists_that_are_not_unboxed_floats_take_the_scalar_loop() -> void {
         assert_true(same_lists(g2, w2))
     }
 }
+
+# `row + x`: a subscript with an int local as its base. Each (list, base) pair
+# is a stream with its own bounds, checked at run time with the base's value.
+fn based(src: list[float], dst: list[float], row: int, w: int, k: float) -> void {
+    for x in 0..w { dst[row + x] = src[row + x] * k + src[x + row + 1] }
+}
+
+fn based_ref(src: list[float], dst: list[float], row: int, w: int, k: float) -> void {
+    var x = 0
+    while x < w {
+        dst[row + x] = src[row + x] * k + src[x + row + 1]
+        x += 1
+    }
+}
+
+# One list under two bases: a recurrence whenever the windows overlap, so it is
+# refused outright.
+fn smear(a: list[float], b0: int, b1: int, w: int) -> void {
+    for x in 0..w { a[b0 + x] = a[b1 + x] * 0.5 + 1.0 }
+}
+
+fn smear_ref(a: list[float], b0: int, b1: int, w: int) -> void {
+    var x = 0
+    while x < w {
+        a[b0 + x] = a[b1 + x] * 0.5 + 1.0
+        x += 1
+    }
+}
+
+fn test_a_based_subscript_is_bit_identical_for_every_base() -> void {
+    for _round in 0..60 {
+        for row in -20..24 {
+            for w in 0..20 {
+                let src = specials(40)
+                var got = zeros(40)
+                var want = zeros(40)
+                var r1 = false
+                var r2 = false
+                try {
+                    based(src, got, row, w, -1.25)
+                } catch _failure {
+                    r1 = true
+                }
+                try {
+                    based_ref(src, want, row, w, -1.25)
+                } catch _failure {
+                    r2 = true
+                }
+                assert_eq(r1, r2, f"row={row} w={w}")
+                assert_true(same_lists(got, want), f"row={row} w={w}")
+            }
+        }
+    }
+}
+
+# A base whose sum with the counter would wrap: the run-time check refuses it,
+# and the scalar loop raises at its first element, as it always did.
+fn test_a_based_subscript_near_the_int_limit_still_raises() -> void {
+    for _round in 0..100 {
+        let src = specials(40)
+        var got = zeros(40)
+        var want = zeros(40)
+        let huge = 9223372036854775800
+        assert_throws(IndexError, || based(src, got, huge, 16, 2.0))
+        assert_throws(IndexError, || based_ref(src, want, huge, 16, 2.0))
+        assert_throws(IndexError, || based(src, got, -huge, 16, 2.0))
+        assert_throws(IndexError, || based_ref(src, want, -huge, 16, 2.0))
+        assert_true(same_lists(got, want))
+    }
+}
+
+fn test_one_list_under_two_bases_and_two_names_stays_scalar() -> void {
+    for _round in 0..100 {
+        for b0 in 0..6 {
+            for b1 in 0..6 {
+                var got = specials(30)
+                var want = copy(got)
+                smear(got, b0, b1, 20)
+                smear_ref(want, b0, b1, 20)
+                assert_true(same_lists(got, want), f"smear {b0} {b1}")
+                var g2 = specials(40)
+                var w2 = copy(g2)
+                based(g2, g2, b0, 16, 0.5)
+                based_ref(w2, w2, b0, 16, 0.5)
+                assert_true(same_lists(g2, w2), f"based alias {b0}")
+            }
+        }
+    }
+}
