@@ -1394,10 +1394,14 @@ JAI_INLINE bool fmtRun(char *buf, size_t *o, const Obj *run) {
  * of the format, the hash and the intern probe: two thirds of an iteration.
  *
  * What makes an entry sound:
- *  - Only an intern HIT is kept. The answer is then the one string with those
- *    bytes, the same object the leaf would hand back again, so a hit changes
- *    nothing anybody can observe; a string that was never interned is never
- *    shared through here.
+ *  - Only an intern HIT is kept, and only while the intern table is under its
+ *    soft cap (formatShortProbe asks nothing of a table past it). The answer
+ *    is then the one string with those bytes, the same object the leaf would
+ *    hand back again. Past the cap the leaf builds a fresh string on every
+ *    call, so `a is b` on two of them is false in the interpreter; an entry
+ *    filed before the cap would make it true in compiled code. So the intern
+ *    table empties the memo when it reaches its cap (jaiInternTableAdd), and
+ *    nothing is filed again until a collection takes it back under.
  *  - pre and post are keys by identity. Strings never change their bytes
  *    (length and chars are written once, at creation), so while both are
  *    alive their identity is their content.

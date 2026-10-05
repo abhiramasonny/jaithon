@@ -4,12 +4,13 @@
 #: keys its runs by identity, so these check the cases where a stale or
 #: confused entry would show: the all-absent key of `f"{n}"` against an empty
 #: slot, two sites sharing one int, a run that is a different string on each
-#: call, and runs freed and their addresses reused across collections.
+#: call, runs freed and their addresses reused across collections, and the
+#: intern table's soft cap, past which every call is a new string.
 #:
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it; `JAITHON_NO_JIT=1` runs the same file, and
 #: every answer is the interpreter's.
-# jit-compiles: bare, stringify, two_sites, with_runs, keyed_count
+# jit-compiles: bare, stringify, two_sites, with_runs, keyed_count, label, plain_label, same_label_count, same_plain_count
 from std.test import assert_eq, assert_true
 
 fn bare(n: int) -> str {
@@ -37,6 +38,38 @@ fn keyed_count(counts: dict, n: int, reps: int) -> void {
         counts[key] = counts.get(key, 0) + 1
         i += 1
     }
+}
+
+fn label(n: int) -> str {
+    return f"item-{n}"
+}
+
+fn plain_label(n: int) -> str {
+    return str(n + 1000)
+}
+
+fn same_label_count(reps: int) -> int {
+    var i = 0
+    var t = 0
+    while i < reps {
+        let a = label(i % 20)
+        let b = label(i % 20)
+        if a is b { t += 1 }
+        i += 1
+    }
+    return t
+}
+
+fn same_plain_count(reps: int) -> int {
+    var i = 0
+    var t = 0
+    while i < reps {
+        let a = plain_label(i % 20)
+        let b = plain_label(i % 20)
+        if a is b { t += 1 }
+        i += 1
+    }
+    return t
 }
 
 pub fn test_bare_int_zero_is_not_an_empty_slot() -> void {
@@ -155,4 +188,30 @@ pub fn test_past_the_intern_soft_cap() -> void {
         assert_eq(bare(r + 100000), str(r + 100000))
         r += 1
     }
+}
+
+pub fn test_past_the_cap_each_call_is_a_new_string() -> void {
+    #: Once the intern table is past its soft cap the leaf builds a fresh
+    #: string on every call, so two calls are two objects -- as the
+    #: interpreter has them. A memo entry filed before the cap must not keep
+    #: answering the old one. The ballast lifts the collector's threshold,
+    #: since a collection in between would empty the memo and hide it.
+    var live = []
+    var j = 0
+    while j < 300000 {
+        live.push([j, j + 1])
+        j += 1
+    }
+    __prim__.gc_collect()
+    same_label_count(3000)
+    same_plain_count(3000)
+    var keep = []
+    var k = 0
+    while k < 40000 {
+        keep.push(f"name{k}")
+        k += 1
+    }
+    assert_eq(same_label_count(3000), 0)
+    assert_eq(same_plain_count(3000), 0)
+    assert_true(keep.len() == 40000 and live.len() == 300000)
 }
