@@ -235,34 +235,58 @@ kernel void nds_bitonic4(device float* values [[buffer(0)]],
 constexpr constant uint RS_E = 16u;
 constexpr constant uint ROW_SORT_MAX = 4096u;
 
+/* The network's order as one unsigned compare.
+ *
+ * `nds_after(a, b)` with no carry is exactly `rs_key(a) > rs_key(b)`: NaN takes
+ * the largest key, so it follows everything and ties every other NaN; -0.0
+ * folds onto 0.0, so the two tie as the float compare has them; a present
+ * float maps to the standard order-preserving bits, which stop short of the
+ * NaN key. Descending is the complement, which turns the whole order over with
+ * NaN in it -- as `nds_after` does. With a carry the slot index breaks a tie,
+ * the same way. So every exchange below decides as `nds_bitonic` would, and
+ * the key only replaces six float tests with one integer one. It is never
+ * stored: the payload a slot carries is the value itself, or for an argsort
+ * the starting slot, whose value is gathered back at the end. */
+inline uint rs_key(float value, uint descending) {
+    uint bits = as_type<uint>(value);
+    uint key;
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+        key = 0xFFFFFFFFu;
+    } else {
+        if ((bits << 1) == 0u) bits = 0u;
+        key = (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+    }
+    return descending != 0u ? ~key : key;
+}
+
 template <bool CARRY>
-inline void rs_settle(thread float* v, thread float* kk, thread float* w, thread float* wk,
-                      bool lower, bool up, uint descending) {
+inline bool rs_after(uint ka, uint kb, float pa, float pb) {
+    if (CARRY) return ka > kb || (ka == kb && pa > pb);
+    return ka > kb;
+}
+
+template <bool CARRY>
+inline void rs_settle(thread uint* kk, thread float* v, thread uint* wk, thread float* w,
+                      bool lower, bool up) {
     for (uint k = 0u; k < RS_E; ++k) {
-        bool after = lower
-            ? nds_after(v[k], w[k], CARRY ? uint(kk[k]) : 0u, CARRY ? uint(wk[k]) : 0u,
-                        descending, CARRY ? 1u : 0u)
-            : nds_after(w[k], v[k], CARRY ? uint(wk[k]) : 0u, CARRY ? uint(kk[k]) : 0u,
-                        descending, CARRY ? 1u : 0u);
+        bool after = lower ? rs_after<CARRY>(kk[k], wk[k], v[k], w[k])
+                           : rs_after<CARRY>(wk[k], kk[k], w[k], v[k]);
         if (after == up) {
+            kk[k] = wk[k];
             v[k] = w[k];
-            if (CARRY) kk[k] = wk[k];
         }
     }
 }
 
 template <bool CARRY, uint J>
-inline void rs_in_thread(thread float* v, thread float* kk, uint first, uint padded, uint stage,
-                         uint descending) {
+inline void rs_in_thread(thread uint* kk, thread float* v, uint first, uint padded, uint stage) {
     for (uint k = 0u; k < RS_E; ++k) {
         if ((k & J) != 0u) continue;
         uint hi = k | J;
         bool up = ((first + k) & (padded - 1u) & stage) == 0u;
-        bool after = nds_after(v[k], v[hi], CARRY ? uint(kk[k]) : 0u, CARRY ? uint(kk[hi]) : 0u,
-                               descending, CARRY ? 1u : 0u);
-        if (after == up) {
-            float t = v[k]; v[k] = v[hi]; v[hi] = t;
-            if (CARRY) { float tk = kk[k]; kk[k] = kk[hi]; kk[hi] = tk; }
+        if (rs_after<CARRY>(kk[k], kk[hi], v[k], v[hi]) == up) {
+            uint tk = kk[k]; kk[k] = kk[hi]; kk[hi] = tk;
+            float tv = v[k]; v[k] = v[hi]; v[hi] = tv;
         }
     }
 }
@@ -274,15 +298,18 @@ inline void rs_sort(device float* values, device float* keys, uint total, uint p
     uint base = group * threads * RS_E;
     uint first = lid * RS_E;
     float pad = as_type<float>(descending != 0u ? 0xFF800000u : 0x7FC00000u);
+    threadgroup uint* share_keys = (threadgroup uint*)share;
+    /* `v` is the payload: the value for a sort, the starting slot for an
+     * argsort. `kk` is the order key, recomputed from the value at load. */
+    uint kk[RS_E];
     float v[RS_E];
-    float kk[RS_E];
+    uint wk[RS_E];
     float w[RS_E];
-    float wk[RS_E];
     for (uint k = 0u; k < RS_E; ++k) {
         uint at = base + first + k;
-        v[k] = at < total ? values[at] : pad;
-        kk[k] = float((first + k) & (padded - 1u));
-        wk[k] = 0.0f;
+        float value = at < total ? values[at] : pad;
+        kk[k] = rs_key(value, descending);
+        v[k] = CARRY ? float((first + k) & (padded - 1u)) : value;
     }
     for (uint stage = 2u; stage <= padded; stage <<= 1u) {
         uint j = stage >> 1u;
@@ -290,36 +317,48 @@ inline void rs_sort(device float* values, device float* keys, uint total, uint p
         for (; j >= 32u * RS_E; j >>= 1u) {
             uint step = j / RS_E;
             uint other = lid ^ step;
+            for (uint k = 0u; k < RS_E; ++k) share_keys[k * threads + lid] = kk[k];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint k = 0u; k < RS_E; ++k) wk[k] = share_keys[k * threads + other];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint k = 0u; k < RS_E; ++k) share[k * threads + lid] = v[k];
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint k = 0u; k < RS_E; ++k) w[k] = share[k * threads + other];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (CARRY) {
-                for (uint k = 0u; k < RS_E; ++k) share[k * threads + lid] = kk[k];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint k = 0u; k < RS_E; ++k) wk[k] = share[k * threads + other];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            rs_settle<CARRY>(v, kk, w, wk, (lid & step) == 0u, up, descending);
+            rs_settle<CARRY>(kk, v, wk, w, (lid & step) == 0u, up);
         }
         for (; j >= RS_E; j >>= 1u) {
             ushort step = ushort(j / RS_E);
             for (uint k = 0u; k < RS_E; ++k) {
+                wk[k] = simd_shuffle_xor(kk[k], step);
                 w[k] = simd_shuffle_xor(v[k], step);
-                if (CARRY) wk[k] = simd_shuffle_xor(kk[k], step);
             }
-            rs_settle<CARRY>(v, kk, w, wk, (lid & uint(step)) == 0u, up, descending);
+            rs_settle<CARRY>(kk, v, wk, w, (lid & uint(step)) == 0u, up);
         }
-        if (RS_E > 8u && stage >= 16u) rs_in_thread<CARRY, 8u>(v, kk, first, padded, stage, descending);
-        if (stage >= 8u) rs_in_thread<CARRY, 4u>(v, kk, first, padded, stage, descending);
-        if (stage >= 4u) rs_in_thread<CARRY, 2u>(v, kk, first, padded, stage, descending);
-        rs_in_thread<CARRY, 1u>(v, kk, first, padded, stage, descending);
+        if (RS_E > 8u && stage >= 16u) rs_in_thread<CARRY, 8u>(kk, v, first, padded, stage);
+        if (stage >= 8u) rs_in_thread<CARRY, 4u>(kk, v, first, padded, stage);
+        if (stage >= 4u) rs_in_thread<CARRY, 2u>(kk, v, first, padded, stage);
+        rs_in_thread<CARRY, 1u>(kk, v, first, padded, stage);
+    }
+    if (CARRY) {
+        /* Every slot's value is the one its starting slot held, still in the
+         * workspace: a group owns whole rows, so it gathers them all before
+         * any of its threads writes. */
+        for (uint k = 0u; k < RS_E; ++k) {
+            uint at = base + first + k;
+            w[k] = at < total ? values[(at & ~(padded - 1u)) + uint(v[k])] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
     }
     for (uint k = 0u; k < RS_E; ++k) {
         uint at = base + first + k;
         if (at >= total) continue;
-        values[at] = v[k];
-        if (CARRY) keys[at] = kk[k];
+        if (CARRY) {
+            values[at] = w[k];
+            keys[at] = v[k];
+        } else {
+            values[at] = v[k];
+        }
     }
 }
 
