@@ -19,6 +19,7 @@ from std.core import Printable
 from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_32S, CV_8U, CV_MAKETYPE, Point, Point2f, Rect, Scalar
 from std.gpu import Buffer, Kernel
+from std.os import env_or
 
 #: Fill only where the neighbour's value is close to the seed's.
 pub const FLOODFILL_FIXED_RANGE = 1 << 16
@@ -564,6 +565,103 @@ kernel void integral_cols(device float* dst [[buffer(0)]],
     }
 }
 
+/* The numbering on the device, so the labels never wait on the host.
+ *
+ * A component's number is how many components were first met before it, so
+ * each root marks the scan position where its component was first met, and an
+ * exclusive count of marks over positions is the numbering: one pass to count
+ * the marks in each group of positions, one group to turn those counts into
+ * where each group starts, and one pass to hand every mark its rank. The host
+ * used to read the roots back, sort them by where they were first seen and
+ * upload the order, which split the work into two command buffers with a
+ * round trip and a sort between them.
+ *
+ * `marks` is zeroed by the host and indexed by scan position, so it is wider
+ * than the frame by the empty corners of the last 2x2 blocks when a side is
+ * odd; those stay zero. Held to `CC_RANK_GROUP` on the host. */
+#define CC_RANK_GROUP 256u
+#define CC_RANK_WARPS 8u
+
+kernel void cc_mark(device const uint* labels [[buffer(0)]],
+                    device const uint* first [[buffer(1)]],
+                    device uint* marks [[buffer(2)]],
+                    constant uint& count [[buffer(3)]],
+                    uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    if (labels[id] != id + 1u) return;
+    marks[first[id]] = id + 1u;
+}
+
+kernel void cc_rank_count(device const uint* marks [[buffer(0)]],
+                          device uint* tallies [[buffer(1)]],
+                          constant uint& reach [[buffer(2)]],
+                          uint id [[thread_position_in_grid]],
+                          uint lid [[thread_index_in_threadgroup]],
+                          uint wid [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint lanes[CC_RANK_WARPS];
+    uint has = (id < reach && marks[id] != 0u) ? 1u : 0u;
+    uint total = simd_sum(has);
+    if (lane == 0u) lanes[warp] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid != 0u) return;
+    uint sum = 0u;
+    for (uint w = 0u; w < CC_RANK_WARPS; w++) sum += lanes[w];
+    tallies[wid] = sum;
+}
+
+kernel void cc_rank_scan(device const uint* tallies [[buffer(0)]],
+                         device uint* bases [[buffer(1)]],
+                         device float* total [[buffer(2)]],
+                         constant uint& groups [[buffer(3)]],
+                         uint lid [[thread_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint lanes[CC_RANK_WARPS];
+    threadgroup uint carry;
+    if (lid == 0u) carry = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint base = 0u; base < groups; base += CC_RANK_GROUP) {
+        uint at = base + lid;
+        uint mine = at < groups ? tallies[at] : 0u;
+        uint before = simd_prefix_exclusive_sum(mine);
+        uint whole = simd_sum(mine);
+        if (lane == 0u) lanes[warp] = whole;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint ahead = 0u;
+        for (uint w = 0u; w < warp; w++) ahead += lanes[w];
+        uint block = 0u;
+        for (uint w = 0u; w < CC_RANK_WARPS; w++) block += lanes[w];
+        if (at < groups) bases[at] = carry + ahead + before;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0u) carry += block;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) total[0] = float(carry);
+}
+
+kernel void cc_rank_assign(device const uint* marks [[buffer(0)]],
+                           device const uint* bases [[buffer(1)]],
+                           device uint* remap [[buffer(2)]],
+                           constant uint& reach [[buffer(3)]],
+                           uint id [[thread_position_in_grid]],
+                           uint wid [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint lanes[CC_RANK_WARPS];
+    uint root = id < reach ? marks[id] : 0u;
+    uint has = root != 0u ? 1u : 0u;
+    uint before = simd_prefix_exclusive_sum(has);
+    uint whole = simd_sum(has);
+    if (lane == 0u) lanes[warp] = whole;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (has == 0u) return;
+    uint ahead = 0u;
+    for (uint w = 0u; w < warp; w++) ahead += lanes[w];
+    remap[root - 1u] = bases[wid] + ahead + before + 1u;
+}
+
 kernel void cc_tally(device const uint* value [[buffer(0)]],
                      device float* out [[buffer(1)]],
                      constant uint& count [[buffer(2)]],
@@ -700,6 +798,13 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
     #: numbers by where a component was first met. Only one entry per
     #: component travels for that, not one per pixel.
     kernel_for("cc_first_seen").dispatch_async([labels, first], count, [count, cols, connectivity])
+    if _CC_DEVICE_NUMBERING {
+        let numbered = _number_on_device(labels, first, out, rows, cols, connectivity)
+        labels.free()
+        counted.free()
+        first.free()
+        return (numbered + 1, out)
+    }
     let tally = Buffer(1)
     tally.fill_zero()
     let roots = Buffer(count)
@@ -738,6 +843,62 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
     seen.free()
     remap.free()
     return (total, out)
+}
+
+#: Number the components by where a raster scan first meets them, write the
+#: labels into `out`, and return how many there are -- all on the device, with
+#: the count the only thing read back.
+fn _number_on_device(
+    labels: Buffer,
+    first: Buffer,
+    out: Mat,
+    rows: int,
+    cols: int,
+    connectivity: int
+) -> int {
+    let count = rows * cols
+    #: Scan positions run over whole 2x2 blocks for eight-connectivity, so an
+    #: odd side leaves positions no pixel owns.
+    let reach = if connectivity == 4 { count } else { ((rows + 1) // 2) * ((cols + 1) // 2) * 4 }
+    let marks = Buffer(reach)
+    marks.fill_zero()
+    kernel_for("cc_mark").dispatch_async([labels, first, marks], count, [count])
+    let groups = (reach + CC_RANK_GROUP - 1) // CC_RANK_GROUP
+    let tallies = Buffer(groups)
+    let bases = Buffer(groups)
+    let total = Buffer(1)
+    kernel_for("cc_rank_count").dispatch_async(
+        [marks, tallies],
+        groups * CC_RANK_GROUP,
+        [reach],
+        group_size: CC_RANK_GROUP
+    )
+    kernel_for("cc_rank_scan").dispatch_async(
+        [tallies, bases, total],
+        CC_RANK_GROUP,
+        [groups],
+        group_size: CC_RANK_GROUP
+    )
+    let remap = Buffer(count)
+    kernel_for("cc_rank_assign").dispatch_async(
+        [marks, bases, remap],
+        groups * CC_RANK_GROUP,
+        [reach],
+        group_size: CC_RANK_GROUP
+    )
+    kernel_for("cc_apply").dispatch_async(
+        [labels, remap, out.storage],
+        count,
+        [count, cols, out.offset, out.step_]
+    )
+    out.invalidate()
+    let numbered = int(total.download()[0])
+    marks.free()
+    tallies.free()
+    bases.free()
+    total.free()
+    remap.free()
+    return numbered
 }
 
 #: One device word, put back together from the halves it travelled in.
@@ -913,6 +1074,15 @@ const DT_BATCH = 24
 #: Matched by `CC_TILE` and the group size in the kernel source.
 const CC_TILE = 16
 const CC_GROUP = 256
+
+#: Positions a numbering group ranks at once. Matched by `CC_RANK_GROUP` in
+#: the kernel source.
+const CC_RANK_GROUP = 256
+
+#: Whether connected components are numbered on the device (the default) or
+#: by reading the roots back and sorting them on the host. Set
+#: `JAICV_CC_DEVICE_NUMBERING=0` for the host path; both give the same labels.
+let _CC_DEVICE_NUMBERING = env_or("JAICV_CC_DEVICE_NUMBERING", "1") != "0"
 
 const INTEGRAL_GROUP = 256
 
