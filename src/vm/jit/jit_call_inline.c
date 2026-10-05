@@ -23,6 +23,90 @@ bool gLoopInlineFailed;
 const ObjFunction *gLoopInlineRefused[JIT_LOOP_REFUSED_MAX];
 unsigned gLoopInlineRefusedCount;
 
+/* A loop inline whose guards keep failing re-runs its whole call in the
+ * interpreter each time, and the rest of the caller with it: a helper called
+ * with lists of two storages in turn deoptimised on every other call through
+ * the storage pin, 2.25x slower than not inlining it. Each loop inline the
+ * function tier emits is remembered by caller and call offset; when one has
+ * deoptimised LOOP_SITE_DEOPTS times its caller's form is retired and the
+ * next call compiles it again with that callee behind a real call, where a
+ * failing guard costs only the callee's own remainder. Not counted under
+ * JAITHON_JIT_DEOPT_STRESS, which fails every guard on purpose and would
+ * retire every inline it is there to test. JAITHON_JIT_INLINE_RETIRE=0 never
+ * retires one. Keyed on raw pointers: a recycled ObjFunction can inherit a
+ * stale entry, which at worst refuses one loop inline it did not need to. */
+enum { LOOP_SITE_TABLE = 64, LOOP_SITE_DEOPTS = 64 };
+
+typedef struct {
+    const ObjFunction *fn;
+    const ObjFunction *callee;
+    uint32_t           ip;
+    uint32_t           deopts;
+    bool               refused;
+} LoopInlineSite;
+
+static LoopInlineSite sLoopSites[LOOP_SITE_TABLE];
+static unsigned       sLoopSiteNext;
+
+static bool jitInlineRetireOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_INLINE_RETIRE");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static void loopSiteRemember(const ObjFunction *fn, uint32_t ip,
+                             const ObjFunction *callee) {
+    for (unsigned i = 0; i < LOOP_SITE_TABLE; i++) {
+        LoopInlineSite *s = &sLoopSites[i];
+        if (s->fn == fn && s->ip == ip) {
+            if (s->callee != callee) {
+                s->callee = callee;
+                s->deopts = 0;
+                s->refused = false;
+            }
+            return;
+        }
+    }
+    LoopInlineSite *s = &sLoopSites[sLoopSiteNext++ % LOOP_SITE_TABLE];
+    s->fn = fn;
+    s->callee = callee;
+    s->ip = ip;
+    s->deopts = 0;
+    s->refused = false;
+}
+
+void jitLoopInlineSeedRefusals(const ObjFunction *fn) {
+    gLoopInlineRefusedCount = 0;
+    for (unsigned i = 0; i < LOOP_SITE_TABLE; i++) {
+        const LoopInlineSite *s = &sLoopSites[i];
+        if (s->fn != fn || !s->refused) continue;
+        if (gLoopInlineRefusedCount >= JIT_LOOP_REFUSED_MAX) break;
+        gLoopInlineRefused[gLoopInlineRefusedCount++] = s->callee;
+    }
+}
+
+bool jitLoopInlineNoteDeopt(const ObjFunction *fn, int64_t ip) {
+    if (!jitInlineRetireOn() || jitDeoptStressOn()) return false;
+    for (unsigned i = 0; i < LOOP_SITE_TABLE; i++) {
+        LoopInlineSite *s = &sLoopSites[i];
+        if (s->fn != fn || (int64_t)s->ip != ip || s->refused) continue;
+        if (++s->deopts < LOOP_SITE_DEOPTS) return false;
+        s->refused = true;
+        if (getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s: the loop inline of %s at %u deoptimised "
+                    "%u times -- compiling it again without\n",
+                    jitFnLabel(fn),
+                    s->callee->name ? s->callee->name->chars : "<anon>",
+                    s->ip, s->deopts);
+        }
+        return true;
+    }
+    return false;
+}
+
 static bool loopInlineRefused(const ObjFunction *fn) {
     if (gLoopInlineRefusedCount >= JIT_LOOP_REFUSED_MAX) return true;
     for (unsigned i = 0; i < gLoopInlineRefusedCount; i++) {
@@ -1259,6 +1343,7 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     unsigned dst = pushReg(e) - 1;
     if (dst != rres) emit(e, jaiA64MovX(dst, rres));
     e->inlined = true;
+    if (!e->measuring) loopSiteRemember(caller, callOff, cfn);
     return true;
 }
 

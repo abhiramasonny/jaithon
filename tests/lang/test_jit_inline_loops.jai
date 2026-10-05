@@ -597,3 +597,79 @@ fn test_a_failed_loop_inline_keeps_the_other_inlines() -> void {
     }
     assert_true(checked > 0 or not failed, "drive never compiled after the failed inline")
 }
+
+# One call site handed lists of two storages in turn: the storage pinned at
+# the inline's entry fails on every other call, and each failure re-runs the
+# call and the rest of the caller in the interpreter. After LOOP_SITE_DEOPTS
+# of those the caller is compiled again without the inline.
+fn count_pos(xs: list[any], n: int) -> int {
+    var s = 0
+    var i = 0
+    while i < n {
+        if xs[i] > 0 { s += 1 }
+        i += 1
+    }
+    return s
+}
+
+fn drive_pos(xs: list[any], r: int) -> int { return count_pos(xs, 16) + noop(r) }
+
+fn test_a_site_whose_storage_alternates() -> void {
+    var a: list[any] = []
+    var b: list[any] = []
+    for k in 0..16 {
+        a.push(k - 4)
+        b.push(k - 4)
+    }
+    b[0] = 1.5
+    b[0] = -4
+    for r in 0..3000 {
+        assert_eq(drive_pos(if r % 2 == 0 { a } else { b }, r), 11 + r)
+    }
+}
+
+fn test_a_loop_inline_that_keeps_deoptimising_is_retired() -> void {
+    for name in ["JAITHON_NO_JIT", "JAITHON_JIT_DEOPT_STRESS", "JAITHON_JIT_INLINE_LOOPS",
+                 "JAITHON_JIT_INLINE_RETIRE", "JAITHON_JIT_INLINE_STG_PIN"] {
+        if env(name) != null { return }
+    }
+    let lines = [
+        "fn count_pos(xs: list[any], n: int) -> int {",
+        "    var s = 0",
+        "    var i = 0",
+        "    while i < n {",
+        "        if xs[i] > 0 { s += 1 }",
+        "        i += 1",
+        "    }",
+        "    return s",
+        "}",
+        "fn noop(x: int) -> int { return x }",
+        "fn drive(xs: list[any], r: int) -> int { return count_pos(xs, 16) + noop(r) }",
+        "fn main() -> int {",
+        "    var a: list[any] = []",
+        "    var b: list[any] = []",
+        "    for k in 0..16 {",
+        "        a.push(k - 4)",
+        "        b.push(k - 4)",
+        "    }",
+        "    b[0] = 1.5",
+        "    b[0] = -4",
+        "    var u = 0",
+        "    for r in 0..20000 { u += drive(if r % 2 == 0 { a } else { b }, r) }",
+        "    print(u)",
+        "    return 0",
+        "}",
+    ]
+    let path = f"{temp_dir()}/jaithon_inline_retire_{pid()}.jai"
+    write_file(path, "\n".join(lines) + "\n")
+    defer { Path(path).remove() }
+    let ran = run(["sh", "-c", f"JAI_JIT_RECON=1 exec '{argv()[0]}' run --no-cache '{path}'"])
+    assert_eq(ran.exit_code, 0)
+    assert_eq(ran.stdout, "200210000\n")
+    var deopts = 0
+    for line in ran.stderr.split("\n") {
+        if line.starts_with("[deopt]") and line.contains(".drive ") { deopts += 1 }
+    }
+    # Every other call deoptimised for the whole run before: about 10000.
+    assert_true(deopts <= 200, f"drive deoptimised {deopts} times")
+}

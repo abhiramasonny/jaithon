@@ -167,6 +167,15 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     }
     CallFrame *frame = &vm.frames[vm.frameCount - 1];
     frame->ip = fn->chunk.code + gDeopt.ip;
+    /* A loop inline that keeps failing its guards: retire the form, and the
+     * next call compiles the body again without that inline. The code stays
+     * in the arena, so a compiled caller that branches to it directly, or an
+     * activation of it further up the stack, still runs it soundly. */
+    if (JAI_UNLIKELY(jitLoopInlineNoteDeopt(fn, gDeopt.ip)) &&
+        fn->jitFunc != NULL) {
+        fn->jitFunc = NULL;
+        fn->jitBlockedOn = NULL;
+    }
     if (jitReconTrace()) {
         fprintf(stderr, "[deopt] %s ip=%lld base=%lld nlocals=%lld nstack=%lld\n",
                 jitFnLabel(fn), (long long)gDeopt.ip,

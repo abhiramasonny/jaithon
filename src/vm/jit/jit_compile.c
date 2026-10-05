@@ -857,7 +857,7 @@ uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (!eligible(fn)) return false;
-    gLoopInlineRefusedCount = 0;
+    jitLoopInlineSeedRefusals(fn);
 
     /* Up to a few attempts: each one may discover another slot that two paths
      * disagree about, and the next begins knowing it. */

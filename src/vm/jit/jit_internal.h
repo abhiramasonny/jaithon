@@ -1269,6 +1269,12 @@ enum { JIT_LOOP_REFUSED_MAX = 4 };
 extern bool gLoopInlineFailed;
 extern const ObjFunction *gLoopInlineRefused[JIT_LOOP_REFUSED_MAX];
 extern unsigned gLoopInlineRefusedCount;
+/* Seeds gLoopInlineRefused with the callees retired from `fn` because their
+ * inline kept deoptimising (jitLoopInlineNoteDeopt). */
+void jitLoopInlineSeedRefusals(const ObjFunction *fn);
+/* A deopt of `fn` resumed at `ip`: true when that is a loop inline's call
+ * site that has now deoptimised often enough to be compiled without it. */
+bool jitLoopInlineNoteDeopt(const ObjFunction *fn, int64_t ip);
 /* The interpreter frame's slot window, as frameWindowSize (vm_call.c) sizes it: every slot
  * the function itself names is below it, so the slots an inline renumbers its
  * callee's locals into (Emit::inlHomes) start here. */
