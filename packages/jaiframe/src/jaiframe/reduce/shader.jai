@@ -10,7 +10,9 @@ from std.os import env_or
 #: trees are the same either way, so are the answers. Read once.
 let _SHARED_FOLDS = env_or("JAIFRAME_SHARED_FOLDS", "1") != "0"
 
-pub let SOURCE = (if _SHARED_FOLDS { "#define SHARED_FOLDS 1\n" } else { "" }) + """#include <metal_stdlib>
+let _DEFINES = if _SHARED_FOLDS { "#define SHARED_FOLDS 1\n" } else { "" }
+
+pub let SOURCE = _DEFINES + """#include <metal_stdlib>
 using namespace metal;
 
 constexpr constant uint RGROUP = 256;
