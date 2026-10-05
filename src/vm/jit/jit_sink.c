@@ -60,7 +60,7 @@ bool jitSinkOn(void) {
  * slot. On, a float field lives in a callee-saved d register: a loop-carried
  * object's chain (`acc = acc.add(step)`) is then an fadd and a move rather
  * than a store and a reload per field per iteration. */
-bool jitSinkFpHomesOn(void) {
+static bool jitSinkFpHomesOn(void) {
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("JAITHON_JIT_SINK_FP_HOMES");

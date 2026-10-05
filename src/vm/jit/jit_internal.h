@@ -1675,7 +1675,6 @@ unsigned sinkBindAfter(const Emit *e, const ObjFunction *caller,
                        uint32_t callOff);
 bool sinkBindResult(Emit *e, unsigned slot);
 bool sinkHasEntryLive(const Emit *e);
-bool jitSinkFpHomesOn(void);
 bool sinkFpFast(const Emit *e, const uint8_t *code, int off, uint8_t op);
 void sinkPlanFpHomes(Emit *e);
 JitArmResult sinkInvoke(Emit *e, ObjFunction *fn, const uint8_t *code,
