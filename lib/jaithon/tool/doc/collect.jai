@@ -1,8 +1,8 @@
 #: Reading a file into a `ModuleDoc`: which `#:` block belongs to which
 #: declaration, and which declarations are documented at all.
 from jaithon.ast import DeclKind, Node, NodeKind, Visibility
-from jaithon.tool.fmt import Comment, _utf8_length, expand_paths, freeze_literals
-from jaithon.tool.fmt import parse_module, render_signature, scan_comments
+from jaithon.tool.fmt import Comment, _utf8_length, expand_paths, parse_for_printing
+from jaithon.tool.fmt import render_signature, scan_comments
 from std.io import Path, print_err, read_file
 from .model import DocComment, Entry, Example, ModuleDoc, _by_line
 
@@ -37,7 +37,7 @@ pub fn module_name_of(path: str) -> str {
 #: that can say which comment belongs to which declaration.
 pub fn collect_module(path: str) -> ModuleDoc {
     let source = read_file(path)
-    let program = freeze_literals(parse_module(source, path), source)
+    let program = parse_for_printing(source, path)
     let blocks = _doc_blocks(scan_comments(source))
     let line_of = _LineIndex(source)
 

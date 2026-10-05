@@ -17,7 +17,7 @@ from jaithon.compile.parse.state import Parser
 from jaithon.compile.parse.node_build import _binary, _join, _member, _node, _unary
 from jaithon.compile.parse.token_class import _additive_op, _compare_op, _multiplicative_op
 from jaithon.compile.parse.predicate import _is_numeric_literal
-from jaithon.compile.parse.primary import _close_sequence, _parse_args, _parse_primary
+from jaithon.compile.parse.primary import _close_sequence, _parse_args, _parse_primary, _spelled
 
 pub fn _parse_subscript(p: Parser, object: Node, open_index: int) -> Node {
     p._advance()
@@ -113,7 +113,10 @@ pub fn _parse_neg_magnitude(p: Parser) -> Node? {
     let start_index = p.current
     p._advance()
     p._advance()
-    return _node(NodeKind.IntLit, p._span_since(start_index), {"intLit": literal.value ?? 0})
+    return _spelled(
+        p,
+        _node(NodeKind.IntLit, p._span_since(start_index), {"intLit": literal.value ?? 0})
+    )
 }
 
 pub fn _parse_unary(p: Parser) -> Node {

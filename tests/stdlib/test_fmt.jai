@@ -183,6 +183,36 @@ fn test_enum_variant_without_payload_stays_bare() -> void {
 #: `-9223372036854775808` is a single token, because its magnitude has no
 #: positive spelling in `int`. Print it after an operator and the sign binds to
 #: that operator instead, leaving digits that overflow — so it keeps brackets.
+#: The parser pins each literal to its spelling as it builds it, instead of a
+#: walk doing it afterwards; the printed text must be what was written, every
+#: literal kind, after multibyte text, inside and around an f-string, and in a
+#: pattern and a default.
+fn test_literals_keep_their_spelling() -> void {
+    let source = "let a = 0xFF + 1_000 + 0b101 + 0o17\n" +
+        "let b = 1.5e3 + 2.0\n" +
+        "let c = \"é ☃ \\u{1F600} \\t\" + 'x' + \"\"\"three\"\"\"\n" +
+        "let d = f\"{a:>8} é {b + 0x10} {\"in\"}\"\n" +
+        "let e = -0x8000000000000000\n" +
+        "fn g(x: int = 0x1F) -> int {\n" +
+        "    return match x {\n" +
+        "        0x1F => 1,\n" +
+        "        -0b1 => 2,\n" +
+        "        _ => 3,\n" +
+        "    }\n" +
+        "}\n"
+    let formatted = format_source(source, "d.jai")
+    for spelling in ["0xFF", "1_000", "0b101", "0o17", "1.5e3", "2.0", "\"é ☃ \\u{1F600} \\t\"", "'x'"] {
+        assert_true(formatted.contains(spelling), spelling + " in " + formatted)
+    }
+    for spelling in ["\"\"\"three\"\"\"", "f\"{a:>8} é {b + 0x10} {\"in\"}\"", "-0x8000000000000000"] {
+        assert_true(formatted.contains(spelling), spelling + " in " + formatted)
+    }
+    for spelling in ["x: int = 0x1F", "0x1F => 1", "-0b1 => 2"] {
+        assert_true(formatted.contains(spelling), spelling + " in " + formatted)
+    }
+    assert_eq(format_source(formatted, "d.jai"), formatted)
+}
+
 fn test_int_min_literal_keeps_its_brackets() -> void {
     assert_true(is_formatted("let low = -(-9223372036854775808)\n", "d.jai"))
     assert_true(is_formatted("let sum = 1 - (-9223372036854775808)\n", "d.jai"))

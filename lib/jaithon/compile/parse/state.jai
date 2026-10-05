@@ -52,6 +52,9 @@ pub class Parser {
     #: `token.source.file`, a field of an object read out of a field.
     let file_id: int
     pub var current: int
+    #: Set by `parse_spelled`: every literal node built goes here, so the
+    #: caller can pin each one to its source text without walking the tree.
+    pub var spelled: list[Node]?
     pub var panic_mode: bool
     pub var expr_depth: int
     pub var yield_count: int
@@ -62,6 +65,7 @@ pub class Parser {
 
     #: Tokenize `lexer` and prepare to parse the tokens it produced.
     pub fn init(self, lexer: Lexer) {
+        self.spelled = null
         self.lexer = lexer
         self.file_id = lexer.file_id
         self.tokens = lexer.tokenize()
