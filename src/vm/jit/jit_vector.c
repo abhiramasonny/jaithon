@@ -492,6 +492,10 @@ static void vecBody(Emit *e, const VecPlan *p, const uint8_t *dense,
 void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     if (!jitVectorOn() || e->measuring || e->inlining || e->failed) return;
     if (e->depth != 0 || e->valueDepth != 0) return;
+    /* A few hundred words per loop. A body already a quarter of the way to
+     * JIT_MAX_INSTS has its deopt stubs still to come, and outgrowing the
+     * buffer declines the WHOLE body -- far worse than a scalar loop. */
+    if (e->count > JIT_MAX_INSTS / 4u) return;
     VecPlan p;
     p.failAt = -1;
     if (!vecMatch(e, fn, off, &p)) {
