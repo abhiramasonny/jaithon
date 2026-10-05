@@ -444,8 +444,13 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
         (fn->jitBlockedOn != NULL && fn->jitBlockedOn->jitFunc != NULL))
         return jitEnterFuncFull(closure, slotBase);
     if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
-    if (fn->module == NULL || fn->module->version != fn->jitFuncModuleVersion)
+    if (fn->module == NULL ||
+        fn->module->version != fn->jitFuncModuleVersion) {
+        /* Retired, as in jitEnterFuncFull: nothing will retry this form, so
+         * it has no business keeping a blocking callee alive. */
+        fn->jitBlockedOn = NULL;
         return JAI_JIT_DECLINED;
+    }
     int64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
     unsigned arity = fn->jitArgCount;
     if (arity > 0 && !jitArgIn(closure, slotBase, 0, &a0))
