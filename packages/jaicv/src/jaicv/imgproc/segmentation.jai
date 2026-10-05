@@ -567,64 +567,56 @@ kernel void integral_cols(device float* dst [[buffer(0)]],
 
 /* The numbering on the device, so the labels never wait on the host.
  *
- * A component's number is how many components were first met before it, so
- * each root marks the scan position where its component was first met, and an
- * exclusive count of marks over positions is the numbering: one pass to count
- * the marks in each group of positions, one group to turn those counts into
- * where each group starts, and one pass to hand every mark its rank. The host
- * used to read the roots back, sort them by where they were first seen and
- * upload the order, which split the work into two command buffers with a
- * round trip and a sort between them.
+ * A component's number is how many components were first met before it. Each
+ * root sets one bit at the scan position where its component was first met,
+ * and its number is how many bits are set before that one: a count of bits in
+ * each group of positions, one group to turn those counts into where each
+ * group starts, and every root adding up the bits ahead of it in its own
+ * group. The host used to read the roots back, sort them by where they were
+ * first seen and upload the order, which split the work into two command
+ * buffers with a round trip and a sort between them.
  *
- * `marks` is zeroed by the host and indexed by scan position, so it is wider
- * than the frame by the empty corners of the last 2x2 blocks when a side is
- * odd; those stay zero. Held to `CC_RANK_GROUP` on the host. */
+ * Bits rather than a word per position: a frame's worth is a thirty-second of
+ * the size, so clearing, counting and scanning it is small, and only roots
+ * write it. Positions run over whole 2x2 blocks for eight-connectivity, so an
+ * odd side leaves positions no pixel owns; their bits stay clear. Held to
+ * `CC_RANK_GROUP` on the host. */
 #define CC_RANK_GROUP 256u
+#define CC_RANK_WORDS 8u
 #define CC_RANK_WARPS 8u
 
 kernel void cc_mark(device const uint* labels [[buffer(0)]],
                     device const uint* first [[buffer(1)]],
-                    device uint* marks [[buffer(2)]],
+                    device atomic_uint* bits [[buffer(2)]],
                     constant uint& count [[buffer(3)]],
                     uint id [[thread_position_in_grid]]) {
     if (id >= count) return;
     if (labels[id] != id + 1u) return;
-    marks[first[id]] = id + 1u;
+    uint at = first[id];
+    atomic_fetch_or_explicit(&bits[at >> 5], 1u << (at & 31u), memory_order_relaxed);
 }
 
-kernel void cc_rank_count(device const uint* marks [[buffer(0)]],
-                          device uint* tallies [[buffer(1)]],
-                          constant uint& reach [[buffer(2)]],
-                          uint id [[thread_position_in_grid]],
+/* Where each group's numbers start: one group of threads, each counting
+ * the bits of one group of positions and carrying the running total from
+ * block to block. A few thousand groups on a 1080p frame, so a single
+ * threadgroup gets through them before a second dispatch would have started. */
+kernel void cc_rank_bases(device const uint* bits [[buffer(0)]],
+                          device uint* bases [[buffer(1)]],
+                          device float* total [[buffer(2)]],
+                          constant uint& groups [[buffer(3)]],
                           uint lid [[thread_index_in_threadgroup]],
-                          uint wid [[threadgroup_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint warp [[simdgroup_index_in_threadgroup]]) {
-    threadgroup uint lanes[CC_RANK_WARPS];
-    uint has = (id < reach && marks[id] != 0u) ? 1u : 0u;
-    uint total = simd_sum(has);
-    if (lane == 0u) lanes[warp] = total;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid != 0u) return;
-    uint sum = 0u;
-    for (uint w = 0u; w < CC_RANK_WARPS; w++) sum += lanes[w];
-    tallies[wid] = sum;
-}
-
-kernel void cc_rank_scan(device const uint* tallies [[buffer(0)]],
-                         device uint* bases [[buffer(1)]],
-                         device float* total [[buffer(2)]],
-                         constant uint& groups [[buffer(3)]],
-                         uint lid [[thread_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]],
-                         uint warp [[simdgroup_index_in_threadgroup]]) {
     threadgroup uint lanes[CC_RANK_WARPS];
     threadgroup uint carry;
     if (lid == 0u) carry = 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint base = 0u; base < groups; base += CC_RANK_GROUP) {
         uint at = base + lid;
-        uint mine = at < groups ? tallies[at] : 0u;
+        uint mine = 0u;
+        if (at < groups) {
+            for (uint w = 0u; w < CC_RANK_WORDS; w++) mine += popcount(bits[at * CC_RANK_WORDS + w]);
+        }
         uint before = simd_prefix_exclusive_sum(mine);
         uint whole = simd_sum(mine);
         if (lane == 0u) lanes[warp] = whole;
@@ -641,25 +633,34 @@ kernel void cc_rank_scan(device const uint* tallies [[buffer(0)]],
     if (lid == 0u) total[0] = float(carry);
 }
 
-kernel void cc_rank_assign(device const uint* marks [[buffer(0)]],
-                           device const uint* bases [[buffer(1)]],
-                           device uint* remap [[buffer(2)]],
-                           constant uint& reach [[buffer(3)]],
-                           uint id [[thread_position_in_grid]],
-                           uint wid [[threadgroup_position_in_grid]],
-                           uint lane [[thread_index_in_simdgroup]],
-                           uint warp [[simdgroup_index_in_threadgroup]]) {
-    threadgroup uint lanes[CC_RANK_WARPS];
-    uint root = id < reach ? marks[id] : 0u;
-    uint has = root != 0u ? 1u : 0u;
-    uint before = simd_prefix_exclusive_sum(has);
-    uint whole = simd_sum(has);
-    if (lane == 0u) lanes[warp] = whole;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (has == 0u) return;
-    uint ahead = 0u;
-    for (uint w = 0u; w < warp; w++) ahead += lanes[w];
-    remap[root - 1u] = bases[wid] + ahead + before + 1u;
+/* Every pixel's label: one more than the number of bits set before the one
+ * its component's root set. The pixels of a component all read the same few
+ * words, so this costs about what reading a remap table did. */
+kernel void cc_number(device const uint* labels [[buffer(0)]],
+                      device const uint* first [[buffer(1)]],
+                      device const uint* bits [[buffer(2)]],
+                      device const uint* bases [[buffer(3)]],
+                      device float* dst [[buffer(4)]],
+                      constant uint& count [[buffer(5)]],
+                      constant uint& cols [[buffer(6)]],
+                      constant uint& d_off [[buffer(7)]],
+                      constant uint& d_step [[buffer(8)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint y = id / cols;
+    uint x = id - y * cols;
+    uint mine = labels[id];
+    float value = 0.0f;
+    if (mine != 0u) {
+        uint at = first[mine - 1u];
+        uint group = at / CC_RANK_GROUP;
+        uint word = at >> 5;
+        uint rank = bases[group];
+        for (uint w = group * CC_RANK_WORDS; w < word; w++) rank += popcount(bits[w]);
+        rank += popcount(bits[word] & ((1u << (at & 31u)) - 1u));
+        value = float(rank + 1u);
+    }
+    dst[d_off + y * d_step + x] = value;
 }
 
 kernel void cc_tally(device const uint* value [[buffer(0)]],
@@ -860,44 +861,28 @@ fn _number_on_device(
     #: Scan positions run over whole 2x2 blocks for eight-connectivity, so an
     #: odd side leaves positions no pixel owns.
     let reach = if connectivity == 4 { count } else { ((rows + 1) // 2) * ((cols + 1) // 2) * 4 }
-    let marks = Buffer(reach)
-    marks.fill_zero()
-    kernel_for("cc_mark").dispatch_async([labels, first, marks], count, [count])
     let groups = (reach + CC_RANK_GROUP - 1) // CC_RANK_GROUP
-    let tallies = Buffer(groups)
+    let bits = Buffer(groups * CC_RANK_WORDS)
+    bits.fill_zero()
+    kernel_for("cc_mark").dispatch_async([labels, first, bits], count, [count])
     let bases = Buffer(groups)
     let total = Buffer(1)
-    kernel_for("cc_rank_count").dispatch_async(
-        [marks, tallies],
-        groups * CC_RANK_GROUP,
-        [reach],
-        group_size: CC_RANK_GROUP
-    )
-    kernel_for("cc_rank_scan").dispatch_async(
-        [tallies, bases, total],
+    kernel_for("cc_rank_bases").dispatch_async(
+        [bits, bases, total],
         CC_RANK_GROUP,
         [groups],
         group_size: CC_RANK_GROUP
     )
-    let remap = Buffer(count)
-    kernel_for("cc_rank_assign").dispatch_async(
-        [marks, bases, remap],
-        groups * CC_RANK_GROUP,
-        [reach],
-        group_size: CC_RANK_GROUP
-    )
-    kernel_for("cc_apply").dispatch_async(
-        [labels, remap, out.storage],
+    kernel_for("cc_number").dispatch_async(
+        [labels, first, bits, bases, out.storage],
         count,
         [count, cols, out.offset, out.step_]
     )
     out.invalidate()
     let numbered = int(total.download()[0])
-    marks.free()
-    tallies.free()
+    bits.free()
     bases.free()
     total.free()
-    remap.free()
     return numbered
 }
 
@@ -1075,9 +1060,11 @@ const DT_BATCH = 24
 const CC_TILE = 16
 const CC_GROUP = 256
 
-#: Positions a numbering group ranks at once. Matched by `CC_RANK_GROUP` in
-#: the kernel source.
+#: Positions a numbering group counts at once, and the 32-bit words of marks
+#: that holds. Matched by `CC_RANK_GROUP` and `CC_RANK_WORDS` in the kernel
+#: source.
 const CC_RANK_GROUP = 256
+const CC_RANK_WORDS = 8
 
 #: Whether connected components are numbered on the device (the default) or
 #: by reading the roots back and sorting them on the host. Set
