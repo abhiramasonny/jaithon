@@ -591,6 +591,13 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             if (!exemplarKind(dsample, &dkind, &dtag, &dcls, &dshape)) {
                 return subWhy(e, "a dict value of a kind the tier cannot hold");
             }
+            /* OP_GET_INDEX may leave float entries in the FP bank (see
+             * fpFastOp), which is right for a list read and wrong here: the
+             * key is stored from its X register and the lookup is a call
+             * that clobbers v16 up. A float key read out of a local's home
+             * went in as stale bits -- `d[x]` raised KeyError for a key
+             * that was there (tests/lang/test_jit_dict_float_key.jai). */
+            fpSyncAll(e);
             /* SLOT_OBJ pins nothing, so the container is proved to be a
              * dict before anything is consumed: a miss resumes with the
              * dict and the key both still on the interpreter's stack. */
