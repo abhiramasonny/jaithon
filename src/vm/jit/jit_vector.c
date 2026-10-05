@@ -379,6 +379,41 @@ static void vecPatch(Emit *e, unsigned at, unsigned cond, unsigned to) {
     }
 }
 
+/* The loop body for lane sets 0..nU-1, every instruction of the program
+ * issued for all of them before the next: the loads of every set first, so
+ * they overlap. Position `pos` of set `u` is v(16 + dense[pos]*U + u); an
+ * invariant is v(31 - i). */
+static void vecBody(Emit *e, const VecPlan *p, const uint8_t *dense,
+                    unsigned U, unsigned nU, const unsigned *xP) {
+#define VREG(pos, u) (16u + (unsigned)dense[(pos)] * U + (u))
+    for (unsigned i = 0; i < p->opCount; i++) {
+        const VecOp *o = &p->ops[i];
+        for (unsigned u = 0; u < nU; u++) {
+            int32_t at = 8 * o->off + 16 * (int32_t)u;
+            unsigned ra = o->aInv ? 31u - o->a : VREG(o->a, u);
+            unsigned rb = o->bInv ? 31u - o->b : VREG(o->b, u);
+            switch (o->op) {
+            case VO_LOAD:
+                emit(e, jaiA64LdurQ(VREG(o->dst, u), xP[o->list], at));
+                break;
+            case VO_ADD:
+                emit(e, jaiA64Fadd2D(VREG(o->dst, u), ra, rb));
+                break;
+            case VO_SUB:
+                emit(e, jaiA64Fsub2D(VREG(o->dst, u), ra, rb));
+                break;
+            case VO_MUL:
+                emit(e, jaiA64Fmul2D(VREG(o->dst, u), ra, rb));
+                break;
+            case VO_STORE:
+                emit(e, jaiA64SturQ(ra, xP[o->list], at));
+                break;
+            }
+        }
+    }
+#undef VREG
+}
+
 void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     if (!jitVectorOn() || e->measuring || e->inlining || e->failed) return;
     if (e->depth != 0 || e->valueDepth != 0) return;
@@ -492,38 +527,34 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     emit(e, jaiA64AddXLsl(xC, xC, xN, lgG));
 
     unsigned top = e->count;
-#define VREG(pos, u) (16u + (unsigned)dense[(pos)] * U + (u))
-    for (unsigned i = 0; i < p.opCount; i++) {
-        const VecOp *o = &p.ops[i];
-        for (unsigned u = 0; u < U; u++) {
-            int32_t at = 8 * o->off + 16 * (int32_t)u;
-            unsigned ra = o->aInv ? 31u - o->a : VREG(o->a, u);
-            unsigned rb = o->bInv ? 31u - o->b : VREG(o->b, u);
-            switch (o->op) {
-            case VO_LOAD:
-                emit(e, jaiA64LdurQ(VREG(o->dst, u), xP[o->list], at));
-                break;
-            case VO_ADD:
-                emit(e, jaiA64Fadd2D(VREG(o->dst, u), ra, rb));
-                break;
-            case VO_SUB:
-                emit(e, jaiA64Fsub2D(VREG(o->dst, u), ra, rb));
-                break;
-            case VO_MUL:
-                emit(e, jaiA64Fmul2D(VREG(o->dst, u), ra, rb));
-                break;
-            case VO_STORE:
-                emit(e, jaiA64SturQ(ra, xP[o->list], at));
-                break;
-            }
-        }
-    }
-#undef VREG
+    vecBody(e, &p, dense, U, U, xP);
     for (unsigned l = 0; l < p.listCount; l++) {
         emit(e, jaiA64AddXImm(xP[l], xP[l], 16u * U));
     }
     emit(e, jaiA64SubsXImm(xN, xN, 1));
     emit(e, jaiA64BCond(JAI_A64_NE, (int32_t)top - (int32_t)e->count));
+
+    /* What is left is under 2U elements: take its pairs one lane set at a
+     * time, so at most one element falls to the scalar loop. A five-point
+     * stencil's 498-wide rows leave two, which is ninety scalar instructions
+     * a row otherwise. */
+    if (U > 1) {
+        emit(e, jaiA64SubX(xN, xE, xC));
+        emit(e, jaiA64LsrX(xN, xN, 1));
+        emit(e, jaiA64SubsXImm(31, xN, 0));
+        unsigned none = e->count;
+        emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+        emit(e, jaiA64AddXLsl(xC, xC, xN, 1));
+        unsigned pairTop = e->count;
+        vecBody(e, &p, dense, U, 1, xP);
+        for (unsigned l = 0; l < p.listCount; l++) {
+            emit(e, jaiA64AddXImm(xP[l], xP[l], 16u));
+        }
+        emit(e, jaiA64SubsXImm(xN, xN, 1));
+        emit(e, jaiA64BCond(JAI_A64_NE,
+                            (int32_t)pairTop - (int32_t)e->count));
+        vecPatch(e, none, JAI_A64_EQ, e->count);
+    }
 
     /* The counter and the variable as the scalar loop would have left them
      * after its last bind, through a register localOut's tag scratches
