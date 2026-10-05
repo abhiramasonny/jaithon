@@ -140,38 +140,45 @@ printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 # GOLDEN_JOBS at a time (default: one per core; GOLDEN_JOBS=1 is the old
 # serial order) and are RECORDED in the order they were listed, so the report
 # reads exactly as before. A job's stdout and stderr go to files, so no job can
-# stall on a full pipe.
-golden_jobs=()
-# Fields are separated by \x1f: a tab is IFS whitespace, and `read` would fold
-# the empty flag and environment fields of most jobs together.
-queue_golden() {
-    golden_jobs+=("$1"$'\x1f'"$2"$'\x1f'"$3"$'\x1f'"${4:-}"$'\x1f'"${5:-}")
+# stall on a full pipe. The REPL phase uses the same runner.
+#
+# A job is its fields joined by \x1f -- the working directory (empty: this
+# one), a file to read stdin from (empty: none), KEY=VALUE pairs separated by
+# spaces, then the command's own words -- and jobs are separated by \x1e, since
+# a word can hold a newline (`--eval=$'...\n...'`).
+parallel_jobs=()
+queue_job() {
+    local IFS=$'\x1f'
+    parallel_jobs+=("$*")
 }
 
-run_golden_jobs() {
+# Run every queued job; job N leaves N.out, N.err and N.status ("code ms") in $1.
+run_parallel_jobs() {
     local dir="$1"
-    local count=${#golden_jobs[@]}
-    [[ $count -eq 0 ]] && return 0
-    printf '%s\n' "${golden_jobs[@]}" > "$dir/jobs"
-    python3 - "$dir" "$JAITHON" "${GOLDEN_JOBS:-0}" <<'PY'
+    [[ ${#parallel_jobs[@]} -eq 0 ]] && return 0
+    printf '%s\x1e' "${parallel_jobs[@]}" > "$dir/jobs"
+    python3 - "$dir" "${GOLDEN_JOBS:-0}" <<'PY'
 import os, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
-directory, exe, wanted = sys.argv[1], sys.argv[2], int(sys.argv[3])
-jobs = [line.rstrip("\n").split("\x1f") for line in open(os.path.join(directory, "jobs"))]
+directory, wanted = sys.argv[1], int(sys.argv[2])
+jobs = open(os.path.join(directory, "jobs"), encoding="utf-8", errors="surrogateescape").read().split("\x1e")[:-1]
 
 def run(index):
-    name, src, expected, flag, envset = jobs[index]
-    if name == "@skip":
-        return
+    fields = jobs[index].split("\x1f")
+    cwd, stdin, envset, command = fields[0] or None, fields[1], fields[2], fields[3:]
     env = dict(os.environ)
     for pair in envset.split():
         key, _, value = pair.partition("=")
         env[key] = value
-    command = [exe, "run"] + ([flag] if flag else []) + [src]
     base = os.path.join(directory, str(index))
     started = time.time()
     with open(base + ".out", "wb") as out, open(base + ".err", "wb") as err:
-        status = subprocess.call(command, stdout=out, stderr=err, env=env)
+        source = open(stdin, "rb") if stdin else None
+        try:
+            status = subprocess.call(command, cwd=cwd, stdin=source, stdout=out, stderr=err, env=env)
+        finally:
+            if source is not None:
+                source.close()
     elapsed = int((time.time() - started) * 1000)
     with open(base + ".status", "w") as record:
         record.write(f"{status} {elapsed}\n")
@@ -180,11 +187,31 @@ workers = wanted if wanted > 0 else (os.cpu_count() or 1)
 with ThreadPoolExecutor(max_workers=workers) as pool:
     list(pool.map(run, range(len(jobs))))
 PY
-    local index=0 job name src expected flag envset status elapsed actual errout
-    for job in "${golden_jobs[@]}"; do
-        IFS=$'\x1f' read -r name src expected flag envset <<< "$job"
+}
+
+# What each golden job is checked against, by job index.
+golden_names=()
+golden_expected=()
+queue_golden() {
+    local name="$1" src="$2" expected="$3" flag="${4:-}" envset="${5:-}"
+    golden_names+=("$name")
+    golden_expected+=("$expected")
+    if [[ "$name" == "@skip" ]]; then
+        queue_job "" "" "" true
+    elif [[ -n "$flag" ]]; then
+        queue_job "" "" "$envset" "$JAITHON" run "$flag" "$src"
+    else
+        queue_job "" "" "$envset" "$JAITHON" run "$src"
+    fi
+}
+
+record_golden_jobs() {
+    local dir="$1" index=0 count=${#golden_names[@]} name expected status elapsed actual errout
+    while [[ $index -lt $count ]]; do
+        name="${golden_names[$index]}"
+        expected="${golden_expected[$index]}"
         if [[ "$name" == "@skip" ]]; then
-            record_skip "$src" "no .expected file"
+            record_skip "$expected" "no .expected file"
             index=$((index + 1))
             continue
         fi
@@ -210,7 +237,7 @@ for src in "$ROOT"/tests/golden/*.jai; do
     matches_filter "$name" || continue
     expected="${src%.jai}.expected"
     if [[ ! -f "$expected" ]]; then
-        queue_golden "@skip" "$name" "" "" ""
+        queue_golden "@skip" "" "$name"
         continue
     fi
     queue_golden "$name" "$src" "$expected"
@@ -244,8 +271,10 @@ for src in "$ROOT"/tests/golden/*.jai; do
     done
 done
 golden_dir="$(mktemp -d "${TMPDIR:-/tmp}/jai_golden.XXXXXX")"
-run_golden_jobs "$golden_dir"
+run_parallel_jobs "$golden_dir"
+record_golden_jobs "$golden_dir"
 rm -rf "$golden_dir"
+parallel_jobs=()
 
 # ------------------------------------------------- 2b. fuzzer bug repros
 #
@@ -386,25 +415,40 @@ printf '%sREPL tests%s\n' "$BOLD" "$RESET"
 
 repl_normalise() { sed 's/^time: [0-9.]* ms$/time: <duration>/'; }
 
+repl_names=()
+repl_sources=()
 for src in "$ROOT"/tests/repl/*.repl; do
     name="$(basename "$src" .repl)"
     matches_filter "$name" || continue
     expected="${src%.repl}.expected"
+    repl_names+=("$name")
+    repl_sources+=("$src")
     if [[ ! -f "$expected" ]]; then
-        record_skip "$name" "no .expected file"
+        queue_job "" "" "" true
         continue
     fi
     repl_flags="$(sed -n '1s/^# args: *//p' "$src")"
     declare -a repl_argv=()
     [[ -n "$repl_flags" ]] && eval "repl_argv=($repl_flags)"
-    start=$(now_ms)
-    (cd "$ROOT/tests/repl" && "$JAITHON" repl ${repl_argv[@]+"${repl_argv[@]}"} \
-        < "$src" >"/tmp/jai_repl_out.$$" 2>"/tmp/jai_repl_err.$$")
-    status=$?
-    actual="$(repl_normalise < "/tmp/jai_repl_out.$$")"
-    errout="$(plain_text "$(cat "/tmp/jai_repl_err.$$")")"
-    rm -f "/tmp/jai_repl_out.$$" "/tmp/jai_repl_err.$$"
-    elapsed=$(( $(now_ms) - start ))
+    queue_job "$ROOT/tests/repl" "$src" "" "$JAITHON" repl ${repl_argv[@]+"${repl_argv[@]}"}
+done
+repl_dir="$(mktemp -d "${TMPDIR:-/tmp}/jai_repl.XXXXXX")"
+run_parallel_jobs "$repl_dir"
+index=0
+while [[ $index -lt ${#repl_names[@]} ]]; do
+    name="${repl_names[$index]}"
+    src="${repl_sources[$index]}"
+    expected="${src%.repl}.expected"
+    if [[ ! -f "$expected" ]]; then
+        record_skip "$name" "no .expected file"
+        index=$((index + 1))
+        continue
+    fi
+    status=255
+    elapsed=0
+    [[ -f "$repl_dir/$index.status" ]] && read -r status elapsed < "$repl_dir/$index.status"
+    actual="$(repl_normalise < "$repl_dir/$index.out")"
+    errout="$(plain_text "$(cat "$repl_dir/$index.err")")"
 
     expected_err="${src%.repl}.expected-err"
     [[ -f "$expected_err" ]] || expected_err="/dev/null"
@@ -420,7 +464,10 @@ $(diff -u "$expected_err" <(printf '%s\n' "$errout") | head -40)"
     else
         record_pass "$name" "$elapsed"
     fi
+    index=$((index + 1))
 done
+rm -rf "$repl_dir"
+parallel_jobs=()
 
 # ------------------------------------------------- 5b. package importability
 #
