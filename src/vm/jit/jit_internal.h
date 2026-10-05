@@ -83,6 +83,8 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
  * keyVersion guard is proved once at the head (see planGuardHoists). */
 #define JIT_MAX_GLOBAL_SITES 64u
 #define JIT_MAX_GUARD_HOIST   4u
+#define JIT_MAX_GLOBAL_ACC   64u
+#define JIT_MAX_TAG_PROOF     8u
 #define JIT_PUSH_UNKNOWN (-1)
 #define JIT_PUSH_FRESH   (-2)
 /* Distinct offsets the `match` arms may branch to across a discarded OP_POP
@@ -529,6 +531,26 @@ typedef struct {
      * proved once at the head instead. See planGuardHoists. */
     struct { uint32_t top, end; } guardHoist[JIT_MAX_GUARD_HOIST];
     unsigned  guardHoistCount;
+    /* Every scalar module-global read and write the measuring pass emitted:
+     * where, which entry, of what kind. Overflow only costs proofs. */
+    struct {
+        uint32_t  off;
+        JaiEntry *slot;
+        uint8_t   kind;
+        bool      write;
+    } globalAcc[JIT_MAX_GLOBAL_ACC];
+    unsigned  globalAccCount;
+    bool      globalAccSpill;
+    /* JAITHON_JIT_GLOBAL_TAG_PROOF: a global whose every access inside a
+     * guard-hoisted loop is of one scalar kind has that tag checked once at
+     * the head; reads skip their tag check, writes their old-tag check and
+     * tag store. See planTagProofs. */
+    struct {
+        uint32_t  top, end;
+        JaiEntry *slot;
+        uint8_t   kind;
+    } tagProof[JIT_MAX_TAG_PROOF];
+    unsigned  tagProofCount;
     /* Every list append the body makes, when the grow stub keeps the
      * registers (jitGrowKeeps): such an append is no longer a clobber, so
      * regionCalls stops seeing it -- but it still moves ONE list's `items`
@@ -1310,6 +1332,8 @@ int pushHoistFor(const Emit *e, int slot);
 int iterHoistAt(const Emit *e, uint32_t top);
 int closHoistFor(const Emit *e, int slot, uint32_t at, const ObjFunction *fn);
 bool jitInlineBorrow(void);
+void noteGlobalAccess(Emit *e, JaiEntry *slot, SlotKind kind, bool write);
+bool globalTagProven(const Emit *e, JaiEntry *slot, SlotKind kind);
 bool jitSimpleInitClass(ObjClass *cls, unsigned argc);
 bool closUpHoisted(const Emit *e, ObjClosure *closure, unsigned index);
 void noteClosureSite(Emit *e, int slot, uint32_t off, ObjClosure *sample);

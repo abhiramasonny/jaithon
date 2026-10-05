@@ -915,6 +915,84 @@ static void planGuardHoists(Emit *e, ObjFunction *fn, uint32_t regionLo,
     }
 }
 
+/* JAITHON_JIT_GLOBAL_TAG_PROOF: see Emit::tagProof. Default on. */
+static bool jitGlobalTagProof(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_GLOBAL_TAG_PROOF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+void noteGlobalAccess(Emit *e, JaiEntry *slot, SlotKind kind, bool write) {
+    if (!e->measuring) return;
+    if (e->globalAccCount >= JIT_MAX_GLOBAL_ACC) {
+        e->globalAccSpill = true;
+        return;
+    }
+    unsigned i = e->globalAccCount++;
+    e->globalAcc[i].off = e->inlining ? e->inlIp : e->curOffset;
+    e->globalAcc[i].slot = slot;
+    e->globalAcc[i].kind = (uint8_t)kind;
+    e->globalAcc[i].write = write;
+}
+
+/* Whether the access about to be emitted is to a global whose tag a loop
+ * head around it has already proved to be `kind`. */
+bool globalTagProven(const Emit *e, JaiEntry *slot, SlotKind kind) {
+    if (e->measuring) return false;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    for (unsigned i = 0; i < e->tagProofCount; i++) {
+        if (e->tagProof[i].slot != slot) continue;
+        if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+        return (SlotKind)e->tagProof[i].kind == kind;
+    }
+    return false;
+}
+
+/* Over a loop whose globals guard is already proved at the head
+ * (planGuardHoists), a module global's tag can change only through a store
+ * the loop itself makes: nothing in it runs Jaithon code, and the only other
+ * writers are Jaithon code. So when every access of a global inside the loop
+ * -- every read and every compiled store -- is of one scalar kind, checking
+ * the tag once at the head proves it for the whole loop: each read drops its
+ * tag check, and each store its check that the old value was an object (it
+ * cannot be) and its tag store (the tag is already the one it would write).
+ * Every access of the loop must have been recorded; a spill proves nothing. */
+static void planTagProofs(Emit *e) {
+    e->tagProofCount = 0;
+    if (!jitGlobalTagProof() || e->globalAccSpill) return;
+    for (unsigned h = 0; h < e->guardHoistCount; h++) {
+        uint32_t lt = e->guardHoist[h].top, le = e->guardHoist[h].end;
+        for (unsigned i = 0; i < e->globalAccCount; i++) {
+            if (e->globalAcc[i].off < lt || e->globalAcc[i].off >= le) continue;
+            JaiEntry *slot = e->globalAcc[i].slot;
+            SlotKind k = (SlotKind)e->globalAcc[i].kind;
+            if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL) continue;
+            bool seen = false, ok = true;
+            for (unsigned t = 0; t < e->tagProofCount; t++) {
+                if (e->tagProof[t].slot == slot && e->tagProof[t].top == lt) {
+                    seen = true;
+                }
+            }
+            if (seen) continue;
+            for (unsigned j = 0; j < e->globalAccCount; j++) {
+                if (e->globalAcc[j].slot != slot) continue;
+                if (e->globalAcc[j].off < lt || e->globalAcc[j].off >= le) continue;
+                if ((SlotKind)e->globalAcc[j].kind != k) ok = false;
+            }
+            if (!ok) continue;
+            if (e->tagProofCount >= JIT_MAX_TAG_PROOF) return;
+            e->tagProof[e->tagProofCount].top = lt;
+            e->tagProof[e->tagProofCount].end = le;
+            e->tagProof[e->tagProofCount].slot = slot;
+            e->tagProof[e->tagProofCount].kind = (uint8_t)k;
+            e->tagProofCount++;
+        }
+    }
+}
+
 void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     if (e->measuring) return;
     const Chunk *c = &fn->chunk;
@@ -1102,6 +1180,7 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     planIterHoists(e, c, regionLo, regionHi);
     planClosureHoists(e, fn, kinds, regionLo, regionHi);
     planGuardHoists(e, fn, regionLo, regionHi);
+    planTagProofs(e);
     if (!lean) return;
     /* Versions, for lists stored into inside their own region. */
     for (unsigned h = 0; h < e->hoistCount; h++) {
@@ -1238,6 +1317,19 @@ void emitHoistsAt(Emit *e, uint32_t off) {
             emit(e, jaiA64SubsX(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
         }
         branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        /* After the key check, which is what keeps these addresses valid. */
+        for (unsigned t = 0; t < e->tagProofCount; t++) {
+            if (e->tagProof[t].top != off) continue;
+            SlotKind tk = (SlotKind)e->tagProof[t].kind;
+            unsigned tag = tk == SLOT_INT ? VAL_INT
+                         : tk == SLOT_FLOAT ? VAL_FLOAT : VAL_BOOL;
+            emitConst64(e, JIT_SCRATCH_D,
+                        (int64_t)(uintptr_t)e->tagProof[t].slot);
+            emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                               (unsigned)offsetof(JaiEntry, value)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        }
     }
     for (unsigned i = 0; i < e->closHoistCount; i++) {
         if (e->closHoist[i].top != off) continue;

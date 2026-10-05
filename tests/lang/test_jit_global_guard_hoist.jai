@@ -70,3 +70,30 @@ fn test_a_loop_that_calls_keeps_its_guards() -> void {
     assert_eq(got, 3000)
     assert_eq(g_seen, 3000)
 }
+
+var g_any: any = 0
+
+fn sum_any(n: int) -> any {
+    g_any = g_any
+    var i = 0
+    while i < n {
+        g_any = g_any + 1
+        i += 1
+    }
+    return g_any
+}
+
+#: The global's kind changes between two entries to the same compiled loop:
+#: the tag proved at the head must be proved again, not remembered.
+fn test_a_global_that_changes_kind_between_entries() -> void {
+    for _ in 0..50 {
+        g_any = 0
+        sum_any(2000)
+    }
+    g_any = 0
+    assert_eq(sum_any(5000), 5000)
+    g_any = 0.5
+    assert_eq(sum_any(4), 4.5)
+    g_any = 10
+    assert_eq(sum_any(3000), 3010)
+}

@@ -764,6 +764,9 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             memcpy(e.clobberAlloc, probe.clobberAlloc, sizeof e.clobberAlloc);
             e.globalSiteCount = probe.globalSiteCount;
             e.globalSiteSpill = probe.globalSiteSpill;
+            e.globalAccCount = probe.globalAccCount;
+            e.globalAccSpill = probe.globalAccSpill;
+            memcpy(e.globalAcc, probe.globalAcc, sizeof e.globalAcc);
             memcpy(e.globalOff, probe.globalOff, sizeof e.globalOff);
             if (e.globalsTable == NULL) {
                 e.globalsTable = probe.globalsTable;

@@ -1070,6 +1070,9 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         memcpy(e.clobberAlloc, body.clobberAlloc, sizeof e.clobberAlloc);
         e.globalSiteCount = body.globalSiteCount;
         e.globalSiteSpill = body.globalSiteSpill;
+        e.globalAccCount = body.globalAccCount;
+        e.globalAccSpill = body.globalAccSpill;
+        memcpy(e.globalAcc, body.globalAcc, sizeof e.globalAcc);
         memcpy(e.globalOff, body.globalOff, sizeof e.globalOff);
         /* The table the guards will name, so the head can name it before
          * the walk reaches the first access. Both passes resolve the same

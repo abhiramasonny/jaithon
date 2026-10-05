@@ -971,12 +971,16 @@ bool emitGetGlobal(Emit *e, ObjFunction *fn, ObjClosure *closure,
                      * instruction with the operand stack the interpreter
                      * expects. */
                     emitGlobalsGuard(e);
+                    noteGlobalAccess(e, gslot, gk, false);
                     emitConst64(e, JIT_SCRATCH_D,
                                 (int64_t)(uintptr_t)gslot);
-                    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
-                                       (unsigned)offsetof(JaiEntry, value)));
-                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
-                    branchOnDeopt(e, JAI_A64_NE);
+                    /* Proved at the loop head (planTagProofs). */
+                    if (!globalTagProven(e, gslot, gk)) {
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                           (unsigned)offsetof(JaiEntry, value)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
+                        branchOnDeopt(e, JAI_A64_NE);
+                    }
                     if (gk == SLOT_BOOL) {
                         /* A byte, not a word. BOOL_VAL writes the union's
                          * one-byte `bool` member and leaves the other seven
@@ -1123,7 +1127,16 @@ bool emitSetGlobal(Emit *e, ObjClosure *closure, const uint8_t *code,
             return false;
         }
         emitGlobalsGuard(e);
-        {
+        noteGlobalAccess(e, gslot, sk, true);
+        if (globalTagProven(e, gslot, sk)) {
+            /* The tag is `sk` already and stays so (planTagProofs): the old
+             * value is no object, so no version bump, and only the payload
+             * changes. */
+            unsigned src = pushReg(e) - 1;
+            emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)gslot);
+            emit(e, jaiA64StrX(src, JIT_SCRATCH_D,
+                               (unsigned)offsetof(JaiEntry, value) + 8u));
+        } else {
             unsigned src = pushReg(e) - 1;
             emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)gslot);
             /* Version only needs to move when a class/closure/native leaves or arrives (jaiValueIsInertGlobal is
