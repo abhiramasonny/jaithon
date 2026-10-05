@@ -369,6 +369,17 @@ static bool jitShrinkSkip(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_SHRINK_WIDE=0 keeps the early arm to int returns: no bool
+ * literal, no bare `return` of a void function. Default on. */
+static bool jitShrinkWide(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SHRINK_WIDE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* The argument register a parameter slot arrives in, when it is a plain int
  * the body keeps no tag for; -1 otherwise. */
 static int earlyIntArg(const Emit *e, const Emit *body, unsigned slot,
@@ -415,7 +426,7 @@ static int earlyNullableArg(const Emit *e, const Emit *body, unsigned slot,
 static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
                                unsigned realArgs) {
     if (!jitShrinkWrap() || e->osr || e->count != 0) return false;
-    if (e->dynamicReturn || body->returnKind != SLOT_INT) return false;
+    if (e->dynamicReturn) return false;
     const Chunk *c = &fn->chunk;
     const uint8_t *p = c->code;
     /* The test: a register, compared against an imm12 (`k`) or against
@@ -425,10 +436,11 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     unsigned cond = 0;
     uint8_t cmp;
     int ret;                 /* offset of the arm's value */
-    if (c->count >= 14 && p[0] == OP_JUMP_IF_CMP_LOCAL_K) {
+    int rel;
+    if (c->count >= 11 && p[0] == OP_JUMP_IF_CMP_LOCAL_K) {
         /* `if n < 2 { ... }`: OP_JUMP_IF_CMP_LOCAL_K cmp, slot, k, rel. */
         cmp = p[1];
-        if (9 + (int)jaiReadI16(p + 7) != 13) return false;
+        rel = (int)jaiReadI16(p + 7);
         uint32_t ki = jaiReadU24(p + 4);
         if (ki >= (uint32_t)c->constants.count) return false;
         Value kv = c->constants.data[ki];
@@ -436,12 +448,12 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
         k = AS_INT(kv);
         rs = earlyIntArg(e, body, jaiReadU16(p + 2), realArgs);
         ret = 9;
-    } else if (c->count >= 13 && p[0] == OP_GET_LOCAL && p[3] == OP_NULL &&
+    } else if (c->count >= 10 && p[0] == OP_GET_LOCAL && p[3] == OP_NULL &&
                p[4] == OP_JUMP_IF_CMP_FALSE) {
         /* `if node == null { ... }`: the pointer against zero. */
         cmp = p[5];
         if (cmp != OP_EQ && cmp != OP_NE) return false;
-        if (8 + (int)jaiReadI16(p + 6) != 12) return false;
+        rel = (int)jaiReadI16(p + 6);
         rs = earlyNullableArg(e, body, jaiReadU16(p + 1), realArgs);
         ret = 8;
     } else {
@@ -457,18 +469,35 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     case OP_NE: cond = JAI_A64_NE; break;
     default: return false;
     }
-    uint32_t target = (uint32_t)ret + 4u;
-    if (p[ret + 3] != OP_RETURN) return false;
+    /* The arm: what it returns, as the body's single return kind says
+     * every return does. */
     int rt = -1;
     int64_t lit = 0;
-    if (p[ret] == OP_GET_LOCAL) {
+    SlotKind rk;
+    unsigned armLen;
+    if (ret + 4 <= c->count && p[ret] == OP_GET_LOCAL &&
+        p[ret + 3] == OP_RETURN) {
         rt = earlyIntArg(e, body, jaiReadU16(p + ret + 1), realArgs);
         if (rt < 0) return false;
-    } else if (p[ret] == OP_INT) {
+        rk = SLOT_INT; armLen = 4;
+    } else if (ret + 4 <= c->count && p[ret] == OP_INT &&
+               p[ret + 3] == OP_RETURN) {
         lit = jaiReadI16(p + ret + 1);
+        rk = SLOT_INT; armLen = 4;
+    } else if (jitShrinkWide() && ret + 2 <= c->count &&
+               (p[ret] == OP_TRUE || p[ret] == OP_FALSE) &&
+               p[ret + 1] == OP_RETURN) {
+        lit = p[ret] == OP_TRUE ? 1 : 0;
+        rk = SLOT_BOOL; armLen = 2;
+    } else if (jitShrinkWide() && ret + 1 <= c->count &&
+               p[ret] == OP_RETURN_NULL && (fn->flags & FN_INIT) == 0) {
+        rk = SLOT_NULL; armLen = 1;
     } else {
         return false;
     }
+    if (body->returnKind != rk) return false;
+    uint32_t target = (uint32_t)ret + armLen;
+    if (ret + rel != (int)target || target >= (uint32_t)c->count) return false;
     emit(e, jaiA64SubsXImm(31, (unsigned)rs, (unsigned)k));
     unsigned skip = e->count;
     emit(e, jaiA64BCond(cond ^ 1u, 0));                /* patched below */
@@ -487,7 +516,7 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     for (uint32_t at = 0; at < target; at++) {
         if (offsetIsBranchTarget(c, at)) entered = true;
     }
-    if (!entered && jitShrinkSkip() && mergeReturnKind(e, SLOT_INT, 0)) {
+    if (!entered && jitShrinkSkip() && mergeReturnKind(e, rk, 0)) {
         e->walkFrom = target;
     }
     return true;

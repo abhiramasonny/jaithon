@@ -135,3 +135,42 @@ fn test_a_null_test_ahead_of_the_frame() -> void {
     }
     assert_eq(count, 1)
 }
+
+#: A bool literal returned from the arm.
+fn holds(node: Tree?, v: int) -> bool {
+    if node == null { return false }
+    if node.value == v { return true }
+    return holds(node.left, v) or holds(node.right, v)
+}
+
+fn is_small(n: int) -> bool {
+    if n < 10 { return true }
+    return n % 2 == 0
+}
+
+var g_visits = 0
+
+#: A bare `return` from a function with nothing to return.
+fn visit(node: Tree?) -> void {
+    if node == null { return }
+    g_visits += 1
+    visit(node.left)
+    visit(node.right)
+}
+
+fn test_bool_and_void_arms() -> void {
+    let tree = grow(10)
+    var found = 0
+    for v in 0..30 {
+        if holds(tree, v) { found += 1 }
+    }
+    assert_eq(found, 10)
+    var small = 0
+    for i in 0..400 {
+        if is_small(i) { small += 1 }
+    }
+    assert_eq(small, 205)
+    g_visits = 0
+    for _ in 0..20 { visit(tree) }
+    assert_eq(g_visits, 20460)
+}
