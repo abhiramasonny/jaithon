@@ -729,6 +729,49 @@ static void ifEmitValue(Emit *e, const IfLink *L, unsigned rd) {
     }
 }
 
+/* Whether `L` is `if s <op> x { s = x }` for an ordering <op>: s becomes the
+ * min or the max of itself and x. */
+static bool ifLinkReduces(const IfLink *L, unsigned s) {
+    if (L->uncond) return false;
+    if (L->cmp != OP_LT && L->cmp != OP_LE && L->cmp != OP_GT &&
+        L->cmp != OP_GE) {
+        return false;
+    }
+    if (L->twoLocals) {
+        unsigned other;
+        if (L->nslot == s) other = L->bslot;
+        else if (L->bslot == s) other = L->nslot;
+        else return false;
+        return L->vop == OP_GET_LOCAL && L->va == other;
+    }
+    return L->nslot == s && L->vop == OP_INT && L->vimm == L->k;
+}
+
+/* Whether `s` reaches the chain at `off` from the previous trip round the
+ * innermost loop holding [off, join): nothing between that loop's head and
+ * `off` writes it. With no loop around the chain, false. */
+static bool ifCarried(const Chunk *c, int off, int join, unsigned s) {
+    int head = -1;
+    for (int at = 0; at < c->count;) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return false;
+        int rel = jaiOpBranchOperandAt(c->code[at]);
+        if (rel >= 0 && at >= join) {
+            int32_t to = (int32_t)(at + len) +
+                         jaiReadI16(c->code + at + 1 + rel);
+            if (to <= off && to > head) head = to;
+        }
+        at += len;
+    }
+    if (head < 0) return false;
+    for (int at = head; at < off;) {
+        int len = instructionLength(c, at);
+        if (len <= 0 || jitOpWritesSlot(c, at, s)) return false;
+        at += len;
+    }
+    return true;
+}
+
 /* See above. True with `*offp` at the join when the chain at `*offp` was
  * emitted branch-free; false, having emitted nothing, otherwise. */
 bool jitTryIfConvert(Emit *e, ObjFunction *fn, int *offp) {
@@ -755,6 +798,21 @@ bool jitTryIfConvert(Emit *e, ObjFunction *fn, int *offp) {
             return false;
         }
         if (!ifValueOk(e, &links[i])) return false;
+    }
+    /* Not a running min or max. `if v > hi { hi = v }` with `hi` carried
+     * round the loop is taken less and less often as `hi` climbs, so its
+     * branch predicts well, and the csel would put a compare and a select
+     * on the loop-carried chain the branch keeps off it: 0.91x over a
+     * million random ints. A clamp of a value loaded this trip (`if v < lo
+     * { v = lo }`) is the same shape with nothing carried, and converts. */
+    for (unsigned i = 0; i < n; i++) {
+        if (ifLinkReduces(&links[i], s) && ifCarried(&fn->chunk, off, join, s)) {
+            if (getenv("JAI_JIT_WHY")) {
+                fprintf(stderr, "[jit] %s keeps the branch of a running "
+                        "min/max at %d\n", jitFnLabel(fn), off);
+            }
+            return false;
+        }
     }
 
     settleAll(e);

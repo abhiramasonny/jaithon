@@ -78,6 +78,10 @@ static bool writesSlot(const Chunk *c, int off, unsigned slot) {
     return false;
 }
 
+bool jitOpWritesSlot(const Chunk *c, int off, unsigned slot) {
+    return writesSlot(c, off, slot);
+}
+
 static bool hasClosures(const Chunk *c) {
     for (int off = 0; off < c->count;) {
         int len = instructionLength(c, off);

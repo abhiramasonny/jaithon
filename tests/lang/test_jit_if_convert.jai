@@ -7,7 +7,9 @@
 #: elements of an int list the loop head has proved in bounds; a list whose
 #: storage is not the one compiled for deoptimises the whole chain to its
 #: first test, before anything is written.
-from std.test import assert_eq
+from std.io import Path, write_file
+from std.os import argv, env, pid, run, temp_dir
+from std.test import assert_eq, assert_true
 
 fn rule_ref(n: int, cur: int) -> int {
     if n == 3 { return 1 }
@@ -187,5 +189,64 @@ fn test_assigned_local_is_tested() -> void {
             let want = if x > 5 { 5 } elif x > 2 { 2 } else { x }
             assert_eq(step_down(x), want)
         }
+    }
+}
+
+#: A running max keeps its branch: `if v > hi { hi = v }` with `hi` carried
+#: round the loop is taken less and less often, so it predicts, and a csel
+#: would put a compare and a select on the loop-carried chain (0.91x over a
+#: million random ints). A clamp of a value loaded on the same trip is the
+#: same shape with nothing carried, and still converts. Run in a child with
+#: JAI_JIT_WHY so the decision itself can be read.
+fn test_a_running_max_keeps_its_branch() -> void {
+    let lines = [
+        "fn scan(xs: list[int]) -> int {",
+        "    var hi = -1",
+        "    var lo = 4000",
+        "    for i in 0..len(xs) {",
+        "        let v = xs[i]",
+        "        if v > hi { hi = v }",
+        "        if lo > v { lo = v }",
+        "    }",
+        "    return hi * 10000 + lo",
+        "}",
+        "fn clamp(xs: list[int]) -> int {",
+        "    var s = 0",
+        "    for i in 0..len(xs) {",
+        "        var v = xs[i]",
+        "        if v < 1000 { v = 1000 } elif v > 3000 { v = 3000 }",
+        "        s += v",
+        "    }",
+        "    return s",
+        "}",
+        "fn main() -> int {",
+        "    var xs: list[int] = []",
+        "    var q = 777",
+        "    for _i in 0..2000 {",
+        "        q = (q * 1103515245 + 12345) % 2147483648",
+        "        xs.push(q // 65536 % 4000)",
+        "    }",
+        "    var total = 0",
+        "    for _r in 0..300 { total += scan(xs) + clamp(xs) }",
+        "    print(total)",
+        "    return 0",
+        "}",
+    ]
+    let src = "\n".join(lines) + "\n"
+    let path = f"{temp_dir()}/jaithon_ifconv_{pid()}.jai"
+    write_file(path, src)
+    defer { Path(path).remove() }
+    let ran = run(["sh", "-c", f"JAI_JIT_WHY=1 exec '{argv()[0]}' run --no-cache '{path}'"])
+    assert_eq(ran.exit_code, 0)
+    assert_eq(ran.stdout, "13187566800\n")
+    var scanConverts = 0
+    var clampConverts = 0
+    for line in ran.stderr.split("\n") {
+        if line.contains("if-converts") and line.contains(".scan ") { scanConverts += 1 }
+        if line.contains("if-converts") and line.contains(".clamp ") { clampConverts += 1 }
+    }
+    assert_eq(scanConverts, 0)
+    if env("JAITHON_NO_JIT") == null and env("JAITHON_JIT_IFCONV") == null {
+        assert_true(clampConverts > 0, "the clamp did not convert")
     }
 }

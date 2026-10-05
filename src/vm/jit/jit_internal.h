@@ -1577,6 +1577,8 @@ bool jitSlotAddSafe(const Emit *e, const ObjFunction *fn, uint32_t q,
 /* Forget the control-flow graph jit_range.c keeps for the compile in
  * progress; called as each compile starts. */
 void jitRangeReset(void);
+/* jit_range.c: whether the instruction at `off` may write local `slot`. */
+bool jitOpWritesSlot(const Chunk *c, int off, unsigned slot);
 bool emitModIntConst(Emit *e, const uint8_t *code, int *offp);
 
 #endif /* arm64 */
