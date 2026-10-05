@@ -44,6 +44,14 @@ static bool nGcStats(int argc, Value *args, Value *out) {
     jaiIODictPut(stats, "temp_roots", INT_VAL(gc != NULL ? gc->tempRootCount : 0));
     jaiIODictPut(stats, "enabled", BOOL_VAL(gc != NULL ? gc->enabled : false));
     jaiIODictPut(stats, "stress", BOOL_VAL(gc != NULL ? gc->stress : false));
+    /* The cadence --gc-stress=N set, 0 when not stressed: `jaithon test` hands
+     * it to the workers it starts from scratch, which a flag alone could not. */
+    unsigned every = 0;
+    if (gc != NULL && gc->stress) {
+        every = gc->stressEvery ? gc->stressEvery : vm.gcStressEvery;
+        if (every == 0) every = 1;
+    }
+    jaiIODictPut(stats, "stress_every", INT_VAL((int64_t)every));
     jaiGCPopRoot();
 
     *out = OBJ_VAL(stats);

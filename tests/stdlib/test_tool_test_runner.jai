@@ -173,3 +173,100 @@ fn test_a_stress_run_stresses_every_file() -> void {
     _drop(root)
     assert_eq(result["exit_code"], 0, result["stdout"])
 }
+
+fn _run_with(environment_changes: dict[str, str], arguments: list[str]) -> dict[str, any] {
+    let command = [__prim__.os_argv()[0], "test"]
+    command.extend(arguments)
+    let environment: dict[str, str] = __prim__.os_env()
+    for (name, value) in environment_changes.items() { environment[name] = value }
+    return __prim__.os_spawn(command, {"env": environment})
+}
+
+fn _times_of(root: str) -> str {
+    let file = Path(root).join("__jaicache__").join("test_times")
+    return if file.exists() { file.read_text() } else { "" }
+}
+
+fn _write_times(root: str, text: str) -> void {
+    let cache = Path(root).join("__jaicache__")
+    cache.mkdir(false, true)
+    cache.join("test_times").write_text(text)
+}
+
+#: The forked runner keeps its children's output under TMPDIR. When no
+#: directory could be made there it retried forever, spinning with no output;
+#: it now runs the files in workers that report over pipes instead.
+fn test_a_missing_temp_dir_still_runs_every_file() -> void {
+    let files = {"test_one.jai": PASSING, "test_two.jai": PASSING}
+    let root = _suite("notmp", files)
+    let result = _run_with({"TMPDIR": root + "/no/such/dir"}, ["--jobs=2", root])
+    _drop(root)
+    assert_eq(result["exit_code"], 0, result["stderr"])
+    assert_true(result["stdout"].contains("2 passed, 0 failed, 2 total"), result["stdout"])
+}
+
+#: A file recorded as needing a fresh process (it loaded a GPU framework) is
+#: spawned, not forked, and a spawned worker does not inherit the collector:
+#: it ran unstressed under `--gc-stress` until the cadence was passed to it.
+fn test_a_file_spawned_on_its_record_is_stressed_too() -> void {
+    let probe = "from std.test import assert_true\n" +
+        "fn test_stressed() -> void { assert_true(__prim__.gc_stats()[\"stress\"] == true) }\n"
+    let root = _suite("spawnstress", {"test_one.jai": probe, "test_two.jai": probe})
+    _write_times(root, "1000\tx\ttest_one.jai\n1000\t-\ttest_two.jai\n")
+    let result = _run_test(["--gc-stress=100000", "--jobs=2", root])
+    _drop(root)
+    assert_eq(result["exit_code"], 0, result["stdout"])
+}
+
+#: A record that says a file needs a fresh process used to be kept forever,
+#: because a file spawned on its record was recorded as needing it again.
+#: After _EXEC_RECHECK such runs a fork is tried, and a file that finishes in
+#: it loses the mark.
+fn test_a_stale_fresh_process_record_heals() -> void {
+    let root = _suite("heal", {"test_one.jai": PASSING, "test_two.jai": PASSING})
+    _write_times(root, "1000\tx15\ttest_one.jai\n1000\t-\ttest_two.jai\n")
+    let first = _run_test(["--jobs=2", root])
+    let between = _times_of(root)
+    let second = _run_test(["--jobs=2", root])
+    let after = _times_of(root)
+    _drop(root)
+    assert_eq(first["exit_code"], 0, first["stdout"])
+    assert_eq(second["exit_code"], 0, second["stdout"])
+    if (__prim__.os_env("JAITHON_TEST_FORK") ?? "1") == "0" { return }
+    assert_true(between.contains("\tx16\ttest_one.jai"), between)
+    assert_true(after.contains("\t-\ttest_one.jai"), after)
+}
+
+#: The record orders the next run slowest first. A filtered run times only
+#: part of each file and a doc run times other work, and either one used to
+#: overwrite it with near-zero times.
+fn test_filtered_and_doc_runs_keep_the_recorded_times() -> void {
+    let files = {"test_one.jai": PASSING, "test_two.jai": PASSING, "examples.jai": EXAMPLES}
+    let root = _suite("keep", files)
+    let recorded = "900000000000\t-\ttest_one.jai\n1000\t-\ttest_two.jai\n"
+    _write_times(root, recorded)
+    let filtered = _run_test(["--jobs=2", "--filter=no_such_test", root])
+    let after_filter = _times_of(root)
+    let doc = _run_test(["--doc", "--jobs=2", root])
+    let after_doc = _times_of(root)
+    _drop(root)
+    assert_eq(filtered["exit_code"], 1)
+    assert_eq(doc["exit_code"], 0, doc["stdout"])
+    assert_eq(after_filter, recorded)
+    assert_eq(after_doc, recorded)
+}
+
+#: Output that is not UTF-8 failed to decode in the parent and took every
+#: other file's results down with it.
+fn test_a_child_printing_invalid_utf8_does_not_stop_the_run() -> void {
+    let noisy = "fn test_noisy() -> void {\n" +
+        "    __prim__.io_write(1, __prim__.bytes_new([255, 104, 10]))\n" +
+        "    __prim__.io_write(2, __prim__.bytes_new([254, 104, 10]))\n}\n"
+    let root = _suite("utf8", {"test_noisy.jai": noisy, "test_one.jai": PASSING})
+    #: Forked only: a worker started from scratch reads its pipes with
+    #: std.os, which still raises on such output.
+    let result = _run_with({"JAITHON_TEST_FORK": "1"}, ["--jobs=2", root])
+    _drop(root)
+    assert_eq(result["exit_code"], 0, result["stderr"])
+    assert_true(result["stdout"].contains("2 passed, 0 failed, 2 total"), result["stdout"])
+}
