@@ -17,8 +17,9 @@
  * emitted above the offset map at the loop head, as the hoists are, so a back
  * edge lands on the ordinary head and never re-runs it (see emitHoistsAt).
  * At run time it checks everything it needs -- each list's storage is F64,
- * every index the whole range will touch is in [0, count), and the stored
- * list is no list it reads at another offset -- and if any check fails it
+ * every index the whole range will touch is in [0, count), no step of a
+ * folded subscript can overflow, and the stored list is no list it reads at
+ * another offset -- and if any check fails it
  * simply falls through to the scalar loop, which then does all the work
  * exactly as before. When they all pass it runs as many whole groups of
  * 2*U elements as fit, advances the loop counter past them, and lets the scalar
@@ -314,14 +315,19 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
             bool aIx = a->kind == VS_IDX || a->kind == VS_IREF;
             bool bIx = b->kind == VS_IDX || b->kind == VS_IREF;
             if (op != OP_MUL && aIx && b->kind == VS_INT) {
-                int64_t k = op == OP_ADD ? a->k + b->k : a->k - b->k;
+                int64_t k;
+                if (op == OP_ADD ? __builtin_add_overflow(a->k, b->k, &k)
+                                 : __builtin_sub_overflow(a->k, b->k, &k)) {
+                    return false;
+                }
                 if (k < -VEC_MAX_OFF || k > VEC_MAX_OFF) return false;
                 a->k = k;
                 d--;
                 break;
             }
             if (op == OP_ADD && a->kind == VS_INT && bIx) {
-                int64_t k = a->k + b->k;
+                int64_t k;
+                if (__builtin_add_overflow(a->k, b->k, &k)) return false;
                 if (k < -VEC_MAX_OFF || k > VEC_MAX_OFF) return false;
                 *a = *b;
                 a->k = k;
@@ -573,6 +579,41 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
         }
         emit(e, jaiA64SubsXImm(31, xC, (unsigned)(-minLo)));
         VEC_SKIP(JAI_A64_LT);
+    }
+    /* A based subscript was folded into one offset, but the scalar loop
+     * computes it one overflow-checked step at a time: `x + 12 + row` adds 12
+     * to x first, and raises there when x is near the top of int even though
+     * the whole sum is a small index. Each step it takes is x + k, base + k,
+     * or x + base + k, with |k| <= 12 (vecMatch bounds every partial offset as
+     * it folds). The last is within 24 of an index the stream checks below
+     * prove in [0, count), so it cannot wrap. The first two cannot once cur,
+     * end and every base lie in [-2^62, 2^62) -- then no step of any element
+     * overflows, and the vector run raises nowhere the scalar loop would.
+     * Outside that the scalar loop runs, and raises at its element. The test
+     * is that (v >> 62) + 1, unsigned, is 0 or 1. Plain subscripts need none
+     * of this: their steps are x + k with x itself bounded by the count. */
+    if (anyBase) {
+        uint16_t seen[VEC_MAX_STREAMS];
+        unsigned nSeen = 0;
+        for (unsigned v = 0; v < 2u + p.streamCount; v++) {
+            unsigned rv;
+            if (v == 0) {
+                rv = xC;
+            } else if (v == 1) {
+                rv = xE;
+            } else {
+                uint16_t b = p.streamBase[v - 2u];
+                bool dup = b == VEC_NO_BASE;
+                for (unsigned i = 0; i < nSeen && !dup; i++) dup = seen[i] == b;
+                if (dup) continue;
+                seen[nSeen++] = b;
+                rv = localIn(e, b, tA);
+            }
+            emit(e, jaiA64AsrX(tB, rv, 62));
+            emit(e, jaiA64AddXImm(tB, tB, 1));
+            emit(e, jaiA64SubsXImm(31, tB, 2u));
+            VEC_SKIP(JAI_A64_HS);
+        }
     }
 
     for (unsigned si = 0; si < p.streamCount; si++) {

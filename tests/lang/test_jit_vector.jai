@@ -86,8 +86,24 @@ fn untyped_ref(src, dst, lo: int, hi: int) -> void {
 }
 
 fn specials(n: int) -> list[float] {
-    let pool = [1.5, -0.0, 0.0, NAN, INF, -INF, 1e-310, -2.5e-308, 1e308,
-                -1e308, 0.1, 3.0, -7.25, 2.0, 1e-300, 4.9e-324]
+    let pool = [
+        1.5,
+        -0.0,
+        0.0,
+        NAN,
+        INF,
+        -INF,
+        1e-310,
+        -2.5e-308,
+        1e308,
+        -1e308,
+        0.1,
+        3.0,
+        -7.25,
+        2.0,
+        1e-300,
+        4.9e-324,
+    ]
     var out: list[float] = []
     for i in 0..n { out.push(pool[(i * 7 + 3) % pool.len()]) }
     return out
@@ -278,5 +294,151 @@ fn test_one_list_under_two_bases_and_two_names_stays_scalar() -> void {
                 assert_true(same_lists(g2, w2), f"based alias {b0}")
             }
         }
+    }
+}
+
+# A subscript the vectoriser folds into one offset is still computed, scalar,
+# one overflow-checked step at a time: `x + 12 + row` adds 12 to x before row,
+# and raises when x is near the top of int even though the whole sum is a
+# small index. The folded stream must decline whenever any of those steps
+# could overflow, and leave the scalar loop to raise at the same element.
+fn var_k_base(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    for x in lo..hi { dst[x + 12 + row] = src[x + row] * 2.0 }
+}
+
+fn var_k_base_ref(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    var x = lo
+    while x < hi {
+        dst[x + 12 + row] = src[x + row] * 2.0
+        x += 1
+    }
+}
+
+fn k_var_base(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    for x in lo..hi { dst[12 + x + row] = src[x + row] * 2.0 }
+}
+
+fn k_var_base_ref(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    var x = lo
+    while x < hi {
+        dst[12 + x + row] = src[x + row] * 2.0
+        x += 1
+    }
+}
+
+fn base_k_var(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    for x in lo..hi { dst[row + 5 + x] = src[x + row] * 2.0 }
+}
+
+fn base_k_var_ref(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    var x = lo
+    while x < hi {
+        dst[row + 5 + x] = src[x + row] * 2.0
+        x += 1
+    }
+}
+
+fn var_down_up_base(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    for x in lo..hi { dst[x - 12 + 7 + row] = src[x + row] * 2.0 }
+}
+
+fn var_down_up_base_ref(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    var x = lo
+    while x < hi {
+        dst[x - 12 + 7 + row] = src[x + row] * 2.0
+        x += 1
+    }
+}
+
+fn k_base_var(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    for x in lo..hi { dst[12 + row + x] = src[12 + row + x] * 2.0 }
+}
+
+fn k_base_var_ref(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    var x = lo
+    while x < hi {
+        dst[12 + row + x] = src[12 + row + x] * 2.0
+        x += 1
+    }
+}
+
+fn far_constant(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    for x in lo..hi { dst[x - 2 - 9223372036854775807] = src[x] * 2.0 }
+}
+
+fn far_constant_ref(src: list[float], dst: list[float], row: int, lo: int, hi: int) -> void {
+    var x = lo
+    while x < hi {
+        dst[x - 2 - 9223372036854775807] = src[x] * 2.0
+        x += 1
+    }
+}
+
+fn agree(kern, kern_ref, row: int, lo: int, hi: int, what: str) -> void {
+    let src = specials(40)
+    var got = zeros(40)
+    var want = zeros(40)
+    var got_err = ""
+    var want_err = ""
+    try {
+        kern(src, got, row, lo, hi)
+    } catch e {
+        got_err = f"{e}"
+    }
+    try {
+        kern_ref(src, want, row, lo, hi)
+    } catch e {
+        want_err = f"{e}"
+    }
+    assert_eq(got_err, want_err, what)
+    assert_true(same_lists(got, want), what)
+}
+
+fn test_a_folded_subscript_still_overflows_where_the_scalar_one_does() -> void {
+    let top = 9223372036854775807
+    for _round in 0..300 {
+        # x near the top: x + 12 overflows partway through the range.
+        agree(
+            var_k_base,
+            var_k_base_ref,
+            -9223372036854775787,
+            9223372036854775790,
+            9223372036854775806,
+            "x + 12 + row"
+        )
+        agree(
+            k_var_base,
+            k_var_base_ref,
+            -9223372036854775787,
+            9223372036854775790,
+            9223372036854775806,
+            "12 + x + row"
+        )
+        # row near the top: row + 5 overflows at every element.
+        agree(base_k_var, base_k_var_ref, top - 2, 2 - top, 18 - top, "row + 5 + x, row = max - 2")
+        agree(base_k_var, base_k_var_ref, top, -top, 16 - top, "row + 5 + x, row = max")
+        # x near the bottom: x - 12 overflows at every element.
+        agree(
+            var_down_up_base,
+            var_down_up_base_ref,
+            top,
+            -9223372036854775800,
+            -9223372036854775784,
+            "x - 12 + 7 + row"
+        )
+        agree(
+            k_base_var,
+            k_base_var_ref,
+            9223372036854775800,
+            -9223372036854775800,
+            -9223372036854775784,
+            "12 + row + x"
+        )
+        agree(far_constant, far_constant_ref, 0, 0, 16, "x - 2 - max")
+        # The same kernels well inside int, where they may vectorise.
+        agree(var_k_base, var_k_base_ref, 3, 0, 16, "x + 12 + row, small")
+        agree(base_k_var, base_k_var_ref, 2, 0, 20, "row + 5 + x, small")
+        agree(var_down_up_base, var_down_up_base_ref, 9, 0, 24, "x - 12 + 7 + row, small")
+        agree(k_base_var, k_base_var_ref, 1, 0, 20, "12 + row + x, small")
     }
 }
