@@ -2,7 +2,7 @@
 from jaithon.ast import Node, NodeKind
 from jaithon.ast import walk
 from jaithon.compile.diag import DiagnosticBag, Severity
-from jaithon.compile.parser import parse
+from jaithon.compile.parser import parse, parse_spelled
 from .comment import Comment, _Trivia, scan_comments
 from .layout import _is_literal
 from .printer import _Printer
@@ -17,7 +17,32 @@ pub fn parse_module(source: str, path: str) -> Node {
     let bag = DiagnosticBag()
     let program = parse(source, 0, bag)
     if program is not null { return program }
+    throw _parse_error(path, bag)
+}
 
+#: JAITHON_FMT_SPELLED=0 goes back to parsing and then freezing the literals
+#: with a walk over the whole tree; read once.
+let _PARSE_SPELLED: bool = (__prim__.os_env("JAITHON_FMT_SPELLED") ?? "1") != "0"
+
+#: Parse `source` for printing: the tree `freeze_literals(parse_module(...))`
+#: gives, with every literal pinned to the text it was written as.
+#:
+#: The parser hands its literals over as it builds them, which saves the walk
+#: `freeze_literals` makes to find them -- 10-15% of `jaithon fmt` and `doc`.
+#:
+#: ```
+#: let tree = parse_for_printing("let x = 0xFF\n", "d.jai")
+#: tree.child_list("stmts")[0].child("init").text("name")    # "0xFF"
+#: ```
+pub fn parse_for_printing(source: str, path: str) -> Node {
+    if not _PARSE_SPELLED { return freeze_literals(parse_module(source, path), source) }
+    let bag = DiagnosticBag()
+    let program = parse_spelled(source, 0, bag)
+    if program is not null { return program }
+    throw _parse_error(path, bag)
+}
+
+fn _parse_error(path: str, bag: DiagnosticBag) -> ParseError {
     var first = f"{path}: cannot parse"
     for diagnostic in bag.items {
         if diagnostic.severity == Severity.Error {
@@ -25,7 +50,7 @@ pub fn parse_module(source: str, path: str) -> Node {
             break
         }
     }
-    throw ParseError(first)
+    return ParseError(first)
 }
 
 #: Pin every literal in `program` to the text it was written as, in place.
@@ -84,7 +109,7 @@ pub fn unplaceable_comments(source: str, path: str) -> list[Comment] {
 
 pub fn _format(source: str, path: str) -> tuple[str, list[Comment]] {
     let text = _Source(source)
-    let program = freeze_literals(parse_module(source, path), source)
+    let program = parse_for_printing(source, path)
     let trivia = _Trivia(scan_comments(source))
     let printer = _Printer(text, trivia)
     printer.statements(program.child_list("stmts"), text.line_count() + 1, true)

@@ -24,7 +24,8 @@
 from .fmt.comment import Comment, scan_comments
 from .fmt.diff import DIFF_CONTEXT, check_report, first_difference, unified_diff
 from .fmt.driver import expand_paths, is_diagnostic_fixture, main, tail_arguments
-from .fmt.format import format_source, freeze_literals, is_formatted, parse_module
+from .fmt.format import format_source, freeze_literals, is_formatted, parse_for_printing
+from .fmt.format import parse_module
 from .fmt.format import render_signature, unplaceable_comments
 from .fmt.layout import LINE_WIDTH
 from .fmt.migrate import _is_ident_part, _is_ident_start, migrate2
@@ -33,7 +34,7 @@ from .fmt.text import _utf8_length
 export { Comment, scan_comments }
 export { DIFF_CONTEXT, check_report, first_difference, unified_diff }
 export { expand_paths, is_diagnostic_fixture, main, tail_arguments }
-export { format_source, freeze_literals, is_formatted, parse_module }
+export { format_source, freeze_literals, is_formatted, parse_for_printing, parse_module }
 export { render_signature, unplaceable_comments }
 export { LINE_WIDTH }
 export { _is_ident_part, _is_ident_start, migrate2 }

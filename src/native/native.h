@@ -520,6 +520,28 @@ JaiSpawnStatus jaiProcessSpawn(const char *const *argv, const char *cwd,
  * or false with errno set on real error — that's how callers tell them apart. */
 bool jaiProcessWait(int pid, bool block, int *outExit);
 
+/* Block until any child exits; false with errno set (ECHILD) when none is left. */
+bool jaiProcessWaitAny(int *outPid, int *outExit);
+
+/* fork() with the child's stdin read from /dev/null and its stdout and stderr
+ * written to the two files. Returns the child's pid in the parent, 0 in the
+ * child, -1 with errno set when the fork failed. Single-threaded callers only:
+ * the child goes on running the whole VM. */
+int jaiProcessForkTo(const char *outPath, const char *errPath);
+
+/* True in a child jaiProcessForkTo made. Such a child cannot use a framework
+ * that talks to a system service over XPC -- Metal's shader compiler answers
+ * "the process is unavailable" -- so the native loader exits it with
+ * JAI_EXIT_NEEDS_EXEC instead of loading one, and the parent runs the work
+ * again in a process started from scratch. */
+extern bool jaiProcessIsForkedChild;
+#define JAI_EXIT_NEEDS_EXEC 75
+
+/* posix_spawnp `argv` with stdin from /dev/null and stdout/stderr written to
+ * the two files. Returns the pid, or -1 with *outErrno set. */
+int jaiProcessSpawnTo(const char *const *argv, const char *outPath,
+                      const char *errPath, int *outErrno);
+
 bool jaiProcessSignal(int pid, int sig);
 char **jaiListDir(const char *path, int *outCount);   /* caller frees */
 bool  jaiStatPath(const char *path, int64_t *size, int64_t *mtime, bool *isDir);

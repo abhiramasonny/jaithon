@@ -395,3 +395,7 @@ void jaiVMPrintStats(FILE *out) {
             vm.jitPicAdmits, vm.jitPicRefusals, picRate);
     jaiGCPrintStats(out);
 }
+
+void jaiVMAfterFork(void) {
+    jaiJitAfterFork();
+}

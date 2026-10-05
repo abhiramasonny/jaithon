@@ -134,6 +134,8 @@ static bool tryDir(int image, const char *dir, void **handle, char *why, size_t 
 static void *openImage(int image) {
     const char *enabled = getenv("JAITHON_NATIVE");
     if (enabled != NULL && strcmp(enabled, "0") == 0) return NULL;
+    /* See jaiProcessIsForkedChild: nothing this child has printed is kept. */
+    if (jaiProcessIsForkedChild) _exit(JAI_EXIT_NEEDS_EXEC);
 
     char why[JAI_MAX_PATH + 128];
     why[0] = '\0';

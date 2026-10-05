@@ -379,6 +379,13 @@ pub fn _parse_lambda(p: Parser) -> Node {
 }
 
 # --- primary ---------------------------------------------------------
+#: Record `literal` for `parse_spelled`, when it asked, and pass it through.
+pub fn _spelled(p: Parser, literal: Node) -> Node {
+    let spelled = p.spelled
+    if spelled is not null { spelled.push(literal) }
+    return literal
+}
+
 pub fn _parse_primary(p: Parser) -> Node {
     let start_index = p.current
     let token = p._peek()
@@ -386,18 +393,19 @@ pub fn _parse_primary(p: Parser) -> Node {
 
     if kind == TokenKind.Int {
         p._advance()
-        return _node(NodeKind.IntLit, p._span_of(token), {"intLit": token.value ?? 0})
+        return _spelled(p, _node(NodeKind.IntLit, p._span_of(token), {"intLit": token.value ?? 0}))
     }
     if kind == TokenKind.Float {
         p._advance()
-        return _node(NodeKind.FloatLit, p._span_of(token), {"floatLit": token.value ?? 0.0})
+        let value = token.value ?? 0.0
+        return _spelled(p, _node(NodeKind.FloatLit, p._span_of(token), {"floatLit": value}))
     }
     if kind == TokenKind.Str {
         p._advance()
-        return _str_lit(p._span_of(token), token.string_value())
+        return _spelled(p, _str_lit(p._span_of(token), token.string_value()))
     }
     if kind == TokenKind.FStringStart or kind == TokenKind.FStringEnd {
-        return _parse_fstring(p)
+        return _spelled(p, _parse_fstring(p))
     }
     if kind == TokenKind.KwThrow {
         p._advance()

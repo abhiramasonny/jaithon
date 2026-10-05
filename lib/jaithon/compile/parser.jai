@@ -6,8 +6,8 @@
 #: ```
 #:
 #: Facade: imports and re-exports the modules of the `parse/` directory. The
-#: surface is three names, and it was three names before the split.
+#: surface was three names before the split; `parse_spelled` is the fourth.
 from jaithon.compile.parse.state import MAX_RECURSION, Parser
-from jaithon.compile.parse.wire import parse
+from jaithon.compile.parse.wire import parse, parse_spelled
 
-export { MAX_RECURSION, Parser, parse }
+export { MAX_RECURSION, Parser, parse, parse_spelled }

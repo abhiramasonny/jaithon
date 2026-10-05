@@ -17,10 +17,10 @@ from jaithon.ast_unparse import to_source
 from jaithon.compile.diag import DiagnosticBag
 from jaithon.compile.lexer import Lexer
 from jaithon.compile.parser import parse
-from jaithon.compile.token import TokenKind
+from jaithon.compile.token import Token, TokenKind
 from std.fmt import bold, green, red
-from std.io import Path, print_err, read_file
-from std.os import argv, cpu_count, spawn
+from std.io import Path, print_err, read_bytes, read_file
+from std.os import argv, cpu_count, env, spawn, temp_dir
 from std.test import Outcome, Report, Test, TestResult
 from std.time import Duration
 from .args import Arguments
@@ -80,6 +80,79 @@ pub fn test_functions(source: str, path: str) -> list[str] {
     return names
 }
 
+#: JAITHON_TEST_SCAN=0 finds test names by parsing the file, as it used to;
+#: read once.
+let _SCAN_NAMES: bool = (env("JAITHON_TEST_SCAN") ?? "1") != "0"
+
+#: The names `test_functions` finds, read off the tokens alone: a `fn` outside
+#: every brace, named like a test, whose parameter list is empty. Null when the
+#: source does not even lex, so the caller can fall back to the parse.
+#:
+#: ```
+#: _scan_test_names("fn test_a() -> void { fn test_b() { } }\nfn test_c(x: int) { }\n")
+#: #     ["test_a"]
+#: ```
+pub fn _scan_test_names(source: str) -> list[str]? {
+    let lexer = Lexer(source, 0, DiagnosticBag())
+    let tokens = lexer.tokenize()
+    if lexer.had_error { return null }
+    let names: list[str] = []
+    let count = tokens.len()
+    var depth = 0
+    var index = 0
+    while index < count {
+        let kind = tokens[index].kind
+        if kind == TokenKind.LBrace {
+            depth += 1
+        } elif kind == TokenKind.RBrace {
+            depth -= 1
+        } elif kind == TokenKind.KwFn and depth == 0 and index + 1 < count {
+            let name_token = tokens[index + 1]
+            if name_token.kind == TokenKind.Ident and is_test_name(name_token.word) {
+                if _no_parameters(tokens, index + 2) { names.push(name_token.word) }
+            }
+        }
+        index += 1
+    }
+    return names
+}
+
+#: Whether the parameter list starting at `tokens[at]` (after any generic
+#: brackets) is empty.
+fn _no_parameters(tokens: list[Token], start: int) -> bool {
+    let count = tokens.len()
+    var at = start
+    if at < count and tokens[at].kind == TokenKind.LBracket {
+        var nesting = 0
+        while at < count {
+            let kind = tokens[at].kind
+            if kind == TokenKind.LBracket { nesting += 1 }
+            if kind == TokenKind.RBracket {
+                nesting -= 1
+                if nesting == 0 { break }
+            }
+            at += 1
+        }
+        at += 1
+    }
+    if at >= count or tokens[at].kind != TokenKind.LParen { return false }
+    at += 1
+    while at < count and tokens[at].kind == TokenKind.Newline { at += 1 }
+    return at < count and tokens[at].kind == TokenKind.RParen
+}
+
+#: A `parse` result for `path` when it does not parse, else nothing: the
+#: answer the runner gave before it found names without parsing.
+fn _unless_unparseable(source: str, path: str, suite: str) -> list[TestResult] {
+    if not _SCAN_NAMES { return [] }
+    try {
+        let _names = test_functions(source, path)
+    } catch error: ParseError {
+        return [_broken(suite, "parse", error.message)]
+    }
+    return []
+}
+
 #: Return the expected-value comment of an example line, or null.
 #:
 #: The value is the text after the last `#` that is not inside a string, which
@@ -121,20 +194,28 @@ pub fn code_of(line: str) -> str {
 pub fn run_file(path: str, filter: str?, verbose: bool) -> list[TestResult] {
     let source = read_file(path)
     let suite = module_name_of(path)
-    var names: list[str] = []
-    try {
-        names = test_functions(source, path)
-    } catch error: ParseError {
-        return [_broken(suite, "parse", error.message)]
+    #: The names come from the tokens when they can: the parse that used to
+    #: find them was the second full compile of every file. Anything the scan
+    #: cannot settle -- no test wanted, or a file that will not load -- goes
+    #: back to the parse, so what is reported is the same either way.
+    var names = if _SCAN_NAMES { _scan_test_names(source) } else { null }
+    if names is null {
+        try {
+            names = test_functions(source, path)
+        } catch error: ParseError {
+            return [_broken(suite, "parse", error.message)]
+        }
     }
 
-    let wanted = [name for name in names if _matches(suite, name, filter)]
-    if wanted.len() == 0 { return [] }
+    let wanted = [name for name in names ?? [] if _matches(suite, name, filter)]
+    if wanted.len() == 0 { return _unless_unparseable(source, path, suite) }
 
     let namespace = f"<test {path}>"
     try {
         __prim__.exec(source, namespace)
     } catch error: Error {
+        let unparseable = _unless_unparseable(source, path, suite)
+        if unparseable.len() > 0 { return unparseable }
         return [_broken(suite, "load", f"{type_of(error)}: {error.message}")]
     }
 
@@ -262,13 +343,6 @@ fn _unescape_field(text: str) -> str {
     return out
 }
 
-fn _has_gc_stress(arguments: list[str]) -> bool {
-    for argument in arguments {
-        if argument.starts_with("--gc-stress") { return true }
-    }
-    return false
-}
-
 fn _outcome_code(outcome: Outcome) -> str {
     if outcome == Outcome.Passed { return "P" }
     if outcome == Outcome.Failed { return "F" }
@@ -335,31 +409,14 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
     #: Dropping them would make a parallel run quieter than a sequential one,
     #: which is a real difference in output and was caught by diffing the two.
     var noise: dict[str, str] = {}
+    var failures: dict[str, int] = {}
     var next_path = 0
 
-    #: Everything the process was invoked with EXCEPT the paths, so a worker
-    #: inherits flags this tool never parses -- `--gc-stress` is the one that
-    #: matters, since it belongs to the CLI rather than to `test`, and a
-    #: hand-built command silently dropped it. Rebuilding the command from
-    #: argv() means a flag added later needs no change here.
-    let own = argv()
-    var forwarded: list[str] = []
-    var index = 1
-    while index < own.len() {
-        let argument = own[index]
-        #: `test` itself, the paths, and any --jobs the caller gave: all
-        #: replaced below.
-        let is_path = not argument.starts_with("-")
-        let is_jobs = argument.starts_with("--jobs") or argument.starts_with("-j")
-        if not is_path and not is_jobs { forwarded.push(argument) }
-        index += 1
-    }
-
     fn launch(path: str) -> void {
-        var command = [exe, "test", "--_shard", "--jobs=1"]
-        command.extend(forwarded)
-        command.push(path)
-        running.push((path, spawn(command)))
+        let process = spawn(_worker_command(exe, path, options))
+        #: Nothing is ever written to it; a test reading it gets end of input.
+        process.close_stdin()
+        running.push((path, process))
     }
 
     while next_path < paths.len() or running.len() > 0 {
@@ -373,22 +430,82 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
         let (path, process) = running[0]
         captured[path] = process.read_stdout()
         noise[path] = process.read_stderr()
-        let _status = process.wait()
+        let status = process.wait()
+        if status != 0 { failures[path] = status }
         running = running[1:]
     }
+    return _report_shards(paths, captured, noise, failures, options)
+}
 
+#: The command that runs `path` alone in a worker process.
+#:
+#: The tool's own flags come from `options`: argv() here is only the binary,
+#: so a worker rebuilt from it ran without `--doc` or `--filter` -- a parallel
+#: `test --doc` found no tests at all, and `--filter` filtered nothing. What
+#: argv() does carry past the binary is still passed on, so a CLI flag that
+#: ever shows up there reaches the worker too.
+fn _worker_command(exe: str, path: str, options: _Options) -> list[str] {
+    let own = argv()
+    var command = [exe]
+    #: A forked worker inherits this process's collector; one started from
+    #: scratch only knows the cadence if it is told, and without it a stress
+    #: run ran every such file (all of the GPU ones) unstressed.
+    let every = _stress_every()
+    if every > 0 { command.push(f"--gc-stress={every}") }
+    command.extend(["test", "--_shard", "--jobs=1"])
+    if options.doc { command.push("--doc") }
+    let filter = options.filter
+    if filter is not null { command.push("--filter=" + filter) }
+    var index = 1
+    while index < own.len() {
+        let argument = own[index]
+        #: `test` itself, the paths, and the flags rebuilt above.
+        let is_path = not argument.starts_with("-")
+        let is_jobs = argument.starts_with("--jobs") or argument.starts_with("-j")
+        let is_own = argument == "--doc" or argument.starts_with("--filter") or argument == "-k"
+        if not is_path and not is_jobs and not is_own { command.push(argument) }
+        index += 1
+    }
+    command.push(path)
+    return command
+}
+
+#: Print each file's results in path order, as the sequential runner would.
+#:
+#: `failures` maps a path to the status its worker died with; a file that
+#: died before reporting anything is an error rather than a silent omission.
+fn _report_shards(
+    paths: list[str],
+    captured: dict[str, str],
+    noise: dict[str, str],
+    failures: dict[str, int],
+    options: _Options
+) -> list[TestResult] {
     let results: list[TestResult] = []
     for path in paths {
         let text = captured.get(path) ?? ""
-        let found = _parse_shard(text)
-        if found.len() == 0 { continue }
+        var found = _parse_shard(text)
+        let status = failures.get(path)
+        if found.len() == 0 and status is not null {
+            let message = f"the test process exited with status {status} before reporting"
+            found = [_broken(module_name_of(path), "crash", message)]
+        }
         let complaints = noise.get(path) ?? ""
-        if complaints.len() > 0 { print_err(complaints.rstrip()) }
+        if complaints.len() > 0 {
+            #: Standard output is buffered and standard error is not: without
+            #: the flush, a reader of both through one pipe (run_tests.sh uses
+            #: 2>&1) got a warning spliced into the middle of a result line,
+            #: wherever the buffer happened to fill, and misnamed that test.
+            __prim__.io_flush(1)
+            print_err(complaints.rstrip())
+        }
         #: Same shape as the sequential runner: per-test lines when verbose,
         #: the one-line summary when not. Printing the summary either way made
-        #: a parallel run unparseable to anything reading for `  pass  `.
+        #: a parallel run unparseable to anything reading for `  pass  `. The
+        #: sequential runner names every file when verbose, tests or not.
+        if options.verbose { print(bold(module_name_of(path))) }
+        if found.len() == 0 { continue }
         if options.verbose {
-            print(bold(module_name_of(path)))
             for result in found { print("  " + result.to_str()) }
         } else {
             print(_file_line(path, found))
@@ -396,6 +513,356 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
         results.extend(found)
     }
     return results
+}
+
+#: JAITHON_TEST_FORK=0 goes back to starting a fresh `jaithon test --_shard`
+#: process per file; read once.
+let _FORK_WORKERS: bool = (env("JAITHON_TEST_FORK") ?? "1") != "0"
+
+#: Run each path in a forked copy of this process, `limit` at a time.
+#:
+#: A spawned worker spends ~42M cycles loading the front end and the runner
+#: and ~130M more having the checker parse the signatures of `std.test`'s
+#: import closure -- for a small test file that is three quarters of its cost
+#: (tests/lang: 21.7G cycles across 107 workers against 6.3G in one process).
+#: A fork starts from this runner with all of that already done, and is still
+#: a process of its own, so a file gets fresh module state, a crash or a call
+#: to exit takes out only that file, and the result is attributed to it.
+#:
+#: A forked child cannot use the GPU (see _NEEDS_EXEC), so a file that loads
+#: a native framework is run again in a worker started from scratch.
+#:
+#: Children are reaped in the order they finish, not the order they started:
+#: draining the oldest first left every free core idle behind one slow file
+#: (the unit list: 33.8s wall for 82s of CPU on 12 cores). Output goes to two
+#: files per child rather than pipes, so no child can block on a full pipe,
+#: and is printed in path order at the end.
+fn _run_forked(exe: str, paths: list[str], options: _Options, limit: int) -> list[TestResult] {
+    let scratch = _scratch_dir()
+    if scratch is null {
+        #: Nowhere to put the children's output -- TMPDIR missing, read-only
+        #: or full. Workers started from scratch report over pipes and need no
+        #: files, so run every file that way instead.
+        return _run_sharded(exe, paths, options, limit)
+    }
+    _warm_for_children()
+    let history = _History.load(paths, options)
+    let order = history.slowest_first(paths)
+    var captured: dict[str, str] = {}
+    var noise: dict[str, str] = {}
+    var failures: dict[str, int] = {}
+    var running: dict[int, int] = {}
+    var started: dict[int, int] = {}
+    var spawned: set[int] = set()
+    #: Files whose forked child exited with _NEEDS_EXEC in this run.
+    var refused: set[int] = set()
+    var again: list[int] = []
+    #: The output files go whatever happens here; a runner that died part way
+    #: used to leave its directory under TMPDIR behind.
+    try {
+        var next_order = 0
+        while next_order < order.len() or again.len() > 0 or running.len() > 0 {
+            while running.len() < limit and (again.len() > 0 or next_order < order.len()) {
+                let from_queue = again.len() == 0
+                let index = if from_queue { order[next_order] } else { again.pop() }
+                if from_queue { next_order += 1 }
+                let base = f"{scratch}/{index}"
+                started[index] = __prim__.time_mono()
+                if not from_queue or history.needs_exec(paths[index]) {
+                    let command = _worker_command(exe, paths[index], options)
+                    let child = __prim__.os_spawn_to(command, base + ".out", base + ".err")
+                    running[child] = index
+                    spawned.add(index)
+                    continue
+                }
+                let child = __prim__.os_fork_to(base + ".out", base + ".err")
+                if child == 0 { _run_child(paths[index], options) }
+                running[child] = index
+            }
+            let done = __prim__.os_wait_any()
+            let index = running.get(done[0])
+            if index is null { continue }
+            running.remove(done[0])
+            if done[1] == _NEEDS_EXEC and index not in spawned {
+                refused.add(index)
+                again.push(index)
+                continue
+            }
+            let path = paths[index]
+            let base = f"{scratch}/{index}"
+            history.record_time(path, __prim__.time_mono() - (started.get(index) ?? 0))
+            if index in refused {
+                history.needed_exec(path)
+            } elif index in spawned {
+                history.spawned_on_record(path)
+            } else {
+                history.forked(path)
+            }
+            captured[path] = _take_file(base + ".out")
+            noise[path] = _take_file(base + ".err")
+            if done[1] != 0 { failures[path] = done[1] }
+        }
+    } finally {
+        _remove_quietly(Path(scratch), true)
+    }
+    history.save()
+    return _report_shards(paths, captured, noise, failures, options)
+}
+
+#: How long each test file took last time, and whether it had to run in a
+#: process of its own, kept beside the files in `__jaicache__/test_times`.
+#:
+#: Only a hint: it orders the work, never what is reported. Starting the
+#: longest file first keeps it off the end of the run, where it would leave
+#: every other core idle; and a file already known to load a native framework
+#: skips the forked attempt that would only exit with _NEEDS_EXEC.
+class _History {
+    var times: dict[str, int]
+    #: Files that loaded a native framework, each with the number of runs
+    #: since a forked child last proved it: they skip the fork until that
+    #: reaches _EXEC_RECHECK, so a file that stops needing a framework goes
+    #: back to forking instead of being spawned forever.
+    var exec_only: dict[str, int]
+    var dirs: dict[str, bool]
+    #: `test_times`, or `doc_times` for `--doc`: a doc run times other work.
+    var name: str
+    #: A filtered run times only part of each file, and a forked child that
+    #: finished may just have skipped the test that loads a framework. Such a
+    #: run only adds what it learns about frameworks; it used to overwrite the
+    #: record with near-zero times and lose the slowest-first order.
+    var partial: bool
+
+    pub fn init(self) {
+        self.times = {}
+        self.exec_only = {}
+        self.dirs = {}
+        self.name = "test_times"
+        self.partial = false
+    }
+
+    pub static fn load(paths: list[str], options: _Options) -> _History {
+        let history = _History()
+        if options.doc { history.name = "doc_times" }
+        history.partial = options.filter is not null
+        for path in paths {
+            let dir = Path(path).parent().text
+            if dir in history.dirs { continue }
+            history.dirs[dir] = false
+            try {
+                let file = Path(history.file_of(dir))
+                if not file.exists() { continue }
+                for line in file.read_text().split("\n") {
+                    let fields = line.split("\t")
+                    if fields.len() != 3 { continue }
+                    let full = dir + "/" + fields[2]
+                    history.times[full] = int(fields[0])
+                    let flag = fields[1]
+                    if flag.starts_with("x") {
+                        history.exec_only[full] = if flag.len() > 1 { int(flag[1:]) } else { 0 }
+                    }
+                }
+            } catch _error: Error {
+            }
+        }
+        return history
+    }
+
+    fn file_of(self, dir: str) -> str {
+        return Path(dir).join("__jaicache__").join(self.name).text
+    }
+
+    #: Path indexes, longest recorded first; files with no record keep their
+    #: place ahead of every recorded one, so a first run is in path order.
+    pub fn slowest_first(self, paths: list[str]) -> list[int] {
+        let unknown: list[int] = []
+        let by_time: dict[int, list[int]] = {}
+        for index in 0..paths.len() {
+            let took = self.times.get(_History.key(paths[index]))
+            if took is null {
+                unknown.push(index)
+                continue
+            }
+            let same = by_time.get(took)
+            if same is null { by_time[took] = [index] } else { same.push(index) }
+        }
+        let order = unknown
+        let times = by_time.keys().sorted()
+        var at = times.len() - 1
+        while at >= 0 {
+            order.extend(by_time[times[at]])
+            at -= 1
+        }
+        return order
+    }
+
+    pub fn needs_exec(self, path: str) -> bool {
+        let runs = self.exec_only.get(_History.key(path))
+        return runs is not null and runs < _EXEC_RECHECK
+    }
+
+    #: Built the same way from a path as from a record, so the two always
+    #: match however the path was spelled (`a//b`, `./a`).
+    static fn key(path: str) -> str {
+        let file = Path(path)
+        return file.parent().text + "/" + file.name()
+    }
+
+    pub fn record_time(self, path: str, nanos: int) -> void {
+        if self.partial { return }
+        self.times[_History.key(path)] = nanos
+        self.touch(path)
+    }
+
+    #: Its forked child exited with _NEEDS_EXEC: proof it needs a fresh process.
+    pub fn needed_exec(self, path: str) -> void {
+        self.exec_only[_History.key(path)] = 0
+        self.touch(path)
+    }
+
+    #: Spawned without trying a fork, on the strength of the record alone.
+    pub fn spawned_on_record(self, path: str) -> void {
+        let key = _History.key(path)
+        self.exec_only[key] = (self.exec_only.get(key) ?? 0) + 1
+        self.touch(path)
+    }
+
+    #: Its forked child ran to the end without loading a framework.
+    pub fn forked(self, path: str) -> void {
+        let key = _History.key(path)
+        if self.partial or key not in self.exec_only { return }
+        self.exec_only.remove(key)
+        self.touch(path)
+    }
+
+    fn touch(self, path: str) -> void { self.dirs[Path(path).parent().text] = true }
+
+    #: Rewrite each directory's record that this run touched. Written to a
+    #: temporary name and renamed over, so a concurrent run reads either the
+    #: old record or the new one.
+    pub fn save(self) -> void {
+        for (dir, touched) in self.dirs.items() {
+            if not touched { continue }
+            let lines: list[str] = []
+            for (key, nanos) in self.times.items() {
+                if not key.starts_with(dir + "/") { continue }
+                let name = key[dir.len() + 1:]
+                if name.contains("/") { continue }
+                let runs = self.exec_only.get(key)
+                let flag = if runs is null { "-" } else { f"x{runs}" }
+                lines.push(f"{nanos}\t{flag}\t{name}")
+            }
+            try {
+                let cache = Path(dir).join("__jaicache__")
+                cache.mkdir(false, true)
+                let target = self.file_of(dir)
+                let staging = target + "." + str(__prim__.time_wall())
+                Path(staging).write_text("\n".join(lines.sorted()) + "\n")
+                __prim__.io_rename(staging, target)
+            } catch _error: Error {
+            }
+        }
+    }
+}
+
+#: The status a forked child exits with when it was about to load a native
+#: framework. Frameworks that talk to a system service over XPC refuse a
+#: process that was forked and not exec'd -- Metal's shader compiler reports
+#: "the process is unavailable" and every GPU test fails -- so the loader
+#: stops the child before it tries (JAI_EXIT_NEEDS_EXEC in native.h).
+const _NEEDS_EXEC: int = 75
+
+#: How many runs a file recorded as needing a fresh process is spawned
+#: straight away before a fork is tried again. A wasted fork costs a fraction
+#: of a second; a stale record costs a spawn's start-up on every run.
+const _EXEC_RECHECK: int = 16
+
+#: The collector's stress cadence in this process, 0 when not stressed.
+fn _stress_every() -> int {
+    let stats: dict[str, any] = __prim__.gc_stats()
+    if stats.get("stress") != true { return 0 }
+    let every = stats.get("stress_every")
+    return if every is int { every } else { 1 }
+}
+
+#: The child's whole life: run one file, print its `@@R` lines, exit. It must
+#: never return into the parent's loop, whatever goes wrong.
+fn _run_child(path: str, options: _Options) -> void {
+    var code = 70
+    #: The exit is in a `finally` so that nothing, caught or not, can carry
+    #: this child up into the parent's loop -- where it would run the parent's
+    #: cleanup and delete the directory every other child is writing to.
+    try {
+        let found = if options.doc {
+            run_doc_examples(path, options.filter, false)
+        } else {
+            run_file(path, options.filter, false)
+        }
+        _emit_shard(found)
+        code = 0
+    } catch error: Error {
+        print_err(f"jaithon test: {path}: {type_of(error)}: {error.message}")
+    } finally {
+        __prim__.os_exit(code)
+    }
+}
+
+#: Have the checker parse `std.test`'s signatures once, here, so every child
+#: inherits them instead of parsing them again. Only signatures: running a
+#: test module's imports here would share their state between files.
+fn _warm_for_children() -> void {
+    try {
+        __prim__.exec("from std.test import assert_eq\nlet _ = assert_eq\n", "<test warm-up>")
+    } catch _error: Error {
+    }
+}
+
+const _SCRATCH_ATTEMPTS: int = 16
+
+#: A fresh directory under the temp dir for the children's output files, or
+#: null when none can be made. Bounded: a missing or read-only temp dir fails
+#: every attempt, and retrying without end hung the runner with no output.
+fn _scratch_dir() -> str? {
+    let base = temp_dir() + "/jaithon-test-" + str(__prim__.time_wall())
+    for attempt in 0.._SCRATCH_ATTEMPTS {
+        let candidate = if attempt == 0 { base } else { f"{base}-{attempt}" }
+        if Path(candidate).exists() { continue }
+        try {
+            Path(candidate).mkdir()
+            return candidate
+        } catch _error: Error {
+        }
+    }
+    return null
+}
+
+fn _take_file(path: str) -> str {
+    let file = Path(path)
+    if not file.exists() { return "" }
+    let text = _text_of(file)
+    _remove_quietly(file, false)
+    return text
+}
+
+#: A child's output as text. A test may print bytes that are not UTF-8; then
+#: every byte past ASCII shows as U+FFFD, rather than a decoding error taking
+#: the whole runner down with every other file's results.
+fn _text_of(file: Path) -> str {
+    try {
+        return file.read_text()
+    } catch _error: Error {
+    }
+    let shown: list[str] = []
+    for byte in read_bytes(file.text).to_list() {
+        shown.push(if byte < 128 { chr(byte) } else { "\u{FFFD}" })
+    }
+    return "".join(shown)
+}
+
+fn _remove_quietly(path: Path, recursive: bool) -> void {
+    try {
+        path.remove(recursive)
+    } catch _error: Error {
+    }
 }
 
 pub fn main(args: list[str]) -> int {
@@ -414,21 +881,34 @@ pub fn main(args: list[str]) -> int {
     #: One file per core unless asked otherwise. A worker is always 1, which
     #: is what stops it spawning workers of its own.
     let wanted = if options.shard { 1 } else { options.jobs }
-    #: `--gc-stress` collects on (almost) every allocation, and the parallel
-    #: parent allocates for its own bookkeeping -- spawning, reading each
-    #: child's output, parsing it back into results. Under stress that
-    #: bookkeeping costs far more than the tests: two files that take 3.3s
-    #: sequentially had not finished after ten minutes. Stress runs are about
-    #: correctness rather than wall time, and the sequential path is the one
-    #: worth stressing, so they stay sequential.
-    let stressed = _has_gc_stress(argv())
-    let limit = if stressed { 1 } elif wanted > 0 { wanted } else { min(cpu_count(), paths.len()) }
+    #: `--gc-stress` is the CLI's, and it never reached this tool's argv(),
+    #: which holds only the binary: the check here read argv() and was always
+    #: false, so a stress run went parallel and its spawned workers -- started
+    #: without the flag -- ran every test unstressed (tests/stdlib at
+    #: `--gc-stress=20`: 2.4s; actually stressed, 75s). The collector's own
+    #: state says whether this process is stressed. A forked worker inherits
+    #: it, and runs with a heap of its own file's size, so a stress run stays
+    #: parallel there; a spawned one would not, so without forking it is
+    #: sequential, as it was always meant to be.
+    let stats: dict[str, any] = __prim__.gc_stats()
+    let stressed = stats.get("stress") == true
+    let limit = if stressed and not _FORK_WORKERS {
+        1
+    } elif wanted > 0 {
+        wanted
+    } else {
+        min(cpu_count(), paths.len())
+    }
 
     if limit > 1 and paths.len() > 1 {
         #: `args` here is the tool's own arguments, not the process's, so the
         #: binary has to come from os.argv().
         let exe = argv()[0]
-        let results = _run_sharded(exe, paths, options, limit)
+        let results = if _FORK_WORKERS {
+            _run_forked(exe, paths, options, limit)
+        } else {
+            _run_sharded(exe, paths, options, limit)
+        }
         if results.len() == 0 {
             print_err("jaithon test: no tests found")
             return 1

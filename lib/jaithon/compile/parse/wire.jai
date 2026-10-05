@@ -10,7 +10,7 @@
 #: `Parser` has already run it, and the two places that build a `Parser`
 #: directly -- `repl.jai` and `mod.jai` -- keep working untouched. The sibling
 #: of `check/checker.jai`'s `install`, except that nobody has to remember it.
-from jaithon.ast import Node
+from jaithon.ast import Node, NodeKind
 from jaithon.compile.diag import DiagnosticBag
 from jaithon.compile.lexer import Lexer
 from jaithon.compile.parse.state import Parser, install_hooks
@@ -42,5 +42,35 @@ pub fn parse(source: str, file_id: int = 0, diagnostics: DiagnosticBag? = null) 
     let parser = Parser(lexer)
     let program = parser.parse_program()
     if lexer.had_error { return null }
+    return program
+}
+
+#: Parse `source` as `parse` does, but with every int, float, string and
+#: f-string literal turned into an `Ident` holding the text it was written
+#: as -- `0xFF` stays `0xFF` where the value would print as `255`. The tree is
+#: for printing (`jaithon fmt`, `jaithon doc`), never for compiling.
+#:
+#: The parser hands back the literals it built, so pinning them costs one step
+#: each; a walk over the finished tree to find them was 10-15% of `fmt`.
+#:
+#: ```
+#: let tree = parse_spelled("let x = 0xFF\n") ?? Node.ident("")
+#: tree.child_list("stmts")[0].child("init").text("name")    # "0xFF"
+#: ```
+pub fn parse_spelled(source: str, file_id: int = 0, diagnostics: DiagnosticBag? = null) -> Node? {
+    let bag = diagnostics ?? DiagnosticBag()
+    let lexer = Lexer(source, file_id, bag)
+    let parser = Parser(lexer)
+    let spelled: list[Node] = []
+    parser.spelled = spelled
+    let program = parser.parse_program()
+    if lexer.had_error { return null }
+    for literal in spelled {
+        let spelling = lexer.text_of(literal.span)
+        if spelling.len() == 0 { continue }
+        # Slots are positioned per kind, so the new kind brings its own list.
+        literal.kind = NodeKind.Ident
+        literal.fields = Node.ident(spelling).fields
+    }
     return program
 }

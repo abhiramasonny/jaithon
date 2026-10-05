@@ -130,6 +130,8 @@ typedef enum {
 
 void jaiVMInit(void);
 void jaiVMFree(void);
+/* Restore what fork() does not carry into the child: the JIT sampling timer. */
+void jaiVMAfterFork(void);
 void jaiVMResetStack(void);
 
 JAI_INLINE void jaiPush(Value v) { *vm.stackTop++ = v; }

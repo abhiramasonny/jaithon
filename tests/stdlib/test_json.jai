@@ -70,6 +70,24 @@ fn test_stringify_escapes_what_json_requires() -> void {
     assert_eq(json.stringify("é", 0, false, true), "\"\\u00e9\"")
 }
 
+#: Plain text takes a shortcut past the escaping loop; every character that
+#: must not take it, in both modes, and the text either side of one.
+fn test_stringify_escapes_each_character_that_needs_it() -> void {
+    assert_eq(json.stringify("plain text"), "\"plain text\"")
+    assert_eq(json.stringify(""), "\"\"")
+    assert_eq(json.stringify("a\\b"), "\"a\\\\b\"")
+    assert_eq(json.stringify("tab\there"), "\"tab\\there\"")
+    assert_eq(json.stringify("\x01\x1f"), "\"\\u0001\\u001f\"")
+    assert_eq(json.stringify("\x08\x0C\r"), "\"\\b\\f\\r\"")
+    assert_eq(json.stringify("del\x7f"), "\"del\x7f\"")
+    assert_eq(json.stringify("del\x7f", 0, false, true), "\"del\\u007f\"")
+    assert_eq(json.stringify("snow ☃", 0, false, true), "\"snow \\u2603\"")
+    assert_eq(json.stringify("snow ☃"), "\"snow ☃\"")
+    assert_eq(json.stringify("face \u{1F600}", 0, false, true), "\"face \\ud83d\\ude00\"")
+    assert_eq(json.stringify("face \u{1F600}"), "\"face \u{1F600}\"")
+    assert_eq(json.stringify({"k\"ey": "v"}), "{\"k\\\"ey\":\"v\"}")
+}
+
 fn test_stringify_refuses_what_json_cannot_express() -> void {
     let infinity = 1e308 * 10.0
     assert_throws(ValueError, || json.stringify(infinity))

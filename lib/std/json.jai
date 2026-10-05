@@ -833,7 +833,14 @@ fn _write(
     out.push("]")
 }
 
+#: JAITHON_JSON_PLAIN=0 sends every string through the escaping loop; read once.
+let _PLAIN_SHORTCUT: bool = (__prim__.os_env("JAITHON_JSON_PLAIN") ?? "1") != "0"
+
 fn _quote(text: str, ascii_only: bool) -> str {
+    #: Most text needs no escape at all, and a scan that only reads compiles
+    #: where the loop below, which builds, runs interpreted: doc's search
+    #: index spent 84% of its interpreted work here, ~15x what the scan costs.
+    if _PLAIN_SHORTCUT and _is_plain(text, ascii_only) { return "\"" + text + "\"" }
     let out = StringBuilder()
     out.push("\"")
     for ch in text {
@@ -857,6 +864,17 @@ fn _quote(text: str, ascii_only: bool) -> str {
     }
     out.push("\"")
     return out.build()
+}
+
+#: Whether `text` can go between quotes as it stands: no quote, backslash or
+#: control character, and with `ascii_only` nothing from DEL up.
+fn _is_plain(text: str, ascii_only: bool) -> bool {
+    for ch in text {
+        let code = ord(ch)
+        if code < 0x20 or code == 0x22 or code == 0x5C { return false }
+        if code >= 0x7F and ascii_only { return false }
+    }
+    return true
 }
 
 fn _path_steps(path: str) -> list[any] {

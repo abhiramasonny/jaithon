@@ -49,6 +49,7 @@ let SPECIFIED = [
     "io_stat", "io_listdir", "io_mkdir", "io_remove", "io_rename",
     # the operating system
     "module_path", "os_env", "os_argv", "os_exit", "os_cwd", "os_chdir", "os_spawn",
+    "os_fork_to", "os_spawn_to", "os_wait_any",
     "os_platform",
     # threads
     "thread_spawn", "thread_join", "thread_detach", "cpu_count",
