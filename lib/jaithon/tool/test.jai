@@ -17,7 +17,7 @@ from jaithon.ast_unparse import to_source
 from jaithon.compile.diag import DiagnosticBag
 from jaithon.compile.lexer import Lexer
 from jaithon.compile.parser import parse
-from jaithon.compile.token import TokenKind
+from jaithon.compile.token import Token, TokenKind
 from std.fmt import bold, green, red
 from std.io import Path, print_err, read_file
 from std.os import argv, cpu_count, env, spawn, temp_dir
@@ -80,6 +80,79 @@ pub fn test_functions(source: str, path: str) -> list[str] {
     return names
 }
 
+#: JAITHON_TEST_SCAN=0 finds test names by parsing the file, as it used to;
+#: read once.
+let _SCAN_NAMES: bool = (env("JAITHON_TEST_SCAN") ?? "1") != "0"
+
+#: The names `test_functions` finds, read off the tokens alone: a `fn` outside
+#: every brace, named like a test, whose parameter list is empty. Null when the
+#: source does not even lex, so the caller can fall back to the parse.
+#:
+#: ```
+#: _scan_test_names("fn test_a() -> void { fn test_b() { } }\nfn test_c(x: int) { }\n")
+#: #     ["test_a"]
+#: ```
+pub fn _scan_test_names(source: str) -> list[str]? {
+    let lexer = Lexer(source, 0, DiagnosticBag())
+    let tokens = lexer.tokenize()
+    if lexer.had_error { return null }
+    let names: list[str] = []
+    let count = tokens.len()
+    var depth = 0
+    var index = 0
+    while index < count {
+        let kind = tokens[index].kind
+        if kind == TokenKind.LBrace {
+            depth += 1
+        } elif kind == TokenKind.RBrace {
+            depth -= 1
+        } elif kind == TokenKind.KwFn and depth == 0 and index + 1 < count {
+            let name_token = tokens[index + 1]
+            if name_token.kind == TokenKind.Ident and is_test_name(name_token.word) {
+                if _no_parameters(tokens, index + 2) { names.push(name_token.word) }
+            }
+        }
+        index += 1
+    }
+    return names
+}
+
+#: Whether the parameter list starting at `tokens[at]` (after any generic
+#: brackets) is empty.
+fn _no_parameters(tokens: list[Token], start: int) -> bool {
+    let count = tokens.len()
+    var at = start
+    if at < count and tokens[at].kind == TokenKind.LBracket {
+        var nesting = 0
+        while at < count {
+            let kind = tokens[at].kind
+            if kind == TokenKind.LBracket { nesting += 1 }
+            if kind == TokenKind.RBracket {
+                nesting -= 1
+                if nesting == 0 { break }
+            }
+            at += 1
+        }
+        at += 1
+    }
+    if at >= count or tokens[at].kind != TokenKind.LParen { return false }
+    at += 1
+    while at < count and tokens[at].kind == TokenKind.Newline { at += 1 }
+    return at < count and tokens[at].kind == TokenKind.RParen
+}
+
+#: A `parse` result for `path` when it does not parse, else nothing: the
+#: answer the runner gave before it found names without parsing.
+fn _unless_unparseable(source: str, path: str, suite: str) -> list[TestResult] {
+    if not _SCAN_NAMES { return [] }
+    try {
+        let _names = test_functions(source, path)
+    } catch error: ParseError {
+        return [_broken(suite, "parse", error.message)]
+    }
+    return []
+}
+
 #: Return the expected-value comment of an example line, or null.
 #:
 #: The value is the text after the last `#` that is not inside a string, which
@@ -121,20 +194,28 @@ pub fn code_of(line: str) -> str {
 pub fn run_file(path: str, filter: str?, verbose: bool) -> list[TestResult] {
     let source = read_file(path)
     let suite = module_name_of(path)
-    var names: list[str] = []
-    try {
-        names = test_functions(source, path)
-    } catch error: ParseError {
-        return [_broken(suite, "parse", error.message)]
+    #: The names come from the tokens when they can: the parse that used to
+    #: find them was the second full compile of every file. Anything the scan
+    #: cannot settle -- no test wanted, or a file that will not load -- goes
+    #: back to the parse, so what is reported is the same either way.
+    var names = if _SCAN_NAMES { _scan_test_names(source) } else { null }
+    if names is null {
+        try {
+            names = test_functions(source, path)
+        } catch error: ParseError {
+            return [_broken(suite, "parse", error.message)]
+        }
     }
 
-    let wanted = [name for name in names if _matches(suite, name, filter)]
-    if wanted.len() == 0 { return [] }
+    let wanted = [name for name in names ?? [] if _matches(suite, name, filter)]
+    if wanted.len() == 0 { return _unless_unparseable(source, path, suite) }
 
     let namespace = f"<test {path}>"
     try {
         __prim__.exec(source, namespace)
     } catch error: Error {
+        let unparseable = _unless_unparseable(source, path, suite)
+        if unparseable.len() > 0 { return unparseable }
         return [_broken(suite, "load", f"{type_of(error)}: {error.message}")]
     }
 

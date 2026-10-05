@@ -137,3 +137,27 @@ fn test_a_run_ordered_by_recorded_times_prints_the_same() -> void {
     if (__prim__.os_env("JAITHON_TEST_FORK") ?? "1") != "0" { assert_true(recorded) }
     assert_eq(_untimed(second["stdout"]), _untimed(first["stdout"]))
 }
+
+#: Test names are read off the tokens now, not a parse; a file that does not
+#: parse must still be reported as a parse error, tests in it or not, and a
+#: file that parses but fails to load as a load error.
+fn test_files_that_do_not_load_report_the_same_stage() -> void {
+    let files = {
+        "test_broken.jai": "fn test_a() -> void { let = }\n",
+        "test_untested.jai": "fn helper( -> void { }\n",
+        "test_unloadable.jai": "from std.no_such_module import thing\nfn test_b() -> void { }\n",
+    }
+    let root = _suite("stages", files)
+    var outputs: list[str] = []
+    for scan in ["0", "1"] {
+        let environment: dict[str, str] = __prim__.os_env()
+        environment["JAITHON_TEST_SCAN"] = scan
+        let command = [__prim__.os_argv()[0], "test", "--jobs=1", root]
+        outputs.push(_untimed(__prim__.os_spawn(command, {"env": environment})["stdout"]))
+    }
+    _drop(root)
+    assert_eq(outputs[1], outputs[0])
+    assert_true(outputs[1].contains("test_broken > parse"), outputs[1])
+    assert_true(outputs[1].contains("test_untested > parse"), outputs[1])
+    assert_true(outputs[1].contains("test_unloadable > load"), outputs[1])
+}
