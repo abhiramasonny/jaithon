@@ -14,7 +14,7 @@ from jaithon.ast import Node, NodeKind, OpKind
 from jaithon.compile.diag import Code
 from jaithon.compile.token import TokenFlags, TokenKind
 from jaithon.compile.parse.state import Parser
-from jaithon.compile.parse.node_build import _binary, _join, _member, _node, _unary
+from jaithon.compile.parse.node_build import _binary, _call, _index, _join, _member, _node, _unary
 from jaithon.compile.parse.token_class import _additive_op, _compare_op, _multiplicative_op
 from jaithon.compile.parse.predicate import _is_numeric_literal
 from jaithon.compile.parse.primary import _close_sequence, _parse_args, _parse_primary, _spelled
@@ -59,12 +59,12 @@ pub fn _parse_subscript(p: Parser, object: Node, open_index: int) -> Node {
         _close_sequence(p, TokenKind.RBracket, "]", "generic argument list", open_index)
         let generic_span = _join(object.span, p._span_since(open_index))
         let tuple = _node(NodeKind.TupleLit, generic_span, {"items": args})
-        return _node(NodeKind.Index, generic_span, {"object": object, "index": tuple})
+        return _index(generic_span, object, tuple)
     }
 
     _close_sequence(p, TokenKind.RBracket, "]", "index expression", open_index)
     let span = _join(object.span, p._span_since(open_index))
-    return _node(NodeKind.Index, span, {"object": object, "index": start ?? p._error_expr(span)})
+    return _index(span, object, start ?? p._error_expr(span))
 }
 
 pub fn _parse_postfix(p: Parser) -> Node {
@@ -83,11 +83,7 @@ pub fn _parse_postfix(p: Parser) -> Node {
             let open_index = p.current
             p._advance()
             let args = _parse_args(p, open_index)
-            expr = _node(
-                NodeKind.Call,
-                _join(expr.span, p._span_since(open_index)),
-                {"callee": expr, "args": args}
-            )
+            expr = _call(_join(expr.span, p._span_since(open_index)), expr, args)
         } elif p._check(TokenKind.LBracket) {
             expr = _parse_subscript(p, expr, p.current)
         } else {

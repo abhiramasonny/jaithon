@@ -9,6 +9,8 @@
 from jaithon.ast import Node, NodeKind, OpKind, Span, TypeExpr, TypeKind, Visibility
 
 pub fn _node(kind: NodeKind, span: Span, fields: dict[str, any] = {}) -> Node {
+    # An empty overlay is no overlay: `init` skips it for null, not for `{}`.
+    if fields.len() == 0 { return Node(kind, null, span) }
     return Node(kind, fields, span)
 }
 
@@ -30,12 +32,16 @@ pub fn _join(first: Span, second: Span) -> Span {
     return Span(first.file, start, max(start, max(first.end, second.end)))
 }
 
+# The builders below that a parse calls once per node build their slot list
+# in schema order (`Node.of_slots`) instead of naming fields in a dict; each is
+# pinned against the named form by tests/checker/test_parse_node_slots.jai.
 pub fn _ident(span: Span, name: str) -> Node {
-    return _node(NodeKind.Ident, span, {"name": name})
+    return Node.of_slots(NodeKind.Ident, span, [name])
 }
 
 pub fn _str_lit(span: Span, chars: str) -> Node {
-    return _node(NodeKind.StrLit, span, {"chars": chars})
+    # `length` stays at its default, 0, as it did when this named `chars` alone.
+    return Node.of_slots(NodeKind.StrLit, span, [chars, 0])
 }
 
 pub fn _sequence(kind: NodeKind, span: Span, items: list[Node]) -> Node {
@@ -47,11 +53,12 @@ pub fn _dict_lit(span: Span, keys: list[Node], values: list[Node]) -> Node {
 }
 
 pub fn _unary(span: Span, op: OpKind, operand: Node) -> Node {
-    return _node(NodeKind.Unary, span, {"op": op, "operand": operand})
+    return Node.of_slots(NodeKind.Unary, span, [op, operand])
 }
 
 pub fn _binary(kind: NodeKind, op: OpKind, left: Node, right: Node) -> Node {
-    return _node(kind, _join(left.span, right.span), {"op": op, "left": left, "right": right})
+    # `Binary` and `Logical` share one schema: op, left, right.
+    return Node.of_slots(kind, _join(left.span, right.span), [op, left, right])
 }
 
 pub fn _wrap(kind: NodeKind, span: Span, operand: Node) -> Node {
@@ -59,7 +66,32 @@ pub fn _wrap(kind: NodeKind, span: Span, operand: Node) -> Node {
 }
 
 pub fn _member(kind: NodeKind, span: Span, object: Node, name: str) -> Node {
-    return _node(kind, span, {"object": object, "name": name})
+    # `Member` and `OptMember` share one schema: object, name.
+    return Node.of_slots(kind, span, [object, name])
+}
+
+pub fn _call(span: Span, callee: Node, args: list[dict[str, any]]) -> Node {
+    return Node.of_slots(NodeKind.Call, span, [callee, args])
+}
+
+pub fn _int_lit(span: Span, value: any) -> Node {
+    return Node.of_slots(NodeKind.IntLit, span, [value])
+}
+
+pub fn _index(span: Span, object: Node, index: Node) -> Node {
+    return Node.of_slots(NodeKind.Index, span, [object, index])
+}
+
+pub fn _block(span: Span, stmts: list[Node]) -> Node {
+    return Node.of_slots(NodeKind.Block, span, [stmts])
+}
+
+pub fn _expr_stmt(span: Span, expr: Node) -> Node {
+    return Node.of_slots(NodeKind.ExprStmt, span, [expr])
+}
+
+pub fn _return(span: Span, value: Node?) -> Node {
+    return Node.of_slots(NodeKind.Return, span, [value])
 }
 
 pub fn _match_node(kind: NodeKind, span: Span, subject: Node, arms: list[dict[str, any]]) -> Node {

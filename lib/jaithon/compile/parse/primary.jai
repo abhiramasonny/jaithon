@@ -18,7 +18,7 @@ from jaithon.compile.diag import Code
 from jaithon.compile.token import Token, TokenKind
 from jaithon.compile.parse.state import Parser, parse_expression, parse_fn_rest, parse_if, parse_match
 from jaithon.compile.parse.state import parse_pattern, parse_unary
-from jaithon.compile.parse.node_build import _arg, _comp_clause, _dict_lit, _ident, _member, _node, _param
+from jaithon.compile.parse.node_build import _arg, _comp_clause, _dict_lit, _ident, _int_lit, _member, _node, _param
 from jaithon.compile.parse.node_build import _sequence, _str_lit, _wrap
 from jaithon.compile.parse.predicate import _starts_await_operand
 from jaithon.compile.parse.type_expr import _parse_type
@@ -393,7 +393,7 @@ pub fn _parse_primary(p: Parser) -> Node {
 
     if kind == TokenKind.Int {
         p._advance()
-        return _spelled(p, _node(NodeKind.IntLit, p._span_of(token), {"intLit": token.value ?? 0}))
+        return _spelled(p, _int_lit(p._span_of(token), token.value ?? 0))
     }
     if kind == TokenKind.Float {
         p._advance()

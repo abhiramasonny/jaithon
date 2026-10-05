@@ -26,7 +26,7 @@ from jaithon.ast import Node, NodeKind, Span, Visibility
 from jaithon.compile.diag import Code, Diagnostic, DiagnosticBag
 from jaithon.compile.lexer import Lexer
 from jaithon.compile.token import Token, TokenKind, kind_text
-from jaithon.compile.parse.node_build import _node
+from jaithon.compile.parse.node_build import _expr_stmt, _node
 from jaithon.compile.parse.predicate import _is_reserved_name, _starts_declaration
 from jaithon.compile.parse.predicate import _starts_expression_kind
 
@@ -208,7 +208,7 @@ pub class Parser {
         self._skip_newlines()
         self._expect_repl_end()
         if self.had_error { return null }
-        return _node(NodeKind.ExprStmt, self._span_since(start_index), {"expr": expr})
+        return _expr_stmt(self._span_since(start_index), expr)
     }
 
     fn _expect_repl_end(self) -> void {

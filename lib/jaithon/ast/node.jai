@@ -72,6 +72,28 @@ pub class Node {
         }
     }
 
+    #: A node of `kind` whose slot list is `slots`, which must hold every field
+    #: the kind declares, in the order `fields_of(kind)` lists them.
+    #:
+    #: For the builders a parser calls once per node, where the named overlay
+    #: in `init` is the cost: a dict built per node, then walked and looked up
+    #: field by field, interpreted whatever it is written as. A list literal in
+    #: schema order is neither. A slot list of the wrong length raises
+    #: `ValueError` here; one in the wrong ORDER is the caller's bug, so every
+    #: builder written against this is pinned by a test against `init`.
+    #:
+    #: ```
+    #: Node.of_slots(NodeKind.Member, Span.none(), [Node.ident("a"), "b"])
+    #: ```
+    pub static fn of_slots(kind: NodeKind, span: Span, slots: list[any]) -> Node {
+        let node = Node(kind, null, span)
+        if slots.len() != node.fields.len() {
+            throw ValueError(f"{kind_name(kind)} has {node.fields.len()} fields, not {slots.len()}")
+        }
+        node.fields = slots
+        return node
+    }
+
     #: An identifier reference.
     pub static fn ident(name: str) -> Node {
         return Node(NodeKind.Ident, {"name": name})
