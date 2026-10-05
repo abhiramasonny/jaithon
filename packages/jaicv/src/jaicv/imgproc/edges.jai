@@ -235,7 +235,12 @@ pub fn canny(
     let labels = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
     let out = Mat(src.rows, src.cols, CV_MAKETYPE(CV_8U, 1))
     let count = src.rows * src.cols
-    if count == 0 { return out }
+    if count == 0 {
+        dx.release()
+        dy.release()
+        labels.release()
+        return out
+    }
     kernel_for("canny_suppress").dispatch_async([dx.storage, dy.storage, labels.storage], count, [count, src.rows, src.cols, dx.offset, dx.step_, dy.offset, dy.step_, labels.offset, labels.step_, if l2_gradient {
         1
     } else {

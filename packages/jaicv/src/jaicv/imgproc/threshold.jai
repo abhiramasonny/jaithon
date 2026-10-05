@@ -310,7 +310,11 @@ pub fn adaptive_threshold(
     }
     let out = Mat(src.rows, src.cols, src.flags)
     let count = src.rows * src.cols
-    if count == 0 { return out }
+    if count == 0 {
+        wide.release()
+        local.release()
+        return out
+    }
     var scalars = [
         count,
         src.cols,
