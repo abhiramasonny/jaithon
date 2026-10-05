@@ -609,7 +609,10 @@ pub fn scale_add(src: Mat, alpha: float, other: Mat, dst: Mat? = null) -> Mat {
 pub fn convert_scale_abs(src: Mat, alpha: float = 1.0, beta: float = 0.0) -> Mat {
     let scaled = src.convert_to(CV_MAKETYPE(CV_32F, src.channels()), alpha, beta)
     let magnitude = unary_op(scaled, UN_ABS)
-    return magnitude.convert_to(CV_MAKETYPE(CV_8U, src.channels()))
+    scaled.release()
+    let out = magnitude.convert_to(CV_MAKETYPE(CV_8U, src.channels()))
+    magnitude.release()
+    return out
 }
 
 #: Bitwise and of two matrices, or of a matrix and a constant.
@@ -748,13 +751,15 @@ pub fn lut(src: Mat, table: Mat, dst: Mat? = null) -> Mat {
 
 #: Length of each `(x, y)` vector.
 pub fn magnitude(x: Mat, y: Mat) -> Mat {
-    let (mag, _angle) = cart_to_polar(x, y)
+    let (mag, angle) = cart_to_polar(x, y)
+    angle.release()
     return mag
 }
 
 #: Direction of each `(x, y)` vector.
 pub fn phase(x: Mat, y: Mat, angle_in_degrees: bool = false) -> Mat {
-    let (_mag, angle) = cart_to_polar(x, y, angle_in_degrees: angle_in_degrees)
+    let (mag, angle) = cart_to_polar(x, y, angle_in_degrees: angle_in_degrees)
+    mag.release()
     return angle
 }
 

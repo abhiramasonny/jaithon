@@ -588,22 +588,40 @@ pub fn min_max(src: Mat, mask: Mat? = null) -> tuple[float, float] {
 #: Length of `src` under one of the `NORM_` codes, or the distance to `other`.
 pub fn norm(src: Mat, other: Mat? = null, norm_type: int = NORM_L2, mask: Mat? = null) -> float {
     var target = src
-    if other is not null {
+    let compared = other
+    if compared is not null {
         let wide = CV_MAKETYPE(CV_32F, src.channels())
-        target = unary_op(
-            binary_op(src.convert_to(wide), other.convert_to(wide), OP_SUBTRACT),
-            UN_ABS
-        )
+        let left = src.convert_to(wide)
+        let right = compared.convert_to(wide)
+        let difference = binary_op(left, right, OP_SUBTRACT)
+        target = unary_op(difference, UN_ABS)
+        left.release()
+        right.release()
+        difference.release()
     }
+    let answer = _norm_of(target, norm_type, mask)
+    #: `target` is the caller's own matrix unless a difference was made here.
+    if compared is not null { target.release() }
+    return answer
+}
+
+fn _norm_of(target: Mat, norm_type: int, mask: Mat?) -> float {
     #: Only the norm that was asked for. Working out all three means a second
     #: reduction over the whole picture for the infinity norm -- and a split
     #: per channel to feed it -- which doubled what an L2 cost.
     if norm_type == NORM_INF {
         var inf = 0.0
-        for channel in 0..target.channels() {
-            let plane = if target.channels() == 1 { target } else { target.split()[channel] }
+        if target.channels() == 1 {
+            let (low, high) = min_max(target, mask: mask)
+            return max(math.fabs(low), math.fabs(high))
+        }
+        #: One split for every plane, and the planes released: splitting once
+        #: per channel made every plane three times over and kept them all.
+        let planes = target.split()
+        for plane in planes {
             let (low, high) = min_max(plane, mask: mask)
             inf = max(inf, max(math.fabs(low), math.fabs(high)))
+            plane.release()
         }
         return inf
     }

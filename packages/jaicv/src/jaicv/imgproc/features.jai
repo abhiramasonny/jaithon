@@ -21,7 +21,7 @@ from std.os import env_or
 from ..core.mat import Mat, f32_bits, f32_from_bits
 from ..core.stats import min_max
 from ..core.types import BORDER_DEFAULT, CV_32F, CV_MAKETYPE, Point, Point2f, Size
-from .common import PRELUDE
+from .common import PRELUDE, cached_weights
 from .filter import blur, box_filter, sobel
 
 #: Sum of squared differences, where less is a better match.
@@ -560,12 +560,9 @@ pub fn match_template(image: Mat, templ: Mat, method: int = TM_CCOEFF_NORMED) ->
     var spread = energy
     for channel in 0..cn { spread -= sums[channel] * sums[channel] / area }
     if spread < 0.0 { spread = 0.0 }
-    let stats = Mat.from_list(
-        1,
-        6,
-        CV_MAKETYPE(CV_32F, 1),
-        [sums[0], sums[1], sums[2], sums[3], energy, math.sqrt(spread)]
-    )
+    #: Shared, not made per call: a matrix dropped here was a device buffer
+    #: leaked on every match.
+    let stats = cached_weights(1, 6, [sums[0], sums[1], sums[2], sums[3], energy, math.sqrt(spread)])
 
     kernel_for("feature_match").dispatch_async(
         [image.storage, templ.storage, out.storage, stats.storage],
@@ -1368,8 +1365,6 @@ pub fn hough_circles(
     let smoothed = blur(image, Size(3, 3))
     let dx = sobel(smoothed, CV_32F, 1, 0, ksize: 3)
     let dy = sobel(smoothed, CV_32F, 0, 1, ksize: 3)
-    let gradient_x = dx.values()
-    let gradient_y = dy.values()
 
     let rows = image.rows
     let cols = image.cols
@@ -1391,6 +1386,9 @@ pub fn hough_circles(
         rows * cols,
         [rows * cols, cols, acc_rows, acc_cols, lower, upper, f32_bits(dp), f32_bits(edge_floor)]
     )
+    smoothed.release()
+    dx.release()
+    dy.release()
     let counted_buffer = Buffer(cells)
     kernel_for("hough_collect").dispatch_async([votes_buffer, counted_buffer], cells, [cells])
     let counted = counted_buffer.download()
