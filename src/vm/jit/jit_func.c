@@ -66,6 +66,12 @@ void emit(Emit *e, uint32_t word) {
         e->failed = true;
         return;
     }
+    /* BLR Xn or BL: a call out of the body. */
+    if ((word & 0xfffffc1fu) == 0xd63f0000u ||
+        (word & 0xfc000000u) == 0x94000000u) {
+        if (e->callExempt) e->callExempt = false;
+        else e->mayCollect = true;
+    }
     e->code[e->count++] = word;
 }
 

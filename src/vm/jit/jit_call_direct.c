@@ -244,8 +244,11 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
      * allocate -- OP_GET_SLICE builds a fresh list without ever counting as a
      * heap write. */
     unsigned callRoots = 0;
-    if (!emitRootFill(e, e->descOffset, &callRoots)) { e->failed = true; return false; }
-    if (callRoots > 0) emitChainLink(e, callRoots);
+    bool leaf = jitCallSkipsRoots(e, cfn, writes);
+    if (!leaf) {
+        if (!emitRootFill(e, e->descOffset, &callRoots)) { e->failed = true; return false; }
+        if (callRoots > 0) emitChainLink(e, callRoots);
+    }
 
     unsigned firstArg = firstIdx - (e->depth - e->valueDepth);
     for (unsigned i = 0; i < nargs; i++) {
@@ -257,6 +260,7 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     }
     emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)cfn->jitFunc);
     noteScratchClobber(e);
+    if (leaf) e->callExempt = true;
     emit(e, jaiA64Blr(JIT_SCRATCH_D));
 
     if (callRoots > 0) emitChainUnlink(e);

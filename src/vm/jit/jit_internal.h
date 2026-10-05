@@ -474,6 +474,11 @@ typedef struct {
      * fine -- it resumes AT an instruction, so the writes before it are not
      * re-run -- which is what makes the retired bail path unnecessary. */
     bool      wroteHeap;
+    /* Set by emit() at every `bl`/`blr` the body emits except one announced
+     * by `callExempt` just before it, so a body that ends with it false can
+     * reach the collector only on its way to raising. See jitLeafCallRoots. */
+    bool      mayCollect;
+    bool      callExempt;
     /* The instruction being compiled is inside a protected region of the
      * function's static exception table (spec §3.8) -- i.e. inside a `try`.
      *
@@ -1236,6 +1241,10 @@ void emitConst64(Emit *e, unsigned rd, int64_t value);
 bool jitLitPoolOn(void);
 void emitConstCmp(Emit *e, unsigned rd, int64_t value);
 void emitChainHeadAddr(Emit *e, unsigned rd);
+bool jitLeafCallRoots(void);
+void jitNoCollectRecord(const uint8_t *code, bool noCollect);
+bool jitNoCollectKnown(const uint8_t *code);
+bool jitCallSkipsRoots(const Emit *e, const ObjFunction *cfn, bool hasSelfSlow);
 /* Lays out the constants emitConst64 pooled, after everything else, and
  * points each load at its constant. False if the code buffer filled. */
 bool emitLiteralPool(Emit *e);

@@ -165,6 +165,87 @@ bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
     return true;
 }
 
+/* JAITHON_JIT_LEAF_CALL_ROOTS (default on): a bare `bl` from the function
+ * tier to a compiled body that cannot reach the collector except on its way
+ * to raising fills no roots and links nothing.
+ *
+ * Why that is sound. Roots matter only while a collection can run, and the
+ * only collection such a callee can start is the one its raise allocates in
+ * (jitThrowOverflow). A raise answers the caller with verdict 2, and a
+ * function-tier frame answers that by leaving through its epilogue, which
+ * reads none of its object registers; so does every function-tier frame
+ * above it, until the C entry or an OSR frame -- and an OSR frame, whose way
+ * out does write its registers back into the interpreter's slots, always
+ * roots. A callee that writes is excluded because its verdict 4 is finished
+ * in the interpreter from this frame's stub, which collects with this frame
+ * live; a callee that bails or deopts without writing has run nothing that
+ * collects, and this frame's own deopt then reads its registers as they were.
+ * A compiled body is recorded by its entry address, which the arena never
+ * reuses, so the answer stays true of the code a caller bakes in. */
+bool jitLeafCallRoots(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_LEAF_CALL_ROOTS");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Entry addresses of compiled bodies that cannot collect, open addressing. */
+static uintptr_t *gNoCollect;
+static size_t     gNoCollectCap, gNoCollectCount;
+
+static size_t noCollectSlot(uintptr_t key, size_t cap) {
+    return (size_t)((key >> 4) * 0x9E3779B97F4A7C15ull) & (cap - 1u);
+}
+
+void jitNoCollectRecord(const uint8_t *code, bool noCollect) {
+    if (code == NULL || !noCollect) return;
+    if ((gNoCollectCount + 1u) * 2u > gNoCollectCap) {
+        size_t cap = gNoCollectCap ? gNoCollectCap * 2u : 256u;
+        uintptr_t *grown = calloc(cap, sizeof *grown);
+        if (grown == NULL) return;
+        for (size_t i = 0; i < gNoCollectCap; i++) {
+            uintptr_t k = gNoCollect[i];
+            if (k == 0) continue;
+            size_t at = noCollectSlot(k, cap);
+            while (grown[at] != 0) at = (at + 1u) & (cap - 1u);
+            grown[at] = k;
+        }
+        free(gNoCollect);
+        gNoCollect = grown;
+        gNoCollectCap = cap;
+    }
+    uintptr_t key = (uintptr_t)code;
+    size_t at = noCollectSlot(key, gNoCollectCap);
+    while (gNoCollect[at] != 0) {
+        if (gNoCollect[at] == key) return;
+        at = (at + 1u) & (gNoCollectCap - 1u);
+    }
+    gNoCollect[at] = key;
+    gNoCollectCount++;
+}
+
+bool jitNoCollectKnown(const uint8_t *code) {
+    if (code == NULL || gNoCollectCap == 0) return false;
+    uintptr_t key = (uintptr_t)code;
+    size_t at = noCollectSlot(key, gNoCollectCap);
+    while (gNoCollect[at] != 0) {
+        if (gNoCollect[at] == key) return true;
+        at = (at + 1u) & (gNoCollectCap - 1u);
+    }
+    return false;
+}
+
+/* Whether a bare `bl` to `cfn`'s compiled entry may leave its roots out; the
+ * caller then announces the call with callExempt so that this body stays
+ * collect-free in turn. `hasSelfSlow`: the site finishes a deoptimised callee
+ * in the interpreter, which collects. */
+bool jitCallSkipsRoots(const Emit *e, const ObjFunction *cfn, bool hasSelfSlow) {
+    if (!jitLeafCallRoots() || e->osr || hasSelfSlow) return false;
+    return jitNoCollectKnown(cfn->jitFunc);
+}
+
 _Static_assert(offsetof(JitCallDesc, link) == 0 &&
                offsetof(JitCallDesc, nroots) == 8,
                "emitChainLink stores link and nroots as one pair");

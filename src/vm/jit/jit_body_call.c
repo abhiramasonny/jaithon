@@ -278,8 +278,11 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             /* Roots before the branch: a `blr` pushes none, and the callee
              * may allocate. */
             unsigned callRoots = 0;
-            if (!emitRootFill(e, e->descOffset, &callRoots)) return false;
-            if (callRoots > 0) emitChainLink(e, callRoots);
+            bool leaf = jitCallSkipsRoots(e, cfn, !cfn->jitFuncNoWrite);
+            if (!leaf) {
+                if (!emitRootFill(e, e->descOffset, &callRoots)) return false;
+                if (callRoots > 0) emitChainLink(e, callRoots);
+            }
 
             unsigned firstArg = cidx + 1u - (e->depth - e->valueDepth);
             for (unsigned i = 0; i < argc; i++) {
@@ -289,6 +292,7 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             emitConst64(e, JIT_SCRATCH_D,
                         (int64_t)(uintptr_t)cfn->jitFunc);
             noteScratchClobber(e);
+            if (leaf) e->callExempt = true;
             emit(e, jaiA64Blr(JIT_SCRATCH_D));
 
             if (callRoots > 0) emitChainUnlink(e);
