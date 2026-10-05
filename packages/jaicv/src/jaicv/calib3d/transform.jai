@@ -593,7 +593,9 @@ pub fn init_undistort_rectify_map(
     size: Size
 ) -> tuple[Mat, Mat] {
     let k = camera_matrix.values()
-    let inverse_new = inverse(new_camera_matrix).values()
+    let inverted = inverse(new_camera_matrix)
+    let inverse_new = inverted.values()
+    inverted.release()
     let count = size.width * size.height
     let map_x = Mat(size.height, size.width, CV_MAKETYPE(CV_32F, 1))
     let map_y = Mat(size.height, size.width, CV_MAKETYPE(CV_32F, 1))

@@ -51,7 +51,10 @@ pub fn undistort(
         used,
         Size(image.cols, image.rows)
     )
-    return remap(image, map_x, map_y, interpolation: INTER_LINEAR)
+    let out = remap(image, map_x, map_y, interpolation: INTER_LINEAR)
+    map_x.release()
+    map_y.release()
+    return out
 }
 
 fn pose_residual(
