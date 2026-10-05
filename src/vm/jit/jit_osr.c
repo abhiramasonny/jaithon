@@ -906,7 +906,6 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
     emitFrameEnter(&e);
     emitSaveRestore(&e, true);
     emitFpSaveRestore(&e, true);
-    sinkEmitEntry(&e);
     emit(&e, jaiA64MovX(JIT_SLOTS_REG, 0));
     for (unsigned i = 0; i < e.locals; i++) {
         if (e.slotXReg[i] != 0 && e.localKind[i] == SLOT_BOOL) {
@@ -943,6 +942,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         }
     }
 
+    sinkEmitEntry(&e);
     planHoists(&e, fn, e.localKind);
     planStrFacts(&e, fn);
     if (getenv("JAI_JIT_WHY")) {

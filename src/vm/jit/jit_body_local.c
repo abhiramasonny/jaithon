@@ -211,6 +211,13 @@ bool emitBind(Emit *e, const uint8_t *code, int *offp) {
     int off = *offp;
     do {
         unsigned slot = jaiReadU16(code + off + 1);
+        /* A sunk local takes only the reference an inlined construction
+         * left (jit_sink.c); a direct one never reaches here. */
+        if (slot <= JIT_MAX_SLOTS && e->sinkOf[slot] != 0 && !e->inlining) {
+            if (!sinkBindResult(e, slot)) return false;
+            off += 3;
+            break;
+        }
         if (!localInRange(e, slot)) return false;
         if (slot == 0) e->usesSlot0 = true;
         if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) return false;

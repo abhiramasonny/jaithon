@@ -559,6 +559,13 @@ bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
     do {
         if (e->inlining) {
             unsigned iargc = code[off + 1];
+            /* Bound by the caller to a sunk local (jit_sink.c). */
+            int sunk = sinkConstructInline(e, iargc);
+            if (sunk < 0) return false;
+            if (sunk > 0) {
+                off += 2;
+                break;
+            }
             /* Inside an inlined body (inlinableBody admitted it as the
              * closing construction) the result is the INLINE's: it stays on
              * top, and the OP_RETURN after it ends the inline as any other

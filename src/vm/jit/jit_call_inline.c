@@ -362,6 +362,10 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
     if (!inlinableBody(callee, argc, &maxSlot, &readsUpvalue, &constructs)) {
         return false;
     }
+    /* A construction the caller binds straight into a sunk local is not
+     * made at all (jit_sink.c), so such a body calls nothing. */
+    unsigned sinkBind = constructs ? sinkBindAfter(e, caller, callOff) : 0;
+    if (sinkBind != 0) constructs = false;
     /* A body that calls out cannot live in x0..x8, and a caller whose own
      * values are there (scratchValues) has no other bank to give it. */
     if (constructs && e->scratchValues) return false;
@@ -411,6 +415,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
      * on its own, and under scratchValues that declines the compile. */
     e->inlining     = true;
     e->inlShared    = constructs;
+    e->inlSinkBind  = sinkBind;
     e->inlDepth     = cidx + 1u + argc;
     e->inlPinned    = 0;
     e->inlValueBase = e->valueDepth;
@@ -447,6 +452,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
          * the register budget already gets. */
         e->inlining = false;
         e->inlShared = false;
+        e->inlSinkBind = 0;
         memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
         gInlineFailed = true;
         e->failed = true;
@@ -462,6 +468,38 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
     uint32_t rshape;
     ObjClass *rcls;
     if (e->depth <= cidx) { e->failed = true; return false; }
+    /* The body's result is a sunk construction: drop what it pinned, and
+     * hand the caller's bind the reference (jit_sink.c). */
+    if (e->stack[e->depth - 1] == SLOT_VREF) {
+        uint8_t sunk = e->stackSunk[e->depth - 1];
+        e->depth--;
+        while (e->depth > cidx) {
+            if (holdsRegister(e->stack[e->depth - 1])) {
+                unsigned r;
+                if (!popValueRaw(e, &r, NULL)) { e->failed = true; return false; }
+            } else {
+                e->depth--;
+            }
+        }
+        e->inlining = false;
+        e->inlShared = false;
+        e->inlSinkBind = 0;
+        memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
+        unsigned d = e->depth;
+        e->stackShape[d] = 0;
+        e->stackClass[d] = e->sink[sunk - 1u].cls;
+        e->stackSeen[d] = NULL_VAL;
+        e->stackLocal[d] = -1;
+        e->stackAscii[d] = false;
+        e->stackNullLit[d] = false;
+        e->stackUnit[d] = false;
+        e->stackPinned[d] = false;
+        e->stackObjType[d] = 0;
+        e->stackElemDecl[d] = 0;
+        e->stackSunk[d] = sunk;
+        e->stack[e->depth++] = SLOT_VREF;
+        return true;
+    }
     rshape = e->stackShape[e->depth - 1];
     rcls   = e->stackClass[e->depth - 1];
     /* Read while `inlining` is still set, so this names the inlined bank's d
@@ -484,6 +522,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
     }
     e->inlining = false;
     e->inlShared = false;
+    e->inlSinkBind = 0;
     memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
 
     if (!pushValue(e, kres, rshape, rcls)) { e->failed = true; return false; }

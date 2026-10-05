@@ -885,6 +885,12 @@ bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi) {
 
 void noteScratchClobber(Emit *e) {
     e->clobbersScratch = true;
+    /* An entry-live sink's homes are a copy of an object something else may
+     * still reach, and a call could write it (jit_sink.c). */
+    if (sinkHasEntryLive(e)) {
+        e->whyNot = "a call out in a loop whose sunk local entered holding an object";
+        e->failed = true;
+    }
     /* The one place every call out passes through, which makes it the one
      * place a field-kind memo can be retired at all of them; see
      * forgetFieldKinds. The sites that reach here without running user code

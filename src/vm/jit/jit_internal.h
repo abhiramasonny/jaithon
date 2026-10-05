@@ -810,7 +810,14 @@ typedef struct {
         SlotKind  kind[JIT_SINK_FIELDS];
         uint16_t  argSlot[JIT_SINK_FIELDS];
         unsigned  homeOff;
+        /* Read in the loop before it is bound: the object the loop is
+         * entered with is unpacked into the homes at entry, and stays the
+         * local's value until the first bind. */
+        bool      entryLive;
     } sink[JIT_MAX_SINK];
+    /* Inside an inlined body: the caller binds its result straight into this
+     * sunk local (+ 1), so the construction it ends with is sunk too. */
+    unsigned  inlSinkBind;
     /* Per operand-stack entry: the sink an SLOT_VREF entry names, + 1. */
     uint8_t   stackSunk[JIT_MAX_STACK];
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
@@ -1658,8 +1665,13 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
                const Value *slots, const bool *byRef);
 bool sinkPushRef(Emit *e, unsigned slot);
 bool sinkFieldRead(Emit *e, unsigned sink, const ObjFunction *fn,
-                   uint32_t nameIdx);
+                   uint32_t nameIdx, const uint8_t *code, int next, int stop);
 int  sinkConstructs(Emit *e, const uint8_t *code, int off);
+int  sinkConstructInline(Emit *e, unsigned argc);
+unsigned sinkBindAfter(const Emit *e, const ObjFunction *caller,
+                       uint32_t callOff);
+bool sinkBindResult(Emit *e, unsigned slot);
+bool sinkHasEntryLive(const Emit *e);
 JitArmResult sinkInvoke(Emit *e, ObjFunction *fn, const uint8_t *code,
                         int *offp);
 void sinkEmitSync(Emit *e);

@@ -199,7 +199,8 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
 
         /* A sunk local's field is a load from its home (jit_sink.c). */
         if (slot <= JIT_MAX_SLOTS && e->sinkOf[slot] != 0) {
-            if (!sinkFieldRead(e, e->sinkOf[slot] - 1u, fn, nameIdx)) {
+            if (!sinkFieldRead(e, e->sinkOf[slot] - 1u, fn, nameIdx,
+                               code, off + 8, stop)) {
                 return JIT_ARM_REFUSED;
             }
             off += 8;
@@ -504,7 +505,9 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
         if (e->stack[e->depth - 1] == SLOT_VREF) {
             unsigned j = e->stackSunk[e->depth - 1] - 1u;
             e->depth--;
-            if (!sinkFieldRead(e, j, fn, nameIdx)) return false;
+            if (!sinkFieldRead(e, j, fn, nameIdx, code, off + 6, stop)) {
+                return false;
+            }
             off += 6;
             break;
         }

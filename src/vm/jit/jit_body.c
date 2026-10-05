@@ -167,7 +167,8 @@ static bool inlineFieldRead(Emit *e, ObjFunction *fn, const uint8_t *code,
         if ((unsigned)e->inlSlot[a] < e->depth &&
             e->stack[e->inlSlot[a]] == SLOT_VREF) {
             return sinkFieldRead(e, e->stackSunk[e->inlSlot[a]] - 1u, fn,
-                                 jaiReadU24(code + off + 3));
+                                 jaiReadU24(code + off + 3), code, off + len,
+                                 stop);
         }
         if (!pushCopyOfEntry(e, (unsigned)e->inlSlot[a])) return false;
         memcpy(synth + 1, code + off + 3, 5);   /* u24 name, u16 cache */
@@ -877,6 +878,8 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         if (e->inlining && op == OP_RETURN) {
             /* The result is on top and stays there; the caller's driver takes
              * it from the model. */
+            /* A sunk construction's reference (jit_sink.c) holds nothing. */
+            if (e->depth > 0 && e->stack[e->depth - 1] == SLOT_VREF) break;
             if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) {
                 e->whyNot = "an inlined body returning a value with no register";
                 return false;

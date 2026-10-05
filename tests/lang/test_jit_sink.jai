@@ -239,6 +239,91 @@ fn test_a_call_that_is_not_inlined() -> void {
         i += 1
     }
     var want = 0
-    for i in 0..20000 { want += (i % 10) * 3 + 6 }
+    for k in 0..20000 { want += (k % 10) * 3 + 6 }
     assert_eq(total, want)
+}
+
+class Vec2 {
+    pub var x: float
+    pub var y: float
+
+    fn init(self, x: float, y: float) {
+        self.x = x
+        self.y = y
+    }
+
+    pub fn add(self, other: Vec2) -> Vec2 {
+        return Vec2(self.x + other.x, self.y + other.y)
+    }
+
+    pub fn dot(self, other: Vec2) -> float {
+        return self.x * other.x + self.y * other.y
+    }
+}
+
+#: Loop-carried: the local is read before it is rebound, so the loop is
+#: entered holding a real object, unpacked at entry, and every iteration's
+#: object comes from an inlined `return Vec2(...)`.
+fn accumulate(start: Vec2, n: int) -> Vec2 {
+    var acc = start
+    let step = Vec2(1.0, 2.0)
+    var total = 0.0
+    for _ in 0..n {
+        acc = acc.add(step)
+        total += acc.dot(step)
+    }
+    assert_eq(total, 5.0 * float(n) * float(n + 1) / 2.0 +
+                     float(n) * (start.x + 2.0 * start.y))
+    return acc
+}
+
+fn test_a_loop_carried_object() -> void {
+    let start = Vec2(0.5, 0.25)
+    let got = accumulate(start, 30000)
+    assert_eq(got.x, 30000.5)
+    assert_eq(got.y, 60000.25)
+    assert_eq(got is start, false)
+    assert_eq(start.x, 0.5)
+}
+
+#: Entered holding an object and left without rebinding it: the same object
+#: comes back, not a copy.
+fn maybe_rebind(start: Vec2, n: int, at: int) -> Vec2 {
+    var acc = start
+    let step = Vec2(1.0, 1.0)
+    var total = 0.0
+    var i = 0
+    while i < n {
+        total += acc.dot(step)
+        if i == at { acc = acc.add(step) }
+        i += 1
+    }
+    return acc
+}
+
+fn test_an_object_not_rebound_keeps_its_identity() -> void {
+    let start = Vec2(2.0, 3.0)
+    for _ in 0..4 { maybe_rebind(start, 20000, -1) }
+    assert_eq(maybe_rebind(start, 20000, -1) is start, true)
+    let moved = maybe_rebind(start, 20000, 5)
+    assert_eq(moved is start, false)
+    assert_eq(moved.x, 3.0)
+}
+
+#: Entered holding an object while the loop also calls out: the call could
+#: reach that object, so the loop is compiled without sinking it.
+var g_seen = 0.0
+fn note(v: float) -> void {
+    g_seen += v
+}
+
+fn test_a_call_out_beside_an_entered_object() -> void {
+    var acc = Vec2(0.0, 0.0)
+    let step = Vec2(1.0, 0.0)
+    for _ in 0..20000 {
+        acc = acc.add(step)
+        note(acc.x)
+    }
+    assert_eq(acc.x, 20000.0)
+    assert_eq(g_seen, 200010000.0)
 }

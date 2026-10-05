@@ -44,6 +44,9 @@
 
 #if (defined(__aarch64__) || defined(__arm64__))
 
+static bool storeConstruction(Emit *e, unsigned j, unsigned argc);
+static bool pushRef(Emit *e, unsigned j);
+
 bool jitSinkOn(void) {
     static int on = -1;
     if (on < 0) {
@@ -168,7 +171,12 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
             unsigned s = jaiReadU16(c->code + off + 1);
             bool ctor = prevOff >= 0 && prevOff + 2 == off &&
                         c->code[prevOff] == OP_CALL;
-            NOTE(s, ctor ? USE_BIND : USE_OTHER);
+            /* Bound to a method's result: only an inlined body that ends by
+             * constructing the class can hand it one (sinkConstructInline);
+             * anything else refuses at the bind. */
+            bool viaInvoke = prevOff >= 0 && prevOff + 7 == off &&
+                             c->code[prevOff] == OP_INVOKE;
+            NOTE(s, ctor || viaInvoke ? USE_BIND : USE_OTHER);
             if (ctor && s <= JIT_MAX_SLOTS) {
                 int argc = c->code[prevOff + 1];
                 if (bindArgc[s] >= 0 && bindArgc[s] != argc) {
@@ -211,7 +219,12 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
 
     for (unsigned s = 0; s < e->locals && e->sinkCount < JIT_MAX_SINK; s++) {
         if ((use[s] & USE_BIND) == 0 || (use[s] & USE_OTHER) != 0) continue;
-        if (firstUse[s] != USE_BIND || byRef[s]) continue;
+        if (byRef[s]) continue;
+        /* Read before it is bound: the object it holds at entry is unpacked
+         * there, so no dominance is needed -- the homes always hold the
+         * local's current fields. */
+        bool entryLive = firstUse[s] != USE_BIND;
+        if (entryLive) goto planned_dominance;
         /* Dominance: nothing before the first bind may leave for anywhere but
          * out of the loop, and nothing may land between the head and it. */
         bool dominated = true;
@@ -229,12 +242,14 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
             off += len;
         }
         if (!dominated) continue;
+    planned_dominance:;
 
         Value v = slots[s];
         if (!IS_INSTANCE(v)) continue;
         ObjInstance *inst = AS_INSTANCE(v);
         ObjClass *cls = inst->klass;
         int argc = bindArgc[s];
+        if (argc < 0 && cls != NULL) argc = (int)cls->fieldCount;
         if (cls == NULL || argc <= 0 || (unsigned)argc > JIT_SINK_FIELDS ||
             cls->fieldCount != (unsigned)argc ||
             inst->fieldCount != (unsigned)argc) {
@@ -262,6 +277,7 @@ void planSinks(Emit *e, const ObjFunction *fn, uint32_t top, uint32_t end,
         e->sink[j].local = s;
         e->sink[j].nfields = (unsigned)argc;
         e->sink[j].homeOff = 16u;   /* the real pass's frame says where */
+        e->sink[j].entryLive = entryLive;
         e->sinkOf[s] = (uint8_t)(j + 1u);
         e->sinkCount++;
         if (getenv("JAI_JIT_WHY")) {
@@ -300,7 +316,7 @@ bool sinkPushRef(Emit *e, unsigned slot) {
 
 /* Field `nameIdx` of sink `sink`: one load from its home. */
 bool sinkFieldRead(Emit *e, unsigned sink, const ObjFunction *fn,
-                   uint32_t nameIdx) {
+                   uint32_t nameIdx, const uint8_t *code, int next, int stop) {
     if (sink >= e->sinkCount) return false;
     if (nameIdx >= (uint32_t)fn->chunk.constants.count) return false;
     Value nv = fn->chunk.constants.data[nameIdx];
@@ -310,9 +326,18 @@ bool sinkFieldRead(Emit *e, unsigned sink, const ObjFunction *fn,
         e->whyNot = "a sunk instance read for something not one of its fields";
         return false;
     }
-    if (!pushValue(e, e->sink[sink].kind[fi->slot], 0, NULL)) return false;
-    unsigned r = pushReg(e) - 1u;
-    emit(e, jaiA64LdrX(r, 31, e->sink[sink].homeOff + 8u * fi->slot));
+    SlotKind kind = e->sink[sink].kind[fi->slot];
+    unsigned at = e->sink[sink].homeOff + 8u * fi->slot;
+    if (!pushValue(e, kind, 0, NULL)) return false;
+    /* Straight to the FP bank when the consumer reads it there, as a heap
+     * field read does. */
+    if (kind == SLOT_FLOAT && fpWorthLoading(e, code, next, stop)) {
+        unsigned idx = e->valueDepth - 1u;
+        emit(e, jaiA64LdrD(fpRegAt(e, idx), 31, at));
+        fpClaim(e, idx);
+        return true;
+    }
+    emit(e, jaiA64LdrX(pushReg(e) - 1u, 31, at));
     return true;
 }
 
@@ -326,42 +351,11 @@ int sinkConstructs(Emit *e, const uint8_t *code, int off) {
     unsigned slot = jaiReadU16(code + off + 3);
     if (slot > JIT_MAX_SLOTS || e->sinkOf[slot] == 0) return 0;
     unsigned j = e->sinkOf[slot] - 1u;
-    unsigned argc = code[off + 1];
-    unsigned home = e->sink[j].homeOff;
-    if (argc != e->sink[j].nfields || e->depth < argc + 1u) goto refuse;
-    unsigned cidx = e->depth - argc - 1u;
-    if (e->stack[cidx] != SLOT_CLASS || e->stackClass[cidx] != e->sink[j].cls) {
-        goto refuse;
+    if (!storeConstruction(e, j, code[off + 1])) {
+        e->whyNot = "a sunk local bound to something its plan did not expect";
+        return -1;
     }
-    for (unsigned i = 0; i < argc; i++) {
-        if (e->stack[cidx + 1u + i] !=
-            e->sink[j].kind[e->sink[j].argSlot[i]]) {
-            goto refuse;
-        }
-    }
-    for (unsigned n = argc; n-- > 0;) {
-        unsigned at = home + 8u * e->sink[j].argSlot[n];
-        unsigned idx = e->valueDepth - 1u;
-        if (e->stack[e->depth - 1u] == SLOT_FLOAT && !e->fpOff &&
-            (e->fpLive & (1u << idx))) {
-            unsigned held = fpHeldIn(e, idx);
-            unsigned r2;
-            SlotKind k2;
-            if (!popValueRaw(e, &r2, &k2)) return -1;
-            emit(e, jaiA64StrD(held, 31, at));
-        } else {
-            unsigned r;
-            if (!popValue(e, &r, NULL)) return -1;
-            emit(e, jaiA64StrX(r, 31, at));
-        }
-    }
-    e->depth--;                                    /* the class */
-    emit(e, jaiA64MovzX(JIT_SCRATCH_A, 1, 0));
-    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31, home + 8u * e->sink[j].nfields));
     return 1;
-refuse:
-    e->whyNot = "a sunk local bound to something its plan did not expect";
-    return -1;
 }
 
 /* OP_INVOKE with a sunk reference among its receiver and arguments: it must
@@ -400,12 +394,154 @@ JitArmResult sinkInvoke(Emit *e, ObjFunction *fn, const uint8_t *code,
 }
 
 /* Zero each sink's "bound yet" word: a way out before the first bind leaves
- * the local as the interpreter had it. */
+ * the local as the interpreter had it. Then unpack each entry-live sink's
+ * object: an instance of exactly the planned class whose fields have the
+ * planned kinds, or the form bails before it has run anything. Emitted once
+ * the frame, the locals and the iterator are in place, so the bail's way out
+ * finds them as it expects. */
 void sinkEmitEntry(Emit *e) {
     for (unsigned j = 0; j < e->sinkCount; j++) {
         emit(e, jaiA64StrX(31, 31,
                            e->sink[j].homeOff + 8u * e->sink[j].nfields));
     }
+    for (unsigned j = 0; j < e->sinkCount; j++) {
+        if (!e->sink[j].entryLive) continue;
+        unsigned at = e->sink[j].local * 16u;
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SLOTS_REG, at));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, VAL_OBJ));
+        branchTo(e, FIXUP_BAIL, true, JAI_A64_NE);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SLOTS_REG, at + 8u));
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                           (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_INSTANCE));
+        branchTo(e, FIXUP_BAIL, true, JAI_A64_NE);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B,
+                           (unsigned)offsetof(ObjInstance, klass)));
+        emitConst64(e, JIT_SCRATCH_C, (int64_t)(uintptr_t)e->sink[j].cls);
+        emit(e, jaiA64SubsX(31, JIT_SCRATCH_A, JIT_SCRATCH_C));
+        branchTo(e, FIXUP_BAIL, true, JAI_A64_NE);
+        for (unsigned f = 0; f < e->sink[j].nfields; f++) {
+            unsigned fo = (unsigned)offsetof(ObjInstance, fields) +
+                          f * (unsigned)sizeof(Value);
+            unsigned tag = e->sink[j].kind[f] == SLOT_FLOAT ? VAL_FLOAT
+                                                            : VAL_INT;
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_B, fo));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
+            branchTo(e, FIXUP_BAIL, true, JAI_A64_NE);
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_B, fo + 8u));
+            emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
+                               e->sink[j].homeOff + 8u * f));
+        }
+    }
+}
+
+bool sinkHasEntryLive(const Emit *e) {
+    for (unsigned j = 0; j < e->sinkCount; j++) {
+        if (e->sink[j].entryLive) return true;
+    }
+    return false;
+}
+
+/* The sunk local the instruction after the call at `callOff` binds its
+ * result to, + 1, or 0: what lets an inlined body's closing construction be
+ * sunk (sinkConstructInline). */
+unsigned sinkBindAfter(const Emit *e, const ObjFunction *caller,
+                       uint32_t callOff) {
+    if (e->sinkCount == 0 || e->inlining) return 0;
+    const Chunk *c = &caller->chunk;
+    if (callOff >= (uint32_t)c->count) return 0;
+    int len = instructionLength(c, (int)callOff);
+    if (len <= 0 || callOff + (uint32_t)len + 3u > (uint32_t)c->count) return 0;
+    const uint8_t *at = c->code + callOff + len;
+    if (at[0] != OP_BIND) return 0;
+    unsigned slot = jaiReadU16(at + 1);
+    if (slot > JIT_MAX_SLOTS || e->sinkOf[slot] == 0) return 0;
+    return slot + 1u;
+}
+
+/* The pushed reference to sink `j`, without sinkPushRef's checks: an inlined
+ * body's result, which only the caller's bind consumes. */
+static bool pushRef(Emit *e, unsigned j) {
+    if (e->depth >= JIT_MAX_STACK) return false;
+    unsigned d = e->depth;
+    e->stackShape[d]   = e->sink[j].cls->shapeId;
+    e->stackClass[d]   = e->sink[j].cls;
+    e->stackSeen[d]    = NULL_VAL;
+    e->stackLocal[d]   = -1;
+    e->stackAscii[d]   = false;
+    e->stackNullLit[d] = false;
+    e->stackUnit[d]    = false;
+    e->stackPinned[d]  = false;
+    e->stackObjType[d] = 0;
+    e->stackElemDecl[d] = 0;
+    e->stackSunk[d]    = (uint8_t)(j + 1u);
+    e->stack[e->depth++] = SLOT_VREF;
+    return true;
+}
+
+/* Stores the top `argc` entries into sink j's homes and drops them and the
+ * class beneath; sets the bound word. */
+static bool storeConstruction(Emit *e, unsigned j, unsigned argc) {
+    unsigned home = e->sink[j].homeOff;
+    if (argc != e->sink[j].nfields || e->depth < argc + 1u) return false;
+    unsigned cidx = e->depth - argc - 1u;
+    if (e->stack[cidx] != SLOT_CLASS || e->stackClass[cidx] != e->sink[j].cls) {
+        return false;
+    }
+    for (unsigned i = 0; i < argc; i++) {
+        if (e->stack[cidx + 1u + i] !=
+            e->sink[j].kind[e->sink[j].argSlot[i]]) {
+            return false;
+        }
+    }
+    for (unsigned n = argc; n-- > 0;) {
+        unsigned at = home + 8u * e->sink[j].argSlot[n];
+        unsigned idx = e->valueDepth - 1u;
+        if (e->stack[e->depth - 1u] == SLOT_FLOAT && !e->fpOff &&
+            (e->fpLive & (1u << idx))) {
+            unsigned held = fpHeldIn(e, idx);
+            unsigned r2;
+            SlotKind k2;
+            if (!popValueRaw(e, &r2, &k2)) return false;
+            emit(e, jaiA64StrD(held, 31, at));
+        } else {
+            unsigned r;
+            if (!popValue(e, &r, NULL)) return false;
+            emit(e, jaiA64StrX(r, 31, at));
+        }
+    }
+    e->depth--;                                    /* the class */
+    emit(e, jaiA64MovzX(JIT_SCRATCH_A, 1, 0));
+    emit(e, jaiA64StrX(JIT_SCRATCH_A, 31, home + 8u * e->sink[j].nfields));
+    return true;
+}
+
+/* OP_TAIL_CALL closing an inlined body whose result the caller binds to a
+ * sunk local: the construction goes to the homes and the body returns a
+ * reference. 1 when done, -1 when it should have been and is not. */
+int sinkConstructInline(Emit *e, unsigned argc) {
+    if (!e->inlining || e->inlSinkBind == 0) return 0;
+    unsigned slot = e->inlSinkBind - 1u;
+    unsigned j = e->sinkOf[slot] - 1u;
+    if (!storeConstruction(e, j, argc) || !pushRef(e, j)) {
+        e->whyNot = "an inlined construction a sunk local cannot take";
+        return -1;
+    }
+    return 1;
+}
+
+/* OP_BIND of sunk local `slot` after an inlined call: its result must be the
+ * reference sinkConstructInline left, which is dropped -- the homes already
+ * hold the fields. */
+bool sinkBindResult(Emit *e, unsigned slot) {
+    unsigned j = e->sinkOf[slot] - 1u;
+    if (e->depth == 0 || e->stack[e->depth - 1u] != SLOT_VREF ||
+        e->stackSunk[e->depth - 1u] != j + 1u) {
+        e->whyNot = "a sunk local bound to something its plan did not expect";
+        return false;
+    }
+    e->depth--;
+    return true;
 }
 
 /* Part of OSR_SYNC_ITER, so on every way out: the sinks' fields into gDeopt
