@@ -581,6 +581,38 @@ fn test_a_scan_with_no_axis_runs_down_the_flattening() -> void {
     assert_eq(cumsum(window, 0).to_list(), [6.0, 7.0, 16.0, 18.0], "a scan reads the view")
 }
 
+#: Enough rows that each is one group, which is where a dense last axis is
+#: staged in threadgroup memory: widths that do not fill the 256 threads
+#: evenly, one past a multiple of them, and a view that starts a row in, so
+#: the staging has to honour the source offset. Small whole numbers keep the
+#: running sums exact, so the host's left-to-right answer is the device's.
+fn test_a_scan_of_many_dense_rows_is_each_rows_running_fold() -> void {
+    if not have_gpu() { return }
+    for width in [17, 257, 4096] {
+        let rows = 1100
+        var values = [0.0 for _at in 0..(rows + 1) * width]
+        for at in 0..values.len() { values[at] = float(at * 7 % 11) - 5.0 }
+        let whole = holding([rows + 1, width], values)
+        defer { whole.free() }
+        let tail = whole.view([rows, width], [width, 1], width)
+        let sums = cumsum(tail, axis: 1).to_list()
+        let peaks = cummax(tail, axis: 1).to_list()
+        var wrong = 0
+        for row in 0..rows {
+            var total = 0.0
+            var high = -1000.0
+            for column in 0..width {
+                let value = values[(row + 1) * width + column]
+                total += value
+                if value > high { high = value }
+                if sums[row * width + column] != total { wrong += 1 }
+                if peaks[row * width + column] != high { wrong += 1 }
+            }
+        }
+        assert_eq(wrong, 0, f"{rows} rows of {width}")
+    }
+}
+
 fn test_a_long_scan_joins_its_chunks() -> void {
     if not have_gpu() { return }
     let count = 200000

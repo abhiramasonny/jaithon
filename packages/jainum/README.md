@@ -194,3 +194,4 @@ its module loads, and is on unless set to `0`.
 | Switch | Off restores |
 | --- | --- |
 | `JAINUM_ROW_SORT` | the dispatch-per-pass bitonic network for rows of up to 4096 slots, instead of one dispatch that runs the whole network in registers, simd shuffles and threadgroup memory; bit-identical |
+| `JAINUM_ROW_SCAN` | the strided chunk kernel for a scan along a dense last axis of up to 4096, instead of one group a row staged in threadgroup memory; the same association, so bit-identical |

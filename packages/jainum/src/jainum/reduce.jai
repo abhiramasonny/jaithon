@@ -37,6 +37,7 @@
 #: and taking the dependency would buy nothing.
 import std.math
 from std.gpu import Buffer
+from std.os import env_or
 from .array import BOOL, FLOAT32, INT64, GROUP, NDArray, PRELUDE, OP_DIV, OP_SUB
 from .array import binary_arith, broadcast_shapes, diagonal_view, dtype_is_integer
 from .array import element_count, f32_bits, fill, is_contiguous, kernel_of
@@ -543,12 +544,73 @@ kernel void nr_scan_apply(device float* dst [[buffer(0)]],
     int at = doff + int(k) * dstep;
     dst[at] = nr_combine(partials[seg * chunks + chunk], dst[at], op, 0u);
 }
+
+/* `nr_scan_chunk` for a dense last axis of at most SCAN_ROW_MAX, with the
+ * row staged in threadgroup memory.
+ *
+ * The arithmetic is the one-chunk scan's, step for step: thread `lid` folds
+ * slots [lid * each, lid * each + each) from the identity, the same ladder
+ * turns the 256 totals into bases, and each slot is its base folded with the
+ * thread's earlier slots. So the answer is the same to the bit, for every op.
+ * What changes is the memory: the row comes in and goes out with neighbouring
+ * threads on neighbouring addresses, where the chunk kernel had each thread
+ * stride through its own run of device memory twice and walk `meta` for its
+ * offsets. The tile is skewed by one slot in every sixteen so the runs of a
+ * simdgroup fall in different banks. */
+constexpr constant uint SCAN_ROW_MAX = 4096u;
+
+inline uint nr_skew(uint slot) { return slot + (slot >> 4u); }
+
+kernel void nr_scan_rows(device float* dst [[buffer(0)]],
+                         device const float* src [[buffer(1)]],
+                         constant uint& n [[buffer(2)]],
+                         constant uint& op [[buffer(3)]],
+                         constant uint& src_base [[buffer(4)]],
+                         uint seg [[threadgroup_position_in_grid]],
+                         uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float tile[SCAN_ROW_MAX + SCAN_ROW_MAX / 16u];
+    threadgroup float scratch[ND_GROUP];
+    device const float* row = src + src_base + seg * n;
+    for (uint slot = lid; slot < n; slot += ND_GROUP) tile[nr_skew(slot)] = row[slot];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint each = (n + ND_GROUP - 1u) / ND_GROUP;
+    uint from = min(n, lid * each);
+    uint to = min(n, from + each);
+    float ident = nr_identity(op, 0u);
+    float mine = ident;
+    for (uint k = from; k < to; k++) mine = nr_combine(mine, tile[nr_skew(k)], op, 0u);
+
+    scratch[lid] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint reach = 1u; reach < ND_GROUP; reach <<= 1u) {
+        float other = lid >= reach ? scratch[lid - reach] : ident;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scratch[lid] = nr_combine(scratch[lid], other, op, 0u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float running = lid == 0u ? ident : scratch[lid - 1u];
+    for (uint k = from; k < to; k++) {
+        running = nr_combine(running, tile[nr_skew(k)], op, 0u);
+        tile[nr_skew(k)] = running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* out = dst + seg * n;
+    for (uint slot = lid; slot < n; slot += ND_GROUP) out[slot] = tile[nr_skew(slot)];
+}
 """
 
 #: Groups a chunked fold or scan aims for. 1024 fills every Apple GPU this
 #: runs on, and it is also the most partials the single finish dispatch wants
 #: to walk — the two bounds want the same number, so there is one constant.
 const _TARGET_GROUPS = 1024
+
+#: The longest dense row `nr_scan_rows` stages in threadgroup memory.
+const _SCAN_ROW_MAX = 4096
+
+#: `JAINUM_ROW_SCAN=0` keeps a dense last-axis scan on the strided chunk
+#: kernel, for an A/B. The answers are the same to the bit. Read once.
+let _ROW_SCAN = env_or("JAINUM_ROW_SCAN", "1") != "0"
 
 #: Elements below which splitting a segment across groups costs more in
 #: launches and partials than it wins in parallelism.
@@ -1304,6 +1366,16 @@ fn _scan(a: NDArray, axis: any, dtype: int, op: int, what: str) -> NDArray {
     if chunks > 1 {
         per = (n + chunks - 1) // chunks
         chunks = (n + per - 1) // per
+    }
+    let dense_rows = at == source.ndim() - 1 and source.is_contiguous()
+    if _ROW_SCAN and chunks == 1 and n <= _SCAN_ROW_MAX and dense_rows {
+        kernel_of(SOURCE, "nr_scan_rows").dispatch_async(
+            [out.storage, source.storage],
+            segments * GROUP,
+            [n, op, source.offset],
+            GROUP
+        )
+        return out
     }
     let partials = Buffer(segments * chunks)
     defer { partials.free() }
