@@ -423,3 +423,29 @@ fn test_a_factory_function() -> void {
     }
     assert_eq(total, 400020000)
 }
+
+#: The record's sink words are cleared when the objects are built, not before
+#: every entry, so a loop that sinks nothing must find them clear. This one
+#: leaves its compiled region every iteration (`int * float`), and slots 4 and
+#: 5 (m and i) are where churn's sunk locals sit: a stale record would
+#: overwrite them with Points on the first way out.
+fn bounce(n: int) -> float {
+    var acc = 0.0
+    var k = 1
+    var m = 2
+    var i = 0
+    while i < n {
+        acc += i * 0.5
+        k = k + 1
+        m = m + 2
+        i += 1
+    }
+    return acc + k * 1.0 + m * 1.0
+}
+
+fn test_a_loop_that_sinks_nothing_after_one_that_did() -> void {
+    assert_eq(churn(30000), churn_reference(30000))
+    assert_eq(bounce(20000), 100055003.0)
+    assert_eq(churn(30000), churn_reference(30000))
+    assert_eq(bounce(20000), 100055003.0)
+}

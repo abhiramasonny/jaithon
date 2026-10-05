@@ -1430,7 +1430,9 @@ static bool osrFormStorageFits(const JaiOsrForm *form, const Value *slots,
 /* The objects an OSR form kept as fields only (jit_sink.c), built now that
  * everything the form handed back is in the frame and on the stack, where the
  * collector can see it. A sink's fields are ints and floats, so the record
- * holds nothing it has to. */
+ * holds nothing it has to. Called only when gDeopt.sinkCount is set, and out
+ * of line, so a loop that sinks nothing pays a load and a branch per exit. */
+__attribute__((noinline))
 static void osrMaterializeSinks(Value *slots, Value *stack, unsigned nstack) {
     int64_t n = gDeopt.sinkCount;
     gDeopt.sinkCount = 0;
@@ -1870,11 +1872,16 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
      * nothing here fills the mask -- clear it rather than leave the last
      * function-tier stub's behind for whoever reads the record next. */
     gDeopt.skipLocals = 0;
-    gDeopt.sinkCount = 0;
-    gDeopt.sinkStackMask = 0;
     int64_t at = ((OsrFnIter)(uintptr_t)form->code)(frame->slots, iter);
+    /* Not cleared before the call: only a form that sinks writes the sink
+     * words (every one of its exits does), and osrMaterializeSinks zeroes them
+     * again, so they are zero whenever no such form has just returned. A
+     * clear here and an unconditional scan cost every other loop ~36
+     * instructions per exit, which a loop leaving its region every
+     * iteration pays millions of times. */
+    bool sunk = gDeopt.sinkCount != 0;
     if (at == -1 || at == -2) {
-        osrMaterializeSinks(frame->slots, NULL, 0);
+        if (sunk) osrMaterializeSinks(frame->slots, NULL, 0);
         if (at == -1)
             return osrNo(fn, top, "the compiled loop bailed out at entry");
         return 2;                        /* an exception is pending */
@@ -1882,7 +1889,7 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
     if (gDeopt.base != 0) vm.stackTop--;   /* the exhausted iterator */
     Value *pushed = vm.stackTop;
     for (int64_t i = 0; i < gDeopt.nstack; i++) *vm.stackTop++ = gDeopt.stack[i];
-    osrMaterializeSinks(frame->slots, pushed, (unsigned)gDeopt.nstack);
+    if (sunk) osrMaterializeSinks(frame->slots, pushed, (unsigned)gDeopt.nstack);
     *resumeAt = (uint32_t)at;
     return 1;
 }

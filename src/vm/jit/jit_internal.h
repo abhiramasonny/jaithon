@@ -139,6 +139,8 @@ typedef struct {
 
 _Static_assert(JIT_MAX_SLOTS <= 64,
                "skipLocals is one bit per local slot");
+_Static_assert(JIT_MAX_STACK + 1 <= 32 && JIT_MAX_SINK <= 2,
+               "sinkStackMask is 32 bits of stack entries per sink");
 
 /* A `self` entry (the callee of a recursive call) occupies no register; register numbers are
  * derived from the count of value entries below an entry, not from its depth. */
