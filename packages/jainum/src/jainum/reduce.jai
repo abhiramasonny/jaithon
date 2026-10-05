@@ -263,12 +263,25 @@ kernel void nr_fold(device float* dst [[buffer(0)]],
     scratch[lid] = mine;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     /* `span` and not `half`, which names Metal's sixteen-bit float and cannot
-     * also name a variable. */
-    for (uint span = width >> 1u; span > 0u; span >>= 1u) {
+     * also name a variable.
+     *
+     * Bit 3 of `flags` finishes the tree in registers once the span is inside
+     * a simdgroup: a segment's slots are width-aligned lanes, so for a span of
+     * 16 or less a slot's partner is `span` lanes down in its own simdgroup.
+     * The same operands meet in the same order as through threadgroup memory,
+     * so the answer is the same to the bit, without five barrier rounds. */
+    uint span = width >> 1u;
+    uint stop = (flags & 8u) != 0u ? 16u : 0u;
+    for (; span > stop; span >>= 1u) {
         if (slot < span) scratch[lid] = nr_combine(scratch[lid], scratch[lid + span], op, skip_nan);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (slot == 0u && seg < segments) dst[seg * chunks + chunk] = scratch[lid];
+    float folded = scratch[lid];
+    for (; span > 0u; span >>= 1u) {
+        float other = simd_shuffle_down(folded, ushort(span));
+        if (slot < span) folded = nr_combine(folded, other, op, skip_nan);
+    }
+    if (slot == 0u && seg < segments) dst[seg * chunks + chunk] = folded;
 }
 
 /* The fold's one-lane-a-segment shape -- the reduced axis strided, the kept
@@ -750,6 +763,11 @@ const _TARGET_GROUPS = 1024
 #: The answers are the same to the bit. Read once.
 let _FOLD_COLUMNS = env_or("JAINUM_FOLD_COLUMNS", "1") != "0"
 
+#: `JAINUM_SHUFFLE_TREE=0` keeps the last five rounds of a fold's tree in
+#: threadgroup memory instead of simd shuffles, for an A/B. Bit-identical.
+#: Read once.
+let _SHUFFLE_TREE = env_or("JAINUM_SHUFFLE_TREE", "1") != "0"
+
 #: The longest dense row `nr_scan_rows` stages in threadgroup memory.
 const _SCAN_ROW_MAX = 4096
 
@@ -1077,6 +1095,7 @@ fn _fold_into(
     let gate = center ?? a.storage
     let fold = kernel_of(SOURCE, "nr_fold")
     let target = if plan.chunks == 1 { dst } else { Buffer(plan.segments * plan.chunks) }
+    let tree = if _SHUFFLE_TREE { 8 } else { 0 }
     if _FOLD_COLUMNS and _takes_quads(plan, a) {
         let quads = plan.segments // 4
         kernel_of(SOURCE, "nr_fold_columns").dispatch_async(
@@ -1093,7 +1112,7 @@ fn _fold_into(
                 plan.n,
                 op,
                 skip_nan,
-                plan.flags,
+                plan.flags | tree,
                 a.offset,
                 plan.per,
                 plan.chunks,
@@ -1121,7 +1140,7 @@ fn _fold_into(
     fold.dispatch_async(
         [dst, partials, partials, flat],
         (plan.segments + each - 1) // each * GROUP,
-        [plan.segments, plan.chunks, _finish_op(op), skip_nan, 3, 0, plan.chunks, 1, width],
+        [plan.segments, plan.chunks, _finish_op(op), skip_nan, 3 | tree, 0, plan.chunks, 1, width],
         GROUP
     )
 }
