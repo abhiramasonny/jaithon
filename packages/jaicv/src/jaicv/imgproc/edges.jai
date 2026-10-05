@@ -230,8 +230,10 @@ pub fn canny(
     let high = max(threshold1, threshold2)
     let dx = sobel(src, CV_32F, 1, 0, ksize: aperture_size, border_mode: BORDER_REPLICATE)
     let dy = sobel(src, CV_32F, 0, 1, ksize: aperture_size, border_mode: BORDER_REPLICATE)
-    let labels = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
-    let out = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_8U, 1))
+    #: Neither is zeroed: suppression writes every label and the final pass
+    #: every output pixel.
+    let labels = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
+    let out = Mat(src.rows, src.cols, CV_MAKETYPE(CV_8U, 1))
     let count = src.rows * src.cols
     if count == 0 { return out }
     kernel_for("canny_suppress").dispatch_async([dx.storage, dy.storage, labels.storage], count, [count, src.rows, src.cols, dx.offset, dx.step_, dy.offset, dy.step_, labels.offset, labels.step_, if l2_gradient {

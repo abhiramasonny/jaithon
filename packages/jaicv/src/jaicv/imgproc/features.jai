@@ -615,7 +615,8 @@ fn structure_tensor(src: Mat, block_size: int, aperture_size: int) -> Mat {
         scale: scale,
         border_mode: BORDER_DEFAULT
     )
-    let cov = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 3))
+    #: Not zeroed: the covariance kernel writes every element.
+    let cov = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 3))
     let count = src.rows * src.cols
     if count == 0 { return cov }
     kernel_for("feature_covariance").dispatch_async(
@@ -653,7 +654,7 @@ pub fn corner_harris(
     if src.channels() != 1 { throw ValueError("corner_harris needs a single-channel Mat") }
     src.flush()
     let cov = structure_tensor(src, block_size, aperture_size)
-    let out = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
+    let out = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
     let count = src.rows * src.cols
     if count == 0 { return out }
     kernel_for("feature_harris").dispatch_async(
@@ -672,7 +673,7 @@ pub fn corner_min_eigen_val(src: Mat, block_size: int = 3, aperture_size: int = 
     if src.channels() != 1 { throw ValueError("corner_min_eigen_val needs a single-channel Mat") }
     src.flush()
     let cov = structure_tensor(src, block_size, aperture_size)
-    let out = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
+    let out = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
     let count = src.rows * src.cols
     if count == 0 { return out }
     kernel_for("feature_min_eigen").dispatch_async(
