@@ -200,6 +200,18 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
                 e->whyNot = "an indirect callee that is not a closure";
                 return false;
             }
+            /* Not inside an inlined body, before anything is emitted. Every
+             * register below is named through valueBankReg, which is the
+             * caller's bank and not an inline's own (valueXReg), so the guard
+             * read `fn` out of whatever the caller kept there -- `via(f, x)`,
+             * whose whole body is `f(x)`, inlined into a loop segfaulted on
+             * every run. And every record inside an inline resumes at the
+             * OUTER call, so a callee that deoptimised after writing would be
+             * run again from the top. */
+            if (e->inlining) {
+                e->whyNot = "an indirect call inside an inlined body";
+                return false;
+            }
             ObjFunction *cfn = AS_CLOSURE(cv)->fn;
             unsigned rCallee0 =
                 valueBankReg(e, cidx - (e->depth - e->valueDepth));
@@ -299,12 +311,6 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
              * emitDirectCall refuses it (finishDropsAnArgument). */
             bool writes = !cfn->jitFuncNoWrite;
             if (writes) {
-                /* Every record inside an inlined body resumes at the OUTER
-                 * call, which would run this one again. */
-                if (e->inlining) {
-                    e->whyNot = "a writing indirect callee inside an inline";
-                    return false;
-                }
                 if (e->selfSlowCount >= JIT_MAX_SELF_SLOW) {
                     e->whyNot = "more slow call sites than the tier tracks";
                     return false;
