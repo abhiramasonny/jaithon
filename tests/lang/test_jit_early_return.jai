@@ -174,3 +174,25 @@ fn test_bool_and_void_arms() -> void {
     for _ in 0..20 { visit(tree) }
     assert_eq(g_visits, 20460)
 }
+
+#: Two int parameters compared against each other, the base case of a
+#: divide-and-conquer recursion.
+fn spans(lo: int, hi: int) -> int {
+    if lo >= hi { return 0 }
+    let mid = (lo + hi) // 2
+    return 1 + spans(lo, mid) + spans(mid + 1, hi)
+}
+
+fn clamp_low(x: int, floor: int) -> int {
+    if x < floor { return floor }
+    return x
+}
+
+fn test_two_parameter_tests() -> void {
+    var got = 0
+    for _ in 0..20 { got = spans(0, 5000) }
+    assert_eq(got, 5000)
+    var total = 0
+    for i in -200..200 { total += clamp_low(i, 17) }
+    assert_eq(total, 23453)
+}

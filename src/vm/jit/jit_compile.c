@@ -409,6 +409,7 @@ static int earlyIntArg(const Emit *e, const Emit *body, unsigned slot,
  * pays one extra compare. Recognised as a bytecode idiom at offset 0:
  *   OP_JUMP_IF_CMP_LOCAL_K cmp, int param, int k, -> 13
  *     or OP_GET_LOCAL nullable param; OP_NULL; OP_JUMP_IF_CMP_FALSE ==/!=, -> 12
+ *     or OP_GET_LOCAL2 int param, int param; OP_JUMP_IF_CMP_FALSE cmp
  *   OP_GET_LOCAL int param | OP_INT v
  *   OP_RETURN
  * and only where the function returns a plain int, so the result convention
@@ -431,7 +432,7 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     const uint8_t *p = c->code;
     /* The test: a register, compared against an imm12 (`k`) or against
      * zero for a null test, and the condition under which the arm runs. */
-    int rs = -1;
+    int rs = -1, rs2 = -1;   /* rs2: the second register of a two-local test */
     int64_t k = 0;
     unsigned cond = 0;
     uint8_t cmp;
@@ -447,6 +448,15 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
         if (!IS_INT(kv) || AS_INT(kv) < 0 || AS_INT(kv) > 4095) return false;
         k = AS_INT(kv);
         rs = earlyIntArg(e, body, jaiReadU16(p + 2), realArgs);
+        ret = 9;
+    } else if (c->count >= 11 && p[0] == OP_GET_LOCAL2 &&
+               p[5] == OP_JUMP_IF_CMP_FALSE) {
+        /* `if lo >= hi { ... }`: two int parameters against each other. */
+        cmp = p[6];
+        rel = (int)jaiReadI16(p + 7);
+        rs = earlyIntArg(e, body, jaiReadU16(p + 1), realArgs);
+        rs2 = earlyIntArg(e, body, jaiReadU16(p + 3), realArgs);
+        if (rs2 < 0) return false;
         ret = 9;
     } else if (c->count >= 10 && p[0] == OP_GET_LOCAL && p[3] == OP_NULL &&
                p[4] == OP_JUMP_IF_CMP_FALSE) {
@@ -506,7 +516,8 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     if (body->returnKind != rk) return false;
     uint32_t target = (uint32_t)ret + armLen;
     if (ret + rel != (int)target || target >= (uint32_t)c->count) return false;
-    emit(e, jaiA64SubsXImm(31, (unsigned)rs, (unsigned)k));
+    if (rs2 >= 0) emit(e, jaiA64SubsXReg(31, (unsigned)rs, (unsigned)rs2));
+    else emit(e, jaiA64SubsXImm(31, (unsigned)rs, (unsigned)k));
     unsigned skip = e->count;
     emit(e, jaiA64BCond(cond ^ 1u, 0));                /* patched below */
     if (rt < 0) emitConst64(e, 0, lit);
