@@ -694,6 +694,9 @@ static bool jitInlineLoopsOn(void) {
  * anything bigger pays its frame back over its own loop. */
 #define JIT_INLINE_LOOP_MAX_CODE  160
 #define JIT_INLINE_LOOP_MAX_SITES 4
+/* A body that only branches (`and`/`or`, an early return) is a predicate of
+ * a dozen instructions; it gets its own, larger allowance. */
+#define JIT_INLINE_BRANCH_MAX_SITES 8
 /* Highest home slot: the deopt stub's skip mask is one bit per local below
  * 64, and every per-slot table is JIT_MAX_SLOTS + 1 wide. */
 #define JIT_INLINE_LOOP_MAX_SLOT  62u
@@ -707,7 +710,7 @@ static bool jitInlineLoopsOn(void) {
  * Writes to its OWN locals are fine: they are renumbered into homes the
  * interpreter never sees. */
 static bool inlinableLoopBody(ObjClosure *callee, unsigned argc, bool method,
-                              unsigned *maxSlotOut) {
+                              unsigned *maxSlotOut, bool *loopsOut) {
     /* Slot 0 is the closure itself for a function, which nothing can read
      * through a home; for a method it is the receiver, bound like any
      * parameter. */
@@ -721,6 +724,7 @@ static bool inlinableLoopBody(ObjClosure *callee, unsigned argc, bool method,
     if (c->code[c->count - 1] != OP_RETURN) return false;
     unsigned maxSlot = argc;
     bool branches = false;
+    bool loops = false;
     unsigned natives = 0;     /* `float`/`int` read and not yet called */
     for (int off = 0; off < c->count;) {
         uint8_t op = c->code[off];
@@ -788,8 +792,12 @@ static bool inlinableLoopBody(ObjClosure *callee, unsigned argc, bool method,
             branches = true;
             break;
         }
+        case OP_LOOP:
+            loops = true;
+            branches = true;
+            break;
         case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
-        case OP_JUMP_IF_CMP_FALSE: case OP_LOOP:
+        case OP_JUMP_IF_CMP_FALSE:
         /* `and` / `or`: the value stays on the stack across the branch,
          * which the join check already holds both edges to. */
         case OP_JUMP_IF_FALSE_KEEP: case OP_JUMP_IF_TRUE_KEEP:
@@ -824,6 +832,7 @@ static bool inlinableLoopBody(ObjClosure *callee, unsigned argc, bool method,
     }
     if (!branches) return false;
     *maxSlotOut = maxSlot;
+    *loopsOut = loops;
     return true;
 }
 
@@ -943,11 +952,17 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                            unsigned argc, uint32_t callOff, bool method) {
     if (!jitInlineLoopsOn()) return false;
     if (e->osr || e->inlHomeLo == 0 || e->mapKernel) return false;
-    if (e->inlLoopCount >= JIT_INLINE_LOOP_MAX_SITES) return false;
     ObjFunction *cfn = callee->fn;
     if (cfn == caller) return false;           /* recursion */
     unsigned maxSlot = 0;
-    if (!inlinableLoopBody(callee, argc, method, &maxSlot)) return false;
+    bool loops = false;
+    if (!inlinableLoopBody(callee, argc, method, &maxSlot, &loops)) {
+        return false;
+    }
+    if (loops ? e->inlLoopCount >= JIT_INLINE_LOOP_MAX_SITES
+              : e->inlBranchCount >= JIT_INLINE_BRANCH_MAX_SITES) {
+        return false;
+    }
     unsigned hb = e->inlHomeNext != 0 ? e->inlHomeNext : e->inlHomeLo;
     if (hb + maxSlot > JIT_INLINE_LOOP_MAX_SLOT) return false;
     unsigned need = hb + maxSlot + 1u;         /* one past the highest home */
@@ -1010,7 +1025,8 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
         e->localObjType[s]  = 0;
     }
     e->inlHomeNext  = need;
-    e->inlLoopCount++;
+    if (loops) e->inlLoopCount++;
+    else e->inlBranchCount++;
 
     e->inlining      = true;
     e->inlHomes      = true;

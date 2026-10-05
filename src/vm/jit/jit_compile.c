@@ -1354,6 +1354,9 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * a bug that only shows up under recursion. */
     for (unsigned i = realArgs; i < e.locals; i++) {
         unsigned slot = e.base + i;
+        /* An inline's home is written before it is read, and no deopt record
+         * or root fill names it, so a stale value there is never seen. */
+        if (e.inlHomeLo != 0 && slot >= e.inlHomeLo) continue;
         if (!e.spilled) {
             emit(&e, jaiA64MovzX(JIT_FIRST_SAVED + i, 0, 0));
         } else if (e.slotXReg[slot] != 0) {
