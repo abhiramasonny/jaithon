@@ -1437,6 +1437,19 @@ JAI_INLINE bool fmtRun(char *buf, size_t *o, const Obj *run) {
 #define FMT_MEMO_TOTAL  ((uint64_t)1 << 16)
 #define FMT_SITE_CAP    16384u
 
+/* What emitFmtMemoProbe reads, at the offsets it reads them. */
+_Static_assert(offsetof(JaiFmtSite, entries) == JAI_FMT_SITE_ENTRIES &&
+                   offsetof(JaiFmtSite, mask) == JAI_FMT_SITE_ENTRIES + 8 &&
+                   offsetof(JaiFmtSite, budget) == JAI_FMT_SITE_BUDGET &&
+                   offsetof(JaiFmtSite, leaf) == JAI_FMT_SITE_LEAF,
+               "a memo site's first four words are where the JIT reads them");
+_Static_assert(offsetof(JaiFmtMemoEntry, pre) == 0 &&
+                   offsetof(JaiFmtMemoEntry, post) == 8 &&
+                   offsetof(JaiFmtMemoEntry, n) == 16 &&
+                   offsetof(JaiFmtMemoEntry, s) == 24 &&
+                   sizeof(JaiFmtMemoEntry) == 32,
+               "a memo entry is the four words the JIT loads as two pairs");
+
 static JaiFmtSite *fmtOwners;     /* sites holding a table */
 static uint64_t    fmtEntries;    /* table entries allocated, all sites */
 static unsigned    fmtSites;

@@ -180,6 +180,12 @@ static void addMissBranch(Emit *e, AddMiss *m, uint32_t word) {
 /* The layout emitDictSlotProbe and its users assume, checked where they are
  * emitted rather than trusted: a 48-byte entry, and keyKind and valKind as
  * one aligned halfword. */
+/* The inline string-key test is `ldr w; cbnz` on the object's first word:
+ * the type, which is a string's exactly when it is zero. */
+_Static_assert(OBJ_STRING == 0 && offsetof(Obj, type) == 0 &&
+                   sizeof(ObjType) == 4,
+               "a string key is tested as a zero 32-bit word at offset 0");
+
 static bool dictSlotProbeFits(void) {
     return offsetof(ObjDict, valKind) == offsetof(ObjDict, keyKind) + 1 &&
            (offsetof(ObjDict, keyKind) & 1u) == 0 && sizeof(JaiEntry) == 48;
