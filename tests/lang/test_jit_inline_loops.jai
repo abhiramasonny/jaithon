@@ -118,6 +118,17 @@ fn depth(n: int) -> int {
 
 fn noop(x: int) -> int { return x }
 
+fn between(x: int, lo: int, hi: int) -> bool { return x >= lo and x <= hi }
+
+fn outside(x: int, lo: int, hi: int) -> bool { return x < lo or x > hi }
+
+fn drive_between(x: int) -> int {
+    var t = 0
+    if between(x, 10, 20) { t += 1 }
+    if outside(x, 5, 15) { t += 2 }
+    return t + noop(0)
+}
+
 class Poly {
     pub var cs: list[int]
     pub var n: int
@@ -342,5 +353,16 @@ fn test_a_method_with_a_loop_over_a_field() -> void {
             want += if over { -1 } else { t }
         }
         assert_eq(drive_poly(p, x), want)
+    }
+}
+
+
+fn test_and_or_predicates() -> void {
+    for x in 0..300 {
+        let v = x % 30
+        var want = 0
+        if v >= 10 and v <= 20 { want += 1 }
+        if v < 5 or v > 15 { want += 2 }
+        assert_eq(drive_between(v), want)
     }
 }

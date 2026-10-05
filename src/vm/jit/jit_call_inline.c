@@ -790,7 +790,12 @@ static bool inlinableLoopBody(ObjClosure *callee, unsigned argc, bool method,
         }
         case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
         case OP_JUMP_IF_CMP_FALSE: case OP_LOOP:
+        /* `and` / `or`: the value stays on the stack across the branch,
+         * which the join check already holds both edges to. */
+        case OP_JUMP_IF_FALSE_KEEP: case OP_JUMP_IF_TRUE_KEEP:
             branches = true;
+            break;
+        case OP_NULL: case OP_IS: case OP_IS_NOT:
             break;
         case OP_GET_INDEX:
         case OP_CONST: case OP_INT: case OP_TRUE: case OP_FALSE:

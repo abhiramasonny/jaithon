@@ -63,9 +63,20 @@ class Gen:
         a, b = r.choice(ints), r.choice(ints)
         return f"({a} {r.choice(['+%', '-%', '*%'])} {b})"
 
-    def cond(self, ints):
+    def cond(self, ints, depth=0):
         r = self.r
+        if depth == 0 and r.random() < 0.3:
+            return (f"({self.cond(ints, 1)}) {r.choice(['and', 'or'])} "
+                    f"({self.cond(ints, 1)})")
         return f"{self.int_term(ints)} {r.choice(['<', '<=', '>', '>=', '==', '!='])} {self.int_term(ints)}"
+
+    def predicate(self, idx):
+        """A straight-line `and`/`or` predicate: branches, no loop."""
+        name = f"p{idx}"
+        src = (f"fn {name}(n: int, k: int) -> bool {{\n"
+               f"    return {self.cond(['n', 'k'])}\n"
+               f"}}")
+        self.helpers.append((name, "pred", "bool", src))
 
     def helper(self, idx):
         r = self.r
@@ -161,7 +172,10 @@ class Gen:
         name, kind, ret, _ = h
         if kind == "method":
             return f"kk.{name}({n_expr}, {k_expr})"
-        lst = {"ints": "ints", "floats": "fls", "any": "mix", "plain": None}[kind]
+        if kind == "pred":
+            return f"(if {name}({n_expr}, {k_expr}) {{ 3 }} else {{ 5 }})"
+        lst = {"ints": "ints", "floats": "fls", "any": "mix", "plain": None,
+               "pred": None}[kind]
         args = ([lst] if lst else []) + [n_expr, k_expr]
         c = f"{name}({', '.join(args)})"
         return f"int({c})" if ret == "float" else c
@@ -170,6 +184,8 @@ class Gen:
         r = self.r
         for i in range(r.randint(2, 4)):
             self.helper(i)
+        for i in range(r.randint(0, 2)):
+            self.predicate(i)
         lines = []
         for _, _, _, src in self.helpers:
             lines.append(src)
