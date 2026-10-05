@@ -377,6 +377,88 @@ static bool nOsSpawn(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* os_fork_to(out_path, err_path) -> int: fork this process. The child gets
+ * 0, its stdin from /dev/null and its stdout/stderr written to the two files;
+ * the parent gets the child's pid. `jaithon test` forks one child per file
+ * from a runner that has already loaded the front end, so a file gets a fresh
+ * process without paying for a fresh start. The child carries on running the
+ * caller's code and must leave through os_exit. */
+static bool nOsForkTo(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjString *outPath, *errPath;
+    if (!jaiArgString(args[0], 1, "os_fork_to", &outPath)) return false;
+    if (!jaiArgString(args[1], 2, "os_fork_to", &errPath)) return false;
+    if (!checkExecText(outPath, "the output path")) return false;
+    if (!checkExecText(errPath, "the error path")) return false;
+    char *outTmp = NULL, *errTmp = NULL;
+    const char *outC = jaiIOPathCStr(outPath, &outTmp);
+    const char *errC = jaiIOPathCStr(errPath, &errTmp);
+    errno = 0;
+    int child = jaiProcessForkTo(outC, errC);
+    int failure = errno;
+    jaiIOPathDone(outTmp);
+    jaiIOPathDone(errTmp);
+    if (child < 0)
+        return jaiThrow(vm.cOSError, "os_fork_to(): cannot fork: %s", strerror(failure));
+    if (child == 0) jaiVMAfterFork();
+    *out = INT_VAL(child);
+    return true;
+}
+
+/* os_spawn_to(command, out_path, err_path) -> int: start `command` with its
+ * stdin from /dev/null and its stdout/stderr written to the two files, and
+ * return its pid. Nothing waits for it: reap it with os_wait_any. Output to
+ * files rather than pipes means a parent that waits on several children at
+ * once can never deadlock against one whose pipe is full. */
+static bool nOsSpawnTo(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjList *command;
+    ObjString *outPath, *errPath;
+    if (!jaiArgList(args[0], 1, "os_spawn_to", &command)) return false;
+    if (!jaiArgString(args[1], 2, "os_spawn_to", &outPath)) return false;
+    if (!jaiArgString(args[2], 3, "os_spawn_to", &errPath)) return false;
+    if (!checkExecText(outPath, "the output path")) return false;
+    if (!checkExecText(errPath, "the error path")) return false;
+    CStrVec argv = { NULL, NULL, 0 };
+    if (!argvFromList(command, &argv)) return false;
+    char *outTmp = NULL, *errTmp = NULL;
+    const char *outC = jaiIOPathCStr(outPath, &outTmp);
+    const char *errC = jaiIOPathCStr(errPath, &errTmp);
+    int failure = 0;
+    int child = jaiProcessSpawnTo((const char *const *)argv.items, outC, errC, &failure);
+    char programCopy[512];
+    snprintf(programCopy, sizeof programCopy, "%s", argv.items[0]);
+    jaiIOPathDone(outTmp);
+    jaiIOPathDone(errTmp);
+    cstrVecFree(&argv);
+    if (child < 0)
+        return jaiThrow(vm.cOSError, "os_spawn_to(): cannot run %s: %s",
+                        programCopy, strerror(failure));
+    *out = INT_VAL(child);
+    return true;
+}
+
+/* os_wait_any() -> [pid, status]: wait for whichever child exits first. The
+ * status is the exit code, or 128 + the signal that killed it. */
+static bool nOsWaitAny(int argc, Value *args, Value *out) {
+    (void)argc;
+    (void)args;
+    int pid = 0, status = 0;
+    errno = 0;
+    if (!jaiProcessWaitAny(&pid, &status))
+        return jaiThrow(vm.cOSError, "os_wait_any(): %s", strerror(errno));
+    ObjList *pair = jaiListNew(2);
+    jaiGCPushRoot(OBJ_VAL(pair));
+    jaiListPush(pair, INT_VAL(pid));
+    jaiListPush(pair, INT_VAL(status));
+    jaiGCPopRoot();
+    *out = OBJ_VAL(pair);
+    return true;
+}
+
 void jaiRegisterProcessPrimitives(void) {
     jaiDefineNative("__prim__.os_spawn", nOsSpawn, 2, 2);
+    jaiDefineNative("__prim__.os_fork_to", nOsForkTo, 2, 2);
+    jaiDefineNative("__prim__.os_spawn_to", nOsSpawnTo, 3, 3);
+    jaiDefineNative("__prim__.os_wait_any", nOsWaitAny, 0, 0);
 }

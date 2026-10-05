@@ -211,18 +211,29 @@ static void jaiJitReadThresholdOverride(void) {
     if (n > 0 && n < 100000) jaiJitThresholdOverride = (uint32_t)n;
 }
 
+static bool sSamplerStarted;
+static void armSamplerTimer(void);
+
 void jaiJitStartSampling(void) {
     jaiJitReadThresholdOverride();
-    static bool started;
-    if (started || !jaiJitEnabled()) return;
-    started = true;
+    if (sSamplerStarted || !jaiJitEnabled()) return;
+    sSamplerStarted = true;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = onTick;
     sa.sa_flags = SA_RESTART;
     if (sigaction(SIGPROF, &sa, NULL) != 0) return;
+    armSamplerTimer();
+}
 
+/* A forked child keeps the SIGPROF handler but not the interval timer, so
+ * without this a child forked by `jaithon test` would never OSR a loop. */
+void jaiJitAfterFork(void) {
+    if (sSamplerStarted) armSamplerTimer();
+}
+
+static void armSamplerTimer(void) {
     struct itimerval it;
     it.it_interval.tv_sec = 0;
     /* A `sample` of a whole-directory `check --no-cache` of the compiler put **6.17% of

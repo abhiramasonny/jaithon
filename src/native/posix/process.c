@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -188,6 +189,72 @@ bool jaiProcessWait(int pid, bool block, int *outExit) {
         if (errno == EINTR) continue;
         return false;
     }
+}
+
+bool jaiProcessWaitAny(int *outPid, int *outExit) {
+    for (;;) {
+        int status = 0;
+        pid_t got = waitpid(-1, &status, 0);
+        if (got > 0) {
+            *outPid = (int)got;
+            *outExit = waitStatusToExit(status);
+            return true;
+        }
+        if (errno == EINTR) continue;
+        return false;
+    }
+}
+
+/* Redirect `fd` to `path`, opened for writing (or reading /dev/null for fd 0). */
+static bool redirectFd(int fd, const char *path, int flags) {
+    int opened = open(path, flags, 0600);
+    if (opened < 0) return false;
+    if (opened != fd) {
+        if (dup2(opened, fd) < 0) { (void)close(opened); return false; }
+        (void)close(opened);
+    }
+    return true;
+}
+
+bool jaiProcessIsForkedChild = false;
+
+int jaiProcessForkTo(const char *outPath, const char *errPath) {
+    (void)fflush(stdout);
+    (void)fflush(stderr);
+    pid_t child = fork();
+    if (child != 0) return (int)child;
+    jaiProcessIsForkedChild = true;
+    const int create = O_WRONLY | O_CREAT | O_TRUNC;
+    if (!redirectFd(STDIN_FILENO, "/dev/null", O_RDONLY) ||
+        !redirectFd(STDOUT_FILENO, outPath, create) ||
+        !redirectFd(STDERR_FILENO, errPath, create)) {
+        _exit(127);
+    }
+    return 0;
+}
+
+int jaiProcessSpawnTo(const char *const *argv, const char *outPath,
+                      const char *errPath, int *outErrno) {
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) { *outErrno = rc; return -1; }
+    const int create = O_WRONLY | O_CREAT | O_TRUNC;
+    rc = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    if (rc == 0)
+        rc = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, outPath, create, 0600);
+    if (rc == 0)
+        rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, errPath, create, 0600);
+    pid_t child = -1;
+    if (rc == 0) {
+        extern char **environ;
+        (void)fflush(stdout);
+        (void)fflush(stderr);
+        rc = posix_spawnp(&child, argv[0], &actions, NULL,
+                          (char *const *)(uintptr_t)(const void *)argv, environ);
+    }
+    (void)posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) { *outErrno = rc; return -1; }
+    return (int)child;
 }
 
 bool jaiProcessSignal(int pid, int sig) {

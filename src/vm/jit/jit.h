@@ -129,6 +129,8 @@ JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase);
 
 /* Start the sampling timer, if the tier is on. Safe to call more than once. */
 void jaiJitStartSampling(void);
+/* Re-arm the sampling timer in a forked child (fork does not inherit it). */
+void jaiJitAfterFork(void);
 
 /* A sampling tick landed while `closure` was executing at `offset`. Rides the
  * interpreter's existing back-edge safepoint rather than counting back edges,
