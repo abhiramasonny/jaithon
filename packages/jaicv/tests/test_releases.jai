@@ -22,7 +22,9 @@ from jaicv.imgproc.hist import equalize_hist
 from jaicv.imgproc.morph import get_structuring_element, morphology_ex, MORPH_RECT
 from jaicv.imgproc.threshold import adaptive_threshold
 from jaicv.photo.denoise import detail_enhance, edge_preserving_filter
-from jaicv.video.optflow import calc_optical_flow_pyr_lk
+from jaicv.video.optflow import calc_optical_flow_farneback, calc_optical_flow_pyr_lk
+from jaicv.calib3d.stereo import StereoBM, StereoSGBM
+from jaicv.features2d.detect import BRIEF, ORB, SimpleBlobDetector, SimpleBlobDetectorParams
 
 let ROWS = 48
 let COLS = 64
@@ -139,6 +141,29 @@ fn test_arithmetic_statistics_and_matching_release_their_intermediates() -> void
     colour.release()
     bytes.release()
     templ.release()
+}
+
+fn test_detectors_flow_and_stereo_release_their_intermediates() -> void {
+    if not gpu.is_available() { return }
+    let bytes = picture(cv.CV_8UC1)
+    let other = picture(cv.CV_8UC1)
+    let orb = ORB(40)
+    assert_eq(growth_of_points(fn() -> int {
+        let (found, described) = orb.detect_and_compute(bytes)
+        described.release()
+        return found.len()
+    }), 0)
+    let keys = orb.detect(bytes)
+    let brief = BRIEF()
+    assert_eq(growth(|| brief.compute(bytes, keys)[1]), 0)
+    assert_eq(growth_of_points(|| SimpleBlobDetector(SimpleBlobDetectorParams()).detect(bytes).len()), 0)
+    assert_eq(growth(|| calc_optical_flow_farneback(bytes, other)), 0)
+    let bm = StereoBM(16, 9)
+    assert_eq(growth(|| bm.compute(bytes, other)), 0)
+    let sgbm = StereoSGBM()
+    assert_eq(growth(|| sgbm.compute(bytes, other)), 0)
+    bytes.release()
+    other.release()
 }
 
 #: Releasing an intermediate must never reach the caller's own matrices.
