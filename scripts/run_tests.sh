@@ -131,6 +131,50 @@ if [[ -x "$ROOT/tests/vm/osr_replace.sh" ]]; then
     done <<< "$replace_output"
 fi
 
+# ----------------------------------------------------- unit tests, started
+#
+# The unit run is started here and only READ in section 3. Its wall time is one
+# long test file (test_against_opencv, ~20s) with every other core idle for most
+# of it, and the goldens are hundreds of short processes: run side by side they
+# fill those cores. The report is unchanged -- section 3 still prints where it
+# always did. UNIT_OVERLAP=0 starts it in section 3 instead.
+unit_args=(test --verbose)
+[[ -n "$FILTER" ]] && unit_args+=("--filter=$FILTER")
+unit_args+=(
+    "$ROOT/tests/lang"
+    "$ROOT/tests/stdlib"
+    "$ROOT/tests/checker"
+    "$ROOT/packages/jaicv/tests"
+    "$ROOT/packages/jaiplot/tests"
+    "$ROOT/packages/jaitensor/tests"
+    "$ROOT/packages/jainum/tests"
+    # jaiframe sat out of this list for a while on the reading that its arith,
+    # groupby and reduce modules disagreed with pandas about nulls. They did
+    # not. All 72 failures were one defect in the tier: a bool returned by a
+    # function in another module was loaded eight bytes wide out of the call
+    # descriptor, and `BOOL_VAL` fills one. `Column.from_floats` asks
+    # `values.map(|v| is_nan(v))` which rows are missing, that came back
+    # all-true, and every column arrived fully null -- so the answers were
+    # `nan` and zero, which reads exactly like null semantics. See
+    # tests/lang/test_jit_bool_call_return.jai.
+    "$ROOT/packages/jaiframe/tests"
+    "$ROOT/packages/jailearn/tests"
+    "$ROOT/packages/jaisci/tests"
+    "$ROOT/packages/jaitoml/tests"
+    "$ROOT/packages/jaiyaml/tests"
+)
+
+unit_pid=""
+unit_file=""
+unit_start=0
+start_unit_tests() {
+    unit_file="$(mktemp "${TMPDIR:-/tmp}/jai_unit.XXXXXX")"
+    unit_start=$(now_ms)
+    "$JAITHON" "${unit_args[@]}" > "$unit_file" 2>&1 &
+    unit_pid=$!
+}
+[[ "${UNIT_OVERLAP:-1}" != "0" ]] && start_unit_tests
+
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 
@@ -325,64 +369,46 @@ done
 
 # ------------------------------------------------------------------ 3. unit
 printf '%sUnit tests%s\n' "$BOLD" "$RESET"
-unit_args=(test --verbose)
-[[ -n "$FILTER" ]] && unit_args+=("--filter=$FILTER")
-unit_args+=(
-    "$ROOT/tests/lang"
-    "$ROOT/tests/stdlib"
-    "$ROOT/tests/checker"
-    "$ROOT/packages/jaicv/tests"
-    "$ROOT/packages/jaiplot/tests"
-    "$ROOT/packages/jaitensor/tests"
-    "$ROOT/packages/jainum/tests"
-    # jaiframe sat out of this list for a while on the reading that its arith,
-    # groupby and reduce modules disagreed with pandas about nulls. They did
-    # not. All 72 failures were one defect in the tier: a bool returned by a
-    # function in another module was loaded eight bytes wide out of the call
-    # descriptor, and `BOOL_VAL` fills one. `Column.from_floats` asks
-    # `values.map(|v| is_nan(v))` which rows are missing, that came back
-    # all-true, and every column arrived fully null -- so the answers were
-    # `nan` and zero, which reads exactly like null semantics. See
-    # tests/lang/test_jit_bool_call_return.jai.
-    "$ROOT/packages/jaiframe/tests"
-    "$ROOT/packages/jailearn/tests"
-    "$ROOT/packages/jaisci/tests"
-    "$ROOT/packages/jaitoml/tests"
-    "$ROOT/packages/jaiyaml/tests"
-)
-
-start=$(now_ms)
-unit_output="$("$JAITHON" "${unit_args[@]}" 2>&1)"
+[[ -z "$unit_pid" ]] && start_unit_tests
+wait "$unit_pid"
 unit_status=$?
-unit_elapsed=$(( $(now_ms) - start ))
+unit_output="$(cat "$unit_file")"
+rm -f "$unit_file"
+unit_elapsed=$(( $(now_ms) - unit_start ))
 unit_seen=0
 unit_failed=0
 unit_suite=""
 in_failures=0
 
-strip_duration() { local s="$1"; printf '%s' "${s%  *}"; }
-
-while IFS= read -r line; do
-    plain="$(plain_text "$line")"
+# The duration is the last two-space-separated field of a result line. The
+# colour codes come off the whole output in one sed, and the duration by
+# parameter expansion: a sed and a subshell per result line, over ~3,000
+# lines, was seconds of the phase.
+unit_plain="$(plain_text "$unit_output")"
+while IFS= read -r plain; do
     [[ "$plain" == "FAILURES" ]] && { in_failures=1; continue; }
     [[ $in_failures -eq 1 ]] && continue
     case "$plain" in
         "  pass  "*)
             unit_seen=1
-            record_pass "$unit_suite$(strip_duration "${plain#  pass  }")" "$unit_elapsed" ;;
+            test_name="${plain#  pass  }"
+            record_pass "$unit_suite${test_name%  *}" "$unit_elapsed" ;;
         "  FAIL  "*)
             unit_seen=1; unit_failed=1
-            record_fail "$unit_suite$(strip_duration "${plain#  FAIL  }")" "" ;;
+            test_name="${plain#  FAIL  }"
+            record_fail "$unit_suite${test_name%  *}" "" ;;
         "  ERROR  "*)
             unit_seen=1; unit_failed=1
-            record_fail "$unit_suite$(strip_duration "${plain#  ERROR  }")" "" ;;
+            test_name="${plain#  ERROR  }"
+            record_fail "$unit_suite${test_name%  *}" "" ;;
         "  skip  "*)
             unit_seen=1
-            record_skip "$unit_suite$(strip_duration "${plain#  skip  }")" "skipped by the runner" ;;
+            test_name="${plain#  skip  }"
+            record_skip "$unit_suite${test_name%  *}" "skipped by the runner" ;;
         "  "*|"") ;;
         *) unit_suite="$plain > " ;;
     esac
-done <<< "$unit_output"
+done <<< "$unit_plain"
 
 if [[ $unit_seen -eq 0 ]]; then
     record_fail "jaithon test" "$unit_output"

@@ -492,7 +492,14 @@ fn _report_shards(
             found = [_broken(module_name_of(path), "crash", message)]
         }
         let complaints = noise.get(path) ?? ""
-        if complaints.len() > 0 { print_err(complaints.rstrip()) }
+        if complaints.len() > 0 {
+            #: Standard output is buffered and standard error is not: without
+            #: the flush, a reader of both through one pipe (run_tests.sh uses
+            #: 2>&1) got a warning spliced into the middle of a result line,
+            #: wherever the buffer happened to fill, and misnamed that test.
+            __prim__.io_flush(1)
+            print_err(complaints.rstrip())
+        }
         #: Same shape as the sequential runner: per-test lines when verbose,
         #: the one-line summary when not. Printing the summary either way made
         #: a parallel run unparseable to anything reading for `  pass  `. The
