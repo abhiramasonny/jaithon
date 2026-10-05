@@ -83,3 +83,4 @@ bit-identical either way; only the time changes.
 | `JAIFRAME_DEVICE_TOTAL` | a download of the scan total on every bit of a join's radix order |
 | `JAIFRAME_JOIN_DIGITS` | a one-bit-a-pass radix order for a join's bucket and pair lanes, instead of the frame sort's eight-bit passes |
 | `JAIFRAME_SHARED_FOLDS` | one threadgroup fold, with its own eleven barriers, per column statistic, instead of folding them side by side through one set; bit-identical |
+| `JAIFRAME_LEAN_STATS` | a second read of every column (extremes, first and last rows) for a frame sum, mean, product, count, variance or deviation, which only use the moments |

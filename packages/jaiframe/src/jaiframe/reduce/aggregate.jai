@@ -6,6 +6,7 @@
 #: the two edges — are the same passes read for where rather than what.
 import std.math
 from std.math import NAN, is_nan
+from std.os import env_or
 from ..column import Agg, Column, DataFrame, Dtype, Index, Series, Value
 from ..column import NA
 from ..column import cached_kernel, f32_bits, positions_buffer
@@ -221,6 +222,17 @@ fn accepted_columns(frame: DataFrame, agg: Agg) -> list[int] {
 
 #: Every column reduced, in one round trip for the summaries and one more for
 #: the quantiles when the aggregation is one.
+#: `JAIFRAME_LEAN_STATS=0` reads every column twice for a frame reduction that
+#: only needs its moments, for an A/B. The answers are the same. Read once.
+let _LEAN_STATS = env_or("JAIFRAME_LEAN_STATS", "1") != "0"
+
+#: The aggregations `finish_reduction` answers from the moments alone, with no
+#: smallest, largest, first or last row.
+fn moments_only(agg: Agg) -> bool {
+    if agg == Agg.Sum or agg == Agg.Mean or agg == Agg.Prod or agg == Agg.Count { return true }
+    return agg == Agg.Var or agg == Agg.Std
+}
+
 fn frame_axis0(frame: DataFrame, agg: Agg, skipna: bool, ddof: int, q: float) -> Series {
     if agg == Agg.Nunique {
         throw ValueError("nunique counts distinct values through a hash table, which is keys.jai")
@@ -239,7 +251,8 @@ fn frame_axis0(frame: DataFrame, agg: Agg, skipna: bool, ddof: int, q: float) ->
         return named_series(names, cells_column(cells, Dtype.Int64))
     }
     let borrowed = borrow_lanes(columns)
-    let summaries = batched_stats(borrowed[0], borrowed[1], rows, zeros(columns.len()))
+    let extrema = not _LEAN_STATS or not moments_only(agg)
+    let summaries = batched_stats(borrowed[0], borrowed[1], rows, zeros(columns.len()), extrema)
     release_lanes(borrowed[0], borrowed[2])
     var picks: list[float] = []
     if agg == Agg.Median or agg == Agg.Quantile {
