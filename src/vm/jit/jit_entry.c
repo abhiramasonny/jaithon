@@ -108,7 +108,7 @@ JAI_INLINE bool jitArgIn(ObjClosure *closure, const Value *slotBase,
     return true;
 }
 
-static inline JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
+JAI_INLINE JaiJitOutcome jitResultOut(ObjFunction *fn, JitResult r,
                                          Value *slotBase) {
     /* The verdict is the low byte. A SLOT_DYNAMIC body's return site puts its
      * Value tag in the byte above (JIT_RET_TAG_SHIFT); every other exit --
@@ -435,7 +435,12 @@ void jitLeanEntryInit(void) {
  * are side-effect free, so redoing them changes nothing. */
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
-    if (!gJitLeanEntry || fn->jitBlockedOn != NULL || fn->jitArgCount > 4)
+    /* A body blocked on a callee that is still cold is entered as it is --
+     * jitRecompileBlocked would only look and return -- and that is the
+     * steady state of a partly compiled hot body whose callee never
+     * compiles, so it is worth not leaving this frame for. */
+    if (!gJitLeanEntry || fn->jitArgCount > 4 ||
+        (fn->jitBlockedOn != NULL && fn->jitBlockedOn->jitFunc != NULL))
         return jitEnterFuncFull(closure, slotBase);
     if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
     if (fn->module == NULL || fn->module->version != fn->jitFuncModuleVersion)
