@@ -20,7 +20,7 @@ from jaithon.compile.parser import parse
 from jaithon.compile.token import TokenKind
 from std.fmt import bold, green, red
 from std.io import Path, print_err, read_file
-from std.os import argv, cpu_count, spawn
+from std.os import argv, cpu_count, env, spawn, temp_dir
 from std.test import Outcome, Report, Test, TestResult
 from std.time import Duration
 from .args import Arguments
@@ -335,31 +335,14 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
     #: Dropping them would make a parallel run quieter than a sequential one,
     #: which is a real difference in output and was caught by diffing the two.
     var noise: dict[str, str] = {}
+    var failures: dict[str, int] = {}
     var next_path = 0
 
-    #: Everything the process was invoked with EXCEPT the paths, so a worker
-    #: inherits flags this tool never parses -- `--gc-stress` is the one that
-    #: matters, since it belongs to the CLI rather than to `test`, and a
-    #: hand-built command silently dropped it. Rebuilding the command from
-    #: argv() means a flag added later needs no change here.
-    let own = argv()
-    var forwarded: list[str] = []
-    var index = 1
-    while index < own.len() {
-        let argument = own[index]
-        #: `test` itself, the paths, and any --jobs the caller gave: all
-        #: replaced below.
-        let is_path = not argument.starts_with("-")
-        let is_jobs = argument.starts_with("--jobs") or argument.starts_with("-j")
-        if not is_path and not is_jobs { forwarded.push(argument) }
-        index += 1
-    }
-
     fn launch(path: str) -> void {
-        var command = [exe, "test", "--_shard", "--jobs=1"]
-        command.extend(forwarded)
-        command.push(path)
-        running.push((path, spawn(command)))
+        let process = spawn(_worker_command(exe, path))
+        #: Nothing is ever written to it; a test reading it gets end of input.
+        process.close_stdin()
+        running.push((path, process))
     }
 
     while next_path < paths.len() or running.len() > 0 {
@@ -373,22 +356,66 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
         let (path, process) = running[0]
         captured[path] = process.read_stdout()
         noise[path] = process.read_stderr()
-        let _status = process.wait()
+        let status = process.wait()
+        if status != 0 { failures[path] = status }
         running = running[1:]
     }
+    return _report_shards(paths, captured, noise, failures, options)
+}
 
+#: The command that runs `path` alone in a worker process.
+#:
+#: Everything the process was invoked with EXCEPT the paths, so a worker
+#: inherits flags this tool never parses -- `--gc-stress` is the one that
+#: matters, since it belongs to the CLI rather than to `test`, and a
+#: hand-built command silently dropped it. Rebuilding the command from
+#: argv() means a flag added later needs no change here.
+fn _worker_command(exe: str, path: str) -> list[str] {
+    let own = argv()
+    var command = [exe, "test", "--_shard", "--jobs=1"]
+    var index = 1
+    while index < own.len() {
+        let argument = own[index]
+        #: `test` itself, the paths, and any --jobs the caller gave: all
+        #: replaced here.
+        let is_path = not argument.starts_with("-")
+        let is_jobs = argument.starts_with("--jobs") or argument.starts_with("-j")
+        if not is_path and not is_jobs { command.push(argument) }
+        index += 1
+    }
+    command.push(path)
+    return command
+}
+
+#: Print each file's results in path order, as the sequential runner would.
+#:
+#: `failures` maps a path to the status its worker died with; a file that
+#: died before reporting anything is an error rather than a silent omission.
+fn _report_shards(
+    paths: list[str],
+    captured: dict[str, str],
+    noise: dict[str, str],
+    failures: dict[str, int],
+    options: _Options
+) -> list[TestResult] {
     let results: list[TestResult] = []
     for path in paths {
         let text = captured.get(path) ?? ""
-        let found = _parse_shard(text)
-        if found.len() == 0 { continue }
+        var found = _parse_shard(text)
+        let status = failures.get(path)
+        if found.len() == 0 and status is not null {
+            let message = f"the test process exited with status {status} before reporting"
+            found = [_broken(module_name_of(path), "crash", message)]
+        }
         let complaints = noise.get(path) ?? ""
         if complaints.len() > 0 { print_err(complaints.rstrip()) }
         #: Same shape as the sequential runner: per-test lines when verbose,
         #: the one-line summary when not. Printing the summary either way made
-        #: a parallel run unparseable to anything reading for `  pass  `.
+        #: a parallel run unparseable to anything reading for `  pass  `. The
+        #: sequential runner names every file when verbose, tests or not.
+        if options.verbose { print(bold(module_name_of(path))) }
+        if found.len() == 0 { continue }
         if options.verbose {
-            print(bold(module_name_of(path)))
             for result in found { print("  " + result.to_str()) }
         } else {
             print(_file_line(path, found))
@@ -396,6 +423,137 @@ fn _run_sharded(exe: str, paths: list[str], options: _Options, limit: int) -> li
         results.extend(found)
     }
     return results
+}
+
+#: JAITHON_TEST_FORK=0 goes back to starting a fresh `jaithon test --_shard`
+#: process per file; read once.
+let _FORK_WORKERS: bool = (env("JAITHON_TEST_FORK") ?? "1") != "0"
+
+#: Run each path in a forked copy of this process, `limit` at a time.
+#:
+#: A spawned worker spends ~42M cycles loading the front end and the runner
+#: and ~130M more having the checker parse the signatures of `std.test`'s
+#: import closure -- for a small test file that is three quarters of its cost
+#: (tests/lang: 21.7G cycles across 107 workers against 6.3G in one process).
+#: A fork starts from this runner with all of that already done, and is still
+#: a process of its own, so a file gets fresh module state, a crash or a call
+#: to exit takes out only that file, and the result is attributed to it.
+#:
+#: A forked child cannot use the GPU (see _NEEDS_EXEC), so a file that loads
+#: a native framework is run again in a worker started from scratch.
+#:
+#: Children are reaped in the order they finish, not the order they started:
+#: draining the oldest first left every free core idle behind one slow file
+#: (the unit list: 33.8s wall for 82s of CPU on 12 cores). Output goes to two
+#: files per child rather than pipes, so no child can block on a full pipe,
+#: and is printed in path order at the end.
+fn _run_forked(exe: str, paths: list[str], options: _Options, limit: int) -> list[TestResult] {
+    _warm_for_children()
+    let scratch = _scratch_dir()
+    var captured: dict[str, str] = {}
+    var noise: dict[str, str] = {}
+    var failures: dict[str, int] = {}
+    var running: dict[int, int] = {}
+    var spawned: set[int] = set()
+    var again: list[int] = []
+    var next_path = 0
+    while next_path < paths.len() or again.len() > 0 or running.len() > 0 {
+        while running.len() < limit and again.len() > 0 {
+            let index = again.pop()
+            let base = f"{scratch}/{index}"
+            let command = _worker_command(exe, paths[index])
+            let child = __prim__.os_spawn_to(command, base + ".out", base + ".err")
+            running[child] = index
+            spawned.add(index)
+        }
+        while running.len() < limit and next_path < paths.len() {
+            let index = next_path
+            next_path += 1
+            let base = f"{scratch}/{index}"
+            let child = __prim__.os_fork_to(base + ".out", base + ".err")
+            if child == 0 { _run_child(paths[index], options) }
+            running[child] = index
+        }
+        let done = __prim__.os_wait_any()
+        let index = running.get(done[0])
+        if index is null { continue }
+        running.remove(done[0])
+        if done[1] == _NEEDS_EXEC and index not in spawned {
+            again.push(index)
+            continue
+        }
+        let path = paths[index]
+        let base = f"{scratch}/{index}"
+        captured[path] = _take_file(base + ".out")
+        noise[path] = _take_file(base + ".err")
+        if done[1] != 0 { failures[path] = done[1] }
+    }
+    _remove_quietly(Path(scratch), true)
+    return _report_shards(paths, captured, noise, failures, options)
+}
+
+#: The status a forked child exits with when it was about to load a native
+#: framework. Frameworks that talk to a system service over XPC refuse a
+#: process that was forked and not exec'd -- Metal's shader compiler reports
+#: "the process is unavailable" and every GPU test fails -- so the loader
+#: stops the child before it tries (JAI_EXIT_NEEDS_EXEC in native.h).
+const _NEEDS_EXEC: int = 75
+
+#: The child's whole life: run one file, print its `@@R` lines, exit. It must
+#: never return into the parent's loop, whatever goes wrong.
+fn _run_child(path: str, options: _Options) -> void {
+    var code = 0
+    try {
+        let found = if options.doc {
+            run_doc_examples(path, options.filter, false)
+        } else {
+            run_file(path, options.filter, false)
+        }
+        _emit_shard(found)
+    } catch error: Error {
+        print_err(f"jaithon test: {path}: {type_of(error)}: {error.message}")
+        code = 70
+    }
+    __prim__.os_exit(code)
+}
+
+#: Have the checker parse `std.test`'s signatures once, here, so every child
+#: inherits them instead of parsing them again. Only signatures: running a
+#: test module's imports here would share their state between files.
+fn _warm_for_children() -> void {
+    try {
+        __prim__.exec("from std.test import assert_eq\nlet _ = assert_eq\n", "<test warm-up>")
+    } catch _error: Error { }
+}
+
+#: A fresh directory under the temp dir for the children's output files.
+fn _scratch_dir() -> str {
+    let base = temp_dir() + "/jaithon-test-" + str(__prim__.time_wall())
+    var attempt = 0
+    loop {
+        let candidate = if attempt == 0 { base } else { f"{base}-{attempt}" }
+        if not Path(candidate).exists() {
+            try {
+                Path(candidate).mkdir()
+                return candidate
+            } catch _error: Error { }
+        }
+        attempt += 1
+    }
+}
+
+fn _take_file(path: str) -> str {
+    let file = Path(path)
+    if not file.exists() { return "" }
+    let text = file.read_text()
+    _remove_quietly(file, false)
+    return text
+}
+
+fn _remove_quietly(path: Path, recursive: bool) -> void {
+    try {
+        path.remove(recursive)
+    } catch _error: Error { }
 }
 
 pub fn main(args: list[str]) -> int {
@@ -428,7 +586,11 @@ pub fn main(args: list[str]) -> int {
         #: `args` here is the tool's own arguments, not the process's, so the
         #: binary has to come from os.argv().
         let exe = argv()[0]
-        let results = _run_sharded(exe, paths, options, limit)
+        let results = if _FORK_WORKERS {
+            _run_forked(exe, paths, options, limit)
+        } else {
+            _run_sharded(exe, paths, options, limit)
+        }
         if results.len() == 0 {
             print_err("jaithon test: no tests found")
             return 1
