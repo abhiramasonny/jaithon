@@ -80,6 +80,14 @@ shapes that have broken it before:
     inside a `try` or called a function value at all, and the closure-call
     arm let such a raise skip its handler; with that arm reverted it now
     disagrees on 6 of the first 12 programs that draw one
+  - a callee that WRITES -- a list push, a global, a field -- and then reads
+    a field off a global whose class is swapped part-way through the run, so
+    its compiled form deoptimises after the write (Gen.deopt_call). Reached
+    through a function parameter, a function value in a local, a direct
+    call, a method, a caller that deoptimises AFTER the call, and a
+    parameter the callee never read. The closure-call arm re-ran such a call
+    from the top and every write before the guard happened twice
+    (tests/lang/test_jit_deopt_runs_once.jai)
 
 Two invariants keep every generated program legal and terminating, since a
 program that dies the same way five times proves nothing:
@@ -122,6 +130,10 @@ TRIP_BUDGET = 2000
 
 # Share of programs that get a `try` around a raising call (Gen.try_call).
 TRY_CALL_RATE = 0.3
+
+# Share of programs that get a writing callee that deoptimises after its
+# write (Gen.deopt_call).
+DEOPT_CALL_RATE = 0.3
 
 # Combined with `+% -% *%` only, so any of these is safe to reach.
 EDGE_INTS = [
@@ -1820,6 +1832,150 @@ class Gen:
                         "}")
         return helpers, node
 
+    def deopt_call(self, dr):
+        """A callee that writes, then deoptimises after the write.
+
+        Every callee here reads `holder.k` AFTER its effect, and `holder` is a
+        global the probe swaps from the base class to a subclass part-way
+        through the run -- after the callee has compiled against the base. So
+        from that call on, the compiled callee stops at the field read with its
+        write already done, and answers its caller "finish me from here". A
+        call arm that instead runs the call again from the top repeats the
+        write: the closure-call arm did, one `push` becoming two
+        (tests/lang/test_jit_deopt_runs_once.jai). The count of every effect
+        is folded into `acc` after each call, so the first repeat changes the
+        digest.
+
+        Returns the classes, the helpers and the probe statement. Everything
+        the statement needs is in its own strings, so a reduction can drop the
+        whole thing but not half of it.
+        """
+        warm = self.prog.warm
+        base = self.fresh("DkBase")
+        wide = self.fresh("DkWide")
+        holder = self.fresh("dkh")
+        log = self.fresh("dkl")
+        bump = self.fresh("dkg")
+        tobj = self.fresh("dkt")
+        classes = [
+            f"class {base} {{\n"
+            f"    pub var k: int\n"
+            f"    pub var hits: int\n"
+            f"    pub fn init(self, k: int) {{\n"
+            f"        self.k = k\n"
+            f"        self.hits = 0\n"
+            f"    }}\n"
+            f"    pub fn hit(self, x: int) -> int {{\n"
+            f"        self.hits = self.hits +% 1\n"
+            f"        {log}.push(x)\n"
+            f"        return {holder}.k +% x\n"
+            f"    }}\n"
+            f"}}",
+            f"class {wide} extends {base} {{\n"
+            f"    pub var extra: int\n"
+            f"    fn init(self, k: int) {{\n"
+            f"        super.init(k)\n"
+            f"        self.extra = 7\n"
+            f"    }}\n"
+            f"}}",
+        ]
+        helpers = [
+            f"var {holder}: {base} = {base}({dr.randint(1, 9)})\n"
+            f"var {log}: list[int] = []\n"
+            f"var {bump} = 0\n"
+            f"var {tobj}: {base} = {base}(0)",
+        ]
+        effect = dr.choice([
+            f"{log}.push(x)",
+            f"{bump} = {bump} +% x +% 1",
+            f"{tobj}.hits = {tobj}.hits +% x +% 1",
+        ])
+        callee = self.fresh("dkc")
+        helpers.append(
+            f"fn {callee}(x: int) -> int {{\n"
+            f"    {effect}\n"
+            f"    return {holder}.k +% x\n"
+            f"}}")
+        arg = f"n % {dr.randint(3, 11)}"
+        lines = []
+        site = dr.randrange(6)
+        if site == 0:
+            # Through a function parameter: the closure-call arm.
+            via = self.fresh("dkv")
+            helpers.append(
+                f"fn {via}(f: fn(int) -> int, x: int) -> int {{\n"
+                f"    let r = f(x)\n"
+                f"    return r +% 0\n"
+                f"}}")
+            lines.append(f"acc = acc +% {via}({callee}, {arg})")
+        elif site == 1:
+            # A function value held in the probe's own local.
+            g = self.fresh("g")
+            lines.append(f"let {g}: fn(int) -> int = {callee}")
+            lines.append(f"acc = acc +% {g}({arg})")
+        elif site == 2:
+            # A direct call to the global function.
+            lines.append(f"acc = acc +% {callee}({arg})")
+        elif site == 3:
+            # A method that writes its receiver and a global list.
+            lines.append(f"acc = acc +% {tobj}.hit({arg})")
+        elif site == 4:
+            # The callee only writes; its CALLER deoptimises after the call,
+            # and that caller is called directly by one holding the function
+            # value in a register.
+            plain = self.fresh("dkp")
+            outer = self.fresh("dko")
+            drive = self.fresh("dkd")
+            helpers.append(
+                f"fn {plain}(x: int) -> int {{\n"
+                f"    {effect}\n"
+                f"    return x +% 1\n"
+                f"}}")
+            helpers.append(
+                f"fn {outer}(f: fn(int) -> int, x: int) -> int {{\n"
+                f"    let r = f(x)\n"
+                f"    return r +% {holder}.k\n"
+                f"}}")
+            helpers.append(
+                f"fn {drive}(f: fn(int) -> int, x: int) -> int {{\n"
+                f"    let r = {outer}(f, x)\n"
+                f"    return r +% 0\n"
+                f"}}")
+            lines.append(f"acc = acc +% {drive}({plain}, {arg})")
+        else:
+            # A parameter the callee never reads while it compiles: null on
+            # every early call, and the read sits past a lambda, which the
+            # tier has no arm for, so the rest is interpreted. The caller
+            # that later passes a real value is warmed with one.
+            lazy = self.fresh("dkz")
+            drive = self.fresh("dku")
+            helpers.append(
+                f"fn {lazy}(x: int, d: int?) -> int {{\n"
+                f"    {effect}\n"
+                f"    if x < 100000 {{\n"
+                f"        let gg = |y| y + x\n"
+                f"        if d is not null {{\n"
+                f"            return x +% d\n"
+                f"        }}\n"
+                f"        return x +% 1\n"
+                f"    }}\n"
+                f"    return x\n"
+                f"}}")
+            helpers.append(
+                f"fn {drive}(x: int, d: int?) -> int {{\n"
+                f"    let r = {lazy}(x, d)\n"
+                f"    return r +% 0\n"
+                f"}}")
+            half = max(1, warm // 2)
+            lines.append(f"if n < {half} {{ acc = acc +% {lazy}({arg}, null) }}")
+            lines.append(f"if n >= {half} {{ acc = acc +% {drive}({arg}, n % 5) }}")
+        lo = max(1, warm // 4)
+        hi = max(lo, (3 * warm) // 4)
+        swap = dr.randint(lo, hi)
+        head = f"if n == {swap} {{ {holder} = {wide}({dr.randint(1, 9)}) }}"
+        tail = (f"acc = acc +% {log}.len() +% {bump} +% {tobj}.hits")
+        return classes, helpers, Node(head, *lines, tail)
+
     def build(self):
         r = self.rng
         self.mixers = []
@@ -1863,6 +2019,14 @@ class Gen:
             self.prog.helpers.extend(helpers)
             probes = self.prog.probes
             probes[tr.randrange(len(probes))].body.append(node)
+        # The same, on a stream of its own again.
+        dr = random.Random(f"deopt-call/{self.prog.seed}")
+        if dr.random() < DEOPT_CALL_RATE:
+            classes, helpers, node = self.deopt_call(dr)
+            self.prog.classes.extend(classes)
+            self.prog.helpers.extend(helpers)
+            probes = self.prog.probes
+            probes[dr.randrange(len(probes))].body.append(node)
         return self.prog
 
 
