@@ -19,7 +19,7 @@ import std.math
 from std.gpu import Buffer, Kernel
 from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_MAKETYPE, Point2f, Size, TermCriteria
-from ..imgproc.common import PRELUDE, cached_weights
+from ..imgproc.common import PRELUDE, held_weights, keep_weights
 from ..imgproc.filter import gaussian_blur
 from ..imgproc.geometric import pyr_down, resize
 
@@ -481,6 +481,10 @@ pub fn calc_optical_flow_pyr_lk(
 }
 
 fn gaussian_weights(radius: int, sigma: float) -> Mat {
+    #: Shared between calls, so a flow does not leak a buffer per expansion.
+    let key = f"flow:{radius}:{sigma}"
+    let held = held_weights(key)
+    if held is not null { return held }
     var values: list[float] = []
     var total = 0.0
     for index in -radius..radius + 1 {
@@ -489,8 +493,7 @@ fn gaussian_weights(radius: int, sigma: float) -> Mat {
         total += value
     }
     for index in 0..values.len() { values[index] /= total }
-    #: Shared between calls, so a flow does not leak a buffer per expansion.
-    return cached_weights(1, values.len(), values)
+    return keep_weights(key, 1, values.len(), values)
 }
 
 #: The five quadratic coefficients fitted to every neighbourhood: the two

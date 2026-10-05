@@ -14,7 +14,7 @@ from ..core.mat import Mat, f32_bits
 from ..core.arith import OP_SUBTRACT, binary_op
 from ..core.types import BORDER_CONSTANT, BORDER_REPLICATE, CV_8U, CV_32F, CV_MAKETYPE
 from ..core.types import Point, Scalar, Size
-from .common import PRELUDE, cached_weights, saturation_args
+from .common import PRELUDE, held_weights, keep_weights, saturation_args
 
 #: A filled rectangle.
 pub const MORPH_RECT = 0
@@ -253,7 +253,9 @@ fn default_element(element: Mat?) -> Mat {
     if given is not null { return given }
     #: Shared rather than built per call: device memory is not collected, so
     #: a fresh element each call was a buffer leaked each call.
-    return cached_weights(3, 3, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    let held = held_weights("element:3x3")
+    if held is not null { return held }
+    return keep_weights("element:3x3", 3, 3, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 }
 
 #: Whether every place in the element is set, which is what lets the two axes

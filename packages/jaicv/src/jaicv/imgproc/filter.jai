@@ -17,7 +17,7 @@ from ..core.arith import UN_SQUARE, add, unary_op
 from ..core.types import BORDER_CONSTANT, BORDER_DEFAULT, BORDER_REFLECT_101, BORDER_REPLICATE
 from ..core.types import CV_32F, CV_MAKETYPE, CV_MAT_CN, CV_MAT_DEPTH
 from ..core.types import Point, Scalar, Size
-from .common import PRELUDE, cached_weights, saturation_args
+from .common import PRELUDE, cached_weights, held_weights, keep_weights, saturation_args
 
 let _SMALL_GAUSSIANS = [
     [1.0],
@@ -500,9 +500,18 @@ pub fn gaussian_blur(
     let width = if ksize.width > 0 { ksize.width } else { _size_for(sigma_x) }
     let height = if ksize.height > 0 { ksize.height } else { _size_for(sigma_y) }
     let sy = if sigma_y > 0.0 { sigma_y } else { sigma_x }
-    let row = cached_weights(width, 1, _gaussian_values(width, sigma_x))
-    let column = cached_weights(height, 1, _gaussian_values(height, sy))
+    let row = _gaussian_taps(width, sigma_x)
+    let column = _gaussian_taps(height, sy)
     return sep_filter_2d(src, -1, row, column, border_mode: border_mode)
+}
+
+#: The shared taps of a Gaussian, named by size and sigma so a call that finds
+#: them does not build or format them.
+fn _gaussian_taps(ksize: int, sigma: float) -> Mat {
+    let key = f"gaussian:{ksize}:{sigma}"
+    let held = held_weights(key)
+    if held is not null { return held }
+    return keep_weights(key, ksize, 1, _gaussian_values(ksize, sigma))
 }
 
 fn _size_for(sigma: float) -> int {
@@ -521,18 +530,24 @@ pub fn box_filter(
     border_mode: int = BORDER_DEFAULT
 ) -> Mat {
     let weight = if normalize { 1.0 / float(ksize.width * ksize.height) } else { 1.0 }
-    var row: list[float] = []
-    for _index in 0..ksize.width { row.push(weight) }
-    var column: list[float] = []
-    for _index in 0..ksize.height { column.push(1.0) }
     return sep_filter_2d(
         src,
         ddepth,
-        cached_weights(ksize.width, 1, row),
-        cached_weights(ksize.height, 1, column),
+        _flat_taps(ksize.width, weight),
+        _flat_taps(ksize.height, 1.0),
         anchor: anchor,
         border_mode: border_mode
     )
+}
+
+#: `count` shared taps all equal to `weight`.
+fn _flat_taps(count: int, weight: float) -> Mat {
+    let key = f"flat:{count}:{weight}"
+    let held = held_weights(key)
+    if held is not null { return held }
+    var values: list[float] = []
+    for _index in 0..count { values.push(weight) }
+    return keep_weights(key, count, 1, values)
 }
 
 #: Average over a rectangular window, normalised.
@@ -636,8 +651,18 @@ pub fn get_derivative_kernels(dx: int, dy: int, ksize: int) -> tuple[Mat, Mat] {
     let column = _derivative_row(dy, ksize)
     return (
         Mat.from_list(row.len(), 1, CV_MAKETYPE(CV_32F, 1), row),
-        Mat.from_list(column.len(), 1, CV_MAKETYPE(CV_32F, 1), column),
+        Mat.from_list(column.len(), 1, CV_MAKETYPE(CV_32F, 1), column)
     )
+}
+
+#: The shared taps of `_derivative_row`, scaled.
+fn _derivative_taps(order: int, ksize: int, scale: float) -> Mat {
+    let key = f"derivative:{order}:{ksize}:{scale}"
+    let held = held_weights(key)
+    if held is not null { return held }
+    var row = _derivative_row(order, ksize)
+    if scale != 1.0 { row = [value * scale for value in row] }
+    return keep_weights(key, row.len(), 1, row)
 }
 
 fn _derivative_row(order: int, ksize: int) -> list[float] {
@@ -692,14 +717,11 @@ pub fn sobel(
     if dx < 0 or dy < 0 or dx == 0 and dy == 0 {
         throw ValueError("sobel needs a non-zero derivative order")
     }
-    var row = _derivative_row(dx, ksize)
-    if scale != 1.0 { row = [value * scale for value in row] }
-    let column = _derivative_row(dy, ksize)
     return sep_filter_2d(
         src,
         ddepth,
-        cached_weights(row.len(), 1, row),
-        cached_weights(column.len(), 1, column),
+        _derivative_taps(dx, ksize, scale),
+        _derivative_taps(dy, ksize, 1.0),
         delta: delta,
         border_mode: border_mode
     )
@@ -737,11 +759,13 @@ pub fn laplacian(
     border_mode: int = BORDER_DEFAULT
 ) -> Mat {
     if ksize == 1 {
-        let weights = cached_weights(
-            3,
-            3,
-            [0.0, scale, 0.0, scale, -4.0 * scale, scale, 0.0, scale, 0.0]
-        )
+        let key = f"laplacian:{scale}"
+        let held = held_weights(key)
+        let weights = if held is not null {
+            held
+        } else {
+            keep_weights(key, 3, 3, [0.0, scale, 0.0, scale, -4.0 * scale, scale, 0.0, scale, 0.0])
+        }
         return filter_2d(src, ddepth, weights, delta: delta, border_mode: border_mode)
     }
     let xx = sobel(src, ddepth, 2, 0, ksize: ksize, scale: scale, border_mode: border_mode)
