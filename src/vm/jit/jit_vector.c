@@ -99,6 +99,7 @@ typedef struct {
     unsigned storeList;
     int      storeOff;
     uint16_t var, cur, end;
+    int      failAt;      /* the body offset the match gave up at, or -1 */
 } VecPlan;
 
 static bool vecListIndex(VecPlan *p, uint16_t slot, unsigned *out) {
@@ -185,10 +186,12 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
     bool stored = false;
     p->listCount = p->invCount = p->opCount = 0;
     p->maxDepth = 0;
+    p->failAt = -1;
     for (int32_t at = (int32_t)off + 9; at < loopAt;) {
         int len = instructionLength(c, at);
         if (len <= 0 || stored) return false;
         uint8_t op = code[at];
+        p->failAt = at;
         if (p->opCount >= VEC_MAX_OPS) return false;
         switch (op) {
         case OP_GET_LOCAL:
@@ -206,6 +209,19 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
                 return false;
             }
             break;
+        case OP_ADD_INT_CONST:
+        case OP_SUB_INT_CONST: {
+            /* `j + k` fused: u16 slot, i16 k. Only on the loop variable. */
+            if (len != 5 || d >= VEC_MAX_DEPTH) return false;
+            if (jaiReadU16(code + at + 1) != p->var) return false;
+            int64_t k = jaiReadI16(code + at + 3);
+            if (op == OP_SUB_INT_CONST) k = -k;
+            if (k < -VEC_MAX_OFF || k > VEC_MAX_OFF) return false;
+            st[d].kind = VS_IDX;
+            st[d].k = k;
+            d++;
+            break;
+        }
         case OP_INT:
             if (len != 3 || d >= VEC_MAX_DEPTH) return false;
             st[d].kind = VS_INT;
@@ -320,6 +336,7 @@ static bool vecMatch(const Emit *e, ObjFunction *fn, uint32_t off, VecPlan *p) {
         if (d > p->maxDepth) p->maxDepth = d;
         at += len;
     }
+    p->failAt = -1;
     if (!stored) return false;
     /* A list read at an offset other than the one stored to: if it is the
      * stored list itself the scalar loop is a recurrence, and two lanes
@@ -366,7 +383,17 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     if (!jitVectorOn() || e->measuring || e->inlining || e->failed) return;
     if (e->depth != 0 || e->valueDepth != 0) return;
     VecPlan p;
-    if (!vecMatch(e, fn, off, &p)) return;
+    p.failAt = -1;
+    if (!vecMatch(e, fn, off, &p)) {
+        /* Only a body the walk got into is worth a line: most loops are not
+         * this shape at all, and say so at their first instruction. */
+        if (p.failAt > (int)off + 9 && getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s at %u: not vectorised, %s at %d\n",
+                    jitFnLabel(fn), off,
+                    jaiOpName((OpCode)fn->chunk.code[p.failAt]), p.failAt);
+        }
+        return;
+    }
 
     /* Lane sets per iteration: as many as the vector registers allow, at most
      * four (eight doubles, what clang unrolls a stencil to). A stack position
@@ -517,8 +544,9 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     }
 #undef VEC_SKIP
     if (getenv("JAI_JIT_WHY")) {
-        fprintf(stderr, "[jit] %s at %u: vectorised %u lists x %u lanes\n",
-                e->osr ? "osr" : "func", off, p.listCount, 2u * U);
+        fprintf(stderr, "[jit] %s %s at %u: vectorised %u lists x %u lanes\n",
+                e->osr ? "osr" : "func", jitFnLabel(fn), off, p.listCount,
+                2u * U);
     }
 }
 
