@@ -30,7 +30,86 @@ static unsigned jitRootLimit(void) {
     return (unsigned)cached;
 }
 
+/* The raw layout (gJitRawRoots): each root is the bare payload, stored two at
+ * a time. A register waits in `pend` for a partner; a pair goes down with one
+ * `stp` while its offset is in stp's reach from sp and as two `str` past it. */
+typedef struct {
+    Emit    *e;
+    unsigned at;      /* byte offset of pointer 0 */
+    unsigned n;       /* pointers placed or pending */
+    int      pend;    /* register waiting for a partner, or -1 */
+} RawFill;
+
+static void rawFlush(RawFill *f) {
+    if (f->pend < 0) return;
+    unsigned off = f->at + 8u * (f->n - 1u);
+    emit(f->e, jaiA64StrX((unsigned)f->pend, 31, off));
+    f->pend = -1;
+}
+
+static void rawPut(RawFill *f, unsigned reg) {
+    if (f->pend < 0) {
+        f->pend = (int)reg;
+        f->n++;
+        return;
+    }
+    unsigned off = f->at + 8u * (f->n - 1u);
+    if (off + 8u <= 504u) {
+        emit(f->e, jaiA64StpOff((unsigned)f->pend, reg, 31, (int32_t)off));
+    } else {
+        emit(f->e, jaiA64StrX((unsigned)f->pend, 31, off));
+        emit(f->e, jaiA64StrX(reg, 31, off + 8u));
+    }
+    f->pend = -1;
+    f->n++;
+}
+
+/* The scratch a local loads into must not be the one already waiting. */
+static unsigned rawScratch(const RawFill *f) {
+    return f->pend == (int)JIT_SCRATCH_C ? JIT_SCRATCH_B : JIT_SCRATCH_C;
+}
+
+static bool emitRootFillRaw(Emit *e, unsigned d, unsigned *nrootsOut) {
+    RawFill f = { e, d + (unsigned)offsetof(JitCallDesc, roots), 0u, -1 };
+    for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
+        SlotKind k = e->localKind[slot];
+        if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
+            continue;
+        }
+        if (f.n >= jitRootLimit()) {
+            e->whyNot = "too many roots"; return false;
+        }
+        /* A dynamic local is guarded before it is read, and the guard settles
+         * the operand stack: nothing of this fill may be left waiting in a
+         * register across that. */
+        if (e->dynamicLocal[slot]) rawFlush(&f);
+        rawPut(&f, localIn(e, slot, rawScratch(&f)));
+    }
+    /* The operand stack, counted from the bottom exactly as the tagged fill
+     * below counts it. */
+    unsigned seen = 0;
+    for (unsigned idx = 0; idx < e->depth; idx++) {
+        SlotKind k = e->stack[idx];
+        if (!holdsRegister(k)) continue;
+        unsigned reg = valueBankReg(e, seen);
+        seen++;
+        if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER && k != SLOT_MAYBE_INST && k != SLOT_MAYBE_OBJ) {
+            continue;
+        }
+        if (f.n >= jitRootLimit()) {
+            e->whyNot = "too many roots"; return false;
+        }
+        rawPut(&f, reg);
+    }
+    rawFlush(&f);
+    *nrootsOut = f.n;
+    return true;
+}
+
 bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
+    if (gJitRawRoots) return emitRootFillRaw(e, d, nrootsOut);
     unsigned nroots = 0;
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
         if (e->localKind[slot] != SLOT_INST &&
@@ -84,6 +163,36 @@ bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
 
     *nrootsOut = nroots;
     return true;
+}
+
+_Static_assert(offsetof(JitCallDesc, link) == 0 &&
+               offsetof(JitCallDesc, nroots) == 8,
+               "emitChainLink stores link and nroots as one pair");
+
+/* Links this frame's descriptor onto gJitFrames around a bare `bl`, which
+ * pushes no roots, with `nroots` roots already filled: the old head and the
+ * count go down as one pair. */
+void emitChainLink(Emit *e, unsigned nroots) {
+    unsigned d = e->descOffset;
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+    emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+    emit(e, jaiA64MovzX(JIT_SCRATCH_C, nroots, 0));
+    if (d + 8u <= 504u) {
+        emit(e, jaiA64StpOff(JIT_SCRATCH_B, JIT_SCRATCH_C, 31, (int32_t)d));
+    } else {
+        emit(e, jaiA64StrX(JIT_SCRATCH_B, 31, d));
+        emit(e, jaiA64StrX(JIT_SCRATCH_C, 31, d + 8u));
+    }
+    emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
+    emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+}
+
+/* Puts back the head emitChainLink saved. x0 and x1 carry the callee's
+ * answer, so only the scratches are touched. */
+void emitChainUnlink(Emit *e) {
+    emit(e, jaiA64LdrX(JIT_SCRATCH_B, 31, e->descOffset));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+    emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
 }
 
 bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,

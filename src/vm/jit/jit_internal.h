@@ -5,6 +5,7 @@
 
 #include "vm/jit/jit.h"
 #include "vm/vm.h"
+#include "vm/gc.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -1081,6 +1082,40 @@ typedef enum { DISCARD_NO, DISCARD_POP, DISCARD_POP_RETURN } DiscardKind;
 extern JitCallDesc *gJitFrames;
 extern JitDeoptRecord gDeopt;
 
+/* JAITHON_JIT_RAW_ROOTS (default on), read once at process start. On, a
+ * descriptor's roots are RAW object pointers -- `nroots` of them, packed two
+ * to a Value of the `roots` array, a zero payload being a null root -- and a C
+ * helper roots them by linking the descriptor onto gJitFrames for the length
+ * of the call, the same chain a direct call already links onto. The root fill
+ * is then one `stp` per two live objects with no tag to build, and the helper
+ * pays two stores where jaiGCPushRootRange paid a bounds-checked append to a
+ * growable array. Off, the roots are tagged Values pushed as a range, as
+ * before. Emitter, marker and helpers all read this one flag, so a process
+ * never mixes the layouts. */
+extern bool gJitRawRoots;
+
+/* The pointer roots of one descriptor in the raw layout. */
+JAI_INLINE Obj **jitRawRootArray(JitCallDesc *d) {
+    return (Obj **)(void *)d->roots;
+}
+
+JAI_INLINE void jitRootsIn(JitCallDesc *d) {
+    if (JAI_LIKELY(gJitRawRoots)) {
+        d->link = gJitFrames;
+        gJitFrames = d;
+    } else {
+        jaiGCPushRootRange(d->roots, (int)d->nroots);
+    }
+}
+
+JAI_INLINE void jitRootsOut(JitCallDesc *d) {
+    if (JAI_LIKELY(gJitRawRoots)) {
+        gJitFrames = d->link;
+    } else {
+        jaiGCPopRootRange();
+    }
+}
+
 void jitThrowOverflow(int64_t which);
 int jitInvokeMethod(JitCallDesc *d);
 int jitInvokeByName(JitCallDesc *d);
@@ -1465,6 +1500,8 @@ bool isClassCallee(const Emit *e, unsigned argc);
 bool subWhy(Emit *e, const char *fmt, ...);
 const char *kindClash(Emit *e, unsigned slot);
 bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut);
+void emitChainLink(Emit *e, unsigned nroots);
+void emitChainUnlink(Emit *e);
 bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
                                  unsigned nargs, void *helper, bool ownStatus,
                                  int calleeReg);
