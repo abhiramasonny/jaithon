@@ -180,9 +180,6 @@ fn test_enum_variant_without_payload_stays_bare() -> void {
     assert_true(is_formatted("pub enum Shape { Circle(radius: float), Point }\n", "d.jai"))
 }
 
-#: `-9223372036854775808` is a single token, because its magnitude has no
-#: positive spelling in `int`. Print it after an operator and the sign binds to
-#: that operator instead, leaving digits that overflow — so it keeps brackets.
 #: The parser pins each literal to its spelling as it builds it, instead of a
 #: walk doing it afterwards; the printed text must be what was written, every
 #: literal kind, after multibyte text, inside and around an f-string, and in a
@@ -213,6 +210,9 @@ fn test_literals_keep_their_spelling() -> void {
     assert_eq(format_source(formatted, "d.jai"), formatted)
 }
 
+#: `-9223372036854775808` is a single token, because its magnitude has no
+#: positive spelling in `int`. Print it after an operator and the sign binds to
+#: that operator instead, leaving digits that overflow — so it keeps brackets.
 fn test_int_min_literal_keeps_its_brackets() -> void {
     assert_true(is_formatted("let low = -(-9223372036854775808)\n", "d.jai"))
     assert_true(is_formatted("let sum = 1 - (-9223372036854775808)\n", "d.jai"))
