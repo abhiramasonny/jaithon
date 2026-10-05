@@ -13,7 +13,7 @@
 #:
 #: The seam. An arm body is a statement, so this file calls `lower_stmt`.
 from jaithon.ast import Node, NodeKind, Span, is_statement
-from jaithon.compile.emit.opcode import Op
+from jaithon.compile.emit.opcode import Op, opcode
 from jaithon.compile.emit.spec import Const, ConstTag
 from jaithon.compile.emit.state import Emitter, lower_stmt
 from jaithon.compile.emit.expr import _block_expr, _expr
@@ -28,36 +28,23 @@ pub fn _match(e: Emitter, node: Node, as_expression: bool) -> void {
     e._bind_local(subject, span)
 
     var done: list[int] = []
-    for arm in node.records("arms") {
+    let arms = node.records("arms")
+    var index = 0
+    while index < arms.len() {
+        let stop = _enum_run_end(e, arms, index)
+        if stop > index {
+            _enum_run(e, arms, index, stop, subject, base, as_expression, done)
+            index = stop
+            continue
+        }
+        let arm = arms[index]
         let arm_span: Span = arm["span"]
         var misses: list[int] = []
         var guard_miss: list[int] = []
 
         e._set_depth(base)
         _pattern_in_slot(e, arm["pattern"], subject, misses)
-
-        if arm["guard"] != null {
-            let guard: Node = arm["guard"]
-            _expr(e, guard)
-            guard_miss.push(e._emit_jump(Op.JumpIfFalse, guard.span))
-        }
-
-        let body: Node? = arm["body"]
-        if as_expression {
-            if body != null and body.kind == NodeKind.Block {
-                _block_expr(e, body)
-            } else {
-                _expr(e, body)
-            }
-        } elif body != null {
-            if body.kind == NodeKind.Block or is_statement(body.kind) {
-                lower_stmt(e, body)
-            } else {
-                _expr(e, body)
-                e._op(Op.Pop, arm_span)
-            }
-        }
-        done.push(e._emit_jump(Op.Jump, arm_span))
+        _arm_rest(e, arm, as_expression, guard_miss, done)
 
         # A pattern miss arrives with the failed candidate still pushed.
         e._set_depth(base + 1)
@@ -65,6 +52,7 @@ pub fn _match(e: Emitter, node: Node, as_expression: bool) -> void {
         e._op(Op.Pop, arm_span)
         e._set_depth(base)
         e._patch_all(guard_miss)
+        index += 1
     }
 
     e._set_depth(base)
@@ -77,6 +65,176 @@ pub fn _match(e: Emitter, node: Node, as_expression: bool) -> void {
 
     e._set_depth(base + (if as_expression { 1 } else { 0 }))
     e._patch_all(done)
+    e._free_temps(1)
+}
+
+#: An arm's guard and body, once its pattern has matched: a failed guard
+#: adds to `guard_miss`, and the body ends in a jump added to `done`.
+fn _arm_rest(
+    e: Emitter,
+    arm: dict[str, any],
+    as_expression: bool,
+    guard_miss: list[int],
+    done: list[int]
+) -> void {
+    let arm_span: Span = arm["span"]
+    if arm["guard"] != null {
+        let guard: Node = arm["guard"]
+        _expr(e, guard)
+        guard_miss.push(e._emit_jump(Op.JumpIfFalse, guard.span))
+    }
+
+    let body: Node? = arm["body"]
+    if as_expression {
+        if body != null and body.kind == NodeKind.Block {
+            _block_expr(e, body)
+        } else {
+            _expr(e, body)
+        }
+    } elif body != null {
+        if body.kind == NodeKind.Block or is_statement(body.kind) {
+            lower_stmt(e, body)
+        } else {
+            _expr(e, body)
+            e._op(Op.Pop, arm_span)
+        }
+    }
+    done.push(e._emit_jump(Op.Jump, arm_span))
+}
+
+#: The enum an arm's pattern names when it is a payload-free variant of an
+#: enum the emitter can see -- `Op.Add`, or `Op.Add | Op.Sub` -- and null for
+#: every other pattern.
+fn _enum_owner(e: Emitter, pattern: Node?) -> str? {
+    if pattern == null { return null }
+    if pattern.kind == NodeKind.PatOr {
+        let alternatives = pattern.child_list("elems")
+        if alternatives.len() == 0 { return null }
+        return _enum_owner(e, alternatives[0])
+    }
+    if pattern.kind != NodeKind.PatEnum { return null }
+    if pattern.child_list("subPatterns").len() > 0 { return null }
+    if e._variant_tag(pattern) < 0 { return null }
+    return pattern.opt_text("typeName")
+}
+
+#: Appends the tags `pattern` accepts, in source order, and answers true when
+#: every alternative in it is a payload-free variant of `owner`. On false,
+#: `tags` may be left half filled.
+fn _enum_tags(e: Emitter, pattern: Node?, owner: str, tags: list[int]) -> bool {
+    if pattern == null { return false }
+    if pattern.kind == NodeKind.PatOr {
+        let alternatives = pattern.child_list("elems")
+        if alternatives.len() == 0 { return false }
+        for alternative in alternatives {
+            if not _enum_tags(e, alternative, owner, tags) { return false }
+        }
+        return true
+    }
+    if pattern.kind != NodeKind.PatEnum { return false }
+    if pattern.child_list("subPatterns").len() > 0 { return false }
+    if pattern.opt_text("typeName") != owner { return false }
+    let tag = e._variant_tag(pattern)
+    if tag < 0 { return false }
+    tags.push(tag)
+    return true
+}
+
+#: Where a run of enum-constant arms starting at `start` ends: one past the
+#: last consecutive arm whose pattern is only variants of the first arm's
+#: enum. `start` itself when the run would test fewer than two tags, which
+#: the per-arm lowering does as cheaply.
+fn _enum_run_end(e: Emitter, arms: list[dict[str, any]], start: int) -> int {
+    let owner = _enum_owner(e, arms[start]["pattern"])
+    if owner == null { return start }
+    var stop = start
+    var count = 0
+    while stop < arms.len() {
+        var tags: list[int] = []
+        if not _enum_tags(e, arms[stop]["pattern"], owner, tags) { break }
+        count += tags.len()
+        stop += 1
+    }
+    if count < 2 { return start }
+    return stop
+}
+
+#: A run of arms that only test variants of one enum, lowered to ONE type
+#: test and ONE tag read into a frame slot, then a single fused
+#: compare-and-branch per alternative -- where the per-arm lowering spends
+#: seven instructions on every alternative it rejects.
+#:
+#: Arm order, guards and the arms after the run are unchanged: a failed guard
+#: falls to the next arm's test exactly as before, and a subject that is not
+#: this enum skips the whole run, which is what each of its arms would have
+#: done one at a time. Every miss edge between arms lands with the operand
+#: stack at `base`, because the tag lives in a slot rather than on the stack.
+fn _enum_run(
+    e: Emitter,
+    arms: list[dict[str, any]],
+    start: int,
+    stop: int,
+    subject: int,
+    base: int,
+    as_expression: bool,
+    done: list[int]
+) -> void {
+    let first: Node = arms[start]["pattern"]
+    let owner = _enum_owner(e, first) ?? "any"
+    let span = first.span
+
+    e._set_depth(base)
+    e._get_local(subject, span)
+    e._chunk().write_op(Op.MatchTypePop, span)
+    e._chunk().write_u24(e._string(owner))
+    let not_enum = e._reserve_jump()
+    e._get_local(subject, span)
+    e._op(Op.EnumTag, span)
+    e._op(Op.SwapPop, span)
+    let tag_slot = e._alloc_temp()
+    e._bind_local(tag_slot, span)
+
+    var misses: list[int] = []
+    for index in range(start, stop) {
+        let arm = arms[index]
+        let arm_span: Span = arm["span"]
+        e._set_depth(base)
+        e._patch_all(misses)
+        misses = []
+
+        var tags: list[int] = []
+        _enum_tags(e, arm["pattern"], owner, tags)
+        var matched: list[int] = []
+        for (position, tag) in tags.enumerate() {
+            let last = position == tags.len() - 1
+            # Jumps when the comparison is FALSE: `!=` on the way to the
+            # body, `==` on the way to the next arm.
+            e._chunk().write_op(Op.JumpIfCmpLocalK, arm_span)
+            e._chunk().write_byte(opcode(if last { Op.Eq } else { Op.Ne }))
+            e._chunk().write_u16(tag_slot)
+            e._chunk().write_u24(e._chunk().add_constant(Const(ConstTag.Int, tag)))
+            if last {
+                misses.push(e._reserve_jump())
+            } else {
+                matched.push(e._reserve_jump())
+            }
+        }
+        e._patch_all(matched)
+        _arm_rest(e, arm, as_expression, misses, done)
+    }
+
+    # The last arm's misses read the subject back, only so that the slot is
+    # still live after every tag test: slot coalescing would otherwise hand
+    # the subject's slot to the tag, and one slot holding an enum and then
+    # an int is a kind clash the compiled tier pays for on every read. The
+    # pop it shares with `not_enum` -- the subject MATCH_TYPE_POP left
+    # behind -- is a branch target, so the peephole keeps the pair.
+    e._set_depth(base)
+    e._patch_all(misses)
+    e._get_local(subject, span)
+    e._patch(not_enum)
+    e._op(Op.Pop, span)
+    e._set_depth(base)
     e._free_temps(1)
 }
 
