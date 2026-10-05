@@ -19,11 +19,11 @@
  * At run time it checks everything it needs -- each list's storage is F64,
  * every index the whole range will touch is in [0, count), no step of a
  * folded subscript can overflow, and the stored list is no list it reads at
- * another offset -- and if any check fails it
- * simply falls through to the scalar loop, which then does all the work
- * exactly as before. When they all pass it runs as many whole groups of
- * 2*U elements as fit, advances the loop counter past them, and lets the scalar
- * loop finish the remainder (0..2U-1 elements).
+ * another offset -- and if any check fails it simply falls through to the
+ * scalar loop, which then does all the work exactly as before. When they all
+ * pass it runs as many whole groups of 2*U elements as fit, then lane pairs,
+ * advances the loop counter past them, and leaves the scalar loop at most one
+ * element.
  *
  * Why the answer is bit-identical: each lane of fadd/fsub/fmul.2d rounds
  * exactly as the scalar instruction does, under the same FPCR; the expression
@@ -568,14 +568,32 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     r = localIn(e, p.end, xE);
     if (r != xE) emit(e, jaiA64MovX(xE, r));
 
-    /* At least one whole group: end > cur, and end - cur neither wraps nor
-     * falls short of 2U. */
-    emit(e, jaiA64SubsXReg(31, xE, xC));
-    VEC_SKIP(JAI_A64_LE);
+    /* The cheapest tests first, so a loop that will not take the vector run
+     * finds out in a few instructions. At least one lane pair: end - cur
+     * neither wraps nor falls short of 2 (which covers end <= cur). Fewer
+     * than 2U elements skip the unrolled loop and take only the pair loop
+     * after it. */
     emit(e, jaiA64SubsX(xN, xE, xC));
     VEC_SKIP(JAI_A64_VS);
-    emit(e, jaiA64SubsXImm(31, xN, 2u * U));
+    emit(e, jaiA64SubsXImm(31, xN, 2u));
     VEC_SKIP(JAI_A64_LT);
+    /* The stored list must be no list read at another offset: a compare and
+     * a branch a list, before any bounds are worked out. localIn writes only
+     * the register it is given, so the stored list stays in tA throughout. */
+    {
+        unsigned ro = 0;
+        bool haveRo = false;
+        for (unsigned l = 0; l < p.listCount; l++) {
+            if (l == p.storeList || !p.read[l]) continue;
+            if (!haveRo) {
+                ro = localIn(e, p.listSlot[p.storeList], tA);
+                haveRo = true;
+            }
+            unsigned rl = localIn(e, p.listSlot[l], tB);
+            emit(e, jaiA64SubsXReg(31, ro, rl));
+            VEC_SKIP(JAI_A64_EQ);
+        }
+    }
     /* Every plain index is cur + lo or more: cur >= -minLo. */
     if (anyPlain) {
         int minLo = 0;
@@ -659,14 +677,6 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
         VEC_SKIP(JAI_A64_LT);
         emit(e, jaiA64AddXLsl(xP[si], xP[si], xS, 3));
     }
-    /* The stored list must be no list read at another offset. */
-    for (unsigned l = 0; l < p.listCount; l++) {
-        if (l == p.storeList || !p.read[l]) continue;
-        unsigned ro = localIn(e, p.listSlot[p.storeList], tA);
-        unsigned rl = localIn(e, p.listSlot[l], tB);
-        emit(e, jaiA64SubsXReg(31, ro, rl));
-        VEC_SKIP(JAI_A64_EQ);
-    }
     for (unsigned i = 0; i < p.invCount; i++) {
         unsigned vr = 31u - i;
         if (p.invIsLocal[i]) {
@@ -679,8 +689,11 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     }
 
     /* Groups of 2U, and the counter moved past them now: the pointers already
-     * carry cur, so xC is not read inside the loop. */
+     * carry cur, so xC is not read inside the loop. No whole group (a short
+     * row) goes straight to the pair loop. */
     emit(e, jaiA64LsrX(xN, xN, lgG));
+    unsigned noGroup = e->count;
+    emit(e, jaiA64CbzX(xN, 0));
     emit(e, jaiA64AddXLsl(xC, xC, xN, lgG));
 
     unsigned top = e->count;
@@ -690,6 +703,9 @@ void emitVectorHead(Emit *e, ObjFunction *fn, uint32_t off) {
     }
     emit(e, jaiA64SubsXImm(xN, xN, 1));
     emit(e, jaiA64BCond(JAI_A64_NE, (int32_t)top - (int32_t)e->count));
+    if (noGroup < e->count) {
+        e->code[noGroup] = jaiA64CbzX(xN, (int32_t)(e->count - noGroup));
+    }
 
     /* What is left is under 2U elements: take its pairs one lane set at a
      * time, so at most one element falls to the scalar loop. A five-point
