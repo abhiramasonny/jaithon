@@ -36,6 +36,10 @@ VM vm;
  * the interpreter's own frame limit. The count is the bound only on a thread
  * whose stack bounds are unknown. */
 #define JAI_MAX_NESTED_RUN 128
+/* Below this many nested runs the stack is not checked at all: so few cannot
+ * exhaust even a 512 KB secondary thread's stack, and the check is skipped on
+ * the commonest, shallowest re-entries. */
+#define JAI_RUN_STACK_CHECK_DEPTH 32
 int sRunDepth;
 
 /* An exception suspended by a `finally` that was reached while unwinding.
@@ -3561,12 +3565,17 @@ static uintptr_t runStackFloor(void) {
     return sRunStackFloor;
 }
 
-JaiRunResult run(int baseFrameCount) {
+/* Whether this re-entry would leave too little stack below it. Kept out of
+ * run(): reading a thread-local costs a call on Darwin, and run() is entered
+ * once per compiled-to-interpreted call. */
+static JAI_NOINLINE bool runStackExhausted(void) {
     uintptr_t floor = runStackFloor();
-    bool exhausted = (floor == 1)
-        ? sRunDepth >= JAI_MAX_NESTED_RUN
-        : (uintptr_t)__builtin_frame_address(0) < floor;
-    if (exhausted) {
+    if (floor == 1) return sRunDepth >= JAI_MAX_NESTED_RUN;
+    return (uintptr_t)__builtin_frame_address(0) < floor;
+}
+
+JaiRunResult run(int baseFrameCount) {
+    if (sRunDepth >= JAI_RUN_STACK_CHECK_DEPTH && runStackExhausted()) {
         (void)jaiThrow(vm.cRecursionError,
                        "maximum native re-entry depth exceeded (%d nested)",
                        sRunDepth);
