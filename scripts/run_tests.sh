@@ -131,6 +131,17 @@ if [[ -x "$ROOT/tests/vm/osr_replace.sh" ]]; then
     done <<< "$replace_output"
 fi
 
+if [[ -x "$ROOT/tests/vm/late_compile.sh" ]]; then
+    late_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/late_compile.sh" 2>&1)"
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)   name="late_compile: ${line#ok }"
+                      matches_filter "$name" && record_pass "$name" 0 ;;
+            "FAIL "*) record_fail "late_compile: ${line#FAIL }" "" ;;
+        esac
+    done <<< "$late_output"
+fi
+
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 
