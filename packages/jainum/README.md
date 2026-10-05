@@ -193,7 +193,7 @@ its module loads, and is on unless set to `0`.
 
 | Switch | Off restores |
 | --- | --- |
-| `JAINUM_ROW_SORT` | the dispatch-per-pass bitonic network for rows of up to 4096 slots, instead of one dispatch that runs the whole network in registers, simd shuffles and threadgroup memory; bit-identical |
+| `JAINUM_ROW_SORT` | the dispatch-per-pass bitonic network, instead of sorting 4096-slot blocks in one dispatch each (registers, simd shuffles and threadgroup memory) with global passes only where a stage spans blocks; bit-identical |
 | `JAINUM_ROW_SCAN` | the strided chunk kernel for a scan along a dense last axis of up to 4096, instead of one group a row, its runs held in registers when they are whole float4s and staged in threadgroup memory otherwise; the same association, so bit-identical |
 | `JAINUM_TILE_TRANSPOSE` | the strided walk for a 2-d copy whose source rows step by one slot (a transposed matrix), instead of 32x32 threadgroup tiles; bit-identical |
 | `JAINUM_BINARY4` | one element a thread, one wrap divide each, for dense and row-repeating real `+ - * /`, instead of four a thread; bit-identical |
