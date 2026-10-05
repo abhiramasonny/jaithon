@@ -295,11 +295,8 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
              * from the register that held it: the guard above pins only the
              * ObjFunction, and which closure over it is a runtime fact.
              *
-             * jaiJitFinishDeopt builds the frame from the record alone, so a
-             * parameter the callee never read (SLOT_OPAQUE: no register, no
-             * value in the record) would come back null to the interpreted
-             * rest of the body. The descriptor-free call cannot supply it, so
-             * such a callee is refused rather than finished wrongly. */
+             * A callee whose finish would drop an argument is refused, as
+             * emitDirectCall refuses it (finishDropsAnArgument). */
             bool writes = !cfn->jitFuncNoWrite;
             if (writes) {
                 /* Every record inside an inlined body resumes at the OUTER
@@ -317,12 +314,10 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
                                 "not in a saved register";
                     return false;
                 }
-                for (unsigned i = 0; i < argc; i++) {
-                    if ((SlotKind)cfn->jitParamKind[i] == SLOT_OPAQUE) {
-                        e->whyNot = "a writing indirect callee with a "
-                                    "parameter it never reads";
-                        return false;
-                    }
+                if (finishDropsAnArgument(cfn, argc)) {
+                    e->whyNot = "a writing indirect callee with a "
+                                "parameter it never reads";
+                    return false;
                 }
             }
 

@@ -1548,6 +1548,7 @@ bool pushLocalAsValue(Emit *e, unsigned slot);
 bool jitConcatLocals(void);
 bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,
                           unsigned ridx, unsigned argc, uint32_t afterIp);
+bool finishDropsAnArgument(const ObjFunction *cfn, unsigned nargs);
 bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
                                 unsigned firstIdx, unsigned argc);
 void emitMaybeInstResult(Emit *e, unsigned dst, unsigned rat,

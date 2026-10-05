@@ -95,6 +95,9 @@ static bool jitPic1Admissible(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     if (!cfn->jitFuncNoWrite && e->selfSlowCount >= JIT_MAX_SELF_SLOW) {
         return false;
     }
+    if (!cfn->jitFuncNoWrite && finishDropsAnArgument(cfn, nargs)) {
+        return false;
+    }
     return true;
 }
 
