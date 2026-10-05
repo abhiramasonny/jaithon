@@ -414,6 +414,7 @@ this table complete in both directions.
 | `JAITHON_JIT_TICK_ARM` | on | Whether the first tick arms a body, rather than waiting for a second. |
 | `JAITHON_JIT_OSR_FORMS` | `JAI_OSR_MAX` | Cap on compiled forms per OSR loop. |
 | `JAITHON_JIT_OSR_SLOTS` | `JAI_OSR_SLOTS` | Cap on slots an OSR entry will reconstruct. |
+| `JAITHON_JIT_DEPTH_MEMO` | on | Keep each function's verifier depth table (`chunkDepthTable`) from its first compile attempt until the function is freed (`jaiJitForgetFunction`), instead of re-running the verifier on every attempt, retry and OSR variant. 5070 verifier runs became 709 on `check --no-cache lib/jaithon`, 32ms to 10ms of CPU. |
 | `JAITHON_JIT_RECOMPILE` | on | Recompile a body once, when the cold callee its walk stopped at finally compiles. Worth 7.3% on `lib/std`; see the recompile section. |
 
 ### Stress, for finding bugs the default configuration hides

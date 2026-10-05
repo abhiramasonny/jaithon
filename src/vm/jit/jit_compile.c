@@ -202,22 +202,132 @@ bool adoptLocalKind(Emit *e, unsigned slot, SlotKind kind,
     return adoptLocalKindSeen(e, slot, kind, shape, klass, NULL_VAL);
 }
 
+/* ---- The verifier's depth table, once per function ----------------------
+ *
+ * chunkDepthTable used to run the whole verifier (jaiChunkStackDepths ->
+ * verifyChunk) on EVERY attempt: each function-tier attempt, each retry
+ * inside jaiJitCompileFunc, and each OSR variant. On `check --no-cache
+ * lib/jaithon` that was 5156 runs for about 700 bodies and 28% of all compile
+ * time. Bytecode is immutable once loaded and the table depends on nothing
+ * else (the chunk and its constants), so it is computed once and kept until
+ * the function is freed (jaiJitForgetFunction, called from freeObject).
+ *
+ * A side table rather than an ObjFunction field: object.h is part of
+ * JAI_BUILD_ID, and a field there would invalidate every seeded image. Open
+ * addressing on the pointer, with tombstones. The verifier's "no answer" is
+ * remembered too, as DEPTH_NONE: a chunk that does not verify never will.
+ *
+ * JAITHON_JIT_DEPTH_MEMO=0 recomputes per attempt, as before. */
+typedef struct {
+    const ObjFunction *fn;    /* NULL empty, DEPTH_TOMB deleted */
+    int               *depth; /* DEPTH_NONE: the verifier had no answer */
+} DepthMemo;
+
+#define DEPTH_TOMB ((const ObjFunction *)(uintptr_t)1)
+#define DEPTH_NONE ((int *)(uintptr_t)1)
+
+static DepthMemo *sDepthMemo;
+static size_t     sDepthCap;    /* power of two, or 0 */
+static size_t     sDepthUsed;   /* live entries plus tombstones */
+static size_t     sDepthLive;
+
+static bool depthMemoOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_DEPTH_MEMO");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static size_t depthHash(const ObjFunction *fn, size_t mask) {
+    uint64_t h = ((uint64_t)(uintptr_t)fn >> 4) * 0x9E3779B97F4A7C15ull;
+    return (size_t)(h >> 24) & mask;
+}
+
+static bool depthMemoGrow(void) {
+    size_t cap = sDepthCap == 0 ? 256 : sDepthCap * 2;
+    /* Mostly tombstones: rebuild at the same size instead. */
+    if (sDepthCap != 0 && sDepthLive * 4 < sDepthCap) cap = sDepthCap;
+    DepthMemo *t = calloc(cap, sizeof *t);
+    if (t == NULL) return false;
+    for (size_t i = 0; i < sDepthCap; i++) {
+        const ObjFunction *k = sDepthMemo[i].fn;
+        if (k == NULL || k == DEPTH_TOMB) continue;
+        size_t j = depthHash(k, cap - 1);
+        while (t[j].fn != NULL) j = (j + 1) & (cap - 1);
+        t[j] = sDepthMemo[i];
+    }
+    free(sDepthMemo);
+    sDepthMemo = t;
+    sDepthCap  = cap;
+    sDepthUsed = sDepthLive;
+    return true;
+}
+
+static DepthMemo *depthMemoFind(const ObjFunction *fn) {
+    if (sDepthCap == 0) return NULL;
+    size_t mask = sDepthCap - 1;
+    for (size_t j = depthHash(fn, mask);; j = (j + 1) & mask) {
+        if (sDepthMemo[j].fn == fn) return &sDepthMemo[j];
+        if (sDepthMemo[j].fn == NULL) return NULL;
+    }
+}
+
+void jaiJitForgetFunction(const ObjFunction *fn) {
+    if (sDepthLive == 0) return;
+    DepthMemo *m = depthMemoFind(fn);
+    if (m == NULL) return;
+    if (m->depth != DEPTH_NONE) free(m->depth);
+    m->fn = DEPTH_TOMB;
+    m->depth = NULL;
+    sDepthLive--;
+}
+
+/* Every caller hands what chunkDepthTable returned to jitFree; with the memo
+ * on, that table belongs to the memo and is not the caller's to free. */
 void jitFree(int *map, int64_t *depths, int *chunkDepth, int count) {
     JAI_FREE_ARRAY(int, map, count);
     JAI_FREE_ARRAY(int64_t, depths, count);
-    JAI_FREE_ARRAY(int, chunkDepth, count);
+    if (!depthMemoOn()) JAI_FREE_ARRAY(int, chunkDepth, count);
 }
 
 /* The bytecode's own answer for every offset, or NULL if it cannot be had.
  * NULL is not a failure: modelAgreesWithChunk simply has nothing to check
  * against, which is the state the tier was in before this existed. */
 int *chunkDepthTable(const ObjFunction *fn) {
-    int *d = JAI_ALLOC(int, fn->chunk.count + 1);
-    if (d == NULL) return NULL;
-    if (!jaiChunkStackDepths(fn, d)) {
-        JAI_FREE_ARRAY(int, d, fn->chunk.count + 1);
-        return NULL;
+    if (!depthMemoOn()) {
+        int *d = JAI_ALLOC(int, fn->chunk.count + 1);
+        if (d == NULL) return NULL;
+        if (!jaiChunkStackDepths(fn, d)) {
+            JAI_FREE_ARRAY(int, d, fn->chunk.count + 1);
+            return NULL;
+        }
+        return d;
     }
+    DepthMemo *m = depthMemoFind(fn);
+    if (m != NULL) return m->depth == DEPTH_NONE ? NULL : m->depth;
+
+    /* Room first, so nothing below can fail after the verifier has run. An
+     * allocation failure is not a fact about the chunk, so it is not
+     * remembered: the next attempt asks again. */
+    if ((sDepthUsed + 1) * 4 > sDepthCap * 3 && !depthMemoGrow()) return NULL;
+    /* Plain malloc, not JAI_ALLOC: the table outlives the attempt and is
+     * freed from inside the sweep, so it stays out of the collector's
+     * accounting altogether. */
+    int *d = malloc(((size_t)fn->chunk.count + 1) * sizeof *d);
+    if (d == NULL) return NULL;
+    if (!jaiChunkStackDepths(fn, d)) { free(d); d = NULL; }
+
+    size_t mask = sDepthCap - 1;
+    size_t j = depthHash(fn, mask);
+    while (sDepthMemo[j].fn != NULL && sDepthMemo[j].fn != DEPTH_TOMB) {
+        j = (j + 1) & mask;
+    }
+    if (sDepthMemo[j].fn == NULL) sDepthUsed++;
+    sDepthMemo[j].fn = fn;
+    sDepthMemo[j].depth = d != NULL ? d : DEPTH_NONE;
+    sDepthLive++;
     return d;
 }
 
@@ -1512,5 +1622,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return false;
 }
+
+void jaiJitForgetFunction(const ObjFunction *fn) { (void)fn; }
 
 #endif

@@ -259,6 +259,11 @@ void jaiPrepareFn1(Value callee, JaiPreparedFn1 *prepared);
  * including every fallback it makes. */
 bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out);
 
+/* The compiled tier keeps per-function tables that outlive one compile
+ * attempt (jit_compile.c's depth memo). freeObject calls this for every
+ * function it frees; it is one test when the tier never kept anything. */
+void jaiJitForgetFunction(const ObjFunction *fn);
+
 /* The length at which an untyped boxed list that has held only one of int,
  * float or bool takes that kind's unboxed storage, on the push that grows it
  * past this many (object_collection.c, jaiListShapeOnGrow). Returns true when
