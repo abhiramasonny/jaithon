@@ -413,7 +413,13 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
         fpClaim(e, e->valueDepth - 1);
     } else {
         unsigned dst = pushReg(e) - 1;
-        if (dst != rres) emit(e, jaiA64MovX(dst, rres));
+        if (dst != rres && e->inlBorrowResult && jitInlineBorrow()) {
+            /* Consumed by the store that follows before anything can write
+             * the inlined bank again; see Emit::inlBorrowResult. */
+            xBorrowLocal(e, e->valueDepth - 1, rres);
+        } else if (dst != rres) {
+            emit(e, jaiA64MovX(dst, rres));
+        }
     }
     e->inlined = true;
     return true;

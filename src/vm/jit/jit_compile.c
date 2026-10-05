@@ -883,6 +883,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         for (unsigned i = 0; i < body.clobberCount; i++) {
             e.clobberOff[i] = body.clobberOff[i];
         }
+        e.closSiteCount = body.closSiteCount;
+        memcpy(e.closSite, body.closSite, sizeof e.closSite);
         e.hoistPoolCount = 0;
         for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {
             e.hoistPool[e.hoistPoolCount++] = (uint8_t)(JIT_FREE_FIRST + r);
@@ -909,6 +911,13 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 fprintf(stderr, "[jit] %s keeps the iterator index of %u..%u "
                         "in x%u\n", jitFnLabel(fn), e.iterHoist[i].top,
                         e.iterHoist[i].end, e.iterHoist[i].reg);
+            }
+            for (unsigned i = 0; i < e.closHoistCount; i++) {
+                fprintf(stderr, "[jit] %s proves slot %u's closure over "
+                        "%u..%u at the head, %u upvalue(s) in registers\n",
+                        jitFnLabel(fn), e.closHoist[i].slot,
+                        e.closHoist[i].top, e.closHoist[i].end,
+                        e.closHoist[i].upCount);
             }
         }
     }

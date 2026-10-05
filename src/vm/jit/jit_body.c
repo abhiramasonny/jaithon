@@ -100,7 +100,16 @@ static unsigned valueIndexOf(const Emit *e, unsigned idx) {
     return seen;
 }
 
-static bool pushCopyOfEntry(Emit *e, unsigned idx) {
+bool jitInlineBorrow(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_INLINE_BORROW");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool pushCopyOfEntryAs(Emit *e, unsigned idx, bool mayBorrow) {
     if (idx >= e->depth || !holdsRegister(e->stack[idx])) return false;
     unsigned vi = valueIndexOf(e, idx);
     fpSyncOne(e, vi);
@@ -109,9 +118,25 @@ static bool pushCopyOfEntry(Emit *e, unsigned idx) {
                     e->stackSeen[idx], -1)) {
         return false;
     }
+    /* Borrowed rather than copied: an inlined body admits no store to a
+     * local, so the entry it reads cannot change while the borrow lives, and
+     * the settle at the next instruction that cannot read a borrow emits the
+     * same `mov` this would have. `|x| x + step` paid a copy of `x` on the
+     * caller's accumulator chain. JAITHON_JIT_INLINE_BORROW=0 copies. */
+    if (mayBorrow && e->inlining && jitInlineBorrow()) {
+        xBorrowLocal(e, e->valueDepth - 1, src);
+        return true;
+    }
     unsigned dst = pushReg(e) - 1;
     if (dst != src) emit(e, jaiA64MovX(dst, src));
     return true;
+}
+
+/* A copy in the entry's own register, for the arms that go on to write it
+ * in place (inlineIntConstOp) or hand it to an arm written against a
+ * materialised receiver (inlineFieldRead). */
+static bool pushCopyOfEntry(Emit *e, unsigned idx) {
+    return pushCopyOfEntryAs(e, idx, false);
 }
 
 /* A field read inside an inlined body. OP_GET_FIELD_LOCAL names a callee
@@ -274,7 +299,11 @@ static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
         e->whyNot = "an inlined body reading a local it never bound";
         return false;
     }
-    if (op == OP_GET_LOCAL) return pushCopyOfEntry(e, (unsigned)e->inlSlot[a]);
+    /* A plain read: the next instruction either reads it through xHeldIn
+     * or settles it at its top, as for any borrowed local. */
+    if (op == OP_GET_LOCAL) {
+        return pushCopyOfEntryAs(e, (unsigned)e->inlSlot[a], true);
+    }
 
     unsigned b = jaiReadU16(code + off + 3);
     if (b > JIT_MAX_SLOTS || e->inlSlot[b] < 0) {
@@ -282,8 +311,8 @@ static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
         return false;
     }
     if (op == OP_GET_LOCAL2) {
-        return pushCopyOfEntry(e, (unsigned)e->inlSlot[a]) &&
-               pushCopyOfEntry(e, (unsigned)e->inlSlot[b]);
+        return pushCopyOfEntryAs(e, (unsigned)e->inlSlot[a], true) &&
+               pushCopyOfEntryAs(e, (unsigned)e->inlSlot[b], true);
     }
 
     unsigned ia = (unsigned)e->inlSlot[a], ib = (unsigned)e->inlSlot[b];
@@ -719,7 +748,10 @@ bool compileBody(Emit *e, ObjClosure *closure) {
              * Settling here is the same conservative branch a non-whitelisted
              * opcode already takes, and it costs `mov`s that §5 prices at zero.
              */
-            if (joinsHere || e->inProtected || !deferSurvives(op) ||
+            if (joinsHere || e->inProtected ||
+                (!deferSurvives(op) &&
+                 !(op == OP_GET_UPVALUE &&
+                   closUpHoisted(e, closure, code[off + 1]))) ||
                 e->deferCarryCount >= jitCarryLimit()) {
                 settleAll(e);
             } else {

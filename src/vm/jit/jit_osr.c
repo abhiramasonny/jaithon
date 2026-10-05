@@ -761,6 +761,8 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 e.pushOff[i]  = probe.pushOff[i];
                 e.pushSlot[i] = probe.pushSlot[i];
             }
+            e.closSiteCount = probe.closSiteCount;
+            memcpy(e.closSite, probe.closSite, sizeof e.closSite);
             e.stampCount = probe.stampCount;
             e.stampSpill = probe.stampSpill;
             for (unsigned i = 0; i < probe.stampCount; i++) {

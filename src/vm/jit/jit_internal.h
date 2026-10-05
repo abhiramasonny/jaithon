@@ -73,6 +73,12 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 /* A hoisted header is proved distinct from at most this many append targets
  * at the hoist; a loop appending to more lists hoists nothing. */
 #define JIT_MAX_HOIST_ALIAS 4u
+/* Indirect call sites whose closure the measuring pass inlined, and the
+ * closure hoists planned from them (see planClosureHoists). Each hoist keeps
+ * at most JIT_MAX_CLOS_UP of the callee's upvalues in registers. */
+#define JIT_MAX_CLOS_SITES 8u
+#define JIT_MAX_CLOS_HOIST 2u
+#define JIT_MAX_CLOS_UP    2u
 #define JIT_PUSH_UNKNOWN (-1)
 #define JIT_PUSH_FRESH   (-2)
 /* Distinct offsets the `match` arms may branch to across a discarded OP_POP
@@ -666,6 +672,39 @@ typedef struct {
         bool     live;
     } iterHoist[2];
     unsigned  iterHoistCount;
+    /* Indirect call sites where the measuring pass inlined a closure read
+     * straight out of a local: the call's offset, the local, and the sample
+     * closure the inline was made against. Overflow only costs hoists. */
+    struct {
+        uint32_t off;
+        uint8_t  slot;
+        ObjClosure *sample;
+    } closSite[JIT_MAX_CLOS_SITES];
+    unsigned  closSiteCount;
+    /* JAITHON_JIT_CLOSURE_HOIST: over a loop that calls nothing and never
+     * writes the local, an inlined closure's function guard is proved once
+     * at the loop head, and the scalar upvalues its body reads are loaded
+     * there into registers. A closure's `fn` never changes, and with no call
+     * and no OP_SET_UPVALUE in compiled code nothing can write the cell while
+     * the loop runs. See planClosureHoists. */
+    struct {
+        uint32_t top, end;
+        uint8_t  slot;
+        ObjFunction *fn;
+        uint8_t  upCount;
+        uint8_t  upIdx[JIT_MAX_CLOS_UP];
+        uint8_t  upReg[JIT_MAX_CLOS_UP];
+        uint8_t  upKind[JIT_MAX_CLOS_UP];
+    } closHoist[JIT_MAX_CLOS_HOIST];
+    unsigned  closHoistCount;
+    /* 1 + the closure hoist covering the call being inlined, 0 for none;
+     * read by emitGetUpvalue while `inlining`. */
+    unsigned  inlClosHoist;
+    /* The caller stores an inlined call's result straight into a local (the
+     * next instruction is OP_SET_LOCAL or OP_BIND, and nothing branches to
+     * it), so the result may stay a borrow of the inlined bank's register
+     * for that one instruction instead of being copied into the caller's. */
+    bool      inlBorrowResult;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -1243,6 +1282,10 @@ void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
 int hoistFor(const Emit *e, int slot);
 int pushHoistFor(const Emit *e, int slot);
 int iterHoistAt(const Emit *e, uint32_t top);
+int closHoistFor(const Emit *e, int slot, uint32_t at, const ObjFunction *fn);
+bool jitInlineBorrow(void);
+bool closUpHoisted(const Emit *e, ObjClosure *closure, unsigned index);
+void noteClosureSite(Emit *e, int slot, uint32_t off, ObjClosure *sample);
 int hoistForStr(const Emit *e, int slot);
 ObjDict *jitDictExemplar(void);
 bool jitFieldDict(void);

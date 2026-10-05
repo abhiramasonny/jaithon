@@ -671,6 +671,153 @@ int pushHoistFor(const Emit *e, int slot) {
     return -1;
 }
 
+/* JAITHON_JIT_CLOSURE_HOIST: see Emit::closHoist. Default on. */
+static bool jitClosureHoist(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_CLOSURE_HOIST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The measuring pass inlined a closure read out of local `slot` at `off`. */
+void noteClosureSite(Emit *e, int slot, uint32_t off, ObjClosure *sample) {
+    if (!e->measuring || e->inlining || sample == NULL) return;
+    if (slot < 0 || slot > (int)JIT_MAX_SLOTS) return;
+    if (e->closSiteCount >= JIT_MAX_CLOS_SITES) return;
+    e->closSite[e->closSiteCount].off = off;
+    e->closSite[e->closSiteCount].slot = (uint8_t)slot;
+    e->closSite[e->closSiteCount].sample = sample;
+    e->closSiteCount++;
+}
+
+/* The closure hoist that proved local `slot` holds a closure over `fn` for a
+ * loop containing `at`, or -1. */
+int closHoistFor(const Emit *e, int slot, uint32_t at, const ObjFunction *fn) {
+    if (e->measuring || slot < 0) return -1;
+    for (unsigned i = 0; i < e->closHoistCount; i++) {
+        if (e->closHoist[i].slot != (uint8_t)slot) continue;
+        if (e->closHoist[i].fn != fn) continue;
+        if (at < e->closHoist[i].top || at >= e->closHoist[i].end) continue;
+        return (int)i;
+    }
+    return -1;
+}
+
+/* Inlining `f(x)` where `f` is a local closure leaves, on every iteration,
+ * a guard that `f` is still over the function the body was inlined from
+ * (four instructions), and for each upvalue the body reads, a four-load
+ * chain to the cell and a tag check (seven more): eleven of closure_calls'
+ * twenty-two per iteration, every one of them loop-invariant. Proved once at
+ * the head instead, over the OUTERMOST loop that
+ *   - writes no value to the local (so the closure is the one the head saw,
+ *     and its `fn` is immutable),
+ *   - calls nothing (regionCalls: no code can run that might store into the
+ *     captured cell, and x13..x17 survive), and
+ *   - is entered only through its head.
+ * Compiled code has no OP_SET_UPVALUE arm and an inlined body admits none,
+ * so with no call nothing can write the cell while the loop runs. A cell can
+ * still be OPEN -- a live frame's stack slot -- and the one frame that could
+ * write such a slot without a call is this one, which only owns a captured
+ * slot if its chunk makes a closure; then the upvalues stay per-site and only
+ * the guard is hoisted. Upvalues are hoisted as scalars only, so a register
+ * holds no reference the collector would have to see. */
+static bool chunkMakesClosures(const Chunk *c) {
+    for (int off = 0; off < c->count;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return true;
+        if (c->code[off] == OP_CLOSURE || c->code[off] == OP_CLOSE_UPVALUE) {
+            return true;
+        }
+        off += len;
+    }
+    return false;
+}
+
+static void planClosureHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds,
+                              uint32_t regionLo, uint32_t regionHi) {
+    e->closHoistCount = 0;
+    if (!jitClosureHoist() || e->noInline) return;
+    const Chunk *c = &fn->chunk;
+    bool upOk = !chunkMakesClosures(c);
+    for (unsigned i = 0; i < e->closSiteCount; i++) {
+        if (e->closHoistCount >= JIT_MAX_CLOS_HOIST) return;
+        unsigned s = e->closSite[i].slot;
+        ObjClosure *sample = e->closSite[i].sample;
+        ObjFunction *cfn = sample->fn;
+        uint32_t at = e->closSite[i].off;
+        if (s > JIT_MAX_SLOTS || kinds[s] != SLOT_OBJ) continue;
+        if (hoistListReg(e, s) == 0) continue;
+        if (closHoistFor(e, (int)s, at, cfn) >= 0) continue;   /* covered */
+        uint32_t bestTop = 0, bestEnd = 0;
+        for (int off = (int)regionLo; off < (int)regionHi;) {
+            int len = instructionLength(c, off);
+            if (len <= 0) break;
+            uint32_t lt = (uint32_t)off;
+            uint32_t le = loopBodyEnd(c, lt);
+            off += len;
+            if (le == 0 || le <= lt || le > regionHi) continue;
+            if (at < lt || at >= le) continue;
+            if (e->slotWriteHi[s] >= lt && e->slotWriteLo[s] < le) continue;
+            if (regionCalls(e, lt, le)) continue;
+            if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
+                bestTop = lt; bestEnd = le;
+            }
+        }
+        if (bestEnd == 0) continue;
+        /* A second hoist of the same local over an overlapping loop would
+         * guard one function at the head and another inside it. */
+        bool clash = false;
+        for (unsigned h = 0; h < e->closHoistCount; h++) {
+            if (e->closHoist[h].slot == (uint8_t)s &&
+                e->closHoist[h].top < bestEnd && bestTop < e->closHoist[h].end) {
+                clash = true;
+            }
+        }
+        if (clash) continue;
+        unsigned k = e->closHoistCount;
+        e->closHoist[k].top = bestTop;
+        e->closHoist[k].end = bestEnd;
+        e->closHoist[k].slot = (uint8_t)s;
+        e->closHoist[k].fn = cfn;
+        e->closHoist[k].upCount = 0;
+        const Chunk *cc = &cfn->chunk;
+        for (int o = 0; upOk && o < cc->count;) {
+            int len = instructionLength(cc, o);
+            if (len <= 0) break;
+            if (cc->code[o] == OP_GET_UPVALUE) {
+                unsigned idx = cc->code[o + 1];
+                bool dup = false;
+                for (unsigned u = 0; u < e->closHoist[k].upCount; u++) {
+                    if (e->closHoist[k].upIdx[u] == idx) dup = true;
+                }
+                Value seen = NULL_VAL;
+                if (idx < (unsigned)sample->upvalueCount &&
+                    sample->upvalues[idx] != NULL) {
+                    seen = *sample->upvalues[idx]->location;
+                }
+                SlotKind uk = IS_INT(seen) ? SLOT_INT
+                            : IS_FLOAT(seen) ? SLOT_FLOAT
+                            : IS_BOOL(seen) ? SLOT_BOOL : SLOT_OPAQUE;
+                if (!dup && uk != SLOT_OPAQUE &&
+                    e->closHoist[k].upCount < JIT_MAX_CLOS_UP &&
+                    e->hoistPoolCount - e->hoistTaken >= 1u) {
+                    unsigned r = e->hoistPool[e->hoistTaken++];
+                    if (r < e->scratchRoom) e->scratchRoom = r;
+                    unsigned u = e->closHoist[k].upCount++;
+                    e->closHoist[k].upIdx[u] = (uint8_t)idx;
+                    e->closHoist[k].upReg[u] = (uint8_t)r;
+                    e->closHoist[k].upKind[u] = (uint8_t)uk;
+                }
+            }
+            o += len;
+        }
+        e->closHoistCount++;
+    }
+}
+
 void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     if (e->measuring) return;
     const Chunk *c = &fn->chunk;
@@ -856,6 +1003,7 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     }
     planPushHoists(e, c, kinds, regionLo, regionHi);
     planIterHoists(e, c, regionLo, regionHi);
+    planClosureHoists(e, fn, kinds, regionLo, regionHi);
     if (!lean) return;
     /* Versions, for lists stored into inside their own region. */
     for (unsigned h = 0; h < e->hoistCount; h++) {
@@ -977,6 +1125,44 @@ void emitHoistsAt(Emit *e, uint32_t off) {
         emit(e, jaiA64LdrX(e->iterHoist[i].reg, rIt,
                            (unsigned)offsetof(ObjIter, index)));
         e->iterHoist[i].live = true;
+    }
+    for (unsigned i = 0; i < e->closHoistCount; i++) {
+        if (e->closHoist[i].top != off) continue;
+        /* See planClosureHoists. A miss resumes the interpreter at the head
+         * with nothing run; the per-site guard would have sent it to the
+         * call, which is no further than the head can reach without it. */
+        unsigned rf = hoistListReg(e, e->closHoist[i].slot);
+        emit(e, jaiA64SubsXImm(31, rf, 0));
+        branchOnDeoptAt(e, JAI_A64_EQ, off, false);
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rf, (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_CLOSURE));
+        branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, rf,
+                           (unsigned)offsetof(ObjClosure, fn)));
+        emitConstCmp(e, JIT_SCRATCH_B,
+                     (int64_t)(uintptr_t)e->closHoist[i].fn);
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        for (unsigned u = 0; u < e->closHoist[i].upCount; u++) {
+            SlotKind uk = (SlotKind)e->closHoist[i].upKind[u];
+            unsigned tag = uk == SLOT_INT ? VAL_INT
+                         : uk == SLOT_FLOAT ? VAL_FLOAT : VAL_BOOL;
+            unsigned r = e->closHoist[i].upReg[u];
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, rf,
+                               (unsigned)offsetof(ObjClosure, upvalues)));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                               e->closHoist[i].upIdx[u] * 8u));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                               (unsigned)offsetof(ObjUpvalue, location)));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, tag));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
+            if (uk == SLOT_BOOL) {
+                emit(e, jaiA64LdrByte(r, JIT_SCRATCH_A, 8));
+            } else {
+                emit(e, jaiA64LdrX(r, JIT_SCRATCH_A, 8));
+            }
+        }
     }
     for (unsigned i = 0; i < e->pushHoistCount; i++) {
         if (e->pushHoist[i].top != off) continue;
