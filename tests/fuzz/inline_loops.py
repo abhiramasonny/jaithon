@@ -81,7 +81,11 @@ class Gen:
     def helper(self, idx):
         r = self.r
         name = f"h{idx}"
-        kind = r.choice(["ints", "ints", "floats", "any", "plain"])
+        # pair/pairf/triple take two or three lists: each is pinned at the
+        # inline's entry with a fixup of its own, and "pair" is called with
+        # the same list twice.
+        kind = r.choice(["ints", "ints", "floats", "any", "plain",
+                         "pair", "pairf", "triple"])
         params = ["n: int", "k: int"]
         if kind == "ints":
             params.insert(0, "xs: list[int]")
@@ -89,6 +93,12 @@ class Gen:
             params.insert(0, "xs: list[float]")
         elif kind == "any":
             params.insert(0, "xs: list[any]")
+        elif kind == "pair":
+            params[0:0] = ["xs: list[int]", "ys: list[int]"]
+        elif kind == "pairf":
+            params[0:0] = ["xs: list[int]", "ys: list[float]"]
+        elif kind == "triple":
+            params[0:0] = ["xs: list[int]", "ys: list[float]", "zs: list[any]"]
         ret = "float" if kind == "floats" and r.random() < 0.6 else "int"
         ints = ["n", "k", "t", "i"]
         body = []
@@ -109,10 +119,19 @@ class Gen:
             ints = ints + ["j"]
         # The element read, if any.
         elem = None
-        if kind in ("ints", "any", "floats"):
+        if kind in ("ints", "any", "floats", "pair", "pairf", "triple"):
             off = r.choice(["i", "i", f"(i + {r.randint(0, 2)})"])
             elem = f"xs[{off}]"
             body.append(f"{ind}let e = {elem}")
+        if kind in ("pair", "pairf", "triple"):
+            off2 = r.choice(["i", f"(i + {r.randint(0, 2)})", "(n - 1 - i)"])
+            body.append(f"{ind}let f = ys[{off2}]")
+            if kind == "pair":
+                body.append(f"{ind}if f {r.choice(['<', '>', '!='])} e {{ t = t +% f }}")
+            else:
+                body.append(f"{ind}if f > {r.randint(0, 3)}.5 {{ t = t +% 1 }}")
+        if kind == "triple":
+            body.append(f"{ind}t = t +% int(zs[{r.choice(['i', '(i + 1)'])}])")
         if ret == "float":
             src = "e" if elem else "float(i)"
             body.append(f"{ind}t = t * 0.5 + {src}")
@@ -175,7 +194,8 @@ class Gen:
         if kind == "pred":
             return f"(if {name}({n_expr}, {k_expr}) {{ 3 }} else {{ 5 }})"
         lst = {"ints": "ints", "floats": "fls", "any": "mix", "plain": None,
-               "pred": None}[kind]
+               "pred": None, "pair": "ints, ints", "pairf": "ints, fls",
+               "triple": "ints, fls, mix"}[kind]
         args = ([lst] if lst else []) + [n_expr, k_expr]
         c = f"{name}({', '.join(args)})"
         return f"int({c})" if ret == "float" else c
@@ -297,7 +317,11 @@ def main():
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--gc", action="store_true")
+    ap.add_argument("--bin", help="the binary to test (default: ./jaithon)")
     args = ap.parse_args()
+    if args.bin:
+        global JAITHON
+        JAITHON = os.path.abspath(args.bin)
     if args.gc:
         CONFIGS.append(("gc", {"_FLAGS": "--gc-stress=3"}))
     seeds = [args.seed] if args.seed is not None else \
