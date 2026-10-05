@@ -209,6 +209,128 @@ static bool jitDictAddFuse(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_DICT_ADD_INLINE=0 leaves the counting arms below with their
+ * leaf call alone, for a one-binary A/B of emitDictAddInline. */
+static bool jitDictAddInline(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_ADD_INLINE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The branches emitDictAddInline sends to the leaf call, patched once the call
+ * is placed. Each keeps the word it was emitted as, so the patch re-encodes
+ * the same test with the real displacement. */
+typedef struct {
+    int      at[12];
+    unsigned n;
+} AddMiss;
+
+static void addMissHere(Emit *e, AddMiss *m) {
+    if (e->count > JIT_MAX_INSTS) return;
+    for (unsigned i = 0; i < m->n; i++) {
+        int at = m->at[i];
+        if (at < 0 || at >= (int)e->count) continue;
+        int32_t rel = (int32_t)((int)e->count - at);
+        uint32_t w = e->code[at];
+        if ((w & 0xff000010u) == 0x54000000u) {          /* b.cond */
+            e->code[at] = jaiA64BCond(w & 0xfu, rel);
+        } else if ((w & 0x7e000000u) == 0x34000000u) {   /* cbz / cbnz */
+            e->code[at] = jaiA64CbzRetarget(w, rel);
+        } else {                                         /* tbz / tbnz */
+            e->code[at] = (w & 0xfff8001fu) |
+                          (((uint32_t)rel & 0x3fffu) << 5);
+        }
+    }
+}
+
+static void addMissBranch(Emit *e, AddMiss *m, uint32_t word) {
+    if (m->n < sizeof m->at / sizeof m->at[0]) {
+        m->at[m->n++] = (int)e->count;
+    }
+    emit(e, word);
+}
+
+/* The update half of jitDictAddStr, inline: the key's own slot -- the first
+ * one its hash names -- holding that very string and an int, which gets the
+ * step added in place. That is every iteration of a counting loop but a
+ * key's first, and here it costs no call, no argument moves and none of the
+ * leaf's re-checks of what the guards in front of it already proved. Every
+ * other case -- a key that is not a string, a typed dict, an empty table, a
+ * collision, a tombstone, an absent key, a value that is not an int, an add
+ * that overflows -- branches to the leaf call, which settles it as before:
+ * the inline path only ever answers what the leaf would have answered the
+ * same way. Lands on `done` (branchToDepth, always) when it answers.
+ *
+ * Only x9..x12 are written, scratch the call that follows clobbers anyway.
+ * False, having emitted nothing, for a step no add/sub immediate holds. */
+static bool emitDictAddInline(Emit *e, unsigned rDict, unsigned rKey,
+                              int64_t step, bool checkDict,
+                              uint32_t doneOffset, int64_t doneDepth,
+                              AddMiss *m) {
+    m->n = 0;
+    if (!jitDictAddInline() || step < -4095 || step > 4095) return false;
+    const unsigned tableAt = (unsigned)offsetof(ObjDict, table);
+    if (offsetof(ObjDict, valKind) != offsetof(ObjDict, keyKind) + 1 ||
+        (offsetof(ObjDict, keyKind) & 1u) != 0 || sizeof(JaiEntry) != 48) {
+        return false;
+    }
+    if (checkDict) {
+        emit(e, jaiA64LdrW(9, rDict, 0));
+        emit(e, jaiA64SubsXImm(31, 9, OBJ_DICT));
+        addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
+    }
+    /* A string key (OBJ_STRING is 0), an untyped dict, a table with room. */
+    emit(e, jaiA64LdrW(9, rKey, 0));
+    addMissBranch(e, m, 0x35000000u | 9u);                       /* cbnz w9 */
+    emit(e, jaiA64LdrHalf(9, rDict, (unsigned)offsetof(ObjDict, keyKind)));
+    addMissBranch(e, m, 0x35000000u | 9u);                       /* cbnz w9 */
+    emit(e, jaiA64LdrW(11, rDict,
+                       tableAt + (unsigned)offsetof(JaiTable, capacity)));
+    addMissBranch(e, m, 0x34000000u | 11u);                      /* cbz w11 */
+    /* The slot: entries + (hash & (capacity - 1)) * 48. */
+    emit(e, jaiA64LdrX(10, rKey, (unsigned)offsetof(ObjString, hash)));
+    emit(e, jaiA64LdrX(12, rDict,
+                       tableAt + (unsigned)offsetof(JaiTable, entries)));
+    emit(e, jaiA64SubXImm(11, 11, 1));
+    emit(e, jaiA64AndX(9, 10, 11));
+    emit(e, jaiA64AddXLsl(9, 9, 9, 1));
+    emit(e, jaiA64AddXLsl(12, 12, 9, 4));
+    /* Live, and holding this very string. */
+    emit(e, jaiA64LdrW(9, 12, (unsigned)offsetof(JaiEntry, order)));
+    addMissBranch(e, m, jaiA64Tbnz(9, 31, 0));
+    emit(e, jaiA64LdrX(9, 12,
+                       (unsigned)(offsetof(JaiEntry, key) +
+                                  offsetof(Value, as))));
+    emit(e, jaiA64SubsXReg(31, 9, rKey));
+    addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
+    emit(e, jaiA64LdrW(9, 12, (unsigned)offsetof(JaiEntry, key)));
+    emit(e, jaiA64SubsXImm(31, 9, VAL_OBJ));
+    addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
+    /* An int value, and a sum that does not overflow. */
+    const unsigned valAt = (unsigned)offsetof(JaiEntry, value);
+    emit(e, jaiA64LdrW(9, 12, valAt));
+    emit(e, jaiA64SubsXImm(31, 9, VAL_INT));
+    addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
+    emit(e, jaiA64LdrX(10, 12, valAt + (unsigned)offsetof(Value, as)));
+    if (step >= 0) {
+        emit(e, jaiA64AddsXImm(10, 10, (unsigned)step));
+    } else {
+        emit(e, jaiA64SubsXImm(10, 10, (unsigned)(-step)));
+    }
+    addMissBranch(e, m, jaiA64BCond(JAI_A64_VS, 0));
+    emit(e, jaiA64StrX(10, 12, valAt + (unsigned)offsetof(Value, as)));
+    /* insertAt's update half bumps the version; so does the leaf. */
+    const unsigned verAt = tableAt + (unsigned)offsetof(JaiTable, version);
+    emit(e, jaiA64LdrW(9, rDict, verAt));
+    emit(e, jaiA64AddXImm(9, 9, 1));
+    emit(e, jaiA64StrW(9, rDict, verAt));
+    branchToDepth(e, doneOffset, 14u /* always */, doneDepth);
+    return true;
+}
+
 /* Proves from the BYTECODE that the four entries under the get's default are
  * the same two locals loaded twice, back to back: the instructions that end
  * at `off` are exactly `<loads of a, b, a, b> <default>`, where the loads are
@@ -335,6 +457,14 @@ bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
     }
     fpSyncAll(e);
     settleAll(e);
+    AddMiss miss = {.n = 0};
+    if (keyKind == SLOT_OBJ) {
+        (void)emitDictAddInline(e, rDict, rKey,
+                                (int64_t)jaiReadI16(code + off + 8), false,
+                                (uint32_t)(off + 12),
+                                stackSignatureAt(e, e->depth - 5), &miss);
+    }
+    addMissHere(e, &miss);
     emit(e, jaiA64MovX(0, rDict));
     emit(e, jaiA64MovX(1, rKey));
     emit(e, jaiA64MovX(2, rDef));
@@ -381,6 +511,14 @@ bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
     if (!leafRegOk(rDict) || !leafRegOk(rKey)) return false;
     fpSyncAll(e);
     settleAll(e);
+    AddMiss miss = {.n = 0};
+    if (keyKind == SLOT_OBJ) {
+        (void)emitDictAddInline(e, rDict, rKey,
+                                (int64_t)jaiReadI16(code + off + 3), true,
+                                (uint32_t)(off + 7),
+                                stackSignatureAt(e, e->depth - 2), &miss);
+    }
+    addMissHere(e, &miss);
     emit(e, jaiA64MovX(0, rDict));
     emit(e, jaiA64MovX(1, rKey));
     emit(e, jaiA64MovzX(2, 0, 0));

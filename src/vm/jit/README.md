@@ -526,6 +526,7 @@ this table complete in both directions.
 | `JAITHON_JIT_MEMBERSHIP` | on | `in` against a container. |
 | `JAITHON_JIT_DICT_LEAF` | on | String- and int-keyed `d.get(k)`, `d[k]`, `d[k] = v` and `k in d` through a leaf call in front of the descriptor call. |
 | `JAITHON_JIT_DICT_ADD` | on | `d[k] = d.get(k, n) + c` and `d[k] += c` on a dict, the counting idioms, as one leaf call. |
+| `JAITHON_JIT_DICT_ADD_INLINE` | `jitDictAddInline` | `emitDictAddInline`, in front of the `jitDictAddStr` call of both counting arms (`emitDictAddFused`, `emitDictAugAddFused`) when the key is an object: the update of a string key found in the first slot its hash names -- live, holding that very string and an int value -- done inline, the step added with an overflow check, stored back and the table's version bumped, with no call, no argument moves and none of the leaf's re-checks. Anything else -- a key that is not a string, a typed dict, an empty table, a collision, an absent key, a value that is not an int, an overflow, a step outside an add/sub immediate -- branches to the leaf call, unchanged. Writes only x9..x12. 1.15x in cycles on `dict_ops` on top of the f-string memo. |
 | `JAITHON_JIT_DICT_PROBE` | on | Compile a dict known only by its predicted type (`var d = {}` in the body) against a probe. |
 | `JAITHON_JIT_DICT_KEYS_ITER` | on | `for k in d` in the function tier: the keys stepped inline. |
 | `JAITHON_JIT_DUP` | on | `OP_DUP` and `OP_DUP2`, which every augmented subscript assignment (`xs[i] += v`, `d[k] += v`) is made of. |
