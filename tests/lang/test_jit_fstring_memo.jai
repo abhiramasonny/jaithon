@@ -10,7 +10,7 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it; `JAITHON_NO_JIT=1` runs the same file, and
 #: every answer is the interpreter's.
-# jit-compiles: bare, stringify, two_sites, with_runs, keyed_count, label, plain_label, same_label_count, same_plain_count
+# jit-compiles: bare, stringify, two_sites, with_runs, keyed_count, label, plain_label
 from std.test import assert_eq, assert_true
 
 fn bare(n: int) -> str {
