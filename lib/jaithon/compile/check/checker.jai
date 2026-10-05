@@ -622,7 +622,9 @@ fn _walk_imports(
 ) -> bool {
     if stack.len() >= MAX_IMPORT_DEPTH { return true }
     for edge in edges {
-        let sig = loader.load(edge.dotted, from_dir)
+        # Only `path` and `imports` are read below, so a kept signature
+        # answers without a parse: most of a closure is never asked for more.
+        let sig = loader.load_edges(edge.dotted, from_dir)
         if sig is null {
             _report_missing(c, loader, edge, stack[stack.len() - 1])
             continue

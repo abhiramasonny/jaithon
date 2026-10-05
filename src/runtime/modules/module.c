@@ -303,7 +303,58 @@ static FrontEndPause frontEndLoadBegin(void) {
     return p;
 }
 
+/* The identity of the front end this process runs, for a cache that holds
+ * what it produced: the signature cache in lib/jaithon/compile/check/modsig.jai.
+ * JAI_BUILD_ID does not move when only the compiler's Jaithon sources do, so it
+ * cannot say which parser wrote an entry. This is a hash over every seed
+ * image's header, each of which records the hash of the source it was built
+ * from, so any reseed moves it. "none" once a front-end module came from
+ * anywhere but this binary's seed -- a cache built from edited compiler
+ * sources, say -- since nothing then names the parser that is running.
+ * Exported as JAITHON_FRONT_END_ID after every front-end load; the reader
+ * looks it up when it first needs it, which is after that. */
+static bool sFrontEndOffSeed;
+
+static uint64_t fnvMix(uint64_t h, const unsigned char *data, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        h ^= data[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void exportFrontEndIdentity(void) {
+    static int exported = -1;   /* -1 not yet, 0 "none", 1 the seed's hash */
+    int want = (sFrontEndOffSeed || seedDisabled() || jaiSeedCount() == 0) ? 0 : 1;
+    if (want == exported) return;
+    exported = want;
+    char text[32] = "none";
+    if (want) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < jaiSeedCount(); i++) {
+            const char *key = jaiSeedModuleAt(i);
+            unsigned char head[32];
+            size_t n = jaiSeedPeekAt(i, head, sizeof head);
+            h = fnvMix(h, (const unsigned char *)key, strlen(key) + 1);
+            h = fnvMix(h, head, n);
+        }
+        snprintf(text, sizeof text, "%016llx", (unsigned long long)h);
+    }
+    (void)setenv("JAITHON_FRONT_END_ID", text, 1);
+}
+
+/* Whether `seeded`, the seed entry for a module the front-end window just
+ * loaded from a cache whose source hashes to `hash`, was built from that same
+ * source -- so the cache and the seed hold the same compiler. */
+static bool seedBuiltFrom(const JaiSeedEntry *seeded, uint64_t hash) {
+    uint64_t recorded = 0;
+    return seeded != NULL &&
+           jaicRecordedHash(seeded->image, seeded->length, &recorded) &&
+           recorded == hash;
+}
+
 static void frontEndLoadEnd(FrontEndPause p, bool loaded) {
+    exportFrontEndIdentity();
     if (!p.paused) return;
     jaiGCEnable(true);
     size_t now = jaiHeapBytes;
@@ -744,6 +795,8 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
             jaiCacheReadFree(cacheData, cacheLen);
             if (cached != NULL) {
                 if (traceLoads()) fprintf(stderr, "load cache   %s\n", path);
+                if (sLoadingFrontEnd && !seedBuiltFrom(seeded, hash))
+                    sFrontEndOffSeed = true;
                 return cached;
             }
             /* Stale, corrupt, or from another compiler: recompile silently. */
@@ -782,6 +835,9 @@ static ObjFunction *loadModuleBody(ObjModule *module, const char *path) {
             }
         }
     }
+
+    /* Compiled here, inside the window: not the seed's compiler. */
+    if (sLoadingFrontEnd) sFrontEndOffSeed = true;
 
     ObjFunction *body = NULL;
     if (selfHosting()) {

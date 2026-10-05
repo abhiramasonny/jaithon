@@ -83,6 +83,15 @@ pub class ModuleSig {
     pub let imports: list[SigImport]
     #: Modules re-exported wholesale by a `from ... import *`.
     pub let wildcards: list[str]
+    #: Whether everything above is filled in. False only between
+    #: `SigLoader.load_edges` answering from a kept signature -- `path` and
+    #: `imports` are then exact -- and the first `SigLoader.load` of it.
+    pub var parsed: bool
+
+    #: Until `parsed`: the source's bytes, and the kept signature's lines
+    #: naming the bodies to blank -- read only if something asks for more.
+    var _raw: any
+    var _ranges: any
 
     pub fn init(self, path: str, dotted: str, file_id: int) {
         self.path = path
@@ -94,6 +103,67 @@ pub class ModuleSig {
         self.reexports = []
         self.imports = []
         self.wildcards = []
+        self.parsed = true
+        self._raw = null
+        self._ranges = null
+    }
+
+    #: Fill in everything from `raw`, the module's bytes, and `text`, them
+    #: decoded: parse, keep the signature on disk, collect, strip.
+    pub fn parse_source(self, raw: any, text: str) -> void {
+        let program = parse(text, self.file_id)
+        if program != null and program.kind == NodeKind.Program and _sig_cache_on() {
+            _keep_signature(self.path, raw, program)
+        }
+        self._fill(program)
+    }
+
+    #: Take `path` and `imports` from a kept signature and defer the rest
+    #: until `ensure_parsed`. `edges` holds `(start, end, dotted)` per import;
+    #: `ranges` is the kept signature's `start end` lines for the bodies to
+    #: blank, as bytes.
+    pub fn defer_parse(self, raw: any, edges: list[tuple[int, int, str]], ranges: any) {
+        for (start, end, dotted) in edges {
+            self.imports.push(SigImport(dotted, Span(self.file_id, start, end)))
+        }
+        self._raw = raw
+        self._ranges = ranges
+        self.parsed = false
+    }
+
+    #: Parse what `defer_parse` held back: the source with its bodies blanked,
+    #: or the whole source when that does not parse here.
+    pub fn ensure_parsed(self) -> void {
+        if self.parsed { return }
+        let raw = self._raw
+        let lines = self._ranges
+        self._raw = null
+        self._ranges = null
+        self.parsed = true
+        while self.imports.len() > 0 { let _dropped = self.imports.pop() }
+
+        var program: Node? = null
+        let ranges = _read_ranges(lines)
+        let blanked = if ranges is null { null } else { _blank(raw, ranges) }
+        if blanked is not null { program = parse(blanked, self.file_id) }
+        if program is not null and program.kind == NodeKind.Program {
+            self._fill(program)
+            return
+        }
+        let source = _decode(raw)
+        if source is null {
+            self._fill(null)
+            return
+        }
+        self.parse_source(raw, source)
+    }
+
+    fn _fill(self, program: Node?) -> void {
+        self.program = program
+        if program != null and program.kind == NodeKind.Program {
+            _collect(self, program.child_list("stmts"))
+            if not _KEEP_SIG_BODIES { _strip_bodies(program.child_list("stmts")) }
+        }
     }
 
     #: `"std.gui.Window"`: the name an imported type is interned under, so two
@@ -164,6 +234,17 @@ pub class SigLoader {
     #: the directory of the file that wrote the import. Null, silently, when it
     #: cannot be found. A file that fails to parse is still cached, empty.
     pub fn load(self, dotted: str, from_dir: str = "") -> ModuleSig? {
+        let sig = self.load_edges(dotted, from_dir)
+        if sig is not null { sig.ensure_parsed() }
+        return sig
+    }
+
+    #: `load` for a caller that reads only `path` and `imports` -- the import
+    #: walk, which visits a module's whole closure to find a cycle and reads
+    #: nothing else. From a kept signature that is two small reads and no
+    #: parse; `load` parses it when something asks for more. File ids are
+    #: handed out here, so they come out in the same order either way.
+    pub fn load_edges(self, dotted: str, from_dir: str = "") -> ModuleSig? {
         if dotted == "" { return null }
         let resolved = self._resolve(dotted, from_dir)
         if resolved is null { return null }
@@ -177,16 +258,20 @@ pub class SigLoader {
             return shared
         }
 
-        let text = read_source(resolved)
-        if text is null { return null }
+        let raw = _read_bytes(resolved)
+        if raw is null { return null }
+        let kept = if _sig_cache_on() { _read_kept(resolved, raw) } else { null }
+        var text: str? = null
+        if kept is null {
+            text = _decode(raw)
+            if text is null { return null }
+        }
 
         let sig = ModuleSig(resolved, dotted, self._take_file_id())
-
-        let program = parse(text, sig.file_id)
-        sig.program = program
-        if program != null and program.kind == NodeKind.Program {
-            _collect(sig, program.child_list("stmts"))
-            if not _KEEP_SIG_BODIES { _strip_bodies(program.child_list("stmts")) }
+        if kept is not null {
+            sig.defer_parse(raw, kept.edges, kept.ranges)
+        } else {
+            sig.parse_source(raw, text ?? "")
         }
 
         self._cache[resolved] = sig
@@ -247,13 +332,21 @@ pub class SigLoader {
     #: The signature parsed from `file_id`, or null when that file is not one.
     #: Spans carry their file, so an indirectly reached declaration traces back.
     pub fn for_file(self, file_id: int) -> ModuleSig? {
-        if file_id in self._by_file { return self._by_file[file_id] }
-        return null
+        if file_id not in self._by_file { return null }
+        let sig = self._by_file[file_id]
+        sig.ensure_parsed()
+        return sig
     }
 
     #: Every signature loaded so far, in load order.
     pub fn loaded(self) -> list[ModuleSig] {
-        return [self._by_file[given] for given in self._by_file.keys().sorted()]
+        var out: list[ModuleSig] = []
+        for given in self._by_file.keys().sorted() {
+            let sig = self._by_file[given]
+            sig.ensure_parsed()
+            out.push(sig)
+        }
+        return out
     }
 
     fn _find_in(self, sig: ModuleSig, name: str, depth: int) -> tuple[Node?, ModuleSig?] {
@@ -261,6 +354,7 @@ pub class SigLoader {
             self._partial = true
             return (null, null)
         }
+        sig.ensure_parsed()
         if sig.program is null { self._partial = true }
         for entry in sig.decls {
             if entry.name == name { return (entry.decl, sig) }
@@ -619,12 +713,314 @@ fn _is_dir(path: str) -> bool {
 }
 
 pub fn read_source(path: str) -> str? {
+    let raw = _read_bytes(path)
+    if raw is null { return null }
+    return _decode(raw)
+}
+
+fn _read_bytes(path: str) -> any {
     try {
         let handle = __prim__.io_open(path, "rb")
         let raw = __prim__.io_read(handle, -1)
         __prim__.io_close(handle)
+        return raw
+    } catch _failure: Error {
+        return null
+    }
+}
+
+fn _decode(raw: any) -> str? {
+    try {
         return __prim__.str_decode(raw)
     } catch _failure: Error {
         return null
     }
+}
+
+# ------------------------------------------------------------------
+# The signature cache
+# ------------------------------------------------------------------
+
+#: Whether a signature outlives the process that parsed it.
+#: `JAITHON_SIG_CACHE=0` parses every imported module from source, as before;
+#: `--no-cache` sets it, because that flag promises everything is compiled from
+#: source. `JAITHON_SIG_BODIES=1` turns it off too, since what is kept has no
+#: bodies to keep.
+#:
+#: What is kept is the module's import edges, the byte range of every body
+#: `_strip_bodies` would empty, and an exact copy of the source it was made
+#: from. The import walk reads the edges and nothing else, so most of a closure
+#: is never parsed at all. A module something asks more of is parsed with
+#: those bodies overwritten by spaces, newlines left where they were: every
+#: byte offset -- so every span -- is unchanged, and the tree is the one
+#: `_strip_bodies` leaves, at a fraction of the cost (bodies are 63% of
+#: lib/jaithon's bytes). The parser that reads it is the one running, so
+#: nothing about the tree's shape is frozen into the file.
+#:
+#: The key is the source itself, compared byte for byte -- a memcmp, cheaper
+#: than any hash and with nothing to collide -- plus the build, the front end
+#: (`JAITHON_FRONT_END_ID`, which the runtime derives from the seed: a reseed
+#: moves it where the build id does not) and `_SIG_CACHE_VERSION`. With no
+#: front-end identity -- the compiler running from anything but the binary's
+#: seed -- nothing is read or written. A signature depends on its own module's
+#: bytes and nothing else: a re-export is recorded by name and followed through
+#: that module's own signature. One is written only for a module that parsed, so
+#: whether a module parses is always the full parser's answer: a module with
+#: an error anywhere, a body included, is re-read from source every time and
+#: still offers nothing. A mismatch, a short or damaged file, a blanked text
+#: this parser cannot read, or a directory that cannot be written is a silent
+#: miss.
+let _SIG_CACHE: bool = (__prim__.os_env("JAITHON_SIG_CACHE") ?? "1") != "0" and not _KEEP_SIG_BODIES
+
+#: Bump when what a kept text means changes: which bodies are blanked, or the
+#: parser's idea of where a body ends.
+const _SIG_CACHE_VERSION: int = 2
+
+const _SIG_CACHE_DIR: str = "__jaicache__"
+const _SIG_CACHE_EXT: str = ".jsig"
+
+const _BYTE_LF: int = 10
+const _BYTE_LBRACE: int = 123
+const _BYTE_RBRACE: int = 125
+
+#: The text a kept signature is parsed from for `source`, or null when
+#: `source` does not parse. Parsing it gives the tree `SigLoader.load` keeps.
+pub fn signature_text(source: str, file_id: int = 1) -> str? {
+    let program = parse(source, file_id)
+    if program is null or program.kind != NodeKind.Program { return null }
+    return _blank(__prim__.str_encode(source), _body_ranges(program.child_list("stmts")))
+}
+
+#: Whether signatures are being kept on disk in this process.
+pub fn signature_cache_enabled() -> bool {
+    return _sig_cache_on()
+}
+
+#: The front end's identity, or "" when there is none to key on. Read each
+#: time rather than once: the runtime exports it when the front end has
+#: loaded, which is after this module's own top level ran, and a process that
+#: imports this module itself may load the front end later still.
+fn _front_end() -> str {
+    let found = __prim__.os_env("JAITHON_FRONT_END_ID") ?? ""
+    if found == "none" or found.contains(" ") { return "" }
+    return found
+}
+
+fn _sig_cache_on() -> bool {
+    return _SIG_CACHE and _front_end() != ""
+}
+
+#: `src/__jaicache__/util.jsig` for `src/util.jai`, beside its `.jaic`.
+fn _kept_path(path: str) -> str {
+    let cut = path.rfind("/")
+    let dir = if cut < 0 { "." } else { path[:cut] }
+    var base = path[cut + 1:]
+    if base.ends_with(MODULE_EXT) { base = base[:base.len() - MODULE_EXT.len()] }
+    return f"{dir}/{_SIG_CACHE_DIR}/{base}{_SIG_CACHE_EXT}"
+}
+
+#: What a kept signature holds, once it is known to belong to the source.
+class _Kept {
+    #: `(start, end, dotted)` for each import, in source order.
+    pub let edges: list[tuple[int, int, str]]
+    #: The `start end` lines of the bodies to blank, as bytes: the import walk
+    #: never needs them, so they are not split until a parse does.
+    pub let ranges: any
+
+    pub fn init(self, edges: list[tuple[int, int, str]], ranges: any) {
+        self.edges = edges
+        self.ranges = ranges
+    }
+}
+
+#: The kept signature for `raw`, the bytes just read from `path`, or null.
+#:
+#: The file is one line `jsig VERSION BUILD FRONT_END LENGTH EDGES RANGES CRC`,
+#: then EDGES bytes of `start end dotted` lines, one per import, then RANGES
+#: bytes of `start end` lines, one per body to blank, then the LENGTH bytes of
+#: source it was made from. CRC covers the two sets of lines.
+fn _read_kept(path: str, raw: any) -> _Kept? {
+    let kept = _read_bytes(_kept_path(path))
+    if kept is null { return null }
+    try {
+        let newline = __prim__.bytes_find(kept, _BYTE_LF)
+        if newline < 0 { return null }
+        let header = _decode(__prim__.bytes_slice(kept, 0, newline))
+        if header is null { return null }
+        let fields = header.split(" ")
+        if fields.len() != 8 or fields[0] != "jsig" { return null }
+        if int(fields[1]) != _SIG_CACHE_VERSION { return null }
+        if int(fields[2]) != __prim__.jaic_build_id() { return null }
+        if fields[3] != _front_end() { return null }
+        let length = __prim__.bytes_len(raw)
+        if int(fields[4]) != length { return null }
+        let edges_length = int(fields[5])
+        let ranges_length = int(fields[6])
+        let edges_start = newline + 1
+        let ranges_start = edges_start + edges_length
+        let source_start = ranges_start + ranges_length
+        if edges_length < 0 or ranges_length < 0 { return null }
+        if __prim__.bytes_len(kept) != source_start + length { return null }
+        let copy = __prim__.bytes_slice(kept, source_start, source_start + length)
+        if __prim__.bytes_cmp(copy, raw) != 0 { return null }
+        let meta = __prim__.bytes_slice(kept, edges_start, source_start)
+        if __prim__.crc32(meta) != int(fields[7]) { return null }
+
+        let lines = _decode(__prim__.bytes_slice(kept, edges_start, ranges_start))
+        if lines is null { return null }
+        var edges: list[tuple[int, int, str]] = []
+        for line in lines.split("\n") {
+            if line == "" { continue }
+            let parts = line.split(" ")
+            if parts.len() != 3 { return null }
+            edges.push((int(parts[0]), int(parts[1]), parts[2]))
+        }
+        return _Kept(edges, __prim__.bytes_slice(kept, ranges_start, source_start))
+    } catch _damaged: Error {
+        return null
+    }
+}
+
+#: The `(start, end)` pairs of a kept signature's range lines, or null when
+#: they do not read as such.
+fn _read_ranges(lines: any) -> list[tuple[int, int]]? {
+    try {
+        let text = _decode(lines)
+        if text is null { return null }
+        var ranges: list[tuple[int, int]] = []
+        for line in text.split("\n") {
+            if line == "" { continue }
+            let parts = line.split(" ")
+            if parts.len() != 2 { return null }
+            ranges.push((int(parts[0]), int(parts[1])))
+        }
+        return ranges
+    } catch _damaged: Error {
+        return null
+    }
+}
+
+#: Write the kept signature for `program`, parsed from `raw`, read from
+#: `path`. Best effort: a temporary file renamed into place, so a reader sees
+#: a whole file or none, and two processes writing one cannot interleave.
+fn _keep_signature(path: str, raw: any, program: Node) -> void {
+    let target = _kept_path(path)
+    # Named by the clock, not `random_u64`: that would move the program's own
+    # random sequence whenever a `run` compiles an import after seeding it.
+    let temporary = f"{target}.{__prim__.time_mono()}.tmp"
+    try {
+        let stmts = program.child_list("stmts")
+        var edge_lines: list[str] = []
+        for node in stmts {
+            if node.kind != NodeKind.Import and node.kind != NodeKind.FromImport { continue }
+            let dotted = node.opt_text("path")
+            if dotted is null { continue }
+            if dotted == "" or dotted.contains(" ") or dotted.contains("\n") { return }
+            edge_lines.push(f"{node.span.start} {node.span.end} {dotted}\n")
+        }
+        let ranges = _body_ranges(stmts)
+        if not _ranges_fit(raw, ranges) { return }
+        var range_lines: list[str] = []
+        for (start, end) in ranges { range_lines.push(f"{start} {end}\n") }
+        let edges = __prim__.str_encode("".join(edge_lines))
+        let blanks = __prim__.str_encode("".join(range_lines))
+
+        let dir = _dirname(target)
+        if not _is_dir(dir) { __prim__.io_mkdir(dir) }
+        let handle = __prim__.io_open(temporary, "wb")
+        let length = __prim__.bytes_len(raw)
+        let build = __prim__.jaic_build_id()
+        let front = _front_end()
+        let sizes = f"{__prim__.bytes_len(edges)} {__prim__.bytes_len(blanks)}"
+        let crc = __prim__.crc32(__prim__.bytes_concat(edges, blanks))
+        let header = f"jsig {_SIG_CACHE_VERSION} {build} {front} {length} {sizes} {crc}\n"
+        __prim__.io_write(handle, header)
+        __prim__.io_write(handle, edges)
+        __prim__.io_write(handle, blanks)
+        __prim__.io_write(handle, raw)
+        __prim__.io_close(handle)
+        __prim__.io_rename(temporary, target)
+    } catch _failure: Error {
+        # A write that failed part way must not leave its temporary behind.
+        try {
+            if _is_regular_file(temporary) { __prim__.io_remove(temporary) }
+        } catch _left: Error {
+        }
+    }
+}
+
+#: The `(start, end)` byte range of every body `_strip_bodies` would empty,
+#: in source order. A generator's body is left out: whether a function is one
+#: is read off its body.
+fn _body_ranges(stmts: list[Node]) -> list[tuple[int, int]] {
+    var blocks: list[Node] = []
+    for node in stmts {
+        if node.kind == NodeKind.FnDecl {
+            _blank_target(blocks, node)
+        } elif node.kind == NodeKind.ClassDecl {
+            for method in node.child_list("methods") { _blank_target(blocks, method) }
+            for method in node.child_list("getters") { _blank_target(blocks, method) }
+            for method in node.child_list("setters") { _blank_target(blocks, method) }
+        } elif node.kind == NodeKind.TraitDecl or node.kind == NodeKind.EnumDecl {
+            for method in node.child_list("methods") { _blank_target(blocks, method) }
+        }
+    }
+    var ranges: list[tuple[int, int]] = []
+    for block in blocks { ranges.push((block.span.start, block.span.end)) }
+    ranges.sort(|range| range[0])
+    return ranges
+}
+
+#: Whether every range is a `{` ... `}` of `raw`, in order and apart.
+fn _ranges_fit(raw: any, ranges: list[tuple[int, int]]) -> bool {
+    let total = __prim__.bytes_len(raw)
+    var position = 0
+    for (start, end) in ranges {
+        if start < position or end > total or end - start < 2 { return false }
+        if __prim__.bytes_get(raw, start) != _BYTE_LBRACE { return false }
+        if __prim__.bytes_get(raw, end - 1) != _BYTE_RBRACE { return false }
+        position = end
+    }
+    return true
+}
+
+#: `raw` decoded, with the inside of every range turned to spaces and its
+#: newlines kept, so every byte stays where it was. Null when a range is not
+#: a `{` ... `}` of `raw`.
+fn _blank(raw: any, ranges: list[tuple[int, int]]) -> str? {
+    if not _ranges_fit(raw, ranges) { return null }
+    let total = __prim__.bytes_len(raw)
+    var parts: list[str] = []
+    var position = 0
+    for (start, end) in ranges {
+        let outside = _decode(__prim__.bytes_slice(raw, position, start + 1))
+        if outside is null { return null }
+        parts.push(outside)
+        var at = start + 1
+        let stop = end - 1
+        while at < stop {
+            let newline = __prim__.bytes_find(raw, _BYTE_LF, at, stop)
+            if newline < 0 {
+                parts.push(" " * (stop - at))
+                at = stop
+            } else {
+                if newline > at { parts.push(" " * (newline - at)) }
+                parts.push("\n")
+                at = newline + 1
+            }
+        }
+        position = stop
+    }
+    let rest = _decode(__prim__.bytes_slice(raw, position, total))
+    if rest is null { return null }
+    parts.push(rest)
+    return "".join(parts)
+}
+
+fn _blank_target(blocks: list[Node], fn_node: Node) -> void {
+    if fn_node.flag("isGenerator") { return }
+    let body = fn_node.child("body")
+    if body is null or body.kind != NodeKind.Block { return }
+    if body.child_list("stmts").len() == 0 { return }
+    blocks.push(body)
 }
