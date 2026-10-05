@@ -473,10 +473,11 @@ fn warp(
     src.flush()
     #: The inverse is the caller's matrix or a shared one from the cache, and
     #: neither is this call's to release.
+    let inverse_rows = if perspective { 3 } else { 2 }
     let inverse = if flags & WARP_INVERSE_MAP != 0 {
         matrix
     } else {
-        cached_weights(if perspective { 3 } else { 2 }, 3, _inverse_values(matrix, perspective))
+        cached_weights(inverse_rows, 3, _inverse_values(matrix, perspective))
     }
     inverse.flush()
     let out = Mat(size.height, size.width, src.flags)

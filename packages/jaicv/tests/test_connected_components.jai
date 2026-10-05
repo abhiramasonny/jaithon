@@ -25,12 +25,17 @@ fn noise(rows: int, cols: int, seed: int, density: int) -> list[float] {
 fn scan_position(y: int, x: int, cols: int, connectivity: int) -> int {
     if connectivity == 4 { return y * cols + x }
     let blocks = (cols + 1) // 2
-    return ((y // 2) * blocks + x // 2) * 4 + (y % 2) * 2 + x % 2
+    return (y // 2 * blocks + x // 2) * 4 + y % 2 * 2 + x % 2
 }
 
 #: Label by flood fill, then number the components by the smallest scan
 #: position each one covers.
-fn reference(values: list[float], rows: int, cols: int, connectivity: int) -> tuple[int, list[int]] {
+fn reference(
+    values: list[float],
+    rows: int,
+    cols: int,
+    connectivity: int
+) -> tuple[int, list[int]] {
     var parts = [0 for _index in 0..rows * cols]
     var firsts: list[int] = []
     var part = 0
