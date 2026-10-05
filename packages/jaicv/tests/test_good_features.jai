@@ -49,6 +49,78 @@ fn test_a_speckled_frame_gives_the_same_corners_either_way() -> void {
     image.release()
 }
 
+#: Good features worked out on the host from the same response: every
+#: interior pixel at least the floor and no smaller than any neighbour,
+#: strongest first with ties in raster order, then spaced out greedily.
+fn reference(image: Mat, max_corners: int, quality: float, min_distance: float) -> list[float] {
+    let response = cv.corner_min_eigen_val(image, 3, 3)
+    let values = response.to_list()
+    response.release()
+    let rows = image.rows
+    let cols = image.cols
+    var strongest = values[0]
+    for value in values { if value > strongest { strongest = value } }
+    if strongest <= 0.0 { return [] }
+    let floor_value = strongest * quality
+    var found: list[int] = []
+    for y in 1..rows - 1 {
+        for x in 1..cols - 1 {
+            let here = values[y * cols + x]
+            if here < floor_value { continue }
+            var peak = true
+            for dy in -1..2 {
+                for dx in -1..2 {
+                    if values[(y + dy) * cols + x + dx] > here { peak = false }
+                }
+            }
+            if peak { found.push(y * cols + x) }
+        }
+    }
+    let ordered = found.sort(key: |at| values[at], reverse: true)
+    var kept: list[float] = []
+    for at in ordered {
+        if kept.len() >= max_corners * 2 { break }
+        let x = float(at % cols)
+        let y = float(at // cols)
+        var clear = true
+        var index = 0
+        while index < kept.len() {
+            let dx = kept[index] - x
+            let dy = kept[index + 1] - y
+            if dx * dx + dy * dy < min_distance * min_distance { clear = false }
+            index += 2
+        }
+        if clear {
+            kept.push(x)
+            kept.push(y)
+        }
+    }
+    return kept
+}
+
+fn matches_reference(image: Mat, max_corners: int, min_distance: float) -> void {
+    let got = cv.good_features_to_track(image, max_corners, 0.01, min_distance)
+    let want = reference(image, max_corners, 0.01, min_distance)
+    assert_eq(got.len() * 2, want.len())
+    for index in 0..got.len() {
+        assert_eq(got[index].x, want[index * 2])
+        assert_eq(got[index].y, want[index * 2 + 1])
+    }
+}
+
+fn test_corners_match_a_host_reference() -> void {
+    if not gpu.is_available() { return }
+    let tied = repeating(60, 80)
+    let speckle = speckled(60, 80)
+    for image in [tied, speckle] {
+        matches_reference(image, 4, 5.0)
+        matches_reference(image, 15, 3.0)
+        matches_reference(image, 40, 2.0)
+    }
+    tied.release()
+    speckle.release()
+}
+
 fn test_a_tied_frame_gives_the_same_corners_either_way() -> void {
     if not gpu.is_available() { return }
     let image = repeating(240, 320)
