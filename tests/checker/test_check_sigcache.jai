@@ -153,9 +153,26 @@ fn test_a_source_that_does_not_parse_has_no_kept_text() -> void {
 # Across processes
 # ------------------------------------------------------------------
 fn test_the_cache_is_on_unless_switched_off() -> void {
+    let front_end = __prim__.os_env("JAITHON_FRONT_END_ID") ?? ""
     let wanted = (__prim__.os_env("JAITHON_SIG_CACHE") ?? "1") != "0" and
-        (__prim__.os_env("JAITHON_SIG_BODIES") ?? "0") == "0"
+        (__prim__.os_env("JAITHON_SIG_BODIES") ?? "0") == "0" and
+        front_end != "" and front_end != "none"
     assert_eq(signature_cache_enabled(), wanted)
+}
+
+fn test_the_running_front_end_has_an_identity() -> void {
+    # The test runner compiled this file, so the front end is loaded and the
+    # runtime has said which one it is: the seed's, in a tree that is seeded.
+    let front_end = __prim__.os_env("JAITHON_FRONT_END_ID") ?? ""
+    assert_true(front_end != "", "the runtime exported no front-end identity")
+}
+
+fn test_a_kept_signature_names_the_front_end_that_wrote_it() -> void {
+    if not signature_cache_enabled() { return }
+    let dir = _module_dir("identity", TRICKY)
+    let _cold = _load_fresh(dir)
+    let header = _read(f"{dir}/__jaicache__/tricky.jsig").split("\n")[0].split(" ")
+    assert_eq(header[3], __prim__.os_env("JAITHON_FRONT_END_ID") ?? "")
 }
 
 fn test_a_second_process_reads_the_edges_without_parsing() -> void {
