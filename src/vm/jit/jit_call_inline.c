@@ -211,7 +211,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
                          unsigned argc, uint32_t callOff, int calleeReg,
                          bool method);
 static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
-                           unsigned argc, uint32_t callOff);
+                           unsigned argc, uint32_t callOff, bool method);
 
 /* Whether the entry an inlined body's slot names is a receiver whose field
  * `name` the OP_GET_FIELD arm can read: an instance of a pinned class, a
@@ -351,8 +351,8 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
     if (!inlinableBody(callee, argc, &maxSlot, &readsUpvalue, &constructs)) {
         /* Not straight-line: a direct call to a small body with loops in it
          * may still stand where the call is, with its locals in homes. */
-        if (!method && calleeReg < 0) {
-            return inlineLoopCall(e, caller, callee, argc, callOff);
+        if (calleeReg < 0) {
+            return inlineLoopCall(e, caller, callee, argc, callOff, method);
         }
         return false;
     }
@@ -706,8 +706,12 @@ static bool jitInlineLoopsOn(void) {
  * collect either (noteScratchClobber refuses any call that slips through).
  * Writes to its OWN locals are fine: they are renumbered into homes the
  * interpreter never sees. */
-static bool inlinableLoopBody(ObjClosure *callee, unsigned argc,
+static bool inlinableLoopBody(ObjClosure *callee, unsigned argc, bool method,
                               unsigned *maxSlotOut) {
+    /* Slot 0 is the closure itself for a function, which nothing can read
+     * through a home; for a method it is the receiver, bound like any
+     * parameter. */
+    unsigned lo = method ? 0u : 1u;
     const ObjFunction *cfn = callee->fn;
     const Chunk *c = &cfn->chunk;
     if (cfn->arity != argc || cfn->defaultCount != 0) return false;
@@ -749,30 +753,37 @@ static bool inlinableLoopBody(ObjClosure *callee, unsigned argc,
         case OP_MUL_INT_CONST: case OP_CMP_LOCAL_CONST_LT:
         case OP_ADD_BIND: case OP_SUB_BIND: case OP_MUL_BIND:
             s1 = jaiReadU16(c->code + off + 1);
-            if (s1 == 0) return false;      /* the closure itself */
+            if (s1 < lo) return false;
             break;
         case OP_GET_LOCAL2: case OP_ADD_LOCALS:
             s1 = jaiReadU16(c->code + off + 1);
             s2 = jaiReadU16(c->code + off + 3);
-            if (s1 == 0 || s2 == 0) return false;
+            if (s1 < lo || s2 < lo) return false;
             break;
         case OP_JUMP_IF_CMP_LOCAL_K:
             s1 = jaiReadU16(c->code + off + 2);
-            if (s1 == 0) return false;
+            if (s1 < lo) return false;
             branches = true;
+            break;
+        /* A field READ: a load behind a guard, which re-runs the call. */
+        case OP_GET_FIELD_LOCAL:
+            s1 = jaiReadU16(c->code + off + 1);
+            if (s1 < lo) return false;
+            break;
+        case OP_GET_FIELD:
             break;
         /* `for i in a..b`: the counter and the end are hidden LOCALS, not
          * an iterator on the stack, so they take homes like any other. */
         case OP_ITER_RANGE:
             s1 = jaiReadU16(c->code + off + 2);
             s2 = jaiReadU16(c->code + off + 4);
-            if (s1 == 0 || s2 == 0) return false;
+            if (s1 < lo || s2 < lo) return false;
             break;
         case OP_FOR_RANGE_BIND: {
             unsigned s3 = jaiReadU16(c->code + off + 7);
             s1 = jaiReadU16(c->code + off + 3);
             s2 = jaiReadU16(c->code + off + 5);
-            if (s1 == 0 || s2 == 0 || s3 == 0) return false;
+            if (s1 < lo || s2 < lo || s3 < lo) return false;
             if (s3 > maxSlot) maxSlot = s3;
             branches = true;
             break;
@@ -831,6 +842,7 @@ static uint8_t *renumberedCode(const Chunk *c, unsigned hb) {
         case OP_INC_LOCAL: case OP_ADD_INT_CONST: case OP_SUB_INT_CONST:
         case OP_MUL_INT_CONST: case OP_CMP_LOCAL_CONST_LT:
         case OP_ADD_BIND: case OP_SUB_BIND: case OP_MUL_BIND:
+        case OP_GET_FIELD_LOCAL:
             ats[0] = off + 1; break;
         case OP_GET_LOCAL2: case OP_ADD_LOCALS:
             ats[0] = off + 1; ats[1] = off + 3; break;
@@ -923,14 +935,14 @@ bool inlineLoopReturn(Emit *e, bool last) {
  * resolve against its own offset map before the caller's fixups come back,
  * so the two numberings never meet in one table. */
 static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
-                           unsigned argc, uint32_t callOff) {
+                           unsigned argc, uint32_t callOff, bool method) {
     if (!jitInlineLoopsOn()) return false;
     if (e->osr || e->inlHomeLo == 0 || e->mapKernel) return false;
     if (e->inlLoopCount >= JIT_INLINE_LOOP_MAX_SITES) return false;
     ObjFunction *cfn = callee->fn;
     if (cfn == caller) return false;           /* recursion */
     unsigned maxSlot = 0;
-    if (!inlinableLoopBody(callee, argc, &maxSlot)) return false;
+    if (!inlinableLoopBody(callee, argc, method, &maxSlot)) return false;
     unsigned hb = e->inlHomeNext != 0 ? e->inlHomeNext : e->inlHomeLo;
     if (hb + maxSlot > JIT_INLINE_LOOP_MAX_SLOT) return false;
     unsigned need = hb + maxSlot + 1u;         /* one past the highest home */
@@ -1012,7 +1024,7 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     for (unsigned idx = 0; idx < cidx + 1u + argc && ok; idx++) {
         if (!holdsRegister(e->stack[idx])) continue;
         unsigned v = vi++;
-        if (idx <= cidx) continue;
+        if (idx < cidx || (idx == cidx && !method)) continue;
         unsigned slot = hb + (idx - cidx);
         if (!localInRange(e, slot) ||
             !adoptLocalKindSeen(e, slot, e->stack[idx], e->stackShape[idx],

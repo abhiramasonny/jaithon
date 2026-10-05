@@ -118,6 +118,27 @@ fn depth(n: int) -> int {
 
 fn noop(x: int) -> int { return x }
 
+class Poly {
+    pub var cs: list[int]
+    pub var n: int
+    fn init(self, cs: list[int]) {
+        self.cs = cs
+        self.n = cs.len()
+    }
+    pub fn eval_at(self, x: int) -> int {
+        var t = 0
+        var i = self.n - 1
+        while i >= 0 {
+            t = t * x + self.cs[i]
+            if t > 1000000 { return -1 }
+            i -= 1
+        }
+        return t
+    }
+}
+
+fn drive_poly(p: Poly, x: int) -> int { return p.eval_at(x) + p.eval_at(x + 1) + noop(0) }
+
 fn wrap_sum(a: int, b: int) -> int {
     var t = a
     for q in 0..b {
@@ -298,5 +319,28 @@ fn test_range_loops_with_returns_inside() -> void {
             if f > 100.0 { break }
         }
         assert_eq(drive_ranges(i), float(want) + f)
+    }
+}
+
+fn test_a_method_with_a_loop_over_a_field() -> void {
+    let p = Poly([3, 1, 4, 1, 5])
+    for x in 0..300 {
+        var want = 0
+        for k in 0..2 {
+            let at = x + k
+            var t = 0
+            var i = 4
+            var over = false
+            while i >= 0 {
+                t = t * at + p.cs[i]
+                if t > 1000000 {
+                    over = true
+                    break
+                }
+                i -= 1
+            }
+            want += if over { -1 } else { t }
+        }
+        assert_eq(drive_poly(p, x), want)
     }
 }

@@ -21,6 +21,8 @@ Every program must print the same thing under every configuration:
     deopt    JAITHON_JIT_DEOPT_STRESS=1        every guard fails: every call
                                                re-runs in the interpreter
     tick     JAITHON_JIT_TICK_US=50
+    gc       --gc-stress=3 (with --gc)             a collection every third
+                                               allocation around the inlines
 
     python3 tests/fuzz/inline_loops.py --count 200 --jobs 6
     python3 tests/fuzz/inline_loops.py --seed 17 --keep
@@ -135,8 +137,30 @@ class Gen:
         src = f"fn {name}({', '.join(params)}) -> {ret} {{\n" + "\n".join(body) + "\n}"
         self.helpers.append((name, kind, ret, src))
 
+    def method(self, idx):
+        """A method whose loop reads the receiver's fields."""
+        r = self.r
+        name = f"m{idx}"
+        ints = ["n", "k", "t", "i", "self.bias"]
+        body = [f"    pub fn {name}(self, n: int, k: int) -> int {{",
+                f"        var t = {self.int_term(['n', 'k'])}",
+                "        var i = 0",
+                "        while i < n {",
+                f"            let e = self.ws[{r.choice(['i', 'i', '(i + 1)'])}]",
+                f"            if e {r.choice(['<', '>', '=='])} {self.int_term(['k', 'i'])} {{ t = t +% e }}",
+                f"            t = t +% {self.int_term(ints)}"]
+        if r.random() < 0.7:
+            body.append(f"            if {self.cond(ints)} {{ return t }}")
+        body += ["            i += 1",
+                 "        }",
+                 "        return t +% self.bias",
+                 "    }"]
+        return name, "\n".join(body)
+
     def call(self, h, n_expr, k_expr):
         name, kind, ret, _ = h
+        if kind == "method":
+            return f"kk.{name}({n_expr}, {k_expr})"
         lst = {"ints": "ints", "floats": "fls", "any": "mix", "plain": None}[kind]
         args = ([lst] if lst else []) + [n_expr, k_expr]
         c = f"{name}({', '.join(args)})"
@@ -150,6 +174,20 @@ class Gen:
         for _, _, _, src in self.helpers:
             lines.append(src)
             lines.append("")
+        methods = [self.method(i) for i in range(r.randint(1, 2))]
+        lines.append("class Kk {")
+        lines.append("    pub var ws: list[int]")
+        lines.append("    pub var bias: int")
+        lines.append("    fn init(self, ws: list[int], bias: int) {")
+        lines.append("        self.ws = ws")
+        lines.append("        self.bias = bias")
+        lines.append("    }")
+        for _, src in methods:
+            lines.append(src)
+        lines.append("}")
+        lines.append("")
+        for name, _ in methods:
+            self.helpers.append((name, "method", "int", ""))
         lines.append("fn side(x: int) -> int { return x % 5 }")
         lines.append("")
         drivers = []
@@ -172,7 +210,7 @@ class Gen:
                 else:
                     body.append(f"    acc = acc +% {c}")
             body.append("    return acc +% side(r)")
-            lines.append(f"fn {name}(ints: list[int], fls: list[float], mix: list[any], r: int) -> int {{")
+            lines.append(f"fn {name}(ints: list[int], fls: list[float], mix: list[any], kk: Kk, r: int) -> int {{")
             lines.extend(body)
             lines.append("}")
             lines.append("")
@@ -189,12 +227,13 @@ class Gen:
         lines.append(f"        fls.push(float(q) * 0.25)")
         lines.append("        mix.push(q)")
         lines.append("    }")
+        lines.append(f"    let kk = Kk(ints, {r.randint(-3, 9)})")
         lines.append("    var total = 0")
         lines.append(f"    for r in 0..{reps} {{")
         lines.append(f"        if r == {flip} {{ mix[{r.randint(0, size - 1)}] = 2.5 }}")
         for d in drivers:
             lines.append("        try {")
-            lines.append(f"            total = total +% {d}(ints, fls, mix, r)")
+            lines.append(f"            total = total +% {d}(ints, fls, mix, kk, r)")
             lines.append("        } catch e: IndexError {")
             lines.append("            total = total +% 7")
             lines.append("        }")
@@ -208,8 +247,10 @@ class Gen:
 def run(path, env_extra, timeout):
     env = dict(os.environ)
     env.update(env_extra)
+    flags = env.pop("_FLAGS", "").split()
     try:
-        p = subprocess.run([JAITHON, "run", path], capture_output=True, text=True,
+        p = subprocess.run([JAITHON] + flags + ["run", path],
+                           capture_output=True, text=True,
                            env=env, timeout=timeout, cwd=ROOT)
         err = p.stderr.strip().splitlines()
         last = err[-1] if (p.returncode != 0 and err) else ""
@@ -239,7 +280,10 @@ def main():
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--gc", action="store_true")
     args = ap.parse_args()
+    if args.gc:
+        CONFIGS.append(("gc", {"_FLAGS": "--gc-stress=3"}))
     seeds = [args.seed] if args.seed is not None else \
         list(range(args.start, args.start + args.count))
     tmpdir = tempfile.mkdtemp(prefix="jai_inline_loops_")
