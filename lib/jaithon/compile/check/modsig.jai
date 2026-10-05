@@ -762,16 +762,15 @@ fn _decode(raw: any) -> str? {
 #: (`JAITHON_FRONT_END_ID`, which the runtime derives from the seed: a reseed
 #: moves it where the build id does not) and `_SIG_CACHE_VERSION`. With no
 #: front-end identity -- the compiler running from anything but the binary's
-#: seed -- nothing is read or written. A signature depends on its own module's bytes and
-#: nothing else: a re-export is recorded by name and followed through that
-#: module's own signature. One is written only for a module that parsed, so
+#: seed -- nothing is read or written. A signature depends on its own module's
+#: bytes and nothing else: a re-export is recorded by name and followed through
+#: that module's own signature. One is written only for a module that parsed, so
 #: whether a module parses is always the full parser's answer: a module with
 #: an error anywhere, a body included, is re-read from source every time and
 #: still offers nothing. A mismatch, a short or damaged file, a blanked text
 #: this parser cannot read, or a directory that cannot be written is a silent
 #: miss.
-let _SIG_CACHE: bool =
-    (__prim__.os_env("JAITHON_SIG_CACHE") ?? "1") != "0" and not _KEEP_SIG_BODIES
+let _SIG_CACHE: bool = (__prim__.os_env("JAITHON_SIG_CACHE") ?? "1") != "0" and not _KEEP_SIG_BODIES
 
 #: Bump when what a kept text means changes: which bodies are blanked, or the
 #: parser's idea of where a body ends.
@@ -797,17 +796,13 @@ pub fn signature_cache_enabled() -> bool {
     return _sig_cache_on()
 }
 
-#: The front end's identity, read the first time it is needed: the runtime
-#: exports it once the front end has loaded, which is after this module's own
-#: top level ran. "" when there is none to key on.
-var _front_end_id: str? = null
-
+#: The front end's identity, or "" when there is none to key on. Read each
+#: time rather than once: the runtime exports it when the front end has
+#: loaded, which is after this module's own top level ran, and a process that
+#: imports this module itself may load the front end later still.
 fn _front_end() -> str {
-    let known = _front_end_id
-    if known is not null { return known }
-    var found = __prim__.os_env("JAITHON_FRONT_END_ID") ?? ""
-    if found == "none" or found.contains(" ") { found = "" }
-    _front_end_id = found
+    let found = __prim__.os_env("JAITHON_FRONT_END_ID") ?? ""
+    if found == "none" or found.contains(" ") { return "" }
     return found
 }
 
