@@ -210,6 +210,8 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
 static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
                          unsigned argc, uint32_t callOff, int calleeReg,
                          bool method);
+static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
+                           unsigned argc, uint32_t callOff);
 
 /* Whether the entry an inlined body's slot names is a receiver whose field
  * `name` the OP_GET_FIELD arm can read: an instance of a pinned class, a
@@ -784,7 +786,7 @@ static bool inlinableLoopBody(ObjClosure *callee, unsigned argc,
         case OP_POP:
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
         case OP_ADD_WRAP: case OP_SUB_WRAP: case OP_MUL_WRAP:
-        case OP_TYPE_GUARD: case OP_TO_FLOAT:
+        case OP_TYPE_GUARD:
         case OP_FLOORDIV: case OP_MOD: case OP_MOD_INT_CONST: case OP_NEG:
         case OP_BAND: case OP_BOR: case OP_BXOR:
         case OP_SHL: case OP_SHR: case OP_BNOT:
@@ -920,8 +922,8 @@ bool inlineLoopReturn(Emit *e, bool last) {
  * the caller's own, and the walk uses the ordinary local arms. Its branches
  * resolve against its own offset map before the caller's fixups come back,
  * so the two numberings never meet in one table. */
-bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
-                    unsigned argc, uint32_t callOff) {
+static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
+                           unsigned argc, uint32_t callOff) {
     if (!jitInlineLoopsOn()) return false;
     if (e->osr || e->inlHomeLo == 0 || e->mapKernel) return false;
     if (e->inlLoopCount >= JIT_INLINE_LOOP_MAX_SITES) return false;

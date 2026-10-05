@@ -1571,8 +1571,6 @@ int deoptRecordNow(Emit *e);
 bool jitDeoptStressOn(void);
 bool jitBoundsColdOn(void);
 bool jitDispatchColdOn(void);
-bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
-                    unsigned argc, uint32_t callOff);
 bool inlineLoopReturn(Emit *e, bool last);
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg);
