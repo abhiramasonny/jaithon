@@ -7,7 +7,9 @@ that shape -- random float expressions over up to three lists at offsets
 -2..2, float literals and a float local -- and calls each kernel on lists of
 every length 0..40 full of NaN, infinities, -0.0 and subnormals, over windows
 that sometimes wrap a negative index and sometimes run off the end (raising
-IndexError part way through), with the stored list sometimes passed in as one
+IndexError part way through), sometimes with the counter and a based
+subscript's base near opposite ends of int (so a step of the subscript raises
+OverflowError), with the stored list sometimes passed in as one
 of the lists it reads, and every few rounds with boxed lists instead of
 unboxed ones. Every element is printed with f"{x}", which round-trips a
 double's bits (all but a NaN's payload).
@@ -39,25 +41,36 @@ CONFIGS = [
 
 LITERALS = ["0.25", "-0.0", "0.0", "1.5", "-3.0", "1e308", "1e-310", "2.0"]
 LISTS = ["a", "b", "c"]
+INT_MAX = 9223372036854775807
 
 
-def subscript(name, k, based=False):
+def subscript(name, k, based=False, rng=None):
     idx = "j" if k == 0 else (f"j + {k}" if k > 0 else f"j - {-k}")
     if based:
-        # Both spellings: `row + j` and `j + row`, the base first or last.
-        idx = f"row + {idx}" if k % 2 == 0 else f"{idx} + row"
+        # Every order of the three terms: the vectoriser folds them into one
+        # offset, but the scalar loop adds them left to right, each step
+        # overflow-checked, so `k + row + j` can raise where `row + j + k`
+        # does not. The constant stays signed by its operator.
+        kt = "" if k == 0 else (f" + {k}" if k > 0 else f" - {-k}")
+        forms = [f"row + {idx}", f"{idx} + row", f"row{kt} + j",
+                 f"j + row{kt}"]
+        if k > 0:
+            forms += [f"{k} + j + row", f"{k} + row + j"]
+        idx = (rng.choice(forms) if rng is not None
+               else forms[0] if k % 2 == 0 else forms[1])
     return f"{name}[{idx}]"
 
 
-def expr(rng, depth, dst, s, sb):
+def expr(rng, depth, dst, s, sb, pb):
     """Reads of the stored list stay rare: at any offset but its own they are
     a recurrence the vectoriser refuses, so they would cost it its coverage.
-    A third of the subscripts take the int parameter `row` as a base."""
+    A fraction `pb` of the subscripts take the int parameter `row` as a
+    base."""
     if depth == 0 or rng.random() < 0.3:
         r = rng.random()
         if r < 0.7:
             name = rng.choice([x for x in LISTS if x != dst])
-            based = rng.random() < 0.33
+            based = rng.random() < pb
             if rng.random() < 0.1:
                 name = dst
                 if rng.random() < 0.5:
@@ -66,26 +79,30 @@ def expr(rng, depth, dst, s, sb):
                     k = rng.randint(-2, 2)
             else:
                 k = rng.randint(-2, 2)
-            return subscript(name, k, based)
+            return subscript(name, k, based, rng)
         if r < 0.85:
             return "f"
         return rng.choice(LITERALS)
     op = rng.choice(["+", "-", "*"])
-    return (f"({expr(rng, depth - 1, dst, s, sb)} {op} "
-            f"{expr(rng, depth - 1, dst, s, sb)})")
+    return (f"({expr(rng, depth - 1, dst, s, sb, pb)} {op} "
+            f"{expr(rng, depth - 1, dst, s, sb, pb)})")
 
 
 def kernel(rng, i):
     dst = rng.choice(["a", "b"])
     s = rng.randint(-2, 2)
-    sb = rng.random() < 0.33
+    # Two kernels in five base every subscript: only those reach the
+    # vector run when the counter is near the end of int.
+    pb = 1.0 if rng.random() < 0.4 else 0.33
+    sb = rng.random() < pb
     typed = rng.random() < 0.5
     params = ("a: list[float], b: list[float], c: list[float], f: float"
               if typed else "a, b, c, f: float")
-    return (f"fn k{i}({params}, row: int, lo: int, hi: int) -> void {{\n"
-            f"    for j in lo..hi {{ {subscript(dst, s, sb)} = "
-            f"{expr(rng, 3, dst, s, sb)} }}\n"
+    text = (f"fn k{i}({params}, row: int, lo: int, hi: int) -> void {{\n"
+            f"    for j in lo..hi {{ {subscript(dst, s, sb, rng)} = "
+            f"{expr(rng, 3, dst, s, sb, pb)} }}\n"
             f"}}\n")
+    return text, pb == 1.0
 
 
 def program(rng, kernels, warm):
@@ -109,8 +126,11 @@ def program(rng, kernels, warm):
            "    for x in xs { t = t + f\"{x},\" }",
            "    return t",
            "}", ""]
+    all_based = []
     for i in range(kernels):
-        src.append(kernel(rng, i))
+        text, based = kernel(rng, i)
+        src.append(text)
+        all_based.append(based)
     src.append("fn main() -> int {")
     src.append(f"    for round in 0..{warm} {{")
     src.append("        let loud = round == 0 or round % 37 == 5 or "
@@ -122,6 +142,33 @@ def program(rng, kernels, warm):
         alias = rng.choice(["none", "none", "ab", "ac", "bc"])
         f = rng.choice(["0.5", "-0.0", "NAN", "3.25", "INF"])
         row = rng.choice([0, 0, 1, 2, 3, -1, -2, -3, 5, 40])
+        # Now and then the same indices with the counter near one end of int
+        # and the base near the other: `j + row` is unchanged, but a step like
+        # `j + 2` or `row + 1` on the way to it overflows.
+        # Only a kernel whose every subscript is based can take the vector
+        # run there; a plain `a[j]` is simply out of range.
+        # Three placements: the base just under the top (`row + 2 + j`
+        # overflows), the counter's end at the top (`j + 2 + row`), and its
+        # start at the bottom (`j - 2 + row`). The shift moves the counter and
+        # the base by opposite amounts, so each `j + row` stays the same index.
+        if rng.random() < (0.7 if all_based[i] else 0.05):
+            # Mostly a window every offset -2..2 stays inside, so the only
+            # thing that can stop the vector run is the overflow itself.
+            if n >= 6 and rng.random() < 0.8:
+                row = rng.choice([0, 1, 2])
+                lo = 2 - row
+                hi = rng.randint(lo + 2, n - 2 - row)
+            mode = rng.choice(["base-top", "end-top", "start-bottom"])
+            if mode == "base-top":
+                shift = row - (INT_MAX - rng.choice([0, 0, 1, 2, 20]))
+            elif mode == "end-top":
+                shift = INT_MAX - rng.choice([0, 0, 1, 20]) - hi
+            else:
+                e = max(0, lo + row) + rng.choice([0, 0, 1])
+                shift = -INT_MAX + e - lo
+            if (-INT_MAX <= lo + shift and hi + shift <= INT_MAX and
+                    -INT_MAX <= row - shift <= INT_MAX):
+                lo, hi, row = lo + shift, hi + shift, row - shift
         src.append(f"        var a{i} = specials({n}, round + {i})")
         src.append(f"        var b{i} = specials({n}, round + {i + 5})")
         src.append(f"        var c{i} = specials({n}, round + {i + 9})")
