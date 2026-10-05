@@ -145,6 +145,7 @@ void jaiGCFree(GCState *gc) {
         object = next;
     }
     gc->objects = NULL;
+    jaiFmtMemoClear();
     /* Page objects own nothing but their blocks, so there is nothing to free
      * one by one: every page goes back to the pool. */
     jaiHeapAccountFreed(jaiPageSpaceReset());
@@ -606,6 +607,8 @@ void jaiGCCollect(void) {
     if (interned != NULL) jaiTableRemoveWhite(interned);
     jaiMethodCacheRemoveWhite();
     jaiShapeCacheRemoveWhite();
+    /* Weak: its strings may be about to go, and their addresses with them. */
+    jaiFmtMemoClear();
 #ifdef JAI_ALLOC_CENSUS
     double t2 = jaiClockMonotonic();
 #endif

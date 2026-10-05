@@ -130,6 +130,188 @@ static void dictLeafCall(Emit *e, void *helper, LeafFix *fx) {
     fx->on = true;
 }
 
+/* JAITHON_JIT_DICT_ADD_INLINE=0 leaves the counting arms below with their
+ * leaf call alone, for a one-binary A/B of emitDictAddInline. */
+static bool jitDictAddInline(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_ADD_INLINE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_DICT_SLOT_INLINE=0 leaves the string-keyed get and store leaves
+ * with their call alone, for a one-binary A/B of the inline slot hit in front
+ * of them (emitDictLeafGet, emitDictLeafSet). */
+static bool jitDictSlotInline(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_DICT_SLOT_INLINE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The branches emitDictAddInline sends to the leaf call, patched once the call
+ * is placed. Each keeps the word it was emitted as, so the patch re-encodes
+ * the same test with the real displacement. */
+typedef struct {
+    int      at[16];
+    unsigned n;
+} AddMiss;
+
+static void addMissHere(Emit *e, AddMiss *m) {
+    if (e->count > JIT_MAX_INSTS) return;
+    for (unsigned i = 0; i < m->n; i++) {
+        int at = m->at[i];
+        if (at < 0 || at >= (int)e->count) continue;
+        int32_t rel = (int32_t)((int)e->count - at);
+        uint32_t w = e->code[at];
+        if ((w & 0xff000010u) == 0x54000000u) {          /* b.cond */
+            e->code[at] = jaiA64BCond(w & 0xfu, rel);
+        } else if ((w & 0x7e000000u) == 0x34000000u) {   /* cbz / cbnz */
+            e->code[at] = jaiA64CbzRetarget(w, rel);
+        } else {                                         /* tbz / tbnz */
+            e->code[at] = (w & 0xfff8001fu) |
+                          (((uint32_t)rel & 0x3fffu) << 5);
+        }
+    }
+}
+
+static void addMissBranch(Emit *e, AddMiss *m, uint32_t word) {
+    if (m->n < sizeof m->at / sizeof m->at[0]) {
+        m->at[m->n++] = (int)e->count;
+    } else {
+        /* A branch nobody would patch is a branch to itself: refuse the
+         * body rather than emit one. */
+        e->failed = true;
+    }
+    emit(e, word);
+}
+
+/* The layout emitDictSlotProbe and its users assume, checked where they are
+ * emitted rather than trusted: a 48-byte entry, and keyKind and valKind as
+ * one aligned halfword. */
+/* The inline string-key test is `ldr w; cbnz` on the object's first word:
+ * the type, which is a string's exactly when it is zero. */
+_Static_assert(OBJ_STRING == 0 && offsetof(Obj, type) == 0 &&
+                   sizeof(ObjType) == 4,
+               "a string key is tested as a zero 32-bit word at offset 0");
+
+static bool dictSlotProbeFits(void) {
+    return offsetof(ObjDict, valKind) == offsetof(ObjDict, keyKind) + 1 &&
+           (offsetof(ObjDict, keyKind) & 1u) == 0 && sizeof(JaiEntry) == 48;
+}
+
+/* The first slot a key's hash names, when it is live and holds that very
+ * key: its address in x12, and every other case -- an empty table, a
+ * collision, a tombstone, an absent key -- one of the branches in `m`. The
+ * dict must already be known to be a dict, and the key a string (its object
+ * in `rKey`) or, with `intKey`, an int (its value in `rKey`).
+ *
+ * A string's hash is the one it carries; one never computed still holds zero
+ * there, which names slot 0, and the identity test is what makes any slot's
+ * answer right, so that is only a miss. An int's is jaiHashU64Inline of it,
+ * computed here as jaiTableFindIntQuick computes it. The test is the stored
+ * key's tag and payload: the same string object, or an int of the same
+ * value -- an equal float stored there is the leaf's to judge. Writes
+ * x9..x12. */
+static void emitDictSlotProbe(Emit *e, unsigned rDict, unsigned rKey,
+                              bool intKey, AddMiss *m) {
+    const unsigned tableAt = (unsigned)offsetof(ObjDict, table);
+    emit(e, jaiA64LdrW(11, rDict,
+                       tableAt + (unsigned)offsetof(JaiTable, capacity)));
+    addMissBranch(e, m, 0x34000000u | 11u);                      /* cbz w11 */
+    /* The slot: entries + (hash & (capacity - 1)) * 48. */
+    if (intKey) {
+        /* splitmix64's finaliser, jaiHashU64Inline. */
+        emit(e, jaiA64EorXLsr(10, rKey, rKey, 30));
+        emitConst64(e, 9, (int64_t)UINT64_C(0xBF58476D1CE4E5B9));
+        emit(e, jaiA64MulX(10, 10, 9));
+        emit(e, jaiA64EorXLsr(10, 10, 10, 27));
+        emitConst64(e, 9, (int64_t)UINT64_C(0x94D049BB133111EB));
+        emit(e, jaiA64MulX(10, 10, 9));
+        emit(e, jaiA64EorXLsr(10, 10, 10, 31));
+    } else {
+        emit(e, jaiA64LdrX(10, rKey, (unsigned)offsetof(ObjString, hash)));
+    }
+    emit(e, jaiA64LdrX(12, rDict,
+                       tableAt + (unsigned)offsetof(JaiTable, entries)));
+    emit(e, jaiA64SubXImm(11, 11, 1));
+    emit(e, jaiA64AndX(9, 10, 11));
+    emit(e, jaiA64AddXLsl(9, 9, 9, 1));
+    emit(e, jaiA64AddXLsl(12, 12, 9, 4));
+    /* Live, and holding this very string. */
+    emit(e, jaiA64LdrW(9, 12, (unsigned)offsetof(JaiEntry, order)));
+    addMissBranch(e, m, jaiA64Tbnz(9, 31, 0));
+    emit(e, jaiA64LdrX(9, 12,
+                       (unsigned)(offsetof(JaiEntry, key) +
+                                  offsetof(Value, as))));
+    emit(e, jaiA64SubsXReg(31, 9, rKey));
+    addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
+    emit(e, jaiA64LdrW(9, 12, (unsigned)offsetof(JaiEntry, key)));
+    emit(e, jaiA64SubsXImm(31, 9, intKey ? VAL_INT : VAL_OBJ));
+    addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
+}
+
+/* The update half of jitDictAddStr, inline: the key's own slot -- the first
+ * one its hash names -- holding that very string and an int, which gets the
+ * step added in place. That is every iteration of a counting loop but a
+ * key's first, and here it costs no call, no argument moves and none of the
+ * leaf's re-checks of what the guards in front of it already proved. Every
+ * other case -- a key that is not a string, a typed dict, an empty table, a
+ * collision, a tombstone, an absent key, a value that is not an int, an add
+ * that overflows -- branches to the leaf call, which settles it as before:
+ * the inline path only ever answers what the leaf would have answered the
+ * same way. Lands on `done` (branchToDepth, always) when it answers.
+ *
+ * Only x9..x12 are written, scratch the call that follows clobbers anyway.
+ * False, having emitted nothing, for a step no add/sub immediate holds. */
+static bool emitDictAddInline(Emit *e, unsigned rDict, unsigned rKey,
+                              bool intKey, int64_t step, bool checkDict,
+                              uint32_t doneOffset, int64_t doneDepth,
+                              AddMiss *m) {
+    m->n = 0;
+    if (!jitDictAddInline() || step < -4095 || step > 4095) return false;
+    const unsigned tableAt = (unsigned)offsetof(ObjDict, table);
+    if (!dictSlotProbeFits()) return false;
+    if (checkDict) {
+        emit(e, jaiA64LdrW(9, rDict, 0));
+        emit(e, jaiA64SubsXImm(31, 9, OBJ_DICT));
+        addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
+    }
+    /* A string key (OBJ_STRING is 0) -- an int key's kind is its
+     * register's -- and an untyped dict. */
+    if (!intKey) {
+        emit(e, jaiA64LdrW(9, rKey, 0));
+        addMissBranch(e, m, 0x35000000u | 9u);                   /* cbnz w9 */
+    }
+    emit(e, jaiA64LdrHalf(9, rDict, (unsigned)offsetof(ObjDict, keyKind)));
+    addMissBranch(e, m, 0x35000000u | 9u);                       /* cbnz w9 */
+    emitDictSlotProbe(e, rDict, rKey, intKey, m);
+    /* An int value, and a sum that does not overflow. */
+    const unsigned valAt = (unsigned)offsetof(JaiEntry, value);
+    emit(e, jaiA64LdrW(9, 12, valAt));
+    emit(e, jaiA64SubsXImm(31, 9, VAL_INT));
+    addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
+    emit(e, jaiA64LdrX(10, 12, valAt + (unsigned)offsetof(Value, as)));
+    if (step >= 0) {
+        emit(e, jaiA64AddsXImm(10, 10, (unsigned)step));
+    } else {
+        emit(e, jaiA64SubsXImm(10, 10, (unsigned)(-step)));
+    }
+    addMissBranch(e, m, jaiA64BCond(JAI_A64_VS, 0));
+    emit(e, jaiA64StrX(10, 12, valAt + (unsigned)offsetof(Value, as)));
+    /* insertAt's update half bumps the version; so does the leaf. */
+    const unsigned verAt = tableAt + (unsigned)offsetof(JaiTable, version);
+    emit(e, jaiA64LdrW(9, rDict, verAt));
+    emit(e, jaiA64AddXImm(9, 9, 1));
+    emit(e, jaiA64StrW(9, rDict, verAt));
+    branchToDepth(e, doneOffset, 14u /* always */, doneDepth);
+    return true;
+}
+
 void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
                      int defIdx, SlotKind defKind, bool absentSlow,
                      LeafFix *fx) {
@@ -149,6 +331,25 @@ void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
 
     if (!dictLeafKeyKind(keyKind)) return;
     dictLeafKeyGuard(e, rKey, keyKind, fx);
+    /* A present string key in its first slot: the entry's value copied
+     * whole into the result, as the leaf writes it, with no call. Anything
+     * else is the leaf call below, unchanged -- including an absent key,
+     * whose default or KeyError is the leaf's to give. */
+    AddMiss miss = {.n = 0};
+    int hit = -1;
+    const unsigned rat =
+        e->descOffset + (unsigned)offsetof(JitCallDesc, result);
+    if (jitDictSlotInline() && dictSlotProbeFits()) {
+        const unsigned valAt = (unsigned)offsetof(JaiEntry, value);
+        emitDictSlotProbe(e, rDict, rKey, keyKind == SLOT_INT, &miss);
+        emit(e, jaiA64LdrX(9, 12, valAt));
+        emit(e, jaiA64LdrX(10, 12, valAt + 8u));
+        emit(e, jaiA64StrX(9, 31, rat));
+        emit(e, jaiA64StrX(10, 31, rat + 8u));
+        hit = (int)e->count;
+        emit(e, jaiA64B(0));
+    }
+    addMissHere(e, &miss);
     emit(e, jaiA64MovX(0, rDict));
     emit(e, jaiA64MovX(1, rKey));
     emit(e, jaiA64AddXImm(2, 31, e->descOffset +
@@ -165,6 +366,11 @@ void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
     }
     dictLeafCall(e, keyKind == SLOT_INT ? (void *)&jitDictGetInt
                                         : (void *)&jitDictGetStr, fx);
+    /* The hit joins the leaf's answered path at its branch over the
+     * descriptor call. */
+    if (hit >= 0 && fx->done > hit && e->count <= JIT_MAX_INSTS) {
+        e->code[hit] = jaiA64B((int32_t)(fx->done - hit));
+    }
 }
 
 static void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey,
@@ -181,12 +387,37 @@ static void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey,
     settleAll(e);
 
     dictLeafKeyGuard(e, rKey, keyKind, fx);
+    /* The update of a present string key in its first slot of an untyped
+     * dict -- jitDictSetStr's call-free half -- inline: the tag and payload
+     * stored and the version bumped. Anything else is the leaf call. */
+    AddMiss miss = {.n = 0};
+    int hit = -1;
+    if (jitDictSlotInline() && dictSlotProbeFits()) {
+        const unsigned valAt = (unsigned)offsetof(JaiEntry, value);
+        const unsigned verAt = (unsigned)(offsetof(ObjDict, table) +
+                                          offsetof(JaiTable, version));
+        emit(e, jaiA64LdrHalf(9, rDict, (unsigned)offsetof(ObjDict, keyKind)));
+        addMissBranch(e, &miss, 0x35000000u | 9u);               /* cbnz w9 */
+        emitDictSlotProbe(e, rDict, rKey, keyKind == SLOT_INT, &miss);
+        emitTagFor(e, vk, rVal, 10, 11);
+        emit(e, jaiA64StrW(10, 12, valAt));
+        emit(e, jaiA64StrX(rVal, 12, valAt + 8u));
+        emit(e, jaiA64LdrW(9, rDict, verAt));
+        emit(e, jaiA64AddXImm(9, 9, 1));
+        emit(e, jaiA64StrW(9, rDict, verAt));
+        hit = (int)e->count;
+        emit(e, jaiA64B(0));
+    }
+    addMissHere(e, &miss);
     emit(e, jaiA64MovX(0, rDict));
     emit(e, jaiA64MovX(1, rKey));
     emitTagFor(e, vk, rVal, 2, JIT_SCRATCH_A);
     emit(e, jaiA64MovX(3, rVal));
     dictLeafCall(e, keyKind == SLOT_INT ? (void *)&jitDictSetInt
                                         : (void *)&jitDictSetStr, fx);
+    if (hit >= 0 && fx->done > hit && e->count <= JIT_MAX_INSTS) {
+        e->code[hit] = jaiA64B((int32_t)(fx->done - hit));
+    }
 }
 
 /* `k in d`: the leaf checks the container and the key itself (see
@@ -348,6 +579,14 @@ bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
     }
     fpSyncAll(e);
     settleAll(e);
+    AddMiss miss = {.n = 0};
+    if (keyKind == SLOT_OBJ || keyKind == SLOT_INT) {
+        (void)emitDictAddInline(e, rDict, rKey, keyKind == SLOT_INT,
+                                (int64_t)jaiReadI16(code + off + 8), false,
+                                (uint32_t)(off + 12),
+                                stackSignatureAt(e, e->depth - 5), &miss);
+    }
+    addMissHere(e, &miss);
     emit(e, jaiA64MovX(0, rDict));
     emit(e, jaiA64MovX(1, rKey));
     emit(e, jaiA64MovX(2, rDef));
@@ -394,6 +633,14 @@ bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
     if (!leafRegOk(rDict) || !leafRegOk(rKey)) return false;
     fpSyncAll(e);
     settleAll(e);
+    AddMiss miss = {.n = 0};
+    if (keyKind == SLOT_OBJ || keyKind == SLOT_INT) {
+        (void)emitDictAddInline(e, rDict, rKey, keyKind == SLOT_INT,
+                                (int64_t)jaiReadI16(code + off + 3), true,
+                                (uint32_t)(off + 7),
+                                stackSignatureAt(e, e->depth - 2), &miss);
+    }
+    addMissHere(e, &miss);
     emit(e, jaiA64MovX(0, rDict));
     emit(e, jaiA64MovX(1, rKey));
     emit(e, jaiA64MovzX(2, 0, 0));

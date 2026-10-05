@@ -109,6 +109,16 @@ uint32_t jaiA64MovnX(unsigned rd, unsigned imm16);
 uint32_t jaiA64Nop(void);
 /* eor Xd, Xn, Xm */
 uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm);
+/* eor Xd, Xn, Xm, lsr #shift */
+uint32_t jaiA64EorXLsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift);
+/* crc32cx Wd, Wn, Xm -- the CRC32C of Xm folded into Wn; register 31 is
+ * wzr as Wn */
+uint32_t jaiA64Crc32cX(unsigned rd, unsigned rn, unsigned rm);
+/* cbz Xt, <label> */
+uint32_t jaiA64CbzX(unsigned rt, int32_t instructions);
+/* ccmp Xn, Xm, #nzcv, cond -- compare when `cond` holds, else set the flags
+ * to nzcv; register 31 is xzr in either operand */
+uint32_t jaiA64CcmpX(unsigned rn, unsigned rm, unsigned nzcv, unsigned cond);
 uint32_t jaiA64CselX(unsigned rd, unsigned rn, unsigned rm, unsigned cond);
 uint32_t jaiA64LdrByte(unsigned rd, unsigned rn, unsigned offset);
 uint32_t jaiA64LdrByteReg(unsigned rd, unsigned rn, unsigned rm);

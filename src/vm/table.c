@@ -5,6 +5,7 @@
 
 #include "vm/gc.h"
 #include "vm/object/object.h"
+#include "vm/vm.h"
 
 const Value JAI_TOMBSTONE = {VAL_OBJ, {.obj = NULL}};
 
@@ -646,4 +647,10 @@ void jaiInternTableAdd(ObjString *s) {
     (void)jaiTableSetInterned(
         &internTable, s,
         INT_VAL((int64_t)jaiInternFingerprint(s->chars, s->length)));
+    /* At the soft cap the f-string leaf stops finding interned answers and
+     * builds a fresh string on every call; a memo entry filed before it would
+     * keep answering the old object. value.c, at jaiFmtMemoClear. */
+    if (JAI_UNLIKELY(internTable.count >= JAI_INTERN_SOFT_CAP)) {
+        jaiFmtMemoClear();
+    }
 }

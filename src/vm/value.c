@@ -1387,7 +1387,162 @@ JAI_INLINE bool fmtRun(char *buf, size_t *o, const Obj *run) {
     return true;
 }
 
-ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
+/* The f-string memo: the answer jaiValueFormatIntLeaf gave for (pre, n, post),
+ * kept so that compiled code can find it again with a few loads and compares
+ * in front of the call (emitFormatLeaf) -- a number-to-string cache, as V8
+ * keeps one. On dict_ops's `f"k{i % 10_000}"` the call it skips is the whole
+ * of the format, the hash and the intern probe: two thirds of an iteration.
+ *
+ * What makes an entry sound:
+ *  - Only an intern HIT is kept, and only while the intern table is under its
+ *    soft cap (formatShortProbe asks nothing of a table past it). The answer
+ *    is then the one string with those bytes, the same object the leaf would
+ *    hand back again. Past the cap the leaf builds a fresh string on every
+ *    call, so `a is b` on two of them is false in the interpreter; an entry
+ *    filed before the cap would make it true in compiled code. So the intern
+ *    table empties the memo when it reaches its cap (jaiInternTableAdd),
+ *    and nothing is filed again until a collection takes it back under.
+ *  - pre and post are keys by identity. Strings never change their bytes
+ *    (length and chars are written once, at creation), so while both are
+ *    alive their identity is their content.
+ *  - Objects are freed only by a collection, and jaiFmtMemoClear empties
+ *    every table in every one of them. No entry outlives a string it names,
+ *    and no address is reused while an entry still holds it. The tables are
+ *    weak.
+ *
+ * One table per compiled site (jaiFmtSiteNew, embedded by the JIT), indexed
+ * by n plus a CRC of the runs (jaiFmtMemoIndex): one site's ints fill
+ * consecutive slots, so `f"user:{n}"` and `f"order:{n}"` over the same ints
+ * no longer evict each other on every call, as they did in one shared table
+ * indexed by n ^ pre >> 4, where the two runs' nearby addresses mapped both
+ * sites onto the same slots.
+ *
+ * A site starts OFF: its probe is one load and a branch, and the call goes
+ * straight to the leaf. The first intern hit the leaf reports turns it on
+ * with a table of FMT_SITE_FIRST entries; FMT_SITE_BUDGET probe misses in a
+ * row with no intern hit turn it off again (the compiled code stores NULL
+ * over `entries`), so a site formatting a stream of distinct strings --
+ * string_build's `f"item-{i}"` -- stops paying for a probe that never hits.
+ * An empty entry's pre is JAI_FMT_MEMO_EMPTY, an address no object has, so
+ * the all-absent key of `f"{n}"` cannot match a cleared slot. A table
+ * doubles whenever twice its size in fills have gone in since it last grew
+ * or was cleared, up to the intern soft cap per site and FMT_MEMO_TOTAL
+ * entries over all of them; a site nothing was filed into between two
+ * collections gives its table back (it was empty since the first of them)
+ * and is off until its next intern hit, so the sites of a phase a program
+ * has finished do not keep the memory a later one needs. */
+#define FMT_SITE_FIRST  64u
+#define FMT_SITE_BUDGET 256
+#define FMT_SITE_MAX    ((uint64_t)JAI_INTERN_SOFT_CAP)
+#define FMT_MEMO_TOTAL  ((uint64_t)1 << 16)
+#define FMT_SITE_CAP    16384u
+
+/* What emitFmtMemoProbe reads, at the offsets it reads them. */
+_Static_assert(offsetof(JaiFmtSite, entries) == JAI_FMT_SITE_ENTRIES &&
+                   offsetof(JaiFmtSite, mask) == JAI_FMT_SITE_ENTRIES + 8 &&
+                   offsetof(JaiFmtSite, budget) == JAI_FMT_SITE_BUDGET &&
+                   offsetof(JaiFmtSite, leaf) == JAI_FMT_SITE_LEAF,
+               "a memo site's first four words are where the JIT reads them");
+_Static_assert(offsetof(JaiFmtMemoEntry, pre) == 0 &&
+                   offsetof(JaiFmtMemoEntry, post) == 8 &&
+                   offsetof(JaiFmtMemoEntry, n) == 16 &&
+                   offsetof(JaiFmtMemoEntry, s) == 24 &&
+                   sizeof(JaiFmtMemoEntry) == 32,
+               "a memo entry is the four words the JIT loads as two pairs");
+
+static JaiFmtSite *fmtOwners;     /* sites holding a table */
+static uint64_t    fmtEntries;    /* table entries allocated, all sites */
+static unsigned    fmtSites;
+
+JaiFmtSite *jaiFmtSiteNew(void) {
+    if (fmtSites >= FMT_SITE_CAP) return NULL;
+    JaiFmtSite *site = calloc(1, sizeof *site);
+    if (site == NULL) return NULL;
+    site->leaf = (void *)&jaiValueFormatIntLeafMemo;
+    fmtSites++;
+    return site;
+}
+
+static void fmtMemoEmpty(JaiFmtMemoEntry *entries, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        entries[i].pre = JAI_FMT_MEMO_EMPTY;
+        entries[i].post = NULL;
+        entries[i].n = 0;
+        entries[i].s = NULL;
+    }
+}
+
+void jaiFmtMemoClear(void) {
+    JaiFmtSite **link = &fmtOwners;
+    while (*link != NULL) {
+        JaiFmtSite *site = *link;
+        site->fills = 0;
+        if (site->dirty) {
+            fmtMemoEmpty(site->table, site->mask + 1u);
+            site->dirty = false;
+            link = &site->nextOwner;
+            continue;
+        }
+        *link = site->nextOwner;
+        site->nextOwner = NULL;
+        fmtEntries -= site->mask + 1u;
+        free(site->table);
+        site->table = NULL;
+        site->entries = NULL;
+        site->mask = 0;
+    }
+}
+
+/* A table of `count` entries, empty, in place of the site's own: the entries
+ * it held are refilled by the misses that follow, which is cheaper than
+ * rehashing them here. malloc and never the collector's allocator -- this
+ * runs inside a leaf. Failing to allocate keeps what the site has. */
+static JAI_NOINLINE void fmtSiteResize(JaiFmtSite *site, uint64_t count) {
+    const uint64_t had = site->table == NULL ? 0 : site->mask + 1u;
+    if (fmtEntries - had + count > FMT_MEMO_TOTAL) return;
+    JaiFmtMemoEntry *table = malloc(count * sizeof *table);
+    if (table == NULL) return;
+    fmtMemoEmpty(table, count);
+    free(site->table);
+    fmtEntries = fmtEntries - had + count;
+    site->table = table;
+    site->mask = count - 1u;
+    site->fills = 0;
+}
+
+ObjString *jaiFmtMemoFill(JaiFmtSite *site, Obj *pre, int64_t n, Obj *post,
+                          ObjString *s) {
+    if (JAI_UNLIKELY(site->table == NULL)) {
+        fmtSiteResize(site, FMT_SITE_FIRST);
+        if (site->table == NULL) return s;
+        site->nextOwner = fmtOwners;
+        fmtOwners = site;
+    } else if (JAI_UNLIKELY(site->fills > 2u * (site->mask + 1u)) &&
+               site->mask + 1u < FMT_SITE_MAX) {
+        fmtSiteResize(site, (site->mask + 1u) * 2u);
+    }
+    JaiFmtMemoEntry *e =
+        &site->table[jaiFmtMemoIndex(pre, n, post, site->mask)];
+    e->pre = pre;
+    e->post = post;
+    e->n = n;
+    e->s = s;
+    site->fills++;
+    site->entries = site->table;
+    site->budget = FMT_SITE_BUDGET;
+    site->dirty = true;
+    return s;
+}
+
+/* The leaf's body, instantiated twice. The memo's copy does not file the
+ * hit itself: keeping pre, n and post alive to a fill in here reshaped the
+ * register plan of the whole function and cost ~11 instructions on EVERY
+ * call, the misses of a stream of distinct strings included. It marks the
+ * answer instead -- bit 0 of the pointer, which no object has set -- and the
+ * compiled caller, which still holds pre, n and post in callee-saved
+ * registers, makes the fill call out of line (emitFmtMemoFillStub). */
+JAI_INLINE ObjString *formatIntLeaf(Obj *pre, int64_t n, Obj *post,
+                                    bool memo) {
     uint64_t words[(FMT_SHORT_BUF + 7) / 8];
     char *buf = (char *)words;
     size_t o = 0;
@@ -1395,11 +1550,25 @@ ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
         o += (size_t)writeInt64Inline(buf + o, n);
         if (JAI_LIKELY(o <= JAI_STR_SHORT_MAX && fmtRun(buf, &o, post))) {
             ObjString *found = formatShortProbe(buf, o);
-            if (JAI_LIKELY(found != NULL)) return found;
+            if (JAI_LIKELY(found != NULL)) {
+                if (memo) return (ObjString *)((uintptr_t)found | 1u);
+                return found;
+            }
             return formatLeafBuilt(buf, o);
         }
     }
     return NULL;
+}
+
+ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
+    return formatIntLeaf(pre, n, post, false);
+}
+
+/* jaiValueFormatIntLeaf for a caller that probed the memo and missed: an
+ * intern hit comes back with bit 0 set, for the caller to strip and to file
+ * with jaiFmtMemoFill. */
+ObjString *jaiValueFormatIntLeafMemo(Obj *pre, int64_t n, Obj *post) {
+    return formatIntLeaf(pre, n, post, true);
 }
 
 /* A short f-string's runs, already rendered, staged where formatShortProbe

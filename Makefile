@@ -84,6 +84,8 @@ FUZZ_WARM  ?= 1500
 # How many generated `match` bodies `make match-fuzz` runs through its six
 # configurations. Four to a program, so this is fifty programs at the default.
 MATCH_FUZZ_COUNT ?= 200
+# How many generated programs `make dictfmt-fuzz` runs: about 90s at 400.
+DICTFMT_FUZZ_COUNT ?= 400
 # How many generated programs `make flow-fuzz` runs. It varies the SHAPE --
 # try/catch, defer, labelled break, closures outliving their capture -- where
 # the other fuzzers vary a kind, so it is one program per count, not four.
@@ -636,10 +638,11 @@ $(BUILD)/%.o: %.m | $(CC_STAMP)
 
 # run_tests.sh runs the verifier itself, as the first of its four layers, so
 # that the run ends in one summary rather than one per layer.
-test: package-check opcode-check exports-check layer-check kind-tag-check switch-doc-check seed-closure-check jaic-wire-check field-kind-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/chunk_cfg $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
+test: package-check opcode-check exports-check layer-check kind-tag-check switch-doc-check seed-closure-check jaic-wire-check field-kind-check linkage-check import-check jit-fusion-check branch-table-check method-surface-check check $(TARGET) $(BUILD)/verify_chunk $(BUILD)/chunk_cfg $(BUILD)/crc32_equiv $(BUILD)/chunk_caches $(BUILD)/fmt_memo $(BUILD)/linetable_ltv1 $(BUILD)/jit_arena $(BUILD)/jit_arm64 $(BUILD)/field_natives $(BUILD)/invoke_result_kind
 	@$(BUILD)/chunk_cfg
 	@$(BUILD)/crc32_equiv
 	@$(BUILD)/chunk_caches
+	@$(BUILD)/fmt_memo
 	@$(BUILD)/linetable_ltv1
 	@$(BUILD)/jit_arena
 	@$(BUILD)/jit_arm64

@@ -270,6 +270,136 @@ static bool jitFormatIntLeaf(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_FMT_MEMO=0 emits no memo site or probe in front of the
+ * one-int-hole leaf, and calls the leaf that fills nothing, for a one-binary
+ * A/B of the memo. Nothing else fills it. */
+static bool jitFmtMemoOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_FMT_MEMO");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The memo probe (see the f-string memo in value.c) for an int in `rN`
+ * between runs in `rPre` and `rPost` (31, the zero register, for an absent
+ * one), against a site of its own: the entry for this (pre, n, post), and
+ * when it matches, its string is the answer with no call at all --
+ *
+ *     x16 <- site;  x10, x17 <- entries, mask;  cbz x10, call   (site off)
+ *     w9  <- crc32c(pre, post), the runs that are there
+ *     x9  <- &entries[(n + w9) & mask]                     jaiFmtMemoIndex
+ *     x10, x11, x12, x0 <- the entry's pre, post, n, s
+ *     cmp pre; [ccmp post;] ccmp n;  b.eq <answered>
+ *     budget -= 1;  if budget < 0: entries <- NULL          (site goes off)
+ *   call:
+ *
+ * An absent post is NULL in every entry the site files, so it is not
+ * compared; pre always is, absent or not, since an empty entry's pre is
+ * JAI_FMT_MEMO_EMPTY, which no operand equals. Fills `*fix` with the index of
+ * the b.eq, for the caller to aim at where the leaf's answer is taken from
+ * x0, and the site, whose leaf the caller calls through x16 (emitFmtMemoCall);
+ * fix->hit is -1 with nothing emitted when there is no memo. Every register
+ * it writes is one the leaf call behind it clobbers anyway, and the operands
+ * must be in callee-saved registers (leafRegOk), so the miss path finds them
+ * as they were. The leaf marks an intern hit for emitFmtMemoFillStub to file:
+ * that is the only way into a table, and what turns a site on. */
+void emitFmtMemoProbe(Emit *e, unsigned rPre, unsigned rN, unsigned rPost,
+                      FmtMemoFix *fix) {
+    fix->hit = -1;
+    fix->site = NULL;
+    if (!jitFmtMemoOn()) return;
+    JaiFmtSite *site = jaiFmtSiteNew();
+    if (site == NULL) return;
+    noteScratchClobber(e);
+    emitConst64(e, 16, (int64_t)(uintptr_t)site);
+    emit(e, jaiA64LdpOff(10, 17, 16, JAI_FMT_SITE_ENTRIES));
+    int off = (int)e->count;
+    emit(e, jaiA64CbzX(10, 0));
+    unsigned rIdx = rN;
+    if (rPre != 31u || rPost != 31u) {
+        unsigned acc = 31u;
+        if (rPre != 31u) {
+            emit(e, jaiA64Crc32cX(9, acc, rPre));
+            acc = 9;
+        }
+        if (rPost != 31u) {
+            emit(e, jaiA64Crc32cX(9, acc, rPost));
+        }
+        emit(e, jaiA64AddXUxtw(9, rN, 9));
+        rIdx = 9;
+    }
+    emit(e, jaiA64AndX(9, rIdx, 17));
+    emit(e, jaiA64AddXLsl(9, 10, 9, 5));
+    emit(e, jaiA64LdpOff(10, 11, 9, 0));
+    emit(e, jaiA64LdpOff(12, 0, 9, 16));
+    emit(e, jaiA64SubsXReg(31, 10, rPre));
+    if (rPost != 31u) emit(e, jaiA64CcmpX(11, rPost, 0, JAI_A64_EQ));
+    emit(e, jaiA64CcmpX(12, rN, 0, JAI_A64_EQ));
+    int at = (int)e->count;
+    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    emit(e, jaiA64LdrX(10, 16, JAI_FMT_SITE_BUDGET));
+    emit(e, jaiA64SubsXImm(10, 10, 1));
+    emit(e, jaiA64StrX(10, 16, JAI_FMT_SITE_BUDGET));
+    emit(e, jaiA64BCond(JAI_A64_GE, 2));
+    emit(e, jaiA64StrX(31, 16, JAI_FMT_SITE_ENTRIES));
+    if (e->count > JIT_MAX_INSTS) return;
+    e->code[off] = jaiA64CbzX(10, (int32_t)((int)e->count - off));
+    fix->hit = at;
+    fix->site = site;
+}
+
+/* The call behind the probe: through the site's own leaf pointer when there
+ * is one (x16 still holds the site), else the plain leaf. */
+void emitFmtMemoCall(Emit *e, const FmtMemoFix *fix) {
+    if (fix->hit >= 0) {
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, 16, JAI_FMT_SITE_LEAF));
+    } else {
+        emitConst64(e, JIT_SCRATCH_A,
+                    (int64_t)(uintptr_t)&jaiValueFormatIntLeaf);
+    }
+}
+
+/* After a call to jaiValueFormatIntLeafMemo has returned a non-NULL x0: an
+ * answer marked as an intern hit (bit 0) goes out of line to be filed --
+ *
+ *         tbnz x0, #0, fill
+ *   ...   <the caller's answered path, then its branch over the slow path>
+ *   fill: jaiFmtMemoFill(site, pre, n, post, x0 - 1);  b answered
+ *
+ * emitFmtMemoFillTest places the test and returns its index (-1 for none);
+ * emitFmtMemoFillStub, called once the caller has emitted its branch over
+ * the slow path, places the stub and aims the test at it, rejoining at
+ * `answered`. pre, n and post are still in their callee-saved registers. */
+int emitFmtMemoFillTest(Emit *e, const FmtMemoFix *fix) {
+    if (fix->hit < 0) return -1;
+    int at = (int)e->count;
+    emit(e, jaiA64Tbnz(0, 0, 0));
+    return at;
+}
+
+void emitFmtMemoFillStub(Emit *e, int test, int answered,
+                         const FmtMemoFix *fix, unsigned rPre, unsigned rN,
+                         unsigned rPost) {
+    if (test < 0 || e->count > JIT_MAX_INSTS) return;
+    e->code[test] = jaiA64Tbnz(0, 0, (int32_t)((int)e->count - test));
+    emit(e, jaiA64SubXImm(4, 0, 1));
+    emitConst64(e, 0, (int64_t)(uintptr_t)fix->site);
+    emit(e, jaiA64MovX(1, rPre));
+    emit(e, jaiA64MovX(2, rN));
+    emit(e, jaiA64MovX(3, rPost));
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jaiFmtMemoFill);
+    emit(e, jaiA64Blr(JIT_SCRATCH_A));
+    emit(e, jaiA64B((int32_t)(answered - (int)e->count)));
+}
+
+/* Aims a probe's hit branch at the current instruction. */
+void fmtMemoHitHere(Emit *e, int at) {
+    if (at < 0 || at >= (int)e->count || e->count > JIT_MAX_INSTS) return;
+    e->code[at] = jaiA64BCond(JAI_A64_EQ, (int32_t)((int)e->count - at));
+}
+
 /* The f-string through jaiValueFormatLeaf, in front of the descriptor call to
  * jitFormat, which stays behind it as the slow path -- the same layout as the
  * dict leaves (see emitDictLeafGet):
@@ -330,6 +460,8 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
      * leaf checks that the objects are strings. Everything else writes its
      * parts out for the general leaf. */
     int hole = -1;
+    FmtMemoFix memo = {-1, NULL};
+    unsigned fmtPre = 31u, fmtN = 31u, fmtPost = 31u;
     bool oneIntHole = parts <= 3 && jitFormatIntLeaf();
     for (unsigned i = 0; i < parts && oneIntHole; i++) {
         SlotKind k = e->stack[first + i];
@@ -347,13 +479,16 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
         unsigned rPost = (unsigned)hole + 1 < parts
                              ? valueXReg(e, vfirst + (unsigned)hole + 1)
                              : 31u;
+        emitFmtMemoProbe(e, rPre, rN, rPost, &memo);
+        fmtPre = rPre;
+        fmtN = rN;
+        fmtPost = rPost;
         /* `mov x, xzr` is the NULL for an absent run; register 31 here is
          * the zero register, which jaiA64MovX encodes as `orr x, xzr, xzr`. */
         emit(e, jaiA64MovX(0, rPre));
         emit(e, jaiA64MovX(1, rN));
         emit(e, jaiA64MovX(2, rPost));
-        emitConst64(e, JIT_SCRATCH_A,
-                    (int64_t)(uintptr_t)&jaiValueFormatIntLeaf);
+        emitFmtMemoCall(e, &memo);
     } else {
         for (unsigned i = 0; i < parts; i++) {
             unsigned reg = valueXReg(e, vfirst + i);
@@ -374,6 +509,11 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
     fx->slow[0] = (int)e->count;
     fx->cond[0] = JAI_A64_EQ;
     emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    /* An intern hit to file goes out of line; a memo hit joins after the
+     * test, with its string already in x0. */
+    int fillTest = emitFmtMemoFillTest(e, &memo);
+    int answered = (int)e->count;
+    fmtMemoHitHere(e, memo.hit);
     /* Straight into the register the result will occupy -- the first part's,
      * once the parts are popped and the string pushed -- and past the load
      * the descriptor path ends with (emitFormat places the join after it).
@@ -389,6 +529,7 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
     }
     fx->done = (int)e->count;
     emit(e, jaiA64B(0));
+    emitFmtMemoFillStub(e, fillTest, answered, &memo, fmtPre, fmtN, fmtPost);
     fx->on = true;
 }
 

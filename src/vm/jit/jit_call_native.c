@@ -235,22 +235,29 @@ int emitNativeResultCall(Emit *e, Value cv, const char *nm,
         unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
         fpSyncAll(e);
         settleAll(e);
+        unsigned rN = valueXReg(e, e->valueDepth - 1);
+        /* `str(n)` is `f"{n}"`, so it shares that f-string's memo entries. */
+        FmtMemoFix memo;
+        emitFmtMemoProbe(e, 31u, rN, 31u, &memo);
         emit(e, jaiA64MovzX(0, 0, 0));
-        emit(e, jaiA64MovX(1, valueXReg(e, e->valueDepth - 1)));
+        emit(e, jaiA64MovX(1, rN));
         emit(e, jaiA64MovzX(2, 0, 0));
-        emitConst64(e, JIT_SCRATCH_A,
-                    (int64_t)(uintptr_t)&jaiValueFormatIntLeaf);
+        emitFmtMemoCall(e, &memo);
         noteScratchClobber(e);
         emit(e, jaiA64Blr(JIT_SCRATCH_A));
         emit(e, jaiA64SubsXImm(31, 0, 0));
         sfx.slow[0] = (int)e->count;
         sfx.cond[0] = JAI_A64_EQ;
         emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+        int fillTest = emitFmtMemoFillTest(e, &memo);
+        int answered = (int)e->count;
+        fmtMemoHitHere(e, memo.hit);
         emit(e, jaiA64MovzX(JIT_SCRATCH_A, VAL_OBJ, 0));
         emit(e, jaiA64StrW(JIT_SCRATCH_A, 31, rat));
         emit(e, jaiA64StrX(0, 31, rat + 8));
         sfx.done = (int)e->count;
         emit(e, jaiA64B(0));
+        emitFmtMemoFillStub(e, fillTest, answered, &memo, 31u, rN, 31u);
         sfx.on = true;
     }
     leafSlowHere(e, &sfx);
