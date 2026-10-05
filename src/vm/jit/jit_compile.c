@@ -399,6 +399,112 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                             const bool *nullable, bool *needNullable,
                             bool noInline);
 
+/* ---- Map kernels -----------------------------------------------------------
+ *
+ * `xs.map(|x| x * 2)` runs its lambda once per element through a full call:
+ * the run in jaiMapPreparedFn1Run hoists every per-callee check out of its
+ * loop, but each element still pays the callee's frame, its saves, its stack
+ * check and its return -- 18 instructions for a body of one multiply, and the
+ * whole of what a 10M-element map costs beyond the loads and stores.
+ *
+ * A kernel is the same body compiled once more with the loop moved inside it.
+ * The prologue runs once; then the loop head loads element `i` of
+ * gJitMapRun.src into the argument register and falls into the body as a call
+ * would, and every return stores its value to element `i` of gJitMapRun.dst
+ * and branches back to the head instead of leaving. Every other way out --
+ * a deopt, the bail block, an exception, an overflow -- leaves as it always
+ * did, with `i` naming the element it was on, and the run finishes that one
+ * element exactly as it finishes a bailed call.
+ *
+ * Only for a body that can call nothing (callsOut off for both passes), so
+ * nothing inside it can collect, move, box or shrink either list, or define a
+ * global: the arrays and the count are fixed for the whole kernel. The rest of
+ * what is refused is everything that assumes one entry per call -- a hoisted
+ * list header, a self-call, a branch back to the entry -- and a partial
+ * compile, which would deoptimise on every element. */
+JitMapRun gJitMapRun;
+static bool    gMapKernel;
+static uint8_t gMapKernelKind;
+static uint8_t *gMapKernelEntry;
+
+void emitMapKernelNext(Emit *e, SlotKind k) {
+    if (k != (SlotKind)e->mapKernelKind) {
+        e->whyNot = "a map kernel returning another kind";
+        return;
+    }
+    unsigned rI = e->mapKernelReg, rG = rI + 2u;
+    emit(e, jaiA64LdrX(JIT_SCRATCH_C, rG, (unsigned)offsetof(JitMapRun, dst)));
+    emit(e, jaiA64StrXIdx(0, JIT_SCRATCH_C, rI));
+    emit(e, jaiA64AddXImm(rI, rI, 1));
+    emit(e, jaiA64B(e->mapKernelHead - (int)e->count));
+}
+
+/* JAITHON_JIT_MAP_KERNEL=0 leaves every map run calling its callee once per
+ * element. */
+bool jaiJitMapKernelOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_MAP_KERNEL");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* See above. `slotBase` is the run's window, its argument the first element;
+ * `kind` the result kind every return must have, an int or a float. The
+ * function's own compiled form and everything recorded about it are left
+ * exactly as they were. NULL when the body does not qualify. */
+uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
+                                uint8_t kind) {
+    ObjFunction *fn = closure->fn;
+    if (kind != (uint8_t)SLOT_INT && kind != (uint8_t)SLOT_FLOAT) return NULL;
+    if (fn->upvalueCount != 0 || fn->arity != 1) return NULL;
+    if (!eligible(fn)) return NULL;
+
+    uint8_t *old       = fn->jitFunc;
+    uint8_t  oldArgC   = fn->jitArgCount;
+    uint8_t  oldArgB   = fn->jitArgBase;
+    uint8_t  oldRet    = fn->jitReturnKind;
+    bool     oldRetK   = fn->jitReturnKnown;
+    uint32_t oldRetS   = fn->jitReturnShape;
+    bool     oldNoWr   = fn->jitFuncNoWrite;
+    ObjFunction *oldBlk = fn->jitBlockedOn;
+    uint8_t  oldKind[8];
+    uint32_t oldShape[8];
+    memcpy(oldKind,  fn->jitParamKind,  sizeof oldKind);
+    memcpy(oldShape, fn->jitParamShape, sizeof oldShape);
+
+    bool dynamic[JIT_MAX_SLOTS + 1], need[JIT_MAX_SLOTS + 1];
+    bool nullable[JIT_MAX_SLOTS + 1], needNull[JIT_MAX_SLOTS + 1];
+    memset(dynamic, 0, sizeof dynamic);
+    memset(nullable, 0, sizeof nullable);
+    memset(need, 0, sizeof need);
+    memset(needNull, 0, sizeof needNull);
+    gMapKernel = true;
+    gMapKernelKind = kind;
+    gMapKernelEntry = NULL;
+    bool ok = compileFuncOnce(closure, slotBase, dynamic, need, nullable,
+                              needNull, false);
+    gMapKernel = false;
+    uint8_t *entry = ok ? gMapKernelEntry : NULL;
+
+    fn->jitBlockedOn   = oldBlk;
+    fn->jitFunc        = old;
+    fn->jitArgCount    = oldArgC;
+    fn->jitArgBase     = oldArgB;
+    fn->jitReturnKind  = oldRet;
+    fn->jitReturnKnown = oldRetK;
+    fn->jitReturnShape = oldRetS;
+    fn->jitFuncNoWrite = oldNoWr;
+    memcpy(fn->jitParamKind,  oldKind,  sizeof oldKind);
+    memcpy(fn->jitParamShape, oldShape, sizeof oldShape);
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] map kernel for %s: %s\n", jitFnLabel(fn),
+                entry != NULL ? "compiled" : "declined");
+    }
+    return entry;
+}
+
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (!eligible(fn)) return false;
@@ -576,7 +682,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     body.base         = 0;
     body.locals       = (unsigned)fn->maxSlots;
     body.usesUpvalues = fn->upvalueCount > 0;
-    body.callsOut     = true;      /* the measuring pass may emit one */
+    body.callsOut     = !gMapKernel;   /* the measuring pass may emit one */
+    body.mapKernel    = gMapKernel;
+    body.mapKernelKind = gMapKernelKind;
+    e.mapKernel       = gMapKernel;
+    e.mapKernelKind   = gMapKernelKind;
     body.measuring    = true;
     body.litPool      = jitLitPoolOn();
     body.descOffset   = 16u;
@@ -663,6 +773,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
+    /* A kernel takes one element in x0 and stores one kind of result. */
+    if (gMapKernel &&
+        (body.usesSlot0 || !body.sawReturn ||
+         body.returnKind != (SlotKind)gMapKernelKind ||
+         body.hasSelfCall || body.unarmedOp != 0)) {
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+        return false;
+    }
     e.base         = body.usesSlot0 ? 0u : 1u;
     /* The measuring pass has walked every return this pass will: if they
      * disagreed there, every return site here carries its own tag in x1.
@@ -722,6 +840,16 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         return false;
     }
 
+    /* A kernel keeps its index, its bound and &gJitMapRun in the three
+     * callee-saved registers above everything the body was planned into. */
+    if (gMapKernel) {
+        if (saved + 3u > JIT_MAX_SAVED) {
+            jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+            return false;
+        }
+        e.mapKernelReg = JIT_FIRST_SAVED + saved;
+        saved += 3u;
+    }
     e.savedCount = saved;
     e.callsOut   = body.callsOut;
     /* The real pass must ask growKeepsHere the measuring pass's question: a
@@ -764,6 +892,31 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     emitFrameEnter(&e);
     emitSaveRestore(&e, true);
     emitFpSaveRestore(&e, true);
+    /* A kernel checks the stack once, then loops from here: element `i` into
+     * x0, where a call would have put its argument, and on into the same
+     * argument moves and local zeroing a call runs. */
+    int guardLoad = -1;
+    unsigned guardBranch = 0;
+    if (gMapKernel) {
+        guardLoad = (int)e.count;
+        emit(&e, jaiA64LdrLit(JIT_SCRATCH_A, 0));      /* patched below */
+        emit(&e, jaiA64CmpSpX(JIT_SCRATCH_A));
+        guardBranch = e.count;
+        emit(&e, jaiA64BCond(JAI_A64_LO, 0));          /* patched below */
+        unsigned rI = e.mapKernelReg, rN = rI + 1u, rG = rI + 2u;
+        emitConst64(&e, rG, (int64_t)(uintptr_t)&gJitMapRun);
+        emit(&e, jaiA64LdrX(rI, rG, (unsigned)offsetof(JitMapRun, i)));
+        emit(&e, jaiA64LdrX(rN, rG, (unsigned)offsetof(JitMapRun, n)));
+        e.mapKernelHead = (int)e.count;
+        emit(&e, jaiA64SubsX(31, rI, rN));
+        e.mapKernelExit = (int)e.count;
+        emit(&e, jaiA64BCond(JAI_A64_GE, 0));          /* patched below */
+        /* Where every way out but the last says which element it was on. */
+        emit(&e, jaiA64StrX(rI, rG, (unsigned)offsetof(JitMapRun, i)));
+        emit(&e, jaiA64LdrX(JIT_SCRATCH_C, rG,
+                            (unsigned)offsetof(JitMapRun, src)));
+        emit(&e, jaiA64LdrXRegLsl3(0, JIT_SCRATCH_C, rI));
+    }
     /* Real arguments land in local registers in order; the closure (if any) lives just past the locals,
      * where closureReg expects it. Placing it by argument index instead once put it three registers low, and the first upvalue read dereferenced whatever was there. */
     unsigned realArgs = e.usesUpvalues ? argCount - 1u : argCount;
@@ -832,11 +985,13 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     }
     /* Stack guard: bail rather than run off the end of the thread's stack,
      * so that runaway recursion still becomes a RecursionError. */
-    int guardLoad = (int)e.count;
-    emit(&e, jaiA64LdrLit(JIT_SCRATCH_A, 0));         /* patched below */
-    emit(&e, jaiA64CmpSpX(JIT_SCRATCH_A));            /* every call pays it */
-    unsigned guardBranch = e.count;
-    emit(&e, jaiA64BCond(JAI_A64_LO, 0));             /* patched below */
+    if (!gMapKernel) {
+        guardLoad = (int)e.count;
+        emit(&e, jaiA64LdrLit(JIT_SCRATCH_A, 0));     /* patched below */
+        emit(&e, jaiA64CmpSpX(JIT_SCRATCH_A));        /* every call pays it */
+        guardBranch = e.count;
+        emit(&e, jaiA64BCond(JAI_A64_LO, 0));         /* patched below */
+    }
 
     unsigned prologue = e.count;
 
@@ -924,7 +1079,20 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
-    if (earlyUnarmedDecline(&e, fn, closure)) {
+    /* Everything that assumes one entry per call, or could let the body
+     * reach either list -- see jaiJitCompileMapKernel. */
+    if (gMapKernel &&
+        (e.base != 1u || argCount != 1u || e.usesUpvalues ||
+         e.clobbersScratch || e.callsOut || e.unarmedOp != 0 ||
+         e.hoistCount != 0 || e.pushHoistCount != 0 ||
+         e.iterHoistCount != 0 || e.selfSlowCount != 0 || e.hasSelfCall ||
+         e.growCount != 0 || e.coldCount != 0 || e.wroteHeap ||
+         e.dynamicReturn || !e.sawReturn ||
+         e.returnKind != (SlotKind)gMapKernelKind)) {
+        jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+        return false;
+    }
+    if (!gMapKernel && earlyUnarmedDecline(&e, fn, closure)) {
         jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
         return false;
     }
@@ -938,6 +1106,18 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         return false;
     }
     (void)prologue;
+
+    /* The kernel's way out once every element is done: a zero verdict, and
+     * `i` already equal to `n`. */
+    if (gMapKernel) {
+        int done = (int)e.count;
+        e.code[e.mapKernelExit] =
+            jaiA64BCond(JAI_A64_GE, done - e.mapKernelExit);
+        emit(&e, jaiA64StrX(e.mapKernelReg, e.mapKernelReg + 2u,
+                            (unsigned)offsetof(JitMapRun, i)));
+        emit(&e, jaiA64MovzX(0, 0, 0));
+        emitEpilogue(&e, 0);
+    }
 
     /* The bail block: say so, return anything, and let the caller throw the
      * whole computation away. */
@@ -1259,6 +1439,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 return false;
             }
         } else if (f->targetOffset == FIXUP_ENTRY) {
+            /* A kernel's entry is not a call's: it runs once. */
+            if (gMapKernel) {
+                jitFree(map, depths, chunkDepth, fn->chunk.count + 1);
+                return false;
+            }
             target = 0;
         } else {
             if (f->targetOffset > (uint32_t)fn->chunk.count) {
@@ -1392,6 +1577,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         return false;
     }
     jitPerfMapNote(entry, e.count, fn, -1);
+    /* Nothing about the function itself changes: the kernel is the run's. */
+    if (gMapKernel) {
+        gMapKernelEntry = entry;
+        return true;
+    }
 
     if (e.whyNot != NULL && getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] %s stopped: %s\n",
@@ -1512,5 +1702,10 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return false;
 }
+uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
+                                uint8_t kind) {
+    (void)closure; (void)slotBase; (void)kind; return NULL;
+}
+bool jaiJitMapKernelOn(void) { return false; }
 
 #endif

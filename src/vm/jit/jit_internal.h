@@ -408,6 +408,16 @@ typedef struct {
      * a call may not fit as an expression; the compile retries with this set when that's what went wrong. */
     bool      noInline;
     bool      inlined;
+    /* A map kernel (jaiJitCompileMapKernel): the body wrapped in a loop over
+     * gJitMapRun, each return storing its value and taking the next element
+     * instead of leaving. `mapKernelHead` is the loop's first instruction and
+     * `mapKernelExit` the `b.ge` out of it, patched once the exit exists. */
+    bool      mapKernel;
+    uint8_t   mapKernelKind;
+    int       mapKernelHead;
+    int       mapKernelExit;
+    /* x(reg) the index, x(reg+1) the bound, x(reg+2) &gJitMapRun. */
+    unsigned  mapKernelReg;
     /* Inlined callee: its locals are operand-stack entries of the CALLER's frame (slots 1..n are the
      * already-present argument entries); nothing is copied, no frame appears -- but the interpreter has no idea, so every guard inside deoptimises to `inlIp` (the caller's OP_CALL) with the model as of `inlDepth`. */
     bool      inlining;
@@ -1108,6 +1118,19 @@ uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
 
 /* Defined in jit_func.c. */
 extern bool gInlineFailed;
+/* What a map kernel loops over: `src` and `dst` are the two lists' element
+ * arrays, both eight bytes wide, and the kernel runs `i` up to `n` in a
+ * register, writing it back here before each element so that every way out
+ * leaves it naming the element it stopped on. One run at a time -- the VM runs one
+ * Jaithon thread, and a kernel calls nothing. */
+typedef struct {
+    const void *src;
+    void       *dst;
+    int64_t     i;
+    int64_t     n;
+} JitMapRun;
+extern JitMapRun gJitMapRun;
+void emitMapKernelNext(Emit *e, SlotKind k);
 
 /* Defined in jit_compile.c. */
 bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,

@@ -33,6 +33,7 @@ static bool dynamicReturnKind(SlotKind k) {
  * kinds and names it for the rest, and it goes up in x1 above a zero verdict
  * byte. Every other body leaves x1 as the bare verdict it always was. */
 void emitReturnLeave(Emit *e, SlotKind k) {
+    if (e->mapKernel && !e->measuring) { emitMapKernelNext(e, k); return; }
     if (!e->dynamicReturn) { emitEpilogue(e, 0); return; }
     emitTagFor(e, k, 0, JIT_SCRATCH_A, JIT_SCRATCH_B);
     emit(e, jaiA64LslX(1, JIT_SCRATCH_A, JIT_RET_TAG_SHIFT));

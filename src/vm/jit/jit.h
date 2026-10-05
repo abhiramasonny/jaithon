@@ -105,6 +105,12 @@ JaiJitOutcome jaiJitEnter(ObjClosure *closure, Value *slotBase);
 /* The whole-function tier (jit_func.c). Compile returns false for anything it
  * does not speak; enter obeys the same boundary contract as jaiJitEnter. */
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase);
+/* A one-argument, call-free body compiled with a list map's loop inside it
+ * (jit_compile.c, "Map kernels"); NULL when the body does not qualify.
+ * JAITHON_JIT_MAP_KERNEL=0 turns it off (jaiJitMapKernelOn). */
+uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
+                                uint8_t kind);
+bool jaiJitMapKernelOn(void);
 
 /* Populate the freshly pushed frame from the deopt record. */
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase);
