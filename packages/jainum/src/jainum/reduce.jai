@@ -271,6 +271,62 @@ kernel void nr_fold(device float* dst [[buffer(0)]],
     if (slot == 0u && seg < segments) dst[seg * chunks + chunk] = scratch[lid];
 }
 
+/* The fold's one-lane-a-segment shape -- the reduced axis strided, the kept
+ * one dense -- with four neighbouring segments a thread on one float4 load.
+ *
+ * Each lane keeps its own accumulator and runs its segment's elements in the
+ * order `nr_fold` at width one does, through the same scalar `nr_ingest` and
+ * `nr_combine`, so every segment's answer is that kernel's to the bit; only
+ * the load is four wide. The host takes this road when the segments come in
+ * fours and every float4 is sixteen-byte aligned. Consecutive threads take
+ * consecutive quads of one chunk, so a simdgroup reads 512 contiguous bytes
+ * a row. */
+inline float4 nr_fold4_lanes(float4 acc, float4 v, float4 c, uint op, uint skip_nan) {
+    acc.x = nr_combine(acc.x, nr_ingest(v.x, c.x, op, skip_nan), op, skip_nan);
+    acc.y = nr_combine(acc.y, nr_ingest(v.y, c.y, op, skip_nan), op, skip_nan);
+    acc.z = nr_combine(acc.z, nr_ingest(v.z, c.z, op, skip_nan), op, skip_nan);
+    acc.w = nr_combine(acc.w, nr_ingest(v.w, c.w, op, skip_nan), op, skip_nan);
+    return acc;
+}
+
+kernel void nr_fold_columns(device float* dst [[buffer(0)]],
+                            device const float* src [[buffer(1)]],
+                            device const float* center [[buffer(2)]],
+                            constant uint& quads [[buffer(3)]],
+                            constant uint& n [[buffer(4)]],
+                            constant uint& op [[buffer(5)]],
+                            constant uint& skip_nan [[buffer(6)]],
+                            constant uint& base [[buffer(7)]],
+                            constant uint& step [[buffer(8)]],
+                            constant uint& per [[buffer(9)]],
+                            constant uint& chunks [[buffer(10)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= quads * chunks) return;
+    uint chunk = gid / quads;
+    uint quad = gid - chunk * quads;
+    uint seg = quad * 4u;
+    float ident = nr_identity(op, skip_nan);
+    float4 c = float4(0.0f);
+    if (op == NR_CENTERED) c = float4(center[seg], center[seg + 1u], center[seg + 2u], center[seg + 3u]);
+    float4 acc = float4(ident);
+    uint start = chunk * per;
+    uint stop = min(n, start + per);
+    device const float* first = src + base + seg;
+    /* Four rows' loads are issued before any of them is folded, so a thread
+     * has four misses in flight; the fold itself still takes them in order. */
+    uint k = start;
+    for (; k + 4u <= stop; k += 4u) {
+        float4 rows[4];
+        for (uint r = 0u; r < 4u; r++) rows[r] = *((device const float4*)(first + (k + r) * step));
+        for (uint r = 0u; r < 4u; r++) acc = nr_fold4_lanes(acc, rows[r], c, op, skip_nan);
+    }
+    for (; k < stop; k++) acc = nr_fold4_lanes(acc, *((device const float4*)(first + k * step)), c, op, skip_nan);
+    dst[seg * chunks + chunk] = acc.x;
+    dst[(seg + 1u) * chunks + chunk] = acc.y;
+    dst[(seg + 2u) * chunks + chunk] = acc.z;
+    dst[(seg + 3u) * chunks + chunk] = acc.w;
+}
+
 /* argmin and argmax, in the same width/chunk shape as the fold.
  *
  * No float4 path: four lanes need four candidate indices and the compare
@@ -605,6 +661,11 @@ kernel void nr_scan_rows(device float* dst [[buffer(0)]],
 #: to walk — the two bounds want the same number, so there is one constant.
 const _TARGET_GROUPS = 1024
 
+#: `JAINUM_FOLD_COLUMNS=0` keeps a fold down the columns of a dense matrix on
+#: one lane a segment, and its finish at a full group a segment, for an A/B.
+#: The answers are the same to the bit. Read once.
+let _FOLD_COLUMNS = env_or("JAINUM_FOLD_COLUMNS", "1") != "0"
+
 #: The longest dense row `nr_scan_rows` stages in threadgroup memory.
 const _SCAN_ROW_MAX = 4096
 
@@ -723,6 +784,11 @@ class _Plan {
     pub let chunks: int
     #: Extents and strides of both halves, as `nr_walk` reads them.
     pub let meta: Buffer
+    #: The kept and reduced runs' unit strides, 0 where the run is not dense,
+    #: and whether the plan is one lane a segment over a strided reduced axis.
+    pub var outer_step: int
+    pub var inner_step: int
+    pub var by_segment: bool
 
     pub fn init(
         self,
@@ -741,6 +807,9 @@ class _Plan {
         self.per = per
         self.chunks = chunks
         self.meta = meta
+        self.outer_step = 0
+        self.inner_step = 0
+        self.by_segment = false
     }
 
     #: Threadgroups the first dispatch runs.
@@ -875,7 +944,11 @@ fn _plan(a: NDArray, axes: list[int], allow_quad: bool, sort_inner: bool) -> _Pl
     for stride in inner_strides { values.push(float(stride)) }
     let meta = Buffer(values.len())
     meta.upload(values)
-    return _Plan(segments, n, flags, width, per, chunks, meta)
+    let plan = _Plan(segments, n, flags, width, per, chunks, meta)
+    plan.outer_step = outer_step
+    plan.inner_step = inner_step
+    plan.by_segment = by_segment
+    return plan
 }
 
 #: The four-float metadata a fold over an already-dense `[segments, n]` block
@@ -919,41 +992,63 @@ fn _fold_into(
     #: read-only allocation already resident for this dispatch.
     let gate = center ?? a.storage
     let fold = kernel_of(SOURCE, "nr_fold")
-    if plan.chunks == 1 {
+    let target = if plan.chunks == 1 { dst } else { Buffer(plan.segments * plan.chunks) }
+    if _FOLD_COLUMNS and _takes_quads(plan, a) {
+        let quads = plan.segments // 4
+        kernel_of(SOURCE, "nr_fold_columns").dispatch_async(
+            [target, a.storage, gate],
+            quads * plan.chunks,
+            [quads, plan.n, op, skip_nan, a.offset, plan.inner_step, plan.per, plan.chunks]
+        )
+    } else {
         fold.dispatch_async(
-            [dst, a.storage, gate, plan.meta],
+            [target, a.storage, gate, plan.meta],
             plan.groups() * GROUP,
-            [plan.segments, plan.n, op, skip_nan, plan.flags, a.offset, plan.per, 1, plan.width],
+            [
+                plan.segments,
+                plan.n,
+                op,
+                skip_nan,
+                plan.flags,
+                a.offset,
+                plan.per,
+                plan.chunks,
+                plan.width,
+            ],
             GROUP
         )
-        return
     }
-    let partials = Buffer(plan.segments * plan.chunks)
+    if plan.chunks == 1 { return }
+    let partials = target
     let flat = _flat_meta(plan.chunks, 1)
     defer { partials.free() }
     defer { flat.free() }
-    fold.dispatch_async(
-        [partials, a.storage, gate, plan.meta],
-        plan.groups() * GROUP,
-        [
-            plan.segments,
-            plan.n,
-            op,
-            skip_nan,
-            plan.flags,
-            a.offset,
-            plan.per,
-            plan.chunks,
-            plan.width,
-        ],
-        GROUP
-    )
+    #: The finish folds `chunks` partials a segment. A width of the next power
+    #: of two at or above that runs the same tree as a width of GROUP: the
+    #: lanes past `chunks` hold the identity, and folding the identity into a
+    #: partial that already started from it changes no bit. So the narrow
+    #: width is the same answer from a quarter of the groups or fewer.
+    var width = GROUP
+    if _FOLD_COLUMNS {
+        width = 1
+        while width < plan.chunks { width *= 2 }
+    }
+    let each = GROUP // width
     fold.dispatch_async(
         [dst, partials, partials, flat],
-        plan.segments * GROUP,
-        [plan.segments, plan.chunks, _finish_op(op), skip_nan, 3, 0, plan.chunks, 1, GROUP],
+        (plan.segments + each - 1) // each * GROUP,
+        [plan.segments, plan.chunks, _finish_op(op), skip_nan, 3, 0, plan.chunks, 1, width],
         GROUP
     )
+}
+
+#: Whether a fold can run `nr_fold_columns`: one lane a segment, segments in
+#: fours on a dense unit-stride kept run, and every row of four sixteen-byte
+#: aligned, which the offset and the reduced stride decide.
+fn _takes_quads(plan: _Plan, a: NDArray) -> bool {
+    if not plan.by_segment or plan.flags & 3 != 3 or plan.outer_step != 1 { return false }
+    if plan.segments % 4 != 0 or a.offset % 4 != 0 { return false }
+    return plan.inner_step % 4 == 0
 }
 
 #: The whole of a plain reduction: shape it, hand the empty case its identity,

@@ -581,6 +581,49 @@ fn test_a_scan_with_no_axis_runs_down_the_flattening() -> void {
     assert_eq(cumsum(window, 0).to_list(), [6.0, 7.0, 16.0, 18.0], "a scan reads the view")
 }
 
+#: Folding down the columns of a wide dense matrix runs four columns a thread
+#: and joins the row chunks in a narrowed finish. Each column is checked on
+#: its own against the host, for folds whose accumulators differ: a sum, a
+#: max and a centred variance, whose centre is per column. Small whole
+#: numbers keep every sum exact, and the second matrix starts a row in so the
+#: four-wide loads see an offset.
+fn test_a_fold_down_wide_columns_is_each_columns_fold() -> void {
+    if not have_gpu() { return }
+    let rows = 900
+    let cols = 1024
+    var values = [0.0 for _at in 0..(rows + 1) * cols]
+    for at in 0..values.len() { values[at] = float(at * 13 % 7) - 3.0 }
+    let whole = holding([rows + 1, cols], values)
+    defer { whole.free() }
+    for start in [0, 1] {
+        let view = whole.view([rows, cols], [cols, 1], start * cols)
+        let sums = sum(view, 0).to_list()
+        let peaks = amax(view, 0).to_list()
+        let spread = variance(view, 0).to_list()
+        var wrong = 0
+        for column in 0..cols {
+            var total = 0.0
+            var high = -1000.0
+            for row in 0..rows {
+                let value = values[(row + start) * cols + column]
+                total += value
+                if value > high { high = value }
+            }
+            if sums[column] != total { wrong += 1 }
+            if peaks[column] != high { wrong += 1 }
+            let mean_value = total / float(rows)
+            var squares = 0.0
+            for row in 0..rows {
+                let gap = values[(row + start) * cols + column] - mean_value
+                squares += gap * gap
+            }
+            if (spread[column] - squares / float(rows)) > 1.0e-3 { wrong += 1 }
+            if (squares / float(rows) - spread[column]) > 1.0e-3 { wrong += 1 }
+        }
+        assert_eq(wrong, 0, f"columns from row {start}")
+    }
+}
+
 #: Enough rows that each is one group, which is where a dense last axis is
 #: staged in threadgroup memory: widths that do not fill the 256 threads
 #: evenly, one past a multiple of them, and a view that starts a row in, so
