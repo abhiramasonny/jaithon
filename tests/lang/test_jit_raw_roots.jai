@@ -130,3 +130,36 @@ fn test_a_list_built_across_self_calls_survives() -> void {
         assert_eq(chain_sum(head), want, "a node built across a self-call was lost")
     }
 }
+
+# A callee whose only way to the collector is raising: the caller holds its
+# objects across the call with no roots at all (JAITHON_JIT_LEAF_CALL_ROOTS),
+# which is sound only because a raise leaves the caller without reading them.
+fn leaf_add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn hold_across_leaf(seed: int, big: int) -> int {
+    let x = Box(seed, f"x{seed}")
+    let y = Box(seed + 1, f"y{seed}")
+    let sum = leaf_add(x.tag, big)
+    if x.label != f"x{seed}" or y.label != f"y{seed}" { return -1 }
+    return sum + y.tag
+}
+
+fn test_objects_survive_a_leaf_call_and_its_raise() -> void {
+    let huge = 9223372036854775807
+    var raised = 0
+    for seed in 0..4000 {
+        assert_eq(hold_across_leaf(seed, 7), 2 * seed + 8,
+                  "a value held across a leaf call was lost")
+        if seed % 500 == 1 {
+            try {
+                let _unused = hold_across_leaf(seed, huge)
+            } catch _failure {
+                raised += 1
+            }
+            let _spent = churn(seed % 11)
+        }
+    }
+    assert_eq(raised, 8, "the leaf's overflow stopped raising")
+}
