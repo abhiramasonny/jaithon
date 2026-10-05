@@ -118,6 +118,28 @@ fn depth(n: int) -> int {
 
 fn noop(x: int) -> int { return x }
 
+fn wrap_sum(a: int, b: int) -> int {
+    var t = a
+    for q in 0..b {
+        t = t +% (q *% 3)
+        if t % 7 == 0 { return t }
+    }
+    return t +% a
+}
+
+fn halving(a: int, b: int) -> float {
+    var t = float(a)
+    for q in 0..b {
+        t = t * 0.5 + float(q)
+        if t > 100.0 { return t }
+    }
+    return t
+}
+
+fn drive_ranges(i: int) -> float {
+    return float(wrap_sum(i, 5) + wrap_sum(i + 1, 9) + noop(0)) + halving(i, i % 13)
+}
+
 fn drive_first(xs: list[int], k: int) -> int {
     return first_at_least(xs, k) + noop(1)
 }
@@ -250,5 +272,31 @@ fn test_a_recursive_body_with_a_loop() -> void {
     for round in 0..200 {
         let n = round % 12
         assert_eq(depth(n), n * (n + 1) // 2)
+    }
+}
+
+fn test_range_loops_with_returns_inside() -> void {
+    for i in 0..300 {
+        var want = 0
+        for p in 0..2 {
+            let a = i + p
+            let b = if p == 0 { 5 } else { 9 }
+            var t = a
+            var done = false
+            for q in 0..b {
+                t = t +% (q *% 3)
+                if t % 7 == 0 {
+                    done = true
+                    break
+                }
+            }
+            want += if done { t } else { t +% a }
+        }
+        var f = float(i)
+        for q in 0..(i % 13) {
+            f = f * 0.5 + float(q)
+            if f > 100.0 { break }
+        }
+        assert_eq(drive_ranges(i), float(want) + f)
     }
 }

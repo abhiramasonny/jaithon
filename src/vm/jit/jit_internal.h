@@ -787,6 +787,7 @@ typedef struct {
     unsigned  inlHomeNext;    /* next free home slot in this pass, 0 = lo */
     unsigned  inlLoopCount;   /* loop-bearing inlines in this pass */
     uint32_t  inlExitOff;     /* the callee's chunk count: the exit target */
+    unsigned  inlRetVi;       /* value index every return leaves its result at */
     bool      inlRetSet;
     SlotKind  inlRetKind;
     uint32_t  inlRetShape;

@@ -704,7 +704,7 @@ static bool jitInlineLoopsOn(void) {
  * collect either (noteScratchClobber refuses any call that slips through).
  * Writes to its OWN locals are fine: they are renumbered into homes the
  * interpreter never sees. */
-static bool inlinableLoopBody(const ObjClosure *callee, unsigned argc,
+static bool inlinableLoopBody(ObjClosure *callee, unsigned argc,
                               unsigned *maxSlotOut) {
     const ObjFunction *cfn = callee->fn;
     const Chunk *c = &cfn->chunk;
@@ -715,12 +715,33 @@ static bool inlinableLoopBody(const ObjClosure *callee, unsigned argc,
     if (c->code[c->count - 1] != OP_RETURN) return false;
     unsigned maxSlot = argc;
     bool branches = false;
+    unsigned natives = 0;     /* `float`/`int` read and not yet called */
     for (int off = 0; off < c->count;) {
         uint8_t op = c->code[off];
         int len = instructionLength(c, off);
         if (len <= 0 || off + len > c->count) return false;
         unsigned s1 = 0, s2 = 0;
         switch (op) {
+        /* `float(i)` and `int(x)`, the two builtins the tier emits as one
+         * instruction rather than a call, exactly as the straight-line
+         * inliner admits them; the caller's module-version check retires
+         * the binding (the callee's module is the caller's). */
+        case OP_GET_GLOBAL: {
+            Value nv;
+            ObjNative *nat = globalNative(callee, jaiReadU24(c->code + off + 1),
+                                          &nv);
+            if (nat == NULL || nat->name == NULL) return false;
+            if (strcmp(nat->name->chars, "float") != 0 &&
+                strcmp(nat->name->chars, "int") != 0) {
+                return false;
+            }
+            natives++;
+            break;
+        }
+        case OP_CALL:
+            if (c->code[off + 1] != 1 || natives == 0) return false;
+            natives--;
+            break;
         case OP_GET_LOCAL: case OP_SET_LOCAL: case OP_BIND:
         case OP_INC_LOCAL: case OP_ADD_INT_CONST: case OP_SUB_INT_CONST:
         case OP_MUL_INT_CONST: case OP_CMP_LOCAL_CONST_LT:
@@ -738,6 +759,22 @@ static bool inlinableLoopBody(const ObjClosure *callee, unsigned argc,
             if (s1 == 0) return false;
             branches = true;
             break;
+        /* `for i in a..b`: the counter and the end are hidden LOCALS, not
+         * an iterator on the stack, so they take homes like any other. */
+        case OP_ITER_RANGE:
+            s1 = jaiReadU16(c->code + off + 2);
+            s2 = jaiReadU16(c->code + off + 4);
+            if (s1 == 0 || s2 == 0) return false;
+            break;
+        case OP_FOR_RANGE_BIND: {
+            unsigned s3 = jaiReadU16(c->code + off + 7);
+            s1 = jaiReadU16(c->code + off + 3);
+            s2 = jaiReadU16(c->code + off + 5);
+            if (s1 == 0 || s2 == 0 || s3 == 0) return false;
+            if (s3 > maxSlot) maxSlot = s3;
+            branches = true;
+            break;
+        }
         case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
         case OP_JUMP_IF_CMP_FALSE: case OP_LOOP:
             branches = true;
@@ -745,7 +782,9 @@ static bool inlinableLoopBody(const ObjClosure *callee, unsigned argc,
         case OP_GET_INDEX:
         case OP_CONST: case OP_INT: case OP_TRUE: case OP_FALSE:
         case OP_POP:
-        case OP_ADD: case OP_SUB: case OP_MUL:
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
+        case OP_ADD_WRAP: case OP_SUB_WRAP: case OP_MUL_WRAP:
+        case OP_TYPE_GUARD: case OP_TO_FLOAT:
         case OP_FLOORDIV: case OP_MOD: case OP_MOD_INT_CONST: case OP_NEG:
         case OP_BAND: case OP_BOR: case OP_BXOR:
         case OP_SHL: case OP_SHR: case OP_BNOT:
@@ -779,7 +818,7 @@ static uint8_t *renumberedCode(const Chunk *c, unsigned hb) {
     for (int off = 0; off < c->count;) {
         uint8_t op = c->code[off];
         int len = instructionLength(c, off);
-        int ats[2] = { -1, -1 };
+        int ats[3] = { -1, -1, -1 };
         switch (op) {
         case OP_GET_LOCAL: case OP_SET_LOCAL: case OP_BIND:
         case OP_INC_LOCAL: case OP_ADD_INT_CONST: case OP_SUB_INT_CONST:
@@ -790,9 +829,13 @@ static uint8_t *renumberedCode(const Chunk *c, unsigned hb) {
             ats[0] = off + 1; ats[1] = off + 3; break;
         case OP_JUMP_IF_CMP_LOCAL_K:
             ats[0] = off + 2; break;
+        case OP_ITER_RANGE:
+            ats[0] = off + 2; ats[1] = off + 4; break;
+        case OP_FOR_RANGE_BIND:
+            ats[0] = off + 3; ats[1] = off + 5; ats[2] = off + 7; break;
         default: break;
         }
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < 3; k++) {
             if (ats[k] < 0) continue;
             unsigned v = jaiReadU16(c->code + ats[k]) + hb;
             putU16(buf + ats[k], v);
@@ -824,14 +867,12 @@ static void patchBranch(Emit *e, const Fixup *f, int target) {
  * the exit. Popped again afterwards, so the walk past it starts from the
  * callee's own empty stack, which is what the branch landing there holds. */
 bool inlineLoopReturn(Emit *e, bool last) {
-    if (e->depth != e->inlDepth + 1u ||
-        !holdsRegister(e->stack[e->depth - 1])) {
+    if (e->depth < e->inlDepth + 1u ||
+        !holdsRegister(e->stack[e->depth - 1]) ||
+        (last && e->depth != e->inlDepth + 1u)) {
         e->whyNot = "an inlined loop returning with more than its result";
         return false;
     }
-    unsigned vi = e->valueDepth - 1;
-    if (e->fpLive & (1u << vi)) fpSyncOne(e, vi);
-    settleAll(e);
     SlotKind k = e->stack[e->depth - 1];
     uint32_t shape = e->stackShape[e->depth - 1];
     ObjClass *cls = e->stackClass[e->depth - 1];
@@ -845,8 +886,25 @@ bool inlineLoopReturn(Emit *e, bool last) {
         e->whyNot = "an inlined loop's returns disagree about the result";
         return false;
     }
+    /* Every entry in its own X register, as a branch wants them. */
+    fpSyncAll(e);
+    settleAll(e);
     if (last) return true;
-    branchTo(e, e->inlExitOff, false, 0);
+    /* Whatever else the body still holds (nothing, for every opcode the
+     * whitelist admits today) is dead past a return, so the result can go
+     * straight into the register the exit reads it from. */
+    unsigned rres = valueXReg(e, e->valueDepth - 1);
+    unsigned rexit = valueXReg(e, e->inlRetVi);
+    if (rres != rexit) emit(e, jaiA64MovX(rexit, rres));
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = e->inlExitOff;
+    e->fixups[e->fixupCount].conditional  = false;
+    e->fixups[e->fixupCount].depth        = -1;
+    e->fixupCount++;
+    emit(e, jaiA64B(0));
+    /* The walk carries on from whatever branch lands on the next offset,
+     * which holds the body's stack without this result. */
     unsigned r;
     return popValueRaw(e, &r, NULL);
 }
@@ -940,6 +998,7 @@ bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     e->inlClosureReg = -1;
     e->inlExitOff    = (uint32_t)count;
     e->inlRetSet     = false;
+    e->inlRetVi      = e->valueDepth;   /* the result's value index */
 
     bool ok = true;
     unsigned vi = 0;
