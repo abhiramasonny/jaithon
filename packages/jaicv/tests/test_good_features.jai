@@ -20,7 +20,13 @@ fn repeating(rows: int, cols: int) -> Mat {
 
 fn same_corners(image: Mat, max_corners: int, min_distance: float) -> void {
     let quick = cv.good_features_to_track(image, max_corners, 0.01, min_distance)
-    let whole = cv.good_features_to_track(image, max_corners, 0.01, min_distance, all_candidates: true)
+    let whole = cv.good_features_to_track(
+        image,
+        max_corners,
+        0.01,
+        min_distance,
+        all_candidates: true
+    )
     assert_true(quick.len() > 0)
     assert_eq(quick.len(), whole.len())
     for index in 0..quick.len() {
@@ -127,5 +133,34 @@ fn test_a_tied_frame_gives_the_same_corners_either_way() -> void {
     same_corners(image, 5, 6.0)
     same_corners(image, 20, 3.0)
     same_corners(image, 60, 10.0)
+    image.release()
+}
+
+#: The survey that finds the strongest response must read an empty frame and a
+#: response of NaNs as having no corners, the way the reduction it replaced
+#: did. An untouched maximum used to decode as a NaN, and comparing it to zero
+#: threw.
+fn test_an_empty_frame_has_no_corners() -> void {
+    if not gpu.is_available() { return }
+    let empty = Mat.zeros(0, 0, cv.CV_8UC1)
+    assert_eq(cv.good_features_to_track(empty, 10, 0.01, 1.0).len(), 0)
+}
+
+fn test_a_response_that_overflows_has_no_corners() -> void {
+    if not gpu.is_available() { return }
+    var values: list[float] = []
+    for index in 0..1600 { values.push(float(index * 37 % 251) * 1e30) }
+    let huge = Mat.from_list(40, 40, cv.CV_32FC1, values)
+    assert_eq(cv.good_features_to_track(huge, 10, 0.01, 1.0).len(), 0)
+    huge.release()
+}
+
+#: Above one, the quality level puts the floor over the strongest corner, so
+#: nothing qualifies -- OpenCV answers with no corners rather than an error.
+fn test_a_quality_level_above_one_finds_nothing() -> void {
+    if not gpu.is_available() { return }
+    let image = repeating(40, 40)
+    assert_eq(cv.good_features_to_track(image, 10, 8.0, 1.0).len(), 0)
+    assert_true(cv.good_features_to_track(image, 10, 0.01, 1.0).len() > 0)
     image.release()
 }
