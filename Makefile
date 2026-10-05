@@ -257,7 +257,12 @@ endif
 #
 # A stale profile is safe -- clang drops the counts of any function whose body
 # changed and keeps the rest, which is why the out-of-date warnings are off --
-# but retrain after large changes or the gain decays. A profile this clang
+# but retrain after large changes or the gain decays. "Large" includes ANY
+# change to runLoop's control flow: one added `if` that never fires dropped its
+# counts and cost 2.6% on `check --no-cache lib/jaithon` and 5-6% on json_parse
+# under JAITHON_NO_JIT=1 (2026-10-05) -- so a new opcode, or any edit inside
+# the interpreter loop, wants a `make pgo-train` before it is measured or
+# merged. Training takes about half a minute. A profile this clang
 # cannot read (a different LLVM's format) is probed for and skipped rather than
 # failing the build. PGO=0 builds without it.
 PGO_PROFILE ?= boot/jaithon.profdata
