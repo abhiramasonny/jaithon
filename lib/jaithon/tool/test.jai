@@ -343,13 +343,6 @@ fn _unescape_field(text: str) -> str {
     return out
 }
 
-fn _has_gc_stress(arguments: list[str]) -> bool {
-    for argument in arguments {
-        if argument.starts_with("--gc-stress") { return true }
-    }
-    return false
-}
-
 fn _outcome_code(outcome: Outcome) -> str {
     if outcome == Outcome.Passed { return "P" }
     if outcome == Outcome.Failed { return "F" }
@@ -783,15 +776,24 @@ pub fn main(args: list[str]) -> int {
     #: One file per core unless asked otherwise. A worker is always 1, which
     #: is what stops it spawning workers of its own.
     let wanted = if options.shard { 1 } else { options.jobs }
-    #: `--gc-stress` collects on (almost) every allocation, and the parallel
-    #: parent allocates for its own bookkeeping -- spawning, reading each
-    #: child's output, parsing it back into results. Under stress that
-    #: bookkeeping costs far more than the tests: two files that take 3.3s
-    #: sequentially had not finished after ten minutes. Stress runs are about
-    #: correctness rather than wall time, and the sequential path is the one
-    #: worth stressing, so they stay sequential.
-    let stressed = _has_gc_stress(argv())
-    let limit = if stressed { 1 } elif wanted > 0 { wanted } else { min(cpu_count(), paths.len()) }
+    #: `--gc-stress` is the CLI's, and it never reached this tool's argv(),
+    #: which holds only the binary: the check here read argv() and was always
+    #: false, so a stress run went parallel and its spawned workers -- started
+    #: without the flag -- ran every test unstressed (tests/stdlib at
+    #: `--gc-stress=20`: 2.4s; actually stressed, 75s). The collector's own
+    #: state says whether this process is stressed. A forked worker inherits
+    #: it, and runs with a heap of its own file's size, so a stress run stays
+    #: parallel there; a spawned one would not, so without forking it is
+    #: sequential, as it was always meant to be.
+    let stats: dict[str, any] = __prim__.gc_stats()
+    let stressed = stats.get("stress") == true
+    let limit = if stressed and not _FORK_WORKERS {
+        1
+    } elif wanted > 0 {
+        wanted
+    } else {
+        min(cpu_count(), paths.len())
+    }
 
     if limit > 1 and paths.len() > 1 {
         #: `args` here is the tool's own arguments, not the process's, so the

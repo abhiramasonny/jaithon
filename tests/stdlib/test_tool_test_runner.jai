@@ -161,3 +161,15 @@ fn test_files_that_do_not_load_report_the_same_stage() -> void {
     assert_true(outputs[1].contains("test_untested > parse"), outputs[1])
     assert_true(outputs[1].contains("test_unloadable > load"), outputs[1])
 }
+
+#: `--gc-stress` belongs to the CLI and never showed in the tool's argv(), so a
+#: stress run went parallel and its spawned workers ran every test unstressed.
+fn test_a_stress_run_stresses_every_file() -> void {
+    let probe = "from std.test import assert_true\n" +
+        "fn test_stressed() -> void { assert_true(__prim__.gc_stats()[\"stress\"] == true) }\n"
+    let files = {"test_one.jai": probe, "test_two.jai": probe}
+    let root = _suite("stress", files)
+    let result = _run_test(["--gc-stress=100000", "--jobs=2", root])
+    _drop(root)
+    assert_eq(result["exit_code"], 0, result["stdout"])
+}
