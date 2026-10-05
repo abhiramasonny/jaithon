@@ -925,6 +925,7 @@ uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (!eligible(fn)) return false;
+    jitLoopInlineSeedRefusals(fn);
 
     /* Up to a few attempts: each one may discover another slot that two paths
      * disagree about, and the next begins knowing it. */
@@ -951,6 +952,17 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         bool firstNeedNull[JIT_MAX_SLOTS + 1];
         memcpy(firstNeed, need, sizeof firstNeed);
         memcpy(firstNeedNull, needNull, sizeof firstNeedNull);
+        /* A loop inline that failed part-way is refused by callee and the
+         * body tried again with every other inline kept. Each retry that
+         * fails the same way refuses one more callee; a full list refuses
+         * them all, so this ends. */
+        for (unsigned r = 0; gLoopInlineFailed && r <= JIT_LOOP_REFUSED_MAX;
+             r++) {
+            if (compileFuncOnce(closure, slotBase, dynamic, need, nullable,
+                                needNull, false)) {
+                return true;
+            }
+        }
         /* An inlined body that could not be emitted is not a decline: the
          * same call through the descriptor still compiles, and a compiled
          * form with a real call in it beats none at all. */
@@ -1075,6 +1087,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     ObjFunction *fn = closure->fn;
     jitBranchTargetsReset();
     gInlineFailed   = false;
+    gLoopInlineFailed = false;
     gMatchUsed      = false;
     gNullableFbUsed = false;
     gVectorUsed     = false;
@@ -1103,6 +1116,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     memcpy(e.dynamicLocal, dynamic, sizeof e.dynamicLocal);
     memcpy(e.nullableLocal, nullable, sizeof e.nullableLocal);
     e.arity        = fn->arity;
+    e.inlHomeLo    = jitFrameWindow(fn);
     e.noInline     = noInline;
     e.offsetToInst  = map;
     e.offsetToDepth = depths;
@@ -1119,6 +1133,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     memcpy(body.dynamicLocal, dynamic, sizeof body.dynamicLocal);
     memcpy(body.nullableLocal, nullable, sizeof body.nullableLocal);
     body.arity        = fn->arity;
+    body.inlHomeLo    = jitFrameWindow(fn);
     body.noInline     = noInline;
     /* The measuring pass runs with slot 0 available, purely to find out
      * whether the body reads it; the real pass then drops it if not. */
@@ -1430,6 +1445,9 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
      * a bug that only shows up under recursion. */
     for (unsigned i = realArgs; i < e.locals; i++) {
         unsigned slot = e.base + i;
+        /* An inline's home is written before it is read, and no deopt record
+         * or root fill names it, so a stale value there is never seen. */
+        if (e.inlHomeLo != 0 && slot >= e.inlHomeLo) continue;
         if (!e.spilled) {
             emit(&e, jaiA64MovzX(JIT_FIRST_SAVED + i, 0, 0));
         } else if (e.slotXReg[slot] != 0) {
@@ -1660,6 +1678,14 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
              * frame, so the record must say "not mine" rather than null.
              * See JitDeoptRecord::skipLocals. */
             if (kind == SLOT_OPAQUE) {
+                skipLocals |= (uint64_t)1 << i;
+                continue;
+            }
+            /* A loop-bearing inline's home: every guard inside that inline
+             * resumes at the caller's OP_CALL, where the callee has not
+             * started, and none outside it can see one. Above the caller's
+             * maxSlots, so the interpreter's frame has no slot for it. */
+            if (e.inlHomeLo != 0 && slot >= e.inlHomeLo) {
                 skipLocals |= (uint64_t)1 << i;
                 continue;
             }

@@ -128,7 +128,9 @@ bool localTagInFrame(const Emit *e, unsigned slot) {
  * write-heavy loop variables OSR exists to speed up. */
 static void noteSlotCost(Emit *e, unsigned slot, unsigned saveX,
                          unsigned saveFp) {
-    if (!e->measuring || e->inlining) return;
+    /* A loop-bearing inline's homes are real slots competing for the same
+     * registers; inlineLoopCall swaps in the callee's loop depths. */
+    if (!e->measuring || (e->inlining && !e->inlHomes)) return;
     if (slot > JIT_MAX_SLOTS) return;
     unsigned w = 1u;
     if (e->loopDepth != NULL && e->curOffset < e->loopDepthCount) {
@@ -518,8 +520,12 @@ void noteSlotStored(Emit *e, int slot) {
 
 void localOut(Emit *e, unsigned slot, unsigned src) {
     noteSlotWrite(e, slot);
+    /* A spilled body borrows only an inline's homes (localHomeX). */
     xHomeWritten(e, e->osr ? e->slotXReg[slot]
-                           : (e->spilled ? 0u : localReg(e, slot)));
+                           : (e->spilled
+                                  ? (e->inlHomeLo != 0 && slot >= e->inlHomeLo
+                                         ? e->slotXReg[slot] : 0u)
+                                  : localReg(e, slot)));
     if (e->osr) {
         /* The memory arm below is three instructions -- the tag built, the tag
          * stored, the payload stored -- against one `mov` into an X home or one
@@ -884,6 +890,13 @@ bool regionStamps(const Emit *e, uint32_t lo, uint32_t hi) {
 
 void noteScratchClobber(Emit *e) {
     e->clobbersScratch = true;
+    /* A loop-bearing inline's homes are rooted nowhere and its guards re-run
+     * the whole call, so nothing inside one may call, allocate or collect.
+     * The whitelist admits nothing that does; this makes it a fact. */
+    if (e->inlHomes) {
+        e->whyNot = "a call inside an inlined loop";
+        e->failed = true;
+    }
     /* The one place every call out passes through, which makes it the one
      * place a field-kind memo can be retired at all of them; see
      * forgetFieldKinds. The sites that reach here without running user code
@@ -1269,9 +1282,34 @@ unsigned xHeldIn(Emit *e, unsigned idx) {
 
 /* X register a local permanently lives in, or 0 when it lives nowhere a stack entry could borrow
  * (a spilled frame slot, or an OSR slot the register plan left in memory). */
+/* JAITHON_JIT_SPILL_BORROW=0: a function-tier body on the per-slot plan
+ * (`spilled`) copies every home of a loop-bearing inline it reads, as it does
+ * its own locals. On, a home the plan gave an X register is borrowed exactly
+ * as the OSR tier borrows its slotXReg homes -- the plan is the same one. The
+ * homes are what push the caller onto the per-slot plan, and the inlined loop
+ * then paid a `mov` for every local it read. */
+static bool jitSpillBorrowOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_SPILL_BORROW");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 unsigned localHomeX(const Emit *e, unsigned slot) {
     if (e->osr) return e->slotXReg[slot];
-    if (e->spilled) return 0u;
+    if (e->spilled) {
+        /* Only an inline's homes: on the caller's own locals the same
+         * borrow measured 1.4% MORE instructions on life and nothing on
+         * nbody, json_parse or object_dispatch. */
+        if (!jitSpillBorrowOn() || slot > JIT_MAX_SLOTS ||
+            e->dynamicLocal[slot] || e->inlHomeLo == 0 ||
+            slot < e->inlHomeLo) {
+            return 0u;
+        }
+        return e->slotXReg[slot];
+    }
     return localReg(e, slot);
 }
 

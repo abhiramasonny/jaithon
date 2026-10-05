@@ -302,7 +302,13 @@ static JaiChunkCfg *rangeCfg(const ObjFunction *fn, bool *closures) {
 
 static bool jitSlotBoundsAt(const Emit *e, const ObjFunction *fn, uint32_t q,
                             unsigned slot, int64_t *loOut, int64_t *hiOut) {
-    if (!rangeFactsOn() || e->inlining || !intLocal(e, slot)) return false;
+    /* A loop-bearing inline is walked over its own renumbered chunk, so its
+     * slot numbers are the homes the walk reads (inlineLoopCall resets the
+     * cache around it); a straight-line inline still names callee slots. */
+    if (!rangeFactsOn() || (e->inlining && !e->inlHomes) ||
+        !intLocal(e, slot)) {
+        return false;
+    }
     if (fn->exceptionCount > 0 || fn->defaultCount > 0) return false;
     const Chunk *c = &fn->chunk;
     if (q >= (uint32_t)c->count) return false;

@@ -775,6 +775,30 @@ typedef struct {
      * (and count towards its save set) instead of taking x0..x8, which the
      * allocator's slow path destroys. See inlinableBody. */
     bool      inlShared;
+    /* The body being inlined has branches and loops (inlineLoopCall): its
+     * locals are renumbered into slots of the caller's own frame above
+     * fn->maxSlots ("homes", from inlHomeLo up), walked by the ordinary local
+     * arms, and every `return` moves its result to one entry and branches to
+     * the inline's exit. A guard still resumes at the caller's OP_CALL with
+     * the callee and its arguments on the stack, so the homes are dead there:
+     * the deopt stubs skip them and no root fill names them. */
+    bool      inlHomes;
+    unsigned  inlHomeLo;      /* first home slot, the caller's maxSlots */
+    unsigned  inlHomeNext;    /* next free home slot in this pass, 0 = lo */
+    unsigned  inlLoopCount;   /* loop-bearing inlines in this pass */
+    unsigned  inlBranchCount; /* branch-only inlines in this pass */
+    /* A list parameter of a loop-bearing inline whose storage was checked
+     * once at the inline's entry (JAITHON_JIT_INLINE_STG_PIN): the body
+     * stores nothing and calls nothing, so no element access inside it can
+     * meet another storage, and each one skips its own dispatch. */
+    bool      homeStgPin[JIT_MAX_SLOTS + 1];
+    uint8_t   homeStg[JIT_MAX_SLOTS + 1];
+    uint32_t  inlExitOff;     /* the callee's chunk count: the exit target */
+    unsigned  inlRetVi;       /* value index every return leaves its result at */
+    bool      inlRetSet;
+    SlotKind  inlRetKind;
+    uint32_t  inlRetShape;
+    ObjClass *inlRetClass;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -1236,6 +1260,31 @@ uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
 
 /* Defined in jit_func.c. */
 extern bool gInlineFailed;
+/* A loop-bearing inline (inlineLoopCall) failed part-way through its walk.
+ * Its callee is added to gLoopInlineRefused and the body is compiled again
+ * with that callee behind a real call and every other inline kept; a full
+ * list refuses every loop inline. Reset per compileFuncOnce and per
+ * jaiJitCompileFunc respectively. */
+enum { JIT_LOOP_REFUSED_MAX = 4 };
+extern bool gLoopInlineFailed;
+extern const ObjFunction *gLoopInlineRefused[JIT_LOOP_REFUSED_MAX];
+extern unsigned gLoopInlineRefusedCount;
+/* Seeds gLoopInlineRefused with the callees retired from `fn` because their
+ * inline kept deoptimising (jitLoopInlineNoteDeopt). */
+void jitLoopInlineSeedRefusals(const ObjFunction *fn);
+/* A deopt of `fn` resumed at `ip`: true when that is a loop inline's call
+ * site that has now deoptimised often enough to be compiled without it. */
+bool jitLoopInlineNoteDeopt(const ObjFunction *fn, int64_t ip);
+/* The interpreter frame's slot window, as frameWindowSize (vm_call.c) sizes it: every slot
+ * the function itself names is below it, so the slots an inline renumbers its
+ * callee's locals into (Emit::inlHomes) start here. */
+static inline unsigned jitFrameWindow(const ObjFunction *fn) {
+    unsigned declared = 1u + (unsigned)fn->arity;
+    if (fn->flags & FN_VARIADIC) declared++;
+    if (fn->flags & FN_KWREST) declared++;
+    unsigned w = (unsigned)fn->maxSlots;
+    return w > declared ? w : declared;
+}
 /* What a map kernel loops over: `src` and `dst` are the two lists' element
  * arrays, both eight bytes wide, and the kernel runs `i` up to `n` in a
  * register, writing it back here before each element so that every way out
@@ -1544,6 +1593,7 @@ int deoptRecordNow(Emit *e);
 bool jitDeoptStressOn(void);
 bool jitBoundsColdOn(void);
 bool jitDispatchColdOn(void);
+bool inlineLoopReturn(Emit *e, bool last);
 bool inlineGlobalCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
                              unsigned argc, uint32_t callOff, int calleeReg);
 bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
