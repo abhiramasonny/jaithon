@@ -633,15 +633,35 @@ bool jitIterAllocOn(void) {
  * per call over a short word or a three-element list paid the descriptor's
  * stores and root push for 40 bytes; that was most of what such a call cost
  * over the same loop written with an index. */
+/* JAITHON_JIT_ITER_SPARE=0: the inline iterator allocation always takes a
+ * fresh object, leaving the iterator a finished loop handed back
+ * (gJitIterSpare) to the descriptor path alone -- which this path had
+ * replaced, so a nested `for nb in g[node]` allocated one per outer
+ * iteration and the spare sat unused. */
+static bool jitIterSpareOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_ITER_SPARE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 ObjIter *jitIterAlloc(Obj *source) {
 #ifdef JAI_ALLOC_CENSUS
     (void)source;
     return NULL;   /* keep the census counting every iterator */
 #else
-    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
-    GCState *g = jaiGCActive;
-    if (JAI_UNLIKELY(g == NULL || source == NULL)) return NULL;
-    if (JAI_UNLIKELY(!jaiSmallServes(sizeof(ObjIter)))) return NULL;
+    if (JAI_UNLIKELY(source == NULL)) return NULL;
+    /* The spare first: no allocation, so nothing here can collect, and
+     * every field is rewritten below exactly as for a fresh one. */
+    ObjIter *spare = jitIterSpareOn() ? gJitIterSpare : NULL;
+    if (spare == NULL) {
+        if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+        GCState *g = jaiGCActive;
+        if (JAI_UNLIKELY(g == NULL)) return NULL;
+        if (JAI_UNLIKELY(!jaiSmallServes(sizeof(ObjIter)))) return NULL;
+    }
 
     IterKind kind;
     int64_t limit;
@@ -662,7 +682,13 @@ ObjIter *jitIterAlloc(Obj *source) {
      * never on that list, and a block on both would be freed twice. It cannot
      * collect here -- jaiGCWanted() was false above, and a page refill only
      * charges bytes. */
-    ObjIter *it = (ObjIter *)jaiAllocateObject(sizeof(ObjIter), OBJ_ITER);
+    ObjIter *it;
+    if (spare != NULL) {
+        it = spare;
+        gJitIterSpare = NULL;
+    } else {
+        it = (ObjIter *)jaiAllocateObject(sizeof(ObjIter), OBJ_ITER);
+    }
     it->kind = kind;
     it->source = OBJ_VAL(source);
     it->index = 0;
