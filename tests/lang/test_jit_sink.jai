@@ -424,11 +424,11 @@ fn test_a_factory_function() -> void {
     assert_eq(total, 400020000)
 }
 
-#: The record's sink words are cleared when the objects are built, not before
-#: every entry, so a loop that sinks nothing must find them clear. This one
-#: leaves its compiled region every iteration (`int * float`), and slots 4 and
-#: 5 (m and i) are where churn's sunk locals sit: a stale record would
-#: overwrite them with Points on the first way out.
+#: Only a form that sank a local has objects built on its way out (it says so
+#: in what it returns), so a loop that sinks nothing, run after one that did,
+#: keeps its own locals. This one leaves its compiled region every iteration
+#: (`int * float`), and slots 4 and 5 (m and i) are where churn's sunk locals
+#: sit: building churn's record again would overwrite them with Points.
 fn bounce(n: int) -> float {
     var acc = 0.0
     var k = 1

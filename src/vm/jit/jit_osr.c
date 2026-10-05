@@ -1098,13 +1098,17 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         sinkEmitSync(&e);                                                      \
     } while (0)
 
+    /* Every value the form returns carries this when it sank a local, so
+     * jaiJitEnterOsr builds the objects without asking gDeopt. */
+    const int64_t sunkRet = e.sinkCount != 0 ? JIT_OSR_SUNK_RET : 0;
+
     e.bailBlock = (int)e.count;
     OSR_SYNC_ITER();
-    emitConst64(&e, 0, (int64_t)-1);          /* -1: could not continue */
+    emitConst64(&e, 0, (int64_t)-1 + sunkRet);   /* -1: could not continue */
     emitEpilogue(&e, 0);
     e.exceptionExit = (int)e.count;
     OSR_SYNC_ITER();
-    emitConst64(&e, 0, (int64_t)-2);          /* -2: an exception is pending */
+    emitConst64(&e, 0, (int64_t)-2 + sunkRet);   /* -2: an exception is pending */
     emitEpilogue(&e, 0);
 
     for (unsigned i = 0; i < 3; i++) {
@@ -1114,7 +1118,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         emit(&e, jaiA64MovzX(0, i, 0));
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitThrowOverflow);
         emit(&e, jaiA64Blr(JIT_SCRATCH_A));
-        emitConst64(&e, 0, (int64_t)-2);
+        emitConst64(&e, 0, (int64_t)-2 + sunkRet);
         emitEpilogue(&e, 0);
     }
 
@@ -1132,7 +1136,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         emitConst64(&e, JIT_SCRATCH_B,
                     (e.hasIter && e.exitOffset[i] == e.iterExit) ? 1 : 0);
         emit(&e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-        emitConst64(&e, 0, (int64_t)e.exitOffset[i]);
+        emitConst64(&e, 0, (int64_t)e.exitOffset[i] + sunkRet);
         emitEpilogue(&e, 0);
     }
 
@@ -1231,7 +1235,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
         jaiDeoptHitEmit(&e, closure->fn->name ? closure->fn->name->chars : "?",
                         top, k, (uint32_t)e.deopt[k].ip);
 #endif
-        emitConst64(&e, 0, (int64_t)e.deopt[k].ip);
+        emitConst64(&e, 0, (int64_t)e.deopt[k].ip + sunkRet);
         emitEpilogue(&e, 0);
     }
 #undef OSR_SYNC_ITER
@@ -1437,8 +1441,8 @@ static bool osrFormStorageFits(const JaiOsrForm *form, const Value *slots,
 /* The objects an OSR form kept as fields only (jit_sink.c), built now that
  * everything the form handed back is in the frame and on the stack, where the
  * collector can see it. A sink's fields are ints and floats, so the record
- * holds nothing it has to. Called only when gDeopt.sinkCount is set, and out
- * of line, so a loop that sinks nothing pays a load and a branch per exit. */
+ * holds nothing it has to. Called only for a form that returned
+ * JIT_OSR_SUNK_RET, and out of line, so no other loop pays for it. */
 __attribute__((noinline))
 static void osrMaterializeSinks(Value *slots, Value *stack, unsigned nstack) {
     int64_t n = gDeopt.sinkCount;
@@ -1880,23 +1884,30 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
      * function-tier stub's behind for whoever reads the record next. */
     gDeopt.skipLocals = 0;
     int64_t at = ((OsrFnIter)(uintptr_t)form->code)(frame->slots, iter);
-    /* Not cleared before the call: only a form that sinks writes the sink
-     * words (every one of its exits does), and osrMaterializeSinks zeroes them
-     * again, so they are zero whenever no such form has just returned. A
-     * clear here and an unconditional scan cost every other loop ~36
-     * instructions per exit, which a loop leaving its region every
-     * iteration pays millions of times. */
-    bool sunk = gDeopt.sinkCount != 0;
-    if (at == -1 || at == -2) {
-        if (sunk) osrMaterializeSinks(frame->slots, NULL, 0);
-        if (at == -1)
-            return osrNo(fn, top, "the compiled loop bailed out at entry");
-        return 2;                        /* an exception is pending */
+    /* One compare for all three rare cases: -1, -2, and a form that sank a
+     * local (JIT_OSR_SUNK_RET on whatever it returns). A loop that sinks
+     * nothing pays nothing more per exit than it did before sinking existed;
+     * a clear of the record before every entry and a scan after every exit
+     * had cost such a loop ~36 instructions an exit, and one that leaves its
+     * region every iteration pays that millions of times. */
+    bool sunk = false;
+    if (JAI_UNLIKELY((uint64_t)at > (uint64_t)UINT32_MAX)) {
+        if (at > 0) {
+            sunk = true;
+            at -= JIT_OSR_SUNK_RET;
+        }
+        if (at == -1 || at == -2) {
+            if (sunk) osrMaterializeSinks(frame->slots, NULL, 0);
+            if (at == -1)
+                return osrNo(fn, top, "the compiled loop bailed out at entry");
+            return 2;                    /* an exception is pending */
+        }
     }
     if (gDeopt.base != 0) vm.stackTop--;   /* the exhausted iterator */
     Value *pushed = vm.stackTop;
     for (int64_t i = 0; i < gDeopt.nstack; i++) *vm.stackTop++ = gDeopt.stack[i];
-    if (sunk) osrMaterializeSinks(frame->slots, pushed, (unsigned)gDeopt.nstack);
+    if (JAI_UNLIKELY(sunk))
+        osrMaterializeSinks(frame->slots, pushed, (unsigned)gDeopt.nstack);
     *resumeAt = (uint32_t)at;
     return 1;
 }

@@ -100,6 +100,11 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
  * (see jit_sink.c). */
 #define JIT_MAX_SINK    2u
 #define JIT_SINK_FIELDS 4u
+/* Added to everything an OSR form that sank a local returns (a resume offset,
+ * -1 or -2), so jaiJitEnterOsr learns from x0 alone whether there are objects
+ * to build: a resume offset is a uint32_t, and every other form's x0 stays
+ * where it was. */
+#define JIT_OSR_SUNK_RET ((int64_t)1 << 40)
 
 /* Values first in JitCallDesc so every field is 8-aligned and the emitted stores can use scaled forms. */
 typedef struct JitCallDesc {
