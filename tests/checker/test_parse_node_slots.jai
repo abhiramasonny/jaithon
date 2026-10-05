@@ -5,9 +5,11 @@
 #: tree every later pass misreads. Each builder here is compared slot by slot
 #: with `Node(kind, {named fields}, span)` over the same parts.
 from std.test import assert_eq, assert_throws, assert_true
-from jaithon.ast import Node, NodeKind, OpKind, Span
+from jaithon.ast import DeclKind, Node, NodeKind, OpKind, Span, Visibility
 from jaithon.compile.parse.node_build import _binary, _call, _ident, _int_lit, _member, _str_lit
-from jaithon.compile.parse.node_build import _block, _expr_stmt, _index, _node, _return, _unary
+from jaithon.compile.parse.node_build import _assign, _block, _bool_lit, _expr_stmt, _if, _index
+from jaithon.compile.parse.node_build import _node, _pat_bind, _pat_class, _pat_seq, _return
+from jaithon.compile.parse.node_build import _sequence, _unary, _var_decl
 
 fn _same(built: Node, named: Node) -> void {
     assert_eq(built.kind, named.kind)
@@ -74,4 +76,66 @@ fn test_an_empty_overlay_builds_the_defaults() {
     let span = Span(0, 0, 4)
     _same(_node(NodeKind.Block, span), Node(NodeKind.Block, null, span))
     _same(_node(NodeKind.NullLit, span, {}), Node(NodeKind.NullLit, null, span))
+}
+
+fn test_patterns_and_sequences() {
+    let span = Span(0, 1, 2)
+    let item = Node.ident("i")
+    let items: list[Node] = [item]
+    for kind in [NodeKind.ListLit, NodeKind.SetLit, NodeKind.TupleLit] {
+        _same(_sequence(kind, span, items), Node(kind, {"items": items}, span))
+    }
+    _same(_pat_bind(span, "x"), Node(NodeKind.PatBind, {"name": "x", "type": null}, span))
+    for kind in [NodeKind.PatTuple, NodeKind.PatList, NodeKind.PatOr] {
+        _same(_pat_seq(kind, span, items, 2), Node(kind, {"elems": items, "restIndex": 2}, span))
+    }
+    let names: list[str?] = ["a", null]
+    for kind in [NodeKind.PatClass, NodeKind.PatEnum] {
+        let named = Node(
+            kind,
+            {
+                "typeName": "T",
+                "variantName": "V",
+                "fieldNames": names,
+                "subPatterns": items,
+            },
+            span
+        )
+        _same(_pat_class(kind, span, "T", "V", names, items), named)
+    }
+}
+
+fn test_if_assign_and_declarations() {
+    let span = Span(0, 4, 9)
+    let cond = Node.ident("c")
+    let then_branch = Node.ident("t")
+    let else_branch = Node.ident("e")
+    for kind in [NodeKind.If, NodeKind.IfExpr] {
+        let named = Node(
+            kind,
+            {"cond": cond, "thenBranch": then_branch, "elseBranch": else_branch},
+            span
+        )
+        _same(_if(kind, span, cond, then_branch, else_branch), named)
+    }
+    let target = Node.ident("x")
+    let named_assign = Node(
+        NodeKind.Assign,
+        {"target": target, "value": cond, "op": OpKind.Sub, "isCompound": true},
+        span
+    )
+    _same(_assign(span, target, cond, OpKind.Sub, true), named_assign)
+    let named_decl = Node(
+        NodeKind.VarDecl,
+        {
+            "varDeclKind": DeclKind.Var,
+            "pattern": target,
+            "declaredType": null,
+            "init": cond,
+            "visibility": Visibility.Public,
+        },
+        span
+    )
+    _same(_var_decl(span, DeclKind.Var, target, null, cond, Visibility.Public), named_decl)
+    _same(_bool_lit(span, true), Node(NodeKind.BoolLit, {"boolLit": true}, span))
 }

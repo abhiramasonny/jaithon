@@ -19,7 +19,7 @@ from jaithon.compile.token import Token, TokenKind
 from jaithon.compile.parse.state import Parser, parse_expression, parse_fn_rest, parse_if, parse_match
 from jaithon.compile.parse.state import parse_pattern, parse_unary
 from jaithon.compile.parse.node_build import _arg, _comp_clause, _dict_lit, _ident, _int_lit, _member, _node, _param
-from jaithon.compile.parse.node_build import _sequence, _str_lit, _wrap
+from jaithon.compile.parse.node_build import _bool_lit, _sequence, _str_lit, _wrap
 from jaithon.compile.parse.predicate import _starts_await_operand
 from jaithon.compile.parse.type_expr import _parse_type
 
@@ -414,7 +414,7 @@ pub fn _parse_primary(p: Parser) -> Node {
     }
     if kind == TokenKind.KwTrue or kind == TokenKind.KwFalse {
         p._advance()
-        return _node(NodeKind.BoolLit, p._span_of(token), {"boolLit": kind == TokenKind.KwTrue})
+        return _bool_lit(p._span_of(token), kind == TokenKind.KwTrue)
     }
     if kind == TokenKind.KwNull {
         p._advance()

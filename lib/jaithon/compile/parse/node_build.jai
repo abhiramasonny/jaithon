@@ -6,7 +6,7 @@
 #: Not one of these takes a `Parser`, reads a token or reports a diagnostic.
 #: They are the shape of the tree and nothing else, which is why this file sits
 #: below every other module of `parse/` and can be read on its own.
-from jaithon.ast import Node, NodeKind, OpKind, Span, TypeExpr, TypeKind, Visibility
+from jaithon.ast import DeclKind, Node, NodeKind, OpKind, Span, TypeExpr, TypeKind, Visibility
 
 pub fn _node(kind: NodeKind, span: Span, fields: dict[str, any] = {}) -> Node {
     # An empty overlay is no overlay: `init` skips it for null, not for `{}`.
@@ -45,7 +45,8 @@ pub fn _str_lit(span: Span, chars: str) -> Node {
 }
 
 pub fn _sequence(kind: NodeKind, span: Span, items: list[Node]) -> Node {
-    return _node(kind, span, {"items": items})
+    # `ListLit`, `SetLit` and `TupleLit` share one schema: items.
+    return Node.of_slots(kind, span, [items])
 }
 
 pub fn _dict_lit(span: Span, keys: list[Node], values: list[Node]) -> Node {
@@ -94,16 +95,41 @@ pub fn _return(span: Span, value: Node?) -> Node {
     return Node.of_slots(NodeKind.Return, span, [value])
 }
 
+pub fn _bool_lit(span: Span, value: bool) -> Node {
+    return Node.of_slots(NodeKind.BoolLit, span, [value])
+}
+
+pub fn _if(kind: NodeKind, span: Span, cond: Node, then_branch: Node, else_branch: Node?) -> Node {
+    # `If` and `IfExpr` share one schema: cond, thenBranch, elseBranch.
+    return Node.of_slots(kind, span, [cond, then_branch, else_branch])
+}
+
+pub fn _assign(span: Span, target: Node, value: Node, op: OpKind, is_compound: bool) -> Node {
+    return Node.of_slots(NodeKind.Assign, span, [target, value, op, is_compound])
+}
+
+pub fn _var_decl(
+    span: Span,
+    decl_kind: DeclKind,
+    pattern: Node,
+    declared: TypeExpr?,
+    init: Node?,
+    visibility: Visibility
+) -> Node {
+    return Node.of_slots(NodeKind.VarDecl, span, [decl_kind, pattern, declared, init, visibility])
+}
+
 pub fn _match_node(kind: NodeKind, span: Span, subject: Node, arms: list[dict[str, any]]) -> Node {
     return _node(kind, span, {"subject": subject, "arms": arms})
 }
 
 pub fn _pat_bind(span: Span, name: str?) -> Node {
-    return _node(NodeKind.PatBind, span, {"name": name, "type": null})
+    return Node.of_slots(NodeKind.PatBind, span, [name, null])
 }
 
 pub fn _pat_seq(kind: NodeKind, span: Span, elems: list[Node], rest_index: int) -> Node {
-    return _node(kind, span, {"elems": elems, "restIndex": rest_index})
+    # `PatTuple`, `PatList` and `PatOr` share one schema: elems, restIndex.
+    return Node.of_slots(kind, span, [elems, rest_index])
 }
 
 pub fn _pat_class(
@@ -114,16 +140,8 @@ pub fn _pat_class(
     field_names: list[str?],
     sub_patterns: list[Node]
 ) -> Node {
-    return _node(
-        kind,
-        span,
-        {
-            "typeName": type_name,
-            "variantName": variant_name,
-            "fieldNames": field_names,
-            "subPatterns": sub_patterns,
-        }
-    )
+    # `PatClass` and `PatEnum` share one schema.
+    return Node.of_slots(kind, span, [type_name, variant_name, field_names, sub_patterns])
 }
 
 pub fn _nulls(count: int) -> list[str?] {
