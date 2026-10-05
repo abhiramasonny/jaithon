@@ -1049,6 +1049,9 @@ bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
                       unsigned ridx);
 bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count);
 bool leafRegOk(unsigned r);
+/* Defined in jit_body_build.c: the inline probe of jaiFmtMemo. */
+int emitFmtMemoProbe(Emit *e, unsigned rPre, unsigned rN, unsigned rPost);
+void fmtMemoHitHere(Emit *e, int at);
 bool jitLeafInReg(void);
 void leafSlowHere(Emit *e, LeafFix *fx);
 void leafDoneHere(Emit *e, LeafFix *fx);

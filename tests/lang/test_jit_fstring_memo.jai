@@ -9,11 +9,15 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it; `JAITHON_NO_JIT=1` runs the same file, and
 #: every answer is the interpreter's.
-# jit-compiles: bare, two_sites, with_runs, keyed_count
+# jit-compiles: bare, stringify, two_sites, with_runs, keyed_count
 from std.test import assert_eq, assert_true
 
 fn bare(n: int) -> str {
     return f"{n}"
+}
+
+fn stringify(n: int) -> str {
+    return str(n)
 }
 
 fn two_sites(n: int) -> str {
@@ -44,6 +48,22 @@ pub fn test_bare_int_zero_is_not_an_empty_slot() -> void {
             assert_eq(bare(0), "0")
             i += 1
         }
+        round += 1
+    }
+}
+
+pub fn test_str_of_an_int_shares_the_memo() -> void {
+    var round = 0
+    while round < 3 {
+        var i = -50
+        while i < 250 {
+            let a = stringify(i)
+            let b = bare(i)
+            assert_eq(a, b)
+            assert_eq(stringify(0), "0")
+            i += 1
+        }
+        __prim__.gc_collect()
         round += 1
     }
 }

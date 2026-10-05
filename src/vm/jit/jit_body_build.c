@@ -282,6 +282,56 @@ static bool jitFmtMemoOn(void) {
     return cached != 0;
 }
 
+/* The memo probe (see jaiFmtMemo in value.c) for an int in `rN` between
+ * runs in `rPre` and `rPost` (31, the zero register, for an absent one): the
+ * entry for this (pre, n, post), and when all three match, its string is the
+ * answer with no call at all --
+ *
+ *     x10, x17 <- entries, mask
+ *     x9  <- (n ^ pre >> 4 ^ post >> 5) & mask    jaiFmtMemoIndex
+ *     x10, x11, x12, x0 <- the entry's pre, post, n, s
+ *     cmp pre; ccmp post; ccmp n;  b.eq <answered>
+ *
+ * The index of that b.eq, for the caller to aim at where the leaf's answer
+ * is taken from x0, or -1 with nothing emitted. Every register it writes is
+ * one the leaf call behind it clobbers anyway, and the operands must be in
+ * callee-saved registers (leafRegOk), so the miss path finds them as they
+ * were. An empty entry's pre is JAI_FMT_MEMO_EMPTY, which no operand equals.
+ * The caller calls jaiValueFormatIntLeafMemo on a miss, which is what fills
+ * the table. */
+int emitFmtMemoProbe(Emit *e, unsigned rPre, unsigned rN, unsigned rPost) {
+    if (!jitFmtMemoOn()) return -1;
+    noteScratchClobber(e);
+    emitConst64(e, 16, (int64_t)(uintptr_t)&jaiFmtMemo);
+    emit(e, jaiA64LdpOff(10, 17, 16, 0));
+    /* An absent run contributes nothing to the index. */
+    unsigned rIdx = rN;
+    if (rPre != 31u) {
+        emit(e, jaiA64EorXLsr(9, rIdx, rPre, 4));
+        rIdx = 9;
+    }
+    if (rPost != 31u) {
+        emit(e, jaiA64EorXLsr(9, rIdx, rPost, 5));
+        rIdx = 9;
+    }
+    emit(e, jaiA64AndX(9, rIdx, 17));
+    emit(e, jaiA64AddXLsl(16, 10, 9, 5));
+    emit(e, jaiA64LdpOff(10, 11, 16, 0));
+    emit(e, jaiA64LdpOff(12, 0, 16, 16));
+    emit(e, jaiA64SubsXReg(31, 10, rPre));
+    emit(e, jaiA64CcmpX(11, rPost, 0, JAI_A64_EQ));
+    emit(e, jaiA64CcmpX(12, rN, 0, JAI_A64_EQ));
+    int at = (int)e->count;
+    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+    return at;
+}
+
+/* Aims a probe's hit branch at the current instruction. */
+void fmtMemoHitHere(Emit *e, int at) {
+    if (at < 0 || at >= (int)e->count || e->count > JIT_MAX_INSTS) return;
+    e->code[at] = jaiA64BCond(JAI_A64_EQ, (int32_t)((int)e->count - at));
+}
+
 /* The f-string through jaiValueFormatLeaf, in front of the descriptor call to
  * jitFormat, which stays behind it as the slow path -- the same layout as the
  * dict leaves (see emitDictLeafGet):
@@ -360,45 +410,7 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
         unsigned rPost = (unsigned)hole + 1 < parts
                              ? valueXReg(e, vfirst + (unsigned)hole + 1)
                              : 31u;
-        /* The memo first (see jaiFmtMemo in value.c): the entry for this
-         * (pre, n, post), and when all three match, its string is the
-         * answer with no call at all --
-         *
-         *     x10, x17 <- entries, mask
-         *     x9  <- (n ^ pre >> 4 ^ post >> 5) & mask    jaiFmtMemoIndex
-         *     x10, x11, x12, x0 <- the entry's pre, post, n, s
-         *     cmp pre; ccmp post; ccmp n;  b.eq answered
-         *
-         * Every register it writes is one the leaf call below clobbers
-         * anyway, and the operands are in callee-saved registers
-         * (leafRegOk), so the miss path finds them as they were. Register
-         * 31 is xzr in each of these forms, which is the NULL of an absent
-         * run, as below. An empty entry's pre is JAI_FMT_MEMO_EMPTY, which
-         * no operand equals. */
-        if (jitFmtMemoOn()) {
-            noteScratchClobber(e);
-            emitConst64(e, 16, (int64_t)(uintptr_t)&jaiFmtMemo);
-            emit(e, jaiA64LdpOff(10, 17, 16, 0));
-            /* An absent run contributes nothing to the index. */
-            unsigned rIdx = rN;
-            if (rPre != 31u) {
-                emit(e, jaiA64EorXLsr(9, rIdx, rPre, 4));
-                rIdx = 9;
-            }
-            if (rPost != 31u) {
-                emit(e, jaiA64EorXLsr(9, rIdx, rPost, 5));
-                rIdx = 9;
-            }
-            emit(e, jaiA64AndX(9, rIdx, 17));
-            emit(e, jaiA64AddXLsl(16, 10, 9, 5));
-            emit(e, jaiA64LdpOff(10, 11, 16, 0));
-            emit(e, jaiA64LdpOff(12, 0, 16, 16));
-            emit(e, jaiA64SubsXReg(31, 10, rPre));
-            emit(e, jaiA64CcmpX(11, rPost, 0, JAI_A64_EQ));
-            emit(e, jaiA64CcmpX(12, rN, 0, JAI_A64_EQ));
-            memoHit = (int)e->count;
-            emit(e, jaiA64BCond(JAI_A64_EQ, 0));
-        }
+        memoHit = emitFmtMemoProbe(e, rPre, rN, rPost);
         /* `mov x, xzr` is the NULL for an absent run; register 31 here is
          * the zero register, which jaiA64MovX encodes as `orr x, xzr, xzr`. */
         emit(e, jaiA64MovX(0, rPre));
@@ -429,10 +441,7 @@ static void emitFormatLeaf(Emit *e, unsigned parts, LeafFix *fx) {
     fx->cond[0] = JAI_A64_EQ;
     emit(e, jaiA64BCond(JAI_A64_EQ, 0));
     /* A memo hit joins here with its string already in x0. */
-    if (memoHit >= 0 && e->count <= JIT_MAX_INSTS) {
-        e->code[memoHit] =
-            jaiA64BCond(JAI_A64_EQ, (int32_t)((int)e->count - memoHit));
-    }
+    fmtMemoHitHere(e, memoHit);
     /* Straight into the register the result will occupy -- the first part's,
      * once the parts are popped and the string pushed -- and past the load
      * the descriptor path ends with (emitFormat places the join after it).
