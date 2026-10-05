@@ -387,10 +387,10 @@ pub fn calc_optical_flow_pyr_lk(
     previous.flush()
     current.flush()
 
+    if points.len() == 0 { return ([], [], []) }
     let first = build_pyramid(previous, max_level + 1)
     let second = build_pyramid(current, max_level + 1)
     let levels = first.len()
-    if points.len() == 0 { return ([], [], []) }
 
     #: Every level of both pyramids into one buffer apiece, with a table of
     #: where each one starts. A kernel cannot take a list of bindings whose
@@ -426,6 +426,12 @@ pub fn calc_optical_flow_pyr_lk(
             [count, plane_b.cols, plane_b.offset, plane_b.step_, base]
         )
         base += count
+    }
+    #: Level zero is the caller's frame; every level below it is ours, and the
+    #: packed copies are all the tracker reads.
+    for level in 1..levels {
+        first[level].release()
+        second[level].release()
     }
 
     var flattened: list[float] = []

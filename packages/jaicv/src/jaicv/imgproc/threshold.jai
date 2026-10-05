@@ -156,9 +156,9 @@ fn kernel_for(entry: str) -> Kernel {
 pub fn histogram_256(src: Mat) -> list[int] {
     src.flush()
     if src.channels() != 1 { throw ValueError("histogram_256 needs a single-channel Mat") }
-    let counts = Mat.zeros(1, 256, CV_MAKETYPE(CV_32F, 1))
     let count = src.rows * src.cols
     if count == 0 { return [0 for _index in 0..256] }
+    let counts = Mat.zeros(1, 256, CV_MAKETYPE(CV_32F, 1))
     #: Two hundred and fifty-six groups of as many threads, each striding the
     #: picture: enough to fill the device and few enough that the merge is
     #: cheap.
@@ -171,6 +171,7 @@ pub fn histogram_256(src: Mat) -> list[int] {
     )
     var out: list[int] = []
     for value in counts.to_list() { out.push(int(value)) }
+    counts.release()
     return out
 }
 
@@ -330,5 +331,7 @@ pub fn adaptive_threshold(
         scalars
     )
     out.invalidate()
+    wide.release()
+    local.release()
     return out
 }

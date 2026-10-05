@@ -623,15 +623,19 @@ fn structure_tensor(src: Mat, block_size: int, aperture_size: int) -> Mat {
         [count, src.cols, dx.offset, dx.step_, dy.offset, dy.step_, cov.offset, cov.step_]
     )
     cov.invalidate()
+    dx.release()
+    dy.release()
     #: The window sums rather than averages, which is why this asks the box
     #: filter not to normalise.
-    return box_filter(
+    let summed = box_filter(
         cov,
         CV_32F,
         Size(block_size, block_size),
         normalize: false,
         border_mode: BORDER_DEFAULT
     )
+    cov.release()
+    return summed
 }
 
 #: Harris's corner response.
@@ -657,6 +661,7 @@ pub fn corner_harris(
         [count, src.cols, cov.offset, cov.step_, out.offset, out.step_, f32_bits(k)]
     )
     out.invalidate()
+    cov.release()
     return out
 }
 
@@ -675,6 +680,7 @@ pub fn corner_min_eigen_val(src: Mat, block_size: int = 3, aperture_size: int = 
         [count, src.cols, cov.offset, cov.step_, out.offset, out.step_]
     )
     out.invalidate()
+    cov.release()
     return out
 }
 
@@ -759,7 +765,10 @@ pub fn good_features_to_track(
     let rows = response.rows
     let cols = response.cols
     let (_low, strongest) = min_max(response)
-    if strongest <= 0.0 { return [] }
+    if strongest <= 0.0 {
+        response.release()
+        return []
+    }
     let floor_value = strongest * quality_level
 
     response.flush()
@@ -872,6 +881,8 @@ pub fn good_features_to_track(
     total.free()
     spots.free()
     scores.free()
+    #: `plane` is either this or the caller's mask, and only this is ours.
+    response.release()
 
     #: Strongest first, and equal strengths in the order they were found --
     #: which is raster order, because that is how the device laid them out.

@@ -260,7 +260,6 @@ pub fn canny(
         [count, src.cols, labels.offset, labels.step_]
     )
     let changed = Buffer(1)
-    let counted = Buffer(1)
     let join = kernel_for("canny_join")
     let flatten = kernel_for("canny_flatten")
     #: A round with no news is the proof that the rounds before it settled,
@@ -292,9 +291,11 @@ pub fn canny(
         [count, src.cols, out.offset, out.step_]
     )
     out.invalidate()
+    dx.release()
+    dy.release()
+    labels.release()
     runs.free()
     strong.free()
     changed.free()
-    counted.free()
     return out
 }

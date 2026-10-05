@@ -3,7 +3,8 @@
 #:
 #: Each module pastes `PRELUDE` at the top of its own Metal source, so border
 #: behaviour is defined once and every filter agrees with every warp.
-from ..core.types import CV_MAT_DEPTH, depth_is_integer, depth_max, depth_min
+from ..core.types import CV_32F, CV_MAKETYPE, CV_MAT_DEPTH, depth_is_integer, depth_max
+from ..core.types import depth_min
 from ..core.mat import Mat, f32_bits
 
 #: Metal helpers shared by the filtering, warping, and morphology kernels.
@@ -213,4 +214,32 @@ pub fn joined(base: list[int], extra: list[int]) -> list[int] {
 #: The `[rows, cols, channels, offset, step]` a kernel needs to address `mat`.
 pub fn layout_of(mat: Mat) -> list[int] {
     return [mat.rows, mat.cols, mat.channels(), mat.offset, mat.step_]
+}
+
+#: How many distinct small constant matrices `cached_weights` keeps.
+const WEIGHTS_CACHE_LIMIT = 256
+
+var _weights: dict[str, Mat] = {}
+
+#: A small constant `CV_32F` matrix -- filter taps, a derivative row, a warp
+#: matrix -- kept on the device once made and shared between calls.
+#:
+#: Device memory is not garbage collected, so a weights matrix built per call
+#: and dropped leaked a buffer every call. Releasing it instead is no better:
+#: the next call's upload lands in the recycled buffer and has to wait for the
+#: work still reading it, which puts a host stall in every filter. The returned
+#: matrix belongs to the cache and must never be released by the caller.
+pub fn cached_weights(rows: int, cols: int, values: list[float]) -> Mat {
+    let key = f"{rows}x{cols}:{values}"
+    let held = _weights.get(key)
+    if held is not null { return held }
+    if _weights.len() >= WEIGHTS_CACHE_LIMIT {
+        #: Work already queued against these keeps its order on the device, so
+        #: freeing them here is safe; it only costs the next call an upload.
+        for old in _weights.values() { old.release() }
+        _weights = {}
+    }
+    let made = Mat.from_list(rows, cols, CV_MAKETYPE(CV_32F, 1), values)
+    _weights[key] = made
+    return made
 }
