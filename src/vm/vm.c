@@ -121,6 +121,12 @@ static bool enumPayloadNamed(Value receiver, ObjString *name) {
 }
 
 static bool safepoint(void) {
+    /* 3: the warm-up count after the program starts (jaiJitMainStarted). The
+     * back edge that exhausts it is a tick, taken right here. */
+    if (JAI_UNLIKELY(jaiInterrupted == 3) && --jaiWarmEdges <= 0) {
+        jaiWarmEdges = -1;   /* tells jaiJitSample this tick is the warm-up's */
+        jaiInterrupted = 2;
+    }
     if (JAI_UNLIKELY(jaiInterrupted == 2)) {
         jaiInterrupted = 0;
         if (vm.frameCount > 0) {

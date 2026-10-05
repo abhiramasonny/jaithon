@@ -1241,6 +1241,10 @@ static int callMain(ObjModule *module, ObjList *args) {
     Value result = NULL_VAL;
     int argc = calleeArity(entry) >= 1 ? 1 : 0;
 
+    /* Again here, not only before the module body: a top-level `env_or`
+     * scanning its argument took the early tick, and main's loops then
+     * waited out a whole interval. */
+    jaiJitMainStarted();
     if (!jaiCallValue(entry, argc, &argument, &result)) {
         if (vm.hasException) {
             jaiReportUncaught(vm.pendingException);
@@ -1622,6 +1626,7 @@ int jaiRunFile(const char *path, const JaiRunOptions *opts, int argc,
     bool ok = false;
     if (body != NULL) {
         jaiPushRoot(OBJ_VAL(body));
+        jaiJitMainStarted();
         ok = runModuleBody(module, body);
         jaiPopRoot();
     }

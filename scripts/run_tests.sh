@@ -142,6 +142,17 @@ if [[ -x "$ROOT/tests/vm/late_compile.sh" ]]; then
     done <<< "$late_output"
 fi
 
+if [[ -x "$ROOT/tests/vm/warm_edges.sh" ]]; then
+    warm_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/warm_edges.sh" 2>&1)"
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)   name="warm_edges: ${line#ok }"
+                      matches_filter "$name" && record_pass "$name" 0 ;;
+            "FAIL "*) record_fail "warm_edges: ${line#FAIL }" "" ;;
+        esac
+    done <<< "$warm_output"
+fi
+
 if [[ -x "$ROOT/tests/vm/hoist_rare_site.sh" ]]; then
     rare_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/hoist_rare_site.sh" 2>&1)"
     while IFS= read -r line; do

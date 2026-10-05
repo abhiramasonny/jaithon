@@ -96,9 +96,12 @@ check() {
         return
     fi
     # Compiled, the callee leaves ~2.1-2.4M interpreted instructions (the
-    # loop itself); interpreted, 4.2-6.3M.
+    # loop itself); interpreted, 4.2-6.3M. No warm-up tick either
+    # (JAITHON_JIT_MAIN_EDGES=0): it would compile the loop and leave the
+    # count measuring nothing.
     out=$(env -u JAITHON_NO_JIT -u JAITHON_JIT_DEOPT_STRESS \
           -u JAITHON_JIT_THRESHOLD JAITHON_JIT_TICK_US=100000 \
+          JAITHON_JIT_MAIN_EDGES=0 \
           "$JAITHON" run --stats "$work/$name.jai" 2>&1)
     answer=$(printf '%s\n' "$out" | grep -E '^[0-9]+$')
     interp=$(printf '%s\n' "$out" | sed -n 's/^vm: \([0-9]*\) instructions.*/\1/p')

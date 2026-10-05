@@ -159,6 +159,9 @@ extern int sRunDepth;
 extern int sFinallyPending;
 extern int sThunkFrame;
 extern volatile sig_atomic_t jaiInterrupted;
+/* Back edges left before jaiInterrupted's warm-up state (3) becomes a tick;
+ * owned by jaiJitMainStarted in jit.c. */
+extern int jaiWarmEdges;
 JaiRunResult run(int baseFrameCount);
 #ifdef JAI_OPCODE_STATS
 extern uint64_t jaiOpCounts[OP_COUNT];

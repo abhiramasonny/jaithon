@@ -141,6 +141,10 @@ void jitLeanEntryInit(void);
 void jaiJitStartSampling(void);
 /* Re-arm the sampling timer in a forked child (fork does not inherit it). */
 void jaiJitAfterFork(void);
+/* The program's own module body, or its main(), is about to run: the next
+ * JAITHON_JIT_MAIN_EDGES interpreted back edges count down to a tick (see
+ * jit.c). The timer and its interval are untouched. */
+void jaiJitMainStarted(void);
 
 /* A sampling tick landed while `closure` was executing at `offset`. Rides the
  * interpreter's existing back-edge safepoint rather than counting back edges,
