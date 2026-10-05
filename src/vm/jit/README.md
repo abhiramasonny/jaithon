@@ -415,6 +415,7 @@ this table complete in both directions.
 | `JAITHON_JIT_OSR_FORMS` | `JAI_OSR_MAX` | Cap on compiled forms per OSR loop. |
 | `JAITHON_JIT_OSR_SLOTS` | `JAI_OSR_SLOTS` | Cap on slots an OSR entry will reconstruct. |
 | `JAITHON_JIT_DEPTH_MEMO` | on | Keep each function's verifier depth table (`chunkDepthTable`) from its first compile attempt until the function is freed (`jaiJitForgetFunction`), instead of re-running the verifier on every attempt, retry and OSR variant. 5070 verifier runs became 709 on `check --no-cache lib/jaithon`, 32ms to 10ms of CPU. |
+| `JAITHON_JIT_OSR_BACKOFF` | on | A loop head that has failed to compile is retried only after 1, 2, 4, 8, 16 and 32 failures; the ticks in between are charged as failures without the walk, so the head retires on the same tick as before. Each attempt was up to four variants of three retries, and across `check` of lib/jaithon and lib/std, fmt and json_parse no head compiled after its first failure. Off retries on every tick. |
 | `JAITHON_JIT_RECOMPILE` | on | Recompile a body once, when the cold callee its walk stopped at finally compiles. Worth 7.3% on `lib/std`; see the recompile section. |
 
 ### Stress, for finding bugs the default configuration hides

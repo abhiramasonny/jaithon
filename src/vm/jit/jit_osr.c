@@ -381,6 +381,17 @@ static bool osrColdWaitOn(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_OSR_BACKOFF=0 retries a failed loop head on every tick until
+ * its budget is spent, as before. See jaiJitEnterOsr. */
+static bool osrBackoffOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_OSR_BACKOFF");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 bool jitOsrColdWait(Emit *e, const ObjFunction *cfn) {
     if (!e->osr || e->inlining || !sColdMayWait || cfn == NULL) return false;
     if (cfn->jitFunc != NULL || cfn->jitRefused) return false;
@@ -1557,20 +1568,40 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
          * compile, an uncompiled callee most often, and then the whole loop
          * declines and NOTHING is compiled. tests/bench's contour follower is
          * exactly that shape. So the prefix stays as the fallback: some of the
-         * loop compiled beats none of it. */
-        sPendingRetries = 0;
-        OsrColdHead *cold = osrColdWaitOn() ? osrColdHead(fn, top) : NULL;
-        sColdMayWait = cold != NULL && cold->waits < OSR_COLD_WAITS;
-        sColdCur = cold;
-        bool built = compileOsrAny(closure, top, frame->slots, iterKind,
-                                   elemSample, elemMixed, elemStg);
-        bool waited = !built && sColdWaited;
-        sColdMayWait = false;
-        sColdCur = NULL;
-        sColdWaited = false;
-        if (waited) {
-            cold->waits++;
-            return osrNo(fn, top, "waiting for a callee to compile");
+         * loop compiled beats none of it.
+         *
+         * A head that has failed is retried only after 1, 2, 4, 8, 16 and 32
+         * failures, and every tick in between is charged as a failure without
+         * the walk -- so the head retires on the same tick it always did, and
+         * a late fact still gets a look within twice the wait. Each attempt
+         * is up to four variants of three retries, and across `check` of
+         * lib/jaithon and lib/std, fmt and json_parse no head compiled on any
+         * attempt after its first failure: those retries were 31ms of the
+         * tier's ~86ms on `check --no-cache lib/jaithon`. */
+        bool built = false;
+        bool backedOff = false;
+        if (miss < fn->osrMissCount && osrBackoffOn()) {
+            unsigned failed = fn->osrMissAttempts[miss];
+            backedOff = failed != 0 && (failed & (failed - 1u)) != 0;
+        }
+        if (backedOff) {
+            (void)osrNo(fn, top, "backing off: retried after 1, 2, 4, 8... "
+                                 "failures");
+        } else {
+            sPendingRetries = 0;
+            OsrColdHead *cold = osrColdWaitOn() ? osrColdHead(fn, top) : NULL;
+            sColdMayWait = cold != NULL && cold->waits < OSR_COLD_WAITS;
+            sColdCur = cold;
+            built = compileOsrAny(closure, top, frame->slots, iterKind,
+                                  elemSample, elemMixed, elemStg);
+            bool waited = !built && sColdWaited;
+            sColdMayWait = false;
+            sColdCur = NULL;
+            sColdWaited = false;
+            if (waited) {
+                cold->waits++;
+                return osrNo(fn, top, "waiting for a callee to compile");
+            }
         }
         if (!built) {
             /* Inlining widens live ranges; a loop that will not fit with it
