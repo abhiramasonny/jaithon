@@ -5,6 +5,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "vm/bytecode/verify.h"
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
@@ -494,6 +497,279 @@ bool emitJumpIfCmpFalse(Emit *e, const uint8_t *code, int *offp) {
     return true;
 }
 
+/* ---- If-conversion ---------------------------------------------------------
+ *
+ * `var alive = 0; if n == 3 { alive = 1 } elif n == 2 { alive = mid[c] }` is
+ * life's whole rule, and the two tests are decided by the data: compiled as
+ * branches they mispredict on a large share of cells, which a branchless
+ * probe of the same rule priced at a quarter of the benchmark. A chain of
+ * links, each `if local <op> k { s = v }`, all assigning the same int local
+ * and ending at one join (an optional unconditional last link is the `else`),
+ * is emitted here instead as one `csel` per link, innermost first:
+ *
+ *     t = s (or the else value);  for each link, last to first:
+ *         v = <value>;  cmp local, #k;  t = cond ? v : t
+ *     s = t
+ *
+ * so every value is computed whether or not its test holds. That is sound
+ * only for values that cannot fault and have no effect: a literal, an int
+ * local, or an element of an int list whose index the loop head has already
+ * proved in bounds (the hoist's span covers it). The storage test such a
+ * read still needs is a guard, and every guard taken in here resumes the
+ * interpreter at the chain's FIRST test, with nothing written yet -- the
+ * arm is still the instruction being compiled, so deoptSite records exactly
+ * that. A chain whose middle is the target of any other branch is left alone.
+ *
+ * Only the real pass converts; the measuring pass walks the branches, which
+ * use at least as many registers. */
+#define IFCONV_MAX_LINKS 4
+
+typedef struct {
+    bool     uncond;     /* the trailing `else` */
+    uint8_t  cmp;
+    unsigned nslot;
+    int64_t  k;
+    uint8_t  vop;        /* OP_INT, OP_GET_LOCAL, or OP_GET_INDEX */
+    int64_t  vimm;
+    unsigned va, vb;
+} IfLink;
+
+/* JAITHON_JIT_IFCONV=0 compiles every such chain as branches. */
+static bool jitIfConvOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_IFCONV");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* Whether any branch from outside [lo, hi) lands strictly inside (lo, hi). */
+static bool branchesInto(const Chunk *c, int lo, int hi) {
+    for (int at = 0; at < c->count;) {
+        int len = instructionLength(c, at);
+        if (len <= 0) return true;
+        int rel = jaiOpBranchOperandAt(c->code[at]);
+        if (rel >= 0 && (at < lo || at >= hi)) {
+            int32_t to = (int32_t)(at + len) +
+                         jaiReadI16(c->code + at + 1 + rel);
+            if (to > lo && to < hi) return true;
+        }
+        at += len;
+    }
+    return false;
+}
+
+static bool parseIfChain(ObjFunction *fn, int off, int stop, IfLink *links,
+                         unsigned *nOut, unsigned *slotOut, int *joinOut) {
+    const Chunk *c = &fn->chunk;
+    const uint8_t *code = c->code;
+    int at = off, join = -1;
+    unsigned n = 0;
+    int slot = -1;
+    for (;;) {
+        if (n >= IFCONV_MAX_LINKS || at + 9 > c->count) return false;
+        IfLink *L = &links[n];
+        int p;
+        int falseTo = -1;
+        if (code[at] == OP_JUMP_IF_CMP_LOCAL_K) {
+            L->uncond = false;
+            L->cmp = code[at + 1];
+            L->nslot = jaiReadU16(code + at + 2);
+            uint32_t kIdx = jaiReadU24(code + at + 4);
+            if (kIdx >= (uint32_t)c->constants.count) return false;
+            Value kv = c->constants.data[kIdx];
+            if (!IS_INT(kv) || AS_INT(kv) < -4095 || AS_INT(kv) > 4095) {
+                return false;
+            }
+            L->k = AS_INT(kv);
+            p = at + 9;
+            falseTo = p + jaiReadI16(code + at + 7);
+        } else if (n > 0 && join >= 0) {
+            L->uncond = true;
+            p = at;
+        } else {
+            return false;
+        }
+        if (p + 6 > c->count) return false;
+        switch (code[p]) {
+        case OP_INT:
+            L->vop = OP_INT;
+            L->vimm = jaiReadI16(code + p + 1);
+            p += 3;
+            break;
+        case OP_GET_LOCAL:
+            L->vop = OP_GET_LOCAL;
+            L->va = jaiReadU16(code + p + 1);
+            p += 3;
+            break;
+        case OP_GET_LOCAL2:
+            if (code[p + 5] != OP_GET_INDEX) return false;
+            L->vop = OP_GET_INDEX;
+            L->va = jaiReadU16(code + p + 1);
+            L->vb = jaiReadU16(code + p + 3);
+            p += 6;
+            break;
+        default:
+            return false;
+        }
+        if (p + 3 > c->count || code[p] != OP_BIND) return false;
+        unsigned s = jaiReadU16(code + p + 1);
+        p += 3;
+        if (slot < 0) slot = (int)s;
+        else if ((unsigned)slot != s) return false;
+        n++;
+        if (L->uncond) {
+            /* The else arm runs into the join. */
+            if (p != join) return false;
+            break;
+        }
+        if (p == falseTo) {
+            /* The last test: its arm falls into the join. */
+            if (join >= 0 && join != p) return false;
+            join = p;
+            break;
+        }
+        if (p + 3 > c->count || code[p] != OP_JUMP) return false;
+        int j = p + 3 + jaiReadI16(code + p + 1);
+        if (join >= 0 && j != join) return false;
+        join = j;
+        p += 3;
+        if (p != falseTo) return false;
+        at = p;
+    }
+    if (join <= off || join > stop || join > c->count) return false;
+    if (branchesInto(c, off, join)) return false;
+    *nOut = n;
+    *slotOut = (unsigned)slot;
+    *joinOut = join;
+    return true;
+}
+
+static bool ifIntLocal(const Emit *e, unsigned slot) {
+    return slot != 0 && localInRange((Emit *)e, slot) &&
+           e->localKind[slot] == SLOT_INT && !e->dynamicLocal[slot];
+}
+
+/* The hoist whose head proved `va[vb]` in bounds, or -1. Mirrors
+ * boundsCoveredAtHead for an index that is the loop variable itself. */
+static int ifCoveredHoist(const Emit *e, unsigned va, unsigned vb) {
+    int h = hoistFor(e, (int)va);
+    if (h < 0 || !e->hoist[h].rangeOk || !e->hoist[h].inside) return -1;
+    if (e->hoist[h].rVar != vb) return -1;
+    if (e->slotWriteLo[vb] != e->slotWriteHi[vb]) return -1;
+    if (!e->spanOk[va] || e->spanLo[va] > 0 || e->spanHi[va] < 0) return -1;
+    return h;
+}
+
+static bool ifValueOk(const Emit *e, const IfLink *L) {
+    switch (L->vop) {
+    case OP_INT:
+        return true;
+    case OP_GET_LOCAL:
+        return ifIntLocal(e, L->va);
+    case OP_GET_INDEX: {
+        if (L->va == 0 || !localInRange((Emit *)e, L->va) ||
+            e->localKind[L->va] != SLOT_LIST || e->dynamicLocal[L->va]) {
+            return false;
+        }
+        if (!ifIntLocal(e, L->vb)) return false;
+        Value seen = seenLocal((Emit *)e, L->va);
+        if (!IS_LIST(seen) || AS_LIST(seen)->stg != (uint8_t)LIST_STORE_I64) {
+            return false;
+        }
+        return ifCoveredHoist(e, L->va, L->vb) >= 0;
+    }
+    default:
+        return false;
+    }
+}
+
+static void ifEmitValue(Emit *e, const IfLink *L, unsigned rd) {
+    switch (L->vop) {
+    case OP_INT:
+        emitConst64(e, rd, L->vimm);
+        return;
+    case OP_GET_LOCAL: {
+        unsigned r = localIn(e, L->va, rd);
+        if (r != rd) emit(e, jaiA64MovX(rd, r));
+        return;
+    }
+    default: {
+        int h = ifCoveredHoist(e, L->va, L->vb);
+        bool pinned = (e->hoist[h].stgPin &&
+                       e->hoist[h].stg == (uint8_t)LIST_STORE_I64) ||
+                      (e->osr && e->localStgPin[L->va] &&
+                       localStgOf(e, L->va) == (uint8_t)LIST_STORE_I64);
+        if (!pinned) {
+            unsigned rl = localIn(e, L->va, JIT_SCRATCH_A);
+            emit(e, jaiA64LdrByte(JIT_SCRATCH_D, rl,
+                                  (unsigned)offsetof(ObjList, stg)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, LIST_STORE_I64));
+            branchOnDeopt(e, JAI_A64_NE);
+        }
+        unsigned ri = localIn(e, L->vb, JIT_SCRATCH_D);
+        emit(e, jaiA64LdrXIdx(rd, e->hoist[h].itemsReg, ri));
+        return;
+    }
+    }
+}
+
+/* See above. True with `*offp` at the join when the chain at `*offp` was
+ * emitted branch-free; false, having emitted nothing, otherwise. */
+static bool tryIfConvert(Emit *e, ObjFunction *fn, int *offp) {
+    if (e->measuring || e->inlining || e->inProtected || !jitIfConvOn()) {
+        return false;
+    }
+    int off = *offp;
+    int stop = e->osr ? (int)e->osrEnd : fn->chunk.count;
+    IfLink links[IFCONV_MAX_LINKS];
+    unsigned n = 0, s = 0;
+    int join = -1;
+    if (!parseIfChain(fn, off, stop, links, &n, &s, &join)) return false;
+    if (!ifIntLocal(e, s)) return false;
+    /* A loop variable some head bounds is never rewritten here. */
+    for (unsigned i = 0; i < e->hoistCount; i++) {
+        if (e->hoist[i].rVar == s) return false;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        unsigned cond;
+        if (!links[i].uncond &&
+            (!negatedCondition(links[i].cmp, &cond) ||
+             !ifIntLocal(e, links[i].nslot))) {
+            return false;
+        }
+        if (!ifValueOk(e, &links[i])) return false;
+    }
+
+    settleAll(e);
+    if (e->fpBorrow != 0) fpReleaseAll(e);
+    unsigned rT = JIT_SCRATCH_B, rV = JIT_SCRATCH_C;
+    unsigned last = n - 1;
+    if (links[last].uncond) {
+        ifEmitValue(e, &links[last], rT);
+    } else {
+        unsigned rs = localIn(e, s, rT);
+        if (rs != rT) emit(e, jaiA64MovX(rT, rs));
+        last = n;
+    }
+    for (unsigned i = last; i-- > 0;) {
+        unsigned cond;
+        (void)negatedCondition(links[i].cmp, &cond);
+        ifEmitValue(e, &links[i], rV);
+        unsigned rn = localIn(e, links[i].nslot, JIT_SCRATCH_A);
+        emitCmpImm(e, rn, links[i].k);
+        emit(e, jaiA64CselX(rT, rV, rT, cond ^ 1u));
+    }
+    localOut(e, s, rT);
+    if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] %s if-converts %u links at %d\n",
+                jitFnLabel(fn), n, off);
+    }
+    *offp = join;
+    return true;
+}
+
 bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
                          int *offp) {
     int off = *offp;
@@ -722,6 +998,7 @@ bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
         if (e->localKind[slot] != SLOT_INT) return false;
         if (slot == 0) e->usesSlot0 = true;
         if (!IS_INT(k)) return false;
+        if (tryIfConvert(e, fn, &off)) break;
 
         /* `while i < n` and `if n < 2` are the same instruction here, and the constant fits the compare's
          * own imm12 far more often than not, so it costs one instruction rather than a movz plus a three-register subs. */
