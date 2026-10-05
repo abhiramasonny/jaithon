@@ -224,6 +224,10 @@ ObjString *jaiFmtMemoFill(JaiFmtSite *site, Obj *pre, int64_t n, Obj *post,
  * Never allocates; see its definition in object_string.c. */
 ObjString *jaiStringSliceLeaf(ObjString *s, int64_t start, int64_t stop,
                               int64_t flags);
+/* `xs[a:b]` for compiled code, or NULL when only jaiSliceGet can make it.
+ * Never collects; see its definition in object_collection.c. */
+ObjList *jaiListSliceLeaf(ObjList *list, int64_t start, int64_t stop,
+                          int64_t flags);
 /* The result kind an OP_INVOKE site has observed for a receiver of
  * `receiver`'s type, or JAI_FB_NONE. A PREDICTION, not a guarantee -- see
  * InlineCache::resultKind; every caller must guard what it emits. */
