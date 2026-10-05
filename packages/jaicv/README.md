@@ -197,9 +197,14 @@ Three device paths are switched the same way:
 Device memory is not garbage collected, so every operation releases the
 intermediates it makes, and small constant matrices -- filter taps, a warp's
 inverse, the default structuring element -- are made once and shared
-(`cached_weights` in `imgproc/common.jai`). `std.gpu.live_buffers()` counts the
-buffers still allocated; `tests/test_releases.jai` holds operations to zero
-growth with it, and `BENCH_LEAK_CALLS=100 ./jaithon run
+(`cached_weights` in `imgproc/common.jai`). The shared matrices are not
+growth-free but bounded: the cache keeps two generations of 256, and a call
+whose values change every time -- a rotating warp, a new sigma each frame --
+fills it until the older generation is released. A matrix handed out is never
+in the generation being released, so a call keeps the taps it fetched.
+`std.gpu.live_buffers()` counts the buffers still allocated;
+`tests/test_releases.jai` holds operations repeated with the same arguments to
+zero growth with it, and `BENCH_LEAK_CALLS=100 ./jaithon run
 tests/bench/jaicv/imgproc.jai` reports the growth of every bench row.
 
 ## Camera access
