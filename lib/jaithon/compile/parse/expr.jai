@@ -70,20 +70,17 @@ pub fn _parse_subscript(p: Parser, object: Node, open_index: int) -> Node {
 pub fn _parse_postfix(p: Parser) -> Node {
     var expr = _parse_primary(p)
 
+    # Each arm is its own function so the loop holds nothing but `expr`. Written
+    # inline, the arms' locals shared frame slots -- `optional` a bool in one,
+    # `open_index` an int in the next -- and a compiled form of the loop was
+    # entered with whichever kind the last iteration left there and refused.
     loop {
         if p._check(TokenKind.Dot) or p._check(TokenKind.QuestionDot) {
-            let optional = p._check(TokenKind.QuestionDot)
-            p._advance()
-            let name_token = p._peek()
-            let name = p._expect_ident_name("a member name after `.`")
-            if name == null { break }
-            let kind = optional ? NodeKind.OptMember : NodeKind.Member
-            expr = _member(kind, p._join_token(expr.span, name_token), expr, name)
+            let member = _parse_member_access(p, expr)
+            if member == null { break }
+            expr = member ?? expr
         } elif p._check(TokenKind.LParen) {
-            let open_index = p.current
-            p._advance()
-            let args = _parse_args(p, open_index)
-            expr = _call(_join(expr.span, p._span_since(open_index)), expr, args)
+            expr = _parse_call(p, expr)
         } elif p._check(TokenKind.LBracket) {
             expr = _parse_subscript(p, expr, p.current)
         } else {
@@ -92,6 +89,26 @@ pub fn _parse_postfix(p: Parser) -> Node {
         if p.panic_mode { break }
     }
     return expr
+}
+
+#: `expr.name` or `expr?.name`, with the parser on the `.` or `?.`; null when
+#: no name follows, which `_expect_ident_name` has already reported.
+pub fn _parse_member_access(p: Parser, expr: Node) -> Node? {
+    let optional = p._check(TokenKind.QuestionDot)
+    p._advance()
+    let name_token = p._peek()
+    let name = p._expect_ident_name("a member name after `.`")
+    if name == null { return null }
+    let kind = optional ? NodeKind.OptMember : NodeKind.Member
+    return _member(kind, p._join_token(expr.span, name_token), expr, name ?? "")
+}
+
+#: `expr(args)`, with the parser on the `(`.
+pub fn _parse_call(p: Parser, expr: Node) -> Node {
+    let open_index = p.current
+    p._advance()
+    let args = _parse_args(p, open_index)
+    return _call(_join(expr.span, p._span_since(open_index)), expr, args)
 }
 
 # --- the precedence ladder (§4.1) ------------------------------------
