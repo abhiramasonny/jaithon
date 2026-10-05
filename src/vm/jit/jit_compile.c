@@ -857,6 +857,7 @@ uint8_t *jaiJitCompileMapKernel(ObjClosure *closure, Value *slotBase,
 bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
     if (!eligible(fn)) return false;
+    gLoopInlineRefusedCount = 0;
 
     /* Up to a few attempts: each one may discover another slot that two paths
      * disagree about, and the next begins knowing it. */
@@ -883,6 +884,17 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
         bool firstNeedNull[JIT_MAX_SLOTS + 1];
         memcpy(firstNeed, need, sizeof firstNeed);
         memcpy(firstNeedNull, needNull, sizeof firstNeedNull);
+        /* A loop inline that failed part-way is refused by callee and the
+         * body tried again with every other inline kept. Each retry that
+         * fails the same way refuses one more callee; a full list refuses
+         * them all, so this ends. */
+        for (unsigned r = 0; gLoopInlineFailed && r <= JIT_LOOP_REFUSED_MAX;
+             r++) {
+            if (compileFuncOnce(closure, slotBase, dynamic, need, nullable,
+                                needNull, false)) {
+                return true;
+            }
+        }
         /* An inlined body that could not be emitted is not a decline: the
          * same call through the descriptor still compiles, and a compiled
          * form with a real call in it beats none at all. */
@@ -998,6 +1010,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     ObjFunction *fn = closure->fn;
     jitBranchTargetsReset();
     gInlineFailed   = false;
+    gLoopInlineFailed = false;
     gMatchUsed      = false;
     gNullableFbUsed = false;
     gJitColdDecline = false;

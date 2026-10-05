@@ -11,7 +11,7 @@
 #: the drivers call out too, so their own locals share the registers with the
 #: homes.
 from std.io import Path, write_file
-from std.os import argv, pid, run, temp_dir
+from std.os import argv, env, pid, run, temp_dir
 from std.test import assert_eq, assert_true
 
 fn safe(cols: list[int], row: int, col: int) -> bool {
@@ -472,6 +472,39 @@ fn test_the_same_list_passed_twice() -> void {
     }
 }
 
+# A small helper that loops over a dict passes the loop whitelist, and its
+# walk then stops on the lookup's call-out. That compile used to be retried
+# with every inline off, so the caller's straight-line inlines went with it;
+# now only this callee is refused. Either way the answer must not change.
+fn twice(x: int) -> int { return x * 2 }
+
+fn dsum(d: dict[int, int], n: int) -> int {
+    var s = 0
+    var i = 0
+    while i < n {
+        s += d[i]
+        i += 1
+    }
+    return s
+}
+
+fn drive_dict(d: dict[int, int], r: int) -> int {
+    var t = 0
+    for j in 0..8 { t += twice(j + r) + noop(j) }
+    return t + dsum(d, r % 10)
+}
+
+fn test_a_helper_that_loops_over_a_dict() -> void {
+    var d: dict[int, int] = {}
+    for k in 0..10 { d[k] = k * 3 }
+    for r in 0..2000 {
+        var want = 0
+        for j in 0..8 { want += (j + r) * 2 + j }
+        for i in 0..(r % 10) { want += i * 3 }
+        assert_eq(drive_dict(d, r), want)
+    }
+}
+
 # The two-list overflow wrote one Fixup past a small heap block, which the
 # allocator usually tolerated: the in-process tests above passed on the broken
 # binary. Guard Malloc puts every block against a guard page, so the same
@@ -507,4 +540,60 @@ fn test_two_list_parameters_under_guard_malloc() -> void {
         f"DYLD_INSERT_LIBRARIES={gm} exec '{argv()[0]}' run --no-cache '{path}' 2>/dev/null"])
     assert_eq(ran.exit_code, 0)
     assert_eq(ran.stdout, "8939106\n")
+}
+
+# After a loop inline fails part-way (here: the dict lookup's call-out), the
+# caller is compiled again without that callee -- and with its straight-line
+# inlines. It was compiled with every inline off, which made this program
+# 3.4x slower than with no loop inlining at all.
+fn test_a_failed_loop_inline_keeps_the_other_inlines() -> void {
+    if env("JAITHON_NO_JIT") != null or env("JAITHON_JIT_INLINE_LOOPS") != null { return }
+    let lines = [
+        "fn twice(x: int) -> int { return x * 2 }",
+        "fn noop(x: int) -> int { return x }",
+        "fn dsum(d: dict[int, int], n: int) -> int {",
+        "    var s = 0",
+        "    var i = 0",
+        "    while i < n {",
+        "        s += d[i]",
+        "        i += 1",
+        "    }",
+        "    return s",
+        "}",
+        "fn drive(d: dict[int, int], r: int) -> int {",
+        "    var t = 0",
+        "    for j in 0..40 { t += twice(j + r) + noop(j) }",
+        "    return t + dsum(d, r % 10)",
+        "}",
+        "fn main() -> int {",
+        "    var d: dict[int, int] = {}",
+        "    for k in 0..10 { d[k] = k * 3 }",
+        "    var u = 0",
+        "    for r in 0..20000 { u += drive(d, r) }",
+        "    print(u)",
+        "    return 0",
+        "}",
+    ]
+    let path = f"{temp_dir()}/jaithon_inline_dict_{pid()}.jai"
+    write_file(path, "\n".join(lines) + "\n")
+    defer { Path(path).remove() }
+    let ran = run(["sh", "-c", f"JAI_JIT_WHY=1 exec '{argv()[0]}' run --no-cache '{path}'"])
+    assert_eq(ran.exit_code, 0)
+    assert_eq(ran.stdout, "16046720000\n")
+    var failed = false
+    var inlined = false
+    var checked = 0
+    for line in ran.stderr.split("\n") {
+        if line.contains("a call inside an inlined loop") {
+            failed = true
+            inlined = false
+        } elif line.contains("inlining twice") {
+            inlined = true
+        } elif failed and line.contains("compiled ") and line.contains(".drive ") {
+            assert_true(inlined, "drive lost its straight-line inlines")
+            checked += 1
+            failed = false
+        }
+    }
+    assert_true(checked > 0 or not failed, "drive never compiled after the failed inline")
 }

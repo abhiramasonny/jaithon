@@ -19,6 +19,17 @@
  * in it beats none at all. A file static for the same reason the Emit buffers
  * are -- compilation is not reentrant, nothing it calls compiles anything. */
 bool gInlineFailed;
+bool gLoopInlineFailed;
+const ObjFunction *gLoopInlineRefused[JIT_LOOP_REFUSED_MAX];
+unsigned gLoopInlineRefusedCount;
+
+static bool loopInlineRefused(const ObjFunction *fn) {
+    if (gLoopInlineRefusedCount >= JIT_LOOP_REFUSED_MAX) return true;
+    for (unsigned i = 0; i < gLoopInlineRefusedCount; i++) {
+        if (gLoopInlineRefused[i] == fn) return true;
+    }
+    return false;
+}
 
 /* JAITHON_JIT_INLINE_METHODS=0 restores the narrow method inliner alone
  * (inlineMethodWalk), and keeps field reads out of every inlined body. */
@@ -976,6 +987,7 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     if (e->osr || e->inlHomeLo == 0 || e->mapKernel) return false;
     ObjFunction *cfn = callee->fn;
     if (cfn == caller) return false;           /* recursion */
+    if (loopInlineRefused(cfn)) return false;  /* failed once in this body */
     unsigned maxSlot = 0;
     bool loops = false;
     if (!inlinableLoopBody(callee, argc, method, &maxSlot, &loops)) {
@@ -1217,6 +1229,13 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
         e->inlining = false;
         e->inlHomes = false;
         gInlineFailed = true;
+        /* Retried without THIS callee rather than without every inline: a
+         * body whose loop inline failed lost its straight-line inlines too,
+         * and ran 3.4x slower than with no loop inlining at all. */
+        gLoopInlineFailed = true;
+        if (gLoopInlineRefusedCount < JIT_LOOP_REFUSED_MAX) {
+            gLoopInlineRefused[gLoopInlineRefusedCount++] = cfn;
+        }
         e->failed = true;
         return false;
     }

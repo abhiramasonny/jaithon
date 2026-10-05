@@ -1260,6 +1260,15 @@ uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
 
 /* Defined in jit_func.c. */
 extern bool gInlineFailed;
+/* A loop-bearing inline (inlineLoopCall) failed part-way through its walk.
+ * Its callee is added to gLoopInlineRefused and the body is compiled again
+ * with that callee behind a real call and every other inline kept; a full
+ * list refuses every loop inline. Reset per compileFuncOnce and per
+ * jaiJitCompileFunc respectively. */
+enum { JIT_LOOP_REFUSED_MAX = 4 };
+extern bool gLoopInlineFailed;
+extern const ObjFunction *gLoopInlineRefused[JIT_LOOP_REFUSED_MAX];
+extern unsigned gLoopInlineRefusedCount;
 /* The interpreter frame's slot window, as frameWindowSize (vm_call.c) sizes it: every slot
  * the function itself names is below it, so the slots an inline renumbers its
  * callee's locals into (Emit::inlHomes) start here. */
