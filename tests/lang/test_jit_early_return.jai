@@ -1,7 +1,8 @@
 #: A body that opens with `if <int param> <cmp> <literal> { return <param or
 #: literal> }` is compiled with that test ahead of its frame
-#: (JAITHON_JIT_SHRINK_WRAP, off by default: tests/vm/shrink_wrap.sh runs
-#: this file with it on), and the body proper starts past it.
+#: (JAITHON_JIT_SHRINK_WRAP; by default only where the arm is taken by most
+#: calls, so tests/vm/shrink_wrap.sh also runs this file with it forced on
+#: everywhere), and the body proper starts past it.
 #:
 #: Each comparison, both kinds of returned value, a returned parameter that is
 #: not the tested one, recursion through the frameless arm, and the body that

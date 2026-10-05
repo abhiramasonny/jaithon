@@ -78,7 +78,10 @@ void jaiAllocPrintCensus(FILE *out) {
 }
 #endif
 
-static inline Obj *allocObj(size_t size, ObjType type) {
+/* Forced inline: the two allocators below inline it anyway, and a caller the
+ * PGO profile has never seen (jaiListSliceLeaf, added after the last
+ * `make pgo-train`) otherwise gets a call to an outlined copy. */
+JAI_INLINE Obj *allocObj(size_t size, ObjType type) {
 #ifdef JAI_ALLOC_CENSUS
     jaiAllocByType[type]++;
     jaiAllocBytesByType[type] += size;
@@ -137,6 +140,68 @@ Obj *jaiAllocateObject(size_t size, ObjType type) {
      * mention a field leaves it NULL or 0 rather than garbage. */
     memset((char *)obj + sizeof(Obj), 0, size - sizeof(Obj));
     return obj;
+}
+
+/* `xs[a:b]` (no step) for compiled code, called as a LEAF: no descriptor, no
+ * roots, no dispatch on the container. NULL sends the caller to the
+ * descriptor path, which does the same thing through jaiSliceGet. Here rather
+ * than beside jaiListSlice so that allocObj's page-space pop inlines into it:
+ * a divide-and-conquer recursion makes a slice per call, and the call into
+ * jaiAllocateObjectRaw was a third of the leaf.
+ *
+ * Sound without roots because nothing here can collect: an allocation
+ * collects only when jaiGCWanted() is already true on the way in (allocObj),
+ * that is answered NULL here, and the one allocation below is the only one --
+ * the backing array comes from the small-block bins or jaiRealloc, which only
+ * count bytes. The same argument as jaiValueFormatLeaf and jitInstanceAlloc.
+ *
+ * Bounds clamp as sliceCount clamps a step of one. The copy is at the
+ * SOURCE'S storage width, and the result takes the source's storage, for the
+ * reason jaiListSlice gives: elemKind can say `int` on a list jaiListBox has
+ * already turned into Values. */
+ObjList *jaiListSliceLeaf(ObjList *list, int64_t start, int64_t stop,
+                          int64_t flags) {
+    if (JAI_UNLIKELY(jaiGCWanted())) return NULL;
+    const int64_t n = list->count;
+    if ((flags & 1) == 0) start = 0;
+    if ((flags & 2) == 0) stop = n;
+    if (start < 0) start = start < -n ? 0 : start + n;
+    else if (start > n) start = n;
+    if (stop < 0) stop = stop < -n ? 0 : stop + n;
+    else if (stop > n) stop = n;
+    const int64_t count = stop > start ? stop - start : 0;
+
+    /* Every field written below, so no zeroing: that is a runtime-length
+     * memset, a call into libc per slice. */
+    ObjList *out = (ObjList *)allocObj(sizeof(ObjList), OBJ_LIST);
+    out->items = NULL;
+    out->count = 0;
+    out->capacity = 0;
+    out->version = 0;
+    out->elemKind = list->elemKind;
+    out->stg = list->stg;
+    if (count > 0) {
+        const size_t w = jaiListStoreWidth(list->stg);
+        const size_t bytes = w * (size_t)count;
+        /* The small-block half of jaiRealloc, inline: the same bins, the
+         * same accounting, freed by the same jaiRealloc(items, size, 0). */
+        out->items = jaiSmallServes(bytes) ? jaiSmallNew(bytes)
+                                           : jaiRealloc(NULL, 0, bytes);
+        out->capacity = (int)count;
+        const char *src = (const char *)list->items + w * (size_t)start;
+        /* Short slices are what a divide-and-conquer recursion makes most
+         * of, and a libc call costs more than copying two words. Whole
+         * words only: a bool list's bytes go through memcpy. */
+        if ((w & 7u) == 0 && bytes <= 32) {
+            uint64_t *d = (uint64_t *)out->items;
+            const uint64_t *s = (const uint64_t *)(const void *)src;
+            for (size_t i = 0; i < bytes / 8; i++) d[i] = s[i];
+        } else {
+            memcpy(out->items, src, bytes);
+        }
+        out->count = (int)count;
+    }
+    return out;
 }
 
 /* What a finalizing page's sweep calls on a dead object: frees what it owns,

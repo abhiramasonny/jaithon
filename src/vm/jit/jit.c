@@ -196,7 +196,9 @@ extern volatile sig_atomic_t jaiInterrupted;
 
 static void onTick(int signum) {
     (void)signum;
-    if (jaiInterrupted == 0) jaiInterrupted = 2;
+    /* 3 is the warm-up count (jaiJitMainStarted): a real tick ends it early
+     * rather than waiting behind it. Never over 1, which is Ctrl-C. */
+    if (jaiInterrupted == 0 || jaiInterrupted == 3) jaiInterrupted = 2;
 }
 
 uint32_t jaiJitThresholdOverride;
@@ -236,6 +238,46 @@ void jaiJitStartSampling(void) {
  * without this a child forked by `jaithon test` would never OSR a loop. */
 void jaiJitAfterFork(void) {
     if (sSamplerHandled) armSamplerTimer();
+}
+
+/* JAITHON_JIT_MAIN_EDGES: interpreted back edges, counted from the moment the
+ * program's own module body and then its main() start, after which the next
+ * back edge is a tick (0 turns it off). Default 4096.
+ *
+ * The program's first hot loop ran interpreted until a SIGPROF tick landed on
+ * one of its back edges, and when that happens is not the program's to say:
+ * the timer's phase is whatever startup left it at, and macOS delivers
+ * ITIMER_PROF on its own accounting granularity -- re-arming the timer to fire
+ * 100us into main changed nothing, the tick still came anywhere up to a whole
+ * interval later. mandelbrot's interpreted count read 0.05M to 3.4M from one
+ * run to the next on identical code.
+ *
+ * A back-edge counter answers that, but not in OP_LOOP's fast path: a new
+ * branch there costs 11% even when never taken (vm.c, jaiInterrupted). So the
+ * count rides the test that is already there. jaiInterrupted = 3 sends every
+ * interpreted back edge to the safepoint, which counts it down and, at zero,
+ * turns the state into a tick (2) on that very back edge. The slow path is paid
+ * for at most 4096 back edges per start, tens of thousands of cycles, and
+ * nothing at all afterwards; the interval, the signal cost and every later
+ * arming decision are exactly as before. A real tick during the count ends it
+ * (onTick turns 3 into 2): the first version let the handler skip state 3,
+ * and a tick that would have armed sieve's loops at once then waited behind
+ * the count -- 1.5K interpreted instructions became 26K. Ctrl-C overrides it.
+ * A tick arriving here becomes the warm-up's only when the count ran out. */
+int jaiWarmEdges;
+
+void jaiJitMainStarted(void) {
+    static int edges = -1;
+    if (edges < 0) {
+        const char *v = getenv("JAITHON_JIT_MAIN_EDGES");
+        edges = v != NULL ? atoi(v) : 4096;
+        if (edges < 0 || edges > (1 << 24)) edges = 4096;
+    }
+    if (edges == 0 || !sSamplerHandled) return;
+    /* A pending tick or a Ctrl-C keeps its meaning. */
+    if (jaiInterrupted != 0 && jaiInterrupted != 3) return;
+    jaiWarmEdges = edges;
+    jaiInterrupted = 3;
 }
 
 static void armSamplerTimer(void) {
@@ -408,7 +450,17 @@ bool jaiJitSample(ObjClosure *closure, uint32_t offset) {
      * loop hot enough to take a tick sits inside one at least as hot, so the
      * request cascades one level per back edge (vm.c asks again for the head
      * it just compiled) instead of waiting a tick per level. */
-    if (fn->tickCount >= JAI_JIT_HOT_TICKS) jaiJitWantEnclosing(fn, offset);
+    /* The warm-up's tick (jaiJitMainStarted) passes outward at once, even on
+     * a body it is the first tick of: it exists to have the program's loops
+     * compiled before the timer gets round to them, and a hot inner loop
+     * whose enclosing loop then waits a whole interval for a second tick is
+     * most of what it came to remove -- mandelbrot ran its pixel loop
+     * interpreted for ~1ms that way, 15M instructions. */
+    bool warm = jaiWarmEdges < 0;
+    if (warm) jaiWarmEdges = 0;
+    if (fn->tickCount >= JAI_JIT_HOT_TICKS || warm) {
+        jaiJitWantEnclosing(fn, offset);
+    }
     /* The tick that makes a body hot arrives on a back edge, which is exactly
      * the entry point the attempt below needs -- so spend it, rather than
      * waiting for the next one.

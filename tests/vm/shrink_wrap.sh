@@ -35,14 +35,52 @@ else
     note FAIL "fib with the arm on: $(printf '%s\n' "$why" | tail -1)"
 fi
 
-# Off unless asked for: the losing recursions are as plausible as the
-# winning ones, and nothing the walk sees tells them apart.
+# By default only where the bytecode after the arm says most calls take it
+# (earlyArmPays): fib, yes; the shapes that measured slower with the arm
+# forced on, no.
 why=$(env $clear -u JAITHON_JIT_SHRINK_WRAP JAI_JIT_WHY=1 "$JAITHON" run "$work/fib.jai" 2>&1)
-if printf '%s
-' "$why" | grep -q "returns early before its frame"; then
-    note FAIL "the arm is emitted with the switch unset"
+if printf '%s\n' "$why" | grep -q "fib returns early before its frame"; then
+    note ok "fib gets the arm by default"
 else
-    note ok "the arm stays off by default"
+    note FAIL "fib has no arm with the switch unset"
+fi
+why=$(env $clear JAITHON_JIT_SHRINK_WRAP=0 JAI_JIT_WHY=1 "$JAITHON" run "$work/fib.jai" 2>&1)
+if printf '%s\n' "$why" | grep -q "returns early before its frame"; then
+    note FAIL "the arm is emitted with the switch at 0"
+else
+    note ok "the arm stays off at 0"
+fi
+
+cat > "$work/losers.jai" <<'JAI'
+fn paths(r: int, c: int) -> int {
+    if r == 0 { return 1 }
+    if c == 0 { return 1 }
+    return paths(r - 1, c) + paths(r, c - 1)
+}
+fn collatz(n: int) -> int {
+    if n == 1 { return 0 }
+    if n % 2 == 0 { return 1 + collatz(n // 2) }
+    return 1 + collatz(3 * n + 1)
+}
+fn gcd(a: int, b: int) -> int {
+    if b == 0 { return a }
+    return gcd(b, a % b)
+}
+fn tri(n: int) -> int {
+    if n < 2 { return n }
+    return tri(n - 1) + tri(n - 2) + 1
+}
+var t = paths(8, 8)
+for i in 1..3000 { t += collatz(i) + gcd(i, 360) }
+print(t + tri(18))
+JAI
+why=$(env $clear -u JAITHON_JIT_SHRINK_WRAP JAI_JIT_WHY=1 "$JAITHON" run "$work/losers.jai" 2>&1)
+if printf '%s\n' "$why" | grep -q "returns early before its frame"; then
+    note FAIL "a shape that loses with the arm got it by default: $(printf '%s\n' "$why" | grep "returns early" | head -1)"
+elif printf '%s\n' "$why" | grep -q "compiled __main__.paths"; then
+    note ok "no arm by default where it measured slower"
+else
+    note FAIL "the losing shapes did not compile at all"
 fi
 
 for mode in "" "JAITHON_JIT_THRESHOLD=1" "JAITHON_JIT_DEOPT_STRESS=1" "JAITHON_JIT_TICK_US=50"; do
