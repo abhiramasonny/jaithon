@@ -1028,9 +1028,12 @@ static const char *parameterName(const CalleeShape *shape, int index) {
  * wants. Missing middle parameters get their defaults here rather than in
  * bindCallArgs, which can only fill a contiguous trailing run.
  *
- * Returns the new argument count, or -1 with an exception pending. */
-int prepareKeywordCall(int posCount, ObjTuple *names,
-                              ObjDict **outKwRest) {
+ * Returns the new argument count, or -1 with an exception pending.
+ *
+ * Never inlined: its two Value[JAI_MAX_ARGS] buffers would otherwise land in
+ * runLoop's frame under LTO, and every native re-entry pays that frame. */
+JAI_NOINLINE int prepareKeywordCall(int posCount, ObjTuple *names,
+                                    ObjDict **outKwRest) {
     int kwCount = (int)names->count;
     int total = posCount + kwCount;
     Value *argBase = vm.stackTop - total;

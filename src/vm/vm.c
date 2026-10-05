@@ -13,6 +13,7 @@
  */
 #include <inttypes.h>
 #include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 
@@ -29,7 +30,11 @@
 VM vm;
 
 /* Nested runLoop() invocations, one per re-entry from native code. Each costs
- * a C stack frame, so it is bounded well below the interpreter frame limit. */
+ * C stack, so re-entry is bounded by the thread's real stack (runStackFloor):
+ * compiled code calling interpreted code re-enters once per call, and a fixed
+ * count let a recursion that alternates between the tiers fail long before
+ * the interpreter's own frame limit. The count is the bound only on a thread
+ * whose stack bounds are unknown. */
 #define JAI_MAX_NESTED_RUN 128
 int sRunDepth;
 
@@ -447,6 +452,71 @@ static bool formatViaUserStr(ObjModule *module, ObjString *name, int count,
                   "Jaithon", (what), jaiTypeNameStatic(v));                    \
         }                                                                      \
     } while (0)
+
+/* The three helpers below hold runLoop's only large buffers. Written inline,
+ * each one was part of runLoop's own frame, which every native re-entry pays
+ * whether or not it reaches the opcode: the frame was about 21 KB, so a
+ * compiled caller that calls back into interpreted code ran out of stack
+ * long before it ran out of interpreter frames. Kept out of line, they cost
+ * stack only while they run. */
+
+/* OP_UNPACK's body, after the shape checks: writes the `count` targets over
+ * `dest`, the source's own slot and the ones above it, rightmost first, so
+ * the leftmost target ends up on top. `source` stays rooted in dest[0] until
+ * the final copy, which is after the one allocation. */
+static JAI_NOINLINE void unpackOnto(Value *dest, Value source, int count,
+                                    int restIndex, int fixed, int available) {
+    Value unpacked[JAI_MAX_ARGS];
+    const Value *items = IS_LIST(source) ? jaiListBox(AS_LIST(source))
+                                         : AS_TUPLE(source)->items;
+    bool hasRest = (restIndex != 255);
+    int restCount = available - fixed;
+    int read = 0;
+    for (int i = 0; i < count; i++) {
+        if (hasRest && i == restIndex) {
+            ObjList *rest = jaiListNew(restCount);
+            for (int j = 0; j < restCount; j++) jaiListPut(rest, j, items[read + j]);
+            rest->count = restCount;
+            read += restCount;
+            unpacked[i] = OBJ_VAL(rest);
+            /* jaiListNew can collect; re-read the (still rooted) source. */
+            items = IS_LIST(source) ? jaiListBox(AS_LIST(source))
+                                    : AS_TUPLE(source)->items;
+        } else {
+            unpacked[i] = items[read++];
+        }
+    }
+    for (int i = 0; i < count; i++) dest[i] = unpacked[count - 1 - i];
+}
+
+/* OP_MATCH_FIELDS' extraction: 1 with the fields pushed onto vm.stackTop,
+ * 0 when the instance lacks one of them, -1 when the stack is full (raised). */
+static JAI_NOINLINE int matchFieldsOnto(ObjInstance *instance,
+                                        const Value *names, int count) {
+    Value extracted[JAI_MAX_ARGS];
+    for (int i = 0; i < count; i++) {
+        if (!IS_STRING(names[i])) return 0;
+        const FieldInfo *field = jaiClassFieldInfo(instance->klass,
+                                                   AS_STRING(names[i]));
+        if (field == NULL || field->slot >= instance->fieldCount) return 0;
+        extracted[i] = instance->fields[field->slot];
+    }
+    if (!ensureStack(count)) return -1;
+    for (int i = 0; i < count; i++) *vm.stackTop++ = extracted[i];
+    return 1;
+}
+
+/* OP_IMPORT, resolved relative to the importing module's directory. */
+static JAI_NOINLINE ObjModule *importFromModule(ObjString *path,
+                                                ObjModule *from) {
+    char dirBuffer[JAI_MAX_PATH];
+    const char *fromDir = NULL;
+    if (from != NULL && from->path != NULL && from->path->length > 0) {
+        jaiPathDirname(dirBuffer, sizeof dirBuffer, from->path->chars);
+        fromDir = dirBuffer;
+    }
+    return jaiImportModule(path->chars, fromDir);
+}
 
 static JaiRunResult runLoop(int baseFrameCount) {
 #if JAI_COMPUTED_GOTO
@@ -2577,13 +2647,10 @@ static JaiRunResult runLoop(int baseFrameCount) {
         SAVE_STATE();
         Value source = stackTop[-1];
 
-        const Value *items = NULL;
         int available = 0;
         if (IS_LIST(source)) {
-            items = jaiListBox(AS_LIST(source));
             available = AS_LIST(source)->count;
         } else if (IS_TUPLE(source)) {
-            items = AS_TUPLE(source)->items;
             available = (int)AS_TUPLE(source)->count;
         } else {
             THROW(vm.cTypeError, "cannot destructure a '%s' value",
@@ -2598,31 +2665,12 @@ static JaiRunResult runLoop(int baseFrameCount) {
                   available == 1 ? "" : "s", count, count == 1 ? "" : "s");
         }
 
-        Value unpacked[JAI_MAX_ARGS];
         if (count > JAI_MAX_ARGS) {
             THROW(vm.cRuntimeError, "too many destructuring targets");
         }
-        int restCount = available - fixed;
-        int read = 0;
-        for (int i = 0; i < count; i++) {
-            if (hasRest && i == restIndex) {
-                ObjList *rest = jaiListNew(restCount);
-                for (int j = 0; j < restCount; j++) jaiListPut(rest, j, items[read + j]);
-                rest->count = restCount;
-                read += restCount;
-                unpacked[i] = OBJ_VAL(rest);
-                /* jaiListNew can collect; re-read the (still rooted) source. */
-                items = IS_LIST(source) ? jaiListBox(AS_LIST(source))
-                                        : AS_TUPLE(source)->items;
-            } else {
-                unpacked[i] = items[read++];
-            }
-        }
+        unpackOnto(stackTop - 1, source, count, restIndex, fixed, available);
         LOAD_STATE();
-        DROP(1);
-        /* Right to left, so the leftmost target is on top and a run of
-         * SET_LOCAL/POP assigns in source order. */
-        for (int i = count - 1; i >= 0; i--) PUSH(unpacked[i]);
+        stackTop += count - 1;
         VM_NEXT();
     }
 
@@ -3337,29 +3385,16 @@ static JaiRunResult runLoop(int baseFrameCount) {
             VM_NEXT();
         }
 
-        ObjInstance *instance = AS_INSTANCE(subject);
-        Value extracted[JAI_MAX_ARGS];
         if (count > JAI_MAX_ARGS) {
             THROW(vm.cRuntimeError, "too many fields in a class pattern");
         }
-        bool ok = true;
-        for (int i = 0; i < count && ok; i++) {
-            if (!IS_STRING(names[i])) { ok = false; break; }
-            const FieldInfo *field = jaiClassFieldInfo(instance->klass,
-                                                       AS_STRING(names[i]));
-            if (field == NULL || field->slot >= instance->fieldCount) {
-                ok = false;
-                break;
-            }
-            extracted[i] = instance->fields[field->slot];
-        }
-        if (!ok) {
+        int matched = matchFieldsOnto(AS_INSTANCE(subject), names, count);
+        if (matched < 0) goto vmThrow;
+        if (matched == 0) {
             ip += offset;
             VM_NEXT();
         }
-        if (!ensureStack(count)) goto vmThrow;
         LOAD_STATE();
-        for (int i = 0; i < count; i++) PUSH(extracted[i]);
         VM_NEXT();
     }
 
@@ -3374,15 +3409,7 @@ static JaiRunResult runLoop(int baseFrameCount) {
     VM_CASE(OP_IMPORT): {
         ObjString *path = AS_STRING(READ_CONST());
         SAVE_STATE();
-        char dirBuffer[JAI_MAX_PATH];
-        const char *fromDir = NULL;
-        if (frame->module != NULL && frame->module->path != NULL &&
-            frame->module->path->length > 0) {
-            jaiPathDirname(dirBuffer, sizeof dirBuffer,
-                           frame->module->path->chars);
-            fromDir = dirBuffer;
-        }
-        ObjModule *imported = jaiImportModule(path->chars, fromDir);
+        ObjModule *imported = importFromModule(path, frame->module);
         if (imported == NULL) {
             if (!vm.hasException) {
                 (void)jaiThrow(vm.cImportError, "cannot import module '%s'",
@@ -3507,11 +3534,42 @@ vmThrow: {
     }
 }
 
+/* The lowest address a run() may start at on this thread, or 1 when the
+ * bounds are unknown. The margin left below it is for everything that is not
+ * a re-entry -- natives, imports, the collector, raising the error itself --
+ * an eighth of the stack, 64 KB to 1 MB. Like the tier's stackLimit, it is
+ * read off the thread's own bounds rather than the first caller's sp. */
+static _Thread_local uintptr_t sRunStackFloor;
+
+static uintptr_t runStackFloor(void) {
+    if (sRunStackFloor != 0) return sRunStackFloor;
+#if defined(__APPLE__)
+    pthread_t self = pthread_self();
+    uintptr_t top  = (uintptr_t)pthread_get_stackaddr_np(self);
+    size_t    size = pthread_get_stacksize_np(self);
+    if (top == 0 || size == 0 || size > top) {
+        sRunStackFloor = 1;
+        return 1;
+    }
+    size_t margin = size / 8;
+    if (margin < 64u * 1024u) margin = 64u * 1024u;
+    if (margin > 1024u * 1024u) margin = 1024u * 1024u;
+    sRunStackFloor = (margin >= size) ? 1 : top - size + margin;
+#else
+    sRunStackFloor = 1;
+#endif
+    return sRunStackFloor;
+}
+
 JaiRunResult run(int baseFrameCount) {
-    if (sRunDepth >= JAI_MAX_NESTED_RUN) {
+    uintptr_t floor = runStackFloor();
+    bool exhausted = (floor == 1)
+        ? sRunDepth >= JAI_MAX_NESTED_RUN
+        : (uintptr_t)__builtin_frame_address(0) < floor;
+    if (exhausted) {
         (void)jaiThrow(vm.cRecursionError,
-                       "maximum native re-entry depth exceeded (%d)",
-                       JAI_MAX_NESTED_RUN);
+                       "maximum native re-entry depth exceeded (%d nested)",
+                       sRunDepth);
         while (vm.frameCount > baseFrameCount) popFrameForUnwind();
         return JAI_RUN_RUNTIME_ERROR;
     }
