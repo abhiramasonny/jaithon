@@ -17,6 +17,7 @@
 import std.math
 from std.core import Printable
 from std.gpu import Buffer, Kernel
+from std.os import env_or
 from ..core.mat import Mat, f32_bits, f32_from_bits
 from ..core.stats import min_max
 from ..core.types import BORDER_DEFAULT, CV_32F, CV_MAKETYPE, Point, Point2f, Size
@@ -744,6 +745,61 @@ fn space_out(spots: list[float], ordered: list[int], squared: float, flat: list[
     return taken
 }
 
+#: Whether `strongest_first` may select the strongest few instead of ranking
+#: every candidate. `JAICV_GF_SELECT=0` always ranks them all; the answer is the
+#: same either way.
+let _GF_SELECT = env_or("JAICV_GF_SELECT", "1") != "0"
+
+#: Candidate indices strongest first, equal strengths in the order found --
+#: but only the first `wanted` of that order, or all of it when `wanted` is
+#: zero.
+#:
+#: Ranking everything costs a key call per candidate, and on a frame with large
+#: flat or repeating stretches tens of thousands of candidates tie at the cut:
+#: 57,608 of them, with four distinct strengths, for 6,400 wanted, which was
+#: 2.3 ms of an 8 ms call. Every candidate stronger than the `wanted`-th
+#: strongest is in the prefix, so those are ranked, and the rest of the prefix
+#: is candidates equal to it, in the order found. Finding that strength is a
+#: sort of the bare values, which needs no key call.
+fn strongest_first(strengths: list[float], found: int, wanted: int) -> list[int] {
+    if wanted <= 0 or found <= wanted * 2 or not _GF_SELECT {
+        var order: list[int] = []
+        for index in 0..found { order.push(index) }
+        return order.sort(key: |index| strengths[index], reverse: true)
+    }
+    let level = strengths.sorted(reverse: true)[wanted - 1]
+    var above: list[int] = []
+    var tied: list[int] = []
+    split_at_level(strengths, found, level, wanted, above, tied)
+    var ordered = above.sort(key: |index| strengths[index], reverse: true)
+    var at = 0
+    while ordered.len() < wanted {
+        ordered.push(tied[at])
+        at += 1
+    }
+    return ordered
+}
+
+#: The candidates stronger than `level`, and the first `limit` equal to it,
+#: each in the order found. A body of its own so the loop compiles.
+fn split_at_level(
+    strengths: list[float],
+    found: int,
+    level: float,
+    limit: int,
+    above: list[int],
+    tied: list[int]
+) -> void {
+    for index in 0..found {
+        let strength = strengths[index]
+        if strength > level {
+            above.push(index)
+        } elif strength == level and tied.len() < limit {
+            tied.push(index)
+        }
+    }
+}
+
 pub fn good_features_to_track(
     image: Mat,
     max_corners: int,
@@ -890,13 +946,18 @@ pub fn good_features_to_track(
     #: with the square of how many there are, and on a textured frame there
     #: are tens of thousands: 640 by 480 took 28 seconds that way, nearly all
     #: of it shuffling a list along.
-    var order: list[int] = []
-    for index in 0..found { order.push(index) }
-    let ordered = order.sort(key: |index| strengths[index], reverse: true)
+    var ordered = strongest_first(strengths, found, wanted)
 
     let room_for = if max_corners > 0 { min(max_corners, found) } else { found }
     var flat = [0.0 for _slot in 0..room_for * 2]
-    let taken = space_out(candidates, ordered, min_distance * min_distance, flat)
+    let squared = min_distance * min_distance
+    var taken = space_out(candidates, ordered, squared, flat)
+    if taken < room_for and ordered.len() < found {
+        #: The strongest few did not fill the answer, so rank every candidate
+        #: and walk them again from the top.
+        ordered = strongest_first(strengths, found, 0)
+        taken = space_out(candidates, ordered, squared, flat)
+    }
     var kept: list[Point2f] = []
     for index in 0..taken { kept.push(Point2f(flat[index * 2], flat[index * 2 + 1])) }
     #: Reading every candidate without filling the answer means the margin
