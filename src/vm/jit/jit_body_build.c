@@ -297,8 +297,9 @@ static bool jitFmtMemoOn(void) {
  * one the leaf call behind it clobbers anyway, and the operands must be in
  * callee-saved registers (leafRegOk), so the miss path finds them as they
  * were. An empty entry's pre is JAI_FMT_MEMO_EMPTY, which no operand equals.
- * The caller calls jaiValueFormatIntLeafMemo on a miss, which is what fills
- * the table. */
+ * The caller calls jaiValueFormatIntLeafMemo on a miss, which marks an
+ * intern hit for emitFmtMemoFillStub to file: that is the only way into the
+ * table. */
 int emitFmtMemoProbe(Emit *e, unsigned rPre, unsigned rN, unsigned rPost) {
     if (!jitFmtMemoOn()) return -1;
     noteScratchClobber(e);
