@@ -457,6 +457,7 @@ this table complete in both directions.
 | `JAITHON_JIT_MODULE_FIELD` | on | Reading a module member as a field. |
 | `JAITHON_JIT_STATIC_FIELD` | on | Reading a class's `statics` table. |
 | `JAITHON_JIT_SOFT_FIELD` | on | Refuse a field arm softly rather than declining the body. |
+| `JAITHON_JIT_SOFT_ANY_FIELD` | on | Interpret a cold read of a declared-`any` field rather than declining the body. |
 | `JAITHON_JIT_FIELD_DECL_KIND` | on | Trust a field's declared type as its kind. |
 | `JAITHON_JIT_ELEM_DECL` | on | Trust a list's declared element type. |
 | `JAITHON_JIT_LIST_PROBE` | on | Read an element kind off a live list. |
@@ -1129,6 +1130,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_MODULE_FIELD` | `moduleFieldOn` | reading `math.PI` and its kin. |
 | `JAITHON_JIT_FIELD_DECL_KIND` | `jitDeclaredFieldKindEnabled` | `declaredScalarFieldKind`'s `OP_GET_FIELD` arm. |
 | `JAITHON_JIT_SOFT_FIELD` | `jitSoftField` | taking the soft unarmed path for a name that is not a field of the pinned class -- non-OSR only, because inside a loop nothing is cold. |
+| `JAITHON_JIT_SOFT_ANY_FIELD` | `jitSoftAnyField` | the same soft unarmed path for `OP_GET_FIELD_LOCAL` on a field declared `any` (or of no kind `declaredScalarFieldKind` predicts) when the measuring walk had no live receiver to sample -- the read has not run since the body was entered. Non-OSR only, as above. `token.value ?? 0.0` on the parser's float-literal arm was the shape: it declined `_parse_primary`, and with it every rung of the expression ladder, each of which calls the one below first. Off: 145.9M interpreted instructions on `check --no-cache lib/jaithon`; on: 136.8M. tests/lang/test_jit_cold_any_field.jai. |
 | `JAITHON_JIT_RET_LIST` | `retListKindOn` | promoting an observed list return from `SLOT_OBJ` to `SLOT_LIST`. |
 | `JAITHON_JIT_LIST_PROBE` | `listProbeOn` | accepting a predicted-list receiver. |
 | `JAITHON_JIT_RET_OBJTYPE` | `retObjTypeOn` | keeping the callee's observed object type. |

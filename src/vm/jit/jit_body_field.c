@@ -286,6 +286,18 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
             unsigned ltag;
             if (!jitDeclaredFieldKindEnabled() ||
                 !declaredScalarFieldKind(info->typeId, &lkind, &ltag)) {
+                /* Nothing to sample and nothing declared: the measuring
+                 * walk never reached this read with a live receiver, so it
+                 * has not RUN since the body was entered. Interpreted from
+                 * here rather than the whole body declined -- the cold-path
+                 * rule the `not a field` arm above follows, with the same
+                 * `!e->osr` (inside a loop nothing is cold).
+                 *
+                 * `token.value ?? 0.0` on the parser's float-literal path is
+                 * the shape: one cold read of an `any` field kept
+                 * `_parse_primary`, and through it every rung of the
+                 * expression ladder above it, interpreted. */
+                if (!e->osr && jitSoftAnyField()) goto unarmedOpcode;
                 return subWhy(e,
                     "no live receiver to read local %u's field off, and its "
                     "declared kind (%u) is not one this predicts",
