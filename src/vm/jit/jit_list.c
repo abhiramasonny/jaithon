@@ -458,6 +458,32 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
     return true;
 }
 
+/* Whether the instruction at `at` runs on every pass of the loop [top, end)
+ * that comes back to the head: nothing between the head and `at` branches
+ * past it to somewhere still inside the loop, or back to the head (a
+ * `continue`). A branch that leaves the loop is fine -- that pass is never
+ * guarded again. A guard moved to the head from a site that passes this
+ * misses on the first pass exactly when the site's own guard would have; one
+ * moved from a site in a rarely taken arm would send every pass of the loop
+ * to the interpreter for a miss the site might never have seen. */
+static bool runsEveryPass(const Chunk *c, uint32_t top, uint32_t end,
+                          uint32_t at) {
+    if (at < top || at >= end) return false;
+    for (int off = (int)top; off < (int)at;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return false;
+        int rel = jaiOpBranchOperandAt(c->code[off]);
+        if (rel >= 0) {
+            int32_t to = (int32_t)(off + len) +
+                         jaiReadI16(c->code + off + 1 + rel);
+            if (to > (int32_t)at && to < (int32_t)end) return false;
+            if (to == (int32_t)top) return false;
+        }
+        off += len;
+    }
+    return true;
+}
+
 /* The appends in [lt, le) that a header of `slot` hoisted over that loop
  * would have to be proved distinct from, or false when no proof is possible:
  * an append to `slot` itself, to a list with no local behind it, or to a
@@ -775,6 +801,7 @@ static void planClosureHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds,
             if (e->slotWriteHi[s] >= lt && e->slotWriteLo[s] < le) continue;
             if (regionCalls(e, lt, le)) continue;
             if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            if (!runsEveryPass(c, lt, le, at)) continue;
             if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
                 bestTop = lt; bestEnd = le;
             }
@@ -892,6 +919,7 @@ static void planGuardHoists(Emit *e, ObjFunction *fn, uint32_t regionLo,
             if (at < lt || at >= le) continue;
             if (regionRebinds(e, lt, le)) continue;
             if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            if (!runsEveryPass(c, lt, le, at)) continue;
             if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
                 bestTop = lt; bestEnd = le;
             }
@@ -1005,7 +1033,8 @@ bool globalTagProven(const Emit *e, JaiEntry *slot, SlotKind kind) {
  * tag check, and each store its check that the old value was an object (it
  * cannot be) and its tag store (the tag is already the one it would write).
  * Every access of the loop must have been recorded; a spill proves nothing. */
-static void planTagProofs(Emit *e) {
+static void planTagProofs(Emit *e, ObjFunction *fn) {
+    const Chunk *c = &fn->chunk;
     e->tagProofCount = 0;
     if (!jitGlobalTagProof() || e->globalAccSpill) return;
     for (unsigned h = 0; h < e->guardHoistCount; h++) {
@@ -1028,6 +1057,24 @@ static void planTagProofs(Emit *e) {
                 if ((SlotKind)e->globalAcc[j].kind != k) ok = false;
             }
             if (!ok) continue;
+            /* The head's check stands in for a read's only when that read
+             * would have made it on the first pass anyway: one that runs
+             * every pass, with no store of the loop's ahead of it. */
+            bool anchored = false;
+            for (unsigned j = 0; j < e->globalAccCount && !anchored; j++) {
+                uint32_t ro = e->globalAcc[j].off;
+                if (e->globalAcc[j].slot != slot || e->globalAcc[j].write) continue;
+                if (!runsEveryPass(c, lt, le, ro)) continue;
+                bool stored = false;
+                for (unsigned w = 0; w < e->globalAccCount; w++) {
+                    if (e->globalAcc[w].slot == slot && e->globalAcc[w].write &&
+                        e->globalAcc[w].off >= lt && e->globalAcc[w].off < ro) {
+                        stored = true;
+                    }
+                }
+                if (!stored) anchored = true;
+            }
+            if (!anchored) continue;
             if (e->tagProofCount >= JIT_MAX_TAG_PROOF) return;
             e->tagProof[e->tagProofCount].top = lt;
             e->tagProof[e->tagProofCount].end = le;
@@ -1251,7 +1298,7 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     planIterHoists(e, c, regionLo, regionHi);
     planClosureHoists(e, fn, kinds, regionLo, regionHi);
     planGuardHoists(e, fn, regionLo, regionHi);
-    planTagProofs(e);
+    planTagProofs(e, fn);
     if (!lean) return;
     /* Versions, for lists stored into inside their own region. */
     for (unsigned h = 0; h < e->hoistCount; h++) {

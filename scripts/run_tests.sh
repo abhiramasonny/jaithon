@@ -131,6 +131,17 @@ if [[ -x "$ROOT/tests/vm/osr_replace.sh" ]]; then
     done <<< "$replace_output"
 fi
 
+if [[ -x "$ROOT/tests/vm/hoist_rare_site.sh" ]]; then
+    rare_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/hoist_rare_site.sh" 2>&1)"
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)   name="hoist_rare_site: ${line#ok }"
+                      matches_filter "$name" && record_pass "$name" 0 ;;
+            "FAIL "*) record_fail "hoist_rare_site: ${line#FAIL }" "" ;;
+        esac
+    done <<< "$rare_output"
+fi
+
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 
