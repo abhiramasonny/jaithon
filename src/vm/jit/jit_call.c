@@ -67,6 +67,15 @@ static bool simpleInitFields(ObjClass *cls, unsigned argc, uint16_t *slots) {
     return off < n && c[off] == OP_RETURN_NULL;
 }
 
+/* Whether `cls(...)` with `argc` arguments is an allocation and stores into
+ * the new object's own fields, nothing more -- the construction an inlined
+ * body may end with (see inlinableBody). */
+bool jitSimpleInitClass(ObjClass *cls, unsigned argc) {
+    uint16_t slots[JIT_MAX_ARGS_OUT];
+    if (argc > JIT_MAX_ARGS_OUT) return false;
+    return simpleInitFields(cls, argc, slots);
+}
+
 /* JAITHON_JIT_INLINE_ALLOC=0 puts the call to jitInstanceAlloc back in place
  * of the inline page-space pop. */
 static bool jitInlineAllocOn(void) {

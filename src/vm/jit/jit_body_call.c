@@ -548,6 +548,20 @@ bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                   int count) {
     int off = *offp;
     do {
+        if (e->inlining) {
+            unsigned iargc = code[off + 1];
+            /* Inside an inlined body (inlinableBody admitted it as the
+             * closing construction) the result is the INLINE's: it stays on
+             * top, and the OP_RETURN after it ends the inline as any other
+             * does. Not a return, so an OSR loop may hold it. */
+            if (!isClassCallee(e, iargc) || !e->inlShared) {
+                e->whyNot = "an inlined tail call that is not a construction";
+                return false;
+            }
+            if (!emitCallOut(e, iargc)) return false;
+            off += 2;
+            break;
+        }
         /* Same OSR resume-offset hazard as OP_RETURN_NULL -- see there. */
         if (e->osr) {
             e->whyNot = "a return inside an OSR loop";
@@ -556,6 +570,7 @@ bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
         /* `return C(...)` compiles to this. The call is made exactly as
          * OP_CALL makes it and its result is returned. */
         unsigned argc = code[off + 1];
+
         if (isClassCallee(e, argc)) {
             if (!emitCallOut(e, argc)) return false;
         } else if (e->depth >= argc + 1u &&

@@ -33,8 +33,19 @@ static bool jitInlineMethodsOn(void) {
 
 /* Structural check, answered before anything is emitted (a half-inlined body can't be taken back):
  * no branches (no offset map, no join, no fixup naming a callee offset in the caller's table); exactly one RETURN, last; locals only via the four opcodes the inline frame understands, and only slots this callee actually has; globals only for the two builtins the tier emits inline (else a global VALUE load would bake a JaiEntry from the callee's own table, needing its own guard); nothing that stores (a guard inside re-executes the WHOLE call, so an earlier store would run twice). What's left is straight-line register arithmetic -- the main walker already speaks it, so no second emitter is needed. `evalA` in spectral is fifteen instructions of exactly this shape. */
+/* JAITHON_JIT_INLINE_CONSTRUCT: see inlinableBody's OP_TAIL_CALL. */
+static bool jitInlineConstructOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_INLINE_CONSTRUCT");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 static bool inlinableBody(ObjClosure *callee, unsigned argc,
-                          unsigned *maxSlotOut, bool *readsUpvalueOut) {
+                          unsigned *maxSlotOut, bool *readsUpvalueOut,
+                          bool *constructsOut) {
     ObjFunction *cfn = callee->fn;
     const Chunk *c = &cfn->chunk;
     if (cfn->arity != argc || cfn->defaultCount != 0) return false;
@@ -44,6 +55,8 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
     unsigned maxSlot = argc;
     bool sawReturn = false;
     bool readsUpvalue = false;
+    ObjClass *ctor = NULL;      /* a class this body constructs, last */
+    bool constructs = false;
     for (int off = 0; off < c->count;) {
         uint8_t op = c->code[off];
         int len = instructionLength(c, off);
@@ -95,7 +108,23 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
         case OP_GET_GLOBAL: {
             uint32_t nameIdx = jaiReadU24(c->code + off + 1);
             Value nv;
-            if (globalNative(callee, nameIdx, &nv) == NULL) return false;
+            ObjClass *gc = NULL;
+            if (globalNative(callee, nameIdx, &nv) == NULL &&
+                (gc = globalClass(callee, nameIdx)) != NULL) {
+                /* A class, resolved at compile time and pinned by the
+                 * caller's module-version check (the callee's module is the
+                 * caller's). Admitted only as the callee of the closing
+                 * construction -- see OP_TAIL_CALL. */
+                if (!jitInlineMethodsOn() || !jitInlineConstructOn()) {
+                    return false;
+                }
+                if (ctor != NULL) return false;
+                ctor = gc;
+                break;
+            }
+            if (gc == NULL && globalNative(callee, nameIdx, &nv) == NULL) {
+                return false;
+            }
             ObjNative *nat = AS_NATIVE(nv);
             const char *nm = nat->name != NULL ? nat->name->chars : "";
             if (strcmp(nm, "float") != 0 && strcmp(nm, "int") != 0) return false;
@@ -103,8 +132,27 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
         }
         case OP_CALL:
             /* The only callee that can be on the stack here is one of the two
-             * builtins above, and the tier emits those as one instruction. */
-            if (c->code[off + 1] != 1) return false;
+             * builtins above, and the tier emits those as one instruction --
+             * unless a class was read, which only a tail call may consume. */
+            if (c->code[off + 1] != 1 || ctor != NULL) return false;
+            break;
+        /* `return C(a, b)` closing the body: an allocation, and stores into
+         * the object just allocated, of a class whose init does nothing else
+         * (jitSimpleInitClass). Those stores are the one exception to the no
+         * stores rule, and they are safe for the reason the rule exists: a
+         * guard that deoptimises to the call re-runs the whole call, and the
+         * only thing the first run left behind is an object nothing refers
+         * to. Nothing follows it but the OP_RETURN, so no guard comes after
+         * the allocation anyway. The allocator's slow path is a real call,
+         * which is why such a body shares the caller's bank (Emit::inlShared). */
+        case OP_TAIL_CALL:
+            if (ctor == NULL || constructs) return false;
+            if (!jitSimpleInitClass(ctor, c->code[off + 1])) return false;
+            if (off + len >= c->count || c->code[off + len] != OP_RETURN ||
+                off + len + 1 != c->count) {
+                return false;
+            }
+            constructs = true;
             break;
         /* `x % k` with a small literal k, fused: it pops and pushes the top
          * entry and names no local, so it reads the inlined body's own
@@ -150,8 +198,10 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
     }
     if (!sawReturn) return false;
     if (maxSlot > JIT_MAX_SLOTS) return false;
+    if (ctor != NULL && !constructs) return false;
     *maxSlotOut = maxSlot;
     *readsUpvalueOut = readsUpvalue;
+    *constructsOut = constructs;
     return true;
 }
 
@@ -295,7 +345,13 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
     unsigned cidx = e->depth - argc - 1;
     unsigned maxSlot = 0;
     bool readsUpvalue = false;
-    if (!inlinableBody(callee, argc, &maxSlot, &readsUpvalue)) return false;
+    bool constructs = false;
+    if (!inlinableBody(callee, argc, &maxSlot, &readsUpvalue, &constructs)) {
+        return false;
+    }
+    /* A body that calls out cannot live in x0..x8, and a caller whose own
+     * values are there (scratchValues) has no other bank to give it. */
+    if (constructs && e->scratchValues) return false;
     if (readsUpvalue && calleeReg < 0) return false;
     if (getenv("JAI_JIT_WHY")) {
         fprintf(stderr, "[jit] inlining %s\n",
@@ -333,6 +389,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
      * Anything inside that really does call still reaches noteScratchClobber
      * on its own, and under scratchValues that declines the compile. */
     e->inlining     = true;
+    e->inlShared    = constructs;
     e->inlDepth     = cidx + 1u + argc;
     e->inlPinned    = 0;
     e->inlValueBase = e->valueDepth;
@@ -368,6 +425,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
          * whole compile is retried with inlining off, which is the same answer
          * the register budget already gets. */
         e->inlining = false;
+        e->inlShared = false;
         memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
         gInlineFailed = true;
         e->failed = true;
@@ -404,6 +462,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
         }
     }
     e->inlining = false;
+    e->inlShared = false;
     memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
 
     if (!pushValue(e, kres, rshape, rcls)) { e->failed = true; return false; }

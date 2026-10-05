@@ -973,7 +973,7 @@ void noteScratchClobber(Emit *e) {
  * on -- so the inlined entries simply continue the caller's numbering, which
  * `scratchValues` has already proved fits (probe.maxValueAll <= the bank). */
 static bool inlineOwnBank(const Emit *e) {
-    return e->inlining && !e->scratchValues;
+    return e->inlining && !e->scratchValues && !e->inlShared;
 }
 
 /* Where entry `idx` of the ordinary (non-inlined) operand stack lives. One run
@@ -1380,7 +1380,7 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     /* An inlined body's entries are not in the caller's bank, so they do not
      * widen its save set -- which is the whole reason they fit. */
     if (e->valueDepth > e->maxValue &&
-        !(e->inlining && e->valueDepth > e->inlValueBase)) {
+        !(e->inlining && !e->inlShared && e->valueDepth > e->inlValueBase)) {
         e->maxValue = e->valueDepth;
     }
     /* The same number counted the other way: how wide the stack gets when the

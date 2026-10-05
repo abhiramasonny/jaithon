@@ -726,6 +726,11 @@ typedef struct {
      * before it is an early-return arm already compiled ahead of the frame
      * (emitEarlyReturnArm), whose test the entry has therefore passed. */
     uint32_t  walkFrom;
+    /* The body being inlined ends by constructing an instance, which calls
+     * out to allocate: its entries continue the caller's callee-saved bank
+     * (and count towards its save set) instead of taking x0..x8, which the
+     * allocator's slow path destroys. See inlinableBody. */
+    bool      inlShared;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -1305,6 +1310,7 @@ int pushHoistFor(const Emit *e, int slot);
 int iterHoistAt(const Emit *e, uint32_t top);
 int closHoistFor(const Emit *e, int slot, uint32_t at, const ObjFunction *fn);
 bool jitInlineBorrow(void);
+bool jitSimpleInitClass(ObjClass *cls, unsigned argc);
 bool closUpHoisted(const Emit *e, ObjClosure *closure, unsigned index);
 void noteClosureSite(Emit *e, int slot, uint32_t off, ObjClosure *sample);
 int hoistForStr(const Emit *e, int slot);
