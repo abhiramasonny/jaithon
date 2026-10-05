@@ -442,14 +442,27 @@ pub fn _parse_primary(p: Parser) -> Node {
         let anonymous = parse_fn_rest(p, Visibility.Private, false, start_index, false, false)
         return anonymous ?? p._error_expr(p._span_of(token))
     }
-    if kind == TokenKind.KwYield {
-        p._advance()
-        p.yield_count += 1
-        let operand = p._starts_expression() ? parse_expression(p) : null
-        return _node(NodeKind.Yield, p._span_since(start_index), {"operand": operand})
-    }
+    if kind == TokenKind.KwYield { return _parse_yield(p, start_index) }
     if kind == TokenKind.Ident { return _parse_ident_primary(p, token, start_index) }
+    return _expected_expression(p, token)
+}
 
+# The `yield` operand and the not-an-expression error are their own functions,
+# not arms of `_parse_primary`, because neither runs in a clean parse of most
+# files: each makes a method call the compiled tier has never seen return, and
+# one such call refused the WHOLE dispatch -- and with it every rung of the
+# ladder above, each of which calls the one below first. A call to a global
+# function the tier has not compiled is a cold exit it already knows how to
+# take.
+pub fn _parse_yield(p: Parser, start_index: int) -> Node {
+    p._advance()
+    p.yield_count += 1
+    let operand = p._starts_expression() ? parse_expression(p) : null
+    return _node(NodeKind.Yield, p._span_since(start_index), {"operand": operand})
+}
+
+pub fn _expected_expression(p: Parser, token: Token) -> Node {
+    let kind = token.kind
     let diag = p._error_at(
         p._span_of(token),
         Code.E0102_EXPECTED_EXPRESSION,
@@ -477,10 +490,17 @@ pub fn _parse_ident_primary(p: Parser, token: Token, start_index: int) -> Node {
         p._advance()
         return _parse_primary(p)
     }
-    if token.word == "await" and _starts_await_operand(p._kind_at(1)) {
-        p._advance()
-        let operand = parse_unary(p)
-        return _wrap(NodeKind.Await, p._span_since(start_index), operand)
+    # Nested rather than `and`-chained: the call is to a function the
+    # compiled tier has usually not compiled, and inside an `and` the walk
+    # cannot step over it -- the chain's jump lands with the operand still
+    # owed -- so it refused this whole function, which every identifier in an
+    # expression goes through.
+    if token.word == "await" {
+        if _starts_await_operand(p._kind_at(1)) {
+            p._advance()
+            let operand = parse_unary(p)
+            return _wrap(NodeKind.Await, p._span_since(start_index), operand)
+        }
     }
     p._advance()
     return _ident(p._span_of(token), token.word)

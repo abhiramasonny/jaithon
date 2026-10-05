@@ -205,13 +205,20 @@ pub fn _parse_bit_xor(p: Parser) -> Node {
         let op_span = p._cur_span()
         p._advance()
         let right = _parse_bit_and(p)
-        if not p.trial_active and _is_numeric_literal(left) and _is_numeric_literal(right) {
-            p.diagnostics.warn(
-                Code.W0105_DEPRECATED,
-                op_span,
-                "`^` is bitwise xor in Jaithon 3, not exponentiation",
-                note: "the power operator is `**`"
-            )
+        # Nested rather than `and`-chained, as `_parse_ident_primary` explains:
+        # a call to a function the compiled tier has not compiled cannot be
+        # stepped over inside an `and`.
+        if not p.trial_active {
+            if _is_numeric_literal(left) {
+                if _is_numeric_literal(right) {
+                    p.diagnostics.warn(
+                        Code.W0105_DEPRECATED,
+                        op_span,
+                        "`^` is bitwise xor in Jaithon 3, not exponentiation",
+                        note: "the power operator is `**`"
+                    )
+                }
+            }
         }
         left = _binary(NodeKind.Binary, OpKind.Bxor, left, right)
         if p.panic_mode { break }
