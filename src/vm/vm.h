@@ -267,6 +267,14 @@ bool jaiCallPreparedFn1(JaiPreparedFn1 *prepared, Value arg, Value *out);
 #define JAI_LIST_SHAPE_AT 8
 bool jaiListShapeOnGrow(ObjList *list, Value v);
 bool jaiListShapeGrownOn(void);
+/* The same shaping, asked for up front by a builder that knows the kind of
+ * everything it is about to write (a map run whose callee returns an int, a
+ * float or a bool): an untyped boxed list whose elements so far are all of
+ * that kind takes the unboxed storage `stg` now, keeping its capacity. The
+ * point is the reservation: a presized boxed array is twice the pages an
+ * unboxed one is, and every one of them is faulted in by the fill. True when
+ * the list is (now) in `stg`. JAITHON_MAP_UNBOXED=0 turns it off. */
+bool jaiListShapeFor(ObjList *list, uint8_t stg);
 
 /* A run of jaiCallPreparedFn1 over `src` from element `from`, appending each
  * result to `dst` -- for a flat callee that takes an int or a float and

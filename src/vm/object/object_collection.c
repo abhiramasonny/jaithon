@@ -279,6 +279,48 @@ bool jaiListShapeOnGrow(ObjList *list, Value v) {
     return true;
 }
 
+static bool shapeForOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *s = getenv("JAITHON_MAP_UNBOXED");
+        on = (s != NULL && s[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+bool jaiListShapeFor(ObjList *list, uint8_t stg) {
+    if (list->stg == stg) return true;
+    if (list->stg != LIST_STORE_BOXED || stg == LIST_STORE_BOXED ||
+        list->elemKind != FIELD_KIND_ANY) {
+        return false;
+    }
+    if (!shapeForOn() || !shapeAtGrowthOn() || !unboxEnabled()) return false;
+    const Value *old = (const Value *)list->items;
+    const int n = list->count;
+    for (int i = 0; i < n; i++) {
+        bool fits = stg == LIST_STORE_I64   ? IS_INT(old[i])
+                  : stg == LIST_STORE_F64   ? IS_FLOAT(old[i])
+                                            : IS_BOOL(old[i]);
+        if (!fits) return false;
+    }
+    const int cap = list->capacity;
+    char *fresh = NULL;
+    if (cap > 0) {
+        jaiGCPushRoot(OBJ_VAL(list));
+        fresh = JAI_GROW_ARRAY(char, NULL, 0,
+                               (size_t)cap * jaiListStoreWidth(stg));
+        jaiGCPopRoot();
+    }
+    /* Re-read: nothing moves the array, but the collection the allocation
+     * may have run marked through it, and this is the list's own pointer. */
+    old = (const Value *)list->items;
+    list->items = fresh;
+    list->stg = stg;
+    for (int i = 0; i < n; i++) jaiListSetRaw(list, i, old[i]);
+    if (cap > 0) JAI_FREE_ARRAY(Value, (Value *)old, cap);
+    return true;
+}
+
 void jaiListPush(ObjList *list, Value v) {
     /* The guard belongs HERE, not in the `list.push` builtin: a typed receiver
      * and an `any` one reach the list through different entry points, and
