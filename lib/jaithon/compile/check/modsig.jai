@@ -88,10 +88,10 @@ pub class ModuleSig {
     #: `imports` are then exact -- and the first `SigLoader.load` of it.
     pub var parsed: bool
 
-    #: Until `parsed`: the source's bytes, and the byte ranges of the bodies
-    #: a kept signature says to blank.
+    #: Until `parsed`: the source's bytes, and the kept signature's lines
+    #: naming the bodies to blank -- read only if something asks for more.
     var _raw: any
-    var _ranges: list[tuple[int, int]]
+    var _ranges: any
 
     pub fn init(self, path: str, dotted: str, file_id: int) {
         self.path = path
@@ -105,7 +105,7 @@ pub class ModuleSig {
         self.wildcards = []
         self.parsed = true
         self._raw = null
-        self._ranges = []
+        self._ranges = null
     }
 
     #: Fill in everything from `raw`, the module's bytes, and `text`, them
@@ -120,13 +120,9 @@ pub class ModuleSig {
 
     #: Take `path` and `imports` from a kept signature and defer the rest
     #: until `ensure_parsed`. `edges` holds `(start, end, dotted)` per import;
-    #: `ranges` the bodies to blank before parsing.
-    pub fn defer_parse(
-        self,
-        raw: any,
-        edges: list[tuple[int, int, str]],
-        ranges: list[tuple[int, int]]
-    ) {
+    #: `ranges` is the kept signature's `start end` lines for the bodies to
+    #: blank, as bytes.
+    pub fn defer_parse(self, raw: any, edges: list[tuple[int, int, str]], ranges: any) {
         for (start, end, dotted) in edges {
             self.imports.push(SigImport(dotted, Span(self.file_id, start, end)))
         }
@@ -140,14 +136,15 @@ pub class ModuleSig {
     pub fn ensure_parsed(self) -> void {
         if self.parsed { return }
         let raw = self._raw
-        let ranges = self._ranges
+        let lines = self._ranges
         self._raw = null
-        self._ranges = []
+        self._ranges = null
         self.parsed = true
         while self.imports.len() > 0 { let _dropped = self.imports.pop() }
 
         var program: Node? = null
-        let blanked = _blank(raw, ranges)
+        let ranges = _read_ranges(lines)
+        let blanked = if ranges is null { null } else { _blank(raw, ranges) }
         if blanked is not null { program = parse(blanked, self.file_id) }
         if program is not null and program.kind == NodeKind.Program {
             self._fill(program)
@@ -778,7 +775,7 @@ let _SIG_CACHE: bool =
 
 #: Bump when what a kept text means changes: which bodies are blanked, or the
 #: parser's idea of where a body ends.
-const _SIG_CACHE_VERSION: int = 1
+const _SIG_CACHE_VERSION: int = 2
 
 const _SIG_CACHE_DIR: str = "__jaicache__"
 const _SIG_CACHE_EXT: str = ".jsig"
@@ -831,10 +828,11 @@ fn _kept_path(path: str) -> str {
 class _Kept {
     #: `(start, end, dotted)` for each import, in source order.
     pub let edges: list[tuple[int, int, str]]
-    #: `(start, end)` of each body to blank, in source order.
-    pub let ranges: list[tuple[int, int]]
+    #: The `start end` lines of the bodies to blank, as bytes: the import walk
+    #: never needs them, so they are not split until a parse does.
+    pub let ranges: any
 
-    pub fn init(self, edges: list[tuple[int, int, str]], ranges: list[tuple[int, int]]) {
+    pub fn init(self, edges: list[tuple[int, int, str]], ranges: any) {
         self.edges = edges
         self.ranges = ranges
     }
@@ -842,9 +840,10 @@ class _Kept {
 
 #: The kept signature for `raw`, the bytes just read from `path`, or null.
 #:
-#: The file is one line `jsig VERSION BUILD FRONT_END LENGTH META_LENGTH META_CRC`, then
-#: META_LENGTH bytes of `E start end dotted` and `B start end` lines, then the
-#: LENGTH bytes of source it was made from.
+#: The file is one line `jsig VERSION BUILD FRONT_END LENGTH EDGES RANGES CRC`,
+#: then EDGES bytes of `start end dotted` lines, one per import, then RANGES
+#: bytes of `start end` lines, one per body to blank, then the LENGTH bytes of
+#: source it was made from. CRC covers the two sets of lines.
 fn _read_kept(path: str, raw: any) -> _Kept? {
     let kept = _read_bytes(_kept_path(path))
     if kept is null { return null }
@@ -854,37 +853,53 @@ fn _read_kept(path: str, raw: any) -> _Kept? {
         let header = _decode(__prim__.bytes_slice(kept, 0, newline))
         if header is null { return null }
         let fields = header.split(" ")
-        if fields.len() != 7 or fields[0] != "jsig" { return null }
+        if fields.len() != 8 or fields[0] != "jsig" { return null }
         if int(fields[1]) != _SIG_CACHE_VERSION { return null }
         if int(fields[2]) != __prim__.jaic_build_id() { return null }
         if fields[3] != _front_end() { return null }
         let length = __prim__.bytes_len(raw)
         if int(fields[4]) != length { return null }
-        let meta_length = int(fields[5])
-        let meta_start = newline + 1
-        let source_start = meta_start + meta_length
-        if meta_length < 0 or __prim__.bytes_len(kept) != source_start + length { return null }
+        let edges_length = int(fields[5])
+        let ranges_length = int(fields[6])
+        let edges_start = newline + 1
+        let ranges_start = edges_start + edges_length
+        let source_start = ranges_start + ranges_length
+        if edges_length < 0 or ranges_length < 0 { return null }
+        if __prim__.bytes_len(kept) != source_start + length { return null }
         let copy = __prim__.bytes_slice(kept, source_start, source_start + length)
         if __prim__.bytes_cmp(copy, raw) != 0 { return null }
-        let meta = __prim__.bytes_slice(kept, meta_start, source_start)
-        if __prim__.crc32(meta) != int(fields[6]) { return null }
-        let lines = _decode(meta)
-        if lines is null { return null }
+        let meta = __prim__.bytes_slice(kept, edges_start, source_start)
+        if __prim__.crc32(meta) != int(fields[7]) { return null }
 
+        let lines = _decode(__prim__.bytes_slice(kept, edges_start, ranges_start))
+        if lines is null { return null }
         var edges: list[tuple[int, int, str]] = []
-        var ranges: list[tuple[int, int]] = []
         for line in lines.split("\n") {
             if line == "" { continue }
             let parts = line.split(" ")
-            if parts[0] == "E" and parts.len() == 4 {
-                edges.push((int(parts[1]), int(parts[2]), parts[3]))
-            } elif parts[0] == "B" and parts.len() == 3 {
-                ranges.push((int(parts[1]), int(parts[2])))
-            } else {
-                return null
-            }
+            if parts.len() != 3 { return null }
+            edges.push((int(parts[0]), int(parts[1]), parts[2]))
         }
-        return _Kept(edges, ranges)
+        return _Kept(edges, __prim__.bytes_slice(kept, ranges_start, source_start))
+    } catch _damaged: Error {
+        return null
+    }
+}
+
+#: The `(start, end)` pairs of a kept signature's range lines, or null when
+#: they do not read as such.
+fn _read_ranges(lines: any) -> list[tuple[int, int]]? {
+    try {
+        let text = _decode(lines)
+        if text is null { return null }
+        var ranges: list[tuple[int, int]] = []
+        for line in text.split("\n") {
+            if line == "" { continue }
+            let parts = line.split(" ")
+            if parts.len() != 2 { return null }
+            ranges.push((int(parts[0]), int(parts[1])))
+        }
+        return ranges
     } catch _damaged: Error {
         return null
     }
@@ -900,30 +915,33 @@ fn _keep_signature(path: str, raw: any, program: Node) -> void {
     let temporary = f"{target}.{__prim__.time_mono()}.tmp"
     try {
         let stmts = program.child_list("stmts")
-        var lines: list[str] = []
+        var edge_lines: list[str] = []
         for node in stmts {
             if node.kind != NodeKind.Import and node.kind != NodeKind.FromImport { continue }
             let dotted = node.opt_text("path")
             if dotted is null { continue }
             if dotted == "" or dotted.contains(" ") or dotted.contains("\n") { return }
-            lines.push(f"E {node.span.start} {node.span.end} {dotted}\n")
+            edge_lines.push(f"{node.span.start} {node.span.end} {dotted}\n")
         }
         let ranges = _body_ranges(stmts)
         if not _ranges_fit(raw, ranges) { return }
-        for (start, end) in ranges { lines.push(f"B {start} {end}\n") }
-        let meta = __prim__.str_encode("".join(lines))
+        var range_lines: list[str] = []
+        for (start, end) in ranges { range_lines.push(f"{start} {end}\n") }
+        let edges = __prim__.str_encode("".join(edge_lines))
+        let blanks = __prim__.str_encode("".join(range_lines))
 
         let dir = _dirname(target)
         if not _is_dir(dir) { __prim__.io_mkdir(dir) }
         let handle = __prim__.io_open(temporary, "wb")
         let length = __prim__.bytes_len(raw)
         let build = __prim__.jaic_build_id()
-        let meta_length = __prim__.bytes_len(meta)
         let front = _front_end()
-        let crc = __prim__.crc32(meta)
-        let header = f"jsig {_SIG_CACHE_VERSION} {build} {front} {length} {meta_length} {crc}\n"
+        let sizes = f"{__prim__.bytes_len(edges)} {__prim__.bytes_len(blanks)}"
+        let crc = __prim__.crc32(__prim__.bytes_concat(edges, blanks))
+        let header = f"jsig {_SIG_CACHE_VERSION} {build} {front} {length} {sizes} {crc}\n"
         __prim__.io_write(handle, header)
-        __prim__.io_write(handle, meta)
+        __prim__.io_write(handle, edges)
+        __prim__.io_write(handle, blanks)
         __prim__.io_write(handle, raw)
         __prim__.io_close(handle)
         __prim__.io_rename(temporary, target)
