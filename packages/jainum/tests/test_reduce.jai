@@ -581,12 +581,12 @@ fn test_a_scan_with_no_axis_runs_down_the_flattening() -> void {
     assert_eq(cumsum(window, 0).to_list(), [6.0, 7.0, 16.0, 18.0], "a scan reads the view")
 }
 
-#: Folding down the columns of a wide dense matrix runs four columns a thread
-#: and joins the row chunks in a narrowed finish. Each column is checked on
-#: its own against the host, for folds whose accumulators differ: a sum, a
-#: max and a centred variance, whose centre is per column. Small whole
-#: numbers keep every sum exact, and the second matrix starts a row in so the
-#: four-wide loads see an offset.
+#: Folding down the columns of a wide dense matrix runs one lane a column and
+#: joins the row chunks in a narrowed finish. Each column is checked on its
+#: own against the host, for folds whose accumulators differ: a sum, a max and
+#: a centred variance, whose centre is per column. Small whole numbers keep
+#: every sum exact, and the second matrix starts a row in so the walk sees an
+#: offset.
 fn test_a_fold_down_wide_columns_is_each_columns_fold() -> void {
     if not have_gpu() { return }
     let rows = 900
