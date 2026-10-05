@@ -714,6 +714,10 @@ let _SHUFFLE_TREE = env_or("JAINUM_SHUFFLE_TREE", "1") != "0"
 #: The longest dense row `nr_scan_rows` stages in threadgroup memory.
 const _SCAN_ROW_MAX = 4096
 
+#: The shortest run a thread of `nr_scan_rows` must own before staging a row
+#: beats the chunk kernel.
+const _SCAN_TILE_RUN = 6
+
 #: `JAINUM_ROW_SCAN=0` keeps a dense last-axis scan on the strided chunk
 #: kernel, for an A/B. The answers are the same to the bit. Read once.
 let _ROW_SCAN = env_or("JAINUM_ROW_SCAN", "1") != "0"
@@ -1481,9 +1485,14 @@ fn _scan(a: NDArray, axis: any, dtype: int, op: int, what: str) -> NDArray {
         chunks = (n + per - 1) // per
     }
     let dense_rows = at == source.ndim() - 1 and source.is_contiguous()
-    if _ROW_SCAN and chunks == 1 and n <= _SCAN_ROW_MAX and dense_rows {
-        let each = (n + GROUP - 1) // GROUP
-        let held = n % 4 == 0 and source.offset % 4 == 0 and (each == 4 or each == 8 or each == 16)
+    let each = (n + GROUP - 1) // GROUP
+    let held = n % 4 == 0 and source.offset % 4 == 0 and (each == 4 or each == 8 or each == 16)
+    #: The staged tile pays a pass through threadgroup memory both ways, and
+    #: with runs of five slots or fewer that costs more than the chunk kernel's
+    #: strided walk: 8000 rows of 257 to 1100 ran 1.2-2.3x slower on it. From
+    #: runs of six it wins, 1.16x at 1500 and 2.8x at 4095.
+    let staged = each >= _SCAN_TILE_RUN
+    if _ROW_SCAN and chunks == 1 and n <= _SCAN_ROW_MAX and dense_rows and (held or staged) {
         let entry = if held { f"nr_scan_held{each}" } else { "nr_scan_rows" }
         kernel_of(SOURCE, entry).dispatch_async(
             [out.storage, source.storage],

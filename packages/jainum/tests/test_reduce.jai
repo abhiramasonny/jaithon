@@ -658,13 +658,14 @@ fn test_a_fold_with_more_chunks_than_lanes_still_finishes() -> void {
 }
 
 #: Enough rows that each is one group, which is where a dense last axis is
-#: staged in threadgroup memory: widths that do not fill the 256 threads
-#: evenly, one past a multiple of them, and a view that starts a row in, so
-#: the staging has to honour the source offset. Small whole numbers keep the
+#: held in registers or staged in threadgroup memory: short widths left to the
+#: chunk kernel, held widths, staged widths that do not fill the 256 threads
+#: evenly, and a view that starts a row in, so both have to honour the source
+#: offset. Small whole numbers keep the
 #: running sums exact, so the host's left-to-right answer is the device's.
 fn test_a_scan_of_many_dense_rows_is_each_rows_running_fold() -> void {
     if not have_gpu() { return }
-    for width in [17, 257, 1000, 2000, 4096] {
+    for width in [17, 257, 1000, 1500, 2000, 3001, 4096] {
         let rows = 1100
         var values = [0.0 for _at in 0..(rows + 1) * width]
         for at in 0..values.len() { values[at] = float(at * 7 % 11) - 5.0 }
