@@ -722,6 +722,26 @@ int main(void) {
                              jaiA64CcmpX(1, 2, 0, JAI_A64_EQ),
                              jaiA64CsetX(0, JAI_A64_EQ), jaiA64Ret() };
       check("ccmp one differs", runWith(w, 9, cell), 0); }
+    /* crc32cx against the compiler's own, from wzr and chained */
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x1234, 0),
+                             jaiA64MovkX(1, 0xabcd, 2),
+                             jaiA64Crc32cX(0, 31, 1), jaiA64Ret() };
+      check("crc32cx wzr", runWith(w, 4, cell),
+            __builtin_arm_crc32cd(0, 0xabcd00001234ull)); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x77, 0), jaiA64MovzX(2, 0x99, 1),
+                             jaiA64Crc32cX(3, 31, 1), jaiA64Crc32cX(0, 3, 2),
+                             jaiA64Ret() };
+      check("crc32cx chained", runWith(w, 5, cell),
+            __builtin_arm_crc32cd(__builtin_arm_crc32cd(0, 0x77), 0x990000)); }
+    /* cbz taken on zero, not on anything else */
+    { const uint32_t w[] = { jaiA64MovzX(1, 0, 0), jaiA64MovzX(0, 5, 0),
+                             jaiA64CbzX(1, 2), jaiA64MovzX(0, 6, 0),
+                             jaiA64Ret() };
+      check("cbz taken", runWith(w, 5, cell), 5); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 3, 0), jaiA64MovzX(0, 5, 0),
+                             jaiA64CbzX(1, 2), jaiA64MovzX(0, 6, 0),
+                             jaiA64Ret() };
+      check("cbz not taken", runWith(w, 5, cell), 6); }
     { const uint32_t w[] = { jaiA64LdrByte(0, 0, 1), jaiA64Ret() };
       check("ldrb offset", runWith(w, 2, cell), (cell[0] >> 8) & 0xffu); }
     { /* Write one byte at offset 3 and read it back: the store must touch that

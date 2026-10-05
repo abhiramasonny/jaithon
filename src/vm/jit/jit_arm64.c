@@ -392,6 +392,17 @@ uint32_t jaiA64EorXLsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
     return 0xca400000u | (rm << 16) | ((shift & 63u) << 10) | (rn << 5) | rd;
 }
 
+/* CRC32CX Wd, Wn, Xm: data-processing (2 source), sf=1, opcode 010111. */
+uint32_t jaiA64Crc32cX(unsigned rd, unsigned rn, unsigned rm) {
+    return 0x9ac05c00u | (rm << 16) | (rn << 5) | rd;
+}
+
+/* cbz Xt, <label> */
+uint32_t jaiA64CbzX(unsigned rt, int32_t instructions) {
+    uint32_t imm19 = (uint32_t)(instructions & 0x7ffff);
+    return 0xb4000000u | (imm19 << 5) | rt;
+}
+
 /* CCMP (register), 64-bit: sf=1 op=1 S=1. */
 uint32_t jaiA64CcmpX(unsigned rn, unsigned rm, unsigned nzcv, unsigned cond) {
     return 0xfa400000u | (rm << 16) | ((cond & 0xfu) << 12) | (rn << 5) |
