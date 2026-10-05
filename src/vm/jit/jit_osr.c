@@ -920,6 +920,11 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                     "%u..%u at the head\n", top, e.guardHoist[i].top,
                     e.guardHoist[i].end);
         }
+        for (unsigned i = 0; i < e.tagProofCount; i++) {
+            fprintf(stderr, "[jit] osr at %u proves a global's tag over %u..%u%s\n",
+                    top, e.tagProof[i].top, e.tagProof[i].end,
+                    e.tagProof[i].reg ? " and keeps it in a register" : "");
+        }
         for (unsigned i = 0; i < e.pushHoistCount; i++) {
             fprintf(stderr, "[jit] osr at %u keeps slot %u's push count over "
                     "%u..%u in x%u\n", top, e.pushHoist[i].slot,

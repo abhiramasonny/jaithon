@@ -549,6 +549,12 @@ typedef struct {
         uint32_t  top, end;
         JaiEntry *slot;
         uint8_t   kind;
+        /* JAITHON_JIT_GLOBAL_PROMOTE: over a loop that calls nothing, the
+         * global's value also lives in this hoist register (0: it does not).
+         * Loaded at the head, read as a borrow, and written THROUGH: every
+         * store still goes to the entry, so a deopt or an exit finds memory
+         * current and nothing is ever written back. */
+        uint8_t   reg;
     } tagProof[JIT_MAX_TAG_PROOF];
     unsigned  tagProofCount;
     /* Every list append the body makes, when the grow stub keeps the
@@ -1334,6 +1340,7 @@ int closHoistFor(const Emit *e, int slot, uint32_t at, const ObjFunction *fn);
 bool jitInlineBorrow(void);
 void noteGlobalAccess(Emit *e, JaiEntry *slot, SlotKind kind, bool write);
 bool globalTagProven(const Emit *e, JaiEntry *slot, SlotKind kind);
+int globalPromotedReg(const Emit *e, JaiEntry *slot, SlotKind kind);
 bool jitSimpleInitClass(ObjClass *cls, unsigned argc);
 bool closUpHoisted(const Emit *e, ObjClosure *closure, unsigned index);
 void noteClosureSite(Emit *e, int slot, uint32_t off, ObjClosure *sample);

@@ -915,6 +915,30 @@ static void planGuardHoists(Emit *e, ObjFunction *fn, uint32_t regionLo,
     }
 }
 
+/* JAITHON_JIT_GLOBAL_PROMOTE: see Emit::tagProof's reg. Default on. */
+static bool jitGlobalPromote(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_GLOBAL_PROMOTE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The hoist register a proved global's value lives in at this access, or
+ * -1. */
+int globalPromotedReg(const Emit *e, JaiEntry *slot, SlotKind kind) {
+    if (e->measuring) return -1;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    for (unsigned i = 0; i < e->tagProofCount; i++) {
+        if (e->tagProof[i].slot != slot) continue;
+        if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+        if ((SlotKind)e->tagProof[i].kind != kind) return -1;
+        return e->tagProof[i].reg != 0 ? (int)e->tagProof[i].reg : -1;
+    }
+    return -1;
+}
+
 /* JAITHON_JIT_GLOBAL_TAG_PROOF: see Emit::tagProof. Default on. */
 static bool jitGlobalTagProof(void) {
     static int cached = -1;
@@ -988,6 +1012,18 @@ static void planTagProofs(Emit *e) {
             e->tagProof[e->tagProofCount].end = le;
             e->tagProof[e->tagProofCount].slot = slot;
             e->tagProof[e->tagProofCount].kind = (uint8_t)k;
+            e->tagProof[e->tagProofCount].reg = 0;
+            /* A module-scope loop's counters and accumulators are carried
+             * from one iteration to the next THROUGH their entries, so each
+             * one is a store and a load on the loop's critical path. In a
+             * loop with no call at all the value can sit in a hoist register
+             * instead; the store stays, off the chain. */
+            if (jitGlobalPromote() && !regionCalls(e, lt, le) &&
+                e->hoistPoolCount - e->hoistTaken >= 1u) {
+                unsigned r = e->hoistPool[e->hoistTaken++];
+                if (r < e->scratchRoom) e->scratchRoom = r;
+                e->tagProof[e->tagProofCount].reg = (uint8_t)r;
+            }
             e->tagProofCount++;
         }
     }
@@ -1329,6 +1365,16 @@ void emitHoistsAt(Emit *e, uint32_t off) {
                                (unsigned)offsetof(JaiEntry, value)));
             emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
             branchOnDeoptAt(e, JAI_A64_NE, off, false);
+            unsigned pr = e->tagProof[t].reg;
+            if (pr != 0) {
+                if (tk == SLOT_BOOL) {
+                    emit(e, jaiA64LdrByte(pr, JIT_SCRATCH_D,
+                                          (unsigned)offsetof(JaiEntry, value) + 8u));
+                } else {
+                    emit(e, jaiA64LdrX(pr, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(JaiEntry, value) + 8u));
+                }
+            }
         }
     }
     for (unsigned i = 0; i < e->closHoistCount; i++) {

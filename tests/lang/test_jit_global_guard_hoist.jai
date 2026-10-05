@@ -97,3 +97,46 @@ fn test_a_global_that_changes_kind_between_entries() -> void {
     g_any = 10
     assert_eq(sum_any(3000), 3010)
 }
+
+#: A module-scope loop that calls nothing: its globals live in registers for
+#: the loop (JAITHON_JIT_GLOBAL_PROMOTE), written through to their entries.
+var g_acc = 0
+var g_k = 0
+while g_k < 300000 {
+    g_acc = (g_acc + g_k * 3) % 1000003
+    g_k += 1
+}
+
+var g_big = 0
+
+#: Overflows on the 64th step: the raise must leave the entry holding the
+#: last value stored, which only writing through guarantees.
+fn grow_big(n: int) -> int {
+    var i = 0
+    while i < n {
+        g_big = g_big * 2 + 1
+        i += 1
+    }
+    return g_big
+}
+
+fn test_a_promoted_module_loop() -> void {
+    assert_eq(g_acc, 145003)
+    assert_eq(g_k, 300000)
+}
+
+fn test_a_promoted_global_survives_a_raise() -> void {
+    for _ in 0..100 {
+        g_big = 0
+        grow_big(40)
+    }
+    g_big = 0
+    var raised = false
+    try {
+        let _unused = grow_big(100)
+    } catch _failure {
+        raised = true
+    }
+    assert_eq(raised, true)
+    assert_eq(g_big, 9223372036854775807)
+}

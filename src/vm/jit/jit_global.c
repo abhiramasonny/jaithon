@@ -972,6 +972,21 @@ bool emitGetGlobal(Emit *e, ObjFunction *fn, ObjClosure *closure,
                      * expects. */
                     emitGlobalsGuard(e);
                     noteGlobalAccess(e, gslot, gk, false);
+                    {
+                        /* Promoted (planTagProofs): the value is in a hoist
+                         * register nothing in the loop writes but the
+                         * global's own stores, which settle every borrow
+                         * first, so the entry borrows it. */
+                        int pr = globalPromotedReg(e, gslot, gk);
+                        if (pr >= 0) {
+                            if (!pushValue3(e, gk, gshape, gcls, gvv, -1)) {
+                                return false;
+                            }
+                            xBorrowLocal(e, e->valueDepth - 1, (unsigned)pr);
+                            off += 6;
+                            break;
+                        }
+                    }
                     emitConst64(e, JIT_SCRATCH_D,
                                 (int64_t)(uintptr_t)gslot);
                     /* Proved at the loop head (planTagProofs). */
@@ -1136,6 +1151,9 @@ bool emitSetGlobal(Emit *e, ObjClosure *closure, const uint8_t *code,
             emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)gslot);
             emit(e, jaiA64StrX(src, JIT_SCRATCH_D,
                                (unsigned)offsetof(JaiEntry, value) + 8u));
+            /* Written through: the entry above, and the promoted copy. */
+            int pr = globalPromotedReg(e, gslot, sk);
+            if (pr >= 0) emit(e, jaiA64MovX((unsigned)pr, src));
         } else {
             unsigned src = pushReg(e) - 1;
             emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)gslot);

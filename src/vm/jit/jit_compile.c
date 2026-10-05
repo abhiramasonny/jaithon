@@ -1115,6 +1115,11 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                         "%u..%u at the head\n", jitFnLabel(fn),
                         e.guardHoist[i].top, e.guardHoist[i].end);
             }
+            for (unsigned i = 0; i < e.tagProofCount; i++) {
+                fprintf(stderr, "[jit] %s proves a global's tag over %u..%u%s\n",
+                        jitFnLabel(fn), e.tagProof[i].top, e.tagProof[i].end,
+                        e.tagProof[i].reg ? " and keeps it in a register" : "");
+            }
             for (unsigned i = 0; i < e.closHoistCount; i++) {
                 fprintf(stderr, "[jit] %s proves slot %u's closure over "
                         "%u..%u at the head, %u upvalue(s) in registers\n",

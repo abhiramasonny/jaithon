@@ -924,11 +924,19 @@ void noteScratchClobber(Emit *e) {
      * registers) and, for any call that could run Jaithon code, the loops
      * whose globals guard was proved at the head. */
     if (!e->measuring &&
-        (e->closHoistCount > 0 || e->guardHoistCount > 0)) {
+        (e->closHoistCount > 0 || e->guardHoistCount > 0 ||
+         e->tagProofCount > 0)) {
         uint32_t at = e->inlining ? e->inlIp : e->curOffset;
         for (unsigned i = 0; i < e->closHoistCount; i++) {
             if (at < e->closHoist[i].top || at >= e->closHoist[i].end) continue;
             e->whyNot = "a call reached a loop a closure was hoisted over";
+            e->failed = true;
+            return;
+        }
+        for (unsigned i = 0; i < e->tagProofCount; i++) {
+            if (e->tagProof[i].reg == 0) continue;
+            if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+            e->whyNot = "a call reached a loop a global was promoted over";
             e->failed = true;
             return;
         }
