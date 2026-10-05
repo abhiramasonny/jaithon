@@ -429,6 +429,7 @@ this table complete in both directions.
 | switch | default | what it does |
 | --- | --- | --- |
 | `JAITHON_JIT_MATCH` | on | The four enum-`match` opcodes. Off restores the pre-arm prefix compile. |
+| `JAITHON_JIT_KEEP_RETRY_NEEDS` | on | Keep the clashing locals the full attempt reported across the fallback attempts (inlining, `match` arms, nullable band off). Off lets a fallback that stopped earlier overwrite them, so the widening step saw nothing to grow and declined the body -- which is what a `match` whose tag slot was coalesced onto its subject's did every time. |
 | `JAITHON_JIT_WRAP` | on | The wrapping operators `+% -% *%`. |
 | `JAITHON_JIT_JOIN` | 1 | How exactly a join compares two operand stacks. `0` restores the 2-bit kind hash that **miscompiled** (see the golden `jit_join_kind_collision`); `1` compares the whole kind; `2` also compares `valueDepth`. |
 | `JAITHON_JIT_NULLABLE_FB` | on | Believe the nullable return-feedback band. Off reads it as mixed, which is what it meant before the band existed. |

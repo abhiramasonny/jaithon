@@ -329,6 +329,18 @@ bool jitMatchArm(void) {
     return cached != 0;
 }
 
+/* JAITHON_JIT_KEEP_RETRY_NEEDS=0 lets a fallback attempt (inlining off, the
+ * `match` arms off, the nullable band off) overwrite the clashing locals the
+ * full attempt reported, as it always did. Default ON; read once. */
+bool jitKeepRetryNeeds(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_KEEP_RETRY_NEEDS");
+        cached = (v != NULL && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    return cached != 0;
+}
+
 /* JAITHON_JIT_DYNAMIC_RETURN=0 makes mergeReturnKind refuse two disagreeing
  * return kinds the way it always did, instead of widening to SLOT_DYNAMIC.
  * Default ON; read once, same reason as every switch above. */

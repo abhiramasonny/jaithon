@@ -1204,6 +1204,7 @@ bool jitNullableFbOn(void);
 bool jitMaybeObjStackOn(void);
 bool jitMaybeObjOn(void);
 bool jitMatchArm(void);
+bool jitKeepRetryNeeds(void);
 bool jitDynamicReturn(void);
 bool jitStaticMethodOn(void);
 
