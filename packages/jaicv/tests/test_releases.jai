@@ -82,7 +82,9 @@ fn test_detectors_release_their_intermediates() -> void {
     assert_eq(growth(|| cv.corner_min_eigen_val(grey)), 0)
     assert_eq(growth_of_points(|| cv.good_features_to_track(grey, 20, 0.01, 3.0).len()), 0)
     assert_eq(
-        growth(|| adaptive_threshold(bytes, 255.0, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 11, 2.0)),
+        growth(
+            || adaptive_threshold(bytes, 255.0, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 11, 2.0)
+        ),
         0
     )
     assert_eq(
@@ -163,7 +165,10 @@ fn test_detectors_flow_and_stereo_release_their_intermediates() -> void {
     let keys = orb.detect(bytes)
     let brief = BRIEF()
     assert_eq(growth(|| brief.compute(bytes, keys)[1]), 0)
-    assert_eq(growth_of_points(|| SimpleBlobDetector(SimpleBlobDetectorParams()).detect(bytes).len()), 0)
+    assert_eq(
+        growth_of_points(|| SimpleBlobDetector(SimpleBlobDetectorParams()).detect(bytes).len()),
+        0
+    )
     assert_eq(growth(|| calc_optical_flow_farneback(bytes, other)), 0)
     let bm = StereoBM(16, 9)
     assert_eq(growth(|| bm.compute(bytes, other)), 0)
@@ -195,4 +200,22 @@ fn test_inputs_survive_the_releases() -> void {
     assert_eq(grey.to_list(), expected)
     assert_eq(cross.to_list().len(), 9)
     assert_eq(turn.to_list().len(), 6)
+}
+
+#: An empty frame takes the early way out of each of these, which has to give
+#: back what was made before it.
+fn test_empty_frames_release_their_intermediates() -> void {
+    if not gpu.is_available() { return }
+    let bytes = Mat.zeros(0, 0, cv.CV_8UC1)
+    let grey = Mat.zeros(0, 0, cv.CV_32FC1)
+    assert_eq(growth(|| cv.canny(bytes, 60.0, 140.0)), 0)
+    assert_eq(growth(|| cv.corner_harris(grey)), 0)
+    assert_eq(growth(|| cv.corner_min_eigen_val(grey)), 0)
+    assert_eq(growth_of_points(|| cv.good_features_to_track(grey, 20, 0.01, 3.0).len()), 0)
+    assert_eq(
+        growth(
+            || adaptive_threshold(bytes, 255.0, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 11, 2.0)
+        ),
+        0
+    )
 }
