@@ -636,7 +636,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
     int count = fn->chunk.count;
 
     /* An inlined body is walked whole; the OSR window belongs to the caller. */
-    int start = (!e->inlining && e->osr) ? (int)e->osrTop : bodyEntryOffset(fn);
+    int start = (!e->inlining && e->osr) ? (int)e->osrTop
+              : (!e->inlining && e->walkFrom != 0) ? (int)e->walkFrom
+              : bodyEntryOffset(fn);
     int stop  = (!e->inlining && e->osr) ? (int)e->osrEnd : count;
     bool afterUncond = false;
     /* The offset the walk visited before this one, for the arms that want to

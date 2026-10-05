@@ -705,6 +705,10 @@ typedef struct {
      * it), so the result may stay a borrow of the inlined bank's register
      * for that one instruction instead of being copied into the caller's. */
     bool      inlBorrowResult;
+    /* The function tier's walk starts here instead of at offset 0: the code
+     * before it is an early-return arm already compiled ahead of the frame
+     * (emitEarlyReturnArm), whose test the entry has therefore passed. */
+    uint32_t  walkFrom;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
