@@ -322,6 +322,16 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
 static bool inlineFieldOf(const Emit *e, int idx, const ObjFunction *cfn,
                           uint32_t nameIdx) {
     if (idx < 0 || (unsigned)idx >= e->depth) return false;
+    /* A sunk instance: every field it has is in its home (jit_sink.c). */
+    if (e->stack[idx] == SLOT_VREF) {
+        unsigned j = e->stackSunk[idx] - 1u;
+        if (j >= e->sinkCount) return false;
+        if (nameIdx >= (uint32_t)cfn->chunk.constants.count) return false;
+        Value vn = cfn->chunk.constants.data[nameIdx];
+        if (!IS_STRING(vn)) return false;
+        const FieldInfo *vf = jaiClassFieldInfo(e->sink[j].cls, AS_STRING(vn));
+        return vf != NULL && !vf->isStatic && vf->slot < e->sink[j].nfields;
+    }
     if (e->stack[idx] != SLOT_INST) return false;
     ObjClass *klass = e->stackClass[idx];
     if (klass == NULL) return false;
@@ -423,7 +433,10 @@ bool inlineMethodCall(Emit *e, ObjFunction *caller, ObjClosure *method,
     if (!jitInlineMethodsOn()) return false;
     if (e->depth < argc + 1u) return false;
     unsigned ridx = e->depth - argc - 1u;
-    if (e->stack[ridx] != SLOT_INST || e->stackClass[ridx] == NULL) return false;
+    if ((e->stack[ridx] != SLOT_INST && e->stack[ridx] != SLOT_VREF) ||
+        e->stackClass[ridx] == NULL) {
+        return false;
+    }
     if (method->fn->upvalueCount != 0) return false;
     return inlineCallAt(e, caller, method, argc, callOff, -1, true);
 }
@@ -458,6 +471,10 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
         }
         return false;
     }
+    /* A construction the caller binds straight into a sunk local is not
+     * made at all (jit_sink.c), so such a body calls nothing. */
+    unsigned sinkBind = constructs ? sinkBindAfter(e, caller, callOff) : 0;
+    if (sinkBind != 0) constructs = false;
     /* A body that calls out cannot live in x0..x8, and a caller whose own
      * values are there (scratchValues) has no other bank to give it. */
     if (constructs && e->scratchValues) return false;
@@ -469,10 +486,18 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
 
     /* Every argument has to be in a register, since that is where the body
      * will read its parameters from -- and for a method, the receiver too. */
+    /* A sunk instance holds none, but its body reads it only by field
+     * (inlineFieldRead), which loads from the instance's home instead. */
     for (unsigned i = 0; i < argc; i++) {
-        if (!holdsRegister(e->stack[cidx + 1u + i])) return false;
+        if (!holdsRegister(e->stack[cidx + 1u + i]) &&
+            e->stack[cidx + 1u + i] != SLOT_VREF) {
+            return false;
+        }
     }
-    if (method && !holdsRegister(e->stack[cidx])) return false;
+    if (method && !holdsRegister(e->stack[cidx]) &&
+        e->stack[cidx] != SLOT_VREF) {
+        return false;
+    }
 
     int savedSlot[JIT_MAX_SLOTS + 1];
     memcpy(savedSlot, e->inlSlot, sizeof savedSlot);
@@ -499,6 +524,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
      * on its own, and under scratchValues that declines the compile. */
     e->inlining     = true;
     e->inlShared    = constructs;
+    e->inlSinkBind  = sinkBind;
     e->inlDepth     = cidx + 1u + argc;
     e->inlPinned    = 0;
     e->inlValueBase = e->valueDepth;
@@ -535,6 +561,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
          * the register budget already gets. */
         e->inlining = false;
         e->inlShared = false;
+        e->inlSinkBind = 0;
         memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
         gInlineFailed = true;
         e->failed = true;
@@ -550,6 +577,38 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
     uint32_t rshape;
     ObjClass *rcls;
     if (e->depth <= cidx) { e->failed = true; return false; }
+    /* The body's result is a sunk construction: drop what it pinned, and
+     * hand the caller's bind the reference (jit_sink.c). */
+    if (e->stack[e->depth - 1] == SLOT_VREF) {
+        uint8_t sunk = e->stackSunk[e->depth - 1];
+        e->depth--;
+        while (e->depth > cidx) {
+            if (holdsRegister(e->stack[e->depth - 1])) {
+                unsigned r;
+                if (!popValueRaw(e, &r, NULL)) { e->failed = true; return false; }
+            } else {
+                e->depth--;
+            }
+        }
+        e->inlining = false;
+        e->inlShared = false;
+        e->inlSinkBind = 0;
+        memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
+        unsigned d = e->depth;
+        e->stackShape[d] = 0;
+        e->stackClass[d] = e->sink[sunk - 1u].cls;
+        e->stackSeen[d] = NULL_VAL;
+        e->stackLocal[d] = -1;
+        e->stackAscii[d] = false;
+        e->stackNullLit[d] = false;
+        e->stackUnit[d] = false;
+        e->stackPinned[d] = false;
+        e->stackObjType[d] = 0;
+        e->stackElemDecl[d] = 0;
+        e->stackSunk[d] = sunk;
+        e->stack[e->depth++] = SLOT_VREF;
+        return true;
+    }
     rshape = e->stackShape[e->depth - 1];
     rcls   = e->stackClass[e->depth - 1];
     /* Read while `inlining` is still set, so this names the inlined bank's d
@@ -572,6 +631,7 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
     }
     e->inlining = false;
     e->inlShared = false;
+    e->inlSinkBind = 0;
     memcpy(e->inlSlot, savedSlot, sizeof savedSlot);
 
     if (!pushValue(e, kres, rshape, rcls)) { e->failed = true; return false; }

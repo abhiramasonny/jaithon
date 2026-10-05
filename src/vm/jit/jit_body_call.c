@@ -25,6 +25,15 @@ static bool storeFollows(ObjFunction *fn, const uint8_t *code, int next) {
 
 bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
     int off = *offp;
+    /* The construction a sunk local is bound to (jit_sink.c). */
+    if (e->sinkCount != 0) {
+        int sunk = sinkConstructs(e, code, off);
+        if (sunk < 0) return false;
+        if (sunk > 0) {
+            *offp = off + 5;
+            return true;
+        }
+    }
     do {
         unsigned argc = code[off + 1];
 
@@ -650,6 +659,13 @@ bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
     do {
         if (e->inlining) {
             unsigned iargc = code[off + 1];
+            /* Bound by the caller to a sunk local (jit_sink.c). */
+            int sunk = sinkConstructInline(e, iargc);
+            if (sunk < 0) return false;
+            if (sunk > 0) {
+                off += 2;
+                break;
+            }
             /* Inside an inlined body (inlinableBody admitted it as the
              * closing construction) the result is the INLINE's: it stays on
              * top, and the OP_RETURN after it ends the inline as any other
@@ -712,6 +728,11 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
      * earlier mutation inside emitInvoke declines hard exactly as before. */
     const unsigned invCount = e->count;
     const unsigned invDepth = e->depth;
+    /* A sunk instance among the receiver and arguments (jit_sink.c). */
+    if (e->sinkCount != 0) {
+        JitArmResult sr = sinkInvoke(e, fn, code, offp);
+        if (sr != JIT_ARM_UNARMED) return sr;
+    }
     do {
         uint32_t nameIdx = jaiReadU24(code + off + 1);
         unsigned argc    = code[off + 4];

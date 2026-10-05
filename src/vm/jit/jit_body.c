@@ -163,6 +163,13 @@ static bool inlineFieldRead(Emit *e, ObjFunction *fn, const uint8_t *code,
             e->whyNot = "an inlined body reading a local it never bound";
             return false;
         }
+        /* A parameter bound to a sunk instance (jit_sink.c). */
+        if ((unsigned)e->inlSlot[a] < e->depth &&
+            e->stack[e->inlSlot[a]] == SLOT_VREF) {
+            return sinkFieldRead(e, e->stackSunk[e->inlSlot[a]] - 1u, fn,
+                                 jaiReadU24(code + off + 3), code, off + len,
+                                 stop);
+        }
         if (!pushCopyOfEntry(e, (unsigned)e->inlSlot[a])) return false;
         memcpy(synth + 1, code + off + 3, 5);   /* u24 name, u16 cache */
     } else {
@@ -845,7 +852,8 @@ bool compileBody(Emit *e, ObjClosure *closure) {
              * under it is discarded unread. */
             if (e->inlining && op == OP_RETURN) {
                 /* handled below */
-            } else if (!fpFastOp(op) || e->inProtected) {
+            } else if ((!fpFastOp(op) && !sinkFpFast(e, code, off, op)) ||
+                       e->inProtected) {
                 fpSyncAll(e);
             } else if (e->fpCarryCount < jitCarryLimit()) {
                 e->fpCarry[e->fpCarryCount++] = (uint32_t)off;
@@ -890,6 +898,8 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         if (e->inlining && op == OP_RETURN) {
             /* The result is on top and stays there; the caller's driver takes
              * it from the model. */
+            /* A sunk construction's reference (jit_sink.c) holds nothing. */
+            if (e->depth > 0 && e->stack[e->depth - 1] == SLOT_VREF) break;
             if (e->depth == 0 || !holdsRegister(e->stack[e->depth - 1])) {
                 e->whyNot = "an inlined body returning a value with no register";
                 return false;

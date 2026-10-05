@@ -17,6 +17,11 @@ no compiled tier there is nothing to count.
 
     python3 tests/fuzz/pic_rate.py --count 100
     python3 tests/fuzz/pic_rate.py --count 40 --start 500 --sites
+
+`--sink` counts the same way for allocation sinking (src/vm/jit/jit_sink.c):
+one `[jit] osr ... keeps N local(s) sunk` line per OSR form compiled with a
+sunk local. A plan line alone is not counted, since a plan that fails is
+compiled again without sinking. progen.py emitted none until gen_sink_family.
 """
 
 import argparse
@@ -41,6 +46,17 @@ MODES = [
     ("split", {"JAITHON_JIT_SPLIT_STRESS": "1"}),
     ("thresh", {"JAITHON_JIT_THRESHOLD": "1"}),
 ]
+
+
+# What a site looks like on stderr; --sink swaps in jit_sink.c's line.
+MARKER = "[jit] pic "
+
+
+def count_sites(err):
+    if MARKER == "sunk":
+        return sum(1 for l in err.splitlines()
+                   if l.startswith("[jit] osr ") and l.endswith(" sunk"))
+    return err.count(MARKER)
 
 
 def one(seed, warm, timeout):
@@ -71,7 +87,7 @@ def one(seed, warm, timeout):
                 got[name] = -1
                 continue
             err = done.stderr.decode("utf-8", "replace")
-            got[name] = err.count("[jit] pic ")
+            got[name] = count_sites(err)
         return seed, got
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -86,7 +102,12 @@ def main():
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--sites", action="store_true",
                     help="also report total sites, not just programs")
+    ap.add_argument("--sink", action="store_true",
+                    help="count OSR forms with a sunk local, not PIC sites")
     args = ap.parse_args()
+    global MARKER
+    if args.sink:
+        MARKER = "sunk"
 
     seeds = range(args.start, args.start + args.count)
     hit = {name: 0 for name, _ in MODES}
