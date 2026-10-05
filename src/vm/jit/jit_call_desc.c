@@ -174,7 +174,7 @@ _Static_assert(offsetof(JitCallDesc, link) == 0 &&
  * count go down as one pair. */
 void emitChainLink(Emit *e, unsigned nroots) {
     unsigned d = e->descOffset;
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+    emitChainHeadAddr(e, JIT_SCRATCH_A);
     emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
     emit(e, jaiA64MovzX(JIT_SCRATCH_C, nroots, 0));
     if (d + 8u <= 504u) {
@@ -191,7 +191,7 @@ void emitChainLink(Emit *e, unsigned nroots) {
  * answer, so only the scratches are touched. */
 void emitChainUnlink(Emit *e) {
     emit(e, jaiA64LdrX(JIT_SCRATCH_B, 31, e->descOffset));
-    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
+    emitChainHeadAddr(e, JIT_SCRATCH_A);
     emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
 }
 

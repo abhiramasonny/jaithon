@@ -70,6 +70,25 @@ void emitConstCmp(Emit *e, unsigned rd, int64_t value) {
     emitConst64(e, rd, value);
 }
 
+/* &gJitFrames, for the link and unlink around a bare `bl`. Pooled because it
+ * is an address no computation waits on -- the load through it feeds a store
+ * into the descriptor and nothing else -- and a call site pays it twice.
+ * JAITHON_JIT_POOL_CHAIN=0 builds it with movz/movk like any other address. */
+static bool jitPoolChain(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_POOL_CHAIN");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+void emitChainHeadAddr(Emit *e, unsigned rd) {
+    uint64_t bits = (uint64_t)(uintptr_t)&gJitFrames;
+    if (jitPoolChain() && poolConst64(e, rd, bits)) return;
+    emitConst64(e, rd, (int64_t)bits);
+}
+
 bool emitLiteralPool(Emit *e) {
     if (e->litUseCount == 0) return !e->failed;
     if ((e->count & 1u) != 0) emit(e, jaiA64Nop());   /* 8-aligned words */

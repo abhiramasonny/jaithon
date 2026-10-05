@@ -1235,6 +1235,7 @@ unsigned fpRegAt(const Emit *e, unsigned idx);
 void emitConst64(Emit *e, unsigned rd, int64_t value);
 bool jitLitPoolOn(void);
 void emitConstCmp(Emit *e, unsigned rd, int64_t value);
+void emitChainHeadAddr(Emit *e, unsigned rd);
 /* Lays out the constants emitConst64 pooled, after everything else, and
  * points each load at its constant. False if the code buffer filled. */
 bool emitLiteralPool(Emit *e);
