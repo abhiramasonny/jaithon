@@ -29,6 +29,26 @@ fn same_corners(image: Mat, max_corners: int, min_distance: float) -> void {
     }
 }
 
+#: Strengths that hardly ever tie, so the ranking cannot deal them out by
+#: value and has to find the strongest few another way.
+fn speckled(rows: int, cols: int) -> Mat {
+    var values: list[float] = []
+    var state = 12345
+    for _index in 0..rows * cols {
+        state = (state * 1103515245 + 12345) % 2147483648
+        values.push(float(state // 65536 % 10007) / 10007.0)
+    }
+    return Mat.from_list(rows, cols, cv.CV_32FC1, values)
+}
+
+fn test_a_speckled_frame_gives_the_same_corners_either_way() -> void {
+    if not gpu.is_available() { return }
+    let image = speckled(240, 320)
+    same_corners(image, 3, 4.0)
+    same_corners(image, 10, 8.0)
+    image.release()
+}
+
 fn test_a_tied_frame_gives_the_same_corners_either_way() -> void {
     if not gpu.is_available() { return }
     let image = repeating(240, 320)

@@ -761,11 +761,30 @@ let _GF_SELECT = env_or("JAICV_GF_SELECT", "1") != "0"
 #: strongest is in the prefix, so those are ranked, and the rest of the prefix
 #: is candidates equal to it, in the order found. Finding that strength is a
 #: sort of the bare values, which needs no key call.
+#:
+#: When there are only a handful of distinct strengths -- the frame where ties
+#: are the problem -- even that sort is more than is needed: the candidates
+#: are dealt into one list per strength as they come, which keeps each list in
+#: the order found, and the lists read strongest first are the ranking.
 fn strongest_first(strengths: list[float], found: int, wanted: int) -> list[int] {
     if wanted <= 0 or found <= wanted * 2 or not _GF_SELECT {
         var order: list[int] = []
         for index in 0..found { order.push(index) }
         return order.sort(key: |index| strengths[index], reverse: true)
+    }
+    var levels: list[float] = []
+    var members: list[list[int]] = []
+    if deal_by_strength(strengths, found, levels, members) {
+        var by_level = [at for at in 0..levels.len()]
+        by_level.sort(key: |at| levels[at], reverse: true)
+        var ordered: list[int] = []
+        for at in by_level {
+            for index in members[at] {
+                if ordered.len() >= wanted { return ordered }
+                ordered.push(index)
+            }
+        }
+        return ordered
     }
     let level = strengths.sorted(reverse: true)[wanted - 1]
     var above: list[int] = []
@@ -778,6 +797,37 @@ fn strongest_first(strengths: list[float], found: int, wanted: int) -> list[int]
         at += 1
     }
     return ordered
+}
+
+#: Most distinct strengths `deal_by_strength` keeps lists for.
+const FEW_STRENGTHS = 8
+
+#: Deal candidate indices into one list per distinct strength, in the order
+#: found, or give up and return false once there are more than `FEW_STRENGTHS`
+#: of them. A body of its own so the loop compiles.
+fn deal_by_strength(
+    strengths: list[float],
+    found: int,
+    levels: list[float],
+    members: list[list[int]]
+) -> bool {
+    #: No return inside the loop: the tier will not enter a loop that has one.
+    var dealt = true
+    for index in 0..found {
+        let strength = strengths[index]
+        var at = 0
+        while at < levels.len() and levels[at] != strength { at += 1 }
+        if at == levels.len() {
+            if at == FEW_STRENGTHS {
+                dealt = false
+                break
+            }
+            levels.push(strength)
+            members.push([])
+        }
+        members[at].push(index)
+    }
+    return dealt
 }
 
 #: The candidates stronger than `level`, and the first `limit` equal to it,
