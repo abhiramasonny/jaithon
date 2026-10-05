@@ -617,6 +617,90 @@ constexpr constant uint SCAN_ROW_MAX = 4096u;
 
 inline uint nr_skew(uint slot) { return slot + (slot >> 4u); }
 
+/* The ladder both row scans share: the 256 run totals scanned inclusive in
+ * threadgroup memory, handing each thread the total of the runs before its
+ * own. The same Hillis-Steele steps as `nr_scan_chunk`. */
+inline float nr_scan_ladder(float mine, threadgroup float* scratch, uint lid, uint op, float ident) {
+    scratch[lid] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint reach = 1u; reach < ND_GROUP; reach <<= 1u) {
+        float other = lid >= reach ? scratch[lid - reach] : ident;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scratch[lid] = nr_combine(scratch[lid], other, op, 0u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return lid == 0u ? ident : scratch[lid - 1u];
+}
+
+/* `nr_scan_rows` with each thread's run held in registers rather than a
+ * tile, for a row whose runs are EACH slots of whole float4s: n a multiple of
+ * four and EACH = ceil(n / 256) one of 4, 8 or 16. A thread's run is then
+ * EACH / 4 aligned float4s that a simdgroup reads as one contiguous span, so
+ * the row needs no staging at all and the group no 17 KB tile. The folds and
+ * the ladder are the tile kernel's, step for step. */
+template <uint EACH>
+inline void nr_scan_held(device float* dst, device const float* src, uint n, uint op,
+                         uint src_base, uint seg, uint lid, threadgroup float* scratch) {
+    uint from = min(n, lid * EACH);
+    uint to = min(n, from + EACH);
+    device const float4* in = (device const float4*)(src + src_base + seg * n + from);
+    device float4* out = (device float4*)(dst + seg * n + from);
+    float r[EACH];
+    for (uint q = 0u; q < EACH / 4u; q++) {
+        float4 x = from + q * 4u < to ? in[q] : float4(0.0f);
+        r[q * 4u] = x.x;
+        r[q * 4u + 1u] = x.y;
+        r[q * 4u + 2u] = x.z;
+        r[q * 4u + 3u] = x.w;
+    }
+    float ident = nr_identity(op, 0u);
+    float mine = ident;
+    for (uint k = 0u; k < EACH; k++) {
+        if (from + k < to) mine = nr_combine(mine, r[k], op, 0u);
+    }
+    float running = nr_scan_ladder(mine, scratch, lid, op, ident);
+    for (uint k = 0u; k < EACH; k++) {
+        if (from + k < to) {
+            running = nr_combine(running, r[k], op, 0u);
+            r[k] = running;
+        }
+    }
+    for (uint q = 0u; q < EACH / 4u; q++) {
+        if (from + q * 4u < to) out[q] = float4(r[q * 4u], r[q * 4u + 1u], r[q * 4u + 2u], r[q * 4u + 3u]);
+    }
+}
+
+kernel void nr_scan_held4(device float* dst [[buffer(0)]],
+                             device const float* src [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             constant uint& op [[buffer(3)]],
+                             constant uint& src_base [[buffer(4)]],
+                             uint seg [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[ND_GROUP];
+    nr_scan_held<4u>(dst, src, n, op, src_base, seg, lid, scratch);
+}
+kernel void nr_scan_held8(device float* dst [[buffer(0)]],
+                             device const float* src [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             constant uint& op [[buffer(3)]],
+                             constant uint& src_base [[buffer(4)]],
+                             uint seg [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[ND_GROUP];
+    nr_scan_held<8u>(dst, src, n, op, src_base, seg, lid, scratch);
+}
+kernel void nr_scan_held16(device float* dst [[buffer(0)]],
+                             device const float* src [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             constant uint& op [[buffer(3)]],
+                             constant uint& src_base [[buffer(4)]],
+                             uint seg [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[ND_GROUP];
+    nr_scan_held<16u>(dst, src, n, op, src_base, seg, lid, scratch);
+}
+
 kernel void nr_scan_rows(device float* dst [[buffer(0)]],
                          device const float* src [[buffer(1)]],
                          constant uint& n [[buffer(2)]],
@@ -1464,7 +1548,10 @@ fn _scan(a: NDArray, axis: any, dtype: int, op: int, what: str) -> NDArray {
     }
     let dense_rows = at == source.ndim() - 1 and source.is_contiguous()
     if _ROW_SCAN and chunks == 1 and n <= _SCAN_ROW_MAX and dense_rows {
-        kernel_of(SOURCE, "nr_scan_rows").dispatch_async(
+        let each = (n + GROUP - 1) // GROUP
+        let held = n % 4 == 0 and source.offset % 4 == 0 and (each == 4 or each == 8 or each == 16)
+        let entry = if held { f"nr_scan_held{each}" } else { "nr_scan_rows" }
+        kernel_of(SOURCE, entry).dispatch_async(
             [out.storage, source.storage],
             segments * GROUP,
             [n, op, source.offset],

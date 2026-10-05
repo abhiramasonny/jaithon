@@ -631,7 +631,7 @@ fn test_a_fold_down_wide_columns_is_each_columns_fold() -> void {
 #: running sums exact, so the host's left-to-right answer is the device's.
 fn test_a_scan_of_many_dense_rows_is_each_rows_running_fold() -> void {
     if not have_gpu() { return }
-    for width in [17, 257, 4096] {
+    for width in [17, 257, 1000, 2000, 4096] {
         let rows = 1100
         var values = [0.0 for _at in 0..(rows + 1) * width]
         for at in 0..values.len() { values[at] = float(at * 7 % 11) - 5.0 }
