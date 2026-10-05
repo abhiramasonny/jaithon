@@ -396,20 +396,59 @@ static int earlyIntArg(const Emit *e, const Emit *body, unsigned slot,
  * unreachable from it. The body still compiles the same test after the
  * prologue, so nothing else about the function changes; the fall-through
  * pays one extra compare. Recognised as a bytecode idiom at offset 0:
- *   OP_JUMP_IF_CMP_LOCAL_K cmp, param, int k, -> 13
- *   OP_GET_LOCAL param | OP_INT v
+ *   OP_JUMP_IF_CMP_LOCAL_K cmp, int param, int k, -> 13
+ *     or OP_GET_LOCAL nullable param; OP_NULL; OP_JUMP_IF_CMP_FALSE ==/!=, -> 12
+ *   OP_GET_LOCAL int param | OP_INT v
  *   OP_RETURN
  * and only where the function returns a plain int, so the result convention
  * is x0 = payload, x1 = 0 like every other return of the body. */
+/* The argument register of a parameter that holds an instance or null as
+ * the pointer or zero (SLOT_MAYBE_INST, and a nullable slot); -1 otherwise. */
+static int earlyNullableArg(const Emit *e, const Emit *body, unsigned slot,
+                            unsigned realArgs) {
+    if (slot < e->base || slot - e->base >= realArgs) return -1;
+    if (slot > JIT_MAX_SLOTS || e->dynamicLocal[slot]) return -1;
+    if (body->localKind[slot] != SLOT_MAYBE_INST) return -1;
+    return (int)(slot - e->base);
+}
+
 static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
                                unsigned realArgs) {
     if (!jitShrinkWrap() || e->osr || e->count != 0) return false;
     if (e->dynamicReturn || body->returnKind != SLOT_INT) return false;
     const Chunk *c = &fn->chunk;
     const uint8_t *p = c->code;
-    if (c->count < 14 || p[0] != OP_JUMP_IF_CMP_LOCAL_K) return false;
-    unsigned cond;
-    switch (p[1]) {
+    /* The test: a register, compared against an imm12 (`k`) or against
+     * zero for a null test, and the condition under which the arm runs. */
+    int rs = -1;
+    int64_t k = 0;
+    unsigned cond = 0;
+    uint8_t cmp;
+    int ret;                 /* offset of the arm's value */
+    if (c->count >= 14 && p[0] == OP_JUMP_IF_CMP_LOCAL_K) {
+        /* `if n < 2 { ... }`: OP_JUMP_IF_CMP_LOCAL_K cmp, slot, k, rel. */
+        cmp = p[1];
+        if (9 + (int)jaiReadI16(p + 7) != 13) return false;
+        uint32_t ki = jaiReadU24(p + 4);
+        if (ki >= (uint32_t)c->constants.count) return false;
+        Value kv = c->constants.data[ki];
+        if (!IS_INT(kv) || AS_INT(kv) < 0 || AS_INT(kv) > 4095) return false;
+        k = AS_INT(kv);
+        rs = earlyIntArg(e, body, jaiReadU16(p + 2), realArgs);
+        ret = 9;
+    } else if (c->count >= 13 && p[0] == OP_GET_LOCAL && p[3] == OP_NULL &&
+               p[4] == OP_JUMP_IF_CMP_FALSE) {
+        /* `if node == null { ... }`: the pointer against zero. */
+        cmp = p[5];
+        if (cmp != OP_EQ && cmp != OP_NE) return false;
+        if (8 + (int)jaiReadI16(p + 6) != 12) return false;
+        rs = earlyNullableArg(e, body, jaiReadU16(p + 1), realArgs);
+        ret = 8;
+    } else {
+        return false;
+    }
+    if (rs < 0) return false;
+    switch (cmp) {
     case OP_LT: cond = JAI_A64_LT; break;
     case OP_LE: cond = JAI_A64_LE; break;
     case OP_GT: cond = JAI_A64_GT; break;
@@ -418,25 +457,19 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     case OP_NE: cond = JAI_A64_NE; break;
     default: return false;
     }
-    if (9 + (int)jaiReadI16(p + 7) != 13) return false;
-    if (p[12] != OP_RETURN) return false;
-    uint32_t ki = jaiReadU24(p + 4);
-    if (ki >= (uint32_t)c->constants.count) return false;
-    Value kv = c->constants.data[ki];
-    if (!IS_INT(kv) || AS_INT(kv) < 0 || AS_INT(kv) > 4095) return false;
-    int rs = earlyIntArg(e, body, jaiReadU16(p + 2), realArgs);
-    if (rs < 0) return false;
+    uint32_t target = (uint32_t)ret + 4u;
+    if (p[ret + 3] != OP_RETURN) return false;
     int rt = -1;
     int64_t lit = 0;
-    if (p[9] == OP_GET_LOCAL) {
-        rt = earlyIntArg(e, body, jaiReadU16(p + 10), realArgs);
+    if (p[ret] == OP_GET_LOCAL) {
+        rt = earlyIntArg(e, body, jaiReadU16(p + ret + 1), realArgs);
         if (rt < 0) return false;
-    } else if (p[9] == OP_INT) {
-        lit = jaiReadI16(p + 10);
+    } else if (p[ret] == OP_INT) {
+        lit = jaiReadI16(p + ret + 1);
     } else {
         return false;
     }
-    emit(e, jaiA64SubsXImm(31, (unsigned)rs, (unsigned)AS_INT(kv)));
+    emit(e, jaiA64SubsXImm(31, (unsigned)rs, (unsigned)k));
     unsigned skip = e->count;
     emit(e, jaiA64BCond(cond ^ 1u, 0));                /* patched below */
     if (rt < 0) emitConst64(e, 0, lit);
@@ -451,11 +484,11 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
      * return the walk no longer reaches is merged here, as it would have
      * been there. */
     bool entered = false;
-    for (uint32_t at = 0; at < 13u; at++) {
+    for (uint32_t at = 0; at < target; at++) {
         if (offsetIsBranchTarget(c, at)) entered = true;
     }
     if (!entered && jitShrinkSkip() && mergeReturnKind(e, SLOT_INT, 0)) {
-        e->walkFrom = 13u;
+        e->walkFrom = target;
     }
     return true;
 }

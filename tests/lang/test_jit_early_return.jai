@@ -94,3 +94,44 @@ fn test_overflow_in_the_body_after_the_arm() -> void {
     }
     assert_eq(raised, true)
 }
+
+class Tree {
+    pub var left: Tree?
+    pub var right: Tree?
+    pub var value: int
+
+    fn init(self, left: Tree?, right: Tree?, value: int) {
+        self.left = left
+        self.right = right
+        self.value = value
+    }
+}
+
+fn grow(depth: int) -> Tree? {
+    if depth == 0 { return null }
+    return Tree(grow(depth - 1), grow(depth - 1), depth)
+}
+
+#: The null test, ahead of the frame: half the calls are the null children.
+fn weight(node: Tree?) -> int {
+    if node == null { return 0 }
+    return node.value + weight(node.left) + weight(node.right)
+}
+
+#: The negated form: the arm runs for every present node.
+fn present(node: Tree?) -> int {
+    if node != null { return 1 }
+    return 0
+}
+
+fn test_a_null_test_ahead_of_the_frame() -> void {
+    let tree = grow(12)
+    var got = 0
+    for _ in 0..40 { got = weight(tree) }
+    assert_eq(got, 8178)
+    var count = 0
+    for _ in 0..2000 {
+        count = present(tree) + present(null)
+    }
+    assert_eq(count, 1)
+}
