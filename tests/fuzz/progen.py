@@ -84,8 +84,8 @@ shapes that have broken it before:
     a field off a global whose class is swapped part-way through the run, so
     its compiled form deoptimises after the write (Gen.deopt_call). Reached
     through a function parameter, a function value in a local, a direct
-    call, a method, a caller that deoptimises AFTER the call, and a
-    parameter the callee never read. The closure-call arm re-ran such a call
+    call, a method, a caller that deoptimises AFTER the call, a forwarder
+    inlined into a loop, and a parameter the callee never read. The closure-call arm re-ran such a call
     from the top and every write before the guard happened twice
     (tests/lang/test_jit_deopt_runs_once.jai)
 
@@ -1898,14 +1898,17 @@ class Gen:
             f"}}")
         arg = f"n % {dr.randint(3, 11)}"
         lines = []
-        site = dr.randrange(6)
+        site = dr.randrange(7)
         if site == 0:
-            # Through a function parameter: the closure-call arm.
+            # Through a function parameter: the closure-call arm. `r + 0`
+            # (not `+%`) keeps the forwarder small enough for the inliner,
+            # which used to admit it and run the call inside the inline;
+            # `r` is a small int, so the checked add cannot raise.
             via = self.fresh("dkv")
             helpers.append(
                 f"fn {via}(f: fn(int) -> int, x: int) -> int {{\n"
                 f"    let r = f(x)\n"
-                f"    return r +% 0\n"
+                f"    return r + 0\n"
                 f"}}")
             lines.append(f"acc = acc +% {via}({callee}, {arg})")
         elif site == 1:
@@ -1942,6 +1945,26 @@ class Gen:
                 f"    return r +% 0\n"
                 f"}}")
             lines.append(f"acc = acc +% {drive}({plain}, {arg})")
+        elif site == 5:
+            # A forwarder small enough to inline, called in a loop: the
+            # inliner used to admit its call through `f`, and the closure
+            # arm then ran inside the inline with the caller's registers.
+            fwd = self.fresh("dkf")
+            loop = self.fresh("dkr")
+            helpers.append(
+                f"fn {fwd}(f: fn(int) -> int, x: int) -> int {{\n"
+                f"    let r = f(x)\n"
+                f"    return r + 0\n"
+                f"}}")
+            helpers.append(
+                f"fn {loop}(f: fn(int) -> int, k: int) -> int {{\n"
+                f"    var t = 0\n"
+                f"    for i in 0..k {{\n"
+                f"        t = t +% {fwd}(f, i)\n"
+                f"    }}\n"
+                f"    return t\n"
+                f"}}")
+            lines.append(f"acc = acc +% {loop}({callee}, {arg})")
         else:
             # A parameter the callee never reads while it compiles: null on
             # every early call, and the read sits past a lambda, which the
