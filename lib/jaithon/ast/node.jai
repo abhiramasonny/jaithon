@@ -19,6 +19,24 @@ from jaithon.ast.schema import record_fields, tags_of
 from jaithon.ast.span import Span
 from jaithon.ast.types import TypeExpr
 
+#: Write `fields` over the default slots of `node`, a node of `kind`.
+#:
+#: Its own function so that `Node.init` -- run for every node, and for the
+#: parser's commonest kinds with no `fields` at all (`Node.of_slots`) -- can
+#: compile: this loop cannot, since `fields` carries every kind a field can
+#: hold and the tier's index-store arm wants one. What the slot list buys here
+#: is the loop that is GONE -- the walk of `fields_of(kind)` that called
+#: `_default_field` once per field of every node built.
+fn _overlay(node: Node, kind: NodeKind, fields: dict[str, any]) -> void {
+    let index = _FIELD_INDEX[kind]
+    for (name, value) in fields.items() {
+        if name not in index {
+            throw KeyError(f"{kind_name(kind)} has no field `{name}`")
+        }
+        node.fields[index[name]] = value
+    }
+}
+
 #: One node of the tree: a kind, a span, and the fields that kind declares.
 #:
 #: The constructor fills every field the kind declares with its default and then
@@ -55,21 +73,19 @@ pub class Node {
     #: Create a node of `kind`, overlaying `fields` on that kind's defaults.
     pub fn init(self, kind: NodeKind, fields: dict[str, any]? = null, span: Span? = null) {
         self.kind = kind
-        self.span = span ?? Span.none()
+        # Not `span ?? Span.none()`: the compiled tier has no arm for `??`,
+        # and this body runs once per node built. `Span.none()` spelled out,
+        # because a static that has not compiled by the time this body is
+        # first tried refuses it, and synthesised nodes are rare enough that
+        # it seldom has.
+        if span == null {
+            self.span = Span(-1, 0, 0)
+        } else {
+            self.span = span
+        }
         self.fields = new_slots(kind)
         if fields is null { return }
-        # The overlay stays interpreted whatever this is written as: the tier's
-        # index-store arm wants one kind of value, and `fields` carries every
-        # kind a field can hold. What the slot list buys here is the loop that
-        # is GONE -- the walk of `fields_of(kind)` that called `_default_field`
-        # once per field of every node built.
-        let index = _FIELD_INDEX[kind]
-        for (name, value) in fields.items() {
-            if name not in index {
-                throw KeyError(f"{kind_name(kind)} has no field `{name}`")
-            }
-            self.fields[index[name]] = value
-        }
+        _overlay(self, kind, fields)
     }
 
     #: A node of `kind` whose slot list is `slots`, which must hold every field
