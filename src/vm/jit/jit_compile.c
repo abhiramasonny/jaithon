@@ -492,6 +492,14 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     } else if (jitShrinkWide() && ret + 1 <= c->count &&
                p[ret] == OP_RETURN_NULL && (fn->flags & FN_INIT) == 0) {
         rk = SLOT_NULL; armLen = 1;
+    } else if (jitShrinkWide() && ret + 2 <= c->count &&
+               p[ret] == OP_NULL && p[ret + 1] == OP_RETURN &&
+               body->returnKind == SLOT_MAYBE_INST) {
+        /* `return null` from a function returning an instance or null:
+         * the pointer-or-zero convention makes it x0 = 0. The body keeps
+         * its own copy of the test (walkFrom stays 0 below), so the return
+         * kind and shape are merged by the walk exactly as before. */
+        rk = SLOT_MAYBE_INST; armLen = 2;
     } else {
         return false;
     }
@@ -516,7 +524,8 @@ static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
     for (uint32_t at = 0; at < target; at++) {
         if (offsetIsBranchTarget(c, at)) entered = true;
     }
-    if (!entered && jitShrinkSkip() && mergeReturnKind(e, rk, 0)) {
+    if (!entered && jitShrinkSkip() && rk != SLOT_MAYBE_INST &&
+        mergeReturnKind(e, rk, 0)) {
         e->walkFrom = target;
     }
     return true;
