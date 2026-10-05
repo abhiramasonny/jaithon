@@ -74,6 +74,10 @@ shapes that have broken it before:
     mergeReturnKind's path, not the join's, and a helper only reaches the
     join if it happens to get hot
   - lists, dicts, strings, indexing, recursion, match, lambdas
+  - a loop that builds an instance of a simple-init class and only reads its
+    fields, which is the only shape src/vm/jit/jit_sink.c sinks (see
+    gen_sink_family). Before it was generated deliberately 0 of 200 programs
+    compiled a sunk local; `pic_rate.py --sink` is the census
 
 Two invariants keep every generated program legal and terminating, since a
 program that dies the same way five times proves nothing:
@@ -153,6 +157,18 @@ CLASS_METHODS = ["kind", "geta", "twice", "bump", "step"]
 # Both operands land in (-STEP_MOD, STEP_MOD) before they are added, so the sum
 # provably cannot overflow whatever the field holds.
 STEP_MOD = 1000003
+
+
+# Every int field of a sink class (gen_sink_class) stays inside
+# (-SINK_MOD, SINK_MOD): its methods reduce by it, and the loops that build one
+# only pass arguments reduced by it. That is what lets them use CHECKED
+# arithmetic, the only kind jit_sink.c's planner reads -- a `+%` anywhere in
+# the loop and nothing in it is sunk.
+SINK_MOD = 1000003
+
+# Programs that get a sink family at all. Drawn from a Random of its own, so
+# the rest of every program is the one the same seed always gave.
+SINK_RATE = 0.6
 
 
 def step_method(term):
@@ -1763,7 +1779,260 @@ class Gen:
             self.prog.probes[-1].body.append(self.st_inst_list(0))
         if r.random() < 0.12:
             self.prog.probes[0].body.append(self.st_late_raise(0))
+        self.gen_sink_family()
         return self.prog
+
+    # -- allocation sinking (src/vm/jit/jit_sink.c) --------------------------
+    #
+    # The planner sinks a local only when the loop around it holds nothing but
+    # opcodes it reads (no `+%`, no field store, no closure, no try), the local
+    # is bound from a construction of a class whose init just stores its
+    # arguments, every field is an int or a float, and every other use is a
+    # field read or the receiver or argument of a method the tier inlines. The
+    # random grammar above never draws all of that at once, so it is built here
+    # whole: a class, a factory, and helper functions that each run one such
+    # loop, called from the probes. Each helper also draws at most one way to
+    # break the plan (a push into a list, an `is`, a raise), so the refusals
+    # and the retry without sinking are exercised beside the sinks themselves.
+    #
+    # Everything is drawn from `sr`, never self.rng, and only after the rest of
+    # the program exists: the classes, helpers and probes a seed gave before
+    # this family existed are unchanged, and only gain what is appended.
+
+    def gen_sink_family(self):
+        sr = random.Random(self.prog.seed * 7919 + 104729)
+        if sr.random() >= SINK_RATE:
+            return
+        sc = self.gen_sink_class(sr)
+        for _ in range(sr.randint(1, 2)):
+            fname, raises = self.gen_sink_fn(sr, sc)
+            call = line(f"acc = acc +% sfold({fname}(n))")
+            probe = sr.choice(self.prog.probes)
+            if raises:
+                probe.body.append(Node("try {", [call],
+                                       "} catch _e: OverflowError {",
+                                       [line("acc = acc -% 17")],
+                                       "} catch _e: DivisionByZeroError {",
+                                       [line("acc = acc -% 19")],
+                                       "}"))
+            else:
+                probe.body.append(call)
+
+    def gen_sink_class(self, sr):
+        name = self.fresh("Sk")
+        names = ["p", "q", "r", "s"]
+        sr.shuffle(names)
+        fields = [(names[i], sr.choice(["int", "float"]))
+                  for i in range(sr.randint(1, 4))]
+        # Declaration order and parameter order differ, so a field's slot and
+        # its argument are two numbers. The stores follow the parameters, which
+        # is what a simple init is (simpleInitFields, src/vm/jit/jit_call.c);
+        # one class in five stores them out of order and is never sunk.
+        decl = list(fields)
+        sr.shuffle(decl)
+        stores = list(fields)
+        if sr.random() < 0.2:
+            sr.shuffle(stores)
+        ints = [f for f, k in fields if k == "int"]
+        floats = [f for f, k in fields if k == "float"]
+
+        def ctor(args):
+            return f"{name}({', '.join(args)})"
+
+        def per_field(int_src, float_src):
+            return [int_src(f) if k == "int" else float_src(f)
+                    for f, k in fields]
+
+        # Each kind's fields rotated by one: a construction whose arguments
+        # are the receiver's own fields in another order.
+        rot = {}
+        for group in (ints, floats):
+            for i, f in enumerate(group):
+                rot[f] = group[(i + 1) % len(group)]
+        src = [f"class {name} {{"]
+        src += [f"    pub var {f}: {k}" for f, k in decl]
+        src.append("")
+        src.append(f"    fn init(self, "
+                   f"{', '.join(f'{f}: {k}' for f, k in fields)}) {{")
+        src += [f"        self.{f} = {f}" for f, _ in stores]
+        src.append("    }")
+        src.append(f"    pub fn add(self, o: {name}) -> {name} {{ return "
+                   + ctor(per_field(
+                       lambda f: f"(self.{f} + o.{f}) % {SINK_MOD}",
+                       lambda f: f"self.{f} + o.{f}")) + " }")
+        src.append(f"    pub fn scale(self, k: int) -> {name} {{ return "
+                   + ctor(per_field(
+                       lambda f: f"(self.{f} * k) % {SINK_MOD}",
+                       lambda f: f"self.{f} * 0.5")) + " }")
+        src.append(f"    pub fn sw(self) -> {name} {{ return "
+                   + ctor([f"self.{rot[f]}" for f, _ in fields]) + " }")
+        # A temporary before the construction: the plan fires on the bind and
+        # the inlined body refuses it, which is the retry-without path.
+        src.append(f"    pub fn shift(self, d: int) -> {name} {{")
+        src.append(f"        let m = d % {SINK_MOD}")
+        src.append("        return " + ctor(per_field(
+            lambda f: f"(self.{f} + m) % {SINK_MOD}",
+            lambda f: f"self.{f} + 1.0")))
+        src.append("    }")
+        isum = " + ".join(f"self.{f}" for f in ints) or "0"
+        fsum = " + ".join(f"self.{f}" for f in floats) or "0.0"
+        dot = " + ".join(f"self.{f} * o.{f}" for f in ints) or "0"
+        src.append(f"    pub fn isum(self) -> int {{ return {isum} }}")
+        src.append(f"    pub fn fsum(self) -> float {{ return {fsum} }}")
+        src.append(f"    pub fn dot(self, o: {name}) -> int"
+                   f" {{ return ({dot}) % {SINK_MOD} }}")
+        src.append("}")
+        self.prog.classes.append("\n".join(src))
+
+        params = ", ".join(f"{f}: {k}" for f, k in fields)
+        mk = self.fresh("mk")
+        self.prog.helpers.append(
+            f"fn {mk}({params}) -> {name} {{\n"
+            f"    return {ctor([f for f, _ in fields])}\n"
+            f"}}")
+        sub = None
+        if sr.random() < 0.4:
+            # Entered holding a subclass: the loop's entry check must refuse.
+            sub = self.fresh("SkSub")
+            args = ", ".join(f for f, _ in fields)
+            self.prog.classes.append(
+                f"class {sub} extends {name} {{\n"
+                f"    fn init(self, {params}) {{\n"
+                f"        super({args})\n"
+                f"    }}\n"
+                f"}}")
+        return {"name": name, "fields": fields, "ints": ints,
+                "floats": floats, "mk": mk, "sub": sub}
+
+    def sink_args(self, sr, sc):
+        """Arguments for one construction, every int reduced by SINK_MOD."""
+        out = []
+        for _, k in sc["fields"]:
+            if k == "int":
+                atom = sr.choice(["sk", "n", "sk * 7 + n", "sk * sk",
+                                  "n * 3 - sk", "sa",
+                                  "xs[sk % xs.len()] % 1009"])
+                out.append(f"({atom}) % {SINK_MOD}")
+            else:
+                out.append(sr.choice(["fw", "fw * 0.5", "fw + 1.5", "-fw",
+                                      "sf", "0.25", "fw * fw"]))
+        return out
+
+    def gen_sink_fn(self, sr, sc):
+        name = sc["name"]
+        fname = self.fresh("sink")
+        trips = sr.choice([40, 200, 500, 1000])
+        bound = (str(trips) if sr.random() < 0.7
+                 else f"(n % 4) * {max(1, trips // 3)}")
+        carried = sr.random() < 0.6
+        escape = sr.choice([None, None, None, None, None,
+                            "list", "is", "overflow", "divide", "deep"])
+        body = ["sk = sk + 1", "fw = fw + 0.25"]
+
+        def build(target):
+            how = sr.random()
+            args = self.sink_args(sr, sc)
+            if how < 0.55:
+                return f"{target} = {name}({', '.join(args)})"
+            if how < 0.85:
+                return f"{target} = {sc['mk']}({', '.join(args)})"
+            if carried and target != "v":
+                meth = sr.choice(["sw()", "scale(sk % 7 + 1)", "shift(sk)"])
+                return f"{target} = v.{meth}"
+            return f"{target} = {name}({', '.join(args)})"
+
+        temps = []
+        for _ in range(sr.randint(0 if carried else 1, 2)):
+            t = self.fresh("t")
+            body.append("let " + build(t))
+            temps.append(t)
+        for t in temps:
+            for _ in range(sr.randint(1, 2)):
+                use = sr.random()
+                if sc["ints"] and use < 0.3:
+                    body.append(f"sa = (sa + {t}.{sr.choice(sc['ints'])})"
+                                f" % {SINK_MOD}")
+                elif sc["floats"] and use < 0.55:
+                    body.append(f"sf = sf + {t}.{sr.choice(sc['floats'])}")
+                elif use < 0.75:
+                    body.append(f"sa = (sa + {t}.isum()) % {SINK_MOD}")
+                elif use < 0.85:
+                    body.append(f"sf = sf + {t}.fsum()")
+                else:
+                    other = sr.choice(temps + (["v"] if carried else []))
+                    body.append(f"sa = (sa + {t}.dot({other})) % {SINK_MOD}")
+        if carried:
+            step = sr.random()
+            if temps and step < 0.45:
+                body.append(f"v = v.add({sr.choice(temps)})")
+            elif step < 0.6:
+                body.append("v = v.sw()")
+            elif step < 0.75:
+                body.append("v = v.scale(sk % 7 + 1)")
+            elif step < 0.85 and sc["ints"]:
+                # Rebound from its own fields, read before the bind.
+                args = [f"(v.{f} + sk) % {SINK_MOD}" if k == "int"
+                        else f"v.{f} * 0.5" for f, k in sc["fields"]]
+                body.append(f"v = {name}({', '.join(args)})")
+            else:
+                body.append(build("v"))
+            if sr.random() < 0.3:
+                body.append(f"sa = (sa + v.isum()) % {SINK_MOD}")
+        # After every bind, so the binds still dominate the loop's reads.
+        if sr.random() < 0.3:
+            body.append(f"if sk % {sr.choice([3, 7, 37])} == 0 {{ continue }}")
+        if sr.random() < 0.2:
+            body.append(f"if sk == {sr.randint(1, trips)} {{ break }}")
+        named = temps + (["v"] if carried else [])
+        if escape == "list" and named:
+            body.append(f"if sk % 64 == 0 {{ kl.push({sr.choice(named)}) }}")
+        elif escape == "is" and len(named) >= 2:
+            a, b = sr.sample(named, 2)
+            body.append(f"if {a} is {b} {{ sa = sa + 1 }}")
+        elif escape == "overflow":
+            body.append(f"if sk == {sr.randint(1, trips)} "
+                        "{ sa = 9223372036854775807 + sk }")
+        elif escape == "divide":
+            at = sr.randint(1, trips)
+            body.append(f"if sk == {at} {{ sa = sa % (sk - {at}) }}")
+
+        out = [f"fn {fname}(n: int) -> str {{",
+               "    var sa = 0",
+               "    var sf = 0.0",
+               "    var fw = 0.5",
+               "    var sk = 0",
+               "    var xs = [3, 1, 4, 1, 5]",
+               "    var kl = [0]"]
+        if carried:
+            init = f"{name}({', '.join(self.sink_args(sr, sc))})"
+            out.append(f"    var v = {init}")
+            if sc["sub"] is not None and sr.random() < 0.5:
+                sub_init = f"{sc['sub']}({', '.join(self.sink_args(sr, sc))})"
+                out.append(f"    if n % 5 == 0 {{ v = {sub_init} }}")
+            out.append("    let keep = v")
+        loop = [f"    while sk < {bound} {{"] + [f"        {b}" for b in body]
+        if escape == "deep":
+            # The sinking loop is the inner one: its form is left and entered
+            # again on every outer iteration.
+            out.append("    for _o in 0..3 {")
+            out += ["    " + l for l in loop] + ["        }"]
+            out.append("        sk = 0")
+            out.append("    }")
+        else:
+            out += loop + ["    }"]
+        if carried:
+            out.append("    if keep is v { sa = sa + 1 }")
+            out.append(f"    sa = (sa + v.isum()) % {SINK_MOD}")
+            out.append("    sf = sf + v.fsum()")
+        if sr.random() < 0.5:
+            # The whole-function tier refuses a dict, so every call runs the
+            # loop through the OSR tier, which is the only one that sinks.
+            out.append('    var d = {"k": 1}')
+            out.append('    sa = sa + d["k"]')
+        out.append('    return f"{sa}|{sf}|{kl.len()}"')
+        out.append("}")
+        self.prog.helpers.append("\n".join(out))
+        return fname, escape in ("overflow", "divide")
 
 
 def generate(seed, warm=WARM_DEFAULT):
