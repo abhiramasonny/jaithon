@@ -694,6 +694,17 @@ bool compileBody(Emit *e, ObjClosure *closure) {
             e->fpSrc = 0;
             e->dynGuarded = 0;
         }
+        /* So are "this entry is the literal 2.0" and "this entry is the int
+         * k": an `if` expression's arms meet in one entry holding different
+         * values. Kept across the join, `1.0 * (if c { 7.0 } else { 2.0 })`
+         * took the else arm's 2.0 for both and compiled `x + x` -- 2.0 every
+         * call (tests/lang/test_jit_join_facts.jai). */
+        if ((e->fTwo != 0 || e->kKnown != 0) &&
+            (!fellIn || offsetIsBranchTarget(&fn->chunk, (uint32_t)off) ||
+             popSkipTarget(e, (uint32_t)off))) {
+            e->fTwo = 0;
+            e->kKnown = 0;
+        }
         /* A field-kind memo is good along the same one edge, and goes for the
          * same reason -- see forgetFieldKinds. `fn` is whichever body is being
          * walked, so an inlined one is measured against its own chunk. */
@@ -750,7 +761,10 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         /* A borrow ends here unless the instruction is one of the few it is
          * allowed to live across. The top of an instruction is the one place
          * the release is guaranteed to be on the executed path. */
-        if (e->fpBorrow != 0 && (e->inProtected || !fpBorrowSurvives(op))) {
+        if (e->fpBorrow != 0 &&
+            (e->inProtected ||
+             !(fpBorrowSurvives(op) ||
+               (op == OP_GET_INDEX && jitBorrowGuardsOn())))) {
             fpReleaseAll(e);
         }
         e->curOffset = (uint32_t)off;
@@ -1246,6 +1260,11 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_GET_LOCAL2:
+            /* `if a < b { s = v }`: the pair is the chain's first test. */
+            if (off + 5 < stop && code[off + 5] == OP_JUMP_IF_CMP_FALSE &&
+                jitTryIfConvert(e, fn, &off)) {
+                break;
+            }
             if (!emitGetLocal2(e, code, &off, stop)) return false;
             break;
 

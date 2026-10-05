@@ -13,6 +13,19 @@
  * and that the head's guard does not cover keeps the hoisted `items` and reads
  * only `count` fresh. The count feeds the bounds branch and nothing else, so
  * the element's address no longer waits on a header load. */
+/* JAITHON_JIT_LIST_ELEM_REUSE=0: an element of a list of lists is loaded
+ * twice, once to confirm it is a list and once more as the result. On, the
+ * pointer the type check loaded is the result, and its load takes the
+ * payload offset as an immediate instead of an `add` ahead of it. */
+static bool jitListElemReuse(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_LIST_ELEM_REUSE");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 static bool jitHoistFreshCount(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -578,6 +591,13 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             if (!exemplarKind(dsample, &dkind, &dtag, &dcls, &dshape)) {
                 return subWhy(e, "a dict value of a kind the tier cannot hold");
             }
+            /* OP_GET_INDEX may leave float entries in the FP bank (see
+             * fpFastOp), which is right for a list read and wrong here: the
+             * key is stored from its X register and the lookup is a call
+             * that clobbers v16 up. A float key read out of a local's home
+             * went in as stale bits -- `d[x]` raised KeyError for a key
+             * that was there (tests/lang/test_jit_dict_float_key.jai). */
+            fpSyncAll(e);
             /* SLOT_OBJ pins nothing, so the container is proved to be a
              * dict before anything is consumed: a miss resumes with the
              * dict and the key both still on the interpreter's stack. */
@@ -838,6 +858,9 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
          * once it is longer than eight (JAITHON_LIST_SHAPE_GROWN), the taken
          * one was the common one. */
         bool gColdDone = false;
+        /* The element pointer of a list of lists, left in JIT_SCRATCH_D by
+         * its type check: the result, without loading it again. */
+        bool gListInD = false;
         if (gAcc.dynamic && gAcc.stg == LIST_STORE_BOXED &&
             (kind == SLOT_INT || kind == SLOT_FLOAT || kind == SLOT_BOOL) &&
             jitDispatchColdOn() && e->coldCount < JIT_MAX_COLD &&
@@ -877,6 +900,14 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
         emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_C, 0));
         emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, tag));
         branchOnDeopt(e, JAI_A64_NE);
+        if (kind == SLOT_LIST && gSkip < 0 && jitListElemReuse()) {
+            emit(e, jaiA64LdrX(JIT_SCRATCH_D, JIT_SCRATCH_C, 8));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_A, JIT_SCRATCH_D,
+                               (unsigned)offsetof(Obj, type)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_LIST));
+            branchOnDeopt(e, JAI_A64_NE);
+            gListInD = true;
+        } else {
         emit(e, jaiA64AddXImm(JIT_SCRATCH_C, JIT_SCRATCH_C, 8));
         if (kind == SLOT_INST) {
             /* The tag says "an object", not "an object of this class" --
@@ -913,6 +944,7 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
             branchOnDeopt(e, JAI_A64_NE);
         }
         }
+        }
         if (gSkip >= 0) {
             int gJoin = listDispatchElse(e, gSkip);
             emit(e, jaiA64AddXLsl(JIT_SCRATCH_C, gItems, JIT_SCRATCH_B,
@@ -927,7 +959,9 @@ bool emitGetIndex(Emit *e, const uint8_t *code, int *offp, int stop) {
         if (!pushValue3(e, kind, elemShape, elemClass, elem, -1)) return false;
         /* Bool payload is one byte (`BOOL_VAL` compiles to `strb`), so the other seven bytes are stale --
          * an 8-byte load would hand a SLOT_BOOL register (required to hold exactly 0 or 1, since every consumer does `cbnz` on the whole word) garbage. */
-        if (kind == SLOT_BOOL) {
+        if (gListInD) {
+            emit(e, jaiA64MovX(pushReg(e) - 1, JIT_SCRATCH_D));
+        } else if (kind == SLOT_BOOL) {
             emit(e, jaiA64LdrByte(pushReg(e) - 1, JIT_SCRATCH_C, 0));
         } else if (kind == SLOT_FLOAT &&
                    fpWorthLoading(e, code, off + 1, stop)) {

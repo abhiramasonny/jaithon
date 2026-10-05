@@ -445,6 +445,8 @@ bool jitSplitStress(void) {
 
 /* Neither an inline's state nor mid-instruction state is the model's actual current state. Inside an
  * inline the interpreter hasn't made the call yet, so it resumes at OP_CALL holding just callee+args, not the inlined body's locals/temporaries. Outside one, a guard mid-instruction (OP_GET_LOCAL2 pushes then guards) leaves the model deeper than the interpreter's stack there -- handing over those extra entries strands them, and a loop can read its own iterator as its loop variable. `instDepth` is the model at the instruction's START, matching the interpreter; only entries THIS instruction pushed (the topmost) may be trimmed back to it -- an instruction that already popped something the interpreter still holds cannot be repaired and is refused. */
+static void noteDeoptBorrows(Emit *e, unsigned k);
+
 static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
                       unsigned *depthOut, unsigned *valueDepthOut) {
     if (e->inlining) {
@@ -542,7 +544,7 @@ bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
                           unsigned *out) {
     /* Assertion, not the fix: a deopt stub writes every entry out of fpRegAt, so nothing may still be
      * borrowing a local's register here. Releasing HERE (rather than at the top of the instruction) was tried and is wrong -- a guard can sit inside a span an earlier branch skips (emitBoundsNormalise's does), so the fmov landed on a not-taken path and matrix_mul read `sum` from a register nothing had written. Declines rather than miscompiles if fpBorrowSurvives let something through it shouldn't have. */
-    if (e->fpBorrow != 0) {
+    if (e->fpBorrow != 0 && !jitBorrowGuardsOn()) {
         /* Names the opcode: which arm let the borrow through is the whole
          * question, and without it the message only says where the loop
          * started. */
@@ -580,6 +582,7 @@ bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
     }
     e->deopt[k].lastFromDesc = lastFromDesc;
     e->deopt[k].fpLive       = e->fpLive;
+    noteDeoptBorrows(e, k);
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
@@ -614,7 +617,9 @@ bool jitDeoptStressOn(void) {
 }
 
 int deoptRecordNow(Emit *e) {
-    if (e->fpBorrow != 0 || anyDeferred(e)) return -1;
+    if ((e->fpBorrow != 0 && !jitBorrowGuardsOn()) || anyDeferred(e)) {
+        return -1;
+    }
     if (e->deoptCount >= JIT_MAX_DEOPT) return -1;
     unsigned k = e->deoptCount;
     if (!deoptSite(e, e->curOffset, &e->deopt[k].ip, &e->deopt[k].depth,
@@ -624,6 +629,7 @@ int deoptRecordNow(Emit *e) {
     e->deoptCount++;
     e->deopt[k].lastFromDesc = false;
     e->deopt[k].fpLive     = e->fpLive;
+    noteDeoptBorrows(e, k);
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
@@ -633,7 +639,7 @@ int deoptRecordNow(Emit *e) {
 
 void branchOnDeopt(Emit *e, unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
-    if (e->fpBorrow != 0) {          /* see deoptRecordAt */
+    if (e->fpBorrow != 0 && !jitBorrowGuardsOn()) {   /* see deoptRecordAt */
         e->whyNot = borrowWhyFor(e);
         e->failed = true;
         return;
@@ -656,6 +662,7 @@ void branchOnDeopt(Emit *e, unsigned cond) {
     }
     e->deopt[k].lastFromDesc = false;
     e->deopt[k].fpLive     = e->fpLive;
+    noteDeoptBorrows(e, k);
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
@@ -730,6 +737,7 @@ void branchOnDeoptInstStart(Emit *e, unsigned cond) {
     }
     e->deopt[k].lastFromDesc = false;
     e->deopt[k].fpLive       = e->fpLive;
+    e->deopt[k].fpBorrow     = 0;
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
         e->deopt[k].classes[i] = e->stackClass[i];
@@ -748,6 +756,40 @@ void branchOnDeoptInstStart(Emit *e, unsigned cond) {
 /* NaN comparison is a TypeError here, not false, matching the interpreter's isnan check: fcmp sets V
  * on an unordered result, and that's routed to a deopt so the interpreter raises exactly what it would have. */
 void nanToDeopt(Emit *e) { branchOnDeopt(e, JAI_A64_VS); }
+
+/* JAITHON_JIT_BORROW_GUARDS=0: a float entry still borrowing a local's d
+ * home may not reach a guard, so it is released -- copied into its own bank
+ * register -- at the top of any instruction that might guard. On the
+ * loop-carried accumulator of `sum += a[k] * b[k][j]` that copy is an `fmov`
+ * on the dependency chain, and an FP move is not eliminated at rename the way
+ * an integer one is. On (the default), a record instead remembers which home
+ * each borrowed entry is in and the stub reads it from there: nothing between
+ * the borrow and the guard can have written the home, since writing a local
+ * releases every borrow of it first (fpReleaseHome). */
+bool jitBorrowGuardsOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_BORROW_GUARDS");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static void noteDeoptBorrows(Emit *e, unsigned k) {
+    e->deopt[k].fpBorrow = e->fpBorrow & e->fpLive;
+    if (e->deopt[k].fpBorrow != 0) {
+        memcpy(e->deopt[k].fpBorrowReg, e->fpBorrowReg,
+               sizeof e->deopt[k].fpBorrowReg);
+    }
+}
+
+/* The d register a stub reads live FP entry `valueIdx` of record `k` out of. */
+unsigned deoptFpSource(const Emit *e, unsigned k, unsigned valueIdx) {
+    if (valueIdx < 32u && (e->deopt[k].fpBorrow & (1u << valueIdx))) {
+        return e->deopt[k].fpBorrowReg[valueIdx];
+    }
+    return fpRegAt(e, valueIdx);
+}
 
 /* `c < "0"` and its three siblings, both operands a string one byte long.
  *

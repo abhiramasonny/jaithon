@@ -1079,7 +1079,7 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
             }
             unsigned reg0 = valueBankReg(&e, valueSeen);
             if (e.deopt[k].fpLive & (1u << valueSeen)) {
-                emit(&e, jaiA64FmovXD(reg0, fpRegAt(&e, valueSeen)));
+                emit(&e, jaiA64FmovXD(reg0, deoptFpSource(&e, k, valueSeen)));
             }
             /* Both nullable kinds. The function tier's twin of this ladder
              * (jit_compile.c) already reads both; this one named only the

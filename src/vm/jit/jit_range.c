@@ -78,6 +78,10 @@ static bool writesSlot(const Chunk *c, int off, unsigned slot) {
     return false;
 }
 
+bool jitOpWritesSlot(const Chunk *c, int off, unsigned slot) {
+    return writesSlot(c, off, slot);
+}
+
 static bool hasClosures(const Chunk *c) {
     for (int off = 0; off < c->count;) {
         int len = instructionLength(c, off);
@@ -147,6 +151,72 @@ static void boundFromLocal(uint8_t cmp, bool truth, bool slotLeft,
     if (cmp == OP_GT && INT64_MIN + 1 > *lo) *lo = INT64_MIN + 1;
 }
 
+/* JAITHON_JIT_RANGE_COUNTER=0: a range loop's variable gets no bound from
+ * the loop that binds it. */
+static bool rangeCounterOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_RANGE_COUNTER");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* The bounds OP_FOR_RANGE_BIND puts on the variable it binds from counter
+ * slot `cur`, read off every OP_ITER_RANGE that starts that counter -- the
+ * counter and its end are the emitter's own temporaries, written by those and
+ * by the binds alone, though one pair may serve several loops in turn.
+ *
+ *   - The counter only ever counts up from the start, so where every start is
+ *     a literal the variable is at least the smallest. The start is the
+ *     operand under the stop, which is the instruction before the one that
+ *     pushes the stop -- when that one pushes exactly one value and pops none.
+ *   - An exclusive range stops before `end` and `end` is at most INT64_MAX,
+ *     so the variable is at most INT64_MAX - 1. An inclusive one can reach
+ *     INT64_MAX itself (its end wraps), so it bounds nothing above. */
+static bool pushesOneValue(uint8_t op) {
+    switch (op) {
+    case OP_INT: case OP_CONST: case OP_GET_LOCAL: case OP_GET_GLOBAL:
+    case OP_ADD_INT_CONST: case OP_SUB_INT_CONST: case OP_MUL_INT_CONST:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void counterBounds(const Chunk *c, unsigned cur, int64_t *lo,
+                          int64_t *hi) {
+    bool allExclusive = true, allLiteral = true, any = false;
+    int64_t least = INT64_MAX;
+    int prev2 = -1, prev1 = -1;
+    for (int off = 0; off < c->count;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return;
+        if (c->code[off] == OP_ITER_RANGE &&
+            jaiReadU16(c->code + off + 2) == cur) {
+            any = true;
+            if (c->code[off + 1] != 0) allExclusive = false;
+            /* Straight-line: a branch landing on the stop's push or on this
+             * instruction could bring another start with it. */
+            if (prev2 >= 0 && c->code[prev2] == OP_INT &&
+                pushesOneValue(c->code[prev1]) &&
+                !offsetIsBranchTarget(c, (uint32_t)prev1) &&
+                !offsetIsBranchTarget(c, (uint32_t)off)) {
+                int64_t k = jaiReadI16(c->code + prev2 + 1);
+                if (k < least) least = k;
+            } else {
+                allLiteral = false;
+            }
+        }
+        prev2 = prev1;
+        prev1 = off;
+        off += len;
+    }
+    if (!any) return;
+    if (allLiteral && least > *lo) *lo = least;
+    if (allExclusive && INT64_MAX - 1 < *hi) *hi = INT64_MAX - 1;
+}
+
 /* What the jump-if-false ending block `p` says about `slot` on the edge that
  * enters the block starting at `into`. */
 static void guardBound(const Emit *e, const ObjFunction *fn, const JaiBlock *p,
@@ -163,6 +233,14 @@ static void guardBound(const Emit *e, const ObjFunction *fn, const JaiBlock *p,
     }
     if (g < 0) return;
     uint8_t op = c->code[g];
+    /* The edge into the body of a range loop: `slot` is the variable it just
+     * bound. Its exhausted edge binds nothing. */
+    if (op == OP_FOR_RANGE_BIND && rangeCounterOn()) {
+        if (into != (uint32_t)(g + instructionLength(c, g))) return;
+        if (jaiReadU16(c->code + g + 3) != slot) return;
+        counterBounds(c, jaiReadU16(c->code + g + 5), lo, hi);
+        return;
+    }
     if (op != OP_JUMP_IF_CMP_LOCAL_K && op != OP_JUMP_IF_CMP_FALSE) return;
     int len = instructionLength(c, g);
     int rel = jaiOpBranchOperandAt(op);

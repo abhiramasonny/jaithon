@@ -239,6 +239,17 @@ bool emitAddSubDiv(Emit *e, ObjFunction *fn, uint8_t op, const uint8_t *code,
         bool    idxCarry     = false;
         uint8_t idxCarryBase = 0;
         int32_t idxCarryOff  = 0;
+        /* `j + 1` where the left entry IS local `j`: a comparison or the
+         * range loop binding `j` may already rule the overflow out (see
+         * jit_range.c), as it does for the fused OP_ADD_INT_CONST. */
+        bool provedNoOverflow = false;
+        if (foldK && e->valueDepth >= 2 &&
+            (e->idxKnown & (1u << (e->valueDepth - 2))) != 0 &&
+            e->idxOff[e->valueDepth - 2] == 0) {
+            provedNoOverflow = jitSlotAddSafe(
+                e, fn, (uint32_t)off, e->idxBase[e->valueDepth - 2],
+                op == OP_SUB ? -kimm : kimm);
+        }
         if (foldK && e->valueDepth >= 2 &&
             (e->idxKnown & (1u << (e->valueDepth - 2))) != 0 &&
             kimm >= -4096 && kimm <= 4096) {
@@ -276,7 +287,9 @@ bool emitAddSubDiv(Emit *e, ObjFunction *fn, uint8_t op, const uint8_t *code,
         if (foldK) emitAddSubImm(e, rt, ra, kimm, op == OP_SUB);
         else emit(e, op == OP_ADD ? jaiA64AddsX(rt, ra, rb)
                                   : jaiA64SubsXReg(rt, ra, rb));
-        branchOnOverflow(e, op == OP_ADD ? 0u : 1u, JAI_A64_VS);
+        if (!provedNoOverflow) {
+            branchOnOverflow(e, op == OP_ADD ? 0u : 1u, JAI_A64_VS);
+        }
         if (rt != rd) emit(e, jaiA64MovX(rd, rt));
         off += 1;
         break;

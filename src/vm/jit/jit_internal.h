@@ -408,6 +408,17 @@ typedef struct {
      * a call may not fit as an expression; the compile retries with this set when that's what went wrong. */
     bool      noInline;
     bool      inlined;
+    /* A map kernel (jaiJitCompileMapKernel): the body wrapped in a loop over
+     * gJitMapRun, each return storing its value and taking the next element
+     * instead of leaving. `mapKernelHead` is the loop's first instruction and
+     * `mapKernelExit` the `b.ge` out of it, patched once the exit exists. */
+    bool      mapKernel;
+    uint8_t   mapKernelKind;
+    int       mapKernelHead;
+    int       mapKernelExit;
+    /* x(reg) the index, x(reg+1) the bound, x(reg+2) &gJitMapRun, and for
+     * a filter kernel (mapKernelKind SLOT_BOOL) x(reg+3) the count kept. */
+    unsigned  mapKernelReg;
     /* Inlined callee: its locals are operand-stack entries of the CALLER's frame (slots 1..n are the
      * already-present argument entries); nothing is copied, no frame appears -- but the interpreter has no idea, so every guard inside deoptimises to `inlIp` (the caller's OP_CALL) with the model as of `inlDepth`. */
     bool      inlining;
@@ -714,6 +725,11 @@ typedef struct {
          * it lives in the descriptor rather than a register. */
         bool     lastFromDesc;
         uint32_t fpLive;
+        /* Live entries that are still a borrow of a local's d home, and
+         * which home: the stub writes those out of the home, since nothing
+         * was ever written to their own bank register (jitBorrowGuardsOn). */
+        uint32_t fpBorrow;
+        uint8_t  fpBorrowReg[32];
         int      stub;
     } deopt[JIT_MAX_DEOPT];
     unsigned  deoptCount;
@@ -1108,6 +1124,25 @@ uint8_t *arenaEmit(JaiCodeArena *arena, const uint32_t *code,
 
 /* Defined in jit_func.c. */
 extern bool gInlineFailed;
+/* What a map kernel loops over: `src` and `dst` are the two lists' element
+ * arrays, both eight bytes wide, and the kernel runs `i` up to `n` in a
+ * register, writing it back here before each element so that every way out
+ * leaves it naming the element it stopped on. One run at a time -- the VM runs one
+ * Jaithon thread, and a kernel calls nothing. */
+typedef struct {
+    const void *src;
+    void       *dst;
+    int64_t     i;
+    int64_t     n;
+    /* A filter kernel's count of elements kept, in a register as `i` is and
+     * written back beside it. */
+    int64_t     j;
+} JitMapRun;
+extern JitMapRun gJitMapRun;
+void emitMapKernelNext(Emit *e, SlotKind k);
+/* An `if`/`elif` chain of int assignments at *offp emitted as csel; see
+ * jit_body_cmp.c. False, having emitted nothing, when it does not apply. */
+bool jitTryIfConvert(Emit *e, ObjFunction *fn, int *offp);
 
 /* Defined in jit_compile.c. */
 bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,
@@ -1150,6 +1185,8 @@ unsigned fpHeldIn(const Emit *e, unsigned idx);
 void fpSyncOne(Emit *e, unsigned idx);
 void fpReleaseHome(Emit *e, unsigned reg);
 void fpReleaseAll(Emit *e);
+bool jitBorrowGuardsOn(void);
+unsigned deoptFpSource(const Emit *e, unsigned k, unsigned valueIdx);
 void fpSyncAll(Emit *e);
 unsigned fpOperand(Emit *e, unsigned idx);
 bool jitFTwo(void);
@@ -1540,6 +1577,8 @@ bool jitSlotAddSafe(const Emit *e, const ObjFunction *fn, uint32_t q,
 /* Forget the control-flow graph jit_range.c keeps for the compile in
  * progress; called as each compile starts. */
 void jitRangeReset(void);
+/* jit_range.c: whether the instruction at `off` may write local `slot`. */
+bool jitOpWritesSlot(const Chunk *c, int off, unsigned slot);
 bool emitModIntConst(Emit *e, const uint8_t *code, int *offp);
 
 #endif /* arm64 */

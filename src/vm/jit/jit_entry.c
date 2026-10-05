@@ -711,6 +711,279 @@ bool jaiMapRunOn(void) {
  * ordinary way. The one exception is a call that comes back with a non-zero
  * verdict, which has already happened and so cannot be handed back; it is
  * finished exactly as jaiCallPreparedFn1 would finish it. */
+/* The run's slow exit: a call that came back with a non-zero verdict has
+ * already happened, so it is finished exactly as jaiCallPreparedFn1 would
+ * finish it, stored the ordinary way, and the rest handed back to the caller,
+ * which will prepare again before the next run. */
+static JAI_NOINLINE int mapRunBailed(JaiPreparedFn1 *p, ObjList *dst,
+                                     JitResult r, Value *base, int frameBase,
+                                     int i, bool *ok) {
+    Value mapped;
+    JaiJitOutcome outcome = jitResultOut(p->fn, r, base);
+    bool good;
+    if (outcome == JAI_JIT_DONE) {
+        mapped = base[0];
+        good = true;
+    } else if (outcome == JAI_JIT_ERROR) {
+        good = false;
+    } else if (outcome == JAI_JIT_DEOPT) {
+        good = jaiFinishJitDeopt1(p->closure, base, frameBase, &mapped);
+    } else {
+        good = callFn1Rerun(base, &mapped);
+    }
+    vm.stackTop = base;
+    if (!good) {
+        *ok = false;
+        return i;
+    }
+    if (JAI_LIKELY(dst->count < dst->capacity)) {
+        jaiListPut(dst, dst->count++, mapped);
+    } else {
+        jaiGCPushRoot(mapped);
+        jaiListPush(dst, mapped);
+        jaiGCPopRoot();
+    }
+    dst->version++;
+    if (vm.hasException) *ok = false;
+    return i + 1;
+}
+
+/* JAITHON_MAP_RUN_TIGHT=0 keeps the run's one generic loop, which decides
+ * the parameter and result kinds per element, re-reads the frame count before
+ * every call and bumps the result's version on every store. */
+static bool mapRunTightOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_MAP_RUN_TIGHT");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* One loop per (parameter kind, result kind), instantiated with constants so
+ * the kind switches are decided once rather than per element; the storage
+ * tests stay, since the callee may box or shrink the very list being mapped.
+ * What is left per element is the staleness test, the load, the call and the
+ * store.
+ *
+ * The frame count is read once: a call that returns with a zero verdict has
+ * popped every frame it pushed. The result's version is bumped once per run
+ * rather than per store: nothing can be iterating a list map has not
+ * returned yet. */
+/* Kernels by function, so a lambda mapped many times compiles one. Keyed
+ * EXACTLY on (function, result kind), in a table that grows and never
+ * evicts: a direct-mapped cache let two hot lambdas that shared a slot evict
+ * each other on every run, and since the arena only ever grows, each of
+ * those recompiles was code space spent for good -- 24 rotating lambdas
+ * filled it and switched the JIT off for the rest of the process (0.07x on
+ * an unrelated hot loop; tests/lang/test_jit_map_kernel.jai).
+ *
+ * An entry also records the compiled form and module version it was built
+ * for: a recompile or a new global makes the kernel stale with it. A stale
+ * entry compiles again at most MAP_KERNEL_COMPILES times in all, and a
+ * declined body is remembered as NULL and not asked again until its form
+ * changes. The arena only ever grows, so a function freed and another
+ * allocated at its address cannot also match on `jitFunc`; it inherits the
+ * old entry's count, which can cost it a kernel, never an answer. */
+typedef struct {
+    ObjFunction *fn;
+    uint8_t     *jitFunc;
+    uint8_t     *kernel;
+    uint32_t     mv;
+    uint8_t      kind;
+    uint8_t      compiles;
+} MapKernelSlot;
+static MapKernelSlot *gMapKernels;
+static uint32_t       gMapKernelCap;
+static uint32_t       gMapKernelCount;
+
+/* Compiles per (function, kind) over the life of the process, as the
+ * regular tier caps its attempts. */
+#define MAP_KERNEL_COMPILES 4
+
+/* Below this many elements a run calls the body per element: not worth a
+ * compile for a short map, and a long one pays it once. */
+#define MAP_KERNEL_MIN 16
+
+static uint32_t mapKernelHash(const ObjFunction *fn, uint8_t kind) {
+    uint64_t h = ((uint64_t)(uintptr_t)fn >> 4) ^ ((uint64_t)kind << 56);
+    h *= 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(h >> 32);
+}
+
+/* The entry for (fn, kind), inserted empty when absent; NULL only when the
+ * table cannot grow. */
+static MapKernelSlot *mapKernelSlot(ObjFunction *fn, uint8_t kind) {
+    if ((gMapKernelCount + 1) * 2 > gMapKernelCap) {
+        uint32_t cap = gMapKernelCap ? gMapKernelCap * 2 : 64;
+        MapKernelSlot *t = calloc(cap, sizeof *t);
+        if (t == NULL) return NULL;
+        for (uint32_t i = 0; i < gMapKernelCap; i++) {
+            MapKernelSlot *o = &gMapKernels[i];
+            if (o->fn == NULL) continue;
+            uint32_t j = mapKernelHash(o->fn, o->kind) & (cap - 1);
+            while (t[j].fn != NULL) j = (j + 1) & (cap - 1);
+            t[j] = *o;
+        }
+        free(gMapKernels);
+        gMapKernels = t;
+        gMapKernelCap = cap;
+    }
+    uint32_t j = mapKernelHash(fn, kind) & (gMapKernelCap - 1);
+    for (;;) {
+        MapKernelSlot *s = &gMapKernels[j];
+        if (s->fn == fn && s->kind == kind) return s;
+        if (s->fn == NULL) {
+            s->fn = fn;
+            s->kind = kind;
+            s->jitFunc = NULL;
+            s->kernel = NULL;
+            s->compiles = 0;
+            s->mv = 0;
+            gMapKernelCount++;
+            return s;
+        }
+        j = (j + 1) & (gMapKernelCap - 1);
+    }
+}
+
+static uint8_t *mapKernelFor(JaiPreparedFn1 *p, Value *base, uint8_t kind) {
+    ObjFunction *fn = p->fn;
+    MapKernelSlot *s = mapKernelSlot(fn, kind);
+    if (s == NULL) return NULL;
+    if (s->compiles > 0 && s->jitFunc == fn->jitFunc &&
+        s->mv == p->moduleVersion) {
+        return s->kernel;
+    }
+    uint8_t *k = NULL;
+    if (s->compiles < MAP_KERNEL_COMPILES) {
+        s->compiles++;
+        k = jaiJitCompileMapKernel(p->closure, base, kind);
+    } else if (getenv("JAI_JIT_WHY")) {
+        fprintf(stderr, "[jit] map kernel for %s: out of compiles\n",
+                jitFnLabel(fn));
+    }
+    s->jitFunc = fn->jitFunc;
+    s->mv = p->moduleVersion;
+    s->kernel = k;
+    return k;
+}
+
+/* As much of the run as a kernel will take, from `from`; `from` itself when
+ * there is no kernel to take it. The body calls nothing, so neither list can
+ * change under it: the arrays and the count are read once. Elements up to the
+ * one it stopped on are stored; a stop with a verdict is that one element's
+ * call, finished as any bailed call is. */
+static int mapRunKernel(JaiPreparedFn1 *p, ObjList *src, int from,
+                        ObjList *dst, bool *ok, Value *base, int frameBase,
+                        SlotKind pk, SlotKind rk, uint8_t rawStg,
+                        bool *took) {
+    *took = false;
+    if (rk != SLOT_INT && rk != SLOT_FLOAT) return from;
+    uint8_t want = pk == SLOT_INT ? (uint8_t)LIST_STORE_I64
+                                  : (uint8_t)LIST_STORE_F64;
+    if (src->stg != want || dst->stg != rawStg || dst->count != from ||
+        dst->capacity < src->count || src->count - from < MAP_KERNEL_MIN ||
+        p->fn->jitFunc != p->entry ||
+        p->fn->module->version != p->moduleVersion ||
+        !jaiJitMapKernelOn()) {
+        return from;
+    }
+    uint8_t *kernel = mapKernelFor(p, base, (uint8_t)rk);
+    if (kernel == NULL) return from;
+    *took = true;
+    gJitMapRun.src = src->items;
+    gJitMapRun.dst = dst->items;
+    gJitMapRun.i = from;
+    gJitMapRun.n = src->count;
+    JitResult r = ((Fn1)(uintptr_t)kernel)(0);
+    int at = (int)gJitMapRun.i;
+    dst->count = at;
+    dst->version++;
+    if (JAI_LIKELY(r.bailed == 0)) {
+        vm.stackTop = base;
+        return at;
+    }
+    /* The window a rerun reads its argument from. */
+    memcpy(&base[1].as, &((const int64_t *)src->items)[at], sizeof(int64_t));
+    return mapRunBailed(p, dst, r, base, frameBase, at, ok);
+}
+
+JAI_INLINE int mapRunLoop(JaiPreparedFn1 *p, ObjList *src, int from,
+                          ObjList *dst, bool *ok, Value *base,
+                          SlotKind pk, SlotKind rk, uint8_t rawStg) {
+    ObjFunction *fn = p->fn;
+    void *entry = p->entry;
+    uint32_t mv = p->moduleVersion;
+    int frameBase = vm.frameCount;
+    bool took;
+    int k = mapRunKernel(p, src, from, dst, ok, base, frameBase, pk, rk,
+                         rawStg, &took);
+    if (took) return k;
+    int i = from;
+    for (; i < src->count; i++) {
+        if (JAI_UNLIKELY(fn->jitFunc != entry ||
+                         fn->module->version != mv)) {
+            break;
+        }
+        int64_t a0;
+        uint8_t stg = src->stg;
+        if (pk == SLOT_INT && stg == (uint8_t)LIST_STORE_I64) {
+            a0 = ((const int64_t *)src->items)[i];
+        } else if (pk == SLOT_FLOAT && stg == (uint8_t)LIST_STORE_F64) {
+            memcpy(&a0, &((const double *)src->items)[i], sizeof a0);
+        } else if (stg == (uint8_t)LIST_STORE_BOXED) {
+            Value v = ((const Value *)src->items)[i];
+            if (pk == SLOT_INT ? !IS_INT(v) : !IS_FLOAT(v)) break;
+            memcpy(&a0, &v.as, sizeof a0);
+        } else {
+            break;
+        }
+        base[1].as.integer = a0;
+        JitResult r = ((Fn1)(uintptr_t)entry)(a0);
+        if (JAI_UNLIKELY(r.bailed != 0)) {
+            dst->version++;
+            return mapRunBailed(p, dst, r, base, frameBase, i, ok);
+        }
+        int at = dst->count;
+        if (JAI_LIKELY(at < dst->capacity && dst->stg == rawStg)) {
+            if (rk == SLOT_INT) {
+                ((int64_t *)dst->items)[at] = r.value;
+            } else if (rk == SLOT_FLOAT) {
+                memcpy(&((double *)dst->items)[at], &r.value, sizeof(double));
+            } else {
+                ((uint8_t *)dst->items)[at] = r.value != 0;
+            }
+            dst->count = at + 1;
+        } else {
+            Value mapped;
+            if (rk == SLOT_INT) {
+                mapped = INT_VAL(r.value);
+            } else if (rk == SLOT_FLOAT) {
+                double d;
+                memcpy(&d, &r.value, sizeof d);
+                mapped = FLOAT_VAL(d);
+            } else {
+                mapped = BOOL_VAL(r.value != 0);
+            }
+            if (at < dst->capacity) {
+                jaiListPut(dst, dst->count++, mapped);
+            } else {
+                jaiListPush(dst, mapped);
+            }
+        }
+        if (JAI_UNLIKELY(vm.hasException)) {
+            dst->version++;
+            vm.stackTop = base;
+            *ok = false;
+            return i + 1;
+        }
+    }
+    dst->version++;
+    vm.stackTop = base;
+    return i;
+}
+
 int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
                          ObjList *dst, bool *ok) {
     *ok = true;
@@ -723,15 +996,42 @@ int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
     if (rk != SLOT_INT && rk != SLOT_FLOAT && rk != SLOT_BOOL) return from;
     void *entry = p->entry;
     uint32_t mv = p->moduleVersion;
+    /* The result storage that takes this kind as it is, if any. */
+    uint8_t rawStg = rk == SLOT_INT   ? (uint8_t)LIST_STORE_I64
+                   : rk == SLOT_FLOAT ? (uint8_t)LIST_STORE_F64
+                                      : (uint8_t)LIST_STORE_U8;
+    /* Before the window is built: this allocates, and so may collect. */
+    (void)jaiListShapeFor(dst, rawStg);
     Value *base = vm.stackTop;
     if (base > p->limit) return from;
     base[0] = p->callee;
     base[1] = pk == SLOT_INT ? INT_VAL(0) : FLOAT_VAL(0.0);
     vm.stackTop = base + 2;
-    /* The result storage that takes this kind as it is, if any. */
-    uint8_t rawStg = rk == SLOT_INT   ? (uint8_t)LIST_STORE_I64
-                   : rk == SLOT_FLOAT ? (uint8_t)LIST_STORE_F64
-                                      : (uint8_t)LIST_STORE_U8;
+
+    if (mapRunTightOn()) {
+        if (pk == SLOT_INT) {
+            if (rk == SLOT_INT) {
+                return mapRunLoop(p, src, from, dst, ok, base, SLOT_INT,
+                                  SLOT_INT, (uint8_t)LIST_STORE_I64);
+            }
+            if (rk == SLOT_FLOAT) {
+                return mapRunLoop(p, src, from, dst, ok, base, SLOT_INT,
+                                  SLOT_FLOAT, (uint8_t)LIST_STORE_F64);
+            }
+            return mapRunLoop(p, src, from, dst, ok, base, SLOT_INT,
+                              SLOT_BOOL, (uint8_t)LIST_STORE_U8);
+        }
+        if (rk == SLOT_INT) {
+            return mapRunLoop(p, src, from, dst, ok, base, SLOT_FLOAT,
+                              SLOT_INT, (uint8_t)LIST_STORE_I64);
+        }
+        if (rk == SLOT_FLOAT) {
+            return mapRunLoop(p, src, from, dst, ok, base, SLOT_FLOAT,
+                              SLOT_FLOAT, (uint8_t)LIST_STORE_F64);
+        }
+        return mapRunLoop(p, src, from, dst, ok, base, SLOT_FLOAT,
+                          SLOT_BOOL, (uint8_t)LIST_STORE_U8);
+    }
 
     int i = from;
     for (; i < src->count; i++) {
@@ -773,37 +1073,7 @@ int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
                 mapped = BOOL_VAL(r.value != 0);
             }
         } else {
-            JaiJitOutcome outcome = jitResultOut(fn, r, base);
-            bool good;
-            if (outcome == JAI_JIT_DONE) {
-                mapped = base[0];
-                good = true;
-            } else if (outcome == JAI_JIT_ERROR) {
-                good = false;
-            } else if (outcome == JAI_JIT_DEOPT) {
-                good = jaiFinishJitDeopt1(p->closure, base, frameBase,
-                                          &mapped);
-            } else {
-                good = callFn1Rerun(base, &mapped);
-            }
-            vm.stackTop = base;
-            if (!good) {
-                *ok = false;
-                return i;
-            }
-            /* Another kind, perhaps, and the window is gone: store it the
-             * ordinary way and hand the rest back to the caller, which will
-             * prepare again before the next run. */
-            if (JAI_LIKELY(dst->count < dst->capacity)) {
-                jaiListPut(dst, dst->count++, mapped);
-            } else {
-                jaiGCPushRoot(mapped);
-                jaiListPush(dst, mapped);
-                jaiGCPopRoot();
-            }
-            dst->version++;
-            if (vm.hasException) *ok = false;
-            return i + 1;
+            return mapRunBailed(p, dst, r, base, frameBase, i, ok);
         }
         /* Into the result at whichever width it has, without jaiListPut's
          * four-way switch: boxed is what jaiListNew made, and the one unboxed
@@ -840,6 +1110,108 @@ int jaiMapPreparedFn1Run(JaiPreparedFn1 *p, ObjList *src, int from,
  * Anything else stops the run; a call that comes back with a non-zero verdict
  * is finished as jaiCallPreparedFn1 finishes it and its answer checked as
  * callPredicate checks it. */
+/* A filter call that came back with a non-zero verdict: finished as
+ * jaiCallPreparedFn1 finishes it, its answer checked as callPredicate checks
+ * it, and `item` kept on a true one. The rest goes back to the caller. */
+static JAI_NOINLINE int filterRunBailed(JaiPreparedFn1 *p, ObjList *dst,
+                                        JitResult r, Value *base,
+                                        int frameBase, int i, Value item,
+                                        bool *ok) {
+    Value verdict;
+    JaiJitOutcome outcome = jitResultOut(p->fn, r, base);
+    bool good;
+    if (outcome == JAI_JIT_DONE) {
+        verdict = base[0];
+        good = true;
+    } else if (outcome == JAI_JIT_ERROR) {
+        good = false;
+    } else if (outcome == JAI_JIT_DEOPT) {
+        good = jaiFinishJitDeopt1(p->closure, base, frameBase, &verdict);
+    } else {
+        good = callFn1Rerun(base, &verdict);
+    }
+    vm.stackTop = base;
+    if (good && !IS_BOOL(verdict)) {
+        (void)jaiThrow(vm.cTypeError,
+                       "list.filter(): the predicate must return "
+                       "bool, not %s", jaiTypeNameStatic(verdict));
+        good = false;
+    }
+    if (!good) {
+        *ok = false;
+        return i;
+    }
+    if (AS_BOOL(verdict)) jaiListPush(dst, item);
+    if (vm.hasException) *ok = false;
+    return i + 1;
+}
+
+/* The filter run through a kernel (jaiJitCompileMapKernel with a bool
+ * result): every element whose verdict is true copied into the result in one
+ * call, the result first given the source's own storage and room for every
+ * element left, since it can keep no more than that. As for a map, the body
+ * calls nothing, so neither list changes under it, and an element the kernel
+ * stops on with a verdict is that element's call, finished as any bailed
+ * call is. */
+static int filterRunKernel(JaiPreparedFn1 *p, ObjList *src, int from,
+                           ObjList *dst, bool *ok, Value *base,
+                           SlotKind pk, bool *took) {
+    *took = false;
+    uint8_t want = pk == SLOT_INT ? (uint8_t)LIST_STORE_I64
+                                  : (uint8_t)LIST_STORE_F64;
+    if (src->stg != want || src->count - from < MAP_KERNEL_MIN ||
+        p->fn->jitFunc != p->entry ||
+        p->fn->module->version != p->moduleVersion ||
+        !jaiJitMapKernelOn()) {
+        return from;
+    }
+    uint8_t *kernel = mapKernelFor(p, base, (uint8_t)SLOT_BOOL);
+    if (kernel == NULL) return from;
+    /* May allocate, and so collect: the window is on the VM stack, the
+     * source is the receiver and the result is rooted by listFilter. */
+    if (!jaiListShapeFor(dst, want)) return from;
+    int need = dst->count + (src->count - from);
+    if (need > dst->capacity) jaiListReserve(dst, need);
+    if (dst->capacity < need || dst->stg != want) return from;
+    *took = true;
+    int frameBase = vm.frameCount;
+    gJitMapRun.src = src->items;
+    gJitMapRun.dst = dst->items;
+    gJitMapRun.i = from;
+    gJitMapRun.n = src->count;
+    gJitMapRun.j = dst->count;
+    JitResult r = ((Fn1)(uintptr_t)kernel)(0);
+    int at = (int)gJitMapRun.i;
+    dst->count = (int)gJitMapRun.j;
+    dst->version++;
+    if (JAI_LIKELY(r.bailed == 0)) {
+        vm.stackTop = base;
+        /* The room for every element is a guess at the top: a filter that
+         * kept a few of a million would hold 8 MB for each result it
+         * returned, and the collector would count every byte of it. A
+         * shrink allocates nothing, so it cannot collect. */
+        if (dst->capacity - dst->count > 1024 &&
+            dst->capacity > 2 * dst->count) {
+            size_t w = jaiListStoreWidth(dst->stg);
+            dst->items = jaiRealloc(dst->items, w * (size_t)dst->capacity,
+                                    w * (size_t)dst->count);
+            dst->capacity = dst->count;
+        }
+        return at;
+    }
+    int64_t bits = ((const int64_t *)src->items)[at];
+    Value item;
+    if (pk == SLOT_INT) {
+        item = INT_VAL(bits);
+    } else {
+        double d;
+        memcpy(&d, &bits, sizeof d);
+        item = FLOAT_VAL(d);
+    }
+    base[1].as.integer = bits;
+    return filterRunBailed(p, dst, r, base, frameBase, at, item, ok);
+}
+
 int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
                          ObjList *dst, bool *ok) {
     *ok = true;
@@ -858,6 +1230,12 @@ int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
     base[0] = p->callee;
     base[1] = pk == SLOT_INT ? INT_VAL(0) : FLOAT_VAL(0.0);
     vm.stackTop = base + 2;
+
+    if (mapRunTightOn()) {
+        bool took;
+        int k = filterRunKernel(p, src, from, dst, ok, base, pk, &took);
+        if (took) return k;
+    }
 
     int i = from;
     for (; i < src->count; i++) {
@@ -888,34 +1266,7 @@ int jaiFilterPreparedFn1(JaiPreparedFn1 *p, ObjList *src, int from,
         if (JAI_LIKELY(r.bailed == 0)) {
             keep = r.value != 0;
         } else {
-            Value verdict;
-            JaiJitOutcome outcome = jitResultOut(fn, r, base);
-            bool good;
-            if (outcome == JAI_JIT_DONE) {
-                verdict = base[0];
-                good = true;
-            } else if (outcome == JAI_JIT_ERROR) {
-                good = false;
-            } else if (outcome == JAI_JIT_DEOPT) {
-                good = jaiFinishJitDeopt1(p->closure, base, frameBase,
-                                          &verdict);
-            } else {
-                good = callFn1Rerun(base, &verdict);
-            }
-            vm.stackTop = base;
-            if (good && !IS_BOOL(verdict)) {
-                (void)jaiThrow(vm.cTypeError,
-                               "list.filter(): the predicate must return "
-                               "bool, not %s", jaiTypeNameStatic(verdict));
-                good = false;
-            }
-            if (!good) {
-                *ok = false;
-                return i;
-            }
-            if (AS_BOOL(verdict)) jaiListPush(dst, item);
-            if (vm.hasException) *ok = false;
-            return i + 1;
+            return filterRunBailed(p, dst, r, base, frameBase, i, item, ok);
         }
         if (keep) {
             jaiListPush(dst, item);
