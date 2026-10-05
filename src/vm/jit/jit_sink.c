@@ -677,6 +677,10 @@ void sinkEmitSync(Emit *e) {
             unsigned at = base +
                           (unsigned)offsetof(__typeof__(gDeopt.sinks[0]), fields) +
                           f * (unsigned)sizeof(Value);
+            /* Pinned `refuses` in tests/vm/jit_kind_tag.manifest: planSinks
+             * admits only int and float fields, storeConstruction only an
+             * argument of exactly that kind, and the entry check only an
+             * object whose tags say so, so no other kind reaches this. */
             unsigned tag = e->sink[j].kind[f] == SLOT_FLOAT ? VAL_FLOAT : VAL_INT;
             emit(e, jaiA64MovzX(JIT_SCRATCH_B, tag, 0));
             emit(e, jaiA64StrW(JIT_SCRATCH_B, JIT_SCRATCH_A, at));
