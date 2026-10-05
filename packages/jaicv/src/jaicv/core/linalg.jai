@@ -135,19 +135,21 @@ pub fn solve_least_squares(a: Mat, b: Mat) -> Mat {
 pub fn symmetric_eigen(a: Mat) -> tuple[list[float], Mat] {
     if a.rows != a.cols { throw ValueError("only a square matrix has eigenvectors here") }
     let n = a.rows
-    let source = a.values()
-    var m: list[list[float]] = []
-    for row in 0..n {
-        var line: list[float] = []
-        for column in 0..n { line.push(source[row * n + column]) }
-        m.push(line)
-    }
-    var v: list[list[float]] = []
-    for row in 0..n {
-        var line: list[float] = []
-        for column in 0..n { line.push(if row == column { 1.0 } else { 0.0 }) }
-        v.push(line)
-    }
+    let (values, vectors) = symmetric_eigen_of(a.values(), n)
+    return (values, Mat.from_list(n, n, CV_MAKETYPE(CV_32F, 1), vectors))
+}
+
+#: `symmetric_eigen` over a plain row-major list in double precision, with the
+#: eigenvectors as rows of a row-major list.
+#:
+#: The rotations work on flat row-major lists, each step in a function of its
+#: own: written as one body over lists of rows, it had more loops than the
+#: tier records and ran interpreted, which a RANSAC calling it two thousand
+#: times a fit could not afford. The arithmetic and its order are unchanged.
+pub fn symmetric_eigen_of(source: list[float], n: int) -> tuple[list[float], list[float]] {
+    var m: list[float] = []
+    var v: list[float] = []
+    _eigen_start(source, n, m, v)
 
     #: Enough rotations for the matrix in hand, not a hundred.
     #:
@@ -160,61 +162,83 @@ pub fn symmetric_eigen(a: Mat) -> tuple[list[float], Mat] {
     #: sizes that were reaching it.
     let sweeps = max(100, 12 * n * (n - 1) // 2)
     for _sweep in 0..sweeps {
-        var largest = 0.0
-        var p = 0
-        var q = 1
-        for row in 0..n {
-            for column in row + 1..n {
-                let size = math.fabs(m[row][column])
-                if size > largest {
-                    largest = size
-                    p = row
-                    q = column
-                }
-            }
-        }
-        if largest < 1e-14 or n < 2 { break }
-
-        let app = m[p][p]
-        let aqq = m[q][q]
-        let apq = m[p][q]
-        let theta = 0.5 * math.atan2(2.0 * apq, app - aqq)
-        let c = math.cos(theta)
-        let s = math.sin(theta)
-
-        for k in 0..n {
-            let mkp = m[k][p]
-            let mkq = m[k][q]
-            m[k][p] = c * mkp + s * mkq
-            m[k][q] = -s * mkp + c * mkq
-        }
-        for k in 0..n {
-            let mpk = m[p][k]
-            let mqk = m[q][k]
-            m[p][k] = c * mpk + s * mqk
-            m[q][k] = -s * mpk + c * mqk
-        }
-        for k in 0..n {
-            let vkp = v[k][p]
-            let vkq = v[k][q]
-            v[k][p] = c * vkp + s * vkq
-            v[k][q] = -s * vkp + c * vkq
-        }
+        if n < 2 { break }
+        let at = _largest_off_diagonal(m, n)
+        if at < 0 { break }
+        _jacobi_rotate(m, v, n, at // n, at % n)
     }
 
     var order: list[int] = []
     for index in 0..n {
         var at = order.len()
-        while at > 0 and m[index][index] > m[order[at - 1]][order[at - 1]] { at -= 1 }
+        while at > 0 and m[index * n + index] > m[order[at - 1] * n + order[at - 1]] { at -= 1 }
         order.insert(at, index)
     }
     var values: list[float] = []
     var vectors: list[float] = []
     for index in order {
-        values.push(m[index][index])
-        for row in 0..n { vectors.push(v[row][index]) }
+        values.push(m[index * n + index])
+        for row in 0..n { vectors.push(v[row * n + index]) }
     }
-    return (values, Mat.from_list(n, n, CV_MAKETYPE(CV_32F, 1), vectors))
+    return (values, vectors)
+}
+
+#: Copy `source` into `m` and make `v` the identity, both flat.
+fn _eigen_start(source: list[float], n: int, m: list[float], v: list[float]) -> void {
+    for index in 0..n * n {
+        m.push(source[index])
+        let row = index // n
+        v.push(if index - row * n == row { 1.0 } else { 0.0 })
+    }
+}
+
+#: Where the largest off-diagonal entry above the diagonal is, as
+#: `row * n + column` -- the first of equal ones in row order -- or -1 once it
+#: is negligible.
+fn _largest_off_diagonal(m: list[float], n: int) -> int {
+    var largest = 0.0
+    var p = 0
+    var q = 1
+    for row in 0..n {
+        for column in row + 1..n {
+            let size = math.fabs(m[row * n + column])
+            if size > largest {
+                largest = size
+                p = row
+                q = column
+            }
+        }
+    }
+    if largest < 1e-14 { return -1 }
+    return p * n + q
+}
+
+#: One Jacobi rotation zeroing `m[p][q]`, carried into the eigenvectors `v`.
+fn _jacobi_rotate(m: list[float], v: list[float], n: int, p: int, q: int) -> void {
+    let app = m[p * n + p]
+    let aqq = m[q * n + q]
+    let apq = m[p * n + q]
+    let theta = 0.5 * math.atan2(2.0 * apq, app - aqq)
+    let c = math.cos(theta)
+    let s = math.sin(theta)
+    for k in 0..n {
+        let mkp = m[k * n + p]
+        let mkq = m[k * n + q]
+        m[k * n + p] = c * mkp + s * mkq
+        m[k * n + q] = -s * mkp + c * mkq
+    }
+    for k in 0..n {
+        let mpk = m[p * n + k]
+        let mqk = m[q * n + k]
+        m[p * n + k] = c * mpk + s * mqk
+        m[q * n + k] = -s * mpk + c * mqk
+    }
+    for k in 0..n {
+        let vkp = v[k * n + p]
+        let vkq = v[k * n + q]
+        v[k * n + p] = c * vkp + s * vkq
+        v[k * n + q] = -s * vkp + c * vkq
+    }
 }
 
 #: The direction that `a x` sends closest to zero.
@@ -223,13 +247,40 @@ pub fn symmetric_eigen(a: Mat) -> tuple[list[float], Mat] {
 #: the eigenvector of `aᵀa` with the smallest eigenvalue. Every homogeneous fit
 #: in geometry — a homography, a fundamental matrix, a conic — ends here.
 pub fn null_space(a: Mat) -> list[float] {
-    let normal = matmul(transpose(a), a)
+    let turned = transpose(a)
+    let normal = matmul(turned, a)
+    turned.release()
     let (_values, vectors) = symmetric_eigen(normal)
     let n = normal.rows
     let flat = vectors.values()
+    normal.release()
+    vectors.release()
     var out: list[float] = []
     for column in 0..n { out.push(flat[(n - 1) * n + column]) }
     return out
+}
+
+#: `null_space` of a `rows` by `cols` row-major list, in double precision and
+#: without a matrix: for a fit run thousands of times, such as every round of
+#: a RANSAC, where each matrix is a device buffer to fill and read back.
+pub fn null_space_of(a: list[float], rows: int, cols: int) -> list[float] {
+    var normal: list[float] = []
+    _gram(a, rows, cols, normal)
+    let (_values, vectors) = symmetric_eigen_of(normal, cols)
+    var out: list[float] = []
+    for column in 0..cols { out.push(vectors[(cols - 1) * cols + column]) }
+    return out
+}
+
+#: `aᵀa` of a `rows` by `cols` row-major list, appended to `normal` row-major.
+fn _gram(a: list[float], rows: int, cols: int, normal: list[float]) -> void {
+    for index in 0..cols * cols {
+        let i = index // cols
+        let j = index - i * cols
+        var total = 0.0
+        for r in 0..rows { total += a[r * cols + i] * a[r * cols + j] }
+        normal.push(total)
+    }
 }
 
 #: Singular value decomposition, as `(u, s, vt)` with `a = u diag(s) vt`.
