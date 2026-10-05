@@ -142,6 +142,17 @@ if [[ -x "$ROOT/tests/vm/hoist_rare_site.sh" ]]; then
     done <<< "$rare_output"
 fi
 
+if [[ -x "$ROOT/tests/vm/shrink_wrap.sh" ]]; then
+    shrink_output="$(JAITHON="$JAITHON" "$ROOT/tests/vm/shrink_wrap.sh" 2>&1)"
+    while IFS= read -r line; do
+        case "$line" in
+            "ok "*)   name="shrink_wrap: ${line#ok }"
+                      matches_filter "$name" && record_pass "$name" 0 ;;
+            "FAIL "*) record_fail "shrink_wrap: ${line#FAIL }" "" ;;
+        esac
+    done <<< "$shrink_output"
+fi
+
 # ---------------------------------------------------------------- 2. golden
 printf '%sGolden tests%s\n' "$BOLD" "$RESET"
 

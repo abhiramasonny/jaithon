@@ -348,12 +348,20 @@ static bool fpHomeWanted(const Emit *m, unsigned base, unsigned locals) {
 
 /* JAITHON_JIT_FN_HOIST: hoist loop-invariant list headers in the
  * function tier as well as the loop tier. */
-/* JAITHON_JIT_SHRINK_WRAP: see emitEarlyReturnArm. Default on. */
+/* JAITHON_JIT_SHRINK_WRAP=1: see emitEarlyReturnArm. Default OFF. The arm
+ * wins 1.17-1.25x on fib, hanoi and `1 + tri(n-1) + tri(n-2)`, and loses
+ * 5-11% on grid paths, binomial, collatz and `tri(n-1) + tri(n-2) + 1`: the
+ * calls that build the frame take a branch at their first instruction, and
+ * which shapes pay for it more than the leaves save is not something the
+ * walk can see (moving the `+ 1` flips the sign). It is stable under
+ * padding, so it is not a layout artefact. Laying the arm out after the
+ * body instead made every result swing +/-11% with a 4-byte shift of the
+ * body. */
 static bool jitShrinkWrap(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_SHRINK_WRAP");
-        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+        cached = (v != NULL && v[0] == '1') ? 1 : 0;
     }
     return cached != 0;
 }
