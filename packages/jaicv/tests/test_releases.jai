@@ -20,6 +20,7 @@ from jaicv.core.types import Point2f
 from jaicv.imgproc.geometric import get_rotation_matrix_2d, warp_affine
 from jaicv.imgproc.hist import equalize_hist
 from jaicv.imgproc.misc import phase_correlate
+from jaicv.calib3d.calibrate import undistort
 from jaicv.imgproc.morph import get_structuring_element, morphology_ex, MORPH_RECT
 from jaicv.imgproc.threshold import adaptive_threshold
 from jaicv.photo.denoise import detail_enhance, edge_preserving_filter
@@ -138,6 +139,8 @@ fn test_arithmetic_statistics_and_matching_release_their_intermediates() -> void
     assert_eq(growth_of_points(|| int(norm(colour, norm_type: cv.NORM_INF))), 0)
     assert_eq(growth_of_points(|| cv.hough_circles(bytes, 1.0, 10.0, 100.0, 30.0, 5, 20).len()), 0)
     assert_eq(growth_of_points(|| int(phase_correlate(grey, other)[1] * 1000.0)), 0)
+    let camera = Mat.from_list(3, 3, cv.CV_32FC1, [50.0, 0.0, 32.0, 0.0, 50.0, 24.0, 0.0, 0.0, 1.0])
+    assert_eq(growth(|| undistort(bytes, camera, [-0.2, 0.05, 0.001, -0.001, 0.0])), 0)
     grey.release()
     other.release()
     colour.release()
