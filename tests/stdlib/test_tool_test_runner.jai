@@ -90,11 +90,7 @@ fn test_a_test_reading_stdin_sees_end_of_input() -> void {
 #: The second run starts files in the order the first one's timings suggest;
 #: what it prints must not depend on that order.
 fn test_a_run_ordered_by_recorded_times_prints_the_same() -> void {
-    let files = {
-        "test_one.jai": PASSING,
-        "test_two.jai": PASSING,
-        "test_three.jai": PASSING,
-    }
+    let files = {"test_one.jai": PASSING, "test_two.jai": PASSING, "test_three.jai": PASSING}
     let root = _suite("again", files)
     let first = _run_test(["--jobs=3", "--verbose", root])
     let recorded = Path(root).join("__jaicache__").join("test_times").exists()

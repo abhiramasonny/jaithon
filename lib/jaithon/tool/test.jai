@@ -532,12 +532,15 @@ class _History {
                     history.times[full] = int(fields[0])
                     if fields[1] == "x" { history.exec_only.add(full) }
                 }
-            } catch _error: Error { }
+            } catch _error: Error {
+            }
         }
         return history
     }
 
-    static fn file_of(dir: str) -> str { return Path(dir).join("__jaicache__").join("test_times").text }
+    static fn file_of(dir: str) -> str {
+        return Path(dir).join("__jaicache__").join("test_times").text
+    }
 
     #: Path indexes, longest recorded first; files with no record keep their
     #: place ahead of every recorded one, so a first run is in path order.
@@ -600,7 +603,8 @@ class _History {
                 let staging = target + "." + str(__prim__.time_wall())
                 Path(staging).write_text("\n".join(lines.sorted()) + "\n")
                 __prim__.io_rename(staging, target)
-            } catch _error: Error { }
+            } catch _error: Error {
+            }
         }
     }
 }
@@ -636,7 +640,8 @@ fn _run_child(path: str, options: _Options) -> void {
 fn _warm_for_children() -> void {
     try {
         __prim__.exec("from std.test import assert_eq\nlet _ = assert_eq\n", "<test warm-up>")
-    } catch _error: Error { }
+    } catch _error: Error {
+    }
 }
 
 #: A fresh directory under the temp dir for the children's output files.
@@ -649,7 +654,8 @@ fn _scratch_dir() -> str {
             try {
                 Path(candidate).mkdir()
                 return candidate
-            } catch _error: Error { }
+            } catch _error: Error {
+            }
         }
         attempt += 1
     }
@@ -666,7 +672,8 @@ fn _take_file(path: str) -> str {
 fn _remove_quietly(path: Path, recursive: bool) -> void {
     try {
         path.remove(recursive)
-    } catch _error: Error { }
+    } catch _error: Error {
+    }
 }
 
 pub fn main(args: list[str]) -> int {
