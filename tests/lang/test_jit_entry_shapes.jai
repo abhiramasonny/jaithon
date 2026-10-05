@@ -8,7 +8,7 @@
 #: JAITHON_NO_JIT=1 proves the expectations and JAITHON_JIT_LEAN_ENTRY=0 the
 #: old path; JAITHON_JIT_THRESHOLD=1 and JAITHON_JIT_DEOPT_STRESS=1 drive the
 #: entry and resume arms on every call.
-from std.test import assert_eq
+from std.test import assert_eq, assert_throws
 
 fn zero() -> int { return 7 }
 
@@ -80,4 +80,31 @@ fn test_deep_recursion_through_the_entry() {
         return fib(n - 1) + fib(n - 2)
     }
     assert_eq(fib(20), 6765)
+}
+
+fn bump(a: int) -> int { return a + 1 }
+
+fn add_up(xs: list, n: int) -> int {
+    var t = 0
+    for i in 0..n { t = t + xs[i] }
+    return t
+}
+
+fn test_a_body_that_bails_after_entry() {
+    var s = 0
+    for i in 0..300 { s = s + bump(i) }
+    assert_eq(s, 45150)
+    assert_throws(OverflowError, fn() -> void { bump(9223372036854775807) },
+                  "an add past the largest int, inside a compiled body")
+    let ints = [1, 2, 3, 4]
+    var t = 0
+    for i in 0..300 { t = t + add_up(ints, 4) }
+    assert_eq(t, 3000)
+    #: Same list, same entry: the element read inside the body is what
+    #: changes, so the body leaves through a deopt, not a decline at entry.
+    let mixed: list = [1, 2, 3, 4]
+    mixed[2] = "x"
+    assert_throws(TypeError, fn() -> void { add_up(mixed, 4) },
+                  "an element that is no longer an int")
+    assert_eq(add_up(mixed, 2), 3)
 }
