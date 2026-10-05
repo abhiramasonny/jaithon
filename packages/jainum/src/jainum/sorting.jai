@@ -652,6 +652,16 @@ fn _run_network(
     }
 }
 
+#: Whether the block kernel gets its whole group on this device. Dispatch
+#: clamps a group to the pipeline's limit, which register pressure sets, and a
+#: clamped block would leave rows partly sorted without an error; such a
+#: device keeps the network.
+fn _blocks_fit(carry: bool) -> bool {
+    let entry = if carry { "nds_row_argsort" } else { "nds_row_sort" }
+    let threads = if carry { ROW_SORT_MAX // 8 } else { ROW_SORT_MAX // 16 }
+    return kernel_of(SOURCE, entry).max_group_size() >= threads
+}
+
 #: The network by blocks of ROW_SORT_MAX slots, over a [rows, padded]
 #: workspace whose slots it seeds itself. See `nds_row_sort`.
 #:
@@ -801,7 +811,7 @@ fn _sort_into(a: NDArray, at: int, descending: bool, out: NDArray, order: NDArra
     #: second allocation, and never writes through the alias.
     var slots = work
     if carry { slots = NDArray([rows, padded], INT32) }
-    if _ROW_SORT {
+    if _ROW_SORT and _blocks_fit(carry) {
         _run_blocks(work, slots, rows, padded, descending, carry)
     } else {
         if carry {
