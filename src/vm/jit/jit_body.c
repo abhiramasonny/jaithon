@@ -163,6 +163,12 @@ static bool inlineFieldRead(Emit *e, ObjFunction *fn, const uint8_t *code,
             e->whyNot = "an inlined body reading a local it never bound";
             return false;
         }
+        /* A parameter bound to a sunk instance (jit_sink.c). */
+        if ((unsigned)e->inlSlot[a] < e->depth &&
+            e->stack[e->inlSlot[a]] == SLOT_VREF) {
+            return sinkFieldRead(e, e->stackSunk[e->inlSlot[a]] - 1u, fn,
+                                 jaiReadU24(code + off + 3));
+        }
         if (!pushCopyOfEntry(e, (unsigned)e->inlSlot[a])) return false;
         memcpy(synth + 1, code + off + 3, 5);   /* u24 name, u16 cache */
     } else {

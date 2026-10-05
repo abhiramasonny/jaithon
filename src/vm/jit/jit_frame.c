@@ -597,6 +597,7 @@ bool deoptRecordAt(Emit *e, uint32_t ip, bool lastFromDesc,
     noteDeoptBorrows(e, k);
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].sunk[i]    = e->stack[i] == SLOT_VREF ? e->stackSunk[i] : 0;
         e->deopt[k].classes[i] = e->stackClass[i];
     }
     *out = k;
@@ -644,6 +645,7 @@ int deoptRecordNow(Emit *e) {
     noteDeoptBorrows(e, k);
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].sunk[i]    = e->stack[i] == SLOT_VREF ? e->stackSunk[i] : 0;
         e->deopt[k].classes[i] = e->stackClass[i];
     }
     return (int)k;
@@ -677,6 +679,7 @@ void branchOnDeopt(Emit *e, unsigned cond) {
     noteDeoptBorrows(e, k);
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].sunk[i]    = e->stack[i] == SLOT_VREF ? e->stackSunk[i] : 0;
         e->deopt[k].classes[i] = e->stackClass[i];
     }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
@@ -752,6 +755,7 @@ void branchOnDeoptInstStart(Emit *e, unsigned cond) {
     e->deopt[k].fpBorrow     = 0;
     for (unsigned i = 0; i < e->deopt[k].depth; i++) {
         e->deopt[k].kinds[i]   = e->stack[i];
+        e->deopt[k].sunk[i]    = e->stack[i] == SLOT_VREF ? e->stackSunk[i] : 0;
         e->deopt[k].classes[i] = e->stackClass[i];
     }
     bool always = jitDeoptStress();

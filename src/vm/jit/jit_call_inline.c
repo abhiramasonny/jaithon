@@ -218,6 +218,16 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
 static bool inlineFieldOf(const Emit *e, int idx, const ObjFunction *cfn,
                           uint32_t nameIdx) {
     if (idx < 0 || (unsigned)idx >= e->depth) return false;
+    /* A sunk instance: every field it has is in its home (jit_sink.c). */
+    if (e->stack[idx] == SLOT_VREF) {
+        unsigned j = e->stackSunk[idx] - 1u;
+        if (j >= e->sinkCount) return false;
+        if (nameIdx >= (uint32_t)cfn->chunk.constants.count) return false;
+        Value vn = cfn->chunk.constants.data[nameIdx];
+        if (!IS_STRING(vn)) return false;
+        const FieldInfo *vf = jaiClassFieldInfo(e->sink[j].cls, AS_STRING(vn));
+        return vf != NULL && !vf->isStatic && vf->slot < e->sink[j].nfields;
+    }
     if (e->stack[idx] != SLOT_INST) return false;
     ObjClass *klass = e->stackClass[idx];
     if (klass == NULL) return false;
@@ -319,7 +329,10 @@ bool inlineMethodCall(Emit *e, ObjFunction *caller, ObjClosure *method,
     if (!jitInlineMethodsOn()) return false;
     if (e->depth < argc + 1u) return false;
     unsigned ridx = e->depth - argc - 1u;
-    if (e->stack[ridx] != SLOT_INST || e->stackClass[ridx] == NULL) return false;
+    if ((e->stack[ridx] != SLOT_INST && e->stack[ridx] != SLOT_VREF) ||
+        e->stackClass[ridx] == NULL) {
+        return false;
+    }
     if (method->fn->upvalueCount != 0) return false;
     return inlineCallAt(e, caller, method, argc, callOff, -1, true);
 }
@@ -360,10 +373,18 @@ static bool inlineCallAt(Emit *e, ObjFunction *caller, ObjClosure *callee,
 
     /* Every argument has to be in a register, since that is where the body
      * will read its parameters from -- and for a method, the receiver too. */
+    /* A sunk instance holds none, but its body reads it only by field
+     * (inlineFieldRead), which loads from the instance's home instead. */
     for (unsigned i = 0; i < argc; i++) {
-        if (!holdsRegister(e->stack[cidx + 1u + i])) return false;
+        if (!holdsRegister(e->stack[cidx + 1u + i]) &&
+            e->stack[cidx + 1u + i] != SLOT_VREF) {
+            return false;
+        }
     }
-    if (method && !holdsRegister(e->stack[cidx])) return false;
+    if (method && !holdsRegister(e->stack[cidx]) &&
+        e->stack[cidx] != SLOT_VREF) {
+        return false;
+    }
 
     int savedSlot[JIT_MAX_SLOTS + 1];
     memcpy(savedSlot, e->inlSlot, sizeof savedSlot);

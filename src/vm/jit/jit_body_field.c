@@ -197,6 +197,15 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
         unsigned slot    = jaiReadU16(code + off + 1);
         uint32_t nameIdx = jaiReadU24(code + off + 3);
 
+        /* A sunk local's field is a load from its home (jit_sink.c). */
+        if (slot <= JIT_MAX_SLOTS && e->sinkOf[slot] != 0) {
+            if (!sinkFieldRead(e, e->sinkOf[slot] - 1u, fn, nameIdx)) {
+                return JIT_ARM_REFUSED;
+            }
+            off += 8;
+            break;
+        }
+
         /* A maybe-instance reads like an instance once known not-null. The program has usually just tested
          * it (`if node == null { return 0 }`) but the tier doesn't track that, so the guard stands and costs one compare against zero; a null arriving for real just deopts. */
         if (e->localKind[slot] != SLOT_INST &&
@@ -490,6 +499,15 @@ bool emitGetField(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
          * since it pushes the receiver twice. */
         uint32_t nameIdx = jaiReadU24(code + off + 1);
         if (e->depth == 0) return false;
+        /* A field of a sunk instance (jit_sink.c): the reference holds no
+         * register, so dropping it emits nothing. */
+        if (e->stack[e->depth - 1] == SLOT_VREF) {
+            unsigned j = e->stackSunk[e->depth - 1] - 1u;
+            e->depth--;
+            if (!sinkFieldRead(e, j, fn, nameIdx)) return false;
+            off += 6;
+            break;
+        }
         ObjClass *klass = e->stackClass[e->depth - 1];
         Value seen = e->stackSeen[e->depth - 1];
         int fromLocal = e->stackLocal[e->depth - 1];

@@ -46,6 +46,7 @@ const char *slotKindName(SlotKind k) {
     case SLOT_NULL:       return "null";
     case SLOT_OBJ:        return "object";
     case SLOT_LIST:       return "list";
+    case SLOT_VREF:       return "sunk instance";
     case SLOT_DYNAMIC:    return "dynamic";
     }
     return "an unnamed kind";
@@ -53,7 +54,7 @@ const char *slotKindName(SlotKind k) {
 
 bool holdsRegister(SlotKind k) {
     return k != SLOT_SELF && k != SLOT_CLASS && k != SLOT_FUNC &&
-           k != SLOT_NATIVE;
+           k != SLOT_NATIVE && k != SLOT_VREF;
 }
 
 void emit(Emit *e, uint32_t word) {

@@ -6,6 +6,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "vm/jit/jit_internal.h"
 
 #if (defined(__aarch64__) || defined(__arm64__))
@@ -18,6 +19,13 @@ bool emitGetLocal(Emit *e, const uint8_t *code, int *offp, int stop) {
          * "OP_GET_LOCAL" for two unrelated causes -- one a window the OSR
          * form does not cover, the other a slot whose kind is not known
          * yet. They want different fixes; they should not share a line. */
+        /* A sunk local (jit_sink.c) is a reference to fields, not a value,
+         * and has no place in the window the probe measured. */
+        if (slot <= JIT_MAX_SLOTS && e->sinkOf[slot] != 0) {
+            if (!sinkPushRef(e, slot)) return false;
+            off += 3;
+            break;
+        }
         if (!localInRange(e, slot)) {
             e->whyNot = "a local outside the compiled window";
             return false;
@@ -78,6 +86,32 @@ bool emitGetLocal2(Emit *e, const uint8_t *code, int *offp, int stop) {
     do {
         unsigned a = jaiReadU16(code + off + 1);
         unsigned b = jaiReadU16(code + off + 3);
+        /* One or both sunk (jit_sink.c): each read on its own, the plain one
+         * through OP_GET_LOCAL's arm with the code after this one behind it
+         * for its look-ahead. */
+        if (e->sinkCount != 0 &&
+            ((a <= JIT_MAX_SLOTS && e->sinkOf[a] != 0) ||
+             (b <= JIT_MAX_SLOTS && e->sinkOf[b] != 0))) {
+            for (unsigned k = 0; k < 2; k++) {
+                unsigned slot = k == 0 ? a : b;
+                if (slot <= JIT_MAX_SLOTS && e->sinkOf[slot] != 0) {
+                    if (!sinkPushRef(e, slot)) return false;
+                    continue;
+                }
+                uint8_t synth[64];
+                int rest = stop - (off + 5);
+                if (rest < 0) rest = 0;
+                if (rest > (int)sizeof synth - 3) rest = (int)sizeof synth - 3;
+                synth[0] = OP_GET_LOCAL;
+                synth[1] = (uint8_t)(slot & 0xffu);
+                synth[2] = (uint8_t)(slot >> 8);
+                memcpy(synth + 3, code + off + 5, (size_t)rest);
+                int soff = 0;
+                if (!emitGetLocal(e, synth, &soff, 3 + rest)) return false;
+            }
+            off += 5;
+            break;
+        }
         /* The second local may guard (if dynamic), and a guard can't be reached with a borrow live -- the
          * deopt stub writes float entries out of fpRegAt, where a borrowed one isn't. So the FIRST local takes a copy instead of a borrow whenever the second is going to guard: `dt * b.vx` in nbody's second loop is exactly this shape (`dt` has a home, `b` is dynamic). */
         bool guardFollows = b <= JIT_MAX_SLOTS && e->dynamicLocal[b];
