@@ -47,6 +47,21 @@ bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
     return true;
 }
 
+/* Whether finishing this callee from its own record would lose an argument.
+ * A callee that writes is finished on verdict 4 by jaiJitFinishDeopt, which
+ * builds the frame from the record alone -- and the record skips a parameter
+ * the compiled body never read (SLOT_OPAQUE: it was null when the body was
+ * specialised, and it has no register). The interpreted rest of the body then
+ * reads null where the caller passed a value. Reachable once the walk stopped
+ * short of the read (emitUnarmedDeopt): `side(n, d)` compiled while `d` was
+ * null, then called with 5, answered as though `d` were still null. */
+bool finishDropsAnArgument(const ObjFunction *cfn, unsigned nargs) {
+    for (unsigned i = 0; i < nargs; i++) {
+        if ((SlotKind)cfn->jitParamKind[i] == SLOT_OPAQUE) return true;
+    }
+    return false;
+}
+
 /* Branches straight to a compiled callee's entry, skipping the descriptor/jaiCallValue/interpreter-
  * frame path. Convention: raw payloads in x0.., closure in the last arg register if the callee reads an upvalue, x0/x1 = value/verdict on return -- the same one jaiJitEnterFunc checks and a self-call already uses, so skipping that entry means answering its checks here instead: module version (why the callee must live in the caller's module), every parameter's kind+shape (by the caller's model), and the verdict (below). Nonzero verdict: a callee that writes NOTHING can have the whole call abandoned and re-executed from the pre-call stack (two compares, no stub); a callee that WRITES cannot be re-run -- verdict 4 means it deoptimised part-way and is FINISHED in the interpreter from its own record, sharing the `selfSlow` machinery a recursive self-call already uses. A raised exception goes to the throw exit instead, since its effects already happened. `calleeReg`: the ObjClosure register, or -1 if baked in. `cidx`: operand-stack index of the callee entry (the RECEIVER for a method, i.e. its slot 0). `after`: offset of the fall-through instruction. */
 /* A `-> T?` result read back out of a call descriptor.
@@ -183,6 +198,10 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     }
 
     if (!directCallArgsMatch(e, cfn, firstIdx, nargs)) return false;
+    if (writes && finishDropsAnArgument(cfn, nargs)) {
+        e->whyNot = "a direct callee that writes and never reads a parameter";
+        return false;
+    }
     if (wantsClosure &&
         (SlotKind)cfn->jitParamKind[nargs] != SLOT_CLOSURE) {
         e->whyNot = "a direct callee whose trailing argument is not its closure";

@@ -84,6 +84,14 @@ shapes that have broken it before:
     fields, which is the only shape src/vm/jit/jit_sink.c sinks (see
     gen_sink_family). Before it was generated deliberately 0 of 200 programs
     compiled a sunk local; `pic_rate.py --sink` is the census
+  - a callee that WRITES -- a list push, a global, a field -- and then reads
+    a field off a global whose class is swapped part-way through the run, so
+    its compiled form deoptimises after the write (Gen.deopt_call). Reached
+    through a function parameter, a function value in a local, a direct
+    call, a method, a caller that deoptimises AFTER the call, a forwarder
+    inlined into a loop, and a parameter the callee never read. The
+    closure-call arm re-ran such a call from the top and every write before
+    the guard happened twice (tests/lang/test_jit_deopt_runs_once.jai)
 
 Two invariants keep every generated program legal and terminating, since a
 program that dies the same way five times proves nothing:
@@ -126,6 +134,10 @@ TRIP_BUDGET = 2000
 
 # Share of programs that get a `try` around a raising call (Gen.try_call).
 TRY_CALL_RATE = 0.3
+
+# Share of programs that get a writing callee that deoptimises after its
+# write (Gen.deopt_call).
+DEOPT_CALL_RATE = 0.3
 
 # Combined with `+% -% *%` only, so any of these is safe to reach.
 EDGE_INTS = [
@@ -1836,6 +1848,177 @@ class Gen:
                         "}")
         return helpers, node
 
+    def deopt_call(self, dr):
+        """A callee that writes, then deoptimises after the write.
+
+        Every callee here reads `holder.k` AFTER its effect, and `holder` is a
+        global the probe swaps from the base class to a subclass part-way
+        through the run -- after the callee has compiled against the base. So
+        from that call on, the compiled callee stops at the field read with its
+        write already done, and answers its caller "finish me from here". A
+        call arm that instead runs the call again from the top repeats the
+        write: the closure-call arm did, one `push` becoming two
+        (tests/lang/test_jit_deopt_runs_once.jai). The count of every effect
+        is folded into `acc` after each call, so the first repeat changes the
+        digest.
+
+        Returns the classes, the helpers and the probe statement. Everything
+        the statement needs is in its own strings, so a reduction can drop the
+        whole thing but not half of it.
+        """
+        warm = self.prog.warm
+        base = self.fresh("DkBase")
+        wide = self.fresh("DkWide")
+        holder = self.fresh("dkh")
+        log = self.fresh("dkl")
+        bump = self.fresh("dkg")
+        tobj = self.fresh("dkt")
+        classes = [
+            f"class {base} {{\n"
+            f"    pub var k: int\n"
+            f"    pub var hits: int\n"
+            f"    pub fn init(self, k: int) {{\n"
+            f"        self.k = k\n"
+            f"        self.hits = 0\n"
+            f"    }}\n"
+            f"    pub fn hit(self, x: int) -> int {{\n"
+            f"        self.hits = self.hits +% 1\n"
+            f"        {log}.push(x)\n"
+            f"        return {holder}.k +% x\n"
+            f"    }}\n"
+            f"}}",
+            f"class {wide} extends {base} {{\n"
+            f"    pub var extra: int\n"
+            f"    fn init(self, k: int) {{\n"
+            f"        super.init(k)\n"
+            f"        self.extra = 7\n"
+            f"    }}\n"
+            f"}}",
+        ]
+        helpers = [
+            f"var {holder}: {base} = {base}({dr.randint(1, 9)})\n"
+            f"var {log}: list[int] = []\n"
+            f"var {bump} = 0\n"
+            f"var {tobj}: {base} = {base}(0)",
+        ]
+        effect = dr.choice([
+            f"{log}.push(x)",
+            f"{bump} = {bump} +% x +% 1",
+            f"{tobj}.hits = {tobj}.hits +% x +% 1",
+        ])
+        callee = self.fresh("dkc")
+        helpers.append(
+            f"fn {callee}(x: int) -> int {{\n"
+            f"    {effect}\n"
+            f"    return {holder}.k +% x\n"
+            f"}}")
+        arg = f"n % {dr.randint(3, 11)}"
+        lines = []
+        site = dr.randrange(7)
+        if site == 0:
+            # Through a function parameter: the closure-call arm. `r + 0`
+            # (not `+%`) keeps the forwarder small enough for the inliner,
+            # which used to admit it and run the call inside the inline;
+            # `r` is a small int, so the checked add cannot raise.
+            via = self.fresh("dkv")
+            helpers.append(
+                f"fn {via}(f: fn(int) -> int, x: int) -> int {{\n"
+                f"    let r = f(x)\n"
+                f"    return r + 0\n"
+                f"}}")
+            lines.append(f"acc = acc +% {via}({callee}, {arg})")
+        elif site == 1:
+            # A function value held in the probe's own local.
+            g = self.fresh("g")
+            lines.append(f"let {g}: fn(int) -> int = {callee}")
+            lines.append(f"acc = acc +% {g}({arg})")
+        elif site == 2:
+            # A direct call to the global function.
+            lines.append(f"acc = acc +% {callee}({arg})")
+        elif site == 3:
+            # A method that writes its receiver and a global list.
+            lines.append(f"acc = acc +% {tobj}.hit({arg})")
+        elif site == 4:
+            # The callee only writes; its CALLER deoptimises after the call,
+            # and that caller is called directly by one holding the function
+            # value in a register.
+            plain = self.fresh("dkp")
+            outer = self.fresh("dko")
+            drive = self.fresh("dkd")
+            helpers.append(
+                f"fn {plain}(x: int) -> int {{\n"
+                f"    {effect}\n"
+                f"    return x +% 1\n"
+                f"}}")
+            helpers.append(
+                f"fn {outer}(f: fn(int) -> int, x: int) -> int {{\n"
+                f"    let r = f(x)\n"
+                f"    return r +% {holder}.k\n"
+                f"}}")
+            helpers.append(
+                f"fn {drive}(f: fn(int) -> int, x: int) -> int {{\n"
+                f"    let r = {outer}(f, x)\n"
+                f"    return r +% 0\n"
+                f"}}")
+            lines.append(f"acc = acc +% {drive}({plain}, {arg})")
+        elif site == 5:
+            # A forwarder small enough to inline, called in a loop: the
+            # inliner used to admit its call through `f`, and the closure
+            # arm then ran inside the inline with the caller's registers.
+            fwd = self.fresh("dkf")
+            loop = self.fresh("dkr")
+            helpers.append(
+                f"fn {fwd}(f: fn(int) -> int, x: int) -> int {{\n"
+                f"    let r = f(x)\n"
+                f"    return r + 0\n"
+                f"}}")
+            # The second accumulator moves the register the arm misread
+            # onto one holding an int, where the load faulted every run.
+            helpers.append(
+                f"fn {loop}(f: fn(int) -> int, k: int, m: int) -> int {{\n"
+                f"    var t = 0\n"
+                f"    var u = 3\n"
+                f"    for i in 0..k {{\n"
+                f"        u = u +% m\n"
+                f"        t = t +% {fwd}(f, i) +% u\n"
+                f"    }}\n"
+                f"    return t\n"
+                f"}}")
+            lines.append(f"acc = acc +% {loop}({callee}, {arg}, n)")
+        else:
+            # A parameter the callee never reads while it compiles: null on
+            # every early call, and the read sits past a lambda, which the
+            # tier has no arm for, so the rest is interpreted. The caller
+            # that later passes a real value is warmed with one.
+            lazy = self.fresh("dkz")
+            drive = self.fresh("dku")
+            helpers.append(
+                f"fn {lazy}(x: int, d: int?) -> int {{\n"
+                f"    {effect}\n"
+                f"    if x < 100000 {{\n"
+                f"        let gg = |y| y + x\n"
+                f"        if d is not null {{\n"
+                f"            return x +% d\n"
+                f"        }}\n"
+                f"        return x +% 1\n"
+                f"    }}\n"
+                f"    return x\n"
+                f"}}")
+            helpers.append(
+                f"fn {drive}(x: int, d: int?) -> int {{\n"
+                f"    let r = {lazy}(x, d)\n"
+                f"    return r +% 0\n"
+                f"}}")
+            half = max(1, warm // 2)
+            lines.append(f"if n < {half} {{ acc = acc +% {lazy}({arg}, null) }}")
+            lines.append(f"if n >= {half} {{ acc = acc +% {drive}({arg}, n % 5) }}")
+        lo = max(1, warm // 4)
+        hi = max(lo, (3 * warm) // 4)
+        swap = dr.randint(lo, hi)
+        head = f"if n == {swap} {{ {holder} = {wide}({dr.randint(1, 9)}) }}"
+        tail = (f"acc = acc +% {log}.len() +% {bump} +% {tobj}.hits")
+        return classes, helpers, Node(head, *lines, tail)
+
     def build(self):
         r = self.rng
         self.mixers = []
@@ -1880,6 +2063,15 @@ class Gen:
             probes = self.prog.probes
             probes[tr.randrange(len(probes))].body.append(node)
         self.gen_sink_family()
+        # Last, on a stream of its own again, so every program that does not
+        # draw one -- sink family included -- is what its seed always made.
+        dr = random.Random(f"deopt-call/{self.prog.seed}")
+        if dr.random() < DEOPT_CALL_RATE:
+            classes, helpers, node = self.deopt_call(dr)
+            self.prog.classes.extend(classes)
+            self.prog.helpers.extend(helpers)
+            probes = self.prog.probes
+            probes[dr.randrange(len(probes))].body.append(node)
         return self.prog
 
     # -- allocation sinking (src/vm/jit/jit_sink.c) --------------------------

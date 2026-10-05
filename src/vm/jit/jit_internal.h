@@ -924,6 +924,12 @@ typedef struct {
         /* Closure to finish on verdict 4: NULL means this one (a self-call knows its own); a direct call to
          * another compiled function that writes names it here instead. */
         ObjClosure *callee;
+        /* An indirect call (`f(x)` on a local) knows its callee's ObjFunction
+         * but not which closure over it, so the closure to finish is read
+         * from the register the call took it from -- callee-saved, so the
+         * `blr` left it there. False (zeroed) for every other site. */
+        bool     calleeFromReg;
+        unsigned calleeReg;
         /* Continuation's required object type/shape, when the fast path's kind says more than "a heap object":
          * VAL_OBJ covers every heap object, and reading `klass` off an ObjString answers wrongly rather than faulting (the list-element-head bug) -- so the type is checked first. */
         int      retType;
@@ -1598,6 +1604,7 @@ bool pushLocalAsValue(Emit *e, unsigned slot);
 bool jitConcatLocals(void);
 bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,
                           unsigned ridx, unsigned argc, uint32_t afterIp);
+bool finishDropsAnArgument(const ObjFunction *cfn, unsigned nargs);
 bool directCallArgsMatch(Emit *e, const ObjFunction *cfn,
                                 unsigned firstIdx, unsigned argc);
 void emitMaybeInstResult(Emit *e, unsigned dst, unsigned rat,

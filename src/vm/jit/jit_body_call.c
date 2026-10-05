@@ -209,6 +209,18 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
                 e->whyNot = "an indirect callee that is not a closure";
                 return false;
             }
+            /* Not inside an inlined body, before anything is emitted. Every
+             * register below is named through valueBankReg, which is the
+             * caller's bank and not an inline's own (valueXReg), so the guard
+             * read `fn` out of whatever the caller kept there -- `via(f, x)`,
+             * whose whole body is `f(x)`, inlined into a loop segfaulted on
+             * every run. And every record inside an inline resumes at the
+             * OUTER call, so a callee that deoptimised after writing would be
+             * run again from the top. */
+            if (e->inlining) {
+                e->whyNot = "an indirect call inside an inlined body";
+                return false;
+            }
             ObjFunction *cfn = AS_CLOSURE(cv)->fn;
             unsigned rCallee0 =
                 valueBankReg(e, cidx - (e->depth - e->valueDepth));
@@ -295,6 +307,35 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
                 return false;
             }
 
+            /* A callee that writes cannot be handed back whole once it has
+             * deoptimised part-way: the interpreter would run it again from
+             * the top and every write before its guard would happen twice --
+             * `log.push(n)` then a field read whose class changed pushed two.
+             * So it is FINISHED from its own record (verdict 4), as
+             * emitDirectCall finishes a writing callee, with the closure read
+             * from the register that held it: the guard above pins only the
+             * ObjFunction, and which closure over it is a runtime fact.
+             *
+             * A callee whose finish would drop an argument is refused, as
+             * emitDirectCall refuses it (finishDropsAnArgument). */
+            bool writes = !cfn->jitFuncNoWrite;
+            if (writes) {
+                if (e->selfSlowCount >= JIT_MAX_SELF_SLOW) {
+                    e->whyNot = "more slow call sites than the tier tracks";
+                    return false;
+                }
+                if (rCallee < JIT_FIRST_SAVED || rCallee > 28u) {
+                    e->whyNot = "a writing indirect callee whose closure is "
+                                "not in a saved register";
+                    return false;
+                }
+                if (finishDropsAnArgument(cfn, argc)) {
+                    e->whyNot = "a writing indirect callee with a "
+                                "parameter it never reads";
+                    return false;
+                }
+            }
+
             /* Roots before the branch: a `blr` pushes none, and the callee
              * may allocate. */
             unsigned callRoots = 0;
@@ -352,25 +393,53 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
              * emitDirectCall does at the same point and for the same
              * reason: the record is taken with the callee and its
              * arguments still on the model's stack, so the interpreter
-             * re-runs the call from the top. Re-running is sound because
-             * the callee is a compiled body that bailed, and the function
-             * tier declines any body whose bail can follow a heap write.
+             * re-runs the call from the top. Re-running is sound for a
+             * bail (verdict 1: nothing written yet) and for a callee that
+             * writes nothing at all. It is NOT sound for verdict 4 from a
+             * callee that writes -- that one is finished from its own
+             * record instead, through the shared selfSlow block, whose
+             * cold half re-reads x1 and takes the same call-offset record
+             * for verdict 1.
              *
              * It costs nothing measurable -- two instructions on the path
              * and a deopt record. Alternating binaries under
              * scripts/gpu_lock.sh, best of five each: closure_calls
              * 123/123, poly_dispatch 138/138, json_parse 110/110,
              * object_dispatch 151/150, sort_merge 353/358. */
-            emit(e, jaiA64SubsXImm(31, 1, 2));
-            if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
-            e->fixups[e->fixupCount].instIndex    = (int)e->count;
-            e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
-            e->fixups[e->fixupCount].conditional  = true;
-            e->fixups[e->fixupCount].depth        = -1;
-            e->fixupCount++;
-            emit(e, jaiA64BCond(JAI_A64_EQ, 0));
-            emit(e, jaiA64SubsXImm(31, 1, 0));
-            branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)off, false);
+            unsigned si = 0;
+            if (writes) {
+                si = e->selfSlowCount++;
+                e->selfSlow[si].roots         = callRoots;
+                e->selfSlow[si].stub          = -1;
+                e->selfSlow[si].callee        = NULL;
+                e->selfSlow[si].calleeFromReg = true;
+                e->selfSlow[si].calleeReg     = rCallee;
+                e->selfSlow[si].retShape      = 0;
+                e->selfSlow[si].retType       = -1;   /* scalar: no object */
+                if (!deoptRecordAt(e, (uint32_t)off, false,
+                                   &e->selfSlow[si].deoptBail)) {
+                    e->failed = true;
+                    return false;
+                }
+                if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+                e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                e->fixups[e->fixupCount].targetOffset = FIXUP_SELFSLOW - si;
+                e->fixups[e->fixupCount].conditional  = true;
+                e->fixups[e->fixupCount].depth        = -1;
+                e->fixupCount++;
+                emit(e, jaiA64CbnzX(1, 0));   /* the stub re-reads x1 itself */
+            } else {
+                emit(e, jaiA64SubsXImm(31, 1, 2));
+                if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+                e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+                e->fixups[e->fixupCount].conditional  = true;
+                e->fixups[e->fixupCount].depth        = -1;
+                e->fixupCount++;
+                emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+                emit(e, jaiA64SubsXImm(31, 1, 0));
+                branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)off, false);
+            }
 
             for (unsigned i = 0; i <= argc; i++) {
                 unsigned r;
@@ -378,6 +447,26 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             }
             if (!pushValue(e, rkind, 0, NULL)) return false;
             emit(e, jaiA64MovX(pushReg(e) - 1, 0));
+            if (writes) {
+                e->selfSlow[si].resultReg = pushReg(e) - 1;
+                e->selfSlow[si].returnTo  = (int)e->count;
+                e->selfSlow[si].tag = rkind == SLOT_INT   ? VAL_INT
+                                    : rkind == SLOT_FLOAT ? VAL_FLOAT
+                                                          : VAL_BOOL;
+                /* The interpreted rest of the callee answers with whatever
+                 * kind it computed; a surprise resumes AFTER the call, which
+                 * has happened. */
+                if (!deoptRecordAt(e, (uint32_t)(off + 2), true,
+                                   &e->selfSlow[si].deoptKind)) {
+                    e->failed = true;
+                    return false;
+                }
+                /* This body now has an effect a re-run would repeat, so it
+                 * must say so: its own callers read jitFuncNoWrite to decide
+                 * whether a deopt in HERE can be answered by calling it
+                 * again from the top. */
+                e->wroteHeap = true;
+            }
             off += 2;
             break;
         }
