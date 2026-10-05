@@ -7,7 +7,7 @@
 #: Each helper is called more than JAI_JIT_THRESHOLD times so the
 #: whole-function tier compiles it; `JAITHON_NO_JIT=1` runs the same file, and
 #: every answer is the interpreter's.
-# jit-compiles: read_all, store_all, store_maybe, read_or
+# jit-compiles: read_all, store_all, store_maybe, read_or, int_count, int_read, int_store
 from std.test import assert_eq, assert_true
 
 class Box {
@@ -43,6 +43,27 @@ fn store_all(d: dict, keys: list[str], v: float) -> void {
 fn store_maybe(d: dict, keys: list[str], b: Box?) -> void {
     for k in keys {
         d[k] = b
+    }
+}
+
+fn int_count(d: dict, keys: list[int]) -> void {
+    for k in keys {
+        d[k] = d.get(k, 0) + 1
+    }
+}
+
+fn int_read(d: dict, keys: list[int]) -> float {
+    var total = 0.0
+    for k in keys {
+        let v: float = d[k]
+        total += v
+    }
+    return total
+}
+
+fn int_store(d: dict, keys: list[int], v: float) -> void {
+    for k in keys {
+        d[k] = v
     }
 }
 
@@ -119,6 +140,56 @@ pub fn test_a_typed_dict_store_is_the_leafs() -> void {
         for k in keys { t[k] = 0.0 }
         store_all(t, keys, 2.5)
         assert_eq(t["slot-1"], 2.5)
+        round += 1
+    }
+}
+
+pub fn test_int_keys() -> void {
+    var keys = []
+    var i = -300
+    while i < 300 {
+        keys.push(i * 1_000_003)
+        i += 1
+    }
+    keys.push(9223372036854775807)
+    keys.push(-9223372036854775807 - 1)
+    var d = {}
+    var round = 0
+    while round < 70 {
+        int_count(d, keys)
+        round += 1
+    }
+    assert_eq(d.len(), keys.len())
+    for k in keys { assert_eq(d[k], 70) }
+    var f = {}
+    for k in keys { f[k] = 0.0 }
+    round = 0
+    while round < 70 {
+        int_store(f, keys, 0.25)
+        assert_eq(int_read(f, keys), 0.25 * keys.len())
+        round += 1
+    }
+}
+
+pub fn test_an_equal_float_key_is_the_leafs() -> void {
+    #: 2.0 and 2 are one key; the inline test answers only an int stored as
+    #: an int, and the leaf finds the float.
+    var keys = [1, 2, 3]
+    var round = 0
+    while round < 70 {
+        var d = {}
+        d[2.0] = 0.5
+        d[1] = 0.5
+        d[3] = 0.5
+        assert_eq(int_read(d, keys), 1.5)
+        int_store(d, keys, 1.0)
+        assert_eq(d.len(), 3)
+        assert_eq(d[2.0], 1.0)
+        var c = {}
+        c[2.0] = 5
+        int_count(c, keys)
+        assert_eq(c[2], 6)
+        assert_eq(c.len(), 3)
         round += 1
     }
 }

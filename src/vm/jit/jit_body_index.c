@@ -144,7 +144,7 @@ static bool jitDictSlotInline(void) {
  * is placed. Each keeps the word it was emitted as, so the patch re-encodes
  * the same test with the real displacement. */
 typedef struct {
-    int      at[12];
+    int      at[16];
     unsigned n;
 } AddMiss;
 
@@ -169,6 +169,10 @@ static void addMissHere(Emit *e, AddMiss *m) {
 static void addMissBranch(Emit *e, AddMiss *m, uint32_t word) {
     if (m->n < sizeof m->at / sizeof m->at[0]) {
         m->at[m->n++] = (int)e->count;
+    } else {
+        /* A branch nobody would patch is a branch to itself: refuse the
+         * body rather than emit one. */
+        e->failed = true;
     }
     emit(e, word);
 }
@@ -181,21 +185,38 @@ static bool dictSlotProbeFits(void) {
            (offsetof(ObjDict, keyKind) & 1u) == 0 && sizeof(JaiEntry) == 48;
 }
 
-/* The first slot a string key's hash names, when it is live and holds that
- * very string: its address in x12, and every other case -- an empty table, a
+/* The first slot a key's hash names, when it is live and holds that very
+ * key: its address in x12, and every other case -- an empty table, a
  * collision, a tombstone, an absent key -- one of the branches in `m`. The
- * key must already be known to be a string and the dict a dict. A string
- * whose hash was never computed still holds zero there, which names slot 0;
- * the identity test is what makes any slot's answer right, so that is only a
- * miss. Writes x9..x12. */
+ * dict must already be known to be a dict, and the key a string (its object
+ * in `rKey`) or, with `intKey`, an int (its value in `rKey`).
+ *
+ * A string's hash is the one it carries; one never computed still holds zero
+ * there, which names slot 0, and the identity test is what makes any slot's
+ * answer right, so that is only a miss. An int's is jaiHashU64Inline of it,
+ * computed here as jaiTableFindIntQuick computes it. The test is the stored
+ * key's tag and payload: the same string object, or an int of the same
+ * value -- an equal float stored there is the leaf's to judge. Writes
+ * x9..x12. */
 static void emitDictSlotProbe(Emit *e, unsigned rDict, unsigned rKey,
-                              AddMiss *m) {
+                              bool intKey, AddMiss *m) {
     const unsigned tableAt = (unsigned)offsetof(ObjDict, table);
     emit(e, jaiA64LdrW(11, rDict,
                        tableAt + (unsigned)offsetof(JaiTable, capacity)));
     addMissBranch(e, m, 0x34000000u | 11u);                      /* cbz w11 */
     /* The slot: entries + (hash & (capacity - 1)) * 48. */
-    emit(e, jaiA64LdrX(10, rKey, (unsigned)offsetof(ObjString, hash)));
+    if (intKey) {
+        /* splitmix64's finaliser, jaiHashU64Inline. */
+        emit(e, jaiA64EorXLsr(10, rKey, rKey, 30));
+        emitConst64(e, 9, (int64_t)UINT64_C(0xBF58476D1CE4E5B9));
+        emit(e, jaiA64MulX(10, 10, 9));
+        emit(e, jaiA64EorXLsr(10, 10, 10, 27));
+        emitConst64(e, 9, (int64_t)UINT64_C(0x94D049BB133111EB));
+        emit(e, jaiA64MulX(10, 10, 9));
+        emit(e, jaiA64EorXLsr(10, 10, 10, 31));
+    } else {
+        emit(e, jaiA64LdrX(10, rKey, (unsigned)offsetof(ObjString, hash)));
+    }
     emit(e, jaiA64LdrX(12, rDict,
                        tableAt + (unsigned)offsetof(JaiTable, entries)));
     emit(e, jaiA64SubXImm(11, 11, 1));
@@ -211,7 +232,7 @@ static void emitDictSlotProbe(Emit *e, unsigned rDict, unsigned rKey,
     emit(e, jaiA64SubsXReg(31, 9, rKey));
     addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
     emit(e, jaiA64LdrW(9, 12, (unsigned)offsetof(JaiEntry, key)));
-    emit(e, jaiA64SubsXImm(31, 9, VAL_OBJ));
+    emit(e, jaiA64SubsXImm(31, 9, intKey ? VAL_INT : VAL_OBJ));
     addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
 }
 
@@ -229,7 +250,7 @@ static void emitDictSlotProbe(Emit *e, unsigned rDict, unsigned rKey,
  * Only x9..x12 are written, scratch the call that follows clobbers anyway.
  * False, having emitted nothing, for a step no add/sub immediate holds. */
 static bool emitDictAddInline(Emit *e, unsigned rDict, unsigned rKey,
-                              int64_t step, bool checkDict,
+                              bool intKey, int64_t step, bool checkDict,
                               uint32_t doneOffset, int64_t doneDepth,
                               AddMiss *m) {
     m->n = 0;
@@ -241,12 +262,15 @@ static bool emitDictAddInline(Emit *e, unsigned rDict, unsigned rKey,
         emit(e, jaiA64SubsXImm(31, 9, OBJ_DICT));
         addMissBranch(e, m, jaiA64BCond(JAI_A64_NE, 0));
     }
-    /* A string key (OBJ_STRING is 0), an untyped dict. */
-    emit(e, jaiA64LdrW(9, rKey, 0));
-    addMissBranch(e, m, 0x35000000u | 9u);                       /* cbnz w9 */
+    /* A string key (OBJ_STRING is 0) -- an int key's kind is its
+     * register's -- and an untyped dict. */
+    if (!intKey) {
+        emit(e, jaiA64LdrW(9, rKey, 0));
+        addMissBranch(e, m, 0x35000000u | 9u);                   /* cbnz w9 */
+    }
     emit(e, jaiA64LdrHalf(9, rDict, (unsigned)offsetof(ObjDict, keyKind)));
     addMissBranch(e, m, 0x35000000u | 9u);                       /* cbnz w9 */
-    emitDictSlotProbe(e, rDict, rKey, m);
+    emitDictSlotProbe(e, rDict, rKey, intKey, m);
     /* An int value, and a sum that does not overflow. */
     const unsigned valAt = (unsigned)offsetof(JaiEntry, value);
     emit(e, jaiA64LdrW(9, 12, valAt));
@@ -296,9 +320,9 @@ void emitDictLeafGet(Emit *e, unsigned rDict, unsigned rKey, SlotKind keyKind,
     int hit = -1;
     const unsigned rat =
         e->descOffset + (unsigned)offsetof(JitCallDesc, result);
-    if (keyKind == SLOT_OBJ && jitDictSlotInline() && dictSlotProbeFits()) {
+    if (jitDictSlotInline() && dictSlotProbeFits()) {
         const unsigned valAt = (unsigned)offsetof(JaiEntry, value);
-        emitDictSlotProbe(e, rDict, rKey, &miss);
+        emitDictSlotProbe(e, rDict, rKey, keyKind == SLOT_INT, &miss);
         emit(e, jaiA64LdrX(9, 12, valAt));
         emit(e, jaiA64LdrX(10, 12, valAt + 8u));
         emit(e, jaiA64StrX(9, 31, rat));
@@ -349,13 +373,13 @@ static void emitDictLeafSet(Emit *e, unsigned rDict, unsigned rKey,
      * stored and the version bumped. Anything else is the leaf call. */
     AddMiss miss = {.n = 0};
     int hit = -1;
-    if (keyKind == SLOT_OBJ && jitDictSlotInline() && dictSlotProbeFits()) {
+    if (jitDictSlotInline() && dictSlotProbeFits()) {
         const unsigned valAt = (unsigned)offsetof(JaiEntry, value);
         const unsigned verAt = (unsigned)(offsetof(ObjDict, table) +
                                           offsetof(JaiTable, version));
         emit(e, jaiA64LdrHalf(9, rDict, (unsigned)offsetof(ObjDict, keyKind)));
         addMissBranch(e, &miss, 0x35000000u | 9u);               /* cbnz w9 */
-        emitDictSlotProbe(e, rDict, rKey, &miss);
+        emitDictSlotProbe(e, rDict, rKey, keyKind == SLOT_INT, &miss);
         emitTagFor(e, vk, rVal, 10, 11);
         emit(e, jaiA64StrW(10, 12, valAt));
         emit(e, jaiA64StrX(rVal, 12, valAt + 8u));
@@ -537,8 +561,8 @@ bool emitDictAddFused(Emit *e, const Chunk *chunk, int off, int count,
     fpSyncAll(e);
     settleAll(e);
     AddMiss miss = {.n = 0};
-    if (keyKind == SLOT_OBJ) {
-        (void)emitDictAddInline(e, rDict, rKey,
+    if (keyKind == SLOT_OBJ || keyKind == SLOT_INT) {
+        (void)emitDictAddInline(e, rDict, rKey, keyKind == SLOT_INT,
                                 (int64_t)jaiReadI16(code + off + 8), false,
                                 (uint32_t)(off + 12),
                                 stackSignatureAt(e, e->depth - 5), &miss);
@@ -591,8 +615,8 @@ bool emitDictAugAddFused(Emit *e, const uint8_t *code, int off, int count) {
     fpSyncAll(e);
     settleAll(e);
     AddMiss miss = {.n = 0};
-    if (keyKind == SLOT_OBJ) {
-        (void)emitDictAddInline(e, rDict, rKey,
+    if (keyKind == SLOT_OBJ || keyKind == SLOT_INT) {
+        (void)emitDictAddInline(e, rDict, rKey, keyKind == SLOT_INT,
                                 (int64_t)jaiReadI16(code + off + 3), true,
                                 (uint32_t)(off + 7),
                                 stackSignatureAt(e, e->depth - 2), &miss);
