@@ -234,9 +234,15 @@ fn test_a_damaged_kept_signature_is_ignored() -> void {
     let text = _read(kept)
     assert_true(text.starts_with("jsig "), "nothing was kept")
 
-    # A range that points at the wrong bytes, with the checksum left stale.
-    _write(kept, text.replace("\nB ", "\nB 1"))
+    # An edge changed under a checksum that no longer matches.
+    _write(kept, _edit_first_line(text, 0, false))
     assert_eq(_decl_text(_load_fresh(dir)), _decl_text(cold))
+    # A body range moved off its brace under a checksum made to match: the
+    # range is checked against the source, and the module is parsed in full.
+    _write(kept, _edit_first_line(text, 1, true))
+    let moved = _load_fresh(dir)
+    assert_eq(_decl_text(moved), _decl_text(cold))
+    assert_eq(_tree_text(moved), _tree_text(cold))
     # Cut short.
     _write(kept, text[:text.len() // 2])
     assert_eq(_decl_text(_load_fresh(dir)), _decl_text(cold))
@@ -248,6 +254,41 @@ fn test_a_damaged_kept_signature_is_ignored() -> void {
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+#: `text`, a kept signature, with the first digit of the first edge line
+#: (`section` 0) or body-range line (`section` 1) changed, and the header's
+#: checksum recomputed when `fix_crc` is set.
+fn _edit_first_line(text: str, section: int, fix_crc: bool) -> str {
+    let lines = text.split("\n")
+    let fields = lines[0].split(" ")
+    let edges_length = int(fields[5])
+    let ranges_length = int(fields[6])
+    var index = 1
+    if section == 1 {
+        var used = 0
+        while used < edges_length {
+            used += lines[index].len() + 1
+            index += 1
+        }
+    }
+    let line = lines[index]
+    let first = if line[0] == "1" { "2" } else { "1" }
+    lines[index] = first + line[1:]
+    var meta_lines: list[str] = []
+    var used = 0
+    var at = 1
+    while used < edges_length + ranges_length {
+        meta_lines.push(lines[at])
+        used += lines[at].len() + 1
+        at += 1
+    }
+    if fix_crc {
+        let meta = "\n".join(meta_lines) + "\n"
+        fields[7] = f"{__prim__.crc32(__prim__.str_encode(meta))}"
+        lines[0] = " ".join(fields)
+    }
+    return "\n".join(lines)
+}
 fn _load_fresh(dir: str) -> ModuleSig {
     clear_shared_signatures()
     let sig = SigLoader().load("tricky", dir)
