@@ -14,6 +14,8 @@ import std.gpu as gpu
 from std.test import assert_eq
 import jaicv as cv
 from jaicv import Mat, Size
+from jaicv.core.arith import convert_scale_abs, magnitude, phase
+from jaicv.core.stats import norm
 from jaicv.core.types import Point2f
 from jaicv.imgproc.geometric import get_rotation_matrix_2d, warp_affine
 from jaicv.imgproc.hist import equalize_hist
@@ -116,6 +118,27 @@ fn test_photo_warp_and_flow_release_their_intermediates() -> void {
     }), 0)
     colour.release()
     grey.release()
+}
+
+fn test_arithmetic_statistics_and_matching_release_their_intermediates() -> void {
+    if not gpu.is_available() { return }
+    let grey = picture(cv.CV_32FC1)
+    let other = picture(cv.CV_32FC1)
+    let colour = picture(cv.CV_8UC3)
+    let bytes = picture(cv.CV_8UC1)
+    assert_eq(growth(|| convert_scale_abs(grey, 2.0, 1.0)), 0)
+    assert_eq(growth(|| magnitude(grey, other)), 0)
+    assert_eq(growth(|| phase(grey, other)), 0)
+    let templ = Mat.from_list(5, 5, cv.CV_32FC1, [float(index) for index in 0..25])
+    assert_eq(growth(|| cv.match_template(grey, templ)), 0)
+    assert_eq(growth_of_points(|| int(norm(grey, other: other))), 0)
+    assert_eq(growth_of_points(|| int(norm(colour, norm_type: cv.NORM_INF))), 0)
+    assert_eq(growth_of_points(|| cv.hough_circles(bytes, 1.0, 10.0, 100.0, 30.0, 5, 20).len()), 0)
+    grey.release()
+    other.release()
+    colour.release()
+    bytes.release()
+    templ.release()
 }
 
 #: Releasing an intermediate must never reach the caller's own matrices.
