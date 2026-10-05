@@ -22,7 +22,7 @@
 #: Every shape below warms its callee past the call threshold while `holder`
 #: is exactly a Base, then swaps in a subclass so the field read AFTER the
 #: write fails its class guard, and counts the writes.
-# jit-compiles: through_a_param, through_a_param_field, through_a_param_global, logs_then_reads, outer_reads_after, drive_outer, reads_late, drive_unread
+# jit-compiles: through_a_param, through_a_param_field, through_a_param_global, through_a_param_b, through_a_param_up, loops_through_a_local, logs_then_reads, outer_reads_after, drive_outer, reads_late, drive_unread
 from std.test import assert_eq
 
 let WARM = 300
@@ -148,6 +148,76 @@ fn test_a_float_closure_call_pushes_once() -> void {
     t += through_a_param_f(halves_then_reads, 1)
     assert_eq(t, float(WARM) / 2.0 + 1.5)
     assert_eq(len(log), WARM + 1)
+}
+
+fn above_then_reads(n: int) -> bool {
+    log.push(n)
+    return holder.k > n
+}
+
+fn through_a_param_b(f: fn(int) -> bool, x: int) -> int {
+    let r = f(x)
+    if r {
+        return 1
+    }
+    return 0
+}
+
+fn test_a_bool_closure_call_pushes_once() -> void {
+    reset()
+    var t = 0
+    for i in 0..WARM {
+        t += through_a_param_b(above_then_reads, 0)
+    }
+    holder = Wide(2)
+    t += through_a_param_b(above_then_reads, 1)
+    assert_eq(t, WARM + 1)
+    assert_eq(len(log), WARM + 1)
+}
+
+fn through_a_param_up(f: fn(int) -> int, x: int) -> int {
+    let r = f(x)
+    return r + 0
+}
+
+#: The callee reads an upvalue, so the call hands it the closure it was
+#: given -- and finishing it must use that closure, not one baked in.
+fn test_a_capturing_closure_call_pushes_once() -> void {
+    reset()
+    var base = 10
+    let g = fn(n: int) -> int {
+        log.push(n)
+        return holder.k + n + base
+    }
+    var t = 0
+    for i in 0..WARM {
+        t += through_a_param_up(g, 0)
+    }
+    holder = Wide(2)
+    t += through_a_param_up(g, 1)
+    assert_eq(t, WARM * 11 + 13)
+    assert_eq(len(log), WARM + 1)
+}
+
+#: The OSR loop tier makes the same call through the same arm. Long enough
+#: that the sampler has compiled the loop well before the swap.
+fn loops_through_a_local(n: int, swap_at: int) -> int {
+    let f = logs_then_reads
+    var t = 0
+    for i in 0..n {
+        if i == swap_at {
+            holder = Wide(2)
+        }
+        t += f(0)
+    }
+    return t
+}
+
+fn test_an_osr_loop_closure_call_pushes_once() -> void {
+    reset()
+    let t = loops_through_a_local(100000, 99500)
+    assert_eq(t, 99500 + 500 * 2)
+    assert_eq(len(log), 100000)
 }
 
 #: The call returns normally; it is the caller that deoptimises, after it.
