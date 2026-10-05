@@ -1073,9 +1073,15 @@ bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
             break;
         }
 
-        if (e->localKind[slot] != SLOT_INT) return false;
+        if (e->localKind[slot] != SLOT_INT) {
+            return subWhy(e, "a local-against-constant compare on a local "
+                             "of kind %d", (int)e->localKind[slot]);
+        }
         if (slot == 0) e->usesSlot0 = true;
-        if (!IS_INT(k)) return false;
+        if (!IS_INT(k)) {
+            return subWhy(e, "an int local compared against a constant "
+                             "that is not an int");
+        }
         if (jitTryIfConvert(e, fn, &off)) break;
 
         /* `while i < n` and `if n < 2` are the same instruction here, and the constant fits the compare's

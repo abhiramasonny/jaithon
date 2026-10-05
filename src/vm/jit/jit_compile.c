@@ -561,6 +561,16 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
                             needNull, false)) {
             return true;
         }
+        /* What the full attempt learned about clashing locals, kept across
+         * the fallback attempts below. Each of them writes `need` afresh, and
+         * one that stops EARLIER than the full attempt -- the arms-off retry
+         * stops at the first `match` -- reports none of the clashes the full
+         * walk found, so the widening step saw nothing to grow and declined a
+         * body that had only asked to be compiled again with one slot wider. */
+        bool firstNeed[JIT_MAX_SLOTS + 1];
+        bool firstNeedNull[JIT_MAX_SLOTS + 1];
+        memcpy(firstNeed, need, sizeof firstNeed);
+        memcpy(firstNeedNull, needNull, sizeof firstNeedNull);
         /* An inlined body that could not be emitted is not a decline: the
          * same call through the descriptor still compiles, and a compiled
          * form with a real call in it beats none at all. */
@@ -586,6 +596,12 @@ bool jaiJitCompileFunc(ObjClosure *closure, Value *slotBase) {
                                       nullable, needNull, false);
             gNoNullableFb = false;
             if (ok) return true;
+        }
+        if (jitKeepRetryNeeds()) {
+            for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
+                need[i]     = need[i] || firstNeed[i];
+                needNull[i] = needNull[i] || firstNeedNull[i];
+            }
         }
         bool grew = false;
         for (unsigned i = 0; i <= JIT_MAX_SLOTS; i++) {
