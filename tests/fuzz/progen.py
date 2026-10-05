@@ -74,6 +74,12 @@ shapes that have broken it before:
     mergeReturnKind's path, not the join's, and a helper only reaches the
     join if it happens to get hot
   - lists, dicts, strings, indexing, recursion, match, lambdas
+  - a `try` around a CALL whose compiled callee raises, directly, through a
+    function parameter, through a function value in a local, and inside a
+    loop (Gen.try_call). Before it was generated nothing here made a call
+    inside a `try` or called a function value at all, and the closure-call
+    arm let such a raise skip its handler; with that arm reverted it now
+    disagrees on 6 of the first 12 programs that draw one
 
 Two invariants keep every generated program legal and terminating, since a
 program that dies the same way five times proves nothing:
@@ -113,6 +119,9 @@ WARM_DEFAULT = 1500
 
 # Loop iterations one probe CALL may run, shared out between nested loops.
 TRIP_BUDGET = 2000
+
+# Share of programs that get a `try` around a raising call (Gen.try_call).
+TRY_CALL_RATE = 0.3
 
 # Combined with `+% -% *%` only, so any of these is safe to reach.
 EDGE_INTS = [
@@ -1728,6 +1737,89 @@ class Gen:
                     [line("acc = acc +% (9223372036854775807 + 1)")],
                     "}")
 
+    def try_call(self, tr):
+        """A `try` around a CALL whose compiled callee raises.
+
+        st_try only ever raises inline, where the overflow guard resumes at its
+        own instruction inside the region. A raise that comes back OUT of a
+        compiled callee takes the caller's exception exit instead, and a
+        compiled body has no frame for the unwinder to search -- so a call arm
+        that forgets to decline inside a `try` lets the error escape the
+        handler. The closure-in-a-local arm did exactly that
+        (tests/lang/test_jit_try_across_calls.jai), and nothing here could
+        reach it: no call was ever made inside a `try`, and no function value
+        was ever called at all.
+
+        Returns the helpers it needs and the statement. Every raise is an
+        OverflowError and every site catches it, so no configuration may let
+        one escape.
+        """
+        limit = tr.randint(3, 40)
+        big = "4611686018427387904"
+        raiser = self.fresh("ovf")
+        helpers = []
+        if tr.random() < 0.5:
+            helpers.append(
+                f"fn {raiser}(k: int) -> int {{\n"
+                f"    if k < {limit} {{ return k *% {tr.randint(2, 9)} +% 1 }}\n"
+                f"    return {big} * (k - {limit} + 2)\n"
+                f"}}")
+        else:
+            # Raised two frames down, by a recursive body too big to inline
+            # that doubles 2^62 once per level.
+            deep = self.fresh("ovfr")
+            helpers.append(
+                f"fn {deep}(k: int) -> int {{\n"
+                f"    if k <= 0 {{ return {big} }}\n"
+                f"    return {deep}(k - 1) * 2\n"
+                f"}}")
+            helpers.append(
+                f"fn {raiser}(k: int) -> int {{\n"
+                f"    if k < {limit} {{ return k *% 3 }}\n"
+                f"    return {deep}(k - {limit}) +% 1\n"
+                f"}}")
+        # Two different answers, so a handler that is skipped for the one
+        # outside it changes the result rather than reproducing it.
+        miss = tr.randint(1, 9999)
+        outer = miss + tr.randint(1, 9999)
+        holder = self.fresh("tc")
+        helpers.append(
+            f"fn {holder}(f: fn(int) -> int, k: int) -> int {{\n"
+            f"    try {{\n"
+            f"        return f(k)\n"
+            f"    }} catch _e: OverflowError {{\n"
+            f"        return -{miss}\n"
+            f"    }}\n"
+            f"}}")
+        arg = f"n % {limit + tr.randint(2, 20)}"
+
+        def guarded(call):
+            return Node("try {",
+                        [line(f"acc = acc +% {call}")],
+                        "} catch _e: OverflowError {",
+                        [line(f"acc = acc -% {outer}")],
+                        "}")
+
+        site = tr.randrange(4)
+        if site == 0:
+            # Through a function parameter, the try in the callee's caller.
+            node = line(f"acc = acc +% {holder}({raiser}, {arg})")
+        elif site == 1:
+            # A direct call, the try in the probe itself.
+            node = guarded(f"{raiser}({arg})")
+        elif site == 2:
+            # A function value held in a local, called inside the probe's try.
+            g = self.fresh("g")
+            node = Node(f"let {g}: fn(int) -> int = {raiser}",
+                        *guarded(f"{g}({arg})").parts)
+        else:
+            # The try inside a loop, so the loop head is outside the region.
+            q = self.fresh("q")
+            node = Node(f"for {q} in 0..{tr.randint(2, 4)} {{",
+                        [guarded(f"{holder}({raiser}, ({arg}) + {q})")],
+                        "}")
+        return helpers, node
+
     def build(self):
         r = self.rng
         self.mixers = []
@@ -1763,6 +1855,14 @@ class Gen:
             self.prog.probes[-1].body.append(self.st_inst_list(0))
         if r.random() < 0.12:
             self.prog.probes[0].body.append(self.st_late_raise(0))
+        # From a Random of its own, after everything else, so a program that
+        # does not draw one is byte-identical to what its seed always made.
+        tr = random.Random(f"try-call/{self.prog.seed}")
+        if tr.random() < TRY_CALL_RATE:
+            helpers, node = self.try_call(tr)
+            self.prog.helpers.extend(helpers)
+            probes = self.prog.probes
+            probes[tr.randrange(len(probes))].body.append(node)
         return self.prog
 
 
