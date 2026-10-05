@@ -435,21 +435,25 @@ void jitLeanEntryInit(void) {
  * are side-effect free, so redoing them changes nothing. */
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase) {
     ObjFunction *fn = closure->fn;
-    if (!gJitLeanEntry || fn->jitBlockedOn != NULL || fn->jitArgCount > 2)
+    if (!gJitLeanEntry || fn->jitBlockedOn != NULL || fn->jitArgCount > 4)
         return jitEnterFuncFull(closure, slotBase);
     if (fn->jitFunc == NULL) return JAI_JIT_DECLINED;
     if (fn->module == NULL || fn->module->version != fn->jitFuncModuleVersion)
         return JAI_JIT_DECLINED;
-    int64_t a0 = 0, a1 = 0;
+    int64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
     unsigned arity = fn->jitArgCount;
     if (arity > 0 && !jitArgIn(closure, slotBase, 0, &a0))
         return jitEnterFuncFull(closure, slotBase);
     if (arity > 1 && !jitArgIn(closure, slotBase, 1, &a1))
         return jitEnterFuncFull(closure, slotBase);
-    JitResult r;
-    if (arity == 0)      r = ((Fn0)(uintptr_t)fn->jitFunc)();
-    else if (arity == 1) r = ((Fn1)(uintptr_t)fn->jitFunc)(a0);
-    else                 r = ((Fn2)(uintptr_t)fn->jitFunc)(a0, a1);
+    if (arity > 2 && !jitArgIn(closure, slotBase, 2, &a2))
+        return jitEnterFuncFull(closure, slotBase);
+    if (arity > 3 && !jitArgIn(closure, slotBase, 3, &a3))
+        return jitEnterFuncFull(closure, slotBase);
+    /* Every arm passes four: the body reads the ones it declared and the rest
+     * are dead argument registers, so one call site serves all five arities
+     * (AAPCS64 leaves x0-x7 the caller's either way). */
+    JitResult r = ((Fn4)(uintptr_t)fn->jitFunc)(a0, a1, a2, a3);
     return jitResultOut(fn, r, slotBase);
 }
 

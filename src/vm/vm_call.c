@@ -525,6 +525,9 @@ CallOutcome invokeCallable(Value callable, int argc) {
             vm.stackTop = slot + 1;
             return CALL_DONE;
         }
+        /* The closure arm below, without a second frame of this function. */
+        if (IS_CLOSURE(klass->initializer))
+            return callClosure(AS_CLOSURE(klass->initializer), argc);
         return invokeCallable(klass->initializer, argc);
     }
 
