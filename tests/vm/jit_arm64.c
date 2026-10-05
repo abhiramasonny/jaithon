@@ -877,6 +877,44 @@ int main(void) {
                              /* 7 */ jaiA64Ret() };
       check("tbz backward", runWith(w, 8, cell), 7); }
 
+    /* The vector forms: two lanes each, with operands chosen so that the two
+     * lanes differ and a swapped or misplaced register would show. ldur/stur
+     * at a negative and a positive unscaled offset (neither a multiple of 16,
+     * so a scaled encoding would land elsewhere); then add, sub and mul, each
+     * checked per lane against what C computes for that lane. */
+    { double d[12] = { 1.5, 0.1, 3.0, -0.0, 0.0, 0.0,
+                       0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+      const uint32_t w[] = { jaiA64AddXImm(1, 0, 8),
+                             jaiA64LdurQ(17, 1, -8),      /* d[0], d[1] */
+                             jaiA64LdurQ(18, 1, 8),       /* d[2], d[3] */
+                             jaiA64Fadd2D(16, 17, 18),
+                             jaiA64SturQ(16, 1, 24),      /* d[4], d[5] */
+                             jaiA64Fsub2D(19, 17, 18),
+                             jaiA64SturQ(19, 1, 40),      /* d[6], d[7] */
+                             jaiA64Fmul2D(20, 17, 18),
+                             jaiA64SturQ(20, 1, 56),      /* d[8], d[9] */
+                             jaiA64MovzX(0, 0, 0), jaiA64Ret() };
+      runWith(w, 11, d);
+      check("fadd.2d lane 0", dbits(d[4]), dbits(1.5 + 3.0));
+      check("fadd.2d lane 1", dbits(d[5]), dbits(0.1 + -0.0));
+      check("fsub.2d lane 0", dbits(d[6]), dbits(1.5 - 3.0));
+      check("fsub.2d lane 1", dbits(d[7]), dbits(0.1 - -0.0));
+      check("fmul.2d lane 0", dbits(d[8]), dbits(1.5 * 3.0));
+      check("fmul.2d lane 1", dbits(d[9]), dbits(0.1 * -0.0));
+      check("stur q left its neighbours", dbits(d[10]), dbits(0.0)); }
+    { double d[4] = { 0.0, 0.0, 0.0, 0.0 };
+      double k = 0.25;
+      int64_t kb;
+      memcpy(&kb, &k, sizeof kb);
+      const uint32_t w[] = { jaiA64MovzX(2, (unsigned)(kb >> 48) & 0xffffu, 3),
+                             jaiA64Dup2DX(30, 2),
+                             jaiA64SturQ(30, 0, 8),
+                             jaiA64MovzX(0, 0, 0), jaiA64Ret() };
+      runWith(w, 5, d);
+      check("dup.2d lane 0", dbits(d[1]), dbits(0.25));
+      check("dup.2d lane 1", dbits(d[2]), dbits(0.25));
+      check("dup.2d untouched", dbits(d[0]), dbits(0.0)); }
+
     if (failures != 0) return 1;
     printf("jit_arm64: ok\n");
     return 0;
