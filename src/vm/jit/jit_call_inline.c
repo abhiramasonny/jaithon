@@ -152,6 +152,7 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
     bool readsUpvalue = false;
     ObjClass *ctor = NULL;      /* a class this body constructs, last */
     bool constructs = false;
+    unsigned natives = 0;       /* `float`/`int` read and not yet called */
     for (int off = 0; off < c->count;) {
         uint8_t op = c->code[off];
         int len = instructionLength(c, off);
@@ -223,13 +224,19 @@ static bool inlinableBody(ObjClosure *callee, unsigned argc,
             ObjNative *nat = AS_NATIVE(nv);
             const char *nm = nat->name != NULL ? nat->name->chars : "";
             if (strcmp(nm, "float") != 0 && strcmp(nm, "int") != 0) return false;
+            natives++;
             break;
         }
         case OP_CALL:
-            /* The only callee that can be on the stack here is one of the two
-             * builtins above, and the tier emits those as one instruction --
-             * unless a class was read, which only a tail call may consume. */
-            if (c->code[off + 1] != 1 || ctor != NULL) return false;
+            /* One of the two builtins above, which the tier emits as one
+             * instruction -- and only if one was read: a parameter holding a
+             * function value is a callee too, and `fn via(f, x) { return
+             * f(x) }` was admitted, putting a real call inside the inline.
+             * A class read is consumed only by a tail call. */
+            if (c->code[off + 1] != 1 || ctor != NULL || natives == 0) {
+                return false;
+            }
+            natives--;
             break;
         /* `return C(a, b)` closing the body: an allocation, and stores into
          * the object just allocated, of a class whose init does nothing else
