@@ -1179,7 +1179,6 @@ void fpSyncOne(Emit *e, unsigned idx);
 void fpReleaseHome(Emit *e, unsigned reg);
 void fpReleaseAll(Emit *e);
 bool jitBorrowGuardsOn(void);
-void noteDeoptBorrows(Emit *e, unsigned k);
 unsigned deoptFpSource(const Emit *e, unsigned k, unsigned valueIdx);
 void fpSyncAll(Emit *e);
 unsigned fpOperand(Emit *e, unsigned idx);

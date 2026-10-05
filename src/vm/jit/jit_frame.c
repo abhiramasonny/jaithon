@@ -445,6 +445,8 @@ bool jitSplitStress(void) {
 
 /* Neither an inline's state nor mid-instruction state is the model's actual current state. Inside an
  * inline the interpreter hasn't made the call yet, so it resumes at OP_CALL holding just callee+args, not the inlined body's locals/temporaries. Outside one, a guard mid-instruction (OP_GET_LOCAL2 pushes then guards) leaves the model deeper than the interpreter's stack there -- handing over those extra entries strands them, and a loop can read its own iterator as its loop variable. `instDepth` is the model at the instruction's START, matching the interpreter; only entries THIS instruction pushed (the topmost) may be trimmed back to it -- an instruction that already popped something the interpreter still holds cannot be repaired and is refused. */
+static void noteDeoptBorrows(Emit *e, unsigned k);
+
 static bool deoptSite(Emit *e, uint32_t ip, uint32_t *ipOut,
                       unsigned *depthOut, unsigned *valueDepthOut) {
     if (e->inlining) {
@@ -773,7 +775,7 @@ bool jitBorrowGuardsOn(void) {
     return on != 0;
 }
 
-void noteDeoptBorrows(Emit *e, unsigned k) {
+static void noteDeoptBorrows(Emit *e, unsigned k) {
     e->deopt[k].fpBorrow = e->fpBorrow & e->fpLive;
     if (e->deopt[k].fpBorrow != 0) {
         memcpy(e->deopt[k].fpBorrowReg, e->fpBorrowReg,
