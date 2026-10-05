@@ -45,9 +45,13 @@ void emitSelfSlowStubs(Emit *e, ObjClosure *closure) {
                                (unsigned)offsetof(JitCallDesc, link)));
             emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
         }
-        emitConst64(e, 0, (int64_t)(uintptr_t)(e->selfSlow[si].callee != NULL
-                                                   ? e->selfSlow[si].callee
-                                                   : closure));
+        if (e->selfSlow[si].calleeFromReg) {
+            emit(e, jaiA64MovX(0, e->selfSlow[si].calleeReg));
+        } else {
+            emitConst64(e, 0, (int64_t)(uintptr_t)(e->selfSlow[si].callee != NULL
+                                                       ? e->selfSlow[si].callee
+                                                       : closure));
+        }
         emit(e, jaiA64AddXImm(1, 31, resultAt));
         emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)&jaiJitFinishDeopt);
         emit(e, jaiA64Blr(JIT_SCRATCH_D));
