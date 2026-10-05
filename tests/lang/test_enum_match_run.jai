@@ -22,6 +22,44 @@ enum Color { Red, Green, Blue }
 
 enum Shape { Dot, Line, Circle(radius: int), Box(w: int, h: int) }
 
+enum Letter { A, B, C, D, E, F, G, H, I, J, K, L }
+
+#: Nine distinct tags, so the run dispatches by a binary search on the tag:
+#: gaps (G, I, L) that must miss, and a guarded arm whose tag a later arm
+#: names again.
+fn bucket(x: Letter, n: int) -> int {
+    return match x {
+        Letter.A | Letter.B => 1,
+        Letter.C if n > 0 => 2,
+        Letter.D | Letter.E | Letter.F => 3,
+        Letter.C => 4,
+        Letter.H => 5,
+        Letter.J | Letter.K => 6,
+        _ => 8,
+    }
+}
+
+#: Every variant named and no default: no tag misses, but a subject that is
+#: not a Letter still has to.
+fn every_letter(v: any) -> int {
+    match v {
+        Letter.A | Letter.L => { return 1 }
+        Letter.B | Letter.K => { return 2 }
+        Letter.C | Letter.J => { return 3 }
+        Letter.D | Letter.I => { return 4 }
+        Letter.E | Letter.H => { return 5 }
+        Letter.F | Letter.G => { return 6 }
+    }
+    return 0
+}
+
+fn _letters() -> list[Letter] {
+    return [
+        Letter.A, Letter.B, Letter.C, Letter.D, Letter.E, Letter.F,
+        Letter.G, Letter.H, Letter.I, Letter.J, Letter.K, Letter.L,
+    ]
+}
+
 fn _ops() -> list[Op] {
     return [Op.Add, Op.Sub, Op.Mul, Op.Div, Op.Mod, Op.Pow]
 }
@@ -213,6 +251,24 @@ pub fn test_a_statement_match_that_breaks_and_continues() -> void {
         assert_eq(walk([Op.Div, Op.Div]), 0, "every element continues")
         call += 1
     }
+}
+
+pub fn test_a_run_dispatched_by_binary_search() -> void {
+    let letters = _letters()
+    let positive = [1, 1, 2, 3, 3, 3, 8, 5, 8, 6, 6, 8]
+    let other = [1, 1, 4, 3, 3, 3, 8, 5, 8, 6, 6, 8]
+    let paired = [1, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1]
+    var call = 0
+    while call < CALLS {
+        let index = call % 12
+        assert_eq(bucket(letters[index], 1), positive[index], "guard true")
+        assert_eq(bucket(letters[index], 0), other[index], "guard false")
+        assert_eq(every_letter(letters[index]), paired[index], "every variant")
+        call += 1
+    }
+    assert_eq(every_letter(Op.Add), 0, "another enum")
+    assert_eq(every_letter(3), 0, "an int equal to a tag")
+    assert_eq(every_letter("A"), 0, "a string")
 }
 
 pub fn test_an_exhaustive_run_still_raises_for_a_foreign_subject() -> void {

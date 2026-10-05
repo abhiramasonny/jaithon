@@ -194,6 +194,17 @@ fn _enum_run(
     let tag_slot = e._alloc_temp()
     e._bind_local(tag_slot, span)
 
+    var arm_tags: list[list[int]] = []
+    var entries: list[list[int]] = []
+    for index in range(start, stop) {
+        var tags: list[int] = []
+        _enum_tags(e, arms[index]["pattern"], owner, tags)
+        arm_tags.push(tags)
+        entries.push([])
+    }
+    var tree_misses: list[int] = []
+    _tag_tree(e, owner, tag_slot, arm_tags, entries, tree_misses, span)
+
     var misses: list[int] = []
     for index in range(start, stop) {
         let arm = arms[index]
@@ -202,8 +213,7 @@ fn _enum_run(
         e._patch_all(misses)
         misses = []
 
-        var tags: list[int] = []
-        _enum_tags(e, arm["pattern"], owner, tags)
+        let tags = arm_tags[index - start]
         var matched: list[int] = []
         for (position, tag) in tags.enumerate() {
             let last = position == tags.len() - 1
@@ -220,6 +230,7 @@ fn _enum_run(
             }
         }
         e._patch_all(matched)
+        e._patch_all(entries[index - start])
         _arm_rest(e, arm, as_expression, misses, done)
     }
 
@@ -231,11 +242,101 @@ fn _enum_run(
     # behind -- is a branch target, so the peephole keeps the pair.
     e._set_depth(base)
     e._patch_all(misses)
+    e._patch_all(tree_misses)
     e._get_local(subject, span)
     e._patch(not_enum)
     e._op(Op.Pop, span)
     e._set_depth(base)
     e._free_temps(1)
+}
+
+#: A run testing at least this many distinct tags is dispatched by a binary
+#: search on the tag; below it the linear tests are as cheap.
+const _TREE_MIN_TAGS: int = 8
+
+#: A binary search on the tag in `slot`, jumping to the body of the FIRST arm
+#: whose pattern names it -- the arm the linear tests would have reached --
+#: or to `misses` for a tag no arm names. Emits nothing for a run under
+#: `_TREE_MIN_TAGS`.
+#:
+#: Each arm's own linear tests stay behind it, reached only from a failed
+#: guard above it (dead-code elimination drops them when no arm has a
+#: guard). The search covers the whole int line, so a tag outside the enum's
+#: variants -- which the type test has already ruled out -- still misses
+#: rather than landing in an arm, and the run's miss label stays reachable.
+fn _tag_tree(
+    e: Emitter,
+    owner: str,
+    slot: int,
+    arm_tags: list[list[int]],
+    entries: list[list[int]],
+    misses: list[int],
+    span: Span
+) -> void {
+    let decl = e.enums.get(owner, null)
+    if decl == null { return }
+    let variants = decl.records("variants").len()
+    var target: list[int] = []
+    for _t in range(variants) { target.push(-1) }
+    var distinct = 0
+    for (position, tags) in arm_tags.enumerate() {
+        for tag in tags {
+            if tag >= 0 and tag < variants and target[tag] < 0 {
+                target[tag] = position
+                distinct += 1
+            }
+        }
+    }
+    if distinct < _TREE_MIN_TAGS { return }
+
+    # Intervals of equal destination: `lows[i]` is where the i-th starts
+    # (lows[0], minus infinity, is never compared against) and `goes[i]` is
+    # its arm, or -1 for a miss.
+    var lows: list[int] = [0]
+    var goes: list[int] = [-1]
+    for t in range(variants) {
+        if target[t] != goes[goes.len() - 1] {
+            lows.push(t)
+            goes.push(target[t])
+        }
+    }
+    if goes[goes.len() - 1] >= 0 {
+        lows.push(variants)
+        goes.push(-1)
+    }
+    _tag_search(e, slot, lows, goes, 0, lows.len(), entries, misses, span)
+}
+
+fn _tag_search(
+    e: Emitter,
+    slot: int,
+    lows: list[int],
+    goes: list[int],
+    first: int,
+    past: int,
+    entries: list[list[int]],
+    misses: list[int],
+    span: Span
+) -> void {
+    if past - first == 1 {
+        let jump = e._emit_jump(Op.Jump, span)
+        if goes[first] < 0 {
+            misses.push(jump)
+        } else {
+            entries[goes[first]].push(jump)
+        }
+        return
+    }
+    let middle = (first + past) // 2
+    # Jumps when `tag < lows[middle]` is FALSE: to the upper half.
+    e._chunk().write_op(Op.JumpIfCmpLocalK, span)
+    e._chunk().write_byte(opcode(Op.Lt))
+    e._chunk().write_u16(slot)
+    e._chunk().write_u24(e._chunk().add_constant(Const(ConstTag.Int, lows[middle])))
+    let upper = e._reserve_jump()
+    _tag_search(e, slot, lows, goes, first, middle, entries, misses, span)
+    e._patch(upper)
+    _tag_search(e, slot, lows, goes, middle, past, entries, misses, span)
 }
 
 pub fn _pattern_in_slot(e: Emitter, pattern: Node?, slot: int, misses: list[int]) -> void {
