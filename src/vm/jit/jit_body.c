@@ -1249,6 +1249,11 @@ bool compileBody(Emit *e, ObjClosure *closure) {
         }
 
         case OP_GET_LOCAL2:
+            /* `if a < b { s = v }`: the pair is the chain's first test. */
+            if (off + 5 < stop && code[off + 5] == OP_JUMP_IF_CMP_FALSE &&
+                jitTryIfConvert(e, fn, &off)) {
+                break;
+            }
             if (!emitGetLocal2(e, code, &off, stop)) return false;
             break;
 

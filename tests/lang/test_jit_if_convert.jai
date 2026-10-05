@@ -133,3 +133,59 @@ fn test_unproven_read_stays_guarded() -> void {
     for i in 0..10 { xs.push(i + 1) }
     for _round in 0..120 { assert_eq(guarded_read(xs, 40), 55) }
 }
+
+#: Two locals compared: the running maximum and minimum, and a clamp whose
+#: bounds are locals too.
+fn extremes(xs: list[int], lo: int, hi: int) -> list[int] {
+    var best = xs[0]
+    var least = xs[0]
+    var clamped = 0
+    for x in xs {
+        if x > best { best = x }
+        if x < least { least = x }
+        var v = x
+        if v < lo {
+            v = lo
+        } elif v > hi {
+            v = hi
+        }
+        clamped += v
+    }
+    return [best, least, clamped]
+}
+
+fn test_two_local_tests() -> void {
+    let xs = noise(23, 500)
+    var best = xs[0]
+    var least = xs[0]
+    var clamped = 0
+    for x in xs {
+        best = max(best, x)
+        least = min(least, x)
+        clamped += min(max(x, 2), 6)
+    }
+    for _round in 0..120 {
+        assert_eq(extremes(xs, 2, 6), [best, least, clamped])
+    }
+}
+
+#: The test's own local is the one assigned: every test still reads its
+#: value from before the chain.
+fn step_down(x: int) -> int {
+    var n = x
+    if n > 5 {
+        n = 5
+    } elif n > 2 {
+        n = 2
+    }
+    return n
+}
+
+fn test_assigned_local_is_tested() -> void {
+    for _round in 0..200 {
+        for x in -3..10 {
+            let want = if x > 5 { 5 } elif x > 2 { 2 } else { x }
+            assert_eq(step_down(x), want)
+        }
+    }
+}

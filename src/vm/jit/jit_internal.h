@@ -1136,6 +1136,9 @@ typedef struct {
 } JitMapRun;
 extern JitMapRun gJitMapRun;
 void emitMapKernelNext(Emit *e, SlotKind k);
+/* An `if`/`elif` chain of int assignments at *offp emitted as csel; see
+ * jit_body_cmp.c. False, having emitted nothing, when it does not apply. */
+bool jitTryIfConvert(Emit *e, ObjFunction *fn, int *offp);
 
 /* Defined in jit_compile.c. */
 bool adoptLocalKindSeen(Emit *e, unsigned slot, SlotKind kind,

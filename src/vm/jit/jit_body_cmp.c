@@ -503,7 +503,8 @@ bool emitJumpIfCmpFalse(Emit *e, const uint8_t *code, int *offp) {
  * life's whole rule, and the two tests are decided by the data: compiled as
  * branches they mispredict on a large share of cells, which a branchless
  * probe of the same rule priced at a quarter of the benchmark. A chain of
- * links, each `if local <op> k { s = v }`, all assigning the same int local
+ * links, each `if local <op> k { s = v }` or `if a <op> b { s = v }` over two
+ * int locals, all assigning the same int local
  * and ending at one join (an optional unconditional last link is the `else`),
  * is emitted here instead as one `csel` per link, innermost first:
  *
@@ -528,6 +529,8 @@ typedef struct {
     bool     uncond;     /* the trailing `else` */
     uint8_t  cmp;
     unsigned nslot;
+    bool     twoLocals;  /* `nslot <cmp> bslot` rather than `nslot <cmp> k` */
+    unsigned bslot;
     int64_t  k;
     uint8_t  vop;        /* OP_INT, OP_GET_LOCAL, or OP_GET_INDEX */
     int64_t  vimm;
@@ -572,8 +575,19 @@ static bool parseIfChain(ObjFunction *fn, int off, int stop, IfLink *links,
         IfLink *L = &links[n];
         int p;
         int falseTo = -1;
-        if (code[at] == OP_JUMP_IF_CMP_LOCAL_K) {
+        if (code[at] == OP_GET_LOCAL2 && code[at + 5] == OP_JUMP_IF_CMP_FALSE) {
+            /* `if a <cmp> b`: the two locals and the jump that tests them. */
             L->uncond = false;
+            L->twoLocals = true;
+            L->nslot = jaiReadU16(code + at + 1);
+            L->bslot = jaiReadU16(code + at + 3);
+            L->cmp = code[at + 6];
+            L->k = 0;
+            p = at + 9;
+            falseTo = p + jaiReadI16(code + at + 7);
+        } else if (code[at] == OP_JUMP_IF_CMP_LOCAL_K) {
+            L->uncond = false;
+            L->twoLocals = false;
             L->cmp = code[at + 1];
             L->nslot = jaiReadU16(code + at + 2);
             uint32_t kIdx = jaiReadU24(code + at + 4);
@@ -717,7 +731,7 @@ static void ifEmitValue(Emit *e, const IfLink *L, unsigned rd) {
 
 /* See above. True with `*offp` at the join when the chain at `*offp` was
  * emitted branch-free; false, having emitted nothing, otherwise. */
-static bool tryIfConvert(Emit *e, ObjFunction *fn, int *offp) {
+bool jitTryIfConvert(Emit *e, ObjFunction *fn, int *offp) {
     if (e->measuring || e->inlining || e->inProtected || !jitIfConvOn()) {
         return false;
     }
@@ -736,7 +750,8 @@ static bool tryIfConvert(Emit *e, ObjFunction *fn, int *offp) {
         unsigned cond;
         if (!links[i].uncond &&
             (!negatedCondition(links[i].cmp, &cond) ||
-             !ifIntLocal(e, links[i].nslot))) {
+             !ifIntLocal(e, links[i].nslot) ||
+             (links[i].twoLocals && !ifIntLocal(e, links[i].bslot)))) {
             return false;
         }
         if (!ifValueOk(e, &links[i])) return false;
@@ -758,7 +773,12 @@ static bool tryIfConvert(Emit *e, ObjFunction *fn, int *offp) {
         (void)negatedCondition(links[i].cmp, &cond);
         ifEmitValue(e, &links[i], rV);
         unsigned rn = localIn(e, links[i].nslot, JIT_SCRATCH_A);
-        emitCmpImm(e, rn, links[i].k);
+        if (links[i].twoLocals) {
+            unsigned rb = localIn(e, links[i].bslot, JIT_SCRATCH_D);
+            emit(e, jaiA64SubsXReg(31, rn, rb));
+        } else {
+            emitCmpImm(e, rn, links[i].k);
+        }
         emit(e, jaiA64CselX(rT, rV, rT, cond ^ 1u));
     }
     localOut(e, s, rT);
@@ -998,7 +1018,7 @@ bool emitJumpIfCmpLocalK(Emit *e, ObjFunction *fn, const uint8_t *code,
         if (e->localKind[slot] != SLOT_INT) return false;
         if (slot == 0) e->usesSlot0 = true;
         if (!IS_INT(k)) return false;
-        if (tryIfConvert(e, fn, &off)) break;
+        if (jitTryIfConvert(e, fn, &off)) break;
 
         /* `while i < n` and `if n < 2` are the same instruction here, and the constant fits the compare's
          * own imm12 far more often than not, so it costs one instruction rather than a movz plus a three-register subs. */
