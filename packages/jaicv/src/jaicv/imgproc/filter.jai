@@ -17,7 +17,7 @@ from ..core.arith import UN_SQUARE, add, unary_op
 from ..core.types import BORDER_CONSTANT, BORDER_DEFAULT, BORDER_REFLECT_101, BORDER_REPLICATE
 from ..core.types import CV_32F, CV_MAKETYPE, CV_MAT_CN, CV_MAT_DEPTH
 from ..core.types import Point, Scalar, Size
-from .common import PRELUDE, saturation_args
+from .common import PRELUDE, cached_weights, held_weights, keep_weights, saturation_args
 
 let _SMALL_GAUSSIANS = [
     [1.0],
@@ -460,6 +460,10 @@ pub fn sep_filter_2d(
 #: A 1-D Gaussian of the given length. A `sigma` of zero derives one from the
 #: size, exactly as `cv::getGaussianKernel` does.
 pub fn get_gaussian_kernel(ksize: int, sigma: float) -> Mat {
+    return Mat.from_list(ksize, 1, CV_MAKETYPE(CV_32F, 1), _gaussian_values(ksize, sigma))
+}
+
+fn _gaussian_values(ksize: int, sigma: float) -> list[float] {
     if ksize <= 0 or ksize % 2 == 0 {
         throw ValueError(f"a Gaussian kernel needs an odd positive size, got {ksize}")
     }
@@ -468,7 +472,7 @@ pub fn get_gaussian_kernel(ksize: int, sigma: float) -> Mat {
     #: samples instead is visibly softer. Larger sizes fall through.
     if sigma <= 0.0 and ksize <= 7 {
         let table = _SMALL_GAUSSIANS[(ksize - 1) // 2]
-        return Mat.from_list(ksize, 1, CV_MAKETYPE(CV_32F, 1), [value for value in table])
+        return [value for value in table]
     }
     let width = if sigma > 0.0 { sigma } else { 0.3 * (float(ksize - 1) * 0.5 - 1.0) + 0.8 }
     let scale = -0.5 / (width * width)
@@ -482,7 +486,7 @@ pub fn get_gaussian_kernel(ksize: int, sigma: float) -> Mat {
         total += value
     }
     for index in 0..ksize { values[index] /= total }
-    return Mat.from_list(ksize, 1, CV_MAKETYPE(CV_32F, 1), values)
+    return values
 }
 
 #: Blur with a Gaussian window.
@@ -496,9 +500,18 @@ pub fn gaussian_blur(
     let width = if ksize.width > 0 { ksize.width } else { _size_for(sigma_x) }
     let height = if ksize.height > 0 { ksize.height } else { _size_for(sigma_y) }
     let sy = if sigma_y > 0.0 { sigma_y } else { sigma_x }
-    let row = get_gaussian_kernel(width, sigma_x)
-    let column = get_gaussian_kernel(height, sy)
+    let row = _gaussian_taps(width, sigma_x)
+    let column = _gaussian_taps(height, sy)
     return sep_filter_2d(src, -1, row, column, border_mode: border_mode)
+}
+
+#: The shared taps of a Gaussian, named by size and sigma so a call that finds
+#: them does not build or format them.
+fn _gaussian_taps(ksize: int, sigma: float) -> Mat {
+    let key = f"gaussian:{ksize}:{sigma}"
+    let held = held_weights(key)
+    if held is not null { return held }
+    return keep_weights(key, ksize, 1, _gaussian_values(ksize, sigma))
 }
 
 fn _size_for(sigma: float) -> int {
@@ -517,18 +530,24 @@ pub fn box_filter(
     border_mode: int = BORDER_DEFAULT
 ) -> Mat {
     let weight = if normalize { 1.0 / float(ksize.width * ksize.height) } else { 1.0 }
-    var row: list[float] = []
-    for _index in 0..ksize.width { row.push(weight) }
-    var column: list[float] = []
-    for _index in 0..ksize.height { column.push(1.0) }
     return sep_filter_2d(
         src,
         ddepth,
-        Mat.from_list(ksize.width, 1, CV_MAKETYPE(CV_32F, 1), row),
-        Mat.from_list(ksize.height, 1, CV_MAKETYPE(CV_32F, 1), column),
+        _flat_taps(ksize.width, weight),
+        _flat_taps(ksize.height, 1.0),
         anchor: anchor,
         border_mode: border_mode
     )
+}
+
+#: `count` shared taps all equal to `weight`.
+fn _flat_taps(count: int, weight: float) -> Mat {
+    let key = f"flat:{count}:{weight}"
+    let held = held_weights(key)
+    if held is not null { return held }
+    var values: list[float] = []
+    for _index in 0..count { values.push(weight) }
+    return keep_weights(key, count, 1, values)
 }
 
 #: Average over a rectangular window, normalised.
@@ -552,7 +571,10 @@ pub fn sqr_box_filter(
 ) -> Mat {
     let widened = src.convert_to(CV_MAKETYPE(CV_32F, src.channels()))
     let squared = unary_op(widened, UN_SQUARE)
-    return box_filter(squared, ddepth, ksize, normalize: normalize, border_mode: border_mode)
+    widened.release()
+    let out = box_filter(squared, ddepth, ksize, normalize: normalize, border_mode: border_mode)
+    squared.release()
+    return out
 }
 
 #: Replace each pixel with the median of its window, which removes speckle
@@ -625,28 +647,42 @@ pub fn bilateral_filter(
 
 #: The 1-D derivative and smoothing kernels a Sobel of a given size uses.
 pub fn get_derivative_kernels(dx: int, dy: int, ksize: int) -> tuple[Mat, Mat] {
-    return (_derivative_row(dx, ksize), _derivative_row(dy, ksize))
+    let row = _derivative_row(dx, ksize)
+    let column = _derivative_row(dy, ksize)
+    return (
+        Mat.from_list(row.len(), 1, CV_MAKETYPE(CV_32F, 1), row),
+        Mat.from_list(column.len(), 1, CV_MAKETYPE(CV_32F, 1), column)
+    )
 }
 
-fn _derivative_row(order: int, ksize: int) -> Mat {
+#: The shared taps of `_derivative_row`, scaled.
+fn _derivative_taps(order: int, ksize: int, scale: float) -> Mat {
+    let key = f"derivative:{order}:{ksize}:{scale}"
+    let held = held_weights(key)
+    if held is not null { return held }
+    var row = _derivative_row(order, ksize)
+    if scale != 1.0 { row = [value * scale for value in row] }
+    return keep_weights(key, row.len(), 1, row)
+}
+
+fn _derivative_row(order: int, ksize: int) -> list[float] {
     if ksize == -1 {
         #: Scharr, which is the 3-tap kernel with the best rotational symmetry.
-        let values = if order == 0 { [3.0, 10.0, 3.0] } else { [-1.0, 0.0, 1.0] }
-        return Mat.from_list(3, 1, CV_MAKETYPE(CV_32F, 1), values)
+        return if order == 0 { [3.0, 10.0, 3.0] } else { [-1.0, 0.0, 1.0] }
     }
     if ksize % 2 == 0 or ksize < 1 {
         throw ValueError(f"a derivative kernel needs an odd positive size, got {ksize}")
     }
     if ksize == 1 {
-        if order == 0 { return Mat.from_list(1, 1, CV_MAKETYPE(CV_32F, 1), [1.0]) }
-        return Mat.from_list(3, 1, CV_MAKETYPE(CV_32F, 1), [-1.0, 0.0, 1.0])
+        if order == 0 { return [1.0] }
+        return [-1.0, 0.0, 1.0]
     }
     #: A Sobel row is a binomial smoothing kernel differentiated `order` times,
     #: which is how OpenCV builds every size from Pascal's triangle.
     var smoothing = _binomial(ksize - 1 - order)
     var row = smoothing
     for _step in 0..order { row = _differentiate(row) }
-    return Mat.from_list(row.len(), 1, CV_MAKETYPE(CV_32F, 1), row)
+    return row
 }
 
 fn _binomial(order: int) -> list[float] {
@@ -681,9 +717,14 @@ pub fn sobel(
     if dx < 0 or dy < 0 or dx == 0 and dy == 0 {
         throw ValueError("sobel needs a non-zero derivative order")
     }
-    let (row, column) = get_derivative_kernels(dx, dy, ksize)
-    let scaled = if scale == 1.0 { row } else { _scaled(row, scale) }
-    return sep_filter_2d(src, ddepth, scaled, column, delta: delta, border_mode: border_mode)
+    return sep_filter_2d(
+        src,
+        ddepth,
+        _derivative_taps(dx, ksize, scale),
+        _derivative_taps(dy, ksize, 1.0),
+        delta: delta,
+        border_mode: border_mode
+    )
 }
 
 #: The 3-tap derivative with the best rotational symmetry.
@@ -708,12 +749,6 @@ pub fn scharr(
     )
 }
 
-fn _scaled(row: Mat, factor: float) -> Mat {
-    var values: list[float] = []
-    for value in row.to_list() { values.push(value * factor) }
-    return Mat.from_list(row.rows, row.cols, row.flags, values)
-}
-
 #: Sum of the second derivatives, which responds to a blob rather than an edge.
 pub fn laplacian(
     src: Mat,
@@ -724,15 +759,19 @@ pub fn laplacian(
     border_mode: int = BORDER_DEFAULT
 ) -> Mat {
     if ksize == 1 {
-        let weights = Mat.from_list(
-            3,
-            3,
-            CV_MAKETYPE(CV_32F, 1),
-            [0.0, scale, 0.0, scale, -4.0 * scale, scale, 0.0, scale, 0.0]
-        )
+        let key = f"laplacian:{scale}"
+        let held = held_weights(key)
+        let weights = if held is not null {
+            held
+        } else {
+            keep_weights(key, 3, 3, [0.0, scale, 0.0, scale, -4.0 * scale, scale, 0.0, scale, 0.0])
+        }
         return filter_2d(src, ddepth, weights, delta: delta, border_mode: border_mode)
     }
     let xx = sobel(src, ddepth, 2, 0, ksize: ksize, scale: scale, border_mode: border_mode)
     let yy = sobel(src, ddepth, 0, 2, ksize: ksize, scale: scale, border_mode: border_mode)
-    return add(xx, yy)
+    let out = add(xx, yy)
+    xx.release()
+    yy.release()
+    return out
 }

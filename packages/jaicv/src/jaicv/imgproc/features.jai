@@ -17,10 +17,11 @@
 import std.math
 from std.core import Printable
 from std.gpu import Buffer, Kernel
+from std.os import env_or
 from ..core.mat import Mat, f32_bits, f32_from_bits
 from ..core.stats import min_max
 from ..core.types import BORDER_DEFAULT, CV_32F, CV_MAKETYPE, Point, Point2f, Size
-from .common import PRELUDE
+from .common import PRELUDE, cached_weights
 from .filter import blur, box_filter, sobel
 
 #: Sum of squared differences, where less is a better match.
@@ -358,6 +359,74 @@ kernel void corner_emit(device const float* response [[buffer(0)]],
     scores[slot] = response[r_off + y * r_step + x];
 }
 
+/* The strongest response anywhere, and how many corners above zero fall in
+ * each slice of the float bit pattern, in one pass -- so the host learns the
+ * floor and where to cut from a single read back instead of a reduction and
+ * then a count against it.
+ *
+ * A slice is the top sixteen bits of a positive float: 128 to an octave, the
+ * same grain as the thousand slices the count used between floor and peak.
+ * The strongest is kept as an order-preserving key, which for a positive
+ * float is its bits with the sign bit set and for a negative one the
+ * complement, so an unsigned maximum is the float maximum. A NaN is skipped,
+ * as the reduction it replaces skips it, and the tests are on the bits because
+ * fast math may fold a float comparison with a NaN either way. */
+kernel void corner_survey(device const float* response [[buffer(0)]],
+                          device const float* mask [[buffer(1)]],
+                          device atomic_uint* top [[buffer(2)]],
+                          device atomic_uint* counts [[buffer(3)]],
+                          constant uint& rows [[buffer(4)]],
+                          constant uint& cols [[buffer(5)]],
+                          constant uint& r_off [[buffer(6)]],
+                          constant uint& r_step [[buffer(7)]],
+                          constant uint& m_off [[buffer(8)]],
+                          constant uint& m_step [[buffer(9)]],
+                          constant uint& use_mask [[buffer(10)]],
+                          uint id [[thread_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    uint key = 0u;
+    if (id < rows * cols) {
+        uint y = id / cols;
+        uint x = id - y * cols;
+        uint bits = as_type<uint>(response[r_off + y * r_step + x]);
+        if ((bits & 0x7FFFFFFFu) <= 0x7F800000u) {
+            key = (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+        }
+    }
+    uint best = simd_max(key);
+    if (lane == 0u) atomic_fetch_max_explicit(top, best, memory_order_relaxed);
+    if (!corner_wins(response, mask, id, rows, cols, r_off, r_step, m_off,
+                     m_step, use_mask, 0.0f)) {
+        return;
+    }
+    uint y = id / cols;
+    uint x = id - y * cols;
+    /* Only a positive response is counted: zero, a negative and a NaN of
+     * either sign all fall outside 1 to 0x7F800000, which keeps the slice
+     * inside the 32768 counts. */
+    uint here = as_type<uint>(response[r_off + y * r_step + x]);
+    if (here - 1u >= 0x7F800000u) return;
+    atomic_fetch_add_explicit(&counts[here >> 16], 1u, memory_order_relaxed);
+}
+
+/* The survey's counts as floats, and its strongest decoded, at the end. A key
+ * no pixel raised -- an empty frame, or one of NaNs -- reads as zero, which
+ * is no corner at all. */
+kernel void corner_survey_read(device const uint* top [[buffer(0)]],
+                               device const uint* counts [[buffer(1)]],
+                               device float* out [[buffer(2)]],
+                               constant uint& slices [[buffer(3)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id < slices) {
+        out[id] = float(counts[id]);
+        return;
+    }
+    if (id != slices) return;
+    uint key = top[0];
+    uint bits = key == 0u ? 0u : (key & 0x80000000u) != 0u ? (key & 0x7FFFFFFFu) : ~key;
+    out[slices] = as_type<float>(bits);
+}
+
 kernel void hough_collect(device const uint* votes [[buffer(0)]],
                           device float* out [[buffer(1)]],
                           constant uint& count [[buffer(2)]],
@@ -559,10 +628,11 @@ pub fn match_template(image: Mat, templ: Mat, method: int = TM_CCOEFF_NORMED) ->
     var spread = energy
     for channel in 0..cn { spread -= sums[channel] * sums[channel] / area }
     if spread < 0.0 { spread = 0.0 }
-    let stats = Mat.from_list(
+    #: Shared, not made per call: a matrix dropped here was a device buffer
+    #: leaked on every match.
+    let stats = cached_weights(
         1,
         6,
-        CV_MAKETYPE(CV_32F, 1),
         [sums[0], sums[1], sums[2], sums[3], energy, math.sqrt(spread)]
     )
 
@@ -614,24 +684,33 @@ fn structure_tensor(src: Mat, block_size: int, aperture_size: int) -> Mat {
         scale: scale,
         border_mode: BORDER_DEFAULT
     )
-    let cov = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 3))
+    #: Not zeroed: the covariance kernel writes every element.
+    let cov = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 3))
     let count = src.rows * src.cols
-    if count == 0 { return cov }
+    if count == 0 {
+        dx.release()
+        dy.release()
+        return cov
+    }
     kernel_for("feature_covariance").dispatch_async(
         [dx.storage, dy.storage, cov.storage],
         count,
         [count, src.cols, dx.offset, dx.step_, dy.offset, dy.step_, cov.offset, cov.step_]
     )
     cov.invalidate()
+    dx.release()
+    dy.release()
     #: The window sums rather than averages, which is why this asks the box
     #: filter not to normalise.
-    return box_filter(
+    let summed = box_filter(
         cov,
         CV_32F,
         Size(block_size, block_size),
         normalize: false,
         border_mode: BORDER_DEFAULT
     )
+    cov.release()
+    return summed
 }
 
 #: Harris's corner response.
@@ -648,15 +727,19 @@ pub fn corner_harris(
     if src.channels() != 1 { throw ValueError("corner_harris needs a single-channel Mat") }
     src.flush()
     let cov = structure_tensor(src, block_size, aperture_size)
-    let out = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
+    let out = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
     let count = src.rows * src.cols
-    if count == 0 { return out }
+    if count == 0 {
+        cov.release()
+        return out
+    }
     kernel_for("feature_harris").dispatch_async(
         [cov.storage, out.storage],
         count,
         [count, src.cols, cov.offset, cov.step_, out.offset, out.step_, f32_bits(k)]
     )
     out.invalidate()
+    cov.release()
     return out
 }
 
@@ -666,15 +749,19 @@ pub fn corner_min_eigen_val(src: Mat, block_size: int = 3, aperture_size: int = 
     if src.channels() != 1 { throw ValueError("corner_min_eigen_val needs a single-channel Mat") }
     src.flush()
     let cov = structure_tensor(src, block_size, aperture_size)
-    let out = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
+    let out = Mat(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
     let count = src.rows * src.cols
-    if count == 0 { return out }
+    if count == 0 {
+        cov.release()
+        return out
+    }
     kernel_for("feature_min_eigen").dispatch_async(
         [cov.storage, out.storage],
         count,
         [count, src.cols, cov.offset, cov.step_, out.offset, out.step_]
     )
     out.invalidate()
+    cov.release()
     return out
 }
 
@@ -738,6 +825,152 @@ fn space_out(spots: list[float], ordered: list[int], squared: float, flat: list[
     return taken
 }
 
+#: Slices of the float bit pattern the survey counts corners into: the top
+#: sixteen bits of every non-negative float.
+const CORNER_SLICES = 32768
+
+#: Whether `good_features_to_track` surveys the response in one pass for its
+#: strongest value and its corner counts. `JAICV_GF_SURVEY=0` takes the
+#: maximum with `min_max` and then counts against the floor, two read backs;
+#: the answer is the same either way.
+let _GF_SURVEY = env_or("JAICV_GF_SURVEY", "1") != "0"
+
+#: Dispatch the survey; the returned buffer holds the count in every slice and
+#: then the strongest response, all as floats, once the work has run.
+fn survey_corners(response: Mat, plane: Mat, opened: int) -> Buffer {
+    let top = Buffer(1)
+    top.fill_zero()
+    let counts = Buffer(CORNER_SLICES)
+    counts.fill_zero()
+    kernel_for("corner_survey").dispatch_async(
+        [response.storage, plane.storage, top, counts],
+        response.rows * response.cols,
+        [
+            response.rows,
+            response.cols,
+            response.offset,
+            response.step_,
+            plane.offset,
+            plane.step_,
+            opened,
+        ]
+    )
+    let read = Buffer(CORNER_SLICES + 1)
+    kernel_for("corner_survey_read").dispatch_async(
+        [top, counts, read],
+        CORNER_SLICES + 1,
+        [CORNER_SLICES]
+    )
+    top.free()
+    counts.free()
+    return read
+}
+
+#: Whether `strongest_first` may select the strongest few instead of ranking
+#: every candidate. `JAICV_GF_SELECT=0` always ranks them all; the answer is the
+#: same either way.
+let _GF_SELECT = env_or("JAICV_GF_SELECT", "1") != "0"
+
+#: Candidate indices strongest first, equal strengths in the order found --
+#: but only the first `wanted` of that order, or all of it when `wanted` is
+#: zero.
+#:
+#: Ranking everything costs a key call per candidate, and on a frame with large
+#: flat or repeating stretches tens of thousands of candidates tie at the cut:
+#: 57,608 of them, with four distinct strengths, for 6,400 wanted, which was
+#: 2.3 ms of an 8 ms call. Every candidate stronger than the `wanted`-th
+#: strongest is in the prefix, so those are ranked, and the rest of the prefix
+#: is candidates equal to it, in the order found. Finding that strength is a
+#: sort of the bare values, which needs no key call.
+#:
+#: When there are only a handful of distinct strengths -- the frame where ties
+#: are the problem -- even that sort is more than is needed: the candidates
+#: are dealt into one list per strength as they come, which keeps each list in
+#: the order found, and the lists read strongest first are the ranking.
+fn strongest_first(strengths: list[float], found: int, wanted: int) -> list[int] {
+    if wanted <= 0 or found <= wanted * 2 or not _GF_SELECT {
+        var order: list[int] = []
+        for index in 0..found { order.push(index) }
+        return order.sort(key: |index| strengths[index], reverse: true)
+    }
+    var levels: list[float] = []
+    var members: list[list[int]] = []
+    if deal_by_strength(strengths, found, levels, members) {
+        var by_level = [at for at in 0..levels.len()]
+        by_level.sort(key: |at| levels[at], reverse: true)
+        var ordered: list[int] = []
+        for at in by_level {
+            for index in members[at] {
+                if ordered.len() >= wanted { return ordered }
+                ordered.push(index)
+            }
+        }
+        return ordered
+    }
+    let level = strengths.sorted(reverse: true)[wanted - 1]
+    var above: list[int] = []
+    var tied: list[int] = []
+    split_at_level(strengths, found, level, wanted, above, tied)
+    var ordered = above.sort(key: |index| strengths[index], reverse: true)
+    var at = 0
+    while ordered.len() < wanted {
+        ordered.push(tied[at])
+        at += 1
+    }
+    return ordered
+}
+
+#: Most distinct strengths `deal_by_strength` keeps lists for.
+const FEW_STRENGTHS = 8
+
+#: Deal candidate indices into one list per distinct strength, in the order
+#: found, or give up and return false once there are more than `FEW_STRENGTHS`
+#: of them. A body of its own so the loop compiles.
+fn deal_by_strength(
+    strengths: list[float],
+    found: int,
+    levels: list[float],
+    members: list[list[int]]
+) -> bool {
+    #: No return inside the loop: the tier will not enter a loop that has one.
+    var dealt = true
+    for index in 0..found {
+        let strength = strengths[index]
+        var at = 0
+        while at < levels.len() and levels[at] != strength { at += 1 }
+        if at == levels.len() {
+            if at == FEW_STRENGTHS {
+                dealt = false
+                break
+            }
+            levels.push(strength)
+            members.push([])
+        }
+        members[at].push(index)
+    }
+    return dealt
+}
+
+#: The candidates stronger than `level`, and the first `limit` equal to it,
+#: each in the order found. A body of its own so the loop compiles.
+fn split_at_level(
+    strengths: list[float],
+    found: int,
+    level: float,
+    limit: int,
+    above: list[int],
+    tied: list[int]
+) -> void {
+    for index in 0..found {
+        let strength = strengths[index]
+        if strength > level {
+            above.push(index)
+        } elif strength == level and tied.len() < limit {
+            tied.push(index)
+        }
+    }
+}
+
 pub fn good_features_to_track(
     image: Mat,
     max_corners: int,
@@ -758,10 +991,10 @@ pub fn good_features_to_track(
     }
     let rows = response.rows
     let cols = response.cols
-    let (_low, strongest) = min_max(response)
-    if strongest <= 0.0 { return [] }
-    let floor_value = strongest * quality_level
-
+    if rows * cols == 0 {
+        response.release()
+        return []
+    }
     response.flush()
     let mask_image = mask
     if mask_image is not null { mask_image.flush() }
@@ -771,6 +1004,29 @@ pub fn good_features_to_track(
     let limit = rows * cols
     let groups = (limit + CORNER_GROUP - 1) // CORNER_GROUP
     let opened = if mask_image is null { 0 } else { 1 }
+
+    #: The strongest response sets the floor. The survey finds it and counts
+    #: the corners in every slice above zero in the same pass, so one read back
+    #: serves both the floor and the cut below.
+    var strongest = 0.0
+    var survey: Buffer? = null
+    if _GF_SURVEY {
+        let read = survey_corners(response, plane, opened)
+        strongest = read.download(CORNER_SLICES, 1)[0]
+        survey = read
+    } else {
+        let (_low, high) = min_max(response)
+        strongest = high
+    }
+    #: A quality level above one puts the floor above the strongest, which
+    #: leaves nothing, as it does in OpenCV.
+    if strongest <= 0.0 or quality_level > 1.0 and strongest * quality_level > strongest {
+        let surveyed = survey
+        if surveyed is not null { surveyed.free() }
+        response.release()
+        return []
+    }
+    let floor_value = strongest * quality_level
 
     #: Whether a pixel is a peak does not depend on the floor, so raising the
     #: floor takes away exactly the weakest candidates and leaves the rest
@@ -785,7 +1041,31 @@ pub fn good_features_to_track(
     var emit_bits = f32_bits(floor_value)
     var room = limit
     var whole_frame = true
-    if wanted > 0 {
+    let surveyed = survey
+    if wanted > 0 and surveyed is not null {
+        #: Slices are whole: a cut strictly above the floor's own slice starts
+        #: above the floor, and every corner counted from there down to it is
+        #: one the emit will find.
+        let low_slice = f32_bits(floor_value) >> 16
+        let high_slice = f32_bits(strongest) >> 16
+        let tally = surveyed.download(low_slice, high_slice - low_slice + 1)
+        var running = 0
+        var cut = 0
+        for index in 0..tally.len() {
+            let at = tally.len() - 1 - index
+            running += int(tally[at] + 0.5)
+            if running >= wanted {
+                cut = at
+                break
+            }
+        }
+        if cut > 0 {
+            let cut_slice = low_slice + cut
+            emit_bits = cut_slice << 16
+            room = running
+            whole_frame = false
+        }
+    } elif wanted > 0 {
         let low_bits = f32_bits(floor_value)
         let slice = (f32_bits(strongest) - low_bits) // CORNER_BUCKETS + 1
         let counts = Buffer(CORNER_BUCKETS)
@@ -831,6 +1111,8 @@ pub fn good_features_to_track(
         }
     }
 
+    if surveyed is not null { surveyed.free() }
+
     let where = [
         rows,
         cols,
@@ -872,6 +1154,8 @@ pub fn good_features_to_track(
     total.free()
     spots.free()
     scores.free()
+    #: `plane` is either this or the caller's mask, and only this is ours.
+    response.release()
 
     #: Strongest first, and equal strengths in the order they were found --
     #: which is raster order, because that is how the device laid them out.
@@ -879,13 +1163,18 @@ pub fn good_features_to_track(
     #: with the square of how many there are, and on a textured frame there
     #: are tens of thousands: 640 by 480 took 28 seconds that way, nearly all
     #: of it shuffling a list along.
-    var order: list[int] = []
-    for index in 0..found { order.push(index) }
-    let ordered = order.sort(key: |index| strengths[index], reverse: true)
+    var ordered = strongest_first(strengths, found, wanted)
 
     let room_for = if max_corners > 0 { min(max_corners, found) } else { found }
     var flat = [0.0 for _slot in 0..room_for * 2]
-    let taken = space_out(candidates, ordered, min_distance * min_distance, flat)
+    let squared = min_distance * min_distance
+    var taken = space_out(candidates, ordered, squared, flat)
+    if taken < room_for and ordered.len() < found {
+        #: The strongest few did not fill the answer, so rank every candidate
+        #: and walk them again from the top.
+        ordered = strongest_first(strengths, found, 0)
+        taken = space_out(candidates, ordered, squared, flat)
+    }
     var kept: list[Point2f] = []
     for index in 0..taken { kept.push(Point2f(flat[index * 2], flat[index * 2 + 1])) }
     #: Reading every candidate without filling the answer means the margin
@@ -1245,8 +1534,6 @@ pub fn hough_circles(
     let smoothed = blur(image, Size(3, 3))
     let dx = sobel(smoothed, CV_32F, 1, 0, ksize: 3)
     let dy = sobel(smoothed, CV_32F, 0, 1, ksize: 3)
-    let gradient_x = dx.values()
-    let gradient_y = dy.values()
 
     let rows = image.rows
     let cols = image.cols
@@ -1268,6 +1555,9 @@ pub fn hough_circles(
         rows * cols,
         [rows * cols, cols, acc_rows, acc_cols, lower, upper, f32_bits(dp), f32_bits(edge_floor)]
     )
+    smoothed.release()
+    dx.release()
+    dy.release()
     let counted_buffer = Buffer(cells)
     kernel_for("hough_collect").dispatch_async([votes_buffer, counted_buffer], cells, [cells])
     let counted = counted_buffer.download()

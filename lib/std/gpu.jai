@@ -30,7 +30,7 @@
 #: Facade: imports and re-exports every sibling module in `std/gpu/`.
 from std.gpu.device import FN_GPU_KERNEL, device_count, device_name, flush, is_available
 from std.gpu.device import is_gpu_kernel, mixed_precision, set_device, set_mixed_precision
-from std.gpu.device import synchronize
+from std.gpu.device import live_buffers, live_floats, synchronize
 from std.gpu.kernel import Buffer, Kernel
 from std.gpu.ops import conv2d_async, conv2d_data_grad_async, conv2d_weights_grad_async
 from std.gpu.ops import labels_valid, matmul_async, mha_async, mlp3_bwd_step, mlp3_sgd_epoch
@@ -39,7 +39,8 @@ from std.gpu.vector import MIN_GPU_ELEMENTS, dot, map_kernel, matmul, reduce_sum
 from std.gpu.vector import vector_mul
 
 export { FN_GPU_KERNEL, device_count, device_name, flush, is_available }
-export { is_gpu_kernel, mixed_precision, set_device, set_mixed_precision, synchronize }
+export { is_gpu_kernel, live_buffers, live_floats, mixed_precision, set_device }
+export { set_mixed_precision, synchronize }
 export { Buffer, Kernel }
 export { conv2d_async, conv2d_data_grad_async, conv2d_weights_grad_async, labels_valid }
 export { matmul_async, mha_async, mlp3_bwd_step, mlp3_sgd_epoch, mlp3_sgd_step }

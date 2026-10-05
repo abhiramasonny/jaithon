@@ -16,7 +16,7 @@ from ..core.types import BORDER_CONSTANT, BORDER_DEFAULT, BORDER_REFLECT_101, BO
 from ..core.types import CV_32F, CV_64F, CV_MAKETYPE, CV_MAT_CN
 from ..core.types import INTER_AREA, INTER_CUBIC, INTER_LANCZOS4, INTER_LINEAR, INTER_NEAREST
 from ..core.types import Point2f, Rect, Scalar, Size, WARP_INVERSE_MAP
-from .common import PRELUDE, layout_of, saturation_args
+from .common import PRELUDE, cached_weights, layout_of, saturation_args
 
 let SOURCE = PRELUDE + """
 kernel void geo_resize(device const float* src [[buffer(0)]],
@@ -471,10 +471,13 @@ fn warp(
     border_value: Scalar
 ) -> Mat {
     src.flush()
+    #: The inverse is the caller's matrix or a shared one from the cache, and
+    #: neither is this call's to release.
+    let inverse_rows = if perspective { 3 } else { 2 }
     let inverse = if flags & WARP_INVERSE_MAP != 0 {
         matrix
     } else {
-        invert_transform(matrix, perspective)
+        cached_weights(inverse_rows, 3, _inverse_values(matrix, perspective))
     }
     inverse.flush()
     let out = Mat(size.height, size.width, src.flags)
@@ -799,6 +802,11 @@ pub fn solve_dense(rows: list[list[float]], right: list[float]) -> list[float] {
 
 #: The inverse of a 2x3 affine or 3x3 perspective transform.
 pub fn invert_transform(matrix: Mat, perspective: bool) -> Mat {
+    let rows = if perspective { 3 } else { 2 }
+    return Mat.from_list(rows, 3, CV_MAKETYPE(CV_32F, 1), _inverse_values(matrix, perspective))
+}
+
+fn _inverse_values(matrix: Mat, perspective: bool) -> list[float] {
     let values = matrix.values()
     if not perspective {
         let determinant = values[0] * values[4] - values[1] * values[3]
@@ -810,12 +818,7 @@ pub fn invert_transform(matrix: Mat, perspective: bool) -> Mat {
         let b = -values[1] * inverse
         let d = -values[3] * inverse
         let e = values[0] * inverse
-        return Mat.from_list(
-            2,
-            3,
-            CV_MAKETYPE(CV_32F, 1),
-            [a, b, -a * values[2] - b * values[5], d, e, -d * values[2] - e * values[5]]
-        )
+        return [a, b, -a * values[2] - b * values[5], d, e, -d * values[2] - e * values[5]]
     }
     var rows: list[list[float]] = []
     for r in 0..3 {
@@ -828,7 +831,7 @@ pub fn invert_transform(matrix: Mat, perspective: bool) -> Mat {
     for r in 0..3 {
         for c in 0..3 { flat.push(inverse[r][c]) }
     }
-    return Mat.from_list(3, 3, CV_MAKETYPE(CV_32F, 1), flat)
+    return flat
 }
 
 #: Inverse of a 3x3 matrix by cofactors.

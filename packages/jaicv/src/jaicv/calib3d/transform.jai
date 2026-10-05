@@ -15,7 +15,7 @@
 import std.math
 from std.gpu import Buffer, Kernel
 from ..core.linalg import identity, inverse, matmul, null_space, subtract, transpose
-from ..core.linalg import levenberg_marquardt, scale, solve_least_squares
+from ..core.linalg import levenberg_marquardt, null_space_of, scale, solve_least_squares
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_MAKETYPE, Point2f, Point3f, Size
 
@@ -30,6 +30,34 @@ fn matrix_of(values: list[float], rows: int, cols: int) -> Mat {
     return Mat.from_list(rows, cols, CV_MAKETYPE(CV_32F, 1), values)
 }
 
+#: The rotation matrix of a rotation vector, row-major, in double precision.
+#:
+#: The arithmetic `rodrigues` does, without the matrix round it: a fit that
+#: evaluates its residual thousands of times cannot afford a device buffer, an
+#: upload and a read back for every three numbers, and those reads were six of
+#: the seven seconds a camera calibration took.
+pub fn rotation_of_vector(x: float, y: float, z: float) -> list[float] {
+    let angle = math.sqrt(x * x + y * y + z * z)
+    if angle < 1e-12 { return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] }
+    let ux = x / angle
+    let uy = y / angle
+    let uz = z / angle
+    let c = math.cos(angle)
+    let s = math.sin(angle)
+    let t = 1.0 - c
+    return [
+        c + ux * ux * t,
+        ux * uy * t - uz * s,
+        ux * uz * t + uy * s,
+        uy * ux * t + uz * s,
+        c + uy * uy * t,
+        uy * uz * t - ux * s,
+        uz * ux * t - uy * s,
+        uz * uy * t + ux * s,
+        c + uz * uz * t,
+    ]
+}
+
 #: Turn a rotation vector into a rotation matrix, or the other way round.
 #:
 #: A three-entry input is read as an axis whose length is the angle and a three
@@ -42,29 +70,8 @@ pub fn rodrigues(source: Mat) -> Mat {
         let x = values[0]
         let y = values[1]
         let z = values[2]
-        let angle = math.sqrt(x * x + y * y + z * z)
-        if angle < 1e-12 { return identity(3) }
-        let ux = x / angle
-        let uy = y / angle
-        let uz = z / angle
-        let c = math.cos(angle)
-        let s = math.sin(angle)
-        let t = 1.0 - c
-        return matrix_of(
-            [
-                c + ux * ux * t,
-                ux * uy * t - uz * s,
-                ux * uz * t + uy * s,
-                uy * ux * t + uz * s,
-                c + uy * uy * t,
-                uy * uz * t - ux * s,
-                uz * ux * t - uy * s,
-                uz * uy * t + ux * s,
-                c + uz * uz * t,
-            ],
-            3,
-            3
-        )
+        if math.sqrt(x * x + y * y + z * z) < 1e-12 { return identity(3) }
+        return matrix_of(rotation_of_vector(x, y, z), 3, 3)
     }
     if source.rows != 3 or source.cols != 3 {
         throw ValueError("rodrigues takes a three-vector or a three by three matrix")
@@ -146,12 +153,181 @@ fn homography_from(source: list[Point2f], target: list[Point2f]) -> Mat {
         for value in [-x, -y, -1.0, 0.0, 0.0, 0.0, u * x, u * y, u] { rows.push(value) }
         for value in [0.0, 0.0, 0.0, -x, -y, -1.0, v * x, v * y, v] { rows.push(value) }
     }
-    let h = null_space(matrix_of(rows, count * 2, 9))
+    let design = matrix_of(rows, count * 2, 9)
+    let h = null_space(design)
+    design.release()
     let normalised = matrix_of(h, 3, 3)
-    let denormalised = matmul(matmul(inverse(tt), normalised), ts)
+    let back = inverse(tt)
+    let left = matmul(back, normalised)
+    let denormalised = matmul(left, ts)
+    for spent in [ts, tt, normalised, back, left] { spent.release() }
     let flat = denormalised.values()
     if math.fabs(flat[8]) < 1e-12 { return denormalised }
-    return scale(denormalised, 1.0 / flat[8])
+    let scaled = scale(denormalised, 1.0 / flat[8])
+    denormalised.release()
+    return scaled
+}
+
+#: `homography_from` in double precision over plain lists, as nine values
+#: row-major. RANSAC fits one of these every round, two thousand rounds a call,
+#: and through matrices each one was eight device buffers made, filled and
+#: read back: three quarters of a second a call.
+fn homography_values(source: list[Point2f], target: list[Point2f]) -> list[float] {
+    let count = source.len()
+    let (fs, ns) = normalised_points(source)
+    let (ft, nt) = normalised_points(target)
+    var rows: list[float] = []
+    _homography_rows(ns, nt, rows)
+    #: Four pairs determine the homography exactly, so with its last entry
+    #: fixed at one it is an eight by eight solve -- what every RANSAC round
+    #: asks for, and a hundred times cheaper than the eigenvectors of the
+    #: normal matrix, which is the same answer to rounding. A sample that does
+    #: not determine one comes back empty.
+    let h = if count == 4 { _exact_homography(rows) } else { null_space_of(rows, count * 2, 9) }
+    if h.len() == 0 { return [] }
+    #: Undo the two normalisations: the target's inverse on the left, the
+    #: source's on the right. Each is a scale about a centre, so its inverse is
+    #: written down rather than solved for.
+    let s = fs[0]
+    let sx = fs[1]
+    let sy = fs[2]
+    let t = ft[0]
+    let tx = ft[1]
+    let ty = ft[2]
+    var right: list[float] = []
+    for row in 0..3 {
+        let a = h[row * 3]
+        let b = h[row * 3 + 1]
+        let c = h[row * 3 + 2]
+        right.push(a * s)
+        right.push(b * s)
+        right.push(c - a * s * sx - b * s * sy)
+    }
+    var out: list[float] = []
+    for column in 0..3 {
+        out.push(right[column] / t + tx * right[6 + column])
+    }
+    for column in 0..3 {
+        out.push(right[3 + column] / t + ty * right[6 + column])
+    }
+    for column in 0..3 { out.push(right[6 + column]) }
+    if math.fabs(out[8]) < 1e-12 { return out }
+    let inverse = 1.0 / out[8]
+    return [value * inverse for value in out]
+}
+
+#: Solve the eight equations `rows` holds for the homography with its last
+#: entry one, by elimination with partial pivoting; empty when they are
+#: singular.
+fn _exact_homography(rows: list[float]) -> list[float] {
+    #: The augmented system: the first eight columns, and minus the ninth.
+    var work: list[float] = []
+    for index in 0..72 {
+        let row = index // 9
+        let column = index - row * 9
+        work.push(if column == 8 { -rows[row * 9 + 8] } else { rows[row * 9 + column] })
+    }
+    if not _eliminate(work) { return [] }
+    var h = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    _back_substitute(work, h)
+    return h
+}
+
+#: Forward elimination of an eight by nine augmented system in place; false
+#: when a pivot vanishes.
+fn _eliminate(work: list[float]) -> bool {
+    var solvable = true
+    for pivot in 0..8 {
+        var best = pivot
+        var size = math.fabs(work[pivot * 9 + pivot])
+        for row in pivot + 1..8 {
+            let candidate = math.fabs(work[row * 9 + pivot])
+            if candidate > size {
+                size = candidate
+                best = row
+            }
+        }
+        if size < 1e-12 {
+            solvable = false
+            break
+        }
+        if best != pivot {
+            for column in 0..9 {
+                let held = work[pivot * 9 + column]
+                work[pivot * 9 + column] = work[best * 9 + column]
+                work[best * 9 + column] = held
+            }
+        }
+        let lead = work[pivot * 9 + pivot]
+        for row in pivot + 1..8 {
+            let factor = work[row * 9 + pivot] / lead
+            for column in pivot..9 { work[row * 9 + column] -= factor * work[pivot * 9 + column] }
+        }
+    }
+    return solvable
+}
+
+#: Back substitution into the first eight entries of `h`.
+fn _back_substitute(work: list[float], h: list[float]) -> void {
+    for step in 0..8 {
+        let row = 7 - step
+        var total = work[row * 9 + 8]
+        for column in row + 1..8 { total -= work[row * 9 + column] * h[column] }
+        h[row] = total / work[row * 9 + row]
+    }
+}
+
+#: The two equations each normalised pair gives a homography, row-major.
+fn _homography_rows(ns: list[Point2f], nt: list[Point2f], rows: list[float]) -> void {
+    for index in 0..ns.len() {
+        let x = ns[index].x
+        let y = ns[index].y
+        let u = nt[index].x
+        let v = nt[index].y
+        rows.push(-x)
+        rows.push(-y)
+        rows.push(-1.0)
+        rows.push(0.0)
+        rows.push(0.0)
+        rows.push(0.0)
+        rows.push(u * x)
+        rows.push(u * y)
+        rows.push(u)
+        rows.push(0.0)
+        rows.push(0.0)
+        rows.push(0.0)
+        rows.push(-x)
+        rows.push(-y)
+        rows.push(-1.0)
+        rows.push(v * x)
+        rows.push(v * y)
+        rows.push(v)
+    }
+}
+
+#: The scale and centre of Hartley's normalisation, as `[scale, cx, cy]`, and
+#: the points moved by it. `normalising` without the matrix.
+fn normalised_points(points: list[Point2f]) -> tuple[list[float], list[Point2f]] {
+    let count = points.len()
+    var cx = 0.0
+    var cy = 0.0
+    for point in points {
+        cx += point.x
+        cy += point.y
+    }
+    cx /= float(count)
+    cy /= float(count)
+    var spread = 0.0
+    for point in points {
+        let dx = point.x - cx
+        let dy = point.y - cy
+        spread += math.sqrt(dx * dx + dy * dy)
+    }
+    spread /= float(count)
+    let factor = if spread > 1e-12 { math.sqrt(2.0) / spread } else { 1.0 }
+    var moved: list[Point2f] = []
+    for point in points { moved.push(Point2f((point.x - cx) * factor, (point.y - cy) * factor)) }
+    return ([factor, cx, cy], moved)
 }
 
 fn apply_homography(h: list[float], point: Point2f) -> Point2f {
@@ -189,6 +365,7 @@ pub fn find_homography(
     var best_h = homography_from(source, target)
     var best_inliers = inliers
     var best_count = 0
+    var best_flat: list[float] = []
     #: A deterministic sampler, so the same input gives the same answer every
     #: time; OpenCV draws from its own generator and does not.
     var state = 0x9E3779B97F4A
@@ -209,13 +386,8 @@ pub fn find_homography(
             sample_source.push(source[pick])
             sample_target.push(target[pick])
         }
-        var candidate: Mat = best_h
-        try {
-            candidate = homography_from(sample_source, sample_target)
-        } catch ValueError {
-            continue
-        }
-        let flat = candidate.values()
+        let flat = homography_values(sample_source, sample_target)
+        if flat.len() == 0 { continue }
         var agreed: list[bool] = []
         var agreement = 0
         for index in 0..count {
@@ -228,7 +400,7 @@ pub fn find_homography(
         }
         if agreement > best_count {
             best_count = agreement
-            best_h = candidate
+            best_flat = flat
             best_inliers = agreed
         }
     }
@@ -241,7 +413,11 @@ pub fn find_homography(
             kept_source.push(source[index])
             kept_target.push(target[index])
         }
+        best_h.release()
         best_h = homography_from(kept_source, kept_target)
+    } elif best_count > 0 {
+        best_h.release()
+        best_h = matrix_of(best_flat, 3, 3)
     }
     return (best_h, best_inliers)
 }
@@ -318,9 +494,21 @@ pub fn project_points(
     camera_matrix: Mat,
     dist_coeffs: list[float] = []
 ) -> list[Point2f] {
-    let r = rodrigues(rvec).values()
-    let t = tvec.values()
-    let k = camera_matrix.values()
+    let turn = rodrigues(rvec)
+    let r = turn.values()
+    turn.release()
+    return projected_through(object_points, r, tvec.values(), camera_matrix.values(), dist_coeffs)
+}
+
+#: `project_points` over plain lists: the rotation matrix `r` row-major, the
+#: translation `t`, and the camera matrix `k`.
+pub fn projected_through(
+    object_points: list[Point3f],
+    r: list[float],
+    t: list[float],
+    k: list[float],
+    dist_coeffs: list[float]
+) -> list[Point2f] {
     var out: list[Point2f] = []
     for point in object_points {
         let cx = r[0] * point.x + r[1] * point.y + r[2] * point.z + t[0]
@@ -405,7 +593,9 @@ pub fn init_undistort_rectify_map(
     size: Size
 ) -> tuple[Mat, Mat] {
     let k = camera_matrix.values()
-    let inverse_new = inverse(new_camera_matrix).values()
+    let inverted = inverse(new_camera_matrix)
+    let inverse_new = inverted.values()
+    inverted.release()
     let count = size.width * size.height
     let map_x = Mat(size.height, size.width, CV_MAKETYPE(CV_32F, 1))
     let map_y = Mat(size.height, size.width, CV_MAKETYPE(CV_32F, 1))

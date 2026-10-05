@@ -467,7 +467,10 @@ pub class ORB {
             let height = int(float(image.rows) / scale)
             if width < self.patch_size or height < self.patch_size { break }
             let scaled = if level == 0 { image } else { resize(image, size: Size(width, height)) }
-            for point in fast(scaled, self.fast_threshold, true) {
+            let corners = fast(scaled, self.fast_threshold, true)
+            #: Level zero is the caller's own image; every other level is ours.
+            if level > 0 { scaled.release() }
+            for point in corners {
                 #: A keypoint too near the edge has no patch to describe, so it
                 #: is dropped here rather than clamped later.
                 let margin = float(self.edge_threshold)
@@ -559,6 +562,8 @@ pub class ORB {
             let scaled = if level == 0 { image } else { resize(image, size: Size(width, height)) }
             let smoothed = gaussian_blur(scaled, Size(7, 7), 2.0)
             let values = smoothed.values()
+            smoothed.release()
+            if level > 0 { scaled.release() }
 
             #: The same keypoints, placed where they sit on this level.
             var here: list[KeyPoint] = []
@@ -577,7 +582,9 @@ pub class ORB {
                 slots.push(index)
             }
             for point in here { point.angle = patch_angle(values, height, width, point, radius) }
-            let block = describe(values, height, width, here, self.pattern, 32, true).values()
+            let described = describe(values, height, width, here, self.pattern, 32, true)
+            let block = described.values()
+            described.release()
             for (at, slot) in slots.enumerate() {
                 keypoints[slot].angle = here[at].angle
                 for byte in 0..32 { rows_out[slot * 32 + byte] = block[at * 32 + byte] }
@@ -615,6 +622,7 @@ pub class BRIEF {
         image.flush()
         let smoothed = gaussian_blur(image, Size(7, 7), 2.0)
         let values = smoothed.values()
+        smoothed.release()
         let described = describe(
             values,
             image.rows,
@@ -819,6 +827,9 @@ pub class SimpleBlobDetector {
             let (_used, binary) = threshold(image, level, 255.0, THRESH_BINARY)
             let hunted = if self.params.blob_color == 0 { subtract_from(binary) } else { binary }
             let (contours, _hierarchy) = find_contours(hunted, RETR_LIST, CHAIN_APPROX_NONE)
+            #: Both are made here at every level, and only the outlines are kept.
+            if self.params.blob_color == 0 { hunted.release() }
+            binary.release()
             for contour in contours {
                 let area = contour_area(contour)
                 if self.params.filter_by_area {

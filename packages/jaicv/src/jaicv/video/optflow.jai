@@ -19,7 +19,7 @@ import std.math
 from std.gpu import Buffer, Kernel
 from ..core.mat import Mat, f32_bits
 from ..core.types import CV_32F, CV_MAKETYPE, Point2f, Size, TermCriteria
-from ..imgproc.common import PRELUDE
+from ..imgproc.common import PRELUDE, held_weights, keep_weights
 from ..imgproc.filter import gaussian_blur
 from ..imgproc.geometric import pyr_down, resize
 
@@ -350,7 +350,9 @@ fn shrink(image: Mat, width: int, height: int, scale: float) -> Mat {
     var window = int(math.floor(sigma * 5.0 + 0.5)) | 1
     if window < 3 { window = 3 }
     let smoothed = gaussian_blur(image, Size(window, window), sigma)
-    return resize(smoothed, size: Size(width, height))
+    let out = resize(smoothed, size: Size(width, height))
+    smoothed.release()
+    return out
 }
 
 fn build_pyramid(image: Mat, levels: int) -> list[Mat] {
@@ -387,10 +389,10 @@ pub fn calc_optical_flow_pyr_lk(
     previous.flush()
     current.flush()
 
+    if points.len() == 0 { return ([], [], []) }
     let first = build_pyramid(previous, max_level + 1)
     let second = build_pyramid(current, max_level + 1)
     let levels = first.len()
-    if points.len() == 0 { return ([], [], []) }
 
     #: Every level of both pyramids into one buffer apiece, with a table of
     #: where each one starts. A kernel cannot take a list of bindings whose
@@ -426,6 +428,12 @@ pub fn calc_optical_flow_pyr_lk(
             [count, plane_b.cols, plane_b.offset, plane_b.step_, base]
         )
         base += count
+    }
+    #: Level zero is the caller's frame; every level below it is ours, and the
+    #: packed copies are all the tracker reads.
+    for level in 1..levels {
+        first[level].release()
+        second[level].release()
     }
 
     var flattened: list[float] = []
@@ -473,6 +481,10 @@ pub fn calc_optical_flow_pyr_lk(
 }
 
 fn gaussian_weights(radius: int, sigma: float) -> Mat {
+    #: Shared between calls, so a flow does not leak a buffer per expansion.
+    let key = f"flow:{radius}:{sigma}"
+    let held = held_weights(key)
+    if held is not null { return held }
     var values: list[float] = []
     var total = 0.0
     for index in -radius..radius + 1 {
@@ -481,7 +493,7 @@ fn gaussian_weights(radius: int, sigma: float) -> Mat {
         total += value
     }
     for index in 0..values.len() { values[index] /= total }
-    return Mat.from_list(1, values.len(), CV_MAKETYPE(CV_32F, 1), values)
+    return keep_weights(key, 1, values.len(), values)
 }
 
 #: The five quadratic coefficients fitted to every neighbourhood: the two
@@ -551,6 +563,9 @@ pub fn calc_optical_flow_farneback(
         #: precisely to be believed about motion.
         let a = shrink(previous, width, height, scale)
         let b = shrink(current, width, height, scale)
+        #: `shrink` hands the caller's own frame back when there is nothing to
+        #: shrink, and only a shrunk copy is ours to release.
+        let shrunk = width != previous.cols or height != previous.rows
 
         var here = Mat.zeros(a.rows, a.cols, CV_MAKETYPE(CV_32F, 2))
         let coarser = flow
@@ -559,9 +574,12 @@ pub fn calc_optical_flow_farneback(
             #: it has to grow with the image it now describes.
             let lifted = resize(coarser, size: Size(a.cols, a.rows))
             let values = lifted.to_list()
+            lifted.release()
             let factor = float(a.cols) / float(coarser.cols)
+            coarser.release()
             var scaled: list[float] = []
             for value in values { scaled.push(value * factor) }
+            here.release()
             here = Mat.from_list(a.rows, a.cols, CV_MAKETYPE(CV_32F, 2), scaled)
         }
 
@@ -576,7 +594,14 @@ pub fn calc_optical_flow_farneback(
                 [count, a.rows, a.cols, first.step_, here.step_, window // 2]
             )
             next.invalidate()
+            here.release()
             here = next
+        }
+        first.release()
+        second.release()
+        if shrunk {
+            a.release()
+            b.release()
         }
         flow = here
         level -= 1

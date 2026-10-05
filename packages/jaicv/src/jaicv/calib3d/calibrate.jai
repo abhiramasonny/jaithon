@@ -25,7 +25,8 @@ from ..imgproc.shape import min_area_rect
 from ..imgproc.morph import erode, get_structuring_element, MORPH_RECT
 from ..imgproc.threshold import adaptive_threshold, ADAPTIVE_THRESH_MEAN_C, THRESH_BINARY
 from ..imgproc.features import corner_sub_pix
-from .transform import find_homography, init_undistort_rectify_map, project_points, rodrigues
+from .transform import find_homography, init_undistort_rectify_map, project_points
+from .transform import projected_through, rodrigues, rotation_of_vector
 
 #: Refine the pose by minimising the reprojection error, starting from a linear
 #: guess. This is the default and the only one jaicv implements.
@@ -50,7 +51,10 @@ pub fn undistort(
         used,
         Size(image.cols, image.rows)
     )
-    return remap(image, map_x, map_y, interpolation: INTER_LINEAR)
+    let out = remap(image, map_x, map_y, interpolation: INTER_LINEAR)
+    map_x.release()
+    map_y.release()
+    return out
 }
 
 fn pose_residual(
@@ -59,10 +63,11 @@ fn pose_residual(
     camera_matrix: Mat,
     dist_coeffs: list[float]
 ) -> fn(list[float]) -> list[float] {
+    let k = camera_matrix.values()
     return fn(parameters: list[float]) -> list[float] {
-        let rvec = matrix_of([parameters[0], parameters[1], parameters[2]], 3, 1)
-        let tvec = matrix_of([parameters[3], parameters[4], parameters[5]], 3, 1)
-        let projected = project_points(object_points, rvec, tvec, camera_matrix, dist_coeffs)
+        let r = rotation_of_vector(parameters[0], parameters[1], parameters[2])
+        let t = [parameters[3], parameters[4], parameters[5]]
+        let projected = projected_through(object_points, r, t, k, dist_coeffs)
         var out: list[float] = []
         for index in 0..projected.len() {
             out.push(projected[index].x - image_points[index].x)
@@ -360,15 +365,18 @@ pub fn calibrate_camera(
         for value in tvec { parameters.push(value) }
     }
 
+    #: Plain lists in double precision rather than matrices: this runs twice
+    #: per parameter per iteration, and a matrix is a device buffer to fill
+    #: and read back.
     let residual = fn(values: list[float]) -> list[float] {
-        let matrix = matrix_of([values[0], 0.0, values[2], 0.0, values[1], values[3], 0.0, 0.0, 1.0], 3, 3)
+        let k = [values[0], 0.0, values[2], 0.0, values[1], values[3], 0.0, 0.0, 1.0]
         let dist = [values[4], values[5], values[6], values[7], values[8]]
         var out: list[float] = []
         for index in 0..views {
             let base = 9 + index * 6
-            let rvec = matrix_of([values[base], values[base + 1], values[base + 2]], 3, 1)
-            let tvec = matrix_of([values[base + 3], values[base + 4], values[base + 5]], 3, 1)
-            let projected = project_points(object_points[index], rvec, tvec, matrix, dist)
+            let r = rotation_of_vector(values[base], values[base + 1], values[base + 2])
+            let t = [values[base + 3], values[base + 4], values[base + 5]]
+            let projected = projected_through(object_points[index], r, t, k, dist)
             for at in 0..projected.len() {
                 out.push(projected[at].x - image_points[index][at].x)
                 out.push(projected[at].y - image_points[index][at].y)

@@ -11,6 +11,13 @@
 #include "native/native.h"
 #include "vm/gc.h"
 
+/* Owned device buffers not yet freed, and the float slots they hold. Device
+ * memory is not collected, so a leak survives every collection; these are what
+ * a leak test compares before and after a call. Views are not counted: they
+ * hold no memory of their own. */
+static int64_t gLiveBuffers;
+static int64_t gLiveFloats;
+
 bool requireGpu(const char *fnName) {
     if (jaiGpuAvailable()) return true;
     return jaiThrow(vm.cRuntimeError,
@@ -116,6 +123,8 @@ static bool nGpuBufferNew(int argc, Value *args, Value *out) {
     record->count = count;
     record->origin = 0;
     record->owned = true;
+    gLiveBuffers++;
+    gLiveFloats += count;
 
     *out = INT_VAL(jaiHandleAdd(HANDLE_GPU_BUFFER, record));
     return true;
@@ -444,10 +453,26 @@ static bool nGpuBufferFree(int argc, Value *args, Value *out) {
     if (!requireBuffer(args[0], 1, "gpu_buffer_free", &b)) return false;
 
     jaiHandleRelease(AS_INT(args[0]));
-    if (b->owned) jaiGpuFree(b->buffer);
+    if (b->owned) {
+        jaiGpuFree(b->buffer);
+        gLiveBuffers--;
+        gLiveFloats -= b->count;
+    }
     JAI_FREE(GpuBuffer, b);
 
     *out = NULL_VAL;
+    return true;
+}
+
+static bool nGpuLiveBuffers(int argc, Value *args, Value *out) {
+    (void)argc; (void)args;
+    *out = INT_VAL(gLiveBuffers);
+    return true;
+}
+
+static bool nGpuLiveFloats(int argc, Value *args, Value *out) {
+    (void)argc; (void)args;
+    *out = INT_VAL(gLiveFloats);
     return true;
 }
 
@@ -469,6 +494,8 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_buffer_fill_zero", nGpuBufferFillZero, 1, 1);
     jaiDefineNative("__prim__.gpu_buffer_download", nGpuBufferDownload, 3, 3);
     jaiDefineNative("__prim__.gpu_buffer_free",     nGpuBufferFree,     1, 1);
+    jaiDefineNative("__prim__.gpu_live_buffers",    nGpuLiveBuffers,    0, 0);
+    jaiDefineNative("__prim__.gpu_live_floats",     nGpuLiveFloats,     0, 0);
 
     jaiDefineNative("__prim__.gpu_compile",               nGpuCompile,            2, 2);
     jaiDefineNative("__prim__.gpu_max_threads_per_group", nGpuMaxThreadsPerGroup, 1, 1);

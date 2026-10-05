@@ -14,7 +14,7 @@ from ..core.mat import Mat, f32_bits
 from ..core.arith import OP_SUBTRACT, binary_op
 from ..core.types import BORDER_CONSTANT, BORDER_REPLICATE, CV_8U, CV_32F, CV_MAKETYPE
 from ..core.types import Point, Scalar, Size
-from .common import PRELUDE, saturation_args
+from .common import PRELUDE, held_weights, keep_weights, saturation_args
 
 #: A filled rectangle.
 pub const MORPH_RECT = 0
@@ -251,7 +251,11 @@ pub fn get_structuring_element(shape: int, ksize: Size, anchor: Point? = null) -
 fn default_element(element: Mat?) -> Mat {
     let given = element
     if given is not null { return given }
-    return get_structuring_element(MORPH_RECT, Size(3, 3))
+    #: Shared rather than built per call: device memory is not collected, so
+    #: a fresh element each call was a buffer leaked each call.
+    let held = held_weights("element:3x3")
+    if held is not null { return held }
+    return keep_weights("element:3x3", 3, 3, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 }
 
 #: Whether every place in the element is set, which is what lets the two axes
@@ -327,6 +331,8 @@ fn rank_filter(
             kernel_for("morph_box_col").dispatch_async([middle.storage, out.storage], count, tail)
             middle.release()
             out.invalidate()
+            #: Every pass after the first reads the one before, which is ours.
+            if _pass > 0 { current.release() }
             current = out
             continue
         }
@@ -356,6 +362,7 @@ fn rank_filter(
             scalars
         )
         out.invalidate()
+        if _pass > 0 { current.release() }
         current = out
     }
     return current
@@ -441,7 +448,7 @@ pub fn morphology_ex(
             border_mode: border_mode,
             border_value: border_value
         )
-        return dilate(
+        let opened = dilate(
             eroded,
             element: shape,
             anchor: anchor,
@@ -449,6 +456,8 @@ pub fn morphology_ex(
             border_mode: border_mode,
             border_value: border_value
         )
+        eroded.release()
+        return opened
     }
     if op == MORPH_CLOSE {
         let dilated = dilate(
@@ -459,7 +468,7 @@ pub fn morphology_ex(
             border_mode: border_mode,
             border_value: border_value
         )
-        return erode(
+        let closed = erode(
             dilated,
             element: shape,
             anchor: anchor,
@@ -467,11 +476,16 @@ pub fn morphology_ex(
             border_mode: border_mode,
             border_value: border_value
         )
+        dilated.release()
+        return closed
     }
     if op == MORPH_GRADIENT {
         let grown = dilate(src, element: shape, anchor: anchor, border_mode: border_mode)
         let shrunk = erode(src, element: shape, anchor: anchor, border_mode: border_mode)
-        return binary_op(grown, shrunk, OP_SUBTRACT)
+        let gradient = binary_op(grown, shrunk, OP_SUBTRACT)
+        grown.release()
+        shrunk.release()
+        return gradient
     }
     if op == MORPH_TOPHAT {
         let opened = morphology_ex(
@@ -482,7 +496,9 @@ pub fn morphology_ex(
             iterations: iterations,
             border_mode: border_mode
         )
-        return binary_op(src, opened, OP_SUBTRACT)
+        let tophat = binary_op(src, opened, OP_SUBTRACT)
+        opened.release()
+        return tophat
     }
     if op == MORPH_BLACKHAT {
         let closed = morphology_ex(
@@ -493,7 +509,9 @@ pub fn morphology_ex(
             iterations: iterations,
             border_mode: border_mode
         )
-        return binary_op(closed, src, OP_SUBTRACT)
+        let blackhat = binary_op(closed, src, OP_SUBTRACT)
+        closed.release()
+        return blackhat
     }
     throw ValueError(f"morphology_ex does not know operation {op}")
 }

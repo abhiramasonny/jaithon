@@ -62,3 +62,12 @@ pub fn synchronize() -> void {
     _require_device("synchronize")
     __prim__.gpu_synchronize()
 }
+
+#: How many device buffers are allocated and not yet freed.
+#:
+#: Device memory is not garbage collected, so this is the number a leak test
+#: compares before and after a call. Views onto another buffer are not counted.
+pub fn live_buffers() -> int { return __prim__.gpu_live_buffers() }
+
+#: How many float slots the buffers `live_buffers` counts hold between them.
+pub fn live_floats() -> int { return __prim__.gpu_live_floats() }

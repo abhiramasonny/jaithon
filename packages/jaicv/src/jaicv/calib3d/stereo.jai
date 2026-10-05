@@ -356,8 +356,10 @@ pub class StereoBM {
         )
         volume.invalidate()
         volume.flush()
+        let costs = volume.values()
+        volume.release()
         return winners(
-            volume.values(),
+            costs,
             rows,
             cols,
             self.num_disparities,
@@ -474,8 +476,11 @@ pub class StereoSGBM {
         }
         aggregated.invalidate()
         aggregated.flush()
+        let costs = aggregated.values()
+        volume.release()
+        aggregated.release()
         return winners(
-            aggregated.values(),
+            costs,
             rows,
             cols,
             self.num_disparities,

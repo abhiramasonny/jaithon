@@ -435,7 +435,7 @@ fn domain_steps(src: Mat, horizontal: bool, sigma_s: float, sigma_r: float) -> M
     let count = src.rows * src.cols
     let steps = Mat.zeros(src.rows, src.cols, CV_MAKETYPE(CV_32F, 1))
     if count == 0 { return steps }
-    kernel_for("photo_domain_step").dispatch([src.storage, steps.storage], count, [count, src.rows, src.cols, src.channels(), src.offset, src.step_, if horizontal {
+    kernel_for("photo_domain_step").dispatch_async([src.storage, steps.storage], count, [count, src.rows, src.cols, src.channels(), src.offset, src.step_, if horizontal {
         1
     } else {
         0
@@ -496,6 +496,8 @@ pub fn edge_preserving_filter(
     )
     out.invalidate()
     values.free()
+    horizontal.release()
+    vertical.release()
     return out
 }
 
@@ -526,6 +528,7 @@ pub fn detail_enhance(src: Mat, sigma_s: float = 10.0, sigma_r: float = 0.15) ->
         ]
     )
     out.invalidate()
+    smoothed.release()
     return out
 }
 

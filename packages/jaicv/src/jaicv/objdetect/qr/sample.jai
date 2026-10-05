@@ -79,6 +79,7 @@ pub fn sample_grid(
         let centre_module = float(centres[centres.len() - 1]) + 0.5
         let rough = get_perspective_transform(source, target)
         let guessed = perspective_transform([Point2f(centre_module, centre_module)], rough)[0]
+        rough.release()
         let scale = distance(target[0].y, target[0].x, target[1].y, target[1].x) / (edge - 3.5)
         let refined = refine_alignment(values, rows, cols, guessed, scale)
         if refined is not null {
@@ -93,6 +94,7 @@ pub fn sample_grid(
         for x in 0..dimension { probes.push(Point2f(float(x) + 0.5, float(y) + 0.5)) }
     }
     let mapped = perspective_transform(probes, matrix)
+    matrix.release()
 
     #: A module is decided by a vote over the pixels around its centre, not by
     #: the one pixel there. One flipped pixel at a centre corrupts a whole
