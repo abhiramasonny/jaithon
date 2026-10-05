@@ -235,13 +235,22 @@ pub fn phase_correlate(first: Mat, second: Mat, window: Mat? = null) -> tuple[Po
     let fa = dft(a, DFT_COMPLEX_OUTPUT)
     let fb = dft(b, DFT_COMPLEX_OUTPUT)
     let cross = mul_spectrums(fa, fb, 0, true)
+    fa.release()
+    fb.release()
+    #: `a` and `b` are the caller's own unless a window was applied here.
+    if taper is not null {
+        a.release()
+        b.release()
+    }
     #: Dividing by the magnitude leaves only the phase, which is where the
     #: shift lives; the magnitudes carry the content and would swamp it.
     let cells = first.rows * first.cols
     let phased = Mat(first.rows, first.cols, CV_MAKETYPE(CV_32F, 2))
     kernel_for("phase_normalise").dispatch_async([cross.storage, phased.storage], cells, [cells])
     phased.invalidate()
+    cross.release()
     let raw = idft(phased, DFT_SCALE | DFT_REAL_OUTPUT)
+    phased.release()
 
     #: The surface is shifted so zero lag sits in the middle, which is what
     #: lets the peak be read off as a displacement from the centre and lets a
@@ -255,6 +264,7 @@ pub fn phase_correlate(first: Mat, second: Mat, window: Mat? = null) -> tuple[Po
         [cells, rows, cols]
     )
     surface.invalidate()
+    raw.release()
 
     #: The peak comes from the device reduction rather than a walk here, and
     #: only the square around it is read back.
@@ -268,7 +278,10 @@ pub fn phase_correlate(first: Mat, second: Mat, window: Mat? = null) -> tuple[Po
     let from_y = max(py - 2, 0)
     let to_x = min(px + 3, cols)
     let to_y = min(py + 3, rows)
-    let patch = crop(surface, Rect(from_x, from_y, to_x - from_x, to_y - from_y)).to_list()
+    let square = crop(surface, Rect(from_x, from_y, to_x - from_x, to_y - from_y))
+    let patch = square.to_list()
+    square.release()
+    surface.release()
     var weight = 0.0
     var wx = 0.0
     var wy = 0.0
