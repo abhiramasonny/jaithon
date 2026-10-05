@@ -217,6 +217,7 @@ void jaiFreeObject(Obj *obj) {
          * existed that never did. */
         if (fn->osrForms != NULL)
             JAI_FREE_ARRAY(JaiOsrForm, fn->osrForms, JAI_OSR_MAX);
+        jaiJitForgetFunction(fn);
         JAI_FREE(ObjFunction, obj);
         return;
     }

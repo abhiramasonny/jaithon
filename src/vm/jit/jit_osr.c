@@ -381,6 +381,17 @@ static bool osrColdWaitOn(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_OSR_BACKOFF=0 retries a failed loop head on every tick until
+ * its budget is spent, as before. See jaiJitEnterOsr. */
+static bool osrBackoffOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_OSR_BACKOFF");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 bool jitOsrColdWait(Emit *e, const ObjFunction *cfn) {
     if (!e->osr || e->inlining || !sColdMayWait || cfn == NULL) return false;
     if (cfn->jitFunc != NULL || cfn->jitRefused) return false;
@@ -422,6 +433,20 @@ bool jitOsrColdWait(Emit *e, const ObjFunction *cfn) {
     sColdWaited = true;
     e->whyNot = "a callee still on its way to compiling";
     return true;
+}
+
+/* A head that has already waited for a callee and may wait again: the next
+ * look at it is likely another wait, which is not a failure. Looks only; a
+ * head with no record has never waited. */
+static bool osrColdWaiting(const ObjFunction *fn, uint32_t top) {
+    if (!osrColdWaitOn()) return false;
+    for (unsigned i = 0; i < OSR_COLD_HEADS; i++) {
+        if (sColdHeads[i].fn == fn && sColdHeads[i].top == top) {
+            return sColdHeads[i].waits > 0 &&
+                   sColdHeads[i].waits < OSR_COLD_WAITS;
+        }
+    }
+    return false;
 }
 
 static OsrColdHead *osrColdHead(const ObjFunction *fn, uint32_t top) {
@@ -1557,20 +1582,46 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
          * compile, an uncompiled callee most often, and then the whole loop
          * declines and NOTHING is compiled. tests/bench's contour follower is
          * exactly that shape. So the prefix stays as the fallback: some of the
-         * loop compiled beats none of it. */
-        sPendingRetries = 0;
-        OsrColdHead *cold = osrColdWaitOn() ? osrColdHead(fn, top) : NULL;
-        sColdMayWait = cold != NULL && cold->waits < OSR_COLD_WAITS;
-        sColdCur = cold;
-        bool built = compileOsrAny(closure, top, frame->slots, iterKind,
-                                   elemSample, elemMixed, elemStg);
-        bool waited = !built && sColdWaited;
-        sColdMayWait = false;
-        sColdCur = NULL;
-        sColdWaited = false;
-        if (waited) {
-            cold->waits++;
-            return osrNo(fn, top, "waiting for a callee to compile");
+         * loop compiled beats none of it.
+         *
+         * A head that has failed is retried only after 1, 2, 4, 8, 16 and 32
+         * failures, and every tick in between is charged as a failure without
+         * the walk -- so the head retires on the same tick it always did, and
+         * a late fact still gets a look within twice the wait. Each attempt
+         * is up to four variants of three retries; the retries skipped were
+         * 31ms of the tier's ~86ms on `check --no-cache lib/jaithon`. It is a
+         * trade, not free: a head that would have compiled on a skipped tick
+         * waits for the next power of two, and if its loop is gone by then it
+         * is never compiled -- a few heads per run on the compiler workloads,
+         * inside their run-to-run OSR noise. A head that has waited for a
+         * cold callee and has waits left is not backed off: a wait is never
+         * charged, so charging the tick it would have waited on would retire
+         * it early. */
+        bool built = false;
+        bool backedOff = false;
+        if (miss < fn->osrMissCount && osrBackoffOn()) {
+            unsigned failed = fn->osrMissAttempts[miss];
+            backedOff = failed != 0 && (failed & (failed - 1u)) != 0 &&
+                        !osrColdWaiting(fn, top);
+        }
+        if (backedOff) {
+            (void)osrNo(fn, top, "backing off: retried after 1, 2, 4, 8... "
+                                 "failures");
+        } else {
+            sPendingRetries = 0;
+            OsrColdHead *cold = osrColdWaitOn() ? osrColdHead(fn, top) : NULL;
+            sColdMayWait = cold != NULL && cold->waits < OSR_COLD_WAITS;
+            sColdCur = cold;
+            built = compileOsrAny(closure, top, frame->slots, iterKind,
+                                  elemSample, elemMixed, elemStg);
+            bool waited = !built && sColdWaited;
+            sColdMayWait = false;
+            sColdCur = NULL;
+            sColdWaited = false;
+            if (waited) {
+                cold->waits++;
+                return osrNo(fn, top, "waiting for a callee to compile");
+            }
         }
         if (!built) {
             /* Inlining widens live ranges; a loop that will not fit with it

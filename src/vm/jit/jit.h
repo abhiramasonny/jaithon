@@ -132,6 +132,10 @@ void jaiJitExemplarsReset(void);
  * Returns 0 declined, 1 resume at *resumeAt, 2 an exception is pending. */
 int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt);
 JaiJitOutcome jaiJitEnterFunc(ObjClosure *closure, Value *slotBase);
+/* JAITHON_JIT_LEAN_ENTRY: the short-frame entry paths in jaiJitEnterFunc and
+ * callClosure. Set once by jitLeanEntryInit, from jaiJitStartSampling. */
+extern bool gJitLeanEntry;
+void jitLeanEntryInit(void);
 
 /* Start the sampling timer, if the tier is on. Safe to call more than once. */
 void jaiJitStartSampling(void);
