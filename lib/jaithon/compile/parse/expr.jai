@@ -124,15 +124,23 @@ pub fn _parse_unary(p: Parser) -> Node {
         p.expr_depth -= 1
         return p._error_expr(p._cur_span())
     }
-    defer { p.expr_depth -= 1 }
-
+    # The depth comes back down by hand on every way out, not in a `defer`:
+    # the compiled tier has no arm for one, and a `defer` here kept this rung
+    # -- and with it every rung above, each of which calls the one below
+    # first -- interpreted. Nothing in the parser throws to unwind past it.
     let kind = p._kind()
     if kind == TokenKind.Minus {
         let folded = _parse_neg_magnitude(p)
-        if folded != null { return folded ?? p._error_expr(p._cur_span()) }
+        if folded != null {
+            let literal = folded ?? p._error_expr(p._cur_span())
+            p.expr_depth -= 1
+            return literal
+        }
     }
     if kind != TokenKind.Minus and kind != TokenKind.Plus and kind != TokenKind.Tilde {
-        return _parse_power(p)
+        let power = _parse_power(p)
+        p.expr_depth -= 1
+        return power
     }
     let start_index = p.current
     p._advance()
@@ -143,7 +151,9 @@ pub fn _parse_unary(p: Parser) -> Node {
     } elif kind == TokenKind.Plus {
         op = OpKind.Pos
     }
-    return _unary(p._span_since(start_index), op, operand)
+    let unary = _unary(p._span_since(start_index), op, operand)
+    p.expr_depth -= 1
+    return unary
 }
 
 pub fn _parse_multiplicative(p: Parser) -> Node {
@@ -291,12 +301,13 @@ pub fn _parse_not(p: Parser) -> Node {
         p.expr_depth -= 1
         return p._error_expr(p._cur_span())
     }
-    defer { p.expr_depth -= 1 }
-
+    # By hand rather than in a `defer`; see `_parse_unary`.
     let start_index = p.current
     p._advance()
     let operand = _parse_not(p)
-    return _unary(p._span_since(start_index), OpKind.Not, operand)
+    let negated = _unary(p._span_since(start_index), OpKind.Not, operand)
+    p.expr_depth -= 1
+    return negated
 }
 
 pub fn _parse_and(p: Parser) -> Node {
@@ -336,16 +347,20 @@ pub fn _parse_expression(p: Parser) -> Node {
         p.expr_depth -= 1
         return p._error_expr(p._cur_span())
     }
-    defer { p.expr_depth -= 1 }
-
+    # By hand rather than in a `defer`; see `_parse_unary`.
     let cond = _parse_coalesce(p)
-    if not p._match(TokenKind.Question) { return cond }
+    if not p._match(TokenKind.Question) {
+        p.expr_depth -= 1
+        return cond
+    }
     let then_expr = _parse_expression(p)
     p._expect(TokenKind.Colon, "`:` in a conditional expression")
     let else_expr = _parse_expression(p)
-    return _node(
+    let ternary = _node(
         NodeKind.Ternary,
         _join(cond.span, else_expr.span),
         {"cond": cond, "thenExpr": then_expr, "elseExpr": else_expr}
     )
+    p.expr_depth -= 1
+    return ternary
 }
