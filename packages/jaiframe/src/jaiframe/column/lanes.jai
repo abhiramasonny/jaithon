@@ -1,6 +1,7 @@
 #: The shader library and the untyped float32 lanes a column is built out of.
 import std.gpu as gpu
 from std.gpu import Buffer, Kernel
+from std.os import env_or
 
 #: The largest number of rows a column may hold.
 #:
@@ -460,6 +461,23 @@ pub fn prefix_sum(flags: Buffer, length: int) -> (Buffer, int) {
     cached_kernel("col_scan_total").dispatch_async([offsets, flags], 1, [length], group_size: 1)
     return (offsets, int(offsets.download(length, 1)[0]))
 }
+
+#: `prefix_sum` for a caller that never reads the total on the host.
+#:
+#: The total is still written into the last slot, on the device, where a
+#: scatter that puts the clear rows after the set ones reads it. What goes is
+#: the download, which is a full device wait: a radix order over a join's keys
+#: calls this once a bit, and paid one round trip a bit for a number it
+#: dropped. `JAIFRAME_DEVICE_TOTAL=0` restores the download, for an A/B.
+pub fn scan_offsets(flags: Buffer, length: int) -> Buffer {
+    if not _DEVICE_TOTAL { return prefix_sum(flags, length)[0] }
+    let offsets = scan_exclusive(flags, length)
+    if length == 0 { return offsets }
+    cached_kernel("col_scan_total").dispatch_async([offsets, flags], 1, [length], group_size: 1)
+    return offsets
+}
+
+let _DEVICE_TOTAL = env_or("JAIFRAME_DEVICE_TOTAL", "1") != "0"
 
 #: The scan without the total.
 #:

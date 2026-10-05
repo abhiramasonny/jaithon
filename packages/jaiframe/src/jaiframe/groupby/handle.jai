@@ -6,7 +6,7 @@
 #: reads all three.
 from std.gpu import Buffer
 from ..column import Agg, Column, DataFrame, Dtype, Index, Series, Value
-from ..column import NA, f32_bits, prefix_sum
+from ..column import NA, f32_bits, prefix_sum, scan_offsets
 from ..keys import NO_GROUP
 from .kernels import FINISH_ALL, FINISH_ANY, FINISH_DIV, FINISH_LERP
 from .kernels import FINISH_STD, FINISH_VAR
@@ -424,9 +424,9 @@ pub class GroupBy {
     fn starts(self) -> Buffer {
         let cached = self.starts_lane
         if cached is not null { return cached }
-        let scanned = prefix_sum(self.sizes(), self.group_total)
-        self.starts_lane = scanned[0]
-        return scanned[0]
+        let scanned = scan_offsets(self.sizes(), self.group_total)
+        self.starts_lane = scanned
+        return scanned
     }
 
     #: The rows laid out by code, stable in row order within each group.

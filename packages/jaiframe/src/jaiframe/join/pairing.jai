@@ -6,7 +6,7 @@
 #: finished pairing with, so both live here.
 from std.gpu import Buffer
 from ..column import Column, Dtype, MAX_ROWS
-from ..column import cached_kernel, concat_columns, iota, prefix_sum, unify_levels
+from ..column import cached_kernel, concat_columns, iota, prefix_sum, scan_offsets, unify_levels
 from .kernels import MIN_BUCKETS, flag, kernel_for, require_device
 from .types import How
 
@@ -66,9 +66,8 @@ fn hash_lane(keys: list[Column], rows: int, seed: int) -> Buffer {
 #: right order — so neither caller needs a second key.
 #:
 #: `bits` comes from the range the keys actually span, so a join against a
-#: hundred-row table pays seven passes rather than thirty-two. The scan hands
-#: its total back to the host, which is one four-byte read per pass and the
-#: only place this waits on the device.
+#: hundred-row table pays seven passes rather than thirty-two. The scan's
+#: total stays on the device, where the scatter reads it, so no pass waits.
 #:
 #: Returns fresh `(order, keys)` lanes the caller owns; the inputs are untouched.
 pub fn radix_order(order_in: Buffer, keys_in: Buffer, count: int, bits: int) -> (Buffer, Buffer) {
@@ -82,13 +81,13 @@ pub fn radix_order(order_in: Buffer, keys_in: Buffer, count: int, bits: int) -> 
     let flags = Buffer(count)
     for bit in 0..bits {
         kernel_for("jn_radix_flags").dispatch_async([keys_front, flags], count, [count, bit])
-        let scanned = prefix_sum(flags, count)
+        let scanned = scan_offsets(flags, count)
         kernel_for("jn_radix_scatter").dispatch_async(
-            [order_front, keys_front, flags, scanned[0], order_back, keys_back],
+            [order_front, keys_front, flags, scanned, order_back, keys_back],
             count,
             [count]
         )
-        scanned[0].free()
+        scanned.free()
         let spare_order = order_front
         let spare_keys = keys_front
         order_front = order_back
