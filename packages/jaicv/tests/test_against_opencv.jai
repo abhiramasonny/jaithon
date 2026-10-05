@@ -184,12 +184,13 @@ fn tolerance_for(name: str, args: list[str]) -> float {
     #: parameters running to hundreds have found the same camera.
     if name == "findChessboardCorners" { return 1e-2 }
     if name == "solvePnP" { return 1e-4 }
-    #: Both fits reproject the corners to within a thousandth of a pixel, so
-    #: they have found the same camera; where they differ is in how they split
-    #: that agreement between the principal point and the last distortion term,
-    #: which a target lying in one plane barely distinguishes. Half a pixel on
-    #: a five-hundred-pixel focal length is the size of that ambiguity.
-    if name == "calibrateCamera" { return 0.5 }
+    #: This was half a pixel, on the reading that a planar target barely
+    #: separates the principal point from the last distortion term. The real
+    #: cause was the fit: its residual went through single-precision matrices,
+    #: so the central differences were rounding noise, and the distorted case
+    #: landed 0.36 away. Evaluated in double it lands 0.0004 away and the clean
+    #: one 0.002, so a hundredth holds both with room.
+    if name == "calibrateCamera" { return 1e-2 }
     #: OpenCV's `undistort` rounds its sampling coordinates to a thirty-second
     #: of a pixel before it resamples; this keeps them in float. On a
     #: chessboard, where a pixel either side of an edge differs by the whole
