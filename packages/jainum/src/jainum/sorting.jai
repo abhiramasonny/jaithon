@@ -28,6 +28,7 @@
 #: Not here: `median` and `percentile`, which `stats` builds on `partition`;
 #: histograms; and `nonzero`, which `index` owns.
 import std.math
+from std.os import env_or
 from .array import BOOL, FLOAT32, INT32, GROUP, NDArray, PRELUDE
 from .array import contiguous_strides, copy_into, exclusive_scan, fill
 from .array import gather_flat, kernel_of, normalize_axis, promote
@@ -44,6 +45,14 @@ from .array import require_real, scatter_flat
 #: written down so it can be tuned against a real machine, not because a real
 #: machine produced it.
 pub const HOST_SORT_LIMIT = 4096
+
+#: The widest padded row `nds_row_sort` takes in one threadgroup: 4096 floats
+#: is the 16 KB exchange buffer. Wider rows run the dispatch-per-pass network.
+const ROW_SORT_MAX = 4096
+
+#: `JAINUM_ROW_SORT=0` sends every row through the dispatch-per-pass network,
+#: for an A/B against the one-dispatch row sort. Read once.
+let _ROW_SORT = env_or("JAINUM_ROW_SORT", "1") != "0"
 
 let SOURCE = PRELUDE + """
 
@@ -201,6 +210,141 @@ kernel void nds_bitonic4(device float* values [[buffer(0)]],
         wide_keys[left >> 2u] = select(ka, kb, swap);
         wide_keys[right >> 2u] = select(kb, ka, swap);
     }
+}
+
+/* The whole network for rows of up to ROW_SORT_MAX slots, in one dispatch.
+ *
+ * A thread holds RS_E consecutive slots in registers, so a pass whose compare
+ * distance `j` is below RS_E is a register exchange, one below 32 * RS_E is a
+ * simd shuffle with the lane `j / RS_E` away, and only the passes wider than
+ * a simdgroup's span go through threadgroup memory. At 4096 slots that is six
+ * barrier rounds where the global network is 78 dispatches. Fusing the
+ * dispatches alone measured nothing; it is the work done between barriers
+ * that pays (sixteen slots a thread measured 4% ahead of eight). The host
+ * launches 256 threads, so a group is RS_E * 256 = ROW_SORT_MAX slots.
+ *
+ * Every pass makes the decision `nds_bitonic` makes for the same pair --
+ * `nds_after(left, right) == up` -- with the left value always the lower
+ * slot's, so the output is the network's to the bit, ties and NaN payloads
+ * included. A group covers whole rows (its span is a multiple of `padded`),
+ * so the slot index within the group stands in for the slot within the row
+ * for every partner, which differs from its own only below `padded`; the
+ * direction test is the one place that has to mask the row bits off, because
+ * the last stage IS `padded`. Rows past `total` are phantom padding a group
+ * sorts and never stores. */
+constexpr constant uint RS_E = 16u;
+constexpr constant uint ROW_SORT_MAX = 4096u;
+
+template <bool CARRY>
+inline void rs_settle(thread float* v, thread float* kk, thread float* w, thread float* wk,
+                      bool lower, bool up, uint descending) {
+    for (uint k = 0u; k < RS_E; ++k) {
+        bool after = lower
+            ? nds_after(v[k], w[k], CARRY ? uint(kk[k]) : 0u, CARRY ? uint(wk[k]) : 0u,
+                        descending, CARRY ? 1u : 0u)
+            : nds_after(w[k], v[k], CARRY ? uint(wk[k]) : 0u, CARRY ? uint(kk[k]) : 0u,
+                        descending, CARRY ? 1u : 0u);
+        if (after == up) {
+            v[k] = w[k];
+            if (CARRY) kk[k] = wk[k];
+        }
+    }
+}
+
+template <bool CARRY, uint J>
+inline void rs_in_thread(thread float* v, thread float* kk, uint first, uint padded, uint stage,
+                         uint descending) {
+    for (uint k = 0u; k < RS_E; ++k) {
+        if ((k & J) != 0u) continue;
+        uint hi = k | J;
+        bool up = ((first + k) & (padded - 1u) & stage) == 0u;
+        bool after = nds_after(v[k], v[hi], CARRY ? uint(kk[k]) : 0u, CARRY ? uint(kk[hi]) : 0u,
+                               descending, CARRY ? 1u : 0u);
+        if (after == up) {
+            float t = v[k]; v[k] = v[hi]; v[hi] = t;
+            if (CARRY) { float tk = kk[k]; kk[k] = kk[hi]; kk[hi] = tk; }
+        }
+    }
+}
+
+template <bool CARRY>
+inline void rs_sort(device float* values, device float* keys, uint total, uint padded,
+                    uint descending, uint group, uint lid, uint threads,
+                    threadgroup float* share) {
+    uint base = group * threads * RS_E;
+    uint first = lid * RS_E;
+    float pad = as_type<float>(descending != 0u ? 0xFF800000u : 0x7FC00000u);
+    float v[RS_E];
+    float kk[RS_E];
+    float w[RS_E];
+    float wk[RS_E];
+    for (uint k = 0u; k < RS_E; ++k) {
+        uint at = base + first + k;
+        v[k] = at < total ? values[at] : pad;
+        kk[k] = float((first + k) & (padded - 1u));
+        wk[k] = 0.0f;
+    }
+    for (uint stage = 2u; stage <= padded; stage <<= 1u) {
+        uint j = stage >> 1u;
+        bool up = (first & (padded - 1u) & stage) == 0u;
+        for (; j >= 32u * RS_E; j >>= 1u) {
+            uint step = j / RS_E;
+            uint other = lid ^ step;
+            for (uint k = 0u; k < RS_E; ++k) share[k * threads + lid] = v[k];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint k = 0u; k < RS_E; ++k) w[k] = share[k * threads + other];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (CARRY) {
+                for (uint k = 0u; k < RS_E; ++k) share[k * threads + lid] = kk[k];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint k = 0u; k < RS_E; ++k) wk[k] = share[k * threads + other];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            rs_settle<CARRY>(v, kk, w, wk, (lid & step) == 0u, up, descending);
+        }
+        for (; j >= RS_E; j >>= 1u) {
+            ushort step = ushort(j / RS_E);
+            for (uint k = 0u; k < RS_E; ++k) {
+                w[k] = simd_shuffle_xor(v[k], step);
+                if (CARRY) wk[k] = simd_shuffle_xor(kk[k], step);
+            }
+            rs_settle<CARRY>(v, kk, w, wk, (lid & uint(step)) == 0u, up, descending);
+        }
+        if (RS_E > 8u && stage >= 16u) rs_in_thread<CARRY, 8u>(v, kk, first, padded, stage, descending);
+        if (stage >= 8u) rs_in_thread<CARRY, 4u>(v, kk, first, padded, stage, descending);
+        if (stage >= 4u) rs_in_thread<CARRY, 2u>(v, kk, first, padded, stage, descending);
+        rs_in_thread<CARRY, 1u>(v, kk, first, padded, stage, descending);
+    }
+    for (uint k = 0u; k < RS_E; ++k) {
+        uint at = base + first + k;
+        if (at >= total) continue;
+        values[at] = v[k];
+        if (CARRY) keys[at] = kk[k];
+    }
+}
+
+kernel void nds_row_sort(device float* values [[buffer(0)]],
+                         device float* keys [[buffer(1)]],
+                         constant uint& total [[buffer(2)]],
+                         constant uint& padded [[buffer(3)]],
+                         constant uint& descending [[buffer(4)]],
+                         uint group [[threadgroup_position_in_grid]],
+                         uint lid [[thread_index_in_threadgroup]],
+                         uint threads [[threads_per_threadgroup]]) {
+    threadgroup float share[ROW_SORT_MAX];
+    rs_sort<false>(values, keys, total, padded, descending, group, lid, threads, share);
+}
+
+kernel void nds_row_argsort(device float* values [[buffer(0)]],
+                            device float* keys [[buffer(1)]],
+                            constant uint& total [[buffer(2)]],
+                            constant uint& padded [[buffer(3)]],
+                            constant uint& descending [[buffer(4)]],
+                            uint group [[threadgroup_position_in_grid]],
+                            uint lid [[thread_index_in_threadgroup]],
+                            uint threads [[threads_per_threadgroup]]) {
+    threadgroup float share[ROW_SORT_MAX];
+    rs_sort<true>(values, keys, total, padded, descending, group, lid, threads, share);
 }
 
 /* One thread per query, bisecting a sorted array.
@@ -547,15 +691,29 @@ fn _sort_into(a: NDArray, at: int, descending: bool, out: NDArray, order: NDArra
     #: With nothing to carry the network binds the values twice rather than a
     #: second allocation, and never writes through the alias.
     var slots = work
-    if carry {
-        slots = NDArray([rows, padded], INT32)
-        kernel_of(SOURCE, "nds_iota").dispatch_async(
-            [slots.storage],
-            rows * padded,
-            [rows * padded, padded - 1]
+    if carry { slots = NDArray([rows, padded], INT32) }
+    if _ROW_SORT and padded <= ROW_SORT_MAX {
+        #: A group is 256 threads of sixteen slots, ROW_SORT_MAX in all, which
+        #: is whole rows because `padded` divides it. The kernel seeds the
+        #: slots itself.
+        let threads = 256
+        let groups = (rows * padded + ROW_SORT_MAX - 1) // ROW_SORT_MAX
+        kernel_of(SOURCE, if carry { "nds_row_argsort" } else { "nds_row_sort" }).dispatch_async(
+            [work.storage, slots.storage],
+            groups * threads,
+            [rows * padded, padded, if descending { 1 } else { 0 }],
+            group_size: threads
         )
+    } else {
+        if carry {
+            kernel_of(SOURCE, "nds_iota").dispatch_async(
+                [slots.storage],
+                rows * padded,
+                [rows * padded, padded - 1]
+            )
+        }
+        _run_network(work, slots, rows, padded, descending, carry)
     }
-    _run_network(work, slots, rows, padded, descending, carry)
     copy_into(target, work.view(moved.shape, strides, 0))
     if ranks is not null {
         copy_into(ranks, slots.view(moved.shape, strides, 0))

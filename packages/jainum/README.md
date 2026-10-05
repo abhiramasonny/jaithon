@@ -184,3 +184,13 @@ computes, and cannot see a name that was renamed in one file and not the
 other, or an export whose signature nobody has called since it grew an
 argument. That is the failure this file exists to catch, and it is the one
 jaicv and jaitensor keep a file of the same name for.
+
+## Switches
+
+Fast paths with an older path beside them, kept one environment variable away
+so a change can be measured as an A/B in one binary. Each is read once, when
+its module loads, and is on unless set to `0`.
+
+| Switch | Off restores |
+| --- | --- |
+| `JAINUM_ROW_SORT` | the dispatch-per-pass bitonic network for rows of up to 4096 slots, instead of one dispatch that runs the whole network in registers, simd shuffles and threadgroup memory; bit-identical |
