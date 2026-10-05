@@ -182,7 +182,7 @@ bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
  * collects, and this frame's own deopt then reads its registers as they were.
  * A compiled body is recorded by its entry address, which the arena never
  * reuses, so the answer stays true of the code a caller bakes in. */
-bool jitLeafCallRoots(void) {
+static bool jitLeafCallRoots(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("JAITHON_JIT_LEAF_CALL_ROOTS");
@@ -226,7 +226,7 @@ void jitNoCollectRecord(const uint8_t *code, bool noCollect) {
     gNoCollectCount++;
 }
 
-bool jitNoCollectKnown(const uint8_t *code) {
+static bool jitNoCollectKnown(const uint8_t *code) {
     if (code == NULL || gNoCollectCap == 0) return false;
     uintptr_t key = (uintptr_t)code;
     size_t at = noCollectSlot(key, gNoCollectCap);

@@ -1241,9 +1241,7 @@ void emitConst64(Emit *e, unsigned rd, int64_t value);
 bool jitLitPoolOn(void);
 void emitConstCmp(Emit *e, unsigned rd, int64_t value);
 void emitChainHeadAddr(Emit *e, unsigned rd);
-bool jitLeafCallRoots(void);
 void jitNoCollectRecord(const uint8_t *code, bool noCollect);
-bool jitNoCollectKnown(const uint8_t *code);
 bool jitCallSkipsRoots(const Emit *e, const ObjFunction *cfn, bool hasSelfSlow);
 /* Lays out the constants emitConst64 pooled, after everything else, and
  * points each load at its constant. False if the code buffer filled. */
