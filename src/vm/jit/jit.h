@@ -63,14 +63,6 @@ extern uint32_t jaiJitThresholdOverride;
 extern bool gJitColdDecline;
 bool jaiJitColdRetryOn(void);
 
-/* Not repeating a function-tier attempt whose inputs have not changed; see
- * the note above jitAttemptPrint in jit_compile.c. */
-bool     jitNegCacheOn(void);
-uint64_t jitAttemptPrint(const ObjFunction *fn, const Value *slots,
-                         unsigned count);
-bool     jitAttemptSeen(const ObjFunction *fn, uint64_t print);
-void     jitAttemptNote(const ObjFunction *fn, uint64_t print);
-
 static inline uint32_t jaiJitThreshold(const ObjFunction *fn) {
     if (jaiJitThresholdOverride != 0) return jaiJitThresholdOverride;
     if (fn != NULL && (fn->flags & FN_TRACE) != 0) return JAI_JIT_TRACE_THRESHOLD;
