@@ -387,6 +387,17 @@ uint32_t jaiA64EorX(unsigned rd, unsigned rn, unsigned rm) {
     return 0xca000000u | (rm << 16) | (rn << 5) | rd;
 }
 
+/* EOR (shifted register) with shift type 01, LSR. */
+uint32_t jaiA64EorXLsr(unsigned rd, unsigned rn, unsigned rm, unsigned shift) {
+    return 0xca400000u | (rm << 16) | ((shift & 63u) << 10) | (rn << 5) | rd;
+}
+
+/* CCMP (register), 64-bit: sf=1 op=1 S=1. */
+uint32_t jaiA64CcmpX(unsigned rn, unsigned rm, unsigned nzcv, unsigned cond) {
+    return 0xfa400000u | (rm << 16) | ((cond & 0xfu) << 12) | (rn << 5) |
+           (nzcv & 0xfu);
+}
+
 /* ldrb w<rd>, [x<rn>, #imm12] -- one unsigned byte, zero-extended. */
 /* csel x<rd>, x<rn>, x<rm>, <cond> -- rn when the condition holds, else rm. */
 uint32_t jaiA64CselX(unsigned rd, unsigned rn, unsigned rm, unsigned cond) {

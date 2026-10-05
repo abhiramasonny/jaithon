@@ -1,0 +1,138 @@
+#: The f-string memo: compiled code probes jaiFmtMemo for (pre, n, post)
+#: before it calls jaiValueFormatIntLeafMemo, and a hit is the string the leaf
+#: answered last time. The memo is weak -- every collection empties it -- and
+#: keys its runs by identity, so these check the cases where a stale or
+#: confused entry would show: the all-absent key of `f"{n}"` against an empty
+#: slot, two sites sharing one int, a run that is a different string on each
+#: call, and runs freed and their addresses reused across collections.
+#:
+#: Each helper is called more than JAI_JIT_THRESHOLD times so the
+#: whole-function tier compiles it; `JAITHON_NO_JIT=1` runs the same file, and
+#: every answer is the interpreter's.
+# jit-compiles: bare, two_sites, with_runs, keyed_count
+from std.test import assert_eq, assert_true
+
+fn bare(n: int) -> str {
+    return f"{n}"
+}
+
+fn two_sites(n: int) -> str {
+    let a = f"a{n}"
+    let b = f"b{n}"
+    return a + "|" + b
+}
+
+fn with_runs(pre: str, n: int, post: str) -> str {
+    return f"{pre}{n}{post}"
+}
+
+fn keyed_count(counts: dict, n: int, reps: int) -> void {
+    var i = 0
+    while i < reps {
+        let key = f"k{i % n}"
+        counts[key] = counts.get(key, 0) + 1
+        i += 1
+    }
+}
+
+pub fn test_bare_int_zero_is_not_an_empty_slot() -> void {
+    var round = 0
+    while round < 3 {
+        var i = -5
+        while i < 200 {
+            assert_eq(bare(i), str(i))
+            assert_eq(bare(0), "0")
+            i += 1
+        }
+        round += 1
+    }
+}
+
+pub fn test_two_sites_on_one_int_stay_apart() -> void {
+    var round = 0
+    while round < 4 {
+        var i = 0
+        while i < 300 {
+            assert_eq(two_sites(i), "a" + str(i) + "|b" + str(i))
+            i += 1
+        }
+        round += 1
+    }
+}
+
+pub fn test_runs_are_keys_by_identity() -> void {
+    let pres = ["x", "y", "xy", ""]
+    let posts = ["", "z", "-"]
+    var round = 0
+    while round < 3 {
+        var i = 0
+        while i < 240 {
+            let pre = pres[i % pres.len()]
+            let post = posts[i % posts.len()]
+            let n = i % 17
+            assert_eq(with_runs(pre, n, post), pre + str(n) + post)
+            i += 1
+        }
+        round += 1
+    }
+}
+
+pub fn test_freed_runs_do_not_answer_for_new_ones() -> void {
+    #: A run built at run time, used until the memo holds it, then dropped
+    #: and collected; the next run is built the same way and may land at the
+    #: same address. A memo that outlived the collection would answer the
+    #: old run's string.
+    var round = 0
+    while round < 30 {
+        let pre = "p" + str(round) + "_"
+        var i = 0
+        while i < 150 {
+            assert_eq(with_runs(pre, i % 5, ""), pre + str(i % 5))
+            i += 1
+        }
+        __prim__.gc_collect()
+        var junk = []
+        var j = 0
+        while j < 200 {
+            junk.push("q" + str(round * 1000 + j) + "_")
+            j += 1
+        }
+        round += 1
+    }
+}
+
+pub fn test_counting_loop_counts() -> void {
+    var counts = {}
+    keyed_count(counts, 37, 5000)
+    __prim__.gc_collect()
+    keyed_count(counts, 37, 5000)
+    assert_eq(counts.len(), 37)
+    var total = 0
+    for (_k, v) in counts.items() { total += v }
+    assert_eq(total, 10000)
+    assert_eq(counts["k0"], 272)
+    assert_eq(counts["k36"], 270)
+}
+
+pub fn test_past_the_intern_soft_cap() -> void {
+    #: More distinct short strings than the intern table keeps; the memo must
+    #: still answer only equal strings, and a dict keyed by them must count.
+    var keep = []
+    var i = 0
+    while i < 40000 {
+        keep.push("s" + str(i))
+        i += 1
+    }
+    var counts = {}
+    keyed_count(counts, 50, 3000)
+    assert_eq(counts.len(), 50)
+    var total = 0
+    for (_k, v) in counts.items() { total += v }
+    assert_eq(total, 3000)
+    assert_true(keep.len() == 40000)
+    var r = 0
+    while r < 200 {
+        assert_eq(bare(r + 100000), str(r + 100000))
+        r += 1
+    }
+}

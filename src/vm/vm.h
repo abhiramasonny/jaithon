@@ -159,6 +159,35 @@ bool jaiValueFormatShortOn(void);
 ObjString *jaiValueFormatLeaf(const Value *parts, int64_t count);
 /* The same for an f-string of one int hole between optional string runs. */
 ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post);
+/* The same, filing an intern hit in jaiFmtMemo; see value.c. */
+ObjString *jaiValueFormatIntLeafMemo(Obj *pre, int64_t n, Obj *post);
+/* What jaiValueFormatIntLeaf answered from the intern table, by (pre, n,
+ * post), weak and direct-mapped; compiled code probes it inline in front of
+ * the call. value.c says why an entry is sound. The JIT loads `entries` and
+ * `mask` as one pair, so they stay first and adjacent, and an entry is the
+ * four words in this order. */
+typedef struct {
+    Obj       *pre;
+    Obj       *post;
+    int64_t    n;
+    ObjString *s;
+} JaiFmtMemoEntry;
+typedef struct {
+    JaiFmtMemoEntry *entries;
+    uint64_t         mask;
+    uint64_t         fills;
+    bool             dirty;
+} JaiFmtMemo;
+extern JaiFmtMemo jaiFmtMemo;
+#define JAI_FMT_MEMO_EMPTY ((Obj *)(uintptr_t)1)
+static inline uint64_t jaiFmtMemoIndex(const Obj *pre, int64_t n,
+                                       const Obj *post, uint64_t mask) {
+    return ((uint64_t)n ^ ((uintptr_t)pre >> 4) ^ ((uintptr_t)post >> 5)) &
+           mask;
+}
+/* Every entry dropped; the collector calls it, since an entry holds its
+ * strings weakly. */
+void jaiFmtMemoClear(void);
 /* `s[a:b]` for compiled code, or NULL when only jaiSliceGet can make it.
  * Never allocates; see its definition in object_string.c. */
 ObjString *jaiStringSliceLeaf(ObjString *s, int64_t start, int64_t stop,

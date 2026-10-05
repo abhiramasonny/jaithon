@@ -1387,7 +1387,94 @@ JAI_INLINE bool fmtRun(char *buf, size_t *o, const Obj *run) {
     return true;
 }
 
-ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
+/* The f-string memo: the answer jaiValueFormatIntLeaf gave for (pre, n, post),
+ * kept so that compiled code can find it again with a few loads and compares
+ * in front of the call (emitFormatLeaf) -- a number-to-string cache, as V8
+ * keeps one. On dict_ops's `f"k{i % 10_000}"` the call it skips is the whole
+ * of the format, the hash and the intern probe: two thirds of an iteration.
+ *
+ * What makes an entry sound:
+ *  - Only an intern HIT is kept. The answer is then the one string with those
+ *    bytes, the same object the leaf would hand back again, so a hit changes
+ *    nothing anybody can observe; a string that was never interned is never
+ *    shared through here.
+ *  - pre and post are keys by identity. Strings never change their bytes
+ *    (length and chars are written once, at creation), so while both are
+ *    alive their identity is their content.
+ *  - Objects are freed only by a collection, and jaiFmtMemoClear empties the
+ *    table in every one of them. No entry outlives a string it names, and no
+ *    address is reused while an entry still holds it. The table is weak.
+ *
+ * An empty entry's pre is JAI_FMT_MEMO_EMPTY, an address no object has, so
+ * the all-NULL key of `f"{n}"` (pre and post absent) cannot match a cleared
+ * slot. It starts at 256 entries and doubles whenever twice its size in fills
+ * have gone in since it last grew -- a loop cycling through more keys than it
+ * holds misses on every one of them, so a table smaller than the cycle is
+ * worth nothing -- up to the intern soft cap, which bounds how many distinct
+ * answers there can be. */
+#define FMT_MEMO_FIRST 256u
+#define FMT_MEMO_MAX   ((uint64_t)JAI_INTERN_SOFT_CAP)
+
+static JaiFmtMemoEntry fmtMemoFirst[FMT_MEMO_FIRST] = {
+    [0 ... FMT_MEMO_FIRST - 1] = {.pre = JAI_FMT_MEMO_EMPTY},
+};
+JaiFmtMemo jaiFmtMemo = {fmtMemoFirst, FMT_MEMO_FIRST - 1u, 0, false};
+
+
+static void fmtMemoEmpty(JaiFmtMemoEntry *entries, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++) {
+        entries[i].pre = JAI_FMT_MEMO_EMPTY;
+        entries[i].post = NULL;
+        entries[i].n = 0;
+        entries[i].s = NULL;
+    }
+}
+
+void jaiFmtMemoClear(void) {
+    if (!jaiFmtMemo.dirty) return;
+    fmtMemoEmpty(jaiFmtMemo.entries, jaiFmtMemo.mask + 1u);
+    jaiFmtMemo.dirty = false;
+}
+
+/* A table twice the size, empty: the entries it held are refilled by the
+ * misses that follow, which is cheaper than rehashing them here. malloc and
+ * never the collector's allocator -- this runs inside a leaf. Failing to grow
+ * keeps the table it has. */
+static JAI_NOINLINE void fmtMemoGrow(void) {
+    const uint64_t count = (jaiFmtMemo.mask + 1u) * 2u;
+    JaiFmtMemoEntry *grown = malloc(count * sizeof *grown);
+    if (grown == NULL) return;
+    fmtMemoEmpty(grown, count);
+    if (jaiFmtMemo.entries != fmtMemoFirst) free(jaiFmtMemo.entries);
+    jaiFmtMemo.entries = grown;
+    jaiFmtMemo.mask = count - 1u;
+    jaiFmtMemo.fills = 0;
+}
+
+/* Reached by a tail call from the leaf, so the leaf itself keeps no frame
+ * for the growth call in here. Returns `s`. */
+static JAI_NOINLINE ObjString *fmtMemoKeep(Obj *pre, int64_t n, Obj *post,
+                                           ObjString *s) {
+    JaiFmtMemoEntry *e =
+        &jaiFmtMemo.entries[jaiFmtMemoIndex(pre, n, post, jaiFmtMemo.mask)];
+    e->pre = pre;
+    e->post = post;
+    e->n = n;
+    e->s = s;
+    jaiFmtMemo.dirty = true;
+    if (JAI_UNLIKELY(++jaiFmtMemo.fills > 2u * (jaiFmtMemo.mask + 1u)) &&
+        jaiFmtMemo.mask + 1u < FMT_MEMO_MAX) {
+        fmtMemoGrow();
+    }
+    return s;
+}
+
+/* The leaf's body, instantiated twice so that the copy compiled code calls
+ * while the memo is off is the leaf as it was, instruction for instruction:
+ * keeping pre, n and post alive to the fill reshapes the register plan of
+ * the whole function, and that cost ~11 instructions a call on its own. */
+JAI_INLINE ObjString *formatIntLeaf(Obj *pre, int64_t n, Obj *post,
+                                    bool memo) {
     uint64_t words[(FMT_SHORT_BUF + 7) / 8];
     char *buf = (char *)words;
     size_t o = 0;
@@ -1395,11 +1482,24 @@ ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
         o += (size_t)writeInt64Inline(buf + o, n);
         if (JAI_LIKELY(o <= JAI_STR_SHORT_MAX && fmtRun(buf, &o, post))) {
             ObjString *found = formatShortProbe(buf, o);
-            if (JAI_LIKELY(found != NULL)) return found;
+            if (JAI_LIKELY(found != NULL)) {
+                if (memo) return fmtMemoKeep(pre, n, post, found);
+                return found;
+            }
             return formatLeafBuilt(buf, o);
         }
     }
     return NULL;
+}
+
+ObjString *jaiValueFormatIntLeaf(Obj *pre, int64_t n, Obj *post) {
+    return formatIntLeaf(pre, n, post, false);
+}
+
+/* jaiValueFormatIntLeaf that also files an intern hit in the memo: what
+ * compiled code calls when its inline probe of the memo misses. */
+ObjString *jaiValueFormatIntLeafMemo(Obj *pre, int64_t n, Obj *post) {
+    return formatIntLeaf(pre, n, post, true);
 }
 
 /* A short f-string's runs, already rendered, staged where formatShortProbe

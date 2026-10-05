@@ -700,6 +700,28 @@ int main(void) {
                              jaiA64MovzX(3, 5, 0), jaiA64SubsXImm(31, 3, 4),
                              jaiA64CselX(0, 1, 2, JAI_A64_EQ), jaiA64Ret() };
       check("csel not taken", runWith(w, 6, cell), 9); }
+    /* eor with a shifted operand, and xzr as that operand */
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x0f, 0), jaiA64MovzX(2, 0xf00, 0),
+                             jaiA64EorXLsr(0, 1, 2, 4), jaiA64Ret() };
+      check("eor lsr", runWith(w, 4, cell), 0x0f ^ 0xf0); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 0x0f, 0),
+                             jaiA64EorXLsr(0, 1, 31, 5), jaiA64Ret() };
+      check("eor lsr xzr", runWith(w, 3, cell), 0x0f); }
+    /* a ccmp chain: all equal, and one of three different */
+    { const uint32_t w[] = { jaiA64MovzX(1, 4, 0), jaiA64MovzX(2, 4, 0),
+                             jaiA64MovzX(3, 9, 0), jaiA64MovzX(4, 9, 0),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CcmpX(3, 4, 0, JAI_A64_EQ),
+                             jaiA64CcmpX(31, 31, 0, JAI_A64_EQ),
+                             jaiA64CsetX(0, JAI_A64_EQ), jaiA64Ret() };
+      check("ccmp all equal", runWith(w, 9, cell), 1); }
+    { const uint32_t w[] = { jaiA64MovzX(1, 4, 0), jaiA64MovzX(2, 4, 0),
+                             jaiA64MovzX(3, 9, 0), jaiA64MovzX(4, 8, 0),
+                             jaiA64SubsXReg(31, 1, 2),
+                             jaiA64CcmpX(3, 4, 0, JAI_A64_EQ),
+                             jaiA64CcmpX(1, 2, 0, JAI_A64_EQ),
+                             jaiA64CsetX(0, JAI_A64_EQ), jaiA64Ret() };
+      check("ccmp one differs", runWith(w, 9, cell), 0); }
     { const uint32_t w[] = { jaiA64LdrByte(0, 0, 1), jaiA64Ret() };
       check("ldrb offset", runWith(w, 2, cell), (cell[0] >> 8) & 0xffu); }
     { /* Write one byte at offset 3 and read it back: the store must touch that
