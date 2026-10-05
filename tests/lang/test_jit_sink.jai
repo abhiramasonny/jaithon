@@ -390,3 +390,36 @@ fn test_break_and_continue() -> void {
     assert_eq(p.y, 1002001)
     assert_eq(odd_sum(20000), 100000000)
 }
+
+#: A factory function that ends by constructing, inlined where it is called
+#: and bound straight into the local: sunk like a direct construction.
+fn make_point(a: int, b: int) -> Point {
+    return Point(a + 1, b)
+}
+
+#: Not inlinable (it loops): the bind gets a real object, and the loop is
+#: compiled without sinking.
+fn make_point_slowly(a: int, b: int) -> Point {
+    var s = 0
+    for k in 0..2 { s += k }
+    return Point(a + s, b)
+}
+
+fn test_a_factory_function() -> void {
+    var total = 0
+    var i = 0
+    while i < 20000 {
+        let p = make_point(i, 2)
+        total += p.x * p.y
+        i += 1
+    }
+    assert_eq(total, 400020000)
+    total = 0
+    i = 0
+    while i < 20000 {
+        let p = make_point_slowly(i, 2)
+        total += p.x * p.y
+        i += 1
+    }
+    assert_eq(total, 400020000)
+}

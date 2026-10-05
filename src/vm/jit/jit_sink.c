@@ -92,9 +92,16 @@ void sinkPlanFpHomes(Emit *e) {
 bool sinkFpFast(const Emit *e, const uint8_t *code, int off, uint8_t op) {
     if (e->sinkCount == 0) return false;
     if (op == OP_TAIL_CALL) return e->inlining && e->inlSinkBind != 0;
+    /* Only a construction sinkConstructs takes: any other call reads its
+     * arguments out of X, so the bank must be synced for it as usual. */
     if (op == OP_CALL && !e->inlining && code[off + 2] == OP_BIND) {
         unsigned slot = jaiReadU16(code + off + 3);
-        return slot <= JIT_MAX_SLOTS && e->sinkOf[slot] != 0;
+        unsigned argc = code[off + 1];
+        if (slot > JIT_MAX_SLOTS || e->sinkOf[slot] == 0) return false;
+        if (e->depth < argc + 1u) return false;
+        unsigned cidx = e->depth - argc - 1u;
+        return e->stack[cidx] == SLOT_CLASS &&
+               e->stackClass[cidx] == e->sink[e->sinkOf[slot] - 1u].cls;
     }
     return false;
 }
@@ -407,7 +414,14 @@ int sinkConstructs(Emit *e, const uint8_t *code, int off) {
     unsigned slot = jaiReadU16(code + off + 3);
     if (slot > JIT_MAX_SLOTS || e->sinkOf[slot] == 0) return 0;
     unsigned j = e->sinkOf[slot] - 1u;
-    if (!storeConstruction(e, j, code[off + 1])) {
+    /* A function, not a class: its body may end by constructing one
+     * (sinkConstructInline, once inlined), and if it does not the bind
+     * refuses (sinkBindResult). */
+    unsigned argc = code[off + 1];
+    if (e->depth < argc + 1u || e->stack[e->depth - argc - 1u] != SLOT_CLASS) {
+        return 0;
+    }
+    if (!storeConstruction(e, j, argc)) {
         e->whyNot = "a sunk local bound to something its plan did not expect";
         return -1;
     }
