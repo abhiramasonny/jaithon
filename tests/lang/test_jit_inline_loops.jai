@@ -10,6 +10,8 @@
 #: test calls hundreds of times, because that is the tier that inlines them;
 #: the drivers call out too, so their own locals share the registers with the
 #: homes.
+from std.io import Path, write_file
+from std.os import argv, pid, run, temp_dir
 from std.test import assert_eq, assert_true
 
 fn safe(cols: list[int], row: int, col: int) -> bool {
@@ -365,4 +367,144 @@ fn test_and_or_predicates() -> void {
         if v < 5 or v > 15 { want += 2 }
         assert_eq(drive_between(v), want)
     }
+}
+
+# Two and three list parameters: each one's storage is pinned at the inline's
+# entry, one fixup apiece. The caller's fixups were saved into a copy sized
+# before the pins, so a second pinned list wrote past its end and the compile
+# crashed on a corrupted heap.
+fn dot(a: list[int], b: list[int], n: int) -> int {
+    var s = 0
+    for i in 0..n { s += a[i] * b[i] }
+    return s
+}
+
+fn weighted(xs: list[float], ws: list[float], n: int) -> float {
+    var i = 0
+    var s = 0.0
+    while i < n {
+        s += xs[i] * ws[i]
+        i += 1
+    }
+    return s
+}
+
+fn count_lists(a: list[int], b: list[int], c: list[int], n: int) -> int {
+    var s = 0
+    var i = 0
+    while i < n {
+        if a[i] < b[i] and b[i] < c[i] { s += 1 }
+        i += 1
+    }
+    return s
+}
+
+fn count_only(a: list[int], b: list[int], n: int) -> int {
+    var s = 0
+    for _i in 0..n { s += 1 }
+    return s
+}
+
+fn drive_dot(a: list[int], b: list[int], n: int) -> int {
+    return dot(a, b, n) + noop(0)
+}
+
+fn drive_weighted(xs: list[float], ws: list[float], n: int) -> float {
+    return weighted(xs, ws, n) + float(noop(0))
+}
+
+fn drive_lists(a: list[int], b: list[int], c: list[int], n: int) -> int {
+    return count_lists(a, b, c, n) + count_only(a, c, n) + noop(0)
+}
+
+fn test_two_list_parameters() -> void {
+    var a: list[int] = []
+    var b: list[int] = []
+    for k in 0..10 {
+        a.push(k)
+        b.push(k * k)
+    }
+    for r in 0..2000 {
+        let n = r % 11
+        var want = 0
+        for i in 0..n { want += i * i * i }
+        assert_eq(drive_dot(a, b, n), want)
+    }
+}
+
+fn test_two_float_list_parameters() -> void {
+    var xs: list[float] = []
+    var ws: list[float] = []
+    for i in 0..8 {
+        xs.push(float(i) * 0.5)
+        ws.push(1.0 / float(i + 1))
+    }
+    var want = 0.0
+    for i in 0..8 { want += xs[i] * ws[i] }
+    for _r in 0..2000 { assert_eq(drive_weighted(xs, ws, 8), want) }
+}
+
+fn test_three_list_parameters_and_one_unread() -> void {
+    var a: list[int] = []
+    var b: list[int] = []
+    var c: list[int] = []
+    for k in 0..12 {
+        a.push(k % 5)
+        b.push(k % 7)
+        c.push(k % 9)
+    }
+    for r in 0..2000 {
+        let n = r % 13
+        var want = n
+        for i in 0..n { if a[i] < b[i] and b[i] < c[i] { want += 1 } }
+        assert_eq(drive_lists(a, b, c, n), want)
+    }
+}
+
+fn test_the_same_list_passed_twice() -> void {
+    var a: list[int] = []
+    for k in 0..10 { a.push(k) }
+    for r in 0..2000 {
+        let n = r % 11
+        var want = 0
+        for i in 0..n { want += i * i }
+        assert_eq(drive_dot(a, a, n), want)
+    }
+}
+
+# The two-list overflow wrote one Fixup past a small heap block, which the
+# allocator usually tolerated: the in-process tests above passed on the broken
+# binary. Guard Malloc puts every block against a guard page, so the same
+# program faults there every time the copy is sized short.
+fn test_two_list_parameters_under_guard_malloc() -> void {
+    let gm = "/usr/lib/libgmalloc.dylib"
+    if not Path(gm).exists() { return }
+    let lines = [
+        "fn dot(a: list[int], b: list[int], n: int) -> int {",
+        "    var s = 0",
+        "    for i in 0..n { s += a[i] * b[i] }",
+        "    return s",
+        "}",
+        "fn noop(x: int) -> int { return x }",
+        "fn drive(a: list[int], b: list[int], n: int) -> int { return dot(a, b, n) + noop(0) }",
+        "fn main() -> int {",
+        "    var a: list[int] = []",
+        "    var b: list[int] = []",
+        "    for k in 0..10 {",
+        "        a.push(k)",
+        "        b.push(k * k)",
+        "    }",
+        "    var u = 0",
+        "    for r in 0..20000 { u += drive(a, b, r % 11) }",
+        "    print(u)",
+        "    return 0",
+        "}",
+    ]
+    let path = f"{temp_dir()}/jaithon_inline_two_lists_{pid()}.jai"
+    write_file(path, "\n".join(lines) + "\n")
+    defer { Path(path).remove() }
+    let ran = run(["sh", "-c",
+        f"DYLD_INSERT_LIBRARIES={gm} exec '{argv()[0]}' run --no-cache '{path}' 2>/dev/null"])
+    assert_eq(ran.exit_code, 0)
+    assert_eq(ran.stdout, "8939106\n")
 }

@@ -1005,9 +1005,8 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     int *cmap = (int *)malloc(sizeof(int) * (size_t)(count + 1));
     int64_t *cdepths = (int64_t *)malloc(sizeof(int64_t) * (size_t)(count + 1));
     uint8_t *cloop = (uint8_t *)calloc((size_t)count + 1u, 1);
-    Fixup *saved = (Fixup *)malloc(sizeof(Fixup) * (e->fixupCount + 1u));
-    if (cmap == NULL || cdepths == NULL || cloop == NULL || saved == NULL) {
-        free(code); free(cmap); free(cdepths); free(cloop); free(saved);
+    if (cmap == NULL || cdepths == NULL || cloop == NULL) {
+        free(code); free(cmap); free(cdepths); free(cloop);
         return false;
     }
     if (getenv("JAI_JIT_WHY")) {
@@ -1102,10 +1101,17 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
     }
     if (e->failed) ok = false;
 
-    /* The walk sees only its own fixups. */
+    /* The walk sees only its own fixups. The copy is sized here, after the
+     * storage pins above have added one fixup each: sized before them, a
+     * callee with two list parameters wrote past its end. */
     unsigned nCaller = e->fixupCount;
-    memcpy(saved, e->fixups, sizeof(Fixup) * nCaller);
-    e->fixupCount = 0;
+    Fixup *saved = (Fixup *)malloc(sizeof(Fixup) * (nCaller + 1u));
+    if (saved == NULL) {
+        ok = false;                /* the table is untouched; nothing to undo */
+    } else {
+        memcpy(saved, e->fixups, sizeof(Fixup) * nCaller);
+        e->fixupCount = 0;
+    }
     unsigned fp0 = e->fpCarryCount, he0 = e->homeEarlyCount;
     unsigned dc0 = e->deferCarryCount;
     int *savedMap = e->offsetToInst;
@@ -1175,7 +1181,9 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
         }
         if (ok && nCaller + kept > JIT_MAX_FIXUPS) ok = false;
     }
-    if (ok) {
+    if (saved == NULL) {
+        /* never swapped out */
+    } else if (ok) {
         memmove(&e->fixups[nCaller], &e->fixups[0], sizeof(Fixup) * kept);
         memcpy(&e->fixups[0], saved, sizeof(Fixup) * nCaller);
         e->fixupCount = nCaller + kept;
