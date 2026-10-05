@@ -359,6 +359,65 @@ kernel void corner_emit(device const float* response [[buffer(0)]],
     scores[slot] = response[r_off + y * r_step + x];
 }
 
+/* The strongest response anywhere, and how many corners above zero fall in
+ * each slice of the float bit pattern, in one pass -- so the host learns the
+ * floor and where to cut from a single read back instead of a reduction and
+ * then a count against it.
+ *
+ * A slice is the top sixteen bits of a positive float: 128 to an octave, the
+ * same grain as the thousand slices the count used between floor and peak.
+ * The strongest is kept as an order-preserving key, which for a positive
+ * float is its bits with the sign bit set and for a negative one the
+ * complement, so an unsigned maximum is the float maximum. */
+kernel void corner_survey(device const float* response [[buffer(0)]],
+                          device const float* mask [[buffer(1)]],
+                          device atomic_uint* top [[buffer(2)]],
+                          device atomic_uint* counts [[buffer(3)]],
+                          constant uint& rows [[buffer(4)]],
+                          constant uint& cols [[buffer(5)]],
+                          constant uint& r_off [[buffer(6)]],
+                          constant uint& r_step [[buffer(7)]],
+                          constant uint& m_off [[buffer(8)]],
+                          constant uint& m_step [[buffer(9)]],
+                          constant uint& use_mask [[buffer(10)]],
+                          uint id [[thread_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    uint key = 0u;
+    if (id < rows * cols) {
+        uint y = id / cols;
+        uint x = id - y * cols;
+        uint bits = as_type<uint>(response[r_off + y * r_step + x]);
+        key = (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+    }
+    uint best = simd_max(key);
+    if (lane == 0u) atomic_fetch_max_explicit(top, best, memory_order_relaxed);
+    if (!corner_wins(response, mask, id, rows, cols, r_off, r_step, m_off,
+                     m_step, use_mask, 0.0f)) {
+        return;
+    }
+    uint y = id / cols;
+    uint x = id - y * cols;
+    float here = response[r_off + y * r_step + x];
+    if (here <= 0.0f) return;
+    atomic_fetch_add_explicit(&counts[as_type<uint>(here) >> 16], 1u, memory_order_relaxed);
+}
+
+/* The survey's counts as floats, and its strongest decoded, at the end. */
+kernel void corner_survey_read(device const uint* top [[buffer(0)]],
+                               device const uint* counts [[buffer(1)]],
+                               device float* out [[buffer(2)]],
+                               constant uint& slices [[buffer(3)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id < slices) {
+        out[id] = float(counts[id]);
+        return;
+    }
+    if (id != slices) return;
+    uint key = top[0];
+    uint bits = (key & 0x80000000u) != 0u ? (key & 0x7FFFFFFFu) : ~key;
+    out[slices] = as_type<float>(bits);
+}
+
 kernel void hough_collect(device const uint* votes [[buffer(0)]],
                           device float* out [[buffer(1)]],
                           constant uint& count [[buffer(2)]],
@@ -743,6 +802,47 @@ fn space_out(spots: list[float], ordered: list[int], squared: float, flat: list[
     return taken
 }
 
+#: Slices of the float bit pattern the survey counts corners into: the top
+#: sixteen bits of every non-negative float.
+const CORNER_SLICES = 32768
+
+#: Whether `good_features_to_track` surveys the response in one pass for its
+#: strongest value and its corner counts. `JAICV_GF_SURVEY=0` takes the
+#: maximum with `min_max` and then counts against the floor, two read backs;
+#: the answer is the same either way.
+let _GF_SURVEY = env_or("JAICV_GF_SURVEY", "1") != "0"
+
+#: Dispatch the survey; the returned buffer holds the count in every slice and
+#: then the strongest response, all as floats, once the work has run.
+fn survey_corners(response: Mat, plane: Mat, opened: int) -> Buffer {
+    let top = Buffer(1)
+    top.fill_zero()
+    let counts = Buffer(CORNER_SLICES)
+    counts.fill_zero()
+    kernel_for("corner_survey").dispatch_async(
+        [response.storage, plane.storage, top, counts],
+        response.rows * response.cols,
+        [
+            response.rows,
+            response.cols,
+            response.offset,
+            response.step_,
+            plane.offset,
+            plane.step_,
+            opened,
+        ]
+    )
+    let read = Buffer(CORNER_SLICES + 1)
+    kernel_for("corner_survey_read").dispatch_async(
+        [top, counts, read],
+        CORNER_SLICES + 1,
+        [CORNER_SLICES]
+    )
+    top.free()
+    counts.free()
+    return read
+}
+
 #: Whether `strongest_first` may select the strongest few instead of ranking
 #: every candidate. `JAICV_GF_SELECT=0` always ranks them all; the answer is the
 #: same either way.
@@ -868,13 +968,6 @@ pub fn good_features_to_track(
     }
     let rows = response.rows
     let cols = response.cols
-    let (_low, strongest) = min_max(response)
-    if strongest <= 0.0 {
-        response.release()
-        return []
-    }
-    let floor_value = strongest * quality_level
-
     response.flush()
     let mask_image = mask
     if mask_image is not null { mask_image.flush() }
@@ -884,6 +977,27 @@ pub fn good_features_to_track(
     let limit = rows * cols
     let groups = (limit + CORNER_GROUP - 1) // CORNER_GROUP
     let opened = if mask_image is null { 0 } else { 1 }
+
+    #: The strongest response sets the floor. The survey finds it and counts
+    #: the corners in every slice above zero in the same pass, so one read back
+    #: serves both the floor and the cut below.
+    var strongest = 0.0
+    var survey: Buffer? = null
+    if _GF_SURVEY {
+        let read = survey_corners(response, plane, opened)
+        strongest = read.download(CORNER_SLICES, 1)[0]
+        survey = read
+    } else {
+        let (_low, high) = min_max(response)
+        strongest = high
+    }
+    if strongest <= 0.0 {
+        let surveyed = survey
+        if surveyed is not null { surveyed.free() }
+        response.release()
+        return []
+    }
+    let floor_value = strongest * quality_level
 
     #: Whether a pixel is a peak does not depend on the floor, so raising the
     #: floor takes away exactly the weakest candidates and leaves the rest
@@ -898,7 +1012,30 @@ pub fn good_features_to_track(
     var emit_bits = f32_bits(floor_value)
     var room = limit
     var whole_frame = true
-    if wanted > 0 {
+    let surveyed = survey
+    if wanted > 0 and surveyed is not null {
+        #: Slices are whole: a cut strictly above the floor's own slice starts
+        #: above the floor, and every corner counted from there down to it is
+        #: one the emit will find.
+        let low_slice = f32_bits(floor_value) >> 16
+        let high_slice = f32_bits(strongest) >> 16
+        let tally = surveyed.download(low_slice, high_slice - low_slice + 1)
+        var running = 0
+        var cut = 0
+        for index in 0..tally.len() {
+            let at = tally.len() - 1 - index
+            running += int(tally[at] + 0.5)
+            if running >= wanted {
+                cut = at
+                break
+            }
+        }
+        if cut > 0 {
+            emit_bits = (low_slice + cut) << 16
+            room = running
+            whole_frame = false
+        }
+    } elif wanted > 0 {
         let low_bits = f32_bits(floor_value)
         let slice = (f32_bits(strongest) - low_bits) // CORNER_BUCKETS + 1
         let counts = Buffer(CORNER_BUCKETS)
@@ -943,6 +1080,8 @@ pub fn good_features_to_track(
             whole_frame = false
         }
     }
+
+    if surveyed is not null { surveyed.free() }
 
     let where = [
         rows,
