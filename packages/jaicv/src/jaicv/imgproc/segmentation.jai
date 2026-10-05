@@ -781,7 +781,6 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
 
     #: Join every touching pair into one tree, then point each pixel at its
     #: tree's root. Two passes, whatever the picture looks like.
-    let counted = Buffer(1)
     let across = (cols + CC_TILE - 1) // CC_TILE
     let down = (rows + CC_TILE - 1) // CC_TILE
     kernel_for("cc_union").dispatch_async(
@@ -798,10 +797,10 @@ pub fn connected_components(image: Mat, connectivity: int = 8) -> tuple[int, Mat
     if _CC_DEVICE_NUMBERING {
         let numbered = _number_on_device(labels, first, out, rows, cols, connectivity)
         labels.free()
-        counted.free()
         first.free()
         return (numbered + 1, out)
     }
+    let counted = Buffer(1)
     let tally = Buffer(1)
     tally.fill_zero()
     let roots = Buffer(count)
@@ -856,7 +855,7 @@ fn _number_on_device(
     let count = rows * cols
     #: Scan positions run over whole 2x2 blocks for eight-connectivity, so an
     #: odd side leaves positions no pixel owns.
-    let reach = if connectivity == 4 { count } else { ((rows + 1) // 2) * ((cols + 1) // 2) * 4 }
+    let reach = if connectivity == 4 { count } else { (rows + 1) // 2 * ((cols + 1) // 2) * 4 }
     let groups = (reach + CC_RANK_GROUP - 1) // CC_RANK_GROUP
     let bits = Buffer(groups * CC_RANK_WORDS)
     bits.fill_zero()
