@@ -30,6 +30,34 @@ fn matrix_of(values: list[float], rows: int, cols: int) -> Mat {
     return Mat.from_list(rows, cols, CV_MAKETYPE(CV_32F, 1), values)
 }
 
+#: The rotation matrix of a rotation vector, row-major, in double precision.
+#:
+#: The arithmetic `rodrigues` does, without the matrix round it: a fit that
+#: evaluates its residual thousands of times cannot afford a device buffer, an
+#: upload and a read back for every three numbers, and those reads were six of
+#: the seven seconds a camera calibration took.
+pub fn rotation_of_vector(x: float, y: float, z: float) -> list[float] {
+    let angle = math.sqrt(x * x + y * y + z * z)
+    if angle < 1e-12 { return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] }
+    let ux = x / angle
+    let uy = y / angle
+    let uz = z / angle
+    let c = math.cos(angle)
+    let s = math.sin(angle)
+    let t = 1.0 - c
+    return [
+        c + ux * ux * t,
+        ux * uy * t - uz * s,
+        ux * uz * t + uy * s,
+        uy * ux * t + uz * s,
+        c + uy * uy * t,
+        uy * uz * t - ux * s,
+        uz * ux * t - uy * s,
+        uz * uy * t + ux * s,
+        c + uz * uz * t,
+    ]
+}
+
 #: Turn a rotation vector into a rotation matrix, or the other way round.
 #:
 #: A three-entry input is read as an axis whose length is the angle and a three
@@ -42,29 +70,8 @@ pub fn rodrigues(source: Mat) -> Mat {
         let x = values[0]
         let y = values[1]
         let z = values[2]
-        let angle = math.sqrt(x * x + y * y + z * z)
-        if angle < 1e-12 { return identity(3) }
-        let ux = x / angle
-        let uy = y / angle
-        let uz = z / angle
-        let c = math.cos(angle)
-        let s = math.sin(angle)
-        let t = 1.0 - c
-        return matrix_of(
-            [
-                c + ux * ux * t,
-                ux * uy * t - uz * s,
-                ux * uz * t + uy * s,
-                uy * ux * t + uz * s,
-                c + uy * uy * t,
-                uy * uz * t - ux * s,
-                uz * ux * t - uy * s,
-                uz * uy * t + ux * s,
-                c + uz * uz * t,
-            ],
-            3,
-            3
-        )
+        if math.sqrt(x * x + y * y + z * z) < 1e-12 { return identity(3) }
+        return matrix_of(rotation_of_vector(x, y, z), 3, 3)
     }
     if source.rows != 3 or source.cols != 3 {
         throw ValueError("rodrigues takes a three-vector or a three by three matrix")
@@ -318,9 +325,21 @@ pub fn project_points(
     camera_matrix: Mat,
     dist_coeffs: list[float] = []
 ) -> list[Point2f] {
-    let r = rodrigues(rvec).values()
-    let t = tvec.values()
-    let k = camera_matrix.values()
+    let turn = rodrigues(rvec)
+    let r = turn.values()
+    turn.release()
+    return projected_through(object_points, r, tvec.values(), camera_matrix.values(), dist_coeffs)
+}
+
+#: `project_points` over plain lists: the rotation matrix `r` row-major, the
+#: translation `t`, and the camera matrix `k`.
+pub fn projected_through(
+    object_points: list[Point3f],
+    r: list[float],
+    t: list[float],
+    k: list[float],
+    dist_coeffs: list[float]
+) -> list[Point2f] {
     var out: list[Point2f] = []
     for point in object_points {
         let cx = r[0] * point.x + r[1] * point.y + r[2] * point.z + t[0]
