@@ -82,3 +82,4 @@ bit-identical either way; only the time changes.
 | `JAIFRAME_FOLD_NULLS` | a radix pass of its own for a float key's null lane, instead of folding it into the value pass |
 | `JAIFRAME_DEVICE_TOTAL` | a download of the scan total on every bit of a join's radix order |
 | `JAIFRAME_JOIN_DIGITS` | a one-bit-a-pass radix order for a join's bucket and pair lanes, instead of the frame sort's eight-bit passes |
+| `JAIFRAME_SHARED_FOLDS` | one threadgroup fold, with its own eleven barriers, per column statistic, instead of folding them side by side through one set; bit-identical |
