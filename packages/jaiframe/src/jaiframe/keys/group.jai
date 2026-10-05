@@ -10,6 +10,12 @@ from .lanes import kernel_for
 from .sort import argsort
 from .table import group_rows, kept_rows, positions_where, reduce_lane
 from .table import tally_groups
+from std.os import env_or
+
+#: `JAIFRAME_HEADS_SURVIVE=0` makes `drop_duplicates(keep: "first")` flag the
+#: duplicates and compact the rest, for an A/B against taking the group heads
+#: the hash table already found. The rows are the same. Read once.
+let _HEADS_SURVIVE = env_or("JAIFRAME_HEADS_SURVIVE", "1") != "0"
 
 #: The rows that carry the same key, numbered by first appearance.
 #:
@@ -248,6 +254,19 @@ pub fn drop_duplicates(
     keep: any = "first",
     ignore_index: bool = false
 ) -> any {
+    if _HEADS_SURVIVE and duplicate_mode(keep) == 0 {
+        #: Keeping the first of each key is keeping the rows that head their
+        #: group, and the table already lists those in row order: the same
+        #: positions the duplicate flags would compact to, without the flags,
+        #: the second scan or its wait.
+        let keys = encode_keys(subset_columns(frame, subset))
+        defer { keys.free() }
+        let grouped = group_rows(keys, false)
+        grouped[0].free()
+        let heads = grouped[1]
+        defer { heads.free() }
+        return reorder(frame, heads, grouped[2], ignore_index)
+    }
     let marks = duplicated(frame, subset, keep)
     defer { marks.free() }
     let flags = Buffer(marks.len())

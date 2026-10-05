@@ -184,3 +184,18 @@ computes, and cannot see a name that was renamed in one file and not the
 other, or an export whose signature nobody has called since it grew an
 argument. That is the failure this file exists to catch, and it is the one
 jaicv and jaitensor keep a file of the same name for.
+
+## Switches
+
+Fast paths with an older path beside them, kept one environment variable away
+so a change can be measured as an A/B in one binary. Each is read once, when
+its module loads, and is on unless set to `0`.
+
+| Switch | Off restores |
+| --- | --- |
+| `JAINUM_ROW_SORT` | the dispatch-per-pass bitonic network, instead of sorting 4096-slot blocks in one dispatch each (registers, simd shuffles and threadgroup memory) with global passes only where a stage spans blocks; bit-identical |
+| `JAINUM_ROW_SCAN` | the strided chunk kernel for a scan along a dense last axis of up to 4096, instead of one group a row, its runs held in registers when they are whole float4s and staged in threadgroup memory when they are six slots or longer; the same association, so bit-identical |
+| `JAINUM_TILE_TRANSPOSE` | the strided walk for a 2-d copy whose source rows step by one slot (a transposed matrix), instead of 32x32 threadgroup tiles; bit-identical |
+| `JAINUM_BINARY4` | one element a thread, one wrap divide each, for dense and row-repeating real `+ - * /`, instead of four a thread; bit-identical |
+| `JAINUM_NARROW_FINISH` | a full group a segment for a chunked fold's finish, instead of a finish as wide as the chunk count (up to a group); bit-identical |
+| `JAINUM_SHUFFLE_TREE` | the last five rounds of a fold's tree through threadgroup memory and barriers, instead of simd shuffles; bit-identical |

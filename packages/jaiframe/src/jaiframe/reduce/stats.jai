@@ -110,11 +110,17 @@ fn packed_run(length: int, valid: Buffer?) -> bool {
 #: floats a column. Batching matters because the wait is what costs: a frame
 #: reduced a column at a time pays the round trip once per column and spends
 #: more on the bus than on the columns.
+#:
+#: `extrema: false` skips the second read of every column -- the smallest and
+#: largest values, where they are, and the first and last present rows -- for a
+#: caller that only wants the moments. Those fields keep `ColumnStats`'
+#: defaults; the moments are computed exactly as they are otherwise.
 pub fn batched_stats(
     lanes: list[Buffer],
     valids: list[Buffer?],
     length: int,
-    centers: list[float]
+    centers: list[float],
+    extrema: bool = true
 ) -> list[ColumnStats] {
     let width = lanes.len()
     var out: list[ColumnStats] = []
@@ -138,15 +144,19 @@ pub fn batched_stats(
             [length, flag(mask is not null), f32_bits(centers[at]), at, flag(quad)],
             group_size: RGROUP
         )
-        kernel_for("red_extrema").dispatch_async(
-            [lane, mask ?? lane, extremes],
-            RGROUPS * RGROUP,
-            [length, flag(mask is not null), at, flag(quad)],
-            group_size: RGROUP
-        )
+        if extrema {
+            kernel_for("red_extrema").dispatch_async(
+                [lane, mask ?? lane, extremes],
+                RGROUPS * RGROUP,
+                [length, flag(mask is not null), at, flag(quad)],
+                group_size: RGROUP
+            )
+        }
     }
     kernel_for("red_join_moments").dispatch_async([moments, folded], width * STATS, [width])
-    kernel_for("red_join_extrema").dispatch_async([extremes, folded], width, [width])
+    if extrema {
+        kernel_for("red_join_extrema").dispatch_async([extremes, folded], width, [width])
+    }
     let numbers = folded.download()
     moments.free()
     extremes.free()
@@ -161,6 +171,7 @@ pub fn batched_stats(
         stats.sum_quads = numbers[base + 4]
         stats.product = numbers[base + 5]
         stats.truthy = int(numbers[base + 6])
+        if not extrema { continue }
         stats.lowest = numbers[base + 8]
         stats.highest = numbers[base + 9]
         stats.lowest_at = int(numbers[base + 10])

@@ -37,6 +37,7 @@
 #: and taking the dependency would buy nothing.
 import std.math
 from std.gpu import Buffer
+from std.os import env_or
 from .array import BOOL, FLOAT32, INT64, GROUP, NDArray, PRELUDE, OP_DIV, OP_SUB
 from .array import binary_arith, broadcast_shapes, diagonal_view, dtype_is_integer
 from .array import element_count, f32_bits, fill, is_contiguous, kernel_of
@@ -262,12 +263,25 @@ kernel void nr_fold(device float* dst [[buffer(0)]],
     scratch[lid] = mine;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     /* `span` and not `half`, which names Metal's sixteen-bit float and cannot
-     * also name a variable. */
-    for (uint span = width >> 1u; span > 0u; span >>= 1u) {
+     * also name a variable.
+     *
+     * Bit 3 of `flags` finishes the tree in registers once the span is inside
+     * a simdgroup: a segment's slots are width-aligned lanes, so for a span of
+     * 16 or less a slot's partner is `span` lanes down in its own simdgroup.
+     * The same operands meet in the same order as through threadgroup memory,
+     * so the answer is the same to the bit, without five barrier rounds. */
+    uint span = width >> 1u;
+    uint stop = (flags & 8u) != 0u ? 16u : 0u;
+    for (; span > stop; span >>= 1u) {
         if (slot < span) scratch[lid] = nr_combine(scratch[lid], scratch[lid + span], op, skip_nan);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (slot == 0u && seg < segments) dst[seg * chunks + chunk] = scratch[lid];
+    float folded = scratch[lid];
+    for (; span > 0u; span >>= 1u) {
+        float other = simd_shuffle_down(folded, ushort(span));
+        if (slot < span) folded = nr_combine(folded, other, op, skip_nan);
+    }
+    if (slot == 0u && seg < segments) dst[seg * chunks + chunk] = folded;
 }
 
 /* argmin and argmax, in the same width/chunk shape as the fold.
@@ -543,12 +557,170 @@ kernel void nr_scan_apply(device float* dst [[buffer(0)]],
     int at = doff + int(k) * dstep;
     dst[at] = nr_combine(partials[seg * chunks + chunk], dst[at], op, 0u);
 }
+
+/* `nr_scan_chunk` for a dense last axis of at most SCAN_ROW_MAX, with the
+ * row staged in threadgroup memory.
+ *
+ * The arithmetic is the one-chunk scan's, step for step: thread `lid` folds
+ * slots [lid * each, lid * each + each) from the identity, the same ladder
+ * turns the 256 totals into bases, and each slot is its base folded with the
+ * thread's earlier slots. So the answer is the same to the bit, for every op.
+ * What changes is the memory: the row comes in and goes out with neighbouring
+ * threads on neighbouring addresses, where the chunk kernel had each thread
+ * stride through its own run of device memory twice and walk `meta` for its
+ * offsets. The tile is skewed by one slot in every sixteen so the runs of a
+ * simdgroup fall in different banks. */
+constexpr constant uint SCAN_ROW_MAX = 4096u;
+
+inline uint nr_skew(uint slot) { return slot + (slot >> 4u); }
+
+/* The ladder both row scans share: the 256 run totals scanned inclusive in
+ * threadgroup memory, handing each thread the total of the runs before its
+ * own. The same Hillis-Steele steps as `nr_scan_chunk`. */
+inline float nr_scan_ladder(float mine, threadgroup float* scratch, uint lid, uint op, float ident) {
+    scratch[lid] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint reach = 1u; reach < ND_GROUP; reach <<= 1u) {
+        float other = lid >= reach ? scratch[lid - reach] : ident;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scratch[lid] = nr_combine(scratch[lid], other, op, 0u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return lid == 0u ? ident : scratch[lid - 1u];
+}
+
+/* `nr_scan_rows` with each thread's run held in registers rather than a
+ * tile, for a row whose runs are EACH slots of whole float4s: n a multiple of
+ * four and EACH = ceil(n / 256) one of 4, 8 or 16. A thread's run is then
+ * EACH / 4 aligned float4s that a simdgroup reads as one contiguous span, so
+ * the row needs no staging at all and the group no 17 KB tile. The folds and
+ * the ladder are the tile kernel's, step for step. */
+template <uint EACH>
+inline void nr_scan_held(device float* dst, device const float* src, uint n, uint op,
+                         uint src_base, uint seg, uint lid, threadgroup float* scratch) {
+    uint from = min(n, lid * EACH);
+    uint to = min(n, from + EACH);
+    device const float4* in = (device const float4*)(src + src_base + seg * n + from);
+    device float4* out = (device float4*)(dst + seg * n + from);
+    float r[EACH];
+    for (uint q = 0u; q < EACH / 4u; q++) {
+        float4 x = from + q * 4u < to ? in[q] : float4(0.0f);
+        r[q * 4u] = x.x;
+        r[q * 4u + 1u] = x.y;
+        r[q * 4u + 2u] = x.z;
+        r[q * 4u + 3u] = x.w;
+    }
+    float ident = nr_identity(op, 0u);
+    float mine = ident;
+    for (uint k = 0u; k < EACH; k++) {
+        if (from + k < to) mine = nr_combine(mine, r[k], op, 0u);
+    }
+    float running = nr_scan_ladder(mine, scratch, lid, op, ident);
+    for (uint k = 0u; k < EACH; k++) {
+        if (from + k < to) {
+            running = nr_combine(running, r[k], op, 0u);
+            r[k] = running;
+        }
+    }
+    for (uint q = 0u; q < EACH / 4u; q++) {
+        if (from + q * 4u < to) out[q] = float4(r[q * 4u], r[q * 4u + 1u], r[q * 4u + 2u], r[q * 4u + 3u]);
+    }
+}
+
+kernel void nr_scan_held4(device float* dst [[buffer(0)]],
+                             device const float* src [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             constant uint& op [[buffer(3)]],
+                             constant uint& src_base [[buffer(4)]],
+                             uint seg [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[ND_GROUP];
+    nr_scan_held<4u>(dst, src, n, op, src_base, seg, lid, scratch);
+}
+kernel void nr_scan_held8(device float* dst [[buffer(0)]],
+                             device const float* src [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             constant uint& op [[buffer(3)]],
+                             constant uint& src_base [[buffer(4)]],
+                             uint seg [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[ND_GROUP];
+    nr_scan_held<8u>(dst, src, n, op, src_base, seg, lid, scratch);
+}
+kernel void nr_scan_held16(device float* dst [[buffer(0)]],
+                             device const float* src [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             constant uint& op [[buffer(3)]],
+                             constant uint& src_base [[buffer(4)]],
+                             uint seg [[threadgroup_position_in_grid]],
+                             uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[ND_GROUP];
+    nr_scan_held<16u>(dst, src, n, op, src_base, seg, lid, scratch);
+}
+
+kernel void nr_scan_rows(device float* dst [[buffer(0)]],
+                         device const float* src [[buffer(1)]],
+                         constant uint& n [[buffer(2)]],
+                         constant uint& op [[buffer(3)]],
+                         constant uint& src_base [[buffer(4)]],
+                         uint seg [[threadgroup_position_in_grid]],
+                         uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float tile[SCAN_ROW_MAX + SCAN_ROW_MAX / 16u];
+    threadgroup float scratch[ND_GROUP];
+    device const float* row = src + src_base + seg * n;
+    for (uint slot = lid; slot < n; slot += ND_GROUP) tile[nr_skew(slot)] = row[slot];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint each = (n + ND_GROUP - 1u) / ND_GROUP;
+    uint from = min(n, lid * each);
+    uint to = min(n, from + each);
+    float ident = nr_identity(op, 0u);
+    float mine = ident;
+    for (uint k = from; k < to; k++) mine = nr_combine(mine, tile[nr_skew(k)], op, 0u);
+
+    scratch[lid] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint reach = 1u; reach < ND_GROUP; reach <<= 1u) {
+        float other = lid >= reach ? scratch[lid - reach] : ident;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scratch[lid] = nr_combine(scratch[lid], other, op, 0u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float running = lid == 0u ? ident : scratch[lid - 1u];
+    for (uint k = from; k < to; k++) {
+        running = nr_combine(running, tile[nr_skew(k)], op, 0u);
+        tile[nr_skew(k)] = running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* out = dst + seg * n;
+    for (uint slot = lid; slot < n; slot += ND_GROUP) out[slot] = tile[nr_skew(slot)];
+}
 """
 
 #: Groups a chunked fold or scan aims for. 1024 fills every Apple GPU this
 #: runs on, and it is also the most partials the single finish dispatch wants
 #: to walk — the two bounds want the same number, so there is one constant.
 const _TARGET_GROUPS = 1024
+
+#: `JAINUM_NARROW_FINISH=0` keeps a chunked fold's finish at a full group a
+#: segment, for an A/B. The answers are the same to the bit. Read once.
+let _NARROW_FINISH = env_or("JAINUM_NARROW_FINISH", "1") != "0"
+
+#: `JAINUM_SHUFFLE_TREE=0` keeps the last five rounds of a fold's tree in
+#: threadgroup memory instead of simd shuffles, for an A/B. Bit-identical.
+#: Read once.
+let _SHUFFLE_TREE = env_or("JAINUM_SHUFFLE_TREE", "1") != "0"
+
+#: The longest dense row `nr_scan_rows` stages in threadgroup memory.
+const _SCAN_ROW_MAX = 4096
+
+#: The shortest run a thread of `nr_scan_rows` must own before staging a row
+#: beats the chunk kernel.
+const _SCAN_TILE_RUN = 6
+
+#: `JAINUM_ROW_SCAN=0` keeps a dense last-axis scan on the strided chunk
+#: kernel, for an A/B. The answers are the same to the bit. Read once.
+let _ROW_SCAN = env_or("JAINUM_ROW_SCAN", "1") != "0"
 
 #: Elements below which splitting a segment across groups costs more in
 #: launches and partials than it wins in parallelism.
@@ -857,28 +1029,17 @@ fn _fold_into(
     #: read-only allocation already resident for this dispatch.
     let gate = center ?? a.storage
     let fold = kernel_of(SOURCE, "nr_fold")
-    if plan.chunks == 1 {
-        fold.dispatch_async(
-            [dst, a.storage, gate, plan.meta],
-            plan.groups() * GROUP,
-            [plan.segments, plan.n, op, skip_nan, plan.flags, a.offset, plan.per, 1, plan.width],
-            GROUP
-        )
-        return
-    }
-    let partials = Buffer(plan.segments * plan.chunks)
-    let flat = _flat_meta(plan.chunks, 1)
-    defer { partials.free() }
-    defer { flat.free() }
+    let target = if plan.chunks == 1 { dst } else { Buffer(plan.segments * plan.chunks) }
+    let tree = if _SHUFFLE_TREE { 8 } else { 0 }
     fold.dispatch_async(
-        [partials, a.storage, gate, plan.meta],
+        [target, a.storage, gate, plan.meta],
         plan.groups() * GROUP,
         [
             plan.segments,
             plan.n,
             op,
             skip_nan,
-            plan.flags,
+            plan.flags | tree,
             a.offset,
             plan.per,
             plan.chunks,
@@ -886,10 +1047,28 @@ fn _fold_into(
         ],
         GROUP
     )
+    if plan.chunks == 1 { return }
+    let partials = target
+    let flat = _flat_meta(plan.chunks, 1)
+    defer { partials.free() }
+    defer { flat.free() }
+    #: The finish folds `chunks` partials a segment. A width of the next power
+    #: of two at or above that runs the same tree as a width of GROUP: the
+    #: lanes past `chunks` hold the identity, and folding the identity into a
+    #: partial that already started from it changes no bit. So the narrow
+    #: width is the same answer from a quarter of the groups or fewer. It
+    #: stops at GROUP: `_chunks_for` allows up to `_TARGET_GROUPS` chunks, and
+    #: past GROUP of them each lane already walks several, as before.
+    var width = GROUP
+    if _NARROW_FINISH {
+        width = 1
+        while width < plan.chunks and width < GROUP { width *= 2 }
+    }
+    let each = GROUP // width
     fold.dispatch_async(
         [dst, partials, partials, flat],
-        plan.segments * GROUP,
-        [plan.segments, plan.chunks, _finish_op(op), skip_nan, 3, 0, plan.chunks, 1, GROUP],
+        (plan.segments + each - 1) // each * GROUP,
+        [plan.segments, plan.chunks, _finish_op(op), skip_nan, 3 | tree, 0, plan.chunks, 1, width],
         GROUP
     )
 }
@@ -1304,6 +1483,24 @@ fn _scan(a: NDArray, axis: any, dtype: int, op: int, what: str) -> NDArray {
     if chunks > 1 {
         per = (n + chunks - 1) // chunks
         chunks = (n + per - 1) // per
+    }
+    let dense_rows = at == source.ndim() - 1 and source.is_contiguous()
+    let each = (n + GROUP - 1) // GROUP
+    let held = n % 4 == 0 and source.offset % 4 == 0 and (each == 4 or each == 8 or each == 16)
+    #: The staged tile pays a pass through threadgroup memory both ways, and
+    #: with runs of five slots or fewer that costs more than the chunk kernel's
+    #: strided walk: 8000 rows of 257 to 1100 ran 1.2-2.3x slower on it. From
+    #: runs of six it wins, 1.16x at 1500 and 2.8x at 4095.
+    let staged = each >= _SCAN_TILE_RUN
+    if _ROW_SCAN and chunks == 1 and n <= _SCAN_ROW_MAX and dense_rows and (held or staged) {
+        let entry = if held { f"nr_scan_held{each}" } else { "nr_scan_rows" }
+        kernel_of(SOURCE, entry).dispatch_async(
+            [out.storage, source.storage],
+            segments * GROUP,
+            [n, op, source.offset],
+            GROUP
+        )
+        return out
     }
     let partials = Buffer(segments * chunks)
     defer { partials.free() }

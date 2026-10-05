@@ -581,6 +581,115 @@ fn test_a_scan_with_no_axis_runs_down_the_flattening() -> void {
     assert_eq(cumsum(window, 0).to_list(), [6.0, 7.0, 16.0, 18.0], "a scan reads the view")
 }
 
+#: Folding down the columns of a wide dense matrix runs one lane a column and
+#: joins the row chunks in a narrowed finish. Each column is checked on its
+#: own against the host, for folds whose accumulators differ: a sum, a max and
+#: a centred variance, whose centre is per column. Small whole numbers keep
+#: every sum exact, and the second matrix starts a row in so the walk sees an
+#: offset.
+fn test_a_fold_down_wide_columns_is_each_columns_fold() -> void {
+    if not have_gpu() { return }
+    let rows = 900
+    let cols = 1024
+    var values = [0.0 for _at in 0..(rows + 1) * cols]
+    for at in 0..values.len() { values[at] = float(at * 13 % 7) - 3.0 }
+    let whole = holding([rows + 1, cols], values)
+    defer { whole.free() }
+    for start in [0, 1] {
+        let view = whole.view([rows, cols], [cols, 1], start * cols)
+        let sums = sum(view, 0).to_list()
+        let peaks = amax(view, 0).to_list()
+        let spread = variance(view, 0).to_list()
+        var wrong = 0
+        for column in 0..cols {
+            var total = 0.0
+            var high = -1000.0
+            for row in 0..rows {
+                let value = values[(row + start) * cols + column]
+                total += value
+                if value > high { high = value }
+            }
+            if sums[column] != total { wrong += 1 }
+            if peaks[column] != high { wrong += 1 }
+            let mean_value = total / float(rows)
+            var squares = 0.0
+            for row in 0..rows {
+                let gap = values[(row + start) * cols + column] - mean_value
+                squares += gap * gap
+            }
+            if spread[column] - squares / float(rows) > 1.0e-3 { wrong += 1 }
+            if squares / float(rows) - spread[column] > 1.0e-3 { wrong += 1 }
+        }
+        assert_eq(wrong, 0, f"columns from row {start}")
+    }
+}
+
+#: Shapes whose fold splits into more chunks than one group has lanes: the
+#: finish then walks several partials a lane. A flat run past 257 * 2048
+#: elements and a tall matrix folded down its columns both get there. Small
+#: whole numbers keep every partial exact, so the host's total is the device's.
+fn test_a_fold_with_more_chunks_than_lanes_still_finishes() -> void {
+    if not have_gpu() { return }
+    let count = 600000
+    var values = [0.0 for _at in 0..count]
+    for at in 0..count { values[at] = float(at % 7) - 3.0 }
+    let flat = holding([count], values)
+    defer { flat.free() }
+    var total = 0.0
+    for value in values { total += value }
+    assert_eq(sum(flat).to_list()[0], total, "a flat sum")
+    assert_eq(amax(flat).to_list()[0], 3.0, "a flat maximum")
+    assert_near(mean(flat).to_list()[0], total / float(count), 1.0e-9, "a flat mean")
+
+    let rows = 20000
+    let cols = 256
+    var grid = [0.0 for _at in 0..rows * cols]
+    for at in 0..grid.len() { grid[at] = float(at * 13 % 5) - 2.0 }
+    let tall = holding([rows, cols], grid)
+    defer { tall.free() }
+    let sums = sum(tall, 0).to_list()
+    var wrong = 0
+    for column in 0..cols {
+        var down = 0.0
+        for row in 0..rows { down += grid[row * cols + column] }
+        if sums[column] != down { wrong += 1 }
+    }
+    assert_eq(wrong, 0, f"{rows} rows of {cols} folded down the columns")
+}
+
+#: Enough rows that each is one group, which is where a dense last axis is
+#: held in registers or staged in threadgroup memory: short widths left to the
+#: chunk kernel, held widths, staged widths that do not fill the 256 threads
+#: evenly, and a view that starts a row in, so both have to honour the source
+#: offset. Small whole numbers keep the
+#: running sums exact, so the host's left-to-right answer is the device's.
+fn test_a_scan_of_many_dense_rows_is_each_rows_running_fold() -> void {
+    if not have_gpu() { return }
+    for width in [17, 257, 1000, 1500, 2000, 3001, 4096] {
+        let rows = 1100
+        var values = [0.0 for _at in 0..(rows + 1) * width]
+        for at in 0..values.len() { values[at] = float(at * 7 % 11) - 5.0 }
+        let whole = holding([rows + 1, width], values)
+        defer { whole.free() }
+        let tail = whole.view([rows, width], [width, 1], width)
+        let sums = cumsum(tail, axis: 1).to_list()
+        let peaks = cummax(tail, axis: 1).to_list()
+        var wrong = 0
+        for row in 0..rows {
+            var total = 0.0
+            var high = -1000.0
+            for column in 0..width {
+                let value = values[(row + 1) * width + column]
+                total += value
+                if value > high { high = value }
+                if sums[row * width + column] != total { wrong += 1 }
+                if peaks[row * width + column] != high { wrong += 1 }
+            }
+        }
+        assert_eq(wrong, 0, f"{rows} rows of {width}")
+    }
+}
+
 fn test_a_long_scan_joins_its_chunks() -> void {
     if not have_gpu() { return }
     let count = 200000

@@ -7,10 +7,100 @@ from .dtype import BOOL, CAST_BOOL, CAST_NONE, CAST_ROUND, COMPLEX64, FLOAT32
 from .dtype import GROUP, INT32, OP_ADD, OP_DIV, OP_MUL, OP_SUB
 from .dtype import dtype_is_bool, dtype_is_complex, dtype_is_integer, dtype_lanes
 from .dtype import dtype_max, dtype_min, dtype_name, promote
-from .metal import SOURCE, kernel_of, require_device
+from .metal import PRELUDE, SOURCE, kernel_of, require_device
+from std.os import env_or
 from .shape import broadcast_shapes, broadcast_strides, contiguous_strides
 from .shape import element_count, is_contiguous, normalize_axis
 from .slicing import ELLIPSIS, IndexToken, Slice, _sign
+
+#: Two copy and arithmetic shapes the general kernels serve slowly, each
+#: behind a switch read once and on unless set to 0, for an A/B in one binary.
+#: `JAINUM_TILE_TRANSPOSE`: a 2-d copy that swaps its axes goes through 32x32
+#: tiles in threadgroup memory instead of the strided walk.
+let _TILE_TRANSPOSE = env_or("JAINUM_TILE_TRANSPOSE", "1") != "0"
+#: `JAINUM_BINARY4`: a dense or row-repeating real binary op takes four
+#: elements a thread, one wrap divide per four.
+let _BINARY4 = env_or("JAINUM_BINARY4", "1") != "0"
+
+let _LOCAL = PRELUDE + """
+
+/* A 2-d copy whose source reads down its columns: the transpose of a dense
+ * matrix, or any view whose second-to-last axis has unit stride. The strided
+ * walk reads such a source one cache line per element; here a group reads a
+ * 32x32 tile with neighbouring threads on neighbouring source addresses,
+ * turns it over in threadgroup memory, and writes it with neighbouring
+ * threads on neighbouring destination addresses. The extra column of the
+ * tile puts a tile column's 32 slots in 32 banks. Edges past `rows` or `cols`
+ * are skipped on both sides, so no shape has to be a multiple of 32.
+ *
+ * Every element goes through the same `nd_convert` the walk applies, so the
+ * copy is the walk's to the bit. */
+kernel void nd_transpose_tile(device float* dst [[buffer(0)]],
+                              device const float* src [[buffer(1)]],
+                              constant uint& rows [[buffer(2)]],
+                              constant uint& cols [[buffer(3)]],
+                              constant uint& src_base [[buffer(4)]],
+                              constant uint& col_step [[buffer(5)]],
+                              constant uint& tiles_across [[buffer(6)]],
+                              constant uint& mode [[buffer(7)]],
+                              constant uint& low_bits [[buffer(8)]],
+                              constant uint& high_bits [[buffer(9)]],
+                              uint tile_id [[threadgroup_position_in_grid]],
+                              uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float tile[32][33];
+    uint down = tile_id / tiles_across;
+    uint across = tile_id - down * tiles_across;
+    uint row0 = down * 32u;
+    uint col0 = across * 32u;
+    uint x = lid & 31u;
+    uint y = lid >> 5u;
+    int step = int(col_step);
+    for (uint k = 0u; k < 32u; k += 8u) {
+        uint r = row0 + x;
+        uint c = col0 + y + k;
+        if (r < rows && c < cols) tile[y + k][x] = src[int(src_base) + int(r) + int(c) * step];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float low = as_type<float>(low_bits);
+    float high = as_type<float>(high_bits);
+    for (uint k = 0u; k < 32u; k += 8u) {
+        uint r = row0 + y + k;
+        uint c = col0 + x;
+        if (r < rows && c < cols) dst[r * cols + c] = nd_convert(tile[x][y + k], mode, low, high);
+    }
+}
+
+/* `nd_binary` four real elements a thread. The wrap divide is paid once per
+ * four, and the host only takes this road when every wrap divides by four, so
+ * a float4 never straddles a seam. Each lane is the scalar kernel's
+ * `nd_apply` and `nd_convert`, so the answer is the same to the bit. */
+kernel void nd_binary4(device float* dst [[buffer(0)]],
+                       device const float* a [[buffer(1)]],
+                       device const float* b [[buffer(2)]],
+                       constant uint& quads [[buffer(3)]],
+                       constant uint& op [[buffer(4)]],
+                       constant uint& mode [[buffer(5)]],
+                       constant uint& low_bits [[buffer(6)]],
+                       constant uint& high_bits [[buffer(7)]],
+                       constant uint& a_wrap [[buffer(8)]],
+                       constant uint& b_wrap [[buffer(9)]],
+                       uint id [[thread_position_in_grid]]) {
+    if (id >= quads) return;
+    uint at = id * 4u;
+    uint ai = a_wrap == 0u ? at : at - (at / a_wrap) * a_wrap;
+    uint bi = b_wrap == 0u ? at : at - (at / b_wrap) * b_wrap;
+    float4 x = *((device const float4*)(a + ai));
+    float4 y = *((device const float4*)(b + bi));
+    float low = as_type<float>(low_bits);
+    float high = as_type<float>(high_bits);
+    float4 out;
+    out.x = nd_convert(nd_apply(x.x, y.x, op), mode, low, high);
+    out.y = nd_convert(nd_apply(x.y, y.y, op), mode, low, high);
+    out.z = nd_convert(nd_apply(x.z, y.z, op), mode, low, high);
+    out.w = nd_convert(nd_apply(x.w, y.w, op), mode, low, high);
+    *((device float4*)(dst + at)) = out;
+}
+"""
 
 #: Reject a complex array at the door of a kernel that has no lanes.
 #:
@@ -557,6 +647,19 @@ pub fn copy_into(dst: NDArray, src: NDArray) -> void {
         )
         return
     }
+    if _TILE_TRANSPOSE and _reads_down_columns(dst, source) {
+        let rows = dst.shape[0]
+        let cols = dst.shape[1]
+        let across = (cols + 31) // 32
+        let tiles = (rows + 31) // 32 * across
+        kernel_of(_LOCAL, "nd_transpose_tile").dispatch_async(
+            [dst.storage, source.storage],
+            tiles * 256,
+            [rows, cols, source.offset, source.strides[1] & 0xFFFFFFFF, across, mode, low, high],
+            group_size: 256
+        )
+        return
+    }
     let meta = layout_buffer([dst, source])
     defer { meta.free() }
     kernel_of(SOURCE, "nd_copy_strided").dispatch_async(
@@ -564,6 +667,17 @@ pub fn copy_into(dst: NDArray, src: NDArray) -> void {
         count,
         [count, lanes, source.lanes(), mode, low, high]
     )
+}
+
+#: Whether a copy into `dst` is a dense 2-d destination over a real source
+#: whose rows step by one slot, which is what a transposed matrix is. The
+#: column stride may be anything, negative included, but the source must not
+#: be dense already (that is `nd_copy`'s) and must not broadcast a row.
+fn _reads_down_columns(dst: NDArray, source: NDArray) -> bool {
+    if dst.ndim() != 2 or dst.offset != 0 or not dst.is_contiguous() { return false }
+    if dst.lanes() != 1 or source.lanes() != 1 { return false }
+    if source.strides[0] != 1 or source.strides[1] == 0 { return false }
+    return dst.shape[0] > 1 and dst.shape[1] > 1
 }
 
 #: Set every element of `a` to `value`, or only those where `mask` is non-zero.
@@ -688,6 +802,15 @@ fn _binary_arrays(left: NDArray, right: NDArray, op: int) -> NDArray {
     #: operands whether one of them merely repeats.
     let a_wrap = _wrap_of(left, a.shape)
     let b_wrap = _wrap_of(right, a.shape)
+    let quarters = lanes == 1 and count % 4 == 0 and a_wrap % 4 == 0 and b_wrap % 4 == 0
+    if _BINARY4 and quarters and a_wrap >= 0 and b_wrap >= 0 {
+        kernel_of(_LOCAL, "nd_binary4").dispatch_async(
+            [out.storage, left.storage, right.storage],
+            count // 4,
+            [count // 4, op, mode, low, high, a_wrap, b_wrap]
+        )
+        return out
+    }
     if a_wrap >= 0 and b_wrap >= 0 {
         kernel_of(SOURCE, "nd_binary").dispatch_async(
             [out.storage, left.storage, right.storage],

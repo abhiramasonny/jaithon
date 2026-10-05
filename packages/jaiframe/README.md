@@ -67,3 +67,21 @@ aggregation vocabulary, the four containers, and the primitives — `take`,
 dispatches through. Nothing outside it reads a lane directly, because which
 lanes exist depends on the dtype and on whether the column has ever held a
 null.
+
+## Switches
+
+Fast paths that have an older path beside them, kept one environment variable
+away so a change can be measured as an A/B in one binary. Each is read once,
+when its module loads, and is on unless set to `0`. The answers are
+bit-identical either way; only the time changes.
+
+| Switch | Off restores |
+| --- | --- |
+| `JAIFRAME_RADIX_SCAN` | the single-threadgroup offsets pass on every radix sort, instead of a three-dispatch scan once a sort spans 128 blocks |
+| `JAIFRAME_RADIX_VOTE` | the per-thread walk of the tile for a scatter rank, instead of simdgroup ballots |
+| `JAIFRAME_FOLD_NULLS` | a radix pass of its own for a float key's null lane, instead of folding it into the value pass |
+| `JAIFRAME_DEVICE_TOTAL` | a download of the scan total on every bit of a join's radix order |
+| `JAIFRAME_JOIN_DIGITS` | a one-bit-a-pass radix order for a join's bucket and pair lanes, instead of the frame sort's eight-bit passes |
+| `JAIFRAME_SHARED_FOLDS` | one threadgroup fold, with its own eleven barriers, per column statistic, instead of folding them side by side through one set; bit-identical |
+| `JAIFRAME_LEAN_STATS` | a second read of every column (extremes, first and last rows) for a frame sum, mean, product, count, variance or deviation, which only use the moments |
+| `JAIFRAME_HEADS_SURVIVE` | flagging the duplicates and compacting the rest for `drop_duplicates(keep: "first")`, instead of taking the group heads the hash table already listed |

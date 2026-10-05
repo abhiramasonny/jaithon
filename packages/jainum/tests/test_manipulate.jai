@@ -157,6 +157,32 @@ fn test_transpose_permutes_by_definition() -> void {
     assert_throws(ValueError, || transpose(a, [0, 0, 1]), "and covers each one once")
 }
 
+#: Copying a turned matrix goes through 32x32 tiles, so the shapes that matter
+#: are the ones that leave a partial tile on an edge, and a source whose
+#: column stride runs backwards. Each copy is checked element by element.
+fn test_a_transposed_copy_is_the_transpose_at_every_edge() -> void {
+    if not have_gpu() { return }
+    for shape in [[33, 65], [32, 32], [100, 3], [3, 100], [1, 40]] {
+        let a = ramp(shape)
+        defer { a.free() }
+        let copied = transpose(a).copy()
+        defer { copied.free() }
+        assert_eq(
+            copied.to_list(),
+            mapped([shape[1], shape[0]], shape, |index| [index[1], index[0]])
+        )
+    }
+    let a = ramp([40, 37])
+    defer { a.free() }
+    let backwards = flip(transpose(a), axis: 1)
+    let copied = backwards.copy()
+    defer { copied.free() }
+    assert_eq(copied.to_list(), mapped([37, 40], [40, 37], |index| [39 - index[1], index[0]]))
+    let counted = transpose(a).astype(INT32)
+    defer { counted.free() }
+    assert_eq(counted.to_list(), mapped([37, 40], [40, 37], |index| [index[1], index[0]]))
+}
+
 fn test_swapaxes_moveaxis_and_rollaxis_are_the_permutations_they_name() -> void {
     if not have_gpu() { return }
     let a = ramp([2, 3, 4])

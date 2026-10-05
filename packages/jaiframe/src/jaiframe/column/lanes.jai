@@ -1,6 +1,7 @@
 #: The shader library and the untyped float32 lanes a column is built out of.
 import std.gpu as gpu
 from std.gpu import Buffer, Kernel
+from std.os import env_or
 
 #: The largest number of rows a column may hold.
 #:
@@ -67,10 +68,11 @@ inline uint hash_combine(uint accumulated, uint incoming) {
 /* -0.0 hashes as 0.0 and every NaN hashes alike, so a key column groups the
  * way a reader expects rather than the way the bit pattern happens to fall. */
 inline uint hash_slot(float value) {
-    float v = value;
-    if (v == 0.0f) v = 0.0f;
-    if (isnan(v)) return fmix32(0x7FC00000u);
-    return fmix32(as_type<uint>(v));
+    if (isnan(value)) return fmix32(0x7FC00000u);
+    /* On the bits, because fast math drops signed zeros: a float compare
+     * against 0.0 is folded away and -0.0 hashed apart from 0.0. */
+    uint bits = as_type<uint>(value);
+    return fmix32((bits << 1) == 0u ? 0u : bits);
 }
 
 kernel void col_iota(device float* out [[buffer(0)]],
@@ -459,6 +461,23 @@ pub fn prefix_sum(flags: Buffer, length: int) -> (Buffer, int) {
     cached_kernel("col_scan_total").dispatch_async([offsets, flags], 1, [length], group_size: 1)
     return (offsets, int(offsets.download(length, 1)[0]))
 }
+
+#: `prefix_sum` for a caller that never reads the total on the host.
+#:
+#: The total is still written into the last slot, on the device, where a
+#: scatter that puts the clear rows after the set ones reads it. What goes is
+#: the download, which is a full device wait: a radix order over a join's keys
+#: calls this once a bit, and paid one round trip a bit for a number it
+#: dropped. `JAIFRAME_DEVICE_TOTAL=0` restores the download, for an A/B.
+pub fn scan_offsets(flags: Buffer, length: int) -> Buffer {
+    if not _DEVICE_TOTAL { return prefix_sum(flags, length)[0] }
+    let offsets = scan_exclusive(flags, length)
+    if length == 0 { return offsets }
+    cached_kernel("col_scan_total").dispatch_async([offsets, flags], 1, [length], group_size: 1)
+    return offsets
+}
+
+let _DEVICE_TOTAL = env_or("JAIFRAME_DEVICE_TOTAL", "1") != "0"
 
 #: The scan without the total.
 #:

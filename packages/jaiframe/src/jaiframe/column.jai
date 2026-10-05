@@ -39,14 +39,14 @@
 #: ```
 from .column.lanes import MAX_ROWS, MISSING_POSITION, WIDE_LIMIT, WIDE_SCALE
 from .column.lanes import cached_kernel, f32_bits, iota, positions_buffer
-from .column.lanes import prefix_sum, wide_pack, wide_unpack
+from .column.lanes import prefix_sum, scan_offsets, wide_pack, wide_unpack
 from .column.types import Agg, Dtype, NA, Value
 from .column.store import Column
 from .column.combine import concat_columns, unify_levels
 from .column.frame import DataFrame, Index, Series
 
 export { MAX_ROWS, MISSING_POSITION, WIDE_LIMIT, WIDE_SCALE }
-export { cached_kernel, f32_bits, iota, positions_buffer, prefix_sum }
+export { cached_kernel, f32_bits, iota, positions_buffer, prefix_sum, scan_offsets }
 export { wide_pack, wide_unpack }
 export { Dtype, Value, NA, Agg }
 export { Column, concat_columns, unify_levels }

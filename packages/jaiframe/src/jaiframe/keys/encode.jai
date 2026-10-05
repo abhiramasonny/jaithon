@@ -5,6 +5,23 @@ from ..column import Column, Dtype
 from ..column import iota
 from .lanes import RADIX_BITS, RADIX_GROUP, RADIX_SIZE
 from .lanes import bits_for, flag, kernel_for, require_device, u32
+from std.os import env_or
+
+#: Fast paths of the radix sort, each on unless its switch is set to 0, and
+#: each read once. They exist so the old path stays one environment variable
+#: away for an A/B in one binary; the answers are bit-identical either way.
+#: `JAIFRAME_RADIX_SCAN`: the three-dispatch offsets scan for a long sort.
+let _PARALLEL_OFFSETS = env_or("JAIFRAME_RADIX_SCAN", "1") != "0"
+#: `JAIFRAME_RADIX_VOTE`: the scatter's rank from simdgroup votes.
+let _VOTE_RANK = env_or("JAIFRAME_RADIX_VOTE", "1") != "0"
+#: `JAIFRAME_FOLD_NULLS`: a float key's null lane folded into its value pass.
+let _FOLD_NULLS = env_or("JAIFRAME_FOLD_NULLS", "1") != "0"
+
+#: Below this many blocks of 256 rows the single-group offsets kernel wins:
+#: its two walks are short and the scan's three dispatches are not free. At
+#: twenty blocks (a group-by's 5000 uniques) the parallel scan cost groupby-sum
+#: a fifth of its time; at 7813 (two million rows) it is 38x faster.
+let PARALLEL_OFFSETS_BLOCKS = 128
 
 #: The key columns of a frame turned into digits: one packed lane of uint32 per
 #: level of the key, most significant first.
@@ -30,6 +47,10 @@ pub class KeyEncoding {
     pub var owners: list[int]
     #: Which lanes are a column's missing flag rather than its value.
     pub var null_lanes: list[bool]
+    #: Which lanes hold `order_bits` of a float, whose present digits never
+    #: reach 0 or all ones. `order` folds the null lane in front of one of
+    #: these into its value pass instead of sorting the null lane on its own.
+    pub var float_lanes: list[bool]
     #: How many key columns went in.
     pub var columns: int
     #: 1.0 where any key column is missing, `null` when none of them can be.
@@ -43,6 +64,7 @@ pub class KeyEncoding {
         self.widths = []
         self.owners = []
         self.null_lanes = []
+        self.float_lanes = []
         self.columns = 0
         self.missing = null
         self.freed = false
@@ -91,64 +113,44 @@ pub class KeyEncoding {
             throw ValueError(f"na_position must be first or last, not {na_position}")
         }
         let ups = spread_flags(ascending, self.columns)
-        var forward = iota(self.length)
+        let forward = iota(self.length)
         if self.length == 0 { return forward }
 
-        let blocks = (self.length + RADIX_GROUP - 1) // RADIX_GROUP
-        var keys = Buffer(self.length)
-        var spare_keys = Buffer(self.length)
-        var spare = Buffer(self.length)
-        let counts = Buffer(blocks * RADIX_SIZE)
+        let sorter = RadixSort(Buffer(self.length), forward, self.length)
 
         var lane = self.lane_count() - 1
         while lane >= 0 {
             let width = self.widths[lane]
             let mask = (1 << width) - 1
-            let invert = if self.null_lanes[lane] {
-                na_position == "first"
+            let invert = not ups[self.owners[lane]]
+            let folds = _FOLD_NULLS and lane > 0 and self.folds_null(lane)
+            if folds {
+                let absent_digit = if na_position == "first" { 0 } else { mask }
+                kernel_for("key_lane_gather_folded").dispatch_async(
+                    [self.packed, sorter.order, sorter.keys],
+                    self.length,
+                    [
+                        self.length,
+                        lane * self.length,
+                        (lane - 1) * self.length,
+                        flag(invert),
+                        absent_digit,
+                    ]
+                )
             } else {
-                not ups[self.owners[lane]]
+                let flips = if self.null_lanes[lane] { na_position == "first" } else { invert }
+                kernel_for("key_lane_gather").dispatch_async(
+                    [self.packed, sorter.order, sorter.keys],
+                    self.length,
+                    [self.length, lane * self.length, mask, flag(flips)]
+                )
             }
-            kernel_for("key_lane_gather").dispatch_async(
-                [self.packed, forward, keys],
-                self.length,
-                [self.length, lane * self.length, mask, flag(invert)]
-            )
-            var shift = 0
-            while shift < width {
-                kernel_for("key_radix_histogram").dispatch_async(
-                    [keys, counts],
-                    blocks * RADIX_GROUP,
-                    [self.length, shift],
-                    group_size: RADIX_GROUP
-                )
-                kernel_for("key_radix_offsets").dispatch_async(
-                    [counts],
-                    RADIX_GROUP,
-                    [blocks],
-                    group_size: RADIX_GROUP
-                )
-                kernel_for("key_radix_scatter").dispatch_async(
-                    [keys, forward, spare_keys, spare, counts],
-                    blocks * RADIX_GROUP,
-                    [self.length, shift],
-                    group_size: RADIX_GROUP
-                )
-                let swapped_keys = keys
-                keys = spare_keys
-                spare_keys = swapped_keys
-                let swapped = forward
-                forward = spare
-                spare = swapped
-                shift += RADIX_BITS
-            }
-            lane -= 1
+            sorter.sort_bits(width)
+            lane -= if folds { 2 } else { 1 }
         }
-        keys.free()
-        spare_keys.free()
-        spare.free()
-        counts.free()
-        return forward
+        sorter.keys.free()
+        sorter.free_spares()
+        return sorter.order
     }
 
     #: 1.0 where a row starts a run of equal keys along `positions`.
@@ -182,6 +184,7 @@ pub class KeyEncoding {
         out.widths = [width for width in self.widths]
         out.owners = [owner for owner in self.owners]
         out.null_lanes = [is_null for is_null in self.null_lanes]
+        out.float_lanes = [is_float for is_float in self.float_lanes]
         out.packed = Buffer(self.lane_count() * count)
         let absent = self.missing
         if absent is not null {
@@ -214,8 +217,114 @@ pub class KeyEncoding {
         if absent is not null { absent.free() }
     }
 
+    #: Whether `lane` is a float value lane right behind its own column's
+    #: null lane, so one pass of `key_lane_gather_folded` can sort both.
+    fn folds_null(self, lane: int) -> bool {
+        if not self.float_lanes[lane] or not self.null_lanes[lane - 1] { return false }
+        return self.owners[lane - 1] == self.owners[lane]
+    }
+
     fn check_live(self) -> void {
         if self.freed { throw RuntimeError("this KeyEncoding has already been released") }
+    }
+}
+
+#: A stable LSD radix sort of a uint key lane carrying a positions lane, in
+#: digits of RADIX_BITS, with the scratch it needs held between calls.
+#:
+#: `keys` and `order` are the live pair; each pass scatters them into the
+#: spares and swaps, so after `sort_bits` they hold the sorted keys and the
+#: permutation that sorted them. The caller owns those two; `free_spares`
+#: releases the rest. A multi-key sort fills `keys` again between calls and
+#: relies on each pass being stable, as `KeyEncoding.order` does.
+pub class RadixSort {
+    pub var keys: Buffer
+    pub var order: Buffer
+    var spare_keys: Buffer
+    var spare: Buffer
+    var counts: Buffer
+    var partial: Buffer
+    var length: int
+    var blocks: int
+    var per: int
+    var parts: int
+    var parallel: bool
+
+    pub fn init(self, keys: Buffer, order: Buffer, length: int) {
+        self.keys = keys
+        self.order = order
+        self.length = length
+        self.blocks = (length + RADIX_GROUP - 1) // RADIX_GROUP
+        self.spare_keys = Buffer(length)
+        self.spare = Buffer(length)
+        self.counts = Buffer(self.blocks * RADIX_SIZE)
+        self.parallel = _PARALLEL_OFFSETS and self.blocks >= PARALLEL_OFFSETS_BLOCKS
+        self.per = (self.blocks + RADIX_SIZE - 1) // RADIX_SIZE
+        self.parts = if self.per > 0 { (self.blocks + self.per - 1) // self.per } else { 0 }
+        self.partial = Buffer(if self.parallel { self.parts * RADIX_SIZE } else { 0 })
+    }
+
+    #: Sort by the low `width` bits of every key, stably. Bits above `width`
+    #: must be zero: a digit is read whole, so they would sort too.
+    pub fn sort_bits(self, width: int) -> void {
+        let entry = if _VOTE_RANK { "key_radix_scatter_vote" } else { "key_radix_scatter" }
+        let scatter = kernel_for(entry)
+        var shift = 0
+        while shift < width {
+            kernel_for("key_radix_histogram").dispatch_async(
+                [self.keys, self.counts],
+                self.blocks * RADIX_GROUP,
+                [self.length, shift],
+                group_size: RADIX_GROUP
+            )
+            if self.parallel {
+                kernel_for("key_offsets_partial").dispatch_async(
+                    [self.counts, self.partial],
+                    self.parts * RADIX_SIZE,
+                    [self.blocks, self.per],
+                    group_size: RADIX_SIZE
+                )
+                kernel_for("key_offsets_scan").dispatch_async(
+                    [self.partial],
+                    RADIX_SIZE,
+                    [self.parts],
+                    group_size: RADIX_SIZE
+                )
+                kernel_for("key_offsets_apply").dispatch_async(
+                    [self.counts, self.partial],
+                    self.parts * RADIX_SIZE,
+                    [self.blocks, self.per],
+                    group_size: RADIX_SIZE
+                )
+            } else {
+                kernel_for("key_radix_offsets").dispatch_async(
+                    [self.counts],
+                    RADIX_GROUP,
+                    [self.blocks],
+                    group_size: RADIX_GROUP
+                )
+            }
+            scatter.dispatch_async(
+                [self.keys, self.order, self.spare_keys, self.spare, self.counts],
+                self.blocks * RADIX_GROUP,
+                [self.length, shift],
+                group_size: RADIX_GROUP
+            )
+            let swapped_keys = self.keys
+            self.keys = self.spare_keys
+            self.spare_keys = swapped_keys
+            let swapped = self.order
+            self.order = self.spare
+            self.spare = swapped
+            shift += RADIX_BITS
+        }
+    }
+
+    pub fn free_spares(self) -> void {
+        self.spare_keys.free()
+        self.spare.free()
+        self.counts.free()
+        self.partial.free()
     }
 }
 
@@ -247,23 +356,28 @@ pub fn encode_keys(columns: list[Column]) -> KeyEncoding {
     var widths: list[int] = []
     var owners: list[int] = []
     var null_lanes: list[bool] = []
+    var float_lanes: list[bool] = []
     var any_nullable = false
     for (at, column) in columns.enumerate() {
         if nullable(column) {
             widths.push(1)
             owners.push(at)
             null_lanes.push(true)
+            float_lanes.push(false)
             any_nullable = true
         }
+        let plain = holds_float_bits(column)
         for width in value_widths(column) {
             widths.push(width)
             owners.push(at)
             null_lanes.push(false)
+            float_lanes.push(plain)
         }
     }
     encoding.widths = widths
     encoding.owners = owners
     encoding.null_lanes = null_lanes
+    encoding.float_lanes = float_lanes
     encoding.packed = Buffer(widths.len() * length)
 
     var absent: Buffer? = null
@@ -345,6 +459,13 @@ pub fn hash_keys(columns: list[Column], seed: int = 0) -> Buffer {
 #: is one bit, so the cost of being wrong the safe way is a single radix pass.
 fn nullable(column: Column) -> bool {
     return column.has_validity() or column.dtype == Dtype.Float64
+}
+
+#: Whether the column's value lane is `order_bits` of its floats, which is
+#: what `key_encode_plain` writes for everything but a bool.
+fn holds_float_bits(column: Column) -> bool {
+    if column.dtype.is_wide() or column.dtype.is_dictionary() { return false }
+    return column.dtype != Dtype.Bool
 }
 
 fn value_widths(column: Column) -> list[int] {

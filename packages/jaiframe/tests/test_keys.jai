@@ -894,3 +894,114 @@ fn test_binning_a_column_with_nothing_in_it() -> void {
     defer { counted.free() }
     assert_eq(counted.values.to_ints(), [0, 0, 0])
 }
+
+#: -0.0 and 0.0 are one key. The shader library runs with fast math, which
+#: folds a float compare against zero away, so the encoding used to keep the
+#: sign bit: the two sorted apart and factorized into two groups.
+fn test_negative_zero_is_the_same_key_as_zero() -> void {
+    if not gpu.is_available() { return }
+    let column = Column.from_floats([0.0, -0.0, 1.0, -0.0, 0.0])
+    defer { column.free() }
+    let found = factorize([column])
+    defer { found[0].free() }
+    defer { for part in found[1] { part.free() } }
+    assert_eq(found[2], 2)
+    assert_eq(found[0].download(), [0.0, 0.0, 1.0, 0.0, 0.0])
+    let order = argsort([column])
+    defer { order.free() }
+    assert_eq(order.download(), [0.0, 1.0, 3.0, 4.0, 2.0])
+}
+
+#: The host's answer for a float key: missing rows at the `first_missing` end,
+#: present rows by value (down when `descending`), ties in row order.
+fn reference_order(values: list[float], descending: bool, first_missing: bool) -> list[int] {
+    let count = float(values.len())
+    let missing_end = if first_missing { -1.0e12 } else { 1.0e12 }
+    let sign = if descending { -1.0 } else { 1.0 }
+    var rows: list[int] = []
+    var ranks: list[float] = []
+    for (row, value) in values.enumerate() {
+        rows.push(row)
+        if is_nan(value) {
+            ranks.push(missing_end + float(row))
+            continue
+        }
+        let clamped = max(-1000.0, min(1000.0, value * sign))
+        ranks.push(clamped * 4.0 * count + float(row))
+    }
+    return rows.sort(key: |row| ranks[row])
+}
+
+#: A float key is a null lane in front of a value lane, and the sort folds the
+#: null lane into the value pass instead of spending a radix pass on it. That
+#: fold is only right if a missing row lands at the absolute end pandas puts
+#: it, in arrival order, without tying a present row -- including the extremes
+#: (-inf, inf) and -0.0 against 0.0, which have to tie with each other. 70000
+#: rows is past the size where the offsets scan switches to three dispatches,
+#: so the long path is checked against the host as well.
+fn test_a_float_key_with_missing_rows_matches_the_host_order() -> void {
+    if not gpu.is_available() { return }
+    let raw = scattered(70000, 203, 29)
+    var values: list[float] = []
+    for step in raw {
+        if step == 0 {
+            values.push(NAN)
+        } elif step == 1 {
+            values.push(-1e308 * 10.0)
+        } elif step == 2 {
+            values.push(1e308 * 10.0)
+        } elif step == 3 {
+            values.push(-0.0)
+        } else {
+            values.push(float(step - 100) * 0.5)
+        }
+    }
+    let column = Column.from_floats(values)
+    defer { column.free() }
+    for descending in [false, true] {
+        for first_missing in [false, true] {
+            let end = if first_missing { "first" } else { "last" }
+            let order = argsort([column], [not descending], na_position: end)
+            let read = order.download()
+            order.free()
+            let expected = reference_order(values, descending, first_missing)
+            var differs = 0
+            for at in 0..expected.len() {
+                if int(read[at]) != expected[at] { differs += 1 }
+            }
+            assert_eq(differs, 0)
+        }
+    }
+}
+
+#: The fold in the middle of a multi-key sort: the float key is the minor one,
+#: so its folded pass runs first and the major key's pass has to keep it.
+fn test_a_minor_float_key_with_missing_rows_keeps_its_place() -> void {
+    if not gpu.is_available() { return }
+    let major = scattered(40000, 5, 31)
+    let minor = scattered(40000, 50, 37)
+    var values: list[float] = []
+    for step in minor { values.push(if step < 4 { NAN } else { float(step) }) }
+    let first = Column.from_ints(major)
+    defer { first.free() }
+    let second = Column.from_floats(values)
+    defer { second.free() }
+    let order = argsort([first, second], [true, false])
+    defer { order.free() }
+    let read = order.download()
+    var rows: list[int] = []
+    for at in 0..40000 { rows.push(at) }
+    var ranks: list[float] = []
+    for row in 0..40000 {
+        let missing = is_nan(values[row])
+        let tail = if missing { 0.0 } else { 100.0 - values[row] }
+        let flag = if missing { 1.0 } else { 0.0 }
+        ranks.push(float(major[row]) * 1.0e10 + flag * 1.0e9 + tail * 1.0e6 + float(row))
+    }
+    let expected = rows.sort(key: |row| ranks[row])
+    var differs = 0
+    for at in 0..40000 {
+        if int(read[at]) != expected[at] { differs += 1 }
+    }
+    assert_eq(differs, 0)
+}

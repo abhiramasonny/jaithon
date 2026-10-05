@@ -254,6 +254,45 @@ fn test_a_strided_view_sorts_by_value_and_not_by_slot() -> void {
     }
 }
 
+#: Many short rows on the device. The one-dispatch row sort packs several rows
+#: into a threadgroup, and the last stage of each row's network is the row's
+#: own width -- so a direction read off the slot in the group rather than the
+#: slot in the row turns every odd row over. Every row is checked, not the
+#: first, in both directions, values and stable permutation both.
+fn test_every_row_of_a_many_row_sort_is_sorted() -> void {
+    if not have_gpu() { return }
+    for width in [3, 7, 64, 256, 1000] {
+        let rows = HOST_SORT_LIMIT // width + 33
+        let data = noise(rows * width, 13, 99)
+        let a = uploaded([rows, width], data)
+        defer { a.free() }
+        for descending in [false, true] {
+            let ordered = sort(a, axis: 1, descending: descending)
+            let order = argsort(a, axis: 1, descending: descending)
+            let got = ordered.to_list()
+            let places = order.to_list()
+            ordered.free()
+            order.free()
+            var wrong = 0
+            for r in 0..rows {
+                let base = r * width
+                let row = data.slice(base, base + width)
+                #: `sort` orders the list in place, so it gets a copy of its own.
+                let want = data.slice(base, base + width).sort()
+                for c in 0..width {
+                    let expect = if descending { want[width - 1 - c] } else { want[c] }
+                    if got[base + c] != expect { wrong += 1 }
+                    if row[int(places[base + c])] != expect { wrong += 1 }
+                    if c > 0 and got[base + c] == got[base + c - 1] {
+                        if places[base + c] < places[base + c - 1] { wrong += 1 }
+                    }
+                }
+            }
+            assert_eq(wrong, 0, f"{rows} rows of {width}, descending {descending}")
+        }
+    }
+}
+
 fn test_the_host_and_device_paths_agree() -> void {
     if not have_gpu() { return }
 

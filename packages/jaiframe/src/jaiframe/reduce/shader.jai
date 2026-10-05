@@ -3,7 +3,16 @@
 #: One translation unit, so the reduction, scan and window kernels share the
 #: same inline helpers and the same constants, and `kernel_for` compiles it
 #: once whichever entry point is asked for first.
-pub let SOURCE = """#include <metal_stdlib>
+from std.os import env_or
+
+#: `JAIFRAME_SHARED_FOLDS=0` folds each of a column's statistics through its
+#: own run of barriers, for an A/B against folding them side by side. The
+#: trees are the same either way, so are the answers. Read once.
+let _SHARED_FOLDS = env_or("JAIFRAME_SHARED_FOLDS", "1") != "0"
+
+let _DEFINES = if _SHARED_FOLDS { "#define SHARED_FOLDS 1\n" } else { "" }
+
+pub let SOURCE = _DEFINES + """#include <metal_stdlib>
 using namespace metal;
 
 constexpr constant uint RGROUP = 256;
@@ -95,6 +104,33 @@ inline float fold_group(float value, threadgroup float* scratch, uint lid, uint 
     float total = scratch[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return total;
+}
+
+/* `fold_group` over N values side by side: each value runs exactly the tree
+ * its own call would, so each answer is the same to the bit, and the eleven
+ * barriers of a fold are paid once for all N rather than once each. `scratch`
+ * holds N * RGROUP floats. */
+template <uint N>
+inline void fold_group_many(thread float* values, thread const uint* ops,
+                            threadgroup float* scratch, uint lid) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0u; i < N; ++i) scratch[i * RGROUP + lid] = values[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = RGROUP / 2u; stride > 0u; stride >>= 1) {
+        if (lid < stride) {
+            for (uint i = 0u; i < N; ++i) {
+                uint at = i * RGROUP + lid;
+                float other = scratch[at + stride];
+                if (ops[i] == 0u) scratch[at] += other;
+                else if (ops[i] == 1u) scratch[at] *= other;
+                else if (ops[i] == 2u) scratch[at] = min(scratch[at], other);
+                else scratch[at] = max(scratch[at], other);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0u; i < N; ++i) values[i] = scratch[i * RGROUP];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 /* A value and the row it was found at, folded together.
@@ -280,6 +316,19 @@ kernel void red_moments(device const float* values [[buffer(0)]],
             if (raw != 0.0f) truthy += 1.0f;
         }
     }
+#ifdef SHARED_FOLDS
+    threadgroup float shared[7u * RGROUP];
+    float folds[7] = {seen, s1, s2, s3, s4, product, truthy};
+    const uint ops[7] = {0u, 0u, 0u, 0u, 0u, 1u, 0u};
+    fold_group_many<7u>(folds, ops, shared, lid);
+    seen = folds[0];
+    s1 = folds[1];
+    s2 = folds[2];
+    s3 = folds[3];
+    s4 = folds[4];
+    product = folds[5];
+    truthy = folds[6];
+#else
     seen = fold_group(seen, scratch, lid, 0u);
     s1 = fold_group(s1, scratch, lid, 0u);
     s2 = fold_group(s2, scratch, lid, 0u);
@@ -287,6 +336,7 @@ kernel void red_moments(device const float* values [[buffer(0)]],
     s4 = fold_group(s4, scratch, lid, 0u);
     product = fold_group(product, scratch, lid, 1u);
     truthy = fold_group(truthy, scratch, lid, 0u);
+#endif
     if (lid != 0u) return;
     uint base = (slot * RGROUPS + wid) * STATS;
     partials[base + 0u] = seen;
@@ -396,9 +446,19 @@ kernel void red_extrema(device const float* values [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     fold_extreme(lows, low_at, lid, 0u);
     fold_extreme(highs, high_at, lid, 1u);
+#ifdef SHARED_FOLDS
+    threadgroup float shared[3u * RGROUP];
+    float folds[3] = {first_present, last_present, first_missing};
+    const uint ops[3] = {2u, 3u, 2u};
+    fold_group_many<3u>(folds, ops, shared, lid);
+    first_present = folds[0];
+    last_present = folds[1];
+    first_missing = folds[2];
+#else
     first_present = fold_group(first_present, scratch, lid, 2u);
     last_present = fold_group(last_present, scratch, lid, 3u);
     first_missing = fold_group(first_missing, scratch, lid, 2u);
+#endif
     if (lid != 0u) return;
     uint base = (slot * RGROUPS + wid) * STATS;
     partials[base + 0u] = low_at[0] < 0.0f ? 0.0f : lows[0];
