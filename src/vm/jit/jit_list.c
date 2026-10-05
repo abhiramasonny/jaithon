@@ -719,16 +719,30 @@ int closHoistFor(const Emit *e, int slot, uint32_t at, const ObjFunction *fn) {
  * Compiled code has no OP_SET_UPVALUE arm and an inlined body admits none,
  * so with no call nothing can write the cell while the loop runs. A cell can
  * still be OPEN -- a live frame's stack slot -- and the one frame that could
- * write such a slot without a call is this one, which only owns a captured
- * slot if its chunk makes a closure; then the upvalues stay per-site and only
- * the guard is hoisted. Upvalues are hoisted as scalars only, so a register
+ * write such a slot without a call is this one, through a local its chunk
+ * captures by reference; a loop that writes one keeps its upvalue reads
+ * per-site and hoists only the guard (loopWritesCapturedLocal). Upvalues are hoisted as scalars only, so a register
  * holds no reference the collector would have to see. */
-static bool chunkMakesClosures(const Chunk *c) {
+/* Whether any local of this chunk that a closure captures BY REFERENCE is
+ * written inside [lo, hi). Such a local is the one cell this frame can write
+ * without a call -- the loop tier keeps it in its frame slot for exactly that
+ * reason (chunkByRefCaptures in jit_osr.c) -- so a loop that writes one keeps
+ * every upvalue read per-site. True when the chunk cannot be decoded. */
+static bool loopWritesCapturedLocal(const Emit *e, const Chunk *c,
+                                    uint32_t lo, uint32_t hi) {
     for (int off = 0; off < c->count;) {
         int len = instructionLength(c, off);
         if (len <= 0) return true;
-        if (c->code[off] == OP_CLOSURE || c->code[off] == OP_CLOSE_UPVALUE) {
-            return true;
+        if (c->code[off] == OP_CLOSURE) {
+            for (int u = off + 4; u + 3 <= off + len; u += 3) {
+                uint8_t how = c->code[u];
+                if ((how & 1u) == 0 || (how & 2u) != 0) continue;
+                unsigned slot = jaiReadU16(c->code + u + 1);
+                if (slot > JIT_MAX_SLOTS) return true;
+                if (e->slotWriteHi[slot] >= lo && e->slotWriteLo[slot] < hi) {
+                    return true;
+                }
+            }
         }
         off += len;
     }
@@ -740,7 +754,6 @@ static void planClosureHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds,
     e->closHoistCount = 0;
     if (!jitClosureHoist() || e->noInline) return;
     const Chunk *c = &fn->chunk;
-    bool upOk = !chunkMakesClosures(c);
     for (unsigned i = 0; i < e->closSiteCount; i++) {
         if (e->closHoistCount >= JIT_MAX_CLOS_HOIST) return;
         unsigned s = e->closSite[i].slot;
@@ -783,6 +796,7 @@ static void planClosureHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds,
         e->closHoist[k].slot = (uint8_t)s;
         e->closHoist[k].fn = cfn;
         e->closHoist[k].upCount = 0;
+        bool upOk = !loopWritesCapturedLocal(e, c, bestTop, bestEnd);
         const Chunk *cc = &cfn->chunk;
         for (int o = 0; upOk && o < cc->count;) {
             int len = instructionLength(cc, o);

@@ -906,6 +906,17 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                     e.hoist[i].itemsReg, cnt, ver,
                     e.hoist[i].stgPin ? ", storage pinned" : "");
         }
+        for (unsigned i = 0; i < e.closHoistCount; i++) {
+            fprintf(stderr, "[jit] osr at %u proves slot %u's closure over "
+                    "%u..%u at the head, %u upvalue(s) in registers\n", top,
+                    e.closHoist[i].slot, e.closHoist[i].top,
+                    e.closHoist[i].end, e.closHoist[i].upCount);
+        }
+        for (unsigned i = 0; i < e.guardHoistCount; i++) {
+            fprintf(stderr, "[jit] osr at %u proves the globals guard over "
+                    "%u..%u at the head\n", top, e.guardHoist[i].top,
+                    e.guardHoist[i].end);
+        }
         for (unsigned i = 0; i < e.pushHoistCount; i++) {
             fprintf(stderr, "[jit] osr at %u keeps slot %u's push count over "
                     "%u..%u in x%u\n", top, e.pushHoist[i].slot,

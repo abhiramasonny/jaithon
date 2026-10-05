@@ -155,3 +155,19 @@ fn count_with(f: fn(int) -> int, start: int, times: int) -> int {
 fn test_a_fused_constant_body_in_a_compiled_loop() -> void {
     assert_eq(count_with(|x| x - 1, 0, 1000000), -1000000)
 }
+
+#: The cell is open and this frame owns it, but the loop never writes it, so
+#: its value is loaded once at the head; the write before the loop must be
+#: the one the loop sees.
+fn test_the_enclosing_frame_keeps_the_cell() -> void {
+    var step = 1
+    let f = |x| x + step
+    step += 2
+    var acc = 0
+    var i = 0
+    while i < 400000 {
+        acc = f(acc)
+        i += 1
+    }
+    assert_eq(acc, 1200000)
+}
