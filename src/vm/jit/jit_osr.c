@@ -786,6 +786,19 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                 e.pushOff[i]  = probe.pushOff[i];
                 e.pushSlot[i] = probe.pushSlot[i];
             }
+            memcpy(e.clobberAlloc, probe.clobberAlloc, sizeof e.clobberAlloc);
+            e.globalSiteCount = probe.globalSiteCount;
+            e.globalSiteSpill = probe.globalSiteSpill;
+            e.globalAccCount = probe.globalAccCount;
+            e.globalAccSpill = probe.globalAccSpill;
+            memcpy(e.globalAcc, probe.globalAcc, sizeof e.globalAcc);
+            memcpy(e.globalOff, probe.globalOff, sizeof e.globalOff);
+            if (e.globalsTable == NULL) {
+                e.globalsTable = probe.globalsTable;
+                e.globalsKeyVersion = probe.globalsKeyVersion;
+            }
+            e.closSiteCount = probe.closSiteCount;
+            memcpy(e.closSite, probe.closSite, sizeof e.closSite);
             e.stampCount = probe.stampCount;
             e.stampSpill = probe.stampSpill;
             for (unsigned i = 0; i < probe.stampCount; i++) {
@@ -920,6 +933,22 @@ static bool compileOsrOnce(ObjClosure *closure, uint32_t top, Value *slots,
                     top, e.hoist[i].slot, e.hoist[i].top, e.hoist[i].end,
                     e.hoist[i].itemsReg, cnt, ver,
                     e.hoist[i].stgPin ? ", storage pinned" : "");
+        }
+        for (unsigned i = 0; i < e.closHoistCount; i++) {
+            fprintf(stderr, "[jit] osr at %u proves slot %u's closure over "
+                    "%u..%u at the head, %u upvalue(s) in registers\n", top,
+                    e.closHoist[i].slot, e.closHoist[i].top,
+                    e.closHoist[i].end, e.closHoist[i].upCount);
+        }
+        for (unsigned i = 0; i < e.guardHoistCount; i++) {
+            fprintf(stderr, "[jit] osr at %u proves the globals guard over "
+                    "%u..%u at the head\n", top, e.guardHoist[i].top,
+                    e.guardHoist[i].end);
+        }
+        for (unsigned i = 0; i < e.tagProofCount; i++) {
+            fprintf(stderr, "[jit] osr at %u proves a global's tag over %u..%u%s\n",
+                    top, e.tagProof[i].top, e.tagProof[i].end,
+                    e.tagProof[i].reg ? " and keeps it in a register" : "");
         }
         for (unsigned i = 0; i < e.pushHoistCount; i++) {
             fprintf(stderr, "[jit] osr at %u keeps slot %u's push count over "

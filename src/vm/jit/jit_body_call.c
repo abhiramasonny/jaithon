@@ -15,6 +15,14 @@
 
 #if (defined(__aarch64__) || defined(__arm64__))
 
+/* Whether the instruction at `next` stores the top entry into a local and
+ * is reached only by falling into it. See Emit::inlBorrowResult. */
+static bool storeFollows(ObjFunction *fn, const uint8_t *code, int next) {
+    if (next >= fn->chunk.count) return false;
+    if (code[next] != OP_SET_LOCAL && code[next] != OP_BIND) return false;
+    return !offsetIsBranchTarget(&fn->chunk, (uint32_t)next);
+}
+
 bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
     int off = *offp;
     do {
@@ -30,9 +38,12 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             /* Cheapest first: a body small enough to stand where the call
              * is costs neither the frame nor the argument shuffle. */
             Value cvv = e->stackSeen[e->depth - argc - 1];
-            if (IS_CLOSURE(cvv) &&
-                inlineGlobalCall(e, fn, AS_CLOSURE(cvv), argc,
-                                 (uint32_t)off, -1)) {
+            e->inlBorrowResult = storeFollows(fn, code, off + 2);
+            bool inl = IS_CLOSURE(cvv) &&
+                       inlineGlobalCall(e, fn, AS_CLOSURE(cvv), argc,
+                                        (uint32_t)off, -1);
+            e->inlBorrowResult = false;
+            if (inl) {
                 off += 2;
                 break;
             }
@@ -193,20 +204,35 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             unsigned rCallee0 =
                 valueBankReg(e, cidx - (e->depth - e->valueDepth));
 
+            /* The local the closure was read out of, if it still holds it:
+             * a loop that never writes that local can prove the guard below,
+             * and the upvalues the body reads, once at its head. */
+            int cslot = (!e->inlining && stackLocalCurrent(e, cidx))
+                            ? e->stackLocal[cidx] : -1;
+            int ch = closHoistFor(e, cslot, (uint32_t)off, cfn);
+
             /* The guard comes first now, because what follows it is a
              * choice between two ways of making the call and both need it:
              * once this register is known to name `cfn`, the body behind
              * it is known too, and that is the whole licence to inline. */
-            emit(e, jaiA64LdrX(JIT_SCRATCH_A, rCallee0,
-                               (unsigned)offsetof(ObjClosure, fn)));
-            emitConstCmp(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
-            emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
-            branchOnDeopt(e, JAI_A64_NE);
+            if (ch < 0) {
+                emit(e, jaiA64LdrX(JIT_SCRATCH_A, rCallee0,
+                                   (unsigned)offsetof(ObjClosure, fn)));
+                emitConstCmp(e, JIT_SCRATCH_B, (int64_t)(uintptr_t)cfn);
+                emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+                branchOnDeopt(e, JAI_A64_NE);
+            }
 
             /* Cheapest first, as the direct call does it: a body small enough to stand where the call is costs
              * neither frame, argument shuffle, nor root fill. An indirect site needs NONE of the checks below to inline -- no argument kind has to match a specialisation, and the callee need not have compiled at all, since arguments stay in the caller's own registers with the caller's own kinds. */
-            if (inlineGlobalCall(e, fn, AS_CLOSURE(cv), argc,
-                                 (uint32_t)off, (int)rCallee0)) {
+            e->inlClosHoist = ch >= 0 ? (unsigned)ch + 1u : 0u;
+            e->inlBorrowResult = storeFollows(fn, code, off + 2);
+            bool inl = inlineGlobalCall(e, fn, AS_CLOSURE(cv), argc,
+                                        (uint32_t)off, (int)rCallee0);
+            e->inlClosHoist = 0;
+            e->inlBorrowResult = false;
+            if (inl) {
+                noteClosureSite(e, cslot, (uint32_t)off, AS_CLOSURE(cv));
                 off += 2;
                 break;
             }
@@ -522,6 +548,20 @@ bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
                   int count) {
     int off = *offp;
     do {
+        if (e->inlining) {
+            unsigned iargc = code[off + 1];
+            /* Inside an inlined body (inlinableBody admitted it as the
+             * closing construction) the result is the INLINE's: it stays on
+             * top, and the OP_RETURN after it ends the inline as any other
+             * does. Not a return, so an OSR loop may hold it. */
+            if (!isClassCallee(e, iargc) || !e->inlShared) {
+                e->whyNot = "an inlined tail call that is not a construction";
+                return false;
+            }
+            if (!emitCallOut(e, iargc)) return false;
+            off += 2;
+            break;
+        }
         /* Same OSR resume-offset hazard as OP_RETURN_NULL -- see there. */
         if (e->osr) {
             e->whyNot = "a return inside an OSR loop";
@@ -530,6 +570,7 @@ bool emitTailCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp,
         /* `return C(...)` compiles to this. The call is made exactly as
          * OP_CALL makes it and its result is returned. */
         unsigned argc = code[off + 1];
+
         if (isClassCallee(e, argc)) {
             if (!emitCallOut(e, argc)) return false;
         } else if (e->depth >= argc + 1u &&

@@ -67,6 +67,15 @@ static bool simpleInitFields(ObjClass *cls, unsigned argc, uint16_t *slots) {
     return off < n && c[off] == OP_RETURN_NULL;
 }
 
+/* Whether `cls(...)` with `argc` arguments is an allocation and stores into
+ * the new object's own fields, nothing more -- the construction an inlined
+ * body may end with (see inlinableBody). */
+bool jitSimpleInitClass(ObjClass *cls, unsigned argc) {
+    uint16_t slots[JIT_MAX_ARGS_OUT];
+    if (argc > JIT_MAX_ARGS_OUT) return false;
+    return simpleInitFields(cls, argc, slots);
+}
+
 /* JAITHON_JIT_INLINE_ALLOC=0 puts the call to jitInstanceAlloc back in place
  * of the inline page-space pop. */
 static bool jitInlineAllocOn(void) {
@@ -525,12 +534,25 @@ bool emitFieldRead(Emit *e, const JaiJitFieldRead *fr, Value nativeVal,
     return true;
 }
 
+static bool emitCallOutInner(Emit *e, unsigned argc);
+
+/* Says, for the clobbers it records, whether this construction can run
+ * Jaithon code: only the simple-init path cannot (see Emit::clobberAlloc). */
 bool emitCallOut(Emit *e, unsigned argc) {
+    bool was = e->allocOnlyCall;
+    e->allocOnlyCall = false;
+    bool ok = emitCallOutInner(e, argc);
+    e->allocOnlyCall = was;
+    return ok;
+}
+
+static bool emitCallOutInner(Emit *e, unsigned argc) {
     ObjClass *cls = e->stackClass[e->depth - argc - 1];
     if (cls == NULL) { e->whyNot = "callee class"; return false; }
 
     uint16_t fslots[JIT_MAX_ARGS_OUT];
     if (argc <= JIT_MAX_ARGS_OUT && simpleInitFields(cls, argc, fslots)) {
+        e->allocOnlyCall = true;
         unsigned first = e->depth - argc;
         SlotKind kinds[JIT_MAX_ARGS_OUT];
         unsigned regs[JIT_MAX_ARGS_OUT];
@@ -641,6 +663,9 @@ bool emitCallOut(Emit *e, unsigned argc) {
             e->code[skipSlow] =
                 jaiA64BCond(JAI_A64_NE, (int32_t)(e->count - skipSlow));
         }
+        /* Both slow paths called out; the inline pop did not, and jumps
+         * past this. */
+        emitPromotedReload(e);
         if (inl && skipInline < e->count && e->count <= JIT_MAX_INSTS)
             e->code[skipInline] = jaiA64B((int32_t)(e->count - skipInline));
         for (unsigned i = 0; i < argc; i++) {

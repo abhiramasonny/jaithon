@@ -458,6 +458,208 @@ static bool fpHomeWanted(const Emit *m, unsigned base, unsigned locals) {
 
 /* JAITHON_JIT_FN_HOIST: hoist loop-invariant list headers in the
  * function tier as well as the loop tier. */
+/* JAITHON_JIT_SHRINK_WRAP=1: see emitEarlyReturnArm. Default OFF. The arm
+ * wins 1.17-1.25x on fib, hanoi and `1 + tri(n-1) + tri(n-2)`, and loses
+ * 5-11% on grid paths, binomial, collatz and `tri(n-1) + tri(n-2) + 1`: the
+ * calls that build the frame take a branch at their first instruction, and
+ * which shapes pay for it more than the leaves save is not something the
+ * walk can see (moving the `+ 1` flips the sign). It is stable under
+ * padding, so it is not a layout artefact. Laying the arm out after the
+ * body instead made every result swing +/-11% with a 4-byte shift of the
+ * body. */
+static bool jitShrinkWrap(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SHRINK_WRAP");
+        cached = (v != NULL && v[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_SHRINK_SKIP=0 keeps the body's own copy of a shrink-wrapped
+ * test, so the fall-through compares twice. Default on. */
+static bool jitShrinkSkip(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SHRINK_SKIP");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* JAITHON_JIT_SHRINK_WIDE=0 keeps the early arm to int returns: no bool
+ * literal, no bare `return` of a void function. Default on. */
+static bool jitShrinkWide(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_SHRINK_WIDE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The argument register a parameter slot arrives in, when it is a plain int
+ * the body keeps no tag for; -1 otherwise. */
+static int earlyIntArg(const Emit *e, const Emit *body, unsigned slot,
+                       unsigned realArgs) {
+    if (slot < e->base || slot - e->base >= realArgs) return -1;
+    if (slot > JIT_MAX_SLOTS) return -1;
+    if (body->localKind[slot] != SLOT_INT) return -1;
+    if (e->dynamicLocal[slot] || e->nullableLocal[slot]) return -1;
+    return (int)(slot - e->base);
+}
+
+/* `if n < 2 { return n }` as the first statement: the commonest guard there
+ * is (563 of 3586 functions in lib/ open with one), and on a recursive
+ * function the arm that runs most. Compiled where the body is, it pays the
+ * whole prologue first -- the frame, the callee-saved stores, the stack-limit
+ * check, the argument moves -- and the epilogue after, thirteen of fib's
+ * seventeen instructions on a leaf call, for a compare and a move.
+ *
+ * So the compare is made on the incoming argument register, ahead of the
+ * frame, and the taken arm returns from there: `cmp; b.cond; mov; mov; ret`.
+ * The arm is self-contained by construction -- an int compare against a
+ * literal and a move of an int argument or literal, no guard, no deopt, no
+ * call, nothing that can raise -- which is what makes running it with no
+ * frame sound: every stub that assumes one (deopt, exception, overflow) is
+ * unreachable from it. The body still compiles the same test after the
+ * prologue, so nothing else about the function changes; the fall-through
+ * pays one extra compare. Recognised as a bytecode idiom at offset 0:
+ *   OP_JUMP_IF_CMP_LOCAL_K cmp, int param, int k, -> 13
+ *     or OP_GET_LOCAL nullable param; OP_NULL; OP_JUMP_IF_CMP_FALSE ==/!=, -> 12
+ *     or OP_GET_LOCAL2 int param, int param; OP_JUMP_IF_CMP_FALSE cmp
+ *   OP_GET_LOCAL int param | OP_INT v
+ *   OP_RETURN
+ * and only where the function returns a plain int, so the result convention
+ * is x0 = payload, x1 = 0 like every other return of the body. */
+/* The argument register of a parameter that holds an instance or null as
+ * the pointer or zero (SLOT_MAYBE_INST, and a nullable slot); -1 otherwise. */
+static int earlyNullableArg(const Emit *e, const Emit *body, unsigned slot,
+                            unsigned realArgs) {
+    if (slot < e->base || slot - e->base >= realArgs) return -1;
+    if (slot > JIT_MAX_SLOTS || e->dynamicLocal[slot]) return -1;
+    if (body->localKind[slot] != SLOT_MAYBE_INST) return -1;
+    return (int)(slot - e->base);
+}
+
+static bool emitEarlyReturnArm(Emit *e, const Emit *body, ObjFunction *fn,
+                               unsigned realArgs) {
+    if (!jitShrinkWrap() || e->osr || e->count != 0) return false;
+    if (e->dynamicReturn) return false;
+    const Chunk *c = &fn->chunk;
+    const uint8_t *p = c->code;
+    /* The test: a register, compared against an imm12 (`k`) or against
+     * zero for a null test, and the condition under which the arm runs. */
+    int rs = -1, rs2 = -1;   /* rs2: the second register of a two-local test */
+    int64_t k = 0;
+    unsigned cond = 0;
+    uint8_t cmp;
+    int ret;                 /* offset of the arm's value */
+    int rel;
+    if (c->count >= 11 && p[0] == OP_JUMP_IF_CMP_LOCAL_K) {
+        /* `if n < 2 { ... }`: OP_JUMP_IF_CMP_LOCAL_K cmp, slot, k, rel. */
+        cmp = p[1];
+        rel = (int)jaiReadI16(p + 7);
+        uint32_t ki = jaiReadU24(p + 4);
+        if (ki >= (uint32_t)c->constants.count) return false;
+        Value kv = c->constants.data[ki];
+        if (!IS_INT(kv) || AS_INT(kv) < 0 || AS_INT(kv) > 4095) return false;
+        k = AS_INT(kv);
+        rs = earlyIntArg(e, body, jaiReadU16(p + 2), realArgs);
+        ret = 9;
+    } else if (c->count >= 11 && p[0] == OP_GET_LOCAL2 &&
+               p[5] == OP_JUMP_IF_CMP_FALSE) {
+        /* `if lo >= hi { ... }`: two int parameters against each other. */
+        cmp = p[6];
+        rel = (int)jaiReadI16(p + 7);
+        rs = earlyIntArg(e, body, jaiReadU16(p + 1), realArgs);
+        rs2 = earlyIntArg(e, body, jaiReadU16(p + 3), realArgs);
+        if (rs2 < 0) return false;
+        ret = 9;
+    } else if (c->count >= 10 && p[0] == OP_GET_LOCAL && p[3] == OP_NULL &&
+               p[4] == OP_JUMP_IF_CMP_FALSE) {
+        /* `if node == null { ... }`: the pointer against zero. */
+        cmp = p[5];
+        if (cmp != OP_EQ && cmp != OP_NE) return false;
+        rel = (int)jaiReadI16(p + 6);
+        rs = earlyNullableArg(e, body, jaiReadU16(p + 1), realArgs);
+        ret = 8;
+    } else {
+        return false;
+    }
+    if (rs < 0) return false;
+    switch (cmp) {
+    case OP_LT: cond = JAI_A64_LT; break;
+    case OP_LE: cond = JAI_A64_LE; break;
+    case OP_GT: cond = JAI_A64_GT; break;
+    case OP_GE: cond = JAI_A64_GE; break;
+    case OP_EQ: cond = JAI_A64_EQ; break;
+    case OP_NE: cond = JAI_A64_NE; break;
+    default: return false;
+    }
+    /* The arm: what it returns, as the body's single return kind says
+     * every return does. */
+    int rt = -1;
+    int64_t lit = 0;
+    SlotKind rk;
+    unsigned armLen;
+    if (ret + 4 <= c->count && p[ret] == OP_GET_LOCAL &&
+        p[ret + 3] == OP_RETURN) {
+        rt = earlyIntArg(e, body, jaiReadU16(p + ret + 1), realArgs);
+        if (rt < 0) return false;
+        rk = SLOT_INT; armLen = 4;
+    } else if (ret + 4 <= c->count && p[ret] == OP_INT &&
+               p[ret + 3] == OP_RETURN) {
+        lit = jaiReadI16(p + ret + 1);
+        rk = SLOT_INT; armLen = 4;
+    } else if (jitShrinkWide() && ret + 2 <= c->count &&
+               (p[ret] == OP_TRUE || p[ret] == OP_FALSE) &&
+               p[ret + 1] == OP_RETURN) {
+        lit = p[ret] == OP_TRUE ? 1 : 0;
+        rk = SLOT_BOOL; armLen = 2;
+    } else if (jitShrinkWide() && ret + 1 <= c->count &&
+               p[ret] == OP_RETURN_NULL && (fn->flags & FN_INIT) == 0) {
+        rk = SLOT_NULL; armLen = 1;
+    } else if (jitShrinkWide() && ret + 2 <= c->count &&
+               p[ret] == OP_NULL && p[ret + 1] == OP_RETURN &&
+               body->returnKind == SLOT_MAYBE_INST) {
+        /* `return null` from a function returning an instance or null:
+         * the pointer-or-zero convention makes it x0 = 0. The body keeps
+         * its own copy of the test (walkFrom stays 0 below), so the return
+         * kind and shape are merged by the walk exactly as before. */
+        rk = SLOT_MAYBE_INST; armLen = 2;
+    } else {
+        return false;
+    }
+    if (body->returnKind != rk) return false;
+    uint32_t target = (uint32_t)ret + armLen;
+    if (ret + rel != (int)target || target >= (uint32_t)c->count) return false;
+    if (rs2 >= 0) emit(e, jaiA64SubsXReg(31, (unsigned)rs, (unsigned)rs2));
+    else emit(e, jaiA64SubsXImm(31, (unsigned)rs, (unsigned)k));
+    unsigned skip = e->count;
+    emit(e, jaiA64BCond(cond ^ 1u, 0));                /* patched below */
+    if (rt < 0) emitConst64(e, 0, lit);
+    else if (rt != 0) emit(e, jaiA64MovX(0, (unsigned)rt));
+    emit(e, jaiA64MovzX(1, 0, 0));
+    emit(e, jaiA64Ret());
+    if (e->failed || e->count > JIT_MAX_INSTS) return false;
+    e->code[skip] = jaiA64BCond(cond ^ 1u, (int32_t)(e->count - skip));
+    /* Every way into the body has now passed the test, so the walk starts at
+     * its target -- unless something else branches into the arm, in which
+     * case the body keeps its own copy and pays the compare again. The
+     * return the walk no longer reaches is merged here, as it would have
+     * been there. */
+    bool entered = false;
+    for (uint32_t at = 0; at < target; at++) {
+        if (offsetIsBranchTarget(c, at)) entered = true;
+    }
+    if (!entered && jitShrinkSkip() && rk != SLOT_MAYBE_INST &&
+        mergeReturnKind(e, rk, 0)) {
+        e->walkFrom = target;
+    }
+    return true;
+}
+
 static bool jitFnHoist(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -1052,6 +1254,16 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         return false;
     }
 
+    /* An early-return arm tested on the argument registers, before the frame
+     * exists. See emitEarlyReturnArm. */
+    {
+        unsigned early = e.usesUpvalues ? argCount - 1u : argCount;
+        if (emitEarlyReturnArm(&e, &body, fn, early) && getenv("JAI_JIT_WHY")) {
+            fprintf(stderr, "[jit] %s returns early before its frame\n",
+                    jitFnLabel(fn));
+        }
+    }
+
     /* Prologue. */
     emitFrameEnter(&e);
     emitSaveRestore(&e, true);
@@ -1211,6 +1423,22 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         for (unsigned i = 0; i < body.clobberCount; i++) {
             e.clobberOff[i] = body.clobberOff[i];
         }
+        memcpy(e.clobberAlloc, body.clobberAlloc, sizeof e.clobberAlloc);
+        e.globalSiteCount = body.globalSiteCount;
+        e.globalSiteSpill = body.globalSiteSpill;
+        e.globalAccCount = body.globalAccCount;
+        e.globalAccSpill = body.globalAccSpill;
+        memcpy(e.globalAcc, body.globalAcc, sizeof e.globalAcc);
+        memcpy(e.globalOff, body.globalOff, sizeof e.globalOff);
+        /* The table the guards will name, so the head can name it before
+         * the walk reaches the first access. Both passes resolve the same
+         * names against the same table, so the walk agrees. */
+        if (e.globalsTable == NULL) {
+            e.globalsTable = body.globalsTable;
+            e.globalsKeyVersion = body.globalsKeyVersion;
+        }
+        e.closSiteCount = body.closSiteCount;
+        memcpy(e.closSite, body.closSite, sizeof e.closSite);
         e.hoistPoolCount = 0;
         for (unsigned r = 0; r < JIT_FREE_COUNT; r++) {
             e.hoistPool[e.hoistPoolCount++] = (uint8_t)(JIT_FREE_FIRST + r);
@@ -1237,6 +1465,23 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
                 fprintf(stderr, "[jit] %s keeps the iterator index of %u..%u "
                         "in x%u\n", jitFnLabel(fn), e.iterHoist[i].top,
                         e.iterHoist[i].end, e.iterHoist[i].reg);
+            }
+            for (unsigned i = 0; i < e.guardHoistCount; i++) {
+                fprintf(stderr, "[jit] %s proves the globals guard over "
+                        "%u..%u at the head\n", jitFnLabel(fn),
+                        e.guardHoist[i].top, e.guardHoist[i].end);
+            }
+            for (unsigned i = 0; i < e.tagProofCount; i++) {
+                fprintf(stderr, "[jit] %s proves a global's tag over %u..%u%s\n",
+                        jitFnLabel(fn), e.tagProof[i].top, e.tagProof[i].end,
+                        e.tagProof[i].reg ? " and keeps it in a register" : "");
+            }
+            for (unsigned i = 0; i < e.closHoistCount; i++) {
+                fprintf(stderr, "[jit] %s proves slot %u's closure over "
+                        "%u..%u at the head, %u upvalue(s) in registers\n",
+                        jitFnLabel(fn), e.closHoist[i].slot,
+                        e.closHoist[i].top, e.closHoist[i].end,
+                        e.closHoist[i].upCount);
             }
         }
     }

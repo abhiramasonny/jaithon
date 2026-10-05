@@ -73,6 +73,18 @@ typedef struct { int64_t value; int64_t bailed; } JitResult;
 /* A hoisted header is proved distinct from at most this many append targets
  * at the hoist; a loop appending to more lists hoists nothing. */
 #define JIT_MAX_HOIST_ALIAS 4u
+/* Indirect call sites whose closure the measuring pass inlined, and the
+ * closure hoists planned from them (see planClosureHoists). Each hoist keeps
+ * at most JIT_MAX_CLOS_UP of the callee's upvalues in registers. */
+#define JIT_MAX_CLOS_SITES 8u
+#define JIT_MAX_CLOS_HOIST 2u
+#define JIT_MAX_CLOS_UP    2u
+/* Module-global accesses the measuring pass records, and the loops whose
+ * keyVersion guard is proved once at the head (see planGuardHoists). */
+#define JIT_MAX_GLOBAL_SITES 64u
+#define JIT_MAX_GUARD_HOIST   4u
+#define JIT_MAX_GLOBAL_ACC   64u
+#define JIT_MAX_TAG_PROOF     8u
 #define JIT_PUSH_UNKNOWN (-1)
 #define JIT_PUSH_FRESH   (-2)
 /* Distinct offsets the `match` arms may branch to across a discarded OP_POP
@@ -515,8 +527,52 @@ typedef struct {
      * which answers "yes, everywhere" -- the whole-body answer, so running out
      * of room costs a hoist and never a wrong one. */
     uint32_t  clobberOff[JIT_MAX_CLOBBER];
+    /* The site is an instance allocation of a class with a simple init
+     * (emitCallOut's whole path): it may collect, but runs no Jaithon code
+     * and so cannot add, remove or rehash a module global. */
+    bool      clobberAlloc[JIT_MAX_CLOBBER];
+    bool      allocOnlyCall;
     unsigned  clobberCount;
     bool      clobberSpill;
+    /* Where the measuring pass emitted a module-globals keyVersion guard. */
+    uint32_t  globalOff[JIT_MAX_GLOBAL_SITES];
+    unsigned  globalSiteCount;
+    bool      globalSiteSpill;
+    /* JAITHON_JIT_GLOBAL_GUARD_HOIST: loops whose every globals guard is
+     * proved once at the head instead. See planGuardHoists. */
+    struct { uint32_t top, end; } guardHoist[JIT_MAX_GUARD_HOIST];
+    unsigned  guardHoistCount;
+    /* Every scalar module-global read and write the measuring pass emitted:
+     * where, which entry, of what kind. Overflow only costs proofs. */
+    struct {
+        uint32_t  off;
+        JaiEntry *slot;
+        uint8_t   kind;
+        bool      write;
+    } globalAcc[JIT_MAX_GLOBAL_ACC];
+    unsigned  globalAccCount;
+    bool      globalAccSpill;
+    /* JAITHON_JIT_GLOBAL_TAG_PROOF: a global whose every access inside a
+     * guard-hoisted loop is of one scalar kind has that tag checked once at
+     * the head; reads skip their tag check, writes their old-tag check and
+     * tag store. See planTagProofs. */
+    struct {
+        uint32_t  top, end;
+        JaiEntry *slot;
+        uint8_t   kind;
+        /* JAITHON_JIT_GLOBAL_PROMOTE: over a loop that calls nothing, the
+         * global's value also lives in this hoist register (0: it does not).
+         * Loaded at the head, read as a borrow, and written THROUGH: every
+         * store still goes to the entry, so a deopt or an exit finds memory
+         * current and nothing is ever written back. */
+        uint8_t   reg;
+        /* The loop allocates (an allocation-only call, Emit::clobberAlloc):
+         * `reg` is one of x13..x17, which the inline allocation never names,
+         * and each allocation's slow path reloads it from the entry after
+         * its call (emitPromotedReload). */
+        bool      allocs;
+    } tagProof[JIT_MAX_TAG_PROOF];
+    unsigned  tagProofCount;
     /* Every list append the body makes, when the grow stub keeps the
      * registers (jitGrowKeeps): such an append is no longer a clobber, so
      * regionCalls stops seeing it -- but it still moves ONE list's `items`
@@ -677,6 +733,48 @@ typedef struct {
         bool     live;
     } iterHoist[2];
     unsigned  iterHoistCount;
+    /* Indirect call sites where the measuring pass inlined a closure read
+     * straight out of a local: the call's offset, the local, and the sample
+     * closure the inline was made against. Overflow only costs hoists. */
+    struct {
+        uint32_t off;
+        uint8_t  slot;
+        ObjClosure *sample;
+    } closSite[JIT_MAX_CLOS_SITES];
+    unsigned  closSiteCount;
+    /* JAITHON_JIT_CLOSURE_HOIST: over a loop that calls nothing and never
+     * writes the local, an inlined closure's function guard is proved once
+     * at the loop head, and the scalar upvalues its body reads are loaded
+     * there into registers. A closure's `fn` never changes, and with no call
+     * and no OP_SET_UPVALUE in compiled code nothing can write the cell while
+     * the loop runs. See planClosureHoists. */
+    struct {
+        uint32_t top, end;
+        uint8_t  slot;
+        ObjFunction *fn;
+        uint8_t  upCount;
+        uint8_t  upIdx[JIT_MAX_CLOS_UP];
+        uint8_t  upReg[JIT_MAX_CLOS_UP];
+        uint8_t  upKind[JIT_MAX_CLOS_UP];
+    } closHoist[JIT_MAX_CLOS_HOIST];
+    unsigned  closHoistCount;
+    /* 1 + the closure hoist covering the call being inlined, 0 for none;
+     * read by emitGetUpvalue while `inlining`. */
+    unsigned  inlClosHoist;
+    /* The caller stores an inlined call's result straight into a local (the
+     * next instruction is OP_SET_LOCAL or OP_BIND, and nothing branches to
+     * it), so the result may stay a borrow of the inlined bank's register
+     * for that one instruction instead of being copied into the caller's. */
+    bool      inlBorrowResult;
+    /* The function tier's walk starts here instead of at offset 0: the code
+     * before it is an early-return arm already compiled ahead of the frame
+     * (emitEarlyReturnArm), whose test the entry has therefore passed. */
+    uint32_t  walkFrom;
+    /* The body being inlined ends by constructing an instance, which calls
+     * out to allocate: its entries continue the caller's callee-saved bank
+     * (and count towards its save set) instead of taking x0..x8, which the
+     * allocator's slow path destroys. See inlinableBody. */
+    bool      inlShared;
     uint8_t   hoistPool[JIT_FREE_COUNT + JIT_SCRATCH_BANK_COUNT];
     unsigned  hoistPoolCount;
     unsigned  hoistTaken;
@@ -1295,6 +1393,15 @@ void emitListHeader(Emit *e, unsigned rList, unsigned rItems,
 int hoistFor(const Emit *e, int slot);
 int pushHoistFor(const Emit *e, int slot);
 int iterHoistAt(const Emit *e, uint32_t top);
+int closHoistFor(const Emit *e, int slot, uint32_t at, const ObjFunction *fn);
+bool jitInlineBorrow(void);
+void noteGlobalAccess(Emit *e, JaiEntry *slot, SlotKind kind, bool write);
+bool globalTagProven(const Emit *e, JaiEntry *slot, SlotKind kind);
+int globalPromotedReg(const Emit *e, JaiEntry *slot, SlotKind kind);
+void emitPromotedReload(Emit *e);
+bool jitSimpleInitClass(ObjClass *cls, unsigned argc);
+bool closUpHoisted(const Emit *e, ObjClosure *closure, unsigned index);
+void noteClosureSite(Emit *e, int slot, uint32_t off, ObjClosure *sample);
 int hoistForStr(const Emit *e, int slot);
 ObjDict *jitDictExemplar(void);
 bool jitFieldDict(void);

@@ -111,7 +111,9 @@ bool emitBitOp(Emit *e, ObjFunction *fn, uint8_t op, int prevOff, int *offp)
              * fold -- and this is where that is put right. */
             settleAll(e);
         }
-        if (op != OP_SHL && op != OP_SHR) settleAll(e);
+        /* `& | ^` read both operands through popValue, a borrowed local
+         * in its own register: settled first, `x ^ step` under an inlined
+         * closure carried two `mov`s on the caller's accumulator chain. */
         if (kcountUsable) e->kPend &= ~(1u << (e->valueDepth - 1));
 
         if ((op == OP_SHL || op == OP_SHR) && !kcountUsable) {

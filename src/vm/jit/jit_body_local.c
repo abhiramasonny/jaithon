@@ -212,6 +212,39 @@ bool emitBind(Emit *e, const uint8_t *code, int *offp) {
     return true;
 }
 
+/* The hoist register holding upvalue `index` of the closure being inlined,
+ * if its loop head loaded it as the kind this read would push, else -1. The
+ * read is then a borrow with no guard, which is why compileBody lets a
+ * deferred entry live across it. */
+static int closUpReg(const Emit *e, ObjClosure *closure, unsigned index,
+                     SlotKind *kindOut, Value *seenOut) {
+    if (!e->inlining || e->inlClosHoist == 0 ||
+        e->inlClosHoist > e->closHoistCount) {
+        return -1;
+    }
+    unsigned h = e->inlClosHoist - 1u;
+    Value seen = NULL_VAL;
+    if (index < (unsigned)closure->upvalueCount &&
+        closure->upvalues[index] != NULL) {
+        seen = *closure->upvalues[index]->location;
+    }
+    SlotKind sk = IS_INT(seen) ? SLOT_INT
+                : IS_FLOAT(seen) ? SLOT_FLOAT
+                : IS_BOOL(seen) ? SLOT_BOOL : SLOT_OPAQUE;
+    for (unsigned u = 0; u < e->closHoist[h].upCount; u++) {
+        if (e->closHoist[h].upIdx[u] != index) continue;
+        if ((SlotKind)e->closHoist[h].upKind[u] != sk) return -1;
+        if (kindOut != NULL) *kindOut = sk;
+        if (seenOut != NULL) *seenOut = seen;
+        return e->closHoist[h].upReg[u];
+    }
+    return -1;
+}
+
+bool closUpHoisted(const Emit *e, ObjClosure *closure, unsigned index) {
+    return jitInlineBorrow() && closUpReg(e, closure, index, NULL, NULL) >= 0;
+}
+
 bool emitGetUpvalue(Emit *e, ObjFunction *fn, ObjClosure *closure,
                     const uint8_t *code, int *offp) {
     int off = *offp;
@@ -223,6 +256,23 @@ bool emitGetUpvalue(Emit *e, ObjFunction *fn, ObjClosure *closure,
          * caller may have no upvalues at all and still be inlining a body
          * that has them. */
         unsigned creg;
+        {
+            SlotKind sk;
+            Value seen;
+            int ur = closUpReg(e, closure, index, &sk, &seen);
+            if (ur >= 0) {
+                /* Loaded at the loop head (planClosureHoists), and nothing
+                 * writes a hoisted register inside its loop. */
+                if (!pushValue3(e, sk, 0, NULL, seen, -1)) return false;
+                if (jitInlineBorrow()) {
+                    xBorrowLocal(e, e->valueDepth - 1, (unsigned)ur);
+                } else {
+                    emit(e, jaiA64MovX(pushReg(e) - 1, (unsigned)ur));
+                }
+                *offp = off + 2;
+                return true;
+            }
+        }
         if (e->inlining) {
             if (e->inlClosureReg < 0) return false;
             creg = (unsigned)e->inlClosureReg;

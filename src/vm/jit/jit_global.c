@@ -188,6 +188,24 @@ JaiEntry *globalSlot(Emit *e, ObjClosure *closure, uint32_t nameIdx,
 /* Emitted before EVERY access, not hoisted: hoisting is sound only given a control-flow claim (no
  * call-out between a guard and a later access on a back edge) -- exactly the kind of reasoning this file has been bitten by before. Costs four instructions on a predictable branch. */
 void emitGlobalsGuard(Emit *e) {
+    /* Where the walk is in the CALLER's offsets, which is what every loop
+     * range is measured in. */
+    uint32_t site = e->inlining ? e->inlIp : e->curOffset;
+    if (e->measuring) {
+        if (e->globalSiteCount < JIT_MAX_GLOBAL_SITES) {
+            e->globalOff[e->globalSiteCount++] = site;
+        } else {
+            e->globalSiteSpill = true;
+        }
+    } else {
+        /* Proved at the head of a loop nothing in which can change the
+         * table's keys (planGuardHoists). */
+        for (unsigned i = 0; i < e->guardHoistCount; i++) {
+            if (site >= e->guardHoist[i].top && site < e->guardHoist[i].end) {
+                return;
+            }
+        }
+    }
     uint32_t at = e->globalsKeyVersion;
     emitConst64(e, JIT_SCRATCH_D,
                 (int64_t)(uintptr_t)&e->globalsTable->keyVersion);
@@ -953,12 +971,31 @@ bool emitGetGlobal(Emit *e, ObjFunction *fn, ObjClosure *closure,
                      * instruction with the operand stack the interpreter
                      * expects. */
                     emitGlobalsGuard(e);
+                    noteGlobalAccess(e, gslot, gk, false);
+                    {
+                        /* Promoted (planTagProofs): the value is in a hoist
+                         * register nothing in the loop writes but the
+                         * global's own stores, which settle every borrow
+                         * first, so the entry borrows it. */
+                        int pr = globalPromotedReg(e, gslot, gk);
+                        if (pr >= 0) {
+                            if (!pushValue3(e, gk, gshape, gcls, gvv, -1)) {
+                                return false;
+                            }
+                            xBorrowLocal(e, e->valueDepth - 1, (unsigned)pr);
+                            off += 6;
+                            break;
+                        }
+                    }
                     emitConst64(e, JIT_SCRATCH_D,
                                 (int64_t)(uintptr_t)gslot);
-                    emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
-                                       (unsigned)offsetof(JaiEntry, value)));
-                    emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
-                    branchOnDeopt(e, JAI_A64_NE);
+                    /* Proved at the loop head (planTagProofs). */
+                    if (!globalTagProven(e, gslot, gk)) {
+                        emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                                           (unsigned)offsetof(JaiEntry, value)));
+                        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
+                        branchOnDeopt(e, JAI_A64_NE);
+                    }
                     if (gk == SLOT_BOOL) {
                         /* A byte, not a word. BOOL_VAL writes the union's
                          * one-byte `bool` member and leaves the other seven
@@ -1105,7 +1142,19 @@ bool emitSetGlobal(Emit *e, ObjClosure *closure, const uint8_t *code,
             return false;
         }
         emitGlobalsGuard(e);
-        {
+        noteGlobalAccess(e, gslot, sk, true);
+        if (globalTagProven(e, gslot, sk)) {
+            /* The tag is `sk` already and stays so (planTagProofs): the old
+             * value is no object, so no version bump, and only the payload
+             * changes. */
+            unsigned src = pushReg(e) - 1;
+            emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)gslot);
+            emit(e, jaiA64StrX(src, JIT_SCRATCH_D,
+                               (unsigned)offsetof(JaiEntry, value) + 8u));
+            /* Written through: the entry above, and the promoted copy. */
+            int pr = globalPromotedReg(e, gslot, sk);
+            if (pr >= 0) emit(e, jaiA64MovX((unsigned)pr, src));
+        } else {
             unsigned src = pushReg(e) - 1;
             emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)gslot);
             /* Version only needs to move when a class/closure/native leaves or arrives (jaiValueIsInertGlobal is

@@ -458,6 +458,32 @@ static bool onlyBackEdgesEnter(const Chunk *c, uint32_t top, uint32_t end) {
     return true;
 }
 
+/* Whether the instruction at `at` runs on every pass of the loop [top, end)
+ * that comes back to the head: nothing between the head and `at` branches
+ * past it to somewhere still inside the loop, or back to the head (a
+ * `continue`). A branch that leaves the loop is fine -- that pass is never
+ * guarded again. A guard moved to the head from a site that passes this
+ * misses on the first pass exactly when the site's own guard would have; one
+ * moved from a site in a rarely taken arm would send every pass of the loop
+ * to the interpreter for a miss the site might never have seen. */
+static bool runsEveryPass(const Chunk *c, uint32_t top, uint32_t end,
+                          uint32_t at) {
+    if (at < top || at >= end) return false;
+    for (int off = (int)top; off < (int)at;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return false;
+        int rel = jaiOpBranchOperandAt(c->code[off]);
+        if (rel >= 0) {
+            int32_t to = (int32_t)(off + len) +
+                         jaiReadI16(c->code + off + 1 + rel);
+            if (to > (int32_t)at && to < (int32_t)end) return false;
+            if (to == (int32_t)top) return false;
+        }
+        off += len;
+    }
+    return true;
+}
+
 /* The appends in [lt, le) that a header of `slot` hoisted over that loop
  * would have to be proved distinct from, or false when no proof is possible:
  * an append to `slot` itself, to a list with no local behind it, or to a
@@ -671,6 +697,426 @@ int pushHoistFor(const Emit *e, int slot) {
     return -1;
 }
 
+/* JAITHON_JIT_CLOSURE_HOIST: see Emit::closHoist. Default on. */
+static bool jitClosureHoist(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_CLOSURE_HOIST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The measuring pass inlined a closure read out of local `slot` at `off`. */
+void noteClosureSite(Emit *e, int slot, uint32_t off, ObjClosure *sample) {
+    if (!e->measuring || e->inlining || sample == NULL) return;
+    if (slot < 0 || slot > (int)JIT_MAX_SLOTS) return;
+    if (e->closSiteCount >= JIT_MAX_CLOS_SITES) return;
+    e->closSite[e->closSiteCount].off = off;
+    e->closSite[e->closSiteCount].slot = (uint8_t)slot;
+    e->closSite[e->closSiteCount].sample = sample;
+    e->closSiteCount++;
+}
+
+/* The closure hoist that proved local `slot` holds a closure over `fn` for a
+ * loop containing `at`, or -1. */
+int closHoistFor(const Emit *e, int slot, uint32_t at, const ObjFunction *fn) {
+    if (e->measuring || slot < 0) return -1;
+    for (unsigned i = 0; i < e->closHoistCount; i++) {
+        if (e->closHoist[i].slot != (uint8_t)slot) continue;
+        if (e->closHoist[i].fn != fn) continue;
+        if (at < e->closHoist[i].top || at >= e->closHoist[i].end) continue;
+        return (int)i;
+    }
+    return -1;
+}
+
+/* Inlining `f(x)` where `f` is a local closure leaves, on every iteration,
+ * a guard that `f` is still over the function the body was inlined from
+ * (four instructions), and for each upvalue the body reads, a four-load
+ * chain to the cell and a tag check (seven more): eleven of closure_calls'
+ * twenty-two per iteration, every one of them loop-invariant. Proved once at
+ * the head instead, over the OUTERMOST loop that
+ *   - writes no value to the local (so the closure is the one the head saw,
+ *     and its `fn` is immutable),
+ *   - calls nothing (regionCalls: no code can run that might store into the
+ *     captured cell, and x13..x17 survive), and
+ *   - is entered only through its head.
+ * Compiled code has no OP_SET_UPVALUE arm and an inlined body admits none,
+ * so with no call nothing can write the cell while the loop runs. A cell can
+ * still be OPEN -- a live frame's stack slot -- and the one frame that could
+ * write such a slot without a call is this one, through a local its chunk
+ * captures by reference; a loop that writes one keeps its upvalue reads
+ * per-site and hoists only the guard (loopWritesCapturedLocal). Upvalues are hoisted as scalars only, so a register
+ * holds no reference the collector would have to see. */
+/* Whether any local of this chunk that a closure captures BY REFERENCE is
+ * written inside [lo, hi). Such a local is the one cell this frame can write
+ * without a call -- the loop tier keeps it in its frame slot for exactly that
+ * reason (chunkByRefCaptures in jit_osr.c) -- so a loop that writes one keeps
+ * every upvalue read per-site. True when the chunk cannot be decoded. */
+static bool loopWritesCapturedLocal(const Emit *e, const Chunk *c,
+                                    uint32_t lo, uint32_t hi) {
+    for (int off = 0; off < c->count;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return true;
+        if (c->code[off] == OP_CLOSURE) {
+            for (int u = off + 4; u + 3 <= off + len; u += 3) {
+                uint8_t how = c->code[u];
+                if ((how & 1u) == 0 || (how & 2u) != 0) continue;
+                unsigned slot = jaiReadU16(c->code + u + 1);
+                if (slot > JIT_MAX_SLOTS) return true;
+                if (e->slotWriteHi[slot] >= lo && e->slotWriteLo[slot] < hi) {
+                    return true;
+                }
+            }
+        }
+        off += len;
+    }
+    return false;
+}
+
+/* A truncated OSR walk ("walked only to OP_CLOSURE") never sees a write to
+ * the local in the loop's uncompiled tail, so slotWriteLo/Hi can call the
+ * local unwritten when it is not. That stays sound only because compiled
+ * code never resumes mid-loop: every re-entry from the interpreter comes
+ * through the head, and so through the head's guard. Anything that lets
+ * compiled code resume past the head must ask for a complete walk here. */
+static void planClosureHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds,
+                              uint32_t regionLo, uint32_t regionHi) {
+    e->closHoistCount = 0;
+    if (!jitClosureHoist() || e->noInline) return;
+    const Chunk *c = &fn->chunk;
+    for (unsigned i = 0; i < e->closSiteCount; i++) {
+        if (e->closHoistCount >= JIT_MAX_CLOS_HOIST) return;
+        unsigned s = e->closSite[i].slot;
+        ObjClosure *sample = e->closSite[i].sample;
+        ObjFunction *cfn = sample->fn;
+        uint32_t at = e->closSite[i].off;
+        if (s > JIT_MAX_SLOTS || kinds[s] != SLOT_OBJ) continue;
+        if (hoistListReg(e, s) == 0) continue;
+        if (closHoistFor(e, (int)s, at, cfn) >= 0) continue;   /* covered */
+        uint32_t bestTop = 0, bestEnd = 0;
+        for (int off = (int)regionLo; off < (int)regionHi;) {
+            int len = instructionLength(c, off);
+            if (len <= 0) break;
+            uint32_t lt = (uint32_t)off;
+            uint32_t le = loopBodyEnd(c, lt);
+            off += len;
+            if (le == 0 || le <= lt || le > regionHi) continue;
+            if (at < lt || at >= le) continue;
+            if (e->slotWriteHi[s] >= lt && e->slotWriteLo[s] < le) continue;
+            if (regionCalls(e, lt, le)) continue;
+            if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            if (!runsEveryPass(c, lt, le, at)) continue;
+            if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
+                bestTop = lt; bestEnd = le;
+            }
+        }
+        if (bestEnd == 0) continue;
+        /* A second hoist of the same local over an overlapping loop would
+         * guard one function at the head and another inside it. */
+        bool clash = false;
+        for (unsigned h = 0; h < e->closHoistCount; h++) {
+            if (e->closHoist[h].slot == (uint8_t)s &&
+                e->closHoist[h].top < bestEnd && bestTop < e->closHoist[h].end) {
+                clash = true;
+            }
+        }
+        if (clash) continue;
+        unsigned k = e->closHoistCount;
+        e->closHoist[k].top = bestTop;
+        e->closHoist[k].end = bestEnd;
+        e->closHoist[k].slot = (uint8_t)s;
+        e->closHoist[k].fn = cfn;
+        e->closHoist[k].upCount = 0;
+        bool upOk = !loopWritesCapturedLocal(e, c, bestTop, bestEnd);
+        const Chunk *cc = &cfn->chunk;
+        for (int o = 0; upOk && o < cc->count;) {
+            int len = instructionLength(cc, o);
+            if (len <= 0) break;
+            if (cc->code[o] == OP_GET_UPVALUE) {
+                unsigned idx = cc->code[o + 1];
+                bool dup = false;
+                for (unsigned u = 0; u < e->closHoist[k].upCount; u++) {
+                    if (e->closHoist[k].upIdx[u] == idx) dup = true;
+                }
+                Value seen = NULL_VAL;
+                if (idx < (unsigned)sample->upvalueCount &&
+                    sample->upvalues[idx] != NULL) {
+                    seen = *sample->upvalues[idx]->location;
+                }
+                SlotKind uk = IS_INT(seen) ? SLOT_INT
+                            : IS_FLOAT(seen) ? SLOT_FLOAT
+                            : IS_BOOL(seen) ? SLOT_BOOL : SLOT_OPAQUE;
+                if (!dup && uk != SLOT_OPAQUE &&
+                    e->closHoist[k].upCount < JIT_MAX_CLOS_UP &&
+                    e->hoistPoolCount - e->hoistTaken >= 1u) {
+                    unsigned r = e->hoistPool[e->hoistTaken++];
+                    if (r < e->scratchRoom) e->scratchRoom = r;
+                    unsigned u = e->closHoist[k].upCount++;
+                    e->closHoist[k].upIdx[u] = (uint8_t)idx;
+                    e->closHoist[k].upReg[u] = (uint8_t)r;
+                    e->closHoist[k].upKind[u] = (uint8_t)uk;
+                }
+            }
+            o += len;
+        }
+        e->closHoistCount++;
+    }
+}
+
+/* JAITHON_JIT_GLOBAL_GUARD_HOIST: see planGuardHoists. Default on. */
+static bool jitGlobalGuardHoist(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_GLOBAL_GUARD_HOIST");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Can anything in [lo, hi) run Jaithon code -- and so define, delete or
+ * rehash a module global? Every such site is a clobber, but not every
+ * clobber is such a site: an instance allocation of a simple-init class
+ * calls only the allocator and, at worst, the collector, and the collector
+ * never touches a module's globals table (it prunes only the intern table). */
+static bool regionRebinds(const Emit *e, uint32_t lo, uint32_t hi) {
+    if (e->clobberSpill) return true;
+    for (unsigned i = 0; i < e->clobberCount; i++) {
+        if (e->clobberOff[i] < lo || e->clobberOff[i] >= hi) continue;
+        if (!e->clobberAlloc[i]) return true;
+    }
+    return false;
+}
+
+/* emitGlobalsGuard runs before EVERY module-global access: three loads and a
+ * compare against the table's keyVersion, which moves only when a key is
+ * added, removed or the table rehashed. A loop at module scope pays it for
+ * every read and write of its counters -- about a hundred of alloc_churn's
+ * 291 instructions an iteration went on global access. Over a loop that runs
+ * no Jaithon code (regionRebinds) and is entered only at its head, nothing
+ * can move the keys between the head and any access in it, so the guard is
+ * proved once at the head, the OUTERMOST such loop around each site. A miss
+ * resumes the interpreter at the head. The value is still loaded and its tag
+ * checked at every access; only the key check moves. */
+static void planGuardHoists(Emit *e, ObjFunction *fn, uint32_t regionLo,
+                            uint32_t regionHi) {
+    e->guardHoistCount = 0;
+    if (!jitGlobalGuardHoist() || e->globalsTable == NULL) return;
+    if (e->globalSiteSpill) return;
+    const Chunk *c = &fn->chunk;
+    for (unsigned i = 0; i < e->globalSiteCount; i++) {
+        uint32_t at = e->globalOff[i];
+        bool covered = false;
+        for (unsigned h = 0; h < e->guardHoistCount; h++) {
+            if (at >= e->guardHoist[h].top && at < e->guardHoist[h].end) {
+                covered = true;
+            }
+        }
+        if (covered) continue;
+        uint32_t bestTop = 0, bestEnd = 0;
+        for (int off = (int)regionLo; off < (int)regionHi;) {
+            int len = instructionLength(c, off);
+            if (len <= 0) break;
+            uint32_t lt = (uint32_t)off;
+            uint32_t le = loopBodyEnd(c, lt);
+            off += len;
+            if (le == 0 || le <= lt || le > regionHi) continue;
+            if (at < lt || at >= le) continue;
+            if (regionRebinds(e, lt, le)) continue;
+            if (!onlyBackEdgesEnter(c, lt, le)) continue;
+            if (!runsEveryPass(c, lt, le, at)) continue;
+            if (bestEnd == 0 || le - lt > bestEnd - bestTop) {
+                bestTop = lt; bestEnd = le;
+            }
+        }
+        if (bestEnd == 0) continue;
+        /* An inner loop chosen first for another site is swallowed by this
+         * one: drop it, so no head is guarded twice. */
+        unsigned k = 0;
+        for (unsigned h = 0; h < e->guardHoistCount; h++) {
+            if (e->guardHoist[h].top >= bestTop &&
+                e->guardHoist[h].end <= bestEnd) {
+                continue;
+            }
+            e->guardHoist[k++] = e->guardHoist[h];
+        }
+        e->guardHoistCount = k;
+        if (e->guardHoistCount >= JIT_MAX_GUARD_HOIST) return;
+        e->guardHoist[e->guardHoistCount].top = bestTop;
+        e->guardHoist[e->guardHoistCount].end = bestEnd;
+        e->guardHoistCount++;
+    }
+}
+
+/* JAITHON_JIT_GLOBAL_PROMOTE: see Emit::tagProof's reg. Default on. */
+static bool jitGlobalPromote(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_GLOBAL_PROMOTE");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* The hoist register a proved global's value lives in at this access, or
+ * -1. */
+int globalPromotedReg(const Emit *e, JaiEntry *slot, SlotKind kind) {
+    if (e->measuring) return -1;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    for (unsigned i = 0; i < e->tagProofCount; i++) {
+        if (e->tagProof[i].slot != slot) continue;
+        if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+        if ((SlotKind)e->tagProof[i].kind != kind) return -1;
+        return e->tagProof[i].reg != 0 ? (int)e->tagProof[i].reg : -1;
+    }
+    return -1;
+}
+
+/* After an allocation's slow path has called out: every promoted global of
+ * a loop around this site is reloaded from its entry, which writing through
+ * keeps current. Nothing else is in x13..x17 in such a loop. JIT_SCRATCH_C
+ * holds the new instance and is left alone. */
+void emitPromotedReload(Emit *e) {
+    if (e->measuring) return;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    for (unsigned i = 0; i < e->tagProofCount; i++) {
+        if (e->tagProof[i].reg == 0) continue;
+        if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+        emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)e->tagProof[i].slot);
+        if ((SlotKind)e->tagProof[i].kind == SLOT_BOOL) {
+            emit(e, jaiA64LdrByte(e->tagProof[i].reg, JIT_SCRATCH_D,
+                                  (unsigned)offsetof(JaiEntry, value) + 8u));
+        } else {
+            emit(e, jaiA64LdrX(e->tagProof[i].reg, JIT_SCRATCH_D,
+                               (unsigned)offsetof(JaiEntry, value) + 8u));
+        }
+    }
+}
+
+/* JAITHON_JIT_GLOBAL_TAG_PROOF: see Emit::tagProof. Default on. */
+static bool jitGlobalTagProof(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_GLOBAL_TAG_PROOF");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+void noteGlobalAccess(Emit *e, JaiEntry *slot, SlotKind kind, bool write) {
+    if (!e->measuring) return;
+    if (e->globalAccCount >= JIT_MAX_GLOBAL_ACC) {
+        e->globalAccSpill = true;
+        return;
+    }
+    unsigned i = e->globalAccCount++;
+    e->globalAcc[i].off = e->inlining ? e->inlIp : e->curOffset;
+    e->globalAcc[i].slot = slot;
+    e->globalAcc[i].kind = (uint8_t)kind;
+    e->globalAcc[i].write = write;
+}
+
+/* Whether the access about to be emitted is to a global whose tag a loop
+ * head around it has already proved to be `kind`. */
+bool globalTagProven(const Emit *e, JaiEntry *slot, SlotKind kind) {
+    if (e->measuring) return false;
+    uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+    for (unsigned i = 0; i < e->tagProofCount; i++) {
+        if (e->tagProof[i].slot != slot) continue;
+        if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+        return (SlotKind)e->tagProof[i].kind == kind;
+    }
+    return false;
+}
+
+/* Over a loop whose globals guard is already proved at the head
+ * (planGuardHoists), a module global's tag can change only through a store
+ * the loop itself makes: nothing in it runs Jaithon code, and the only other
+ * writers are Jaithon code. So when every access of a global inside the loop
+ * -- every read and every compiled store -- is of one scalar kind, checking
+ * the tag once at the head proves it for the whole loop: each read drops its
+ * tag check, and each store its check that the old value was an object (it
+ * cannot be) and its tag store (the tag is already the one it would write).
+ * Every access of the loop must have been recorded; a spill proves nothing. */
+static void planTagProofs(Emit *e, ObjFunction *fn) {
+    const Chunk *c = &fn->chunk;
+    e->tagProofCount = 0;
+    if (!jitGlobalTagProof() || e->globalAccSpill) return;
+    for (unsigned h = 0; h < e->guardHoistCount; h++) {
+        uint32_t lt = e->guardHoist[h].top, le = e->guardHoist[h].end;
+        for (unsigned i = 0; i < e->globalAccCount; i++) {
+            if (e->globalAcc[i].off < lt || e->globalAcc[i].off >= le) continue;
+            JaiEntry *slot = e->globalAcc[i].slot;
+            SlotKind k = (SlotKind)e->globalAcc[i].kind;
+            if (k != SLOT_INT && k != SLOT_FLOAT && k != SLOT_BOOL) continue;
+            bool seen = false, ok = true;
+            for (unsigned t = 0; t < e->tagProofCount; t++) {
+                if (e->tagProof[t].slot == slot && e->tagProof[t].top == lt) {
+                    seen = true;
+                }
+            }
+            if (seen) continue;
+            for (unsigned j = 0; j < e->globalAccCount; j++) {
+                if (e->globalAcc[j].slot != slot) continue;
+                if (e->globalAcc[j].off < lt || e->globalAcc[j].off >= le) continue;
+                if ((SlotKind)e->globalAcc[j].kind != k) ok = false;
+            }
+            if (!ok) continue;
+            /* The head's check stands in for a read's only when that read
+             * would have made it on the first pass anyway: one that runs
+             * every pass, with no store of the loop's ahead of it. */
+            bool anchored = false;
+            for (unsigned j = 0; j < e->globalAccCount && !anchored; j++) {
+                uint32_t ro = e->globalAcc[j].off;
+                if (e->globalAcc[j].slot != slot || e->globalAcc[j].write) continue;
+                if (!runsEveryPass(c, lt, le, ro)) continue;
+                bool stored = false;
+                for (unsigned w = 0; w < e->globalAccCount; w++) {
+                    if (e->globalAcc[w].slot == slot && e->globalAcc[w].write &&
+                        e->globalAcc[w].off >= lt && e->globalAcc[w].off < ro) {
+                        stored = true;
+                    }
+                }
+                if (!stored) anchored = true;
+            }
+            if (!anchored) continue;
+            if (e->tagProofCount >= JIT_MAX_TAG_PROOF) return;
+            e->tagProof[e->tagProofCount].top = lt;
+            e->tagProof[e->tagProofCount].end = le;
+            e->tagProof[e->tagProofCount].slot = slot;
+            e->tagProof[e->tagProofCount].kind = (uint8_t)k;
+            e->tagProof[e->tagProofCount].reg = 0;
+            e->tagProof[e->tagProofCount].allocs = false;
+            /* A module-scope loop's counters and accumulators are carried
+             * from one iteration to the next THROUGH their entries, so each
+             * one is a store and a load on the loop's critical path. In a
+             * loop with no call at all the value can sit in a hoist register
+             * instead; the store stays, off the chain. A loop whose only
+             * calls are allocations (regionRebinds already said nothing else
+             * calls) takes x13..x17 alone and reloads after each slow path. */
+            if (jitGlobalPromote()) {
+                bool calls = regionCalls(e, lt, le);
+                for (unsigned q = e->hoistTaken; q < e->hoistPoolCount; q++) {
+                    unsigned r = e->hoistPool[q];
+                    if (calls && (r < JIT_FREE_FIRST ||
+                                  r >= JIT_FREE_FIRST + JIT_FREE_COUNT)) {
+                        continue;
+                    }
+                    /* Taken out of the pool in place: swap to the front. */
+                    e->hoistPool[q] = e->hoistPool[e->hoistTaken];
+                    e->hoistPool[e->hoistTaken++] = (uint8_t)r;
+                    if (r < e->scratchRoom) e->scratchRoom = r;
+                    e->tagProof[e->tagProofCount].reg = (uint8_t)r;
+                    e->tagProof[e->tagProofCount].allocs = calls;
+                    break;
+                }
+            }
+            e->tagProofCount++;
+        }
+    }
+}
+
 void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     if (e->measuring) return;
     const Chunk *c = &fn->chunk;
@@ -856,6 +1302,9 @@ void planHoists(Emit *e, ObjFunction *fn, const SlotKind *kinds) {
     }
     planPushHoists(e, c, kinds, regionLo, regionHi);
     planIterHoists(e, c, regionLo, regionHi);
+    planClosureHoists(e, fn, kinds, regionLo, regionHi);
+    planGuardHoists(e, fn, regionLo, regionHi);
+    planTagProofs(e, fn);
     if (!lean) return;
     /* Versions, for lists stored into inside their own region. */
     for (unsigned h = 0; h < e->hoistCount; h++) {
@@ -977,6 +1426,82 @@ void emitHoistsAt(Emit *e, uint32_t off) {
         emit(e, jaiA64LdrX(e->iterHoist[i].reg, rIt,
                            (unsigned)offsetof(ObjIter, index)));
         e->iterHoist[i].live = true;
+    }
+    for (unsigned i = 0; i < e->guardHoistCount; i++) {
+        if (e->guardHoist[i].top != off) continue;
+        /* emitGlobalsGuard's own compare, resuming at the head. */
+        uint32_t kv = e->globalsKeyVersion;
+        emitConst64(e, JIT_SCRATCH_D,
+                    (int64_t)(uintptr_t)&e->globalsTable->keyVersion);
+        emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D, 0));
+        if (kv <= 0xfffu) {
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, kv));
+        } else {
+            emitConst64(e, JIT_SCRATCH_B, (int64_t)kv);
+            emit(e, jaiA64SubsX(31, JIT_SCRATCH_C, JIT_SCRATCH_B));
+        }
+        branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        /* After the key check, which is what keeps these addresses valid. */
+        for (unsigned t = 0; t < e->tagProofCount; t++) {
+            if (e->tagProof[t].top != off) continue;
+            SlotKind tk = (SlotKind)e->tagProof[t].kind;
+            unsigned tag = tk == SLOT_INT ? VAL_INT
+                         : tk == SLOT_FLOAT ? VAL_FLOAT : VAL_BOOL;
+            emitConst64(e, JIT_SCRATCH_D,
+                        (int64_t)(uintptr_t)e->tagProof[t].slot);
+            emit(e, jaiA64LdrW(JIT_SCRATCH_C, JIT_SCRATCH_D,
+                               (unsigned)offsetof(JaiEntry, value)));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_C, tag));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
+            unsigned pr = e->tagProof[t].reg;
+            if (pr != 0) {
+                if (tk == SLOT_BOOL) {
+                    emit(e, jaiA64LdrByte(pr, JIT_SCRATCH_D,
+                                          (unsigned)offsetof(JaiEntry, value) + 8u));
+                } else {
+                    emit(e, jaiA64LdrX(pr, JIT_SCRATCH_D,
+                                       (unsigned)offsetof(JaiEntry, value) + 8u));
+                }
+            }
+        }
+    }
+    for (unsigned i = 0; i < e->closHoistCount; i++) {
+        if (e->closHoist[i].top != off) continue;
+        /* See planClosureHoists. A miss resumes the interpreter at the head
+         * with nothing run; the per-site guard would have sent it to the
+         * call, which is no further than the head can reach without it. */
+        unsigned rf = hoistListReg(e, e->closHoist[i].slot);
+        emit(e, jaiA64SubsXImm(31, rf, 0));
+        branchOnDeoptAt(e, JAI_A64_EQ, off, false);
+        emit(e, jaiA64LdrW(JIT_SCRATCH_A, rf, (unsigned)offsetof(Obj, type)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_A, OBJ_CLOSURE));
+        branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        emit(e, jaiA64LdrX(JIT_SCRATCH_A, rf,
+                           (unsigned)offsetof(ObjClosure, fn)));
+        emitConstCmp(e, JIT_SCRATCH_B,
+                     (int64_t)(uintptr_t)e->closHoist[i].fn);
+        emit(e, jaiA64SubsXReg(31, JIT_SCRATCH_A, JIT_SCRATCH_B));
+        branchOnDeoptAt(e, JAI_A64_NE, off, false);
+        for (unsigned u = 0; u < e->closHoist[i].upCount; u++) {
+            SlotKind uk = (SlotKind)e->closHoist[i].upKind[u];
+            unsigned tag = uk == SLOT_INT ? VAL_INT
+                         : uk == SLOT_FLOAT ? VAL_FLOAT : VAL_BOOL;
+            unsigned r = e->closHoist[i].upReg[u];
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, rf,
+                               (unsigned)offsetof(ObjClosure, upvalues)));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                               e->closHoist[i].upIdx[u] * 8u));
+            emit(e, jaiA64LdrX(JIT_SCRATCH_A, JIT_SCRATCH_A,
+                               (unsigned)offsetof(ObjUpvalue, location)));
+            emit(e, jaiA64LdrW(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+            emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_B, tag));
+            branchOnDeoptAt(e, JAI_A64_NE, off, false);
+            if (uk == SLOT_BOOL) {
+                emit(e, jaiA64LdrByte(r, JIT_SCRATCH_A, 8));
+            } else {
+                emit(e, jaiA64LdrX(r, JIT_SCRATCH_A, 8));
+            }
+        }
     }
     for (unsigned i = 0; i < e->pushHoistCount; i++) {
         if (e->pushHoist[i].top != off) continue;

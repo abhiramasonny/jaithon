@@ -100,7 +100,16 @@ static unsigned valueIndexOf(const Emit *e, unsigned idx) {
     return seen;
 }
 
-static bool pushCopyOfEntry(Emit *e, unsigned idx) {
+bool jitInlineBorrow(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_INLINE_BORROW");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool pushCopyOfEntryAs(Emit *e, unsigned idx, bool mayBorrow) {
     if (idx >= e->depth || !holdsRegister(e->stack[idx])) return false;
     unsigned vi = valueIndexOf(e, idx);
     fpSyncOne(e, vi);
@@ -109,9 +118,25 @@ static bool pushCopyOfEntry(Emit *e, unsigned idx) {
                     e->stackSeen[idx], -1)) {
         return false;
     }
+    /* Borrowed rather than copied: an inlined body admits no store to a
+     * local, so the entry it reads cannot change while the borrow lives, and
+     * the settle at the next instruction that cannot read a borrow emits the
+     * same `mov` this would have. `|x| x + step` paid a copy of `x` on the
+     * caller's accumulator chain. JAITHON_JIT_INLINE_BORROW=0 copies. */
+    if (mayBorrow && e->inlining && jitInlineBorrow()) {
+        xBorrowLocal(e, e->valueDepth - 1, src);
+        return true;
+    }
     unsigned dst = pushReg(e) - 1;
     if (dst != src) emit(e, jaiA64MovX(dst, src));
     return true;
+}
+
+/* A copy in the entry's own register, for the arms that go on to write it
+ * in place (inlineIntConstOp) or hand it to an arm written against a
+ * materialised receiver (inlineFieldRead). */
+static bool pushCopyOfEntry(Emit *e, unsigned idx) {
+    return pushCopyOfEntryAs(e, idx, false);
 }
 
 /* A field read inside an inlined body. OP_GET_FIELD_LOCAL names a callee
@@ -179,13 +204,26 @@ static bool inlineIntConstOp(Emit *e, const uint8_t *code, int off) {
         e->whyNot = "an inlined fused constant op on a local that is not an int";
         return false;
     }
-    if (!pushCopyOfEntry(e, src)) return false;
+    /* Read straight out of the entry's register into the new one, not
+     * copied there first and operated on in place: on a loop that inlines
+     * the body, the copy was a second `mov` on the caller's accumulator
+     * chain right after the argument's own, and a chain of eliminated movs
+     * is not free on this core -- `|x| x + 7` under a hoisted closure guard
+     * ran 15% slower than with the guard per-site. The entry itself is never
+     * written. */
+    if (!holdsRegister(e->stack[src])) return false;
+    unsigned svi = valueIndexOf(e, src);
+    fpSyncOne(e, svi);
+    unsigned rs = xHeldIn(e, svi);
+    if (!pushValue3(e, e->stack[src], e->stackShape[src], e->stackClass[src],
+                    NULL_VAL, -1)) {
+        return false;
+    }
     unsigned rd = pushReg(e) - 1;
-    e->stackSeen[e->depth - 1] = NULL_VAL;   /* no longer the local's value */
     if (op == OP_MUL_INT_CONST) {
         emitConst64(e, JIT_SCRATCH_D, k);
-        emit(e, jaiA64SmulhX(JIT_SCRATCH_A, rd, JIT_SCRATCH_D));
-        emit(e, jaiA64MulX(rd, rd, JIT_SCRATCH_D));
+        emit(e, jaiA64SmulhX(JIT_SCRATCH_A, rs, JIT_SCRATCH_D));
+        emit(e, jaiA64MulX(rd, rs, JIT_SCRATCH_D));
         emit(e, jaiA64SubsXAsr(31, JIT_SCRATCH_A, rd, 63));
         branchOnOverflow(e, 2u, JAI_A64_NE);
         return true;
@@ -194,12 +232,12 @@ static bool inlineIntConstOp(Emit *e, const uint8_t *code, int off) {
      * stub names the right one. */
     int64_t addend = op == OP_SUB_INT_CONST ? -(int64_t)k : (int64_t)k;
     if (addend >= 0 && addend <= 4095) {
-        emit(e, jaiA64AddsXImm(rd, rd, (unsigned)addend));
+        emit(e, jaiA64AddsXImm(rd, rs, (unsigned)addend));
     } else if (addend < 0 && addend >= -4095) {
-        emit(e, jaiA64SubsXImm(rd, rd, (unsigned)(-addend)));
+        emit(e, jaiA64SubsXImm(rd, rs, (unsigned)(-addend)));
     } else {
         emitConst64(e, JIT_SCRATCH_A, addend);
-        emit(e, jaiA64AddsX(rd, rd, JIT_SCRATCH_A));
+        emit(e, jaiA64AddsX(rd, rs, JIT_SCRATCH_A));
     }
     branchOnOverflow(e, op == OP_SUB_INT_CONST ? 1u : 0u, JAI_A64_VS);
     return true;
@@ -274,7 +312,11 @@ static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
         e->whyNot = "an inlined body reading a local it never bound";
         return false;
     }
-    if (op == OP_GET_LOCAL) return pushCopyOfEntry(e, (unsigned)e->inlSlot[a]);
+    /* A plain read: the next instruction either reads it through xHeldIn
+     * or settles it at its top, as for any borrowed local. */
+    if (op == OP_GET_LOCAL) {
+        return pushCopyOfEntryAs(e, (unsigned)e->inlSlot[a], true);
+    }
 
     unsigned b = jaiReadU16(code + off + 3);
     if (b > JIT_MAX_SLOTS || e->inlSlot[b] < 0) {
@@ -282,8 +324,8 @@ static bool inlineLocalOp(Emit *e, const uint8_t *code, int off) {
         return false;
     }
     if (op == OP_GET_LOCAL2) {
-        return pushCopyOfEntry(e, (unsigned)e->inlSlot[a]) &&
-               pushCopyOfEntry(e, (unsigned)e->inlSlot[b]);
+        return pushCopyOfEntryAs(e, (unsigned)e->inlSlot[a], true) &&
+               pushCopyOfEntryAs(e, (unsigned)e->inlSlot[b], true);
     }
 
     unsigned ia = (unsigned)e->inlSlot[a], ib = (unsigned)e->inlSlot[b];
@@ -338,6 +380,8 @@ static bool deferSurvives(uint8_t op) {
     case OP_INT: case OP_CONST:
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
     case OP_SHL: case OP_SHR:
+    /* Cannot fail, so no record: both operands are read through popValue. */
+    case OP_BAND: case OP_BOR: case OP_BXOR:
     /* Its arm settles both operands itself on every path that reads a register
      * for them, and takes no deopt record before doing so. */
     case OP_FLOORDIV:
@@ -607,7 +651,9 @@ bool compileBody(Emit *e, ObjClosure *closure) {
     int count = fn->chunk.count;
 
     /* An inlined body is walked whole; the OSR window belongs to the caller. */
-    int start = (!e->inlining && e->osr) ? (int)e->osrTop : bodyEntryOffset(fn);
+    int start = (!e->inlining && e->osr) ? (int)e->osrTop
+              : (!e->inlining && e->walkFrom != 0) ? (int)e->walkFrom
+              : bodyEntryOffset(fn);
     int stop  = (!e->inlining && e->osr) ? (int)e->osrEnd : count;
     bool afterUncond = false;
     /* The offset the walk visited before this one, for the arms that want to
@@ -730,10 +776,19 @@ bool compileBody(Emit *e, ObjClosure *closure) {
              * Settling here is the same conservative branch a non-whitelisted
              * opcode already takes, and it costs `mov`s that §5 prices at zero.
              */
-            if (joinsHere || e->inProtected || !deferSurvives(op) ||
+            if (joinsHere || e->inProtected ||
+                (!deferSurvives(op) &&
+                 !(op == OP_GET_UPVALUE &&
+                   closUpHoisted(e, closure, code[off + 1]))) ||
                 e->deferCarryCount >= jitCarryLimit()) {
                 settleAll(e);
-            } else {
+            } else if (!e->inlining) {
+                /* An inlined body's offsets are its OWN chunk's, and the
+                 * landing map below is the caller's: recorded, a callee
+                 * offset that happened to equal a caller's loop head
+                 * declined the whole body. Nothing can land inside an
+                 * inlined body -- it has no branches, and the caller's
+                 * reach it only at the call's own offset. */
                 e->deferCarry[e->deferCarryCount++] = (uint32_t)off;
             }
         }

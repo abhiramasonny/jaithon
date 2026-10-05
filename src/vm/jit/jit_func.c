@@ -454,6 +454,13 @@ static void noteSlotWrite(Emit *e, unsigned slot) {
             e->whyNot = "a pushed list's local was written after all";
             e->failed = true;
         }
+        for (unsigned i = 0; i < e->closHoistCount; i++) {
+            if (e->closHoist[i].slot != (uint8_t)slot) continue;
+            if (e->curOffset < e->closHoist[i].top) continue;
+            if (e->curOffset >= e->closHoist[i].end) continue;
+            e->whyNot = "a hoisted closure's local was written after all";
+            e->failed = true;
+        }
         return;
     }
     if (e->inlining) return;
@@ -894,6 +901,7 @@ void noteScratchClobber(Emit *e) {
          * over-report, not under-report, which is the safe direction. */
         uint32_t at = e->inlining ? e->inlIp : e->curOffset;
         if (e->clobberCount < JIT_MAX_CLOBBER) {
+            e->clobberAlloc[e->clobberCount] = e->allocOnlyCall;
             e->clobberOff[e->clobberCount++] = at;
         } else {
             e->clobberSpill = true;
@@ -915,6 +923,34 @@ void noteScratchClobber(Emit *e) {
         for (unsigned i = 0; i < e->hoistCount; i++) {
             if (at < e->hoist[i].top || at >= e->hoist[i].end) continue;
             e->whyNot = "a call reached a loop a header was hoisted out of";
+            e->failed = true;
+            return;
+        }
+    }
+    /* The same ratchet for the closure hoists (their upvalues sit in hoist
+     * registers) and, for any call that could run Jaithon code, the loops
+     * whose globals guard was proved at the head. */
+    if (!e->measuring &&
+        (e->closHoistCount > 0 || e->guardHoistCount > 0 ||
+         e->tagProofCount > 0)) {
+        uint32_t at = e->inlining ? e->inlIp : e->curOffset;
+        for (unsigned i = 0; i < e->closHoistCount; i++) {
+            if (at < e->closHoist[i].top || at >= e->closHoist[i].end) continue;
+            e->whyNot = "a call reached a loop a closure was hoisted over";
+            e->failed = true;
+            return;
+        }
+        for (unsigned i = 0; i < e->tagProofCount; i++) {
+            if (e->tagProof[i].reg == 0) continue;
+            if (at < e->tagProof[i].top || at >= e->tagProof[i].end) continue;
+            if (e->allocOnlyCall && e->tagProof[i].allocs) continue;
+            e->whyNot = "a call reached a loop a global was promoted over";
+            e->failed = true;
+            return;
+        }
+        for (unsigned i = 0; !e->allocOnlyCall && i < e->guardHoistCount; i++) {
+            if (at < e->guardHoist[i].top || at >= e->guardHoist[i].end) continue;
+            e->whyNot = "a call reached a loop a globals guard was hoisted over";
             e->failed = true;
             return;
         }
@@ -953,7 +989,7 @@ void noteScratchClobber(Emit *e) {
  * on -- so the inlined entries simply continue the caller's numbering, which
  * `scratchValues` has already proved fits (probe.maxValueAll <= the bank). */
 static bool inlineOwnBank(const Emit *e) {
-    return e->inlining && !e->scratchValues;
+    return e->inlining && !e->scratchValues && !e->inlShared;
 }
 
 /* Where entry `idx` of the ordinary (non-inlined) operand stack lives. One run
@@ -1360,7 +1396,7 @@ bool pushValue3(Emit *e, SlotKind kind, uint32_t shape, ObjClass *klass,
     /* An inlined body's entries are not in the caller's bank, so they do not
      * widen its save set -- which is the whole reason they fit. */
     if (e->valueDepth > e->maxValue &&
-        !(e->inlining && e->valueDepth > e->inlValueBase)) {
+        !(e->inlining && !e->inlShared && e->valueDepth > e->inlValueBase)) {
         e->maxValue = e->valueDepth;
     }
     /* The same number counted the other way: how wide the stack gets when the
