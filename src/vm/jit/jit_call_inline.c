@@ -688,6 +688,28 @@ static bool jitInlineLoopsOn(void) {
     return on != 0;
 }
 
+/* JAITHON_JIT_INLINE_STG_PIN=0: every element read inside a loop-bearing
+ * inline dispatches on its list's storage, as a function-tier read does. */
+static bool jitInlineStgPinOn(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("JAITHON_JIT_INLINE_STG_PIN");
+        on = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+/* Whether the callee's code writes `slot` anywhere (its own numbering). */
+static bool calleeWritesSlot(const Chunk *c, unsigned slot) {
+    for (int off = 0; off < c->count;) {
+        int len = instructionLength(c, off);
+        if (len <= 0) return true;
+        if (jitOpWritesSlot(c, off, slot)) return true;
+        off += len;
+    }
+    return false;
+}
+
 /* Bounds on code growth: the arena is shared, and a full one changes which
  * tier compiles everything after it. A callee this small with a loop in it
  * is the shape the call overhead dominates (queens' `safe` is 78 bytes);
@@ -1057,6 +1079,28 @@ static bool inlineLoopCall(Emit *e, ObjFunction *caller, ObjClosure *callee,
         e->localObjType[slot]  = e->stackObjType[idx];
         localOut(e, slot, xHeldIn(e, v));
     }
+
+    /* A list parameter the body never rebinds keeps its storage for the
+     * whole inline -- nothing in it stores or calls -- so one check here
+     * stands for every element read inside the loop. A miss re-runs the call
+     * in the interpreter like any other guard in the body. */
+    for (unsigned idx = cidx + 1u; ok && jitInlineStgPinOn() &&
+                                   idx < cidx + 1u + argc; idx++) {
+        unsigned slot = hb + (idx - cidx);
+        e->homeStgPin[slot] = false;
+        if (e->stack[idx] != SLOT_LIST || e->dynamicLocal[slot]) continue;
+        Value seen = e->stackSeen[idx];
+        if (!IS_LIST(seen) || AS_LIST(seen) == NULL) continue;
+        if (calleeWritesSlot(&cfn->chunk, idx - cidx)) continue;
+        uint8_t stg = AS_LIST(seen)->stg;
+        unsigned r = localIn(e, slot, JIT_SCRATCH_C);
+        emit(e, jaiA64LdrByte(JIT_SCRATCH_D, r, (unsigned)offsetof(ObjList, stg)));
+        emit(e, jaiA64SubsXImm(31, JIT_SCRATCH_D, stg));
+        branchOnDeopt(e, JAI_A64_NE);
+        e->homeStgPin[slot] = true;
+        e->homeStg[slot] = stg;
+    }
+    if (e->failed) ok = false;
 
     /* The walk sees only its own fixups. */
     unsigned nCaller = e->fixupCount;

@@ -107,6 +107,18 @@ ListAccess listAccessFor(Emit *e, unsigned rList, int slot,
         a.dynamic = false;
         return a;
     }
+    /* PINNED AT AN INLINE'S ENTRY: a list parameter of a loop-bearing
+     * inline, whose storage the entry checked (inlineLoopCall). Only for the
+     * kind that storage holds, so the arm's own kind check cannot refuse. */
+    if (e->inlHomes && slot >= 0 && slot <= (int)JIT_MAX_SLOTS &&
+        e->homeStgPin[slot] &&
+        (e->homeStg[slot] == LIST_STORE_BOXED ||
+         listStgKind(e->homeStg[slot]) == vk)) {
+        a.stg = e->homeStg[slot];
+        a.alt = a.stg;
+        a.dynamic = false;
+        return a;
+    }
     /* PINNED AT THE HOIST. Not proved at entry, but at the head of the loop
      * this access sits in, by emitHoistsAt -- see jitHoistPinOn. */
     {

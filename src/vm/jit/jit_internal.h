@@ -787,6 +787,12 @@ typedef struct {
     unsigned  inlHomeNext;    /* next free home slot in this pass, 0 = lo */
     unsigned  inlLoopCount;   /* loop-bearing inlines in this pass */
     unsigned  inlBranchCount; /* branch-only inlines in this pass */
+    /* A list parameter of a loop-bearing inline whose storage was checked
+     * once at the inline's entry (JAITHON_JIT_INLINE_STG_PIN): the body
+     * stores nothing and calls nothing, so no element access inside it can
+     * meet another storage, and each one skips its own dispatch. */
+    bool      homeStgPin[JIT_MAX_SLOTS + 1];
+    uint8_t   homeStg[JIT_MAX_SLOTS + 1];
     uint32_t  inlExitOff;     /* the callee's chunk count: the exit target */
     unsigned  inlRetVi;       /* value index every return leaves its result at */
     bool      inlRetSet;
