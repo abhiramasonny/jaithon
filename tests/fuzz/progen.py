@@ -139,6 +139,10 @@ TRY_CALL_RATE = 0.3
 # write (Gen.deopt_call).
 DEOPT_CALL_RATE = 0.3
 
+# Share of programs that get a recursive callee whose effect is in a tail the
+# compiled walk never reaches (Gen.self_call).
+SELF_CALL_RATE = 0.3
+
 # Combined with `+% -% *%` only, so any of these is safe to reach.
 EDGE_INTS = [
     0, 1, -1, 2, 3, 7, 63, 64, 65, 255, 256, 1023, 65535, 65536,
@@ -2019,6 +2023,179 @@ class Gen:
         tail = (f"acc = acc +% {log}.len() +% {bump} +% {tobj}.hits")
         return classes, helpers, Node(head, *lines, tail)
 
+    def self_call(self, sr):
+        """A recursive callee whose effect runs in a tail it never compiled.
+
+        The compiled walk stops at a lambda (the tier has no arm for one), so
+        whatever follows it -- here the effect -- is interpreted. Every leaf
+        activation therefore deoptimises, and the compiled self-call one level
+        up FINISHES it in the interpreter, effect included, then carries on
+        compiled. Or the effect sits in a non-recursive callee's own
+        interpreted tail, and the finish runs that. Either way no compiled
+        instruction of the recursive body writes, and a self-call used not to
+        count as a write, so the body advertised jitFuncNoWrite; when it then
+        deoptimised AFTER its self-call (the `holder` swap, or a finished call
+        answering null where the self-call took an int), a compiled caller ran
+        it again from the top and the effect happened twice
+        (tests/lang/test_jit_self_call_runs_once.jai). JAITHON_JIT_DEOPT_STRESS
+        cannot find this: it fails guards, and nothing here needs one to.
+
+        Returns the classes, the helpers and the probe statement, like
+        deopt_call.
+        """
+        warm = self.prog.warm
+        base = self.fresh("ScBase")
+        wide = self.fresh("ScWide")
+        holder = self.fresh("sch")
+        log = self.fresh("scl")
+        bump = self.fresh("scg")
+        tobj = self.fresh("sct")
+        flag = self.fresh("scz")
+        classes = [
+            f"class {base} {{\n"
+            f"    pub var k: int\n"
+            f"    pub var hits: int\n"
+            f"    pub fn init(self, k: int) {{\n"
+            f"        self.k = k\n"
+            f"        self.hits = 0\n"
+            f"    }}\n"
+            f"}}",
+            f"class {wide} extends {base} {{\n"
+            f"    pub var extra: int\n"
+            f"    fn init(self, k: int) {{\n"
+            f"        super.init(k)\n"
+            f"        self.extra = 7\n"
+            f"    }}\n"
+            f"}}",
+        ]
+        helpers = [
+            f"var {holder}: {base} = {base}({sr.randint(1, 9)})\n"
+            f"var {log}: list[int] = []\n"
+            f"var {bump} = 0\n"
+            f"var {tobj}: {base} = {base}(0)\n"
+            f"var {flag} = false",
+        ]
+        effect = sr.choice([
+            f"{log}.push(n +% 1)",
+            f"{bump} = {bump} +% n +% 1",
+            f"{tobj}.hits = {tobj}.hits +% n +% 1",
+        ])
+        # The nullable form deoptimises on the self-call's own result record
+        # rather than on a guard: the outer level returns what it got, so the
+        # compiled self-call takes an int and the finished leaf answers null.
+        nullable = sr.random() < 0.25
+        rt = "int?" if nullable else "int"
+        rec = self.fresh("scr")
+        if nullable:
+            helpers.append(
+                f"fn {rec}(n: int) -> int? {{\n"
+                f"    if n > 0 {{\n"
+                f"        let v = {rec}(n - 1)\n"
+                f"        return v\n"
+                f"    }}\n"
+                f"    let gg = |y| y + n\n"
+                f"    {effect}\n"
+                f"    if {flag} {{\n"
+                f"        return null\n"
+                f"    }}\n"
+                f"    return {sr.randint(0, 9)}\n"
+                f"}}")
+        elif sr.random() < 0.5:
+            helpers.append(
+                f"fn {rec}(n: int) -> int {{\n"
+                f"    if n > 0 {{\n"
+                f"        let v = {rec}(n - 1)\n"
+                f"        return v + {holder}.k\n"
+                f"    }}\n"
+                f"    let gg = |y| y + n\n"
+                f"    {effect}\n"
+                f"    return {sr.randint(0, 9)}\n"
+                f"}}")
+        else:
+            # Every instruction of the recursive body compiles and none of
+            # them writes; the effect is in the callee's interpreted tail.
+            tw = self.fresh("scw")
+            helpers.append(
+                f"fn {tw}(n: int) -> int {{\n"
+                f"    if n > 100000 {{\n"
+                f"        return n\n"
+                f"    }}\n"
+                f"    let gg = |y| y + n\n"
+                f"    {effect}\n"
+                f"    return {sr.randint(0, 9)}\n"
+                f"}}")
+            helpers.append(
+                f"fn {rec}(n: int) -> int {{\n"
+                f"    if n > 0 {{\n"
+                f"        let v = {rec}(n - 1)\n"
+                f"        return v + {holder}.k\n"
+                f"    }}\n"
+                f"    return {tw}(n) + 0\n"
+                f"}}")
+        # The caller has to answer null; any non-null answer is a small int.
+        miss = sr.randint(10, 99)
+        settle = (f"    if q is null {{\n"
+                  f"        return {miss}\n"
+                  f"    }}\n") if nullable else ""
+        arg = f"n % {sr.randint(2, 4)} + {sr.randint(0, 1)}"
+        lines = []
+        site = sr.randrange(5)
+        if nullable and site in (2, 3):
+            site -= 2
+        if site == 0:
+            # Through a function parameter: the closure-call arm.
+            via = self.fresh("scv")
+            helpers.append(
+                f"fn {via}(f: fn(int) -> {rt}, x: int) -> int {{\n"
+                f"    let q = f(x)\n"
+                f"{settle}"
+                f"    return q + 0\n"
+                f"}}")
+            lines.append(f"acc = acc +% {via}({rec}, {arg})")
+        elif site == 1:
+            # A direct call from a compiled forwarder: emitDirectCall.
+            drive = self.fresh("scd")
+            helpers.append(
+                f"fn {drive}(x: int) -> int {{\n"
+                f"    let q = {rec}(x)\n"
+                f"{settle}"
+                f"    return q + 0\n"
+                f"}}")
+            lines.append(f"acc = acc +% {drive}({arg})")
+        elif site == 2:
+            # A function value held in the probe's own local.
+            g = self.fresh("g")
+            lines.append(f"let {g}: fn(int) -> int = {rec}")
+            lines.append(f"acc = acc +% {g}({arg})")
+        elif site == 3:
+            # A direct call in the probe itself.
+            lines.append(f"acc = acc +% {rec}({arg})")
+        else:
+            # A loop calling it through a parameter, for the OSR tier.
+            loop = self.fresh("scp")
+            use = (f"        if q is not null {{\n"
+                   f"            t = t + q\n"
+                   f"        }}\n") if nullable else f"        t = t + q\n"
+            helpers.append(
+                f"fn {loop}(f: fn(int) -> {rt}, k: int) -> int {{\n"
+                f"    var t = 0\n"
+                f"    for i in 0..k {{\n"
+                f"        let q = f(i % 3 + 1)\n"
+                f"{use}"
+                f"    }}\n"
+                f"    return t\n"
+                f"}}")
+            lines.append(f"acc = acc +% {loop}({rec}, n % 4 + 1)")
+        lo = max(1, warm // 4)
+        hi = max(lo, (3 * warm) // 4)
+        swap = sr.randint(lo, hi)
+        head = Node(f"if n == {swap} {{",
+                    [line(f"{holder} = {wide}({sr.randint(1, 9)})"),
+                     line(f"{flag} = true")],
+                    "}")
+        tail = (f"acc = acc +% {log}.len() +% {bump} +% {tobj}.hits")
+        return classes, helpers, Node(*head.parts, *lines, tail)
+
     def build(self):
         r = self.rng
         self.mixers = []
@@ -2072,6 +2249,14 @@ class Gen:
             self.prog.helpers.extend(helpers)
             probes = self.prog.probes
             probes[dr.randrange(len(probes))].body.append(node)
+        # After it, on a stream of its own, for the same reason.
+        sr = random.Random(f"self-call/{self.prog.seed}")
+        if sr.random() < SELF_CALL_RATE:
+            classes, helpers, node = self.self_call(sr)
+            self.prog.classes.extend(classes)
+            self.prog.helpers.extend(helpers)
+            probes = self.prog.probes
+            probes[sr.randrange(len(probes))].body.append(node)
         return self.prog
 
     # -- allocation sinking (src/vm/jit/jit_sink.c) --------------------------
