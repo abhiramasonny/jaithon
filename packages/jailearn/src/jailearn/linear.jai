@@ -25,7 +25,7 @@ from .base import Estimator, EstimatorKind, Params
 from .base import affine_columns, cached_kernel, check_fitted, check_matrix, check_pair
 from .base import check_width, cholesky_solve, column_moments, param_bool, param_float
 from .base import HOST_SOLVE_ORDER, LabelIndex, host_cholesky_solve, param_int, params_of
-from .base import require_target
+from .base import require_target, row_argmax
 from .shared import Descent, linear_scores
 
 let SOURCE = """#include <metal_stdlib>
@@ -131,6 +131,49 @@ kernel void lin_logit_rows_fused(device const float* design [[buffer(0)]],
     float loss = max(-signed_margin, 0.0f) + log(1.0f + exp(-fabs(signed_margin)));
     target[padded / 4u] = float4(positive ? -q : p, loss, 0.0f, 0.0f);
     for (uint j = padded / 4u + 1u; j < stride / 4u; ++j) target[j] = 0.0f;
+}
+
+/* One row of a multinomial logistic loss: from the scores `z` (`zstride`
+ * wide, `classes` used) the softmax `p`, then `[p - onehot(t) | loss | 0..]`
+ * into `out` (`stride` wide). `outT . design` is then the gradient in its
+ * first `classes` rows and, through the design's ones column, the total
+ * loss in the next. Shifted by the row maximum, so no score overflows. */
+kernel void lin_softmax_rows(device const float* z [[buffer(0)]],
+                             device const float* t [[buffer(1)]],
+                             device float* out [[buffer(2)]],
+                             constant uint& rows [[buffer(3)]],
+                             constant uint& classes [[buffer(4)]],
+                             constant uint& zstride [[buffer(5)]],
+                             constant uint& stride [[buffer(6)]],
+                             uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    device const float* scores = z + ulong(row) * zstride;
+    device float* target = out + ulong(row) * stride;
+    float peak = scores[0];
+    for (uint k = 1u; k < classes; ++k) peak = max(peak, scores[k]);
+    float total = 0.0f;
+    for (uint k = 0u; k < classes; ++k) total += exp(scores[k] - peak);
+    float lse = peak + log(total);
+    uint label = uint(t[row] + 0.5f);
+    for (uint k = 0u; k < classes; ++k) {
+        target[k] = exp(scores[k] - lse) - (k == label ? 1.0f : 0.0f);
+    }
+    target[classes] = lse - scores[min(label, classes - 1u)];
+    for (uint k = classes + 1u; k < stride; ++k) target[k] = 0.0f;
+}
+
+/* Softmax across each row of `[rows, classes]` scores, in place. */
+kernel void lin_softmax(device float* m [[buffer(0)]],
+                        constant uint& rows [[buffer(1)]],
+                        constant uint& classes [[buffer(2)]],
+                        uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    device float* line = m + ulong(row) * classes;
+    float peak = line[0];
+    for (uint k = 1u; k < classes; ++k) peak = max(peak, line[k]);
+    float total = 0.0f;
+    for (uint k = 0u; k < classes; ++k) total += exp(line[k] - peak);
+    for (uint k = 0u; k < classes; ++k) line[k] = exp(line[k] - peak) / total;
 }
 
 /* The normal equations' operand for a ridge fit, `stride` columns a row:
@@ -563,10 +606,12 @@ pub fn linear_regression(fit_intercept: bool = true) -> Ridge {
 
 fn round_up4(n: int) -> int { return (n + 3) // 4 * 4 }
 
-#: Two-class logistic regression with scikit-learn's objective:
-#: `C * sum(log(1 + exp(-y z))) + |w|^2 / 2`, the intercept unpenalised.
+#: Logistic regression with scikit-learn's objective:
+#: `C * sum(log(1 + exp(-y z))) + |w|^2 / 2` for two classes, the
+#: multinomial (softmax) loss for more, the intercepts unpenalised.
 #:
-#: Fitted by Newton's method rather than scikit-learn's L-BFGS. With the
+#: More than two classes take `fit_multinomial` (L-BFGS, as scikit-learn).
+#: Two are fitted by Newton's method rather than scikit-learn's L-BFGS. With the
 #: features in the tens, the Hessian is small enough to solve on the host
 #: (`host_cholesky_solve`) and costs one product to form, so each iteration is
 #: two dispatches over the samples and one read back of a `(d+1) x (d+3)`
@@ -590,6 +635,8 @@ pub class LogisticRegression: Estimator {
     pub var tol: float
     pub var coef_: Tensor?
     pub var intercept_: float
+    #: One intercept a row of `coef_`: `[intercept_]` for two classes.
+    pub var intercepts_: list[float]
     pub var classes_: list[float]
     pub var n_iter_: int
     pub var converged_: bool
@@ -611,6 +658,7 @@ pub class LogisticRegression: Estimator {
         self.tol = tol
         self.coef_ = null
         self.intercept_ = 0.0
+        self.intercepts_ = []
         self.classes_ = []
         self.n_iter_ = 0
         self.converged_ = false
@@ -626,15 +674,18 @@ pub class LogisticRegression: Estimator {
         check_pair(x, target)
         self.free()
         let labels = LabelIndex.from_labels(target)
-        if labels.count() != 2 {
-            let count = labels.count()
+        if labels.count() < 2 {
             labels.free()
-            throw ValueError(f"LogisticRegression here is two-class; y has {count} classes")
+            throw ValueError("LogisticRegression needs samples of at least two classes")
         }
         self.labels = labels
         self.classes_ = labels.classes
         let codes = labels.encode(target)
         defer { codes.free() }
+        if labels.count() > 2 {
+            self.fit_multinomial(x, codes, labels.count())
+            return
+        }
 
         let rows = x.shape[0]
         let width = x.shape[1]
@@ -729,23 +780,174 @@ pub class LogisticRegression: Estimator {
         self.converged_ = descent.converged
         self.coef_ = Tensor([1, width], theta[0:width])
         self.intercept_ = if self.fit_intercept { theta[width] } else { 0.0 }
+        self.intercepts_ = [self.intercept_]
     }
 
-    #: `X . coef_ + intercept_`, the log-odds of the second class.
+    #: More than two classes: scikit-learn's multinomial objective,
+    #: `C * sum(-log softmax(W x + b)[y]) + |W|^2 / 2`, by L-BFGS -- the
+    #: solver scikit-learn uses for it -- with every function evaluation on
+    #: the device: the scores as one product, `lin_softmax_rows`, and the
+    #: gradient and the loss as a second product read back together. The
+    #: Hessian is `(classes x features)^2` here and would take a product per
+    #: pair of classes to form, which is why Newton stays two-class.
+    #:
+    #: Stops when the largest gradient component of the mean loss is at most
+    #: `tol`, scikit-learn's criterion for the same solver.
+    fn fit_multinomial(self, x: Tensor, codes: Tensor, classes: int) -> void {
+        let rows = x.shape[0]
+        let width = x.shape[1]
+        self.width = width
+        let padded = round_up4(width + 1)
+        let lanes = round_up4(classes)
+        let stride = round_up4(classes + 1)
+        let order = if self.fit_intercept { width + 1 } else { width }
+        let count = classes * order
+        let design = Tensor([rows, padded])
+        defer { design.free() }
+        linear_kernel("lin_augment").dispatch_async(
+            [x.buffer(), design.buffer()],
+            rows * padded,
+            [rows, width, padded]
+        )
+        let weights = Tensor([lanes, padded])
+        defer { weights.free() }
+        let residual = Tensor([rows, stride])
+        defer { residual.free() }
+        let c = self.C
+        let mean_scale = 1.0 / (c * float(rows))
+
+        let evaluate = fn(theta: list[float]) -> tuple[float, list[float]] {
+            var w = [0.0] * (lanes * padded)
+            for k in 0..classes {
+                for j in 0..order { w[k * padded + j] = theta[k * order + j] }
+            }
+            weights.upload(w)
+            let scores = jt.matmul(design, weights, trans_b: true)
+            linear_kernel("lin_softmax_rows").dispatch_async(
+                [scores.buffer(), codes.buffer(), residual.buffer()],
+                rows,
+                [rows, classes, lanes, stride]
+            )
+            scores.free()
+            let product = jt.matmul(residual, design, trans_a: true)
+            let g = product.download()
+            product.free()
+            var penalty = 0.0
+            var gradient = [0.0] * count
+            for k in 0..classes {
+                for j in 0..order {
+                    let at = k * order + j
+                    let ridge = if j < width { theta[at] } else { 0.0 }
+                    penalty += ridge * ridge
+                    gradient[at] = c * g[k * padded + j] + ridge
+                }
+            }
+            return (c * g[classes * padded + width] + 0.5 * penalty, gradient)
+        }
+
+        var theta = [0.0] * count
+        var (objective, gradient) = evaluate(theta)
+        var steps: list[list[float]] = []
+        var turns: list[list[float]] = []
+        var weights_of: list[float] = []
+        var iterations = 0
+        var converged = false
+        while iterations < self.max_iter {
+            var largest = 0.0
+            for value in gradient { largest = max(largest, math.fabs(value)) }
+            if largest * mean_scale <= self.tol {
+                converged = true
+                break
+            }
+            let direction = lbfgs_direction(gradient, steps, turns, weights_of)
+            var slope = dot_of(gradient, direction)
+            if slope >= 0.0 {
+                steps = []
+                turns = []
+                weights_of = []
+                for index in 0..count { direction[index] = -gradient[index] / largest }
+                slope = dot_of(gradient, direction)
+            }
+            var t = 1.0
+            var trial = [0.0] * count
+            var (next_objective, next_gradient) = (objective, gradient)
+            for _halving in 0..40 {
+                for index in 0..count { trial[index] = theta[index] + t * direction[index] }
+                let (value, slopes) = evaluate(trial)
+                next_objective = value
+                next_gradient = slopes
+                #: The loss is a float32 sum, good to about a millionth of
+                #: itself; near the optimum the decrease Armijo asks for is
+                #: smaller than that, and demanding it anyway stalls the
+                #: search a thousandth short of where the gradient says the
+                #: optimum is. So a step inside the sum's rounding passes.
+                let noise = 1.0e-6 * math.fabs(objective)
+                if value <= objective + 1.0e-4 * t * slope + noise { break }
+                t *= 0.5
+            }
+            var step = [0.0] * count
+            var turn = [0.0] * count
+            for index in 0..count {
+                step[index] = trial[index] - theta[index]
+                turn[index] = next_gradient[index] - gradient[index]
+            }
+            let curvature = dot_of(step, turn)
+            if curvature > 1.0e-12 * math.sqrt(dot_of(step, step) * dot_of(turn, turn)) {
+                steps.push(step)
+                turns.push(turn)
+                weights_of.push(1.0 / curvature)
+                if steps.len() > LBFGS_MEMORY {
+                    steps = steps[1:]
+                    turns = turns[1:]
+                    weights_of = weights_of[1:]
+                }
+            }
+            theta = trial
+            objective = next_objective
+            gradient = next_gradient
+            iterations += 1
+        }
+        self.n_iter_ = iterations
+        self.converged_ = converged
+        var coef = [0.0] * (classes * width)
+        var bias: list[float] = []
+        for k in 0..classes {
+            for j in 0..width { coef[k * width + j] = theta[k * order + j] }
+            bias.push(if self.fit_intercept { theta[k * order + width] } else { 0.0 })
+        }
+        self.coef_ = Tensor([classes, width], coef)
+        self.intercepts_ = bias
+        self.intercept_ = 0.0
+    }
+
+    fn multinomial(self) -> bool { return self.classes_.len() > 2 }
+
+    #: `X . coef_ + intercept_`: the log-odds of the second class as
+    #: `[n_samples]` for two classes, each class's score as `[n_samples,
+    #: n_classes]` beyond.
     pub fn decision_function(self, x: Tensor) -> Tensor {
         check_fitted(self.is_fitted(), "LogisticRegression")
         check_width(x, self.width, "LogisticRegression")
         let coef = self.coef_
         if coef is null { throw RuntimeError("LogisticRegression lost its coefficients") }
-        let bias = Tensor([1], [self.intercept_])
+        let bias = Tensor([self.intercepts_.len()], self.intercepts_)
         defer { bias.free() }
         let scores = linear_scores(x, coef, bias)
+        if self.multinomial() { return scores }
         return jt.reshape(scores, [x.shape[0]])
     }
 
-    #: `[n_samples, 2]`, the columns in the order of `classes_`.
+    #: `[n_samples, n_classes]`, the columns in the order of `classes_`.
     pub fn predict_proba(self, x: Tensor) -> Tensor {
         let scores = self.decision_function(x)
+        if self.multinomial() {
+            linear_kernel("lin_softmax").dispatch_async(
+                [scores.buffer()],
+                x.shape[0],
+                [x.shape[0], self.classes_.len()]
+            )
+            return scores
+        }
         defer { scores.free() }
         let out = Tensor([x.shape[0], 2])
         linear_kernel("lin_logit_proba").dispatch_async(
@@ -756,10 +958,18 @@ pub class LogisticRegression: Estimator {
         return out
     }
 
-    #: The second class where the log-odds are positive, as scikit-learn.
+    #: The second class where the log-odds are positive, as scikit-learn; with
+    #: more classes the highest score, the first in `classes_` on a tie.
     pub fn predict(self, x: Tensor) -> Tensor {
         let scores = self.decision_function(x)
         defer { scores.free() }
+        let labels = self.labels
+        if labels is null { throw RuntimeError("LogisticRegression lost its classes") }
+        if self.multinomial() {
+            let winners = row_argmax(scores)
+            defer { winners.free() }
+            return labels.decode(winners)
+        }
         let codes = Tensor([x.shape[0]])
         defer { codes.free() }
         linear_kernel("lin_threshold").dispatch_async(
@@ -767,8 +977,6 @@ pub class LogisticRegression: Estimator {
             x.shape[0],
             [x.shape[0]]
         )
-        let labels = self.labels
-        if labels is null { throw RuntimeError("LogisticRegression lost its classes") }
         return labels.decode(codes)
     }
 
@@ -805,6 +1013,55 @@ pub class LogisticRegression: Estimator {
         self.labels = null
         self.intercept_ = 0.0
     }
+}
+
+#: How many curvature pairs L-BFGS keeps, scikit-learn's (scipy's) default.
+const LBFGS_MEMORY: int = 10
+
+fn dot_of(a: list[float], b: list[float]) -> float {
+    var total = 0.0
+    for index in 0..a.len() { total += a[index] * b[index] }
+    return total
+}
+
+#: The L-BFGS direction `-H g` by the two-loop recursion over the kept pairs,
+#: scaled by the newest pair's curvature (or by the gradient's size before
+#: there is one).
+fn lbfgs_direction(
+    gradient: list[float],
+    steps: list[list[float]],
+    turns: list[list[float]],
+    weights: list[float]
+) -> list[float] {
+    let count = gradient.len()
+    var q = [value for value in gradient]
+    let pairs = steps.len()
+    var alphas = [0.0] * pairs
+    var index = pairs - 1
+    while index >= 0 {
+        let alpha = weights[index] * dot_of(steps[index], q)
+        alphas[index] = alpha
+        let turn = turns[index]
+        for slot in 0..count { q[slot] -= alpha * turn[slot] }
+        index -= 1
+    }
+    var gamma = 1.0
+    if pairs > 0 {
+        let last = turns[pairs - 1]
+        gamma = dot_of(steps[pairs - 1], last) / dot_of(last, last)
+    } else {
+        var largest = 0.0
+        for value in gradient { largest = max(largest, math.fabs(value)) }
+        gamma = 1.0 / max(largest, 1.0)
+    }
+    for slot in 0..count { q[slot] *= gamma }
+    for pair in 0..pairs {
+        let beta = weights[pair] * dot_of(turns[pair], q)
+        let step = steps[pair]
+        for slot in 0..count { q[slot] += step[slot] * (alphas[pair] - beta) }
+    }
+    for slot in 0..count { q[slot] = -q[slot] }
+    return q
 }
 
 #: Solve `H d = g`, damping the diagonal by growing multiples of its largest

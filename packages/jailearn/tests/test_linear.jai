@@ -322,6 +322,81 @@ fn test_logistic_regression_matches_sklearn() -> void {
     assert_near(scores.download()[0], math.log(0.8840213 / 0.1159787), 1e-3, "decision_function")
 }
 
+#: Three classes from the same rows: scikit-learn's multinomial fit
+#: (`tol=1e-12`), at two settings, coefficients and intercepts.
+fn test_multinomial_logistic_regression_matches_sklearn() -> void {
+    if not have_gpu() { return }
+    let (x, _two) = logistic_data()
+    defer { x.free() }
+    defer { _two.free() }
+    let weights = [[1.0, -0.5, 0.3, 0.0, 0.8], [-0.7, 1.2, 0.0, 0.4, -0.3], [0.2, 0.1, -1.1, 0.9, 0.0]]
+    let values = x.download()
+    var labels: list[float] = []
+    for i in 0..200 {
+        var best = 0
+        var top = -1.0e30
+        for k in 0..3 {
+            var score = 0.6 * math.sin(2.7 * float(i) + 1.9 * float(k))
+            for j in 0..5 { score += values[i * 5 + j] * weights[k][j] }
+            if score > top {
+                top = score
+                best = k
+            }
+        }
+        labels.push([5.0, 7.0, 9.0][best])
+    }
+    let y = Tensor([200], labels)
+    defer { y.free() }
+    let cases: list[tuple[float, bool, list[float], list[float]]] = [
+        (1.0, true, [
+            0.921495, -1.1577, 0.745035, -0.690657, 0.773432,
+            -0.912808, 1.500597, 0.829982, -0.074597, -0.483631,
+            -0.008687, -0.342898, -1.575017, 0.765254, -0.289802,
+        ], [0.46118, -0.646521, 0.185341]),
+        (0.3, false, [
+            1.050079, -0.897648, 0.564756, -0.404177, 0.72196,
+            -1.047837, 1.129401, 0.582024, -0.140759, -0.505767,
+            -0.002242, -0.231753, -1.14678, 0.544936, -0.216193,
+        ], [0.0, 0.0, 0.0]),
+    ]
+    for (c, intercept, coef, bias) in cases {
+        let model = LogisticRegression(C: c, fit_intercept: intercept, tol: 1.0e-7, max_iter: 500)
+        model.fit(x, y)
+        assert_true(model.converged_, f"C {c} converged in {model.n_iter_}")
+        let fitted = model.coef_
+        if fitted is not null {
+            assert_eq(fitted.shape, [3, 5])
+            let got = fitted.download()
+            for (index, want) in coef.enumerate() {
+                assert_near(got[index], want, 1e-3 * max(1.0, math.fabs(want)), f"C {c} coef {index}")
+            }
+        }
+        for (index, want) in bias.enumerate() {
+            assert_near(model.intercepts_[index], want, 1e-3, f"C {c} intercept {index}")
+        }
+        model.free()
+    }
+
+    let model = LogisticRegression(tol: 1.0e-7, max_iter: 500)
+    defer { model.free() }
+    model.fit(x, y)
+    assert_close(model.classes_, [5.0, 7.0, 9.0], "classes_")
+    let head = x.view(0, [6, 5])
+    defer { head.free() }
+    let predicted = model.predict(head)
+    defer { predicted.free() }
+    assert_close(predicted.download(), [7.0, 7.0, 9.0, 9.0, 5.0, 5.0], "multinomial predict")
+    let proba = model.predict_proba(head)
+    defer { proba.free() }
+    assert_eq(proba.shape, [6, 3])
+    let shares = proba.download()
+    let want = [0.273362, 0.69505, 0.031588, 0.276119, 0.667641, 0.05624]
+    for index in 0..6 { assert_near(shares[index], want[index], 1e-4, f"multinomial proba {index}") }
+    let scores = model.decision_function(head)
+    defer { scores.free() }
+    assert_eq(scores.shape, [6, 3])
+}
+
 fn test_logistic_regression_keeps_the_contract() -> void {
     if not have_gpu() { return }
     let (x, y) = logistic_data()
@@ -342,9 +417,9 @@ fn test_logistic_regression_keeps_the_contract() -> void {
     assert_true(not fresh.is_fitted(), "a clone is unfitted")
     assert_throws(ValueError, || LogisticRegression(C: 0.0))
 
-    let three = Tensor([200], [float(i % 3) for i in 0..200])
-    defer { three.free() }
-    assert_throws(ValueError, || model.fit(x, three))
+    let one = Tensor([200], [4.0 for _i in 0..200])
+    defer { one.free() }
+    assert_throws(ValueError, || model.fit(x, one))
 
     #: One step cannot converge, and says so.
     let short = LogisticRegression(max_iter: 1)
