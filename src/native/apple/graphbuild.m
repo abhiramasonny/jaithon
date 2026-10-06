@@ -44,6 +44,10 @@ struct JaiGraphPlan {
     void *executable;   /* MPSGraphExecutable *, +1 */
     void *inputShapes;  /* NSArray<NSArray<NSNumber *> *> *, +1 */
     void *outputShapes; /* NSArray<NSArray<NSNumber *> *> *, +1 */
+    /* NSArray<NSNumber *> *, +1, or NULL when the executable takes its inputs
+     * in the caller's order: for each of the executable's inputs, which of
+     * the caller's it is. */
+    void *feedOrder;
     int   inputCount;
     int   outputCount;
     /* Which way this plan reaches the hardware: 0 not decided yet, 1 encoded
@@ -560,21 +564,41 @@ int jaiGraphResize(JaiGraphBuilder *b, int x, int height, int width,
             MPSGraphTensor *size = [g constantWithData:data
                                                  shape:@[ @2 ]
                                               dataType:MPSDataTypeInt32];
+            MPSGraphTensor *resized = nil;
             if (bilinear) {
-                return record(b, [g resizeBilinearWithTensor:in
-                                                  sizeTensor:size
-                                                centerResult:center != 0
-                                                alignCorners:corners != 0
-                                                      layout:MPSGraphTensorNamedDataLayoutNCHW
-                                                        name:nil]);
+                resized = [g resizeBilinearWithTensor:in
+                                           sizeTensor:size
+                                         centerResult:center != 0
+                                         alignCorners:corners != 0
+                                               layout:MPSGraphTensorNamedDataLayoutNCHW
+                                                 name:nil];
+            } else {
+                resized = [g resizeNearestWithTensor:in
+                                          sizeTensor:size
+                                 nearestRoundingMode:(MPSGraphResizeNearestRoundingMode)rounding
+                                        centerResult:center != 0
+                                        alignCorners:corners != 0
+                                              layout:MPSGraphTensorNamedDataLayoutNCHW
+                                                name:nil];
             }
-            return record(b, [g resizeNearestWithTensor:in
-                                             sizeTensor:size
-                                    nearestRoundingMode:(MPSGraphResizeNearestRoundingMode)rounding
-                                           centerResult:center != 0
-                                           alignCorners:corners != 0
-                                                 layout:MPSGraphTensorNamedDataLayoutNCHW
-                                                   name:nil]);
+            if (resized == nil) return -1;
+            /* The size is a constant, but the shape inference that ships with
+             * macOS 27 does not look inside it: every sizeTensor resize comes
+             * back [-1, -1, -1, -1], and so does everything downstream of it
+             * until something reshapes. A reshape to the size this call was
+             * given puts the shape back. The static resizeTensor:size: would
+             * do that by itself, but it has no nearest rounding mode, and the
+             * rounding mode is what ONNX's nearest resize is about. N and C
+             * have to be known for the reshape to say anything true; when they
+             * are not, the compile asks the executable instead. */
+            NSArray<NSNumber *> *from = in.shape;
+            if (from != nil && from.count == 4 && from[0].longLongValue >= 0 &&
+                from[1].longLongValue >= 0) {
+                resized = [g reshapeTensor:resized
+                                 withShape:@[ from[0], from[1], @(height), @(width) ]
+                                      name:nil];
+            }
+            return record(b, resized);
         }
         return -1;
     }
@@ -895,10 +919,79 @@ JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCo
                                             compilationDescriptor:descriptor];
         if (executable == nil) return NULL;
 
+        /* The executable takes its inputs in its own order, not the caller's.
+         * Every caller so far created its placeholders in the order it lists
+         * them, and MPSGraph happens to keep that order, but nothing promises
+         * it -- so the plan records where each of the executable's inputs
+         * comes from, and a run hands them over in that order. */
+        NSArray<MPSGraphTensor *> *feedTensors = executable.feedTensors;
+        NSMutableArray<NSNumber *> *feedOrder = nil;
+        if (feedTensors != nil && (int)feedTensors.count == inputCount) {
+            for (NSUInteger at = 0; at < feedTensors.count; at++) {
+                int source = -1;
+                for (int i = 0; i < inputCount; i++) {
+                    if (tensorAt(b, inputs[i]) == feedTensors[at]) {
+                        source = i;
+                        break;
+                    }
+                }
+                if (source < 0) return NULL;
+                if (feedOrder == nil && source != (int)at) {
+                    feedOrder = [NSMutableArray arrayWithCapacity:feedTensors.count];
+                    for (NSUInteger before = 0; before < at; before++) {
+                        [feedOrder addObject:@(before)];
+                    }
+                }
+                if (feedOrder != nil) [feedOrder addObject:@(source)];
+            }
+        } else if (inputCount > 0) {
+            return NULL;
+        }
+
+        /* A shape the builder could not settle is asked of the executable,
+         * which knows the input shapes it was compiled for and so can say
+         * what comes out. Shape inference on a sizeTensor resize is the case
+         * that needs it today, when the resize's batch or channels were not
+         * known either. An output that is still open after that has no
+         * buffer that could be sized for it, so there is no plan. */
+        bool open = false;
+        for (NSArray<NSNumber *> *shape in outShapes) {
+            for (NSNumber *dim in shape) {
+                if (dim.longLongValue < 0) open = true;
+            }
+        }
+        if (open) {
+            if (@available(macOS 14.0, *)) {
+                NSMutableArray<MPSGraphShapedType *> *types =
+                    [NSMutableArray arrayWithCapacity:feedTensors.count];
+                for (MPSGraphTensor *tensor in feedTensors) [types addObject:feeds[tensor]];
+                MPSGraphDevice *device =
+                    [MPSGraphDevice deviceWithMTLDevice:jaiGpuMetalDevice()];
+                NSArray<MPSGraphShapedType *> *settled =
+                    [executable getOutputTypesWithDevice:device
+                                              inputTypes:types
+                                   compilationDescriptor:descriptor];
+                if (settled == nil || settled.count != (NSUInteger)outputCount) return NULL;
+                for (int i = 0; i < outputCount; i++) {
+                    NSArray<NSNumber *> *shape = settled[(NSUInteger)i].shape;
+                    if (shape == nil) return NULL;
+                    outShapes[(NSUInteger)i] = shape;
+                }
+            } else {
+                return NULL;
+            }
+            for (NSArray<NSNumber *> *shape in outShapes) {
+                for (NSNumber *dim in shape) {
+                    if (dim.longLongValue < 0) return NULL;
+                }
+            }
+        }
+
         JaiGraphPlan *plan = JAI_ALLOC(JaiGraphPlan, 1);
         plan->executable = (__bridge_retained void *)executable;
         plan->inputShapes = (__bridge_retained void *)[inShapes copy];
         plan->outputShapes = (__bridge_retained void *)[outShapes copy];
+        plan->feedOrder = feedOrder != nil ? (__bridge_retained void *)[feedOrder copy] : NULL;
         plan->inputCount = inputCount;
         plan->outputCount = outputCount;
         plan->route = forcedRoute();
@@ -1032,6 +1125,13 @@ bool jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOffsets
             if (data == nil) return false;
             [feeds addObject:data];
         }
+        if (plan->feedOrder != NULL) {
+            NSArray<NSNumber *> *order = (__bridge NSArray *)plan->feedOrder;
+            NSMutableArray<MPSGraphTensorData *> *ordered =
+                [NSMutableArray arrayWithCapacity:feeds.count];
+            for (NSNumber *source in order) [ordered addObject:feeds[source.unsignedIntegerValue]];
+            feeds = ordered;
+        }
         NSMutableArray<MPSGraphTensorData *> *results = [NSMutableArray new];
         for (int i = 0; i < plan->outputCount; i++) {
             MPSGraphTensorData *data = (__bridge_transfer MPSGraphTensorData *)
@@ -1074,6 +1174,7 @@ void jaiGraphPlanFree(JaiGraphPlan *plan) {
         CFBridgingRelease(plan->executable);
         CFBridgingRelease(plan->inputShapes);
         CFBridgingRelease(plan->outputShapes);
+        if (plan->feedOrder != NULL) CFBridgingRelease(plan->feedOrder);
     }
     JAI_FREE(JaiGraphPlan, plan);
 }
