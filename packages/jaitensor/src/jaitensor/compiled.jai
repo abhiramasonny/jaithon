@@ -593,6 +593,46 @@ pub fn set_compiled_step(on: bool) -> void { _allowed = if on { 1 } else { 0 } }
 #: turns it off can put it back the way it found it.
 pub fn compiled_step_allowed() -> bool { return allowed() }
 
+var _route_policy: str? = null
+
+#: How a step's plan picks between encoding into the shared command buffer
+#: and letting the platform run it.
+#:
+#: A step is called back to back, a batch at a time, so what matters is how
+#: many go through a second, not how long one takes: encoding returns at once
+#: and lets the next batch's staging overlap this one's arithmetic, where a run
+#: blocks on every call. The plan's own default times one call at a time, and
+#: on a [784-512-512-10] step the two read within noise that way, so the route
+#: was a coin toss -- 273 ms in one process and 176-186 in three, 302 ms run
+#: and 202 encode when each was forced. "throughput" asks the plan to time
+#: calls back to back instead.
+#:
+#: `JAITENSOR_STEP_ROUTE_POLICY=latency` asks for the one-call rule, for an A/B
+#: in one binary. Read once.
+fn route_policy() -> str {
+    if _route_policy is null {
+        _route_policy = if (env("JAITENSOR_STEP_ROUTE_POLICY") ?? "") == "latency" {
+            "latency"
+        } else {
+            "throughput"
+        }
+    }
+    return _route_policy ?? "throughput"
+}
+
+#: Compile a step's plan under `route_policy`.
+#:
+#: A runtime whose `graph_compile` takes no policy rejects the fourth argument
+#: with a TypeError before it builds anything. Such a runtime only has the
+#: one-call rule, so the step is compiled under that.
+fn compile_plan(builder: int, inputs: list[int], outputs: list[int]) -> int {
+    try {
+        return __prim__.graph_compile(builder, inputs, outputs, route_policy())
+    } catch _error: TypeError {
+        return __prim__.graph_compile(builder, inputs, outputs)
+    }
+}
+
 var _flat = -1
 
 fn flat_policy() -> int {
@@ -853,7 +893,7 @@ pub fn compile_step(
     for id in updated { outputs.push(id) }
     for id in carried_out { outputs.push(id) }
 
-    let handle = __prim__.graph_compile(builder, inputs, outputs)
+    let handle = compile_plan(builder, inputs, outputs)
     if handle < 0 {
         _refusal = "the step would not compile"
         return null
