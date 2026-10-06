@@ -267,8 +267,19 @@ kernel void mha_scores_mma(device const float* a [[buffer(0)]],
     uint tile_n = rest % tiles;
     uint head = rest / tiles;
     /* Causal: a patch wholly above the diagonal is masked, and nothing
-     * downstream reads it. */
-    if (causal != 0u && tile_n > tile_m) return;
+     * downstream reads it, so the grid holds only the lower triangle --
+     * tiles * (tiles + 1) / 2 patches a head -- and `wid` counts along it
+     * row by row. */
+    if (causal != 0u) {
+        uint triangle = tiles * (tiles + 1u) / 2u;
+        uint t = wid % triangle;
+        head = wid / triangle;
+        tile_m = uint((sqrt(8.0f * float(t) + 1.0f) - 1.0f) * 0.5f);
+        while ((tile_m + 1u) * (tile_m + 2u) / 2u <= t) tile_m++;
+        while (tile_m * (tile_m + 1u) / 2u > t) tile_m--;
+        tile_n = t - tile_m * (tile_m + 1u) / 2u;
+    }
+    if (head >= heads) return;
     uint m0 = tile_m * 64u + sg * 32u;
     uint n0 = tile_n * 64u;
     device const float* A = a + (ulong)head * hd + (ulong)m0 * dim;

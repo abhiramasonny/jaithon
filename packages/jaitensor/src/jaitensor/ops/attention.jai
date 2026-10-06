@@ -191,6 +191,13 @@ fn release_unrecorded(tensor: Tensor) -> void {
     if tensor.creator is null { tensor.free() }
 }
 
+#: Threadgroups `mha_scores_mma` needs per head: every 64x64 patch, or with a
+#: causal mask only those on or below the diagonal.
+fn score_patches(tiles: int, causal: bool) -> int {
+    if causal { return tiles * (tiles + 1) // 2 }
+    return tiles * tiles
+}
+
 #: Whether the batched simdgroup-matrix attention kernels can take this shape.
 #:
 #: They tile in 8x8 fragments with no partial-tile masking, so the sequence
@@ -242,7 +249,7 @@ fn mha_by_mma(
     let probs = Tensor([heads * seq, seq])
     cached_attn_kernel("mha_scores_mma").dispatch_async(
         [query.buffer(), key.buffer(), probs.buffer()],
-        tiles * tiles * heads * 64,
+        score_patches(tiles, causal) * heads * 64,
         [seq, heads, hd, tiles, mask],
         group_size: 64
     )
@@ -297,7 +304,7 @@ fn mha_mma_grads(
     let grad_probs = Tensor([heads * seq, seq])
     cached_attn_kernel("mha_scores_mma").dispatch_async(
         [upstream.buffer(), value.buffer(), grad_probs.buffer()],
-        tiles * tiles * heads * 64,
+        score_patches(tiles, causal) * heads * 64,
         [seq, heads, hd, tiles, mask],
         group_size: 64
     )
