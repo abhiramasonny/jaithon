@@ -772,6 +772,48 @@ fn test_a_flat_dataset_trains_through_the_compiled_step_and_agrees() -> void {
     }
 }
 
+#: Evaluating between fits must not throw the compiled step away.
+#:
+#: `evaluate` prepared the model as `fit` does, and that built a compiled step
+#: for whatever batch size it was asked to evaluate at -- freeing the one
+#: training had, and with it every moment Adam had accumulated. The next fit
+#: then started Adam over from rest: a different model from fitting straight
+#: through, with nothing to say so.
+fn test_evaluate_between_fits_keeps_the_optimiser_state() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    var traces: list[list[float]] = []
+    for interrupted in [false, true] {
+        #: Pictures, so the step is compiled whatever the flat rule says.
+        let rows = learnable_rows(64, 20, 4, 3)
+        let data = Dataset(rows.features.view(0, [64, 5, 4, 1]), rows.labels.view(0, [64]))
+        let model = jt.Sequential(
+            [
+                Flatten(),
+                Dense(24, activation: Activation.Relu),
+                Dense(12, activation: Activation.Relu),
+                Dense(4, activation: Activation.Softmax),
+            ]
+        )
+        model.compile(optimizer: jt.Adam(learning_rate: 0.01), loss: SparseCategoricalCrossentropy())
+        var trace: list[float] = []
+        for _round in 0..3 {
+            let history = model.fit(data, epochs: 1, batch_size: 16, verbose: false, plot_path: null)
+            trace.push(history.loss[0])
+            if interrupted { model.evaluate(data, batch_size: 8) }
+        }
+        assert_eq(model.training_route(), "compiled")
+        traces.push(trace)
+        model.free()
+        rows.free()
+    }
+    for index in 0..traces[0].len() {
+        assert_near(traces[1][index], traces[0][index], 1e-5, f"fit {index} after an evaluate")
+    }
+}
+
 #: A flat dataset takes the compiled step only when the batch that does not
 #: fill is a sliver of the epoch. The step is built for one batch size and
 #: leaves that batch untrained, which the static path does not -- so a hundred

@@ -247,8 +247,12 @@ pub class Sequential {
     }
 
     #: Measure loss and accuracy without updating parameters.
+    #:
+    #: Never builds a compiled step: evaluating does not use one, and building
+    #: one for a batch size training did not use threw away the step training
+    #: had -- and with it the momentum or Adam state it carries.
     pub fn evaluate(self, dataset: Dataset, batch_size: int = 2048) -> Metrics {
-        self._prepare(dataset, 1, batch_size)
+        self._prepare(dataset, 1, batch_size, training: false)
         return self._run_epoch(dataset, batch_size, false)
     }
 
@@ -409,7 +413,7 @@ pub class Sequential {
         self.freed = true
     }
 
-    fn _prepare(self, dataset: Dataset, epochs: int, batch_size: int) -> void {
+    fn _prepare(self, dataset: Dataset, epochs: int, batch_size: int, training: bool = true) -> void {
         self._check_live()
         if epochs <= 0 { throw ValueError(f"epochs must be positive, got {epochs}") }
         if batch_size <= 0 { throw ValueError(f"batch_size must be positive, got {batch_size}") }
@@ -446,7 +450,7 @@ pub class Sequential {
         if optimizer is not null and not self.fused_sgd {
             prepare_state(self._parameters(), optimizer.settings())
         }
-        self._try_compiling(dataset, batch_size, classes)
+        if training { self._try_compiling(dataset, batch_size, classes) }
     }
 
     #: Build the whole step as one graph when the model allows it.
