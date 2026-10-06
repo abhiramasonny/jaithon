@@ -2,7 +2,9 @@
 import jaitensor as jt
 from jaitensor import Dataset
 from jaitensor.ops import dense_static_forward
-from std.test import assert_eq
+from std.test import assert_eq, assert_near
+import std.gpu as gpu
+from std.gpu import Buffer
 from std.trace import is_traced
 
 fn separable_data(repeats: int = 32) -> Dataset {
@@ -173,4 +175,114 @@ fn test_static_step_matches_autograd_weights() -> void {
 
 fn test_static_kernels_are_traced() -> void {
     assert is_traced(dense_static_forward)
+}
+
+fn filled(size: int, seed: int) -> Buffer {
+    let buffer = gpu.Buffer(size)
+    if seed == 0 { buffer.fill_zero() } else { buffer.fill_uniform(-0.1, 0.1, seed) }
+    return buffer
+}
+
+#: The device epoch counts the same loss and the same right answers, step for
+#: step, as the per-step kernel it batches up.
+#:
+#: The epoch ping-pongs its loss and correct-count accumulators between the
+#: caller's buffers and scratch, the way it ping-pongs the weights, instead of
+#: copying them home after every step. So an odd number of steps ends with the
+#: totals in scratch, a second epoch starts from whichever weight side the
+#: first left, and a read straight after the call has to wait for the last
+#: step rather than the first. Odd and even, one hidden layer and three, two
+#: epochs each, read without a synchronize in between.
+fn test_the_device_epoch_counts_what_the_steps_count() -> void {
+    if not jt.is_available() { return }
+    let batch = 32
+    let inputs = 16
+    let hidden = 256
+    let classes = 4
+    let rate = 0.05
+    for deep in [false, true] {
+        for steps in [5, 4] {
+            let samples = steps * batch
+            var rows: list[float] = []
+            var answers: list[float] = []
+            var seed = 11
+            for _sample in 0..samples {
+                seed = (seed * 1103515245 + 12345) % 2147483648
+                let kind = seed % classes
+                for slot in 0..inputs {
+                    let signal = if slot % classes == kind { 1.0 } else { 0.0 }
+                    rows.push(signal + float(seed % 7) * 0.05)
+                }
+                answers.push(float(kind))
+            }
+            let x = jt.Tensor([samples, inputs], rows)
+            let y = jt.Tensor([samples], answers)
+            var got: list[float] = []
+            var want: list[float] = []
+            for by_epoch in [true, false] {
+                let w1 = filled(inputs * hidden, 1)
+                let b1 = filled(hidden, 0)
+                let w2 = filled(hidden * hidden, 2)
+                let b2 = filled(hidden, 0)
+                let w3 = filled(hidden * hidden, 3)
+                let b3 = filled(hidden, 0)
+                let w4 = filled(hidden * classes, 4)
+                let b4 = filled(classes, 0)
+                let loss = filled(1, 0)
+                let correct = filled(1, 0)
+                var seen: list[float] = []
+                for _epoch in 0..2 {
+                    if by_epoch {
+                        if deep {
+                            gpu.mlp3_sgd_epoch(
+                                x.buffer(), w1, b1, w2, b2, w3, b3, w4, b4, y.buffer(), loss,
+                                samples, batch, inputs, hidden, classes, rate,
+                                flush_every: 2, correct_acc: correct
+                            )
+                        } else {
+                            gpu.mlp_sgd_epoch(
+                                x.buffer(), w1, b1, w4, b4, y.buffer(), loss,
+                                samples, batch, inputs, hidden, classes, rate,
+                                flush_every: 2, correct_acc: correct
+                            )
+                        }
+                    } else {
+                        for step in 0..steps {
+                            let xs = x.view(step * batch * inputs, [batch, inputs])
+                            let ys = y.view(step * batch, [batch])
+                            if deep {
+                                gpu.mlp3_sgd_step(
+                                    xs.buffer(), w1, b1, w2, b2, w3, b3, w4, b4, ys.buffer(), loss,
+                                    batch, inputs, hidden, classes, rate, correct_acc: correct
+                                )
+                            } else {
+                                gpu.mlp_sgd_step(
+                                    xs.buffer(), w1, b1, w4, b4, ys.buffer(), loss,
+                                    batch, inputs, hidden, classes, rate, correct_acc: correct
+                                )
+                            }
+                            xs.free()
+                            ys.free()
+                        }
+                    }
+                    #: Read at once, the way fit reads an epoch's totals.
+                    seen.push(loss.download()[0])
+                    seen.push(correct.download()[0])
+                    loss.fill_zero()
+                    correct.fill_zero()
+                }
+                gpu.synchronize()
+                seen.extend(w4.download())
+                for buffer in [w1, b1, w2, b2, w3, b3, w4, b4, loss, correct] { buffer.free() }
+                if by_epoch { got = seen } else { want = seen }
+            }
+            x.free()
+            y.free()
+            assert_eq(got.len(), want.len())
+            for index in 0..got.len() {
+                assert_near(got[index], want[index], 1e-4, f"deep {deep} steps {steps} slot {index}")
+            }
+            assert got[1] > 0.0
+        }
+    }
 }
