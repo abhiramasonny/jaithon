@@ -65,6 +65,45 @@ inline uint causal_stop(uint valid, uint columns, uint causal_rows, uint zero_sp
     return min(columns, (valid + zero_span - 1u) / zero_span * zero_span);
 }
 
+/* A 256-thread group's max and sum, in the same order of operations the
+ * softmax kernels below spell out inline, so either path rounds alike. */
+inline float group_max_256(float value, threadgroup float* lanes, threadgroup float* shared,
+                           uint lid, uint lane, uint warp) {
+    const float floor_value = -3.402823e+38f;
+    if (lid < 32u) lanes[lid] = floor_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    value = simd_max(value);
+    if (lane == 0u) lanes[warp] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float m = floor_value;
+        for (uint j = 0u; j < 32u; j++) m = max(m, lanes[j]);
+        *shared = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return *shared;
+}
+
+inline float group_sum_256(float value, threadgroup float* lanes, threadgroup float* shared,
+                           uint lid, uint lane, uint warp) {
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    value = simd_sum(value);
+    if (lane == 0u) lanes[warp] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        *shared = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return *shared;
+}
+
+/* Rows up to this many columns keep their values in registers between the
+ * passes: eight a thread across the group of 256. */
+constant constexpr uint SOFTMAX_HELD = 8u;
+
 /* Row softmax of every head's scores at once, scaling as it reads.
  *
  * In place, and the aliasing is safe rather than lucky: a threadgroup owns
@@ -81,6 +120,7 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
                                constant uint& scale_bits [[buffer(3)]],
                                constant uint& causal_rows [[buffer(4)]],
                                constant uint& zero_span [[buffer(5)]],
+                               constant uint& hold [[buffer(6)]],
                                uint row [[threadgroup_position_in_grid]],
                                uint lid [[thread_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]],
@@ -95,6 +135,38 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
     threadgroup float shared_total;
     const uint valid = causal_limit(row, columns, causal_rows);
     const uint stop = causal_stop(valid, columns, causal_rows, zero_span);
+
+    /* A row that fits is read once and written once: the three passes below
+     * read it three times, which at seq 1024 and 12 heads is 48 MB a pass of
+     * a kernel that is nothing but bandwidth. Same operations on the same
+     * values in the same order, so the answer is bit for bit the same. */
+    if (hold != 0u && valid <= GROUP * SOFTMAX_HELD) {
+        float held[SOFTMAX_HELD];
+        float top = floor_value;
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            const uint i = lid + r * GROUP;
+            held[r] = i < valid ? scores[base + i] * factor : floor_value;
+            top = max(top, held[r]);
+        }
+        const float hm = group_max_256(top, lanes, &shared_peak, lid, lane, warp);
+        float sum = 0.0f;
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            if (lid + r * GROUP < valid) {
+                held[r] = exp(held[r] - hm);
+                sum += held[r];
+            }
+        }
+        const float denom = group_sum_256(sum, lanes, &shared_total, lid, lane, warp);
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            const uint i = lid + r * GROUP;
+            if (i < valid) scores[base + i] = held[r] / denom;
+        }
+        for (uint i = valid + lid; i < stop; i += GROUP) scores[base + i] = 0.0f;
+        return;
+    }
 
     float peak = floor_value;
     for (uint i = lid; i < valid; i += GROUP) peak = max(peak, scores[base + i] * factor);
@@ -144,6 +216,7 @@ kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
                                         constant uint& scale_bits [[buffer(4)]],
                                         constant uint& causal_rows [[buffer(5)]],
                                         constant uint& zero_span [[buffer(6)]],
+                                        constant uint& hold [[buffer(7)]],
                                         uint row [[threadgroup_position_in_grid]],
                                         uint lid [[thread_index_in_threadgroup]],
                                         uint lane [[thread_index_in_simdgroup]],
@@ -156,6 +229,32 @@ kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
     threadgroup float shared_dot;
     const uint valid = causal_limit(row, columns, causal_rows);
     const uint stop = causal_stop(valid, columns, causal_rows, zero_span);
+
+    /* As in the forward: a row that fits is read once, not twice. */
+    if (hold != 0u && valid <= GROUP * SOFTMAX_HELD) {
+        float held_p[SOFTMAX_HELD];
+        float held_g[SOFTMAX_HELD];
+        float part = 0.0f;
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            const uint i = lid + r * GROUP;
+            held_p[r] = 0.0f;
+            held_g[r] = 0.0f;
+            if (i < valid) {
+                held_g[r] = grad[base + i];
+                held_p[r] = probs[base + i];
+                part += held_g[r] * held_p[r];
+            }
+        }
+        const float whole = group_sum_256(part, lanes, &shared_dot, lid, lane, warp);
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            const uint i = lid + r * GROUP;
+            if (i < valid) grad[base + i] = factor * (held_p[r] * (held_g[r] - whole));
+        }
+        for (uint i = valid + lid; i < stop; i += GROUP) grad[base + i] = 0.0f;
+        return;
+    }
 
     float dot = 0.0f;
     for (uint i = lid; i < valid; i += GROUP) dot += grad[base + i] * probs[base + i];
