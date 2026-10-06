@@ -31,7 +31,15 @@
 
 #define JAI_POOL_MAX_ENTRIES 512
 #define JAI_POOL_MAX_BYTES   (1536u * 1024u * 1024u)
+/* Hash slots for the size classes: a power of two, over twice the most
+ * classes there can be (one per parked buffer). */
+#define JAI_POOL_SLOTS       1024u
 
+/* One parked buffer. It sits on two lists at once: every parked buffer in the
+ * order it was parked, which is the eviction order, and the ones of its own
+ * size in the same order, which is where an allocation looks. Both are
+ * doubly linked through indices, so taking from either end, or from the
+ * middle when an eviction reaches it, is O(1). */
 typedef struct {
     size_t   bytes;
     void    *buffer;
@@ -39,13 +47,28 @@ typedef struct {
      * whose previous owner left work queued against it is still waiting on
      * that work, and the new owner is the one who finds out. */
     uint64_t lastBatch;
+    int      older, newer;            /* all parked buffers; `newer` links the free list */
+    int      sizeOlder, sizeNewer;    /* parked buffers of this size */
 } JaiPooledBuffer;
 
+/* A size class: the oldest and newest parked buffer of exactly `bytes`.
+ * `bytes` 0 marks an empty slot; open addressing, linear probing. */
+typedef struct {
+    size_t bytes;
+    int    oldest, newest;
+} JaiPoolClass;
+
 static JaiPooledBuffer gPool[JAI_POOL_MAX_ENTRIES];
+static JaiPoolClass    gClasses[JAI_POOL_SLOTS];
+static int             gPoolFree = -1;     /* unused entries, through `newer` */
+static int             gPoolOldest = -1;
+static int             gPoolNewest = -1;
+static bool            gPoolReady;
 static int             gPoolCount;
 static size_t          gPoolBytes;
 static int             gPoolMode;   /* 0 unknown, 1 on, 2 off */
 static int             gPoolPoison; /* 0 unknown, 1 on, 2 off */
+static int             gPoolSwap;   /* 0 unknown, 1 on, 2 off */
 
 static bool poolEnabled(void) {
     if (gPoolMode == 0) {
@@ -63,45 +86,126 @@ static bool poolPoisons(void) {
     return gPoolPoison == 1;
 }
 
-/* The most recently parked buffer of exactly this size, or nil. Newest first,
- * because that one is likeliest to still be warm. */
+/* Whether a small recycled buffer still busy with its previous owner's work
+ * may be traded for a fresh one at its first host write instead of waited for
+ * -- see hostWriteBarrier. JAITHON_GPU_POOL_SWAP=0 turns that off, and a
+ * small allocation then refuses a busy buffer and allocates, as it used to. */
+static bool poolSwaps(void) {
+    if (gPoolSwap == 0) {
+        const char *setting = getenv("JAITHON_GPU_POOL_SWAP");
+        gPoolSwap = (setting != NULL && strcmp(setting, "0") == 0) ? 2 : 1;
+    }
+    return gPoolSwap == 1;
+}
+
 /* Under this, a fresh allocation is cheaper than waiting for a parked buffer
  * to be free. Metal maps a small buffer in a few microseconds; waiting for a
  * kernel that is still reading one costs the better part of a millisecond. */
 #define JAI_POOL_WAIT_RATHER_THAN_ALLOCATE (1u * 1024u * 1024u)
 
+static void poolInit(void) {
+    if (gPoolReady) return;
+    for (int i = 0; i < JAI_POOL_MAX_ENTRIES; i++) {
+        gPool[i].newer = i + 1 < JAI_POOL_MAX_ENTRIES ? i + 1 : -1;
+    }
+    gPoolFree = 0;
+    gPoolReady = true;
+}
+
+static unsigned classHome(size_t bytes) {
+    uint64_t h = (uint64_t)bytes * 0x9E3779B97F4A7C15ull;
+    return (unsigned)(h >> 40) & (JAI_POOL_SLOTS - 1u);
+}
+
+static int classFind(size_t bytes) {
+    for (unsigned i = classHome(bytes), n = 0; n < JAI_POOL_SLOTS;
+         i = (i + 1u) & (JAI_POOL_SLOTS - 1u), n++) {
+        if (gClasses[i].bytes == bytes) return (int)i;
+        if (gClasses[i].bytes == 0) return -1;
+    }
+    return -1;
+}
+
+static int classAdd(size_t bytes) {
+    unsigned i = classHome(bytes);
+    while (gClasses[i].bytes != 0) {
+        if (gClasses[i].bytes == bytes) return (int)i;
+        i = (i + 1u) & (JAI_POOL_SLOTS - 1u);
+    }
+    gClasses[i].bytes = bytes;
+    gClasses[i].oldest = -1;
+    gClasses[i].newest = -1;
+    return (int)i;
+}
+
+/* Empty a slot without tombstones: shift back any later entry of the probe
+ * run whose home does not lie cyclically after the hole. */
+static void classRemove(int slot) {
+    unsigned hole = (unsigned)slot;
+    unsigned j = hole;
+    for (;;) {
+        j = (j + 1u) & (JAI_POOL_SLOTS - 1u);
+        if (gClasses[j].bytes == 0) break;
+        const unsigned home = classHome(gClasses[j].bytes);
+        const bool stays = hole <= j ? (hole < home && home <= j)
+                                     : (hole < home || home <= j);
+        if (stays) continue;
+        gClasses[hole] = gClasses[j];
+        hole = j;
+    }
+    gClasses[hole].bytes = 0;
+}
+
+/* Take entry `e` off both lists and back onto the free list. */
+static void poolUnlink(int e, int slot) {
+    JaiPooledBuffer *p = &gPool[e];
+    if (p->older >= 0) gPool[p->older].newer = p->newer; else gPoolOldest = p->newer;
+    if (p->newer >= 0) gPool[p->newer].older = p->older; else gPoolNewest = p->older;
+    JaiPoolClass *c = &gClasses[slot];
+    if (p->sizeOlder >= 0) gPool[p->sizeOlder].sizeNewer = p->sizeNewer; else c->oldest = p->sizeNewer;
+    if (p->sizeNewer >= 0) gPool[p->sizeNewer].sizeOlder = p->sizeOlder; else c->newest = p->sizeOlder;
+    if (c->oldest < 0) classRemove(slot);
+    gPoolCount--;
+    gPoolBytes -= p->bytes;
+    p->buffer = NULL;
+    p->newer = gPoolFree;
+    gPoolFree = e;
+}
+
 /* Hand back a parked buffer of exactly this size, preferring one whose work
  * has finished.
  *
  * Two of the same size are not interchangeable: one may still be the
- * destination or the source of a kernel that has not run, and its new owner
- * pays for that the first time it writes from the host -- 176 us against the
- * 4 us the dispatch it was feeding costs. A run of small buffers, each
- * uploaded and handed straight to one kernel, is the worst case: recycling the
- * busy one every time turns the run into a chain of round trips.
+ * destination or the source of a kernel that has not run. For GPU work that
+ * does not matter -- the queue runs in order, so whatever the new owner
+ * encodes lands behind it. It matters only to a host write, which is not in
+ * that order, and hostWriteBarrier deals with it there: a large buffer waits
+ * for the old work, a small untouched one is traded for a fresh one, which is
+ * no dearer than allocating here would have been.
  *
- * So a small buffer refuses a busy one and lets the caller allocate. The pool
- * then grows to however many of that size are in flight at once and settles
- * there, which is the multi-buffering a caller would otherwise have to write.
- * A large one takes what it is given: the allocation is expensive, and the
- * wait is small beside the work such a buffer is usually part of. */
+ * Refusing a busy small buffer here instead, as this did, recycled nothing
+ * in a chain that never waits: every freed buffer was still busy, the pool
+ * filled with 512 of them and evicted one per free, and an elementwise op at
+ * N=1024 cost 10.4 us against 8.5 with no pool at all. So a busy one is taken
+ * when nothing settled is at either end of its size's list. The newest
+ * settled one comes first, being the likeliest to be warm. */
 static id<MTLBuffer> poolTake(size_t bytes, uint64_t *lastBatch) {
+    const int slot = classFind(bytes);
+    if (slot < 0) return nil;
     const uint64_t settled = doneBatch();
-    const int passes = bytes < JAI_POOL_WAIT_RATHER_THAN_ALLOCATE ? 1 : 2;
-    for (int pass = 0; pass < passes; pass++) {
-        for (int i = gPoolCount - 1; i >= 0; i--) {
-            if (gPool[i].bytes != bytes) continue;
-            if (pass == 0 && gPool[i].lastBatch > settled) continue;
-            id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)gPool[i].buffer;
-            if (lastBatch != NULL) *lastBatch = gPool[i].lastBatch;
-            memmove(&gPool[i], &gPool[i + 1],
-                    (size_t)(gPoolCount - i - 1) * sizeof(JaiPooledBuffer));
-            gPoolCount--;
-            gPoolBytes -= bytes;
-            return buffer;
+    const JaiPoolClass *c = &gClasses[slot];
+    int e = c->newest;
+    if (gPool[e].lastBatch > settled) {
+        if (gPool[c->oldest].lastBatch <= settled) {
+            e = c->oldest;
+        } else if (bytes < JAI_POOL_WAIT_RATHER_THAN_ALLOCATE && !poolSwaps()) {
+            return nil;
         }
     }
-    return nil;
+    id<MTLBuffer> buffer = (__bridge_transfer id<MTLBuffer>)gPool[e].buffer;
+    if (lastBatch != NULL) *lastBatch = gPool[e].lastBatch;
+    poolUnlink(e, slot);
+    return buffer;
 }
 
 /* Park a buffer, evicting the oldest when there is no room. Evicting rather
@@ -109,26 +213,43 @@ static id<MTLBuffer> poolTake(size_t bytes, uint64_t *lastBatch) {
  * the pool with entries it will never ask for again. */
 static bool poolGive(void *buffer, size_t bytes, uint64_t lastBatch) {
     if (bytes > JAI_POOL_MAX_BYTES) return false;
+    poolInit();
     while (gPoolCount > 0 &&
            (gPoolCount >= JAI_POOL_MAX_ENTRIES ||
             gPoolBytes + bytes > JAI_POOL_MAX_BYTES)) {
-        CFBridgingRelease(gPool[0].buffer);
-        gPoolBytes -= gPool[0].bytes;
-        memmove(&gPool[0], &gPool[1],
-                (size_t)(gPoolCount - 1) * sizeof(JaiPooledBuffer));
-        gPoolCount--;
+        const int e = gPoolOldest;
+        void *evicted = gPool[e].buffer;
+        poolUnlink(e, classFind(gPool[e].bytes));
+        CFBridgingRelease(evicted);
     }
-    if (gPoolCount >= JAI_POOL_MAX_ENTRIES) return false;
-    gPool[gPoolCount].bytes = bytes;
-    gPool[gPoolCount].buffer = buffer;
-    gPool[gPoolCount].lastBatch = lastBatch;
+    if (gPoolFree < 0) return false;
+    const int e = gPoolFree;
+    gPoolFree = gPool[e].newer;
+    const int slot = classAdd(bytes);
+    JaiPooledBuffer *p = &gPool[e];
+    p->bytes = bytes;
+    p->buffer = buffer;
+    p->lastBatch = lastBatch;
+    p->older = gPoolNewest;
+    p->newer = -1;
+    if (gPoolNewest >= 0) gPool[gPoolNewest].newer = e; else gPoolOldest = e;
+    gPoolNewest = e;
+    JaiPoolClass *c = &gClasses[slot];
+    p->sizeOlder = c->newest;
+    p->sizeNewer = -1;
+    if (c->newest >= 0) gPool[c->newest].sizeNewer = e; else c->oldest = e;
+    c->newest = e;
     gPoolCount++;
     gPoolBytes += bytes;
     return true;
 }
 
 void *jaiGpuBufferHandle(JaiGpuBuffer *b) {
-    return b == NULL ? NULL : b->buffer;
+    if (b == NULL) return NULL;
+    /* The caller now holds the MTLBuffer itself and may write it without a
+     * mark, so a later first host write must not trade it away. */
+    b->untouched = false;
+    return b->buffer;
 }
 
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
@@ -168,6 +289,7 @@ JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
         b->bytes = bytes;
         b->recycled = reused;
         b->lastBatch = reused ? carried : 0;
+        b->untouched = reused;
         return b;
     }
 }
@@ -184,11 +306,45 @@ JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
  * A buffer with nothing queued against it -- which is most of them, and every
  * one that has only ever been written from the host -- goes straight through.
  * The rest wait for their own batch and not for the queue, so a host write to
- * one buffer does not stall on work belonging to another. */
+ * one buffer does not stall on work belonging to another.
+ *
+ * Except a small recycled one its new owner has not touched. The only work
+ * still pending on it is the previous owner's, so nothing the new owner needs
+ * is in those bytes: it trades the MTLBuffer for a fresh one and parks the
+ * busy one again for GPU work, where queue order makes it safe. That is what
+ * lets poolTake hand busy small buffers out at all -- a wait here would make
+ * every upload into one a round trip. Touching it in any way (a mark, or
+ * handing out the MTLBuffer) ends the trade, because from then on the bytes
+ * or the handle belong to the new owner. */
+static bool swapForFresh(JaiGpuBuffer *b) {
+    const size_t least = b->bytes < JAI_GPU_MIN_BYTES ? JAI_GPU_MIN_BYTES : b->bytes;
+    id<MTLBuffer> fresh = [gDevice newBufferWithLength:least
+                                               options:MTLResourceStorageModeShared];
+    if (fresh == nil) return false;
+    void *busy = b->buffer;
+    const uint64_t busyBatch = b->lastBatch;
+    b->buffer = (__bridge_retained void *)fresh;
+    b->lastBatch = 0;
+    bool parked = false;
+    @synchronized(gQueue) {
+        parked = poolGive(busy, b->bytes, busyBatch);
+    }
+    if (!parked) CFBridgingRelease(busy);
+    return true;
+}
+
 static void hostWriteBarrier(JaiGpuBuffer *b) {
     if (b == NULL) return;
     if (!b->recycled && b->lastBatch == 0) return;
+    const bool tradable = b->recycled && b->untouched;
     b->recycled = false;
+    b->untouched = false;
+    if (tradable && b->bytes < JAI_POOL_WAIT_RATHER_THAN_ALLOCATE && poolSwaps() &&
+        b->lastBatch > doneBatch()) {
+        @autoreleasepool {
+            if (swapForFresh(b)) return;
+        }
+    }
     jaiGpuWaitFor(b);
 }
 
@@ -252,7 +408,7 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
         float scaleValue = scale;
         @synchronized(gQueue) {
             if (gAsyncCommands == nil) {
-                gAsyncCommands = [gQueue commandBuffer];
+                gAsyncCommands = newAsyncCommandBuffer();
                 beginBatchLocked();
                 if (gAsyncCommands == nil) {
                     float *destination = (float *)[dest contents] + offset;
@@ -380,6 +536,7 @@ const float *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count) 
     const size_t bytes = count * sizeof(float);
     if (start > b->bytes || bytes > b->bytes - start) return NULL;
     jaiGpuWaitFor(b);
+    b->untouched = false;   /* the caller holds a pointer into these bytes */
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     return (const float *)[buffer contents] + elementOffset;
 }

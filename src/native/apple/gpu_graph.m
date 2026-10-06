@@ -57,6 +57,10 @@ MPSGraphTensorData *graphData(JaiGpuBuffer *b, size_t offset,
  * cannot be addressed. */
 void *jaiGpuTensorDataAt(JaiGpuBuffer *b, size_t offset, void *shape) {
     if (b == NULL || shape == NULL) return NULL;
+    /* The MTLBuffer leaves with the wrapper, and the work it feeds may be
+     * run straight on the queue without a mark, so a later first host write
+     * must not trade it away -- see hostWriteBarrier. */
+    b->untouched = false;
     NSArray<NSNumber *> *dims = (__bridge NSArray<NSNumber *> *)shape;
     return (__bridge_retained void *)graphDataAt(b, offset, dims);
 }
@@ -67,6 +71,7 @@ static MPSGraphTensorData *graphDataDesc(JaiGpuBuffer *b, size_t offset, size_t 
     if (offset == 0) return graphData(b, 0, shape);
     if (desc == nil || b == NULL || b->buffer == NULL) return nil;
     if (!ndarrayWindowIsPacked(shape)) return nil;
+    b->untouched = false;   /* the wrapper holds the MTLBuffer from here on */
     if (offset + bytes > b->bytes) return nil;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)b->buffer;
     MPSNDArray *array = [[MPSNDArray alloc] initWithBuffer:buf offset:offset descriptor:desc];
@@ -150,6 +155,7 @@ bool encodeGraphOnAsync(MPSGraph *graph,
                                NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds,
                                NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results) {
     dispatchTraceTick(1);
+    noteGraphEncodeLocked();
     if (!ensureAsyncCommandBuffer()) return false;
     MPSCommandBuffer *mps =
         [MPSCommandBuffer commandBufferWithCommandBuffer:gAsyncCommands];
@@ -173,7 +179,9 @@ bool encodeGraphOnAsync(MPSGraph *graph,
     if (mps.rootCommandBuffer != gAsyncCommands) meterNoteMpsSwap();
     gAsyncCommands = mps.rootCommandBuffer;
     gAsyncEncoder = nil;
-    return gAsyncCommands != nil;
+    if (gAsyncCommands == nil) return false;
+    afterGraphEncodeLocked();
+    return true;
 }
 
 id<MTLBuffer> growScratch(id<MTLBuffer> existing, size_t *cap, size_t bytes) {
@@ -387,6 +395,7 @@ static bool encodeMlpExecutableOnAsyncArrays(
     NSArray<MPSGraphTensorData *> *results) {
     if (exec == nil || inputs == nil || results == nil) return false;
     dispatchTraceTick(1);
+    noteGraphEncodeLocked();
     if (!ensureAsyncCommandBuffer()) return false;
     MPSCommandBuffer *mps =
         [MPSCommandBuffer commandBufferWithCommandBuffer:gAsyncCommands];
@@ -403,7 +412,9 @@ static bool encodeMlpExecutableOnAsyncArrays(
     if (mps.rootCommandBuffer != gAsyncCommands) meterNoteMpsSwap();
     gAsyncCommands = mps.rootCommandBuffer;
     gAsyncEncoder = nil;
-    return gAsyncCommands != nil;
+    if (gAsyncCommands == nil) return false;
+    afterGraphEncodeLocked();
+    return true;
 }
 
 /* Encode a compiled executable into the batch everything else is queued on,

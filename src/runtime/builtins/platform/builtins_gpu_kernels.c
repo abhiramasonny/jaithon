@@ -177,13 +177,21 @@ bool nGpuDispatchAsync(int argc, Value *args, Value *out) {
     return dispatchKernel(args, out, true);
 }
 
+/* The native side keeps why a wait failed -- the Metal error, or the timeout
+ * that ended it -- and the message carries it, because "did not complete" on
+ * its own is all five failures of one session ever said. */
+static bool throwQueueFailure(const char *name) {
+    const char *why = jaiGpuLastError();
+    if (why == NULL || why[0] == '\0') why = "no reason was recorded";
+    return jaiThrow(vm.cRuntimeError, "%s(): queued GPU work did not complete: %s",
+                    name, why);
+}
+
 bool nGpuFlush(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
     if (!requireGpu("gpu_flush")) return false;
-    if (!jaiGpuFlush())
-        return jaiThrow(vm.cRuntimeError,
-                        "gpu_flush(): queued GPU work did not complete");
+    if (!jaiGpuFlush()) return throwQueueFailure("gpu_flush");
     *out = NULL_VAL;
     return true;
 }
@@ -192,9 +200,7 @@ bool nGpuSynchronize(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
     if (!requireGpu("gpu_synchronize")) return false;
-    if (!jaiGpuSynchronize())
-        return jaiThrow(vm.cRuntimeError,
-                        "gpu_synchronize(): queued GPU work did not complete");
+    if (!jaiGpuSynchronize()) return throwQueueFailure("gpu_synchronize");
     *out = NULL_VAL;
     return true;
 }

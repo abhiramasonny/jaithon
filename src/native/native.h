@@ -294,6 +294,10 @@ bool          jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int c
 /* Commit queued async work so the GPU can start; does not wait. */
 bool          jaiGpuFlush(void);
 bool          jaiGpuSynchronize(void);
+/* Why the last flush, synchronize or wait failed: the Metal error (domain,
+ * code, description, and per-encoder status when it was recorded) or the
+ * timeout that ended the wait. Empty when nothing has failed. */
+const char   *jaiGpuLastError(void);
 /* Wait only for the queued work that could have written this buffer, leaving
  * anything queued after it running. Reading a result this way does not stall
  * on work submitted afterwards, which is what lets a loop overlap the two. */
