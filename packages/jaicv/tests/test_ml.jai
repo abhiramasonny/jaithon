@@ -19,7 +19,6 @@ fn next_state(state: int) -> int {
 }
 
 # --- the tree every threshold of every feature scored from scratch ----------
-
 fn ref_impurity(targets: list[float], indices: list[int], regression: bool) -> float {
     if indices.len() == 0 { return 0.0 }
     if regression {
@@ -139,7 +138,11 @@ fn ref_grow(
     var left: list[int] = []
     var right: list[int] = []
     for index in indices {
-        if rows[index][best_feature] <= best_threshold { left.push(index) } else { right.push(index) }
+        if rows[index][best_feature] <= best_threshold {
+            left.push(index)
+        } else {
+            right.push(index)
+        }
     }
     let left_at = ref_grow(rows, targets, left, depth + 1, max_depth, regression, nodes)
     let right_at = ref_grow(rows, targets, right, depth + 1, max_depth, regression, nodes)
@@ -251,7 +254,6 @@ fn test_a_forest_still_votes_for_the_class_it_was_shown() -> void {
 }
 
 # --- Jacobi with the pivot found by scanning every off-diagonal -------------
-
 fn ref_eigen(source: list[float], n: int) -> tuple[list[float], list[float]] {
     var m: list[float] = []
     var v: list[float] = []
@@ -359,7 +361,11 @@ fn checkerboard(count: int, seed: int) -> tuple[Mat, Mat, list[float]] {
         features.push(y)
         labels.push(if x * y > 0.0 { 7.0 } else { 3.0 })
     }
-    return (Mat.from_list(count, 2, CV_32FC1, features), Mat.from_list(count, 1, CV_32FC1, labels), labels)
+    return (
+        Mat.from_list(count, 2, CV_32FC1, features),
+        Mat.from_list(count, 1, CV_32FC1, labels),
+        labels
+    )
 }
 
 fn test_the_svm_stops_at_the_optimum_of_its_dual() -> void {
@@ -399,7 +405,10 @@ fn test_the_svm_stops_at_the_optimum_of_its_dual() -> void {
             assert_true(margin <= 1.0 + slack, f"sample {index}: at the bound but margin {margin}")
         } else {
             free += 1
-            assert_true(math.fabs(margin - 1.0) <= slack, f"sample {index}: free but margin {margin}")
+            assert_true(
+                math.fabs(margin - 1.0) <= slack,
+                f"sample {index}: free but margin {margin}"
+            )
         }
     }
     assert_true(free > 0, "no multiplier strictly inside the box")
@@ -416,7 +425,6 @@ fn test_the_svm_stops_at_the_optimum_of_its_dual() -> void {
 }
 
 # --- products, covariances and PCA big enough to go to the device -----------
-
 fn noise(count: int, seed: int, spread: float, shift: float) -> list[float] {
     var state = seed
     var out: list[float] = []
@@ -481,7 +489,8 @@ fn test_a_large_covariance_and_pca_agree_with_double_precision() -> void {
     for r in 0..rows {
         for c in 0..width {
             #: Columns of different spread, mixed a little, far from the origin.
-            let mixed = base[r * width + c] * (1.0 + float(c)) + 0.3 * base[r * width + (c + 1) % width]
+            let mixed = base[r * width + c] * (1.0 + float(c)) +
+                0.3 * base[r * width + (c + 1) % width]
             values.push(mixed + 50.0)
         }
     }
@@ -497,7 +506,9 @@ fn test_a_large_covariance_and_pca_agree_with_double_precision() -> void {
     for i in 0..width {
         for j in 0..width {
             var total = 0.0
-            for r in 0..rows { total += (seen[r * width + i] - centre[i]) * (seen[r * width + j] - centre[j]) }
+            for r in 0..rows {
+                total += (seen[r * width + i] - centre[i]) * (seen[r * width + j] - centre[j])
+            }
             want.push(total / float(rows - 1))
         }
     }
@@ -506,14 +517,20 @@ fn test_a_large_covariance_and_pca_agree_with_double_precision() -> void {
     let got_mean = mean.to_list()
     for c in 0..width { assert_near(got_mean[c], centre[c], 1e-4) }
     for index in 0..width * width {
-        assert_true(math.fabs(got[index] - want[index]) <= 1e-4 * (1.0 + math.fabs(want[index])), f"covariance entry {index}: {got[index]} against {want[index]}")
+        assert_true(
+            math.fabs(got[index] - want[index]) <= 1e-4 * (1.0 + math.fabs(want[index])),
+            f"covariance entry {index}: {got[index]} against {want[index]}"
+        )
     }
 
     let (want_values, want_vectors) = symmetric_eigen_of(want, width)
     let analysis = PCA(samples, 4)
     let vectors = analysis.eigenvectors.to_list()
     for k in 0..4 {
-        assert_true(math.fabs(analysis.eigenvalues[k] - want_values[k]) <= 1e-4 * want_values[k], f"eigenvalue {k}")
+        assert_true(
+            math.fabs(analysis.eigenvalues[k] - want_values[k]) <= 1e-4 * want_values[k],
+            f"eigenvalue {k}"
+        )
         var dot = 0.0
         for c in 0..width { dot += vectors[k * width + c] * want_vectors[k * width + c] }
         #: Same direction AND the same sign as the double-precision solve.
@@ -526,7 +543,9 @@ fn test_a_large_covariance_and_pca_agree_with_double_precision() -> void {
     for r in 0..rows {
         for k in 0..4 {
             var total = 0.0
-            for c in 0..width { total += (seen[r * width + c] - got_mean[c]) * vectors[k * width + c] }
+            for c in 0..width {
+                total += (seen[r * width + c] - got_mean[c]) * vectors[k * width + c]
+            }
             worst = max(worst, math.fabs(projected[r * 4 + k] - total))
         }
     }
@@ -534,16 +553,20 @@ fn test_a_large_covariance_and_pca_agree_with_double_precision() -> void {
 }
 
 # --- logistic regression's device gradient takes the host's steps -----------
-
 fn test_logistic_regression_on_the_device_takes_the_host_steps() -> void {
     if not have_gpu() { return }
     let (count, width) = (3000, 21)
-    assert_true(count * (width + 1) >= LOGISTIC_DEVICE_VALUES, "this set is meant to reach the device")
+    assert_true(
+        count * (width + 1) >= LOGISTIC_DEVICE_VALUES,
+        "this set is meant to reach the device"
+    )
     let features = noise(count * width, 31, 2.0, 0.5)
     var labels: list[float] = []
     for r in 0..count {
         var score = 0.3
-        for c in 0..width { score += features[r * width + c] * (if c % 3 == 0 { 1.0 } else { -0.4 }) }
+        for c in 0..width {
+            score += features[r * width + c] * (if c % 3 == 0 { 1.0 } else { -0.4 })
+        }
         labels.push(if score > 0.0 { 4.0 } else { -1.0 })
     }
     let samples = Mat.from_list(count, width, CV_32FC1, features)
@@ -568,7 +591,9 @@ fn test_logistic_regression_on_the_device_takes_the_host_steps() -> void {
             for c in 0..width { gradient[c] += error * seen[r * width + c] }
         }
         let scale = model.learning_rate / float(count)
-        for c in 0..width { weights[c] -= scale * (gradient[c] + model.regularisation * weights[c]) }
+        for c in 0..width {
+            weights[c] -= scale * (gradient[c] + model.regularisation * weights[c])
+        }
         weights[width] -= scale * gradient[width]
     }
     assert_near(got[0], weights[width], 1e-4)
@@ -579,11 +604,13 @@ fn test_logistic_regression_on_the_device_takes_the_host_steps() -> void {
     for r in 0..count {
         if predicted[r] == labels[r] { right += 1 }
     }
-    assert_true(right > count * 9 // 10, f"only {right} of {count} training samples classified correctly")
+    assert_true(
+        right > count * 9 // 10,
+        f"only {right} of {count} training samples classified correctly"
+    )
 }
 
 # --- the kmeans kernels that replaced the per-centre ones agree bit for bit --
-
 fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> void {
     if not have_gpu() { return }
     for shape in [(5000, 7, 5), (20000, 50, 8), (3001, 3, 16), (777, 64, 1)] {
@@ -595,25 +622,46 @@ fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> vo
         let first_sums = Buffer(k * width + k + 1)
         let second_sums = Buffer(k * width + k + 1)
         Kernel.compile(KMEANS_SOURCE, "kmeans_assign").dispatch_async(
-            [values, centres, held[0], held[1]], count, [count, width, k]
+            [values, centres, held[0], held[1]],
+            count,
+            [count, width, k]
         )
         Kernel.compile(KMEANS_SOURCE, "kmeans_assign_staged").dispatch_async(
-            [values, centres, held[2], held[3]], count, [count, width, k], group_size: 256
+            [values, centres, held[2], held[3]],
+            count,
+            [count, width, k],
+            group_size: 256
         )
         Kernel.compile(KMEANS_SOURCE, "kmeans_assign_tiled").dispatch_async(
-            [values, centres, held[4], held[5]], (count + 255) // 256 * 256, [count, width, k], group_size: 256
+            [values, centres, held[4], held[5]],
+            (count + 255) // 256 * 256,
+            [count, width, k],
+            group_size: 256
         )
         Kernel.compile(KMEANS_SOURCE, "kmeans_gather").dispatch_async(
-            [values, held[0], held[1], first_sums], (k * width + k + 1) * 256, [count, width, k], group_size: 256
+            [values, held[0], held[1], first_sums],
+            (k * width + k + 1) * 256,
+            [count, width, k],
+            group_size: 256
         )
         Kernel.compile(KMEANS_SOURCE, "kmeans_gather_columns").dispatch_async(
-            [values, held[0], held[1], second_sums], (width + 1) * 256, [count, width, k, 0], group_size: 256
+            [values, held[0], held[1], second_sums],
+            (width + 1) * 256,
+            [count, width, k, 0],
+            group_size: 256
         )
         let columns = Buffer(count * width)
         let third_sums = Buffer(k * width + k + 1)
-        Kernel.compile(KMEANS_SOURCE, "kmeans_transpose").dispatch_async([values, columns], count * width, [count, width])
+        Kernel.compile(KMEANS_SOURCE, "kmeans_transpose").dispatch_async(
+            [values, columns],
+            count * width,
+            [count, width]
+        )
         Kernel.compile(KMEANS_SOURCE, "kmeans_gather_columns").dispatch_async(
-            [columns, held[0], held[1], third_sums], (width + 1) * 256, [count, width, k, 1], group_size: 256
+            [columns, held[0], held[1], third_sums],
+            (width + 1) * 256,
+            [count, width, k, 1],
+            group_size: 256
         )
         assert_eq(held[2].download(), held[0].download(), f"{shape}: labels")
         assert_eq(held[3].download(), held[1].download(), f"{shape}: distances")
@@ -621,7 +669,9 @@ fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> vo
         assert_eq(held[5].download(), held[1].download(), f"{shape}: tiled distances")
         assert_eq(second_sums.download(), first_sums.download(), f"{shape}: totals")
         assert_eq(third_sums.download(), first_sums.download(), f"{shape}: totals by column")
-        for buffer in [values, centres, first_sums, second_sums, third_sums, columns] { buffer.free() }
+        for buffer in [values, centres, first_sums, second_sums, third_sums, columns] {
+            buffer.free()
+        }
         for buffer in held { buffer.free() }
     }
 }

@@ -428,11 +428,7 @@ pub fn kmeans(
     #: a copy laid out that way, made once for every attempt and iteration.
     let held_columns: Buffer? = if by_column and _KMEANS_TRANSPOSED and width > 1 {
         let copy = Buffer(samples * width)
-        kernel_for("kmeans_transpose").dispatch_async(
-            [held_values, copy],
-            samples * width,
-            [samples, width]
-        )
+        kernel_for("kmeans_transpose").dispatch_async([held_values, copy], samples * width, [samples, width])
         copy
     } else {
         null
@@ -440,6 +436,7 @@ pub fn kmeans(
     defer {
         if held_columns is not null { held_columns.free() }
     }
+    let layout = if held_columns is not null { 1 } else { 0 }
     var state = if seed == 0 { 1 } else { seed }
     var best_centres: list[float] = []
     var best_cost = 1e300
@@ -480,7 +477,9 @@ pub fn kmeans(
                 chosen = state % samples
             }
             let added = centres.len() // width
-            for value in _sample_row(held_values, host_values, chosen, width) { centres.push(value) }
+            for value in _sample_row(held_values, host_values, chosen, width) {
+                centres.push(value)
+            }
             if centres.len() // width < k {
                 held_centres.upload(centres)
                 kernel_for("kmeans_seed").dispatch_async(
@@ -525,7 +524,7 @@ pub fn kmeans(
                 kernel_for("kmeans_gather_columns").dispatch_async(
                     [held_columns ?? held_values, held_labels, held_nearest, gathered],
                     (width + 1) * 256,
-                    [samples, width, k, if held_columns is not null { 1 } else { 0 }],
+                    [samples, width, k, layout],
                     group_size: 256
                 )
             } else {
@@ -596,11 +595,7 @@ pub fn kmeans(
     }
 
     let labels_out = Mat(samples, 1, CV_MAKETYPE(CV_32S, 1), storage: best_held)
-    return (
-        best_cost,
-        labels_out,
-        Mat.from_list(k, width, CV_MAKETYPE(CV_32F, 1), best_centres)
-    )
+    return (best_cost, labels_out, Mat.from_list(k, width, CV_MAKETYPE(CV_32F, 1), best_centres))
 }
 
 #: One sample's values: from the host copy when there is one, otherwise read
@@ -710,7 +705,8 @@ pub class PCA {
     pub fn project(self, data: Mat) -> Mat {
         let width = self.mean.cols
         let centre = self.mean.to_list()
-        if on_device(data.rows * width * self.eigenvectors.rows) and data.cols * data.channels() == width {
+        if on_device(data.rows * width * self.eigenvectors.rows) and
+            data.cols * data.channels() == width {
             let projected = device_centred_product(data, centre, self.eigenvectors)
             if projected is not null { return projected }
         }

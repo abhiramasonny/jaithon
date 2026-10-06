@@ -42,7 +42,12 @@ pub fn device_view(mat: Mat) -> Tensor? {
 
 #: A float matrix holding `product`'s values, which it takes over.
 fn mat_of(product: Tensor) -> Mat {
-    return Mat(product.shape[0], product.shape[1], CV_MAKETYPE(CV_32F, 1), storage: product.buffer())
+    return Mat(
+        product.shape[0],
+        product.shape[1],
+        CV_MAKETYPE(CV_32F, 1),
+        storage: product.buffer()
+    )
 }
 
 #: `a` (or its transpose) times `b` (or its transpose) on the device, or null

@@ -416,7 +416,16 @@ pub class SVM {
         for row in rows {
             for value in row { flat.push(value) }
         }
-        let q = _SvmRows(self.kernel_type, self.gamma, self.degree, self.coef0, flat, count, width, signs)
+        let q = _SvmRows(
+            self.kernel_type,
+            self.gamma,
+            self.degree,
+            self.coef0,
+            flat,
+            count,
+            width,
+            signs
+        )
 
         var alpha: list[float] = []
         var gradient: list[float] = []
@@ -428,7 +437,16 @@ pub class SVM {
         for _step in 0..limit {
             let i = _svm_first(signs, alpha, gradient, self.c)
             if i < 0 { break }
-            let j = _svm_partner(q.row(i), q.diagonal, signs, alpha, gradient, self.c, i, self.tolerance)
+            let j = _svm_partner(
+                q.row(i),
+                q.diagonal,
+                signs,
+                alpha,
+                gradient,
+                self.c,
+                i,
+                self.tolerance
+            )
             if j < 0 { break }
             _svm_step(q.row(i), q.row(j), q.diagonal, signs, alpha, gradient, self.c, i, j)
         }
@@ -1149,7 +1167,12 @@ pub class DTrees {
                     let on_right = float(count - at - 1)
                     let right_sum = all_sum - left_sum
                     let left_error = max(left_squares - left_sum * left_sum / on_left, 0.0)
-                    let right_error = max(all_squares - left_squares - right_sum * right_sum / on_right, 0.0)
+                    let right_error = max(
+                        all_squares -
+                            left_squares -
+                            right_sum * right_sum / on_right,
+                        0.0
+                    )
                     let score = (left_error + right_error) / float(count)
                     if score > best_seen + slack { continue }
                     if score < best_seen { best_seen = score }
