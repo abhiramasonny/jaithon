@@ -35,6 +35,7 @@ from .base import random_uniform, require_target, rng_for, row_argmax, row_argmi
 from .base import row_extreme, row_topk, scatter_add_rows, select_columns, sort_columns
 from .base import take_rows, to_rows, to_values, triangular_solve, vector
 from .base import HOST_SOLVE_ORDER, host_cholesky_solve
+from .base import NEAREST_BAND_FLOATS, TOPK_ONE_PASS_MAX, nearest_rows
 
 from .pipeline import ColumnTransformer, FeatureUnion, NESTED, Pipeline
 from .pipeline import REMAINDER_DROP, REMAINDER_PASSTHROUGH, make_column_transformer
@@ -58,12 +59,16 @@ export { kmeanspp_seed, rng_for, random_uniform, random_normal }
 export { MAX_CLASSES, distinct_values }
 export { cholesky_factor, triangular_solve, cholesky_solve, diagonal }
 export { HOST_SOLVE_ORDER, host_cholesky_solve }
+export { NEAREST_BAND_FLOATS, TOPK_ONE_PASS_MAX, nearest_rows }
 export { cached_kernel }
 
 export { Pipeline, ColumnTransformer, FeatureUnion, make_pipeline, make_column_transformer }
 
 from .linear import Ridge, StandardScaler, linear_regression
 export { StandardScaler, Ridge, linear_regression }
+
+from .neighbors import KNeighborsClassifier, KNeighborsRegressor
+export { KNeighborsClassifier, KNeighborsRegressor }
 export { NESTED, REMAINDER_DROP, REMAINDER_PASSTHROUGH }
 
 export { MAX_BINS, BIN_UNIFORM, BIN_QUANTILE, BIN_KMEANS }

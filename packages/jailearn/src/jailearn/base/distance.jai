@@ -6,6 +6,7 @@ from std.gpu import Buffer
 
 from .kernels import base_kernel
 from .params import check_matrix
+from .reduce import row_topk, row_topk_into, topk_one_pass
 
 #: The squared length of every row. jaitensor's row reduction rather than a
 #: kernel here: it puts a threadgroup on each row, which matters as soon as the
@@ -53,6 +54,80 @@ pub fn pairwise_sqdist(a: Tensor, b: Tensor, first: int = 0, rows: int = 0) -> T
     right.free()
     block.free()
     return out
+}
+
+#: Queries per band in `nearest_rows` are chosen so a band's product holds
+#: about this many floats (256 MB), whatever the size of `b`.
+pub const NEAREST_BAND_FLOATS: int = 67108864
+
+#: The `k` rows of `b` nearest each row of `a`: `(squared distances,
+#: indices)`, both `[n_a, k]`, nearest first, equal distances by the smaller
+#: index -- what `row_topk(pairwise_sqdist(a, b), k, largest: false)` returns.
+#:
+#: It is cheaper than that composition in two ways. The top-k reads the raw
+#: product `a.bT` and adds the norms as it ranks, so the distance matrix is
+#: never finished by a separate pass over it; and `a` is taken in bands of
+#: rows sized by `NEAREST_BAND_FLOATS`, so `n_a x n_b` is never materialised
+#: at once. A `k` past `TOPK_ONE_PASS_MAX` takes the composition, band by
+#: band. `band_floats` overrides the band size.
+pub fn nearest_rows(
+    a: Tensor,
+    b: Tensor,
+    k: int,
+    band_floats: int = NEAREST_BAND_FLOATS
+) -> tuple[Tensor, Tensor] {
+    check_matrix(a, "a")
+    check_matrix(b, "b")
+    if a.shape[1] != b.shape[1] {
+        throw ValueError(f"a has {a.shape[1]} features against b's {b.shape[1]}")
+    }
+    let queries = a.shape[0]
+    let points = b.shape[0]
+    if k <= 0 or k > points { throw ValueError(f"cannot take {k} of {points} rows") }
+    let values = Tensor([queries, k])
+    let index = Tensor([queries, k])
+    let band = max(1, min(queries, band_floats // max(points, 1)))
+    let one_pass = topk_one_pass(k)
+    let left = row_sqnorm(a)
+    let right = row_sqnorm(b)
+    let product = Tensor([band, points])
+    var first = 0
+    while first < queries {
+        let rows = min(band, queries - first)
+        let block = a.view(first * a.shape[1], [rows, a.shape[1]])
+        let target = product.view(0, [rows, points])
+        jt.matmul(block, b, trans_b: true, out: target)
+        if one_pass {
+            row_topk_into(
+                target.buffer(), rows, points, k, false, values, index,
+                first: first, left: left.buffer(), right: right.buffer()
+            )
+        } else {
+            base_kernel("base_dist_finish").dispatch_async(
+                [target.buffer(), left.buffer(), right.buffer()],
+                rows * points,
+                [rows, points, first]
+            )
+            let (near, at) = row_topk(target, k, largest: false)
+            copy_rows(near, values, first * k)
+            copy_rows(at, index, first * k)
+            near.free()
+            at.free()
+        }
+        block.free()
+        target.free()
+        first += rows
+    }
+    product.free()
+    left.free()
+    right.free()
+    return (values, index)
+}
+
+fn copy_rows(part: Tensor, whole: Tensor, offset: int) -> void {
+    let window = whole.view(offset, [part.size])
+    base_kernel("base_copy").dispatch_async([part.buffer(), window.buffer()], part.size, [part.size, 1])
+    window.free()
 }
 
 #: `k(a_i, b_j) = a_i . b_j`.

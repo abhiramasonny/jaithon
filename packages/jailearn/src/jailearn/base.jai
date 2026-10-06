@@ -31,9 +31,9 @@ from .base.data import column, hstack, index_tensor, matrix, select_columns, tak
 from .base.data import to_rows, to_values, vector
 from .base.reduce import argsort_columns, column_min_max, column_moments, column_quantiles
 from .base.reduce import log_sum_exp_rows, masked_column_mean, row_argmax, row_argmin
-from .base.reduce import row_extreme, row_topk, sort_columns
+from .base.reduce import TOPK_ONE_PASS_MAX, row_extreme, row_topk, sort_columns
 from .base.distance import GRAM_LINEAR, GRAM_POLY, GRAM_RBF, GRAM_SIGMOID, gram
-from .base.distance import pairwise_sqdist
+from .base.distance import NEAREST_BAND_FLOATS, nearest_rows, pairwise_sqdist
 from .base.classes import bincount, class_sums, class_sumsq, scatter_add_rows
 from .base.elementwise import affine_columns, count_equal, nan_mask
 from .base.random import kmeanspp_seed, random_normal, random_uniform, rng_for
@@ -49,8 +49,9 @@ export { column, hstack, index_tensor, matrix, select_columns, take_rows, to_row
 export { to_values, vector }
 export { argsort_columns, column_min_max, column_moments, column_quantiles }
 export { log_sum_exp_rows, masked_column_mean, row_argmax, row_argmin, row_extreme }
-export { row_topk, sort_columns }
+export { TOPK_ONE_PASS_MAX, row_topk, sort_columns }
 export { GRAM_LINEAR, GRAM_POLY, GRAM_RBF, GRAM_SIGMOID, gram, pairwise_sqdist }
+export { NEAREST_BAND_FLOATS, nearest_rows }
 export { bincount, class_sums, class_sumsq, scatter_add_rows }
 export { affine_columns, count_equal, nan_mask }
 export { kmeanspp_seed, random_normal, random_uniform, rng_for }
