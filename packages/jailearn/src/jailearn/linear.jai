@@ -15,14 +15,57 @@
 #: an `alpha` of zero gets the refusal `cholesky_factor` raises, which is the
 #: honest answer from this solver rather than a plausible wrong one.
 import std.math
+from std.gpu import Kernel
+from std.os import env_or
 
 import jaitensor as jt
 from jaitensor import Tensor
 
 from .base import Estimator, EstimatorKind, Params
-from .base import affine_columns, check_fitted, check_matrix, check_pair, check_width
-from .base import cholesky_solve, column_moments, param_bool, param_float, params_of
+from .base import affine_columns, cached_kernel, check_fitted, check_matrix, check_pair
+from .base import check_width, cholesky_solve, column_moments, param_bool, param_float
+from .base import params_of
 from .shared import linear_scores
+
+let SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+/* A scaler's fitted state from the column moments, in place: the mean
+ * becomes the offset `mean_` records (zero when not centring) and the
+ * variance becomes the reciprocal deviation `scale_` records (one for a
+ * column that does not vary, or when not scaling). Precise square root and
+ * division, so the state matches the double-precision host arithmetic this
+ * replaced to the last bit float32 can hold. */
+kernel void lin_scaler_state(device float* mean [[buffer(0)]],
+                             device float* variance [[buffer(1)]],
+                             constant uint& width [[buffer(2)]],
+                             constant uint& with_mean [[buffer(3)]],
+                             constant uint& with_std [[buffer(4)]],
+                             uint id [[thread_position_in_grid]]) {
+    if (id >= width) return;
+    float deviation = precise::sqrt(variance[id]);
+    bool usable = with_std != 0u && deviation > 1.0e-12f;
+    variance[id] = usable ? precise::divide(1.0f, deviation) : 1.0f;
+    if (with_mean == 0u) mean[id] = 0.0f;
+}
+
+/* `-mean * scale`, the offset `affine_columns` adds after it multiplies. */
+kernel void lin_scaler_shift(device const float* mean [[buffer(0)]],
+                             device const float* scale [[buffer(1)]],
+                             device float* shift [[buffer(2)]],
+                             constant uint& width [[buffer(3)]],
+                             uint id [[thread_position_in_grid]]) {
+    if (id >= width) return;
+    shift[id] = -mean[id] * scale[id];
+}
+"""
+
+fn linear_kernel(entry: str) -> Kernel { return cached_kernel(SOURCE, entry) }
+
+#: `JAILEARN_SCALER_ON_DEVICE=0` restores reading the moments back and
+#: building the scaler's state on the host, which waits for the device twice
+#: per `fit_transform`.
+let _SCALER_ON_DEVICE = env_or("JAILEARN_SCALER_ON_DEVICE", "1") != "0"
 
 #: Centre every column and scale it to unit variance.
 pub class StandardScaler: Estimator {
@@ -51,6 +94,20 @@ pub class StandardScaler: Estimator {
         self.free()
         self.width = x.shape[1]
         let (mean, variance) = column_moments(x)
+        if _SCALER_ON_DEVICE {
+            linear_kernel("lin_scaler_state").dispatch_async(
+                [mean.buffer(), variance.buffer()],
+                self.width,
+                [
+                    self.width,
+                    if self.with_mean { 1 } else { 0 },
+                    if self.with_std { 1 } else { 0 },
+                ]
+            )
+            self.mean_ = mean
+            self.scale_ = variance
+            return
+        }
         defer { mean.free() }
         defer { variance.free() }
 
@@ -77,6 +134,16 @@ pub class StandardScaler: Estimator {
         let scale = self.scale_
         let mean = self.mean_
         if scale is null or mean is null { throw RuntimeError("StandardScaler lost its state") }
+        if _SCALER_ON_DEVICE {
+            let shift = Tensor([self.width])
+            defer { shift.free() }
+            linear_kernel("lin_scaler_shift").dispatch_async(
+                [mean.buffer(), scale.buffer(), shift.buffer()],
+                self.width,
+                [self.width]
+            )
+            return affine_columns(x, scale, shift)
+        }
         let factors = scale.download()
         let centres = mean.download()
         var shift: list[float] = []
