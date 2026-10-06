@@ -170,12 +170,12 @@ fn mixed(xs: list[any], n: int) -> int {
 fn test_a_deopt_with_sunk_objects_live() -> void {
     var want = 0
     for i in 0..20000 {
-        want += (i % 7) * (i % 3) + (i % 5) * 2 + i % 4
+        want += i % 7 * (i % 3) + i % 5 * 2 + i % 4
     }
     assert_eq(mixed([0, 1, 2, 3], 20000), want)
     want = 0
     for i in 0..20000 {
-        want += (i % 7) * (i % 3) + (i % 5) * 2 + i % 4
+        want += i % 7 * (i % 3) + i % 5 * 2 + i % 4
     }
     assert_eq(mixed([0, 1, 2.0, 3], 20000), want)
 }
@@ -239,7 +239,7 @@ fn test_a_call_that_is_not_inlined() -> void {
         i += 1
     }
     var want = 0
-    for k in 0..20000 { want += (k % 10) * 3 + 6 }
+    for k in 0..20000 { want += k % 10 * 3 + 6 }
     assert_eq(total, want)
 }
 
@@ -303,8 +303,7 @@ fn accumulate(start: Vec2, n: int) -> Vec2 {
         acc = acc.add(step)
         total += acc.dot(step)
     }
-    assert_eq(total, 5.0 * float(n) * float(n + 1) / 2.0 +
-                     float(n) * (start.x + 2.0 * start.y))
+    assert_eq(total, 5.0 * float(n) * float(n + 1) / 2.0 + float(n) * (start.x + 2.0 * start.y))
     return acc
 }
 
@@ -344,6 +343,7 @@ fn test_an_object_not_rebound_keeps_its_identity() -> void {
 #: Entered holding an object while the loop also calls out: the call could
 #: reach that object, so the loop is compiled without sinking it.
 var g_seen = 0.0
+
 fn note(v: float) -> void {
     g_seen += v
 }

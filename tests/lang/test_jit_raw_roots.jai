@@ -66,7 +66,7 @@ fn hold_five(seed: int) -> int {
 
 fn expected_five(seed: int) -> int {
     var spent = 0
-    for i in 0..(seed % 11) * 40 { spent += i % 40 }
+    for i in 0..seed % 11 * 40 { spent += i % 40 }
     return 5 * seed + 10 + spent
 }
 
@@ -87,8 +87,14 @@ fn hold_eight(seed: int) -> int {
     let r6 = Box(seed, "r6")
     let r7 = Box(seed, "r7")
     if seed % 97 == 0 { collect_now() }
-    let joined = r0.label + r1.label + r2.label + r3.label + r4.label +
-                 r5.label + r6.label + r7.label
+    let joined = r0.label +
+        r1.label +
+        r2.label +
+        r3.label +
+        r4.label +
+        r5.label +
+        r6.label +
+        r7.label
     return r0.tag + r7.tag + joined.len()
 }
 
@@ -150,8 +156,11 @@ fn test_objects_survive_a_leaf_call_and_its_raise() -> void {
     let huge = 9223372036854775807
     var raised = 0
     for seed in 0..4000 {
-        assert_eq(hold_across_leaf(seed, 7), 2 * seed + 8,
-                  "a value held across a leaf call was lost")
+        assert_eq(
+            hold_across_leaf(seed, 7),
+            2 * seed + 8,
+            "a value held across a leaf call was lost"
+        )
         if seed % 500 == 1 {
             try {
                 let _unused = hold_across_leaf(seed, huge)

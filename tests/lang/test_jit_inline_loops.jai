@@ -134,10 +134,12 @@ fn drive_between(x: int) -> int {
 class Poly {
     pub var cs: list[int]
     pub var n: int
+
     fn init(self, cs: list[int]) {
         self.cs = cs
         self.n = cs.len()
     }
+
     pub fn eval_at(self, x: int) -> int {
         var t = 0
         var i = self.n - 1
@@ -155,7 +157,7 @@ fn drive_poly(p: Poly, x: int) -> int { return p.eval_at(x) + p.eval_at(x + 1) +
 fn wrap_sum(a: int, b: int) -> int {
     var t = a
     for q in 0..b {
-        t = t +% (q *% 3)
+        t = t +% q *% 3
         if t % 7 == 0 { return t }
     }
     return t +% a
@@ -238,7 +240,7 @@ fn test_two_counts_and_a_sum_in_one_caller() -> void {
     var xs: list[int] = []
     var fs: list[float] = []
     for k in 0..64 {
-        xs.push((k * 37) % 64)
+        xs.push(k * 37 % 64)
         fs.push(float(k) * 0.5)
     }
     for round in 0..300 {
@@ -246,7 +248,7 @@ fn test_two_counts_and_a_sum_in_one_caller() -> void {
         for k in 0..64 { if xs[k] < round % 64 { want += 1 } }
         for k in 0..32 { if xs[k] < 16 { want += 1 } }
         var ws = 0.0
-        for k in 0..(round % 64) { ws += fs[k] }
+        for k in 0..round % 64 { ws += fs[k] }
         assert_eq(drive_counts(xs, fs, round), float(want) + ws)
     }
 }
@@ -271,8 +273,15 @@ fn test_a_raise_inside_the_inlined_loop() -> void {
         assert_eq(drive_raise(xs, n), if n > 20 { -1 } else { n })
     }
     for round in 0..200 {
-        assert_eq(drive_missing(xs, if round % 2 == 0 { 1000 } else { 7 }),
-                  if round % 2 == 0 { -1 } else { 7 })
+        assert_eq(drive_missing(xs, if round % 2 == 0 {
+            1000
+        } else {
+            7
+        }), if round % 2 == 0 {
+            -1
+        } else {
+            7
+        })
     }
 }
 
@@ -318,7 +327,7 @@ fn test_range_loops_with_returns_inside() -> void {
             var t = a
             var done = false
             for q in 0..b {
-                t = t +% (q *% 3)
+                t = t +% q *% 3
                 if t % 7 == 0 {
                     done = true
                     break
@@ -327,7 +336,7 @@ fn test_range_loops_with_returns_inside() -> void {
             want += if done { t } else { t +% a }
         }
         var f = float(i)
-        for q in 0..(i % 13) {
+        for q in 0..i % 13 {
             f = f * 0.5 + float(q)
             if f > 100.0 { break }
         }
@@ -357,7 +366,6 @@ fn test_a_method_with_a_loop_over_a_field() -> void {
         assert_eq(drive_poly(p, x), want)
     }
 }
-
 
 fn test_and_or_predicates() -> void {
     for x in 0..300 {
@@ -500,7 +508,7 @@ fn test_a_helper_that_loops_over_a_dict() -> void {
     for r in 0..2000 {
         var want = 0
         for j in 0..8 { want += (j + r) * 2 + j }
-        for i in 0..(r % 10) { want += i * 3 }
+        for i in 0..r % 10 { want += i * 3 }
         assert_eq(drive_dict(d, r), want)
     }
 }
@@ -536,8 +544,13 @@ fn test_two_list_parameters_under_guard_malloc() -> void {
     let path = f"{temp_dir()}/jaithon_inline_two_lists_{pid()}.jai"
     write_file(path, "\n".join(lines) + "\n")
     defer { Path(path).remove() }
-    let ran = run(["sh", "-c",
-        f"DYLD_INSERT_LIBRARIES={gm} exec '{argv()[0]}' run --no-cache '{path}' 2>/dev/null"])
+    let ran = run(
+        [
+            "sh",
+            "-c",
+            f"DYLD_INSERT_LIBRARIES={gm} exec '{argv()[0]}' run --no-cache '{path}' 2>/dev/null",
+        ]
+    )
     assert_eq(ran.exit_code, 0)
     assert_eq(ran.stdout, "8939106\n")
 }
@@ -629,8 +642,13 @@ fn test_a_site_whose_storage_alternates() -> void {
 }
 
 fn test_a_loop_inline_that_keeps_deoptimising_is_retired() -> void {
-    for name in ["JAITHON_NO_JIT", "JAITHON_JIT_DEOPT_STRESS", "JAITHON_JIT_INLINE_LOOPS",
-                 "JAITHON_JIT_INLINE_RETIRE", "JAITHON_JIT_INLINE_STG_PIN"] {
+    for name in [
+        "JAITHON_NO_JIT",
+        "JAITHON_JIT_DEOPT_STRESS",
+        "JAITHON_JIT_INLINE_LOOPS",
+        "JAITHON_JIT_INLINE_RETIRE",
+        "JAITHON_JIT_INLINE_STG_PIN",
+    ] {
         if env(name) != null { return }
     }
     let lines = [
