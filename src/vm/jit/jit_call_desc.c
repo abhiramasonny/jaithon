@@ -30,7 +30,86 @@ static unsigned jitRootLimit(void) {
     return (unsigned)cached;
 }
 
+/* The raw layout (gJitRawRoots): each root is the bare payload, stored two at
+ * a time. A register waits in `pend` for a partner; a pair goes down with one
+ * `stp` while its offset is in stp's reach from sp and as two `str` past it. */
+typedef struct {
+    Emit    *e;
+    unsigned at;      /* byte offset of pointer 0 */
+    unsigned n;       /* pointers placed or pending */
+    int      pend;    /* register waiting for a partner, or -1 */
+} RawFill;
+
+static void rawFlush(RawFill *f) {
+    if (f->pend < 0) return;
+    unsigned off = f->at + 8u * (f->n - 1u);
+    emit(f->e, jaiA64StrX((unsigned)f->pend, 31, off));
+    f->pend = -1;
+}
+
+static void rawPut(RawFill *f, unsigned reg) {
+    if (f->pend < 0) {
+        f->pend = (int)reg;
+        f->n++;
+        return;
+    }
+    unsigned off = f->at + 8u * (f->n - 1u);
+    if (off + 8u <= 504u) {
+        emit(f->e, jaiA64StpOff((unsigned)f->pend, reg, 31, (int32_t)off));
+    } else {
+        emit(f->e, jaiA64StrX((unsigned)f->pend, 31, off));
+        emit(f->e, jaiA64StrX(reg, 31, off + 8u));
+    }
+    f->pend = -1;
+    f->n++;
+}
+
+/* The scratch a local loads into must not be the one already waiting. */
+static unsigned rawScratch(const RawFill *f) {
+    return f->pend == (int)JIT_SCRATCH_C ? JIT_SCRATCH_B : JIT_SCRATCH_C;
+}
+
+static bool emitRootFillRaw(Emit *e, unsigned d, unsigned *nrootsOut) {
+    RawFill f = { e, d + (unsigned)offsetof(JitCallDesc, roots), 0u, -1 };
+    for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
+        SlotKind k = e->localKind[slot];
+        if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER && k != SLOT_MAYBE_INST) {
+            continue;
+        }
+        if (f.n >= jitRootLimit()) {
+            e->whyNot = "too many roots"; return false;
+        }
+        /* A dynamic local is guarded before it is read, and the guard settles
+         * the operand stack: nothing of this fill may be left waiting in a
+         * register across that. */
+        if (e->dynamicLocal[slot]) rawFlush(&f);
+        rawPut(&f, localIn(e, slot, rawScratch(&f)));
+    }
+    /* The operand stack, counted from the bottom exactly as the tagged fill
+     * below counts it. */
+    unsigned seen = 0;
+    for (unsigned idx = 0; idx < e->depth; idx++) {
+        SlotKind k = e->stack[idx];
+        if (!holdsRegister(k)) continue;
+        unsigned reg = valueBankReg(e, seen);
+        seen++;
+        if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
+            k != SLOT_ITER && k != SLOT_MAYBE_INST && k != SLOT_MAYBE_OBJ) {
+            continue;
+        }
+        if (f.n >= jitRootLimit()) {
+            e->whyNot = "too many roots"; return false;
+        }
+        rawPut(&f, reg);
+    }
+    rawFlush(&f);
+    *nrootsOut = f.n;
+    return true;
+}
+
 bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
+    if (gJitRawRoots) return emitRootFillRaw(e, d, nrootsOut);
     unsigned nroots = 0;
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
         /* An inline's home is dead outside the inline, and nothing inside
@@ -87,6 +166,117 @@ bool emitRootFill(Emit *e, unsigned d, unsigned *nrootsOut) {
 
     *nrootsOut = nroots;
     return true;
+}
+
+/* JAITHON_JIT_LEAF_CALL_ROOTS (default on): a bare `bl` from the function
+ * tier to a compiled body that cannot reach the collector except on its way
+ * to raising fills no roots and links nothing.
+ *
+ * Why that is sound. Roots matter only while a collection can run, and the
+ * only collection such a callee can start is the one its raise allocates in
+ * (jitThrowOverflow). A raise answers the caller with verdict 2, and a
+ * function-tier frame answers that by leaving through its epilogue, which
+ * reads none of its object registers; so does every function-tier frame
+ * above it, until the C entry or an OSR frame -- and an OSR frame, whose way
+ * out does write its registers back into the interpreter's slots, always
+ * roots. A callee that writes is excluded because its verdict 4 is finished
+ * in the interpreter from this frame's stub, which collects with this frame
+ * live; a callee that bails or deopts without writing has run nothing that
+ * collects, and this frame's own deopt then reads its registers as they were.
+ * A compiled body is recorded by its entry address, which the arena never
+ * reuses, so the answer stays true of the code a caller bakes in. */
+static bool jitLeafCallRoots(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_JIT_LEAF_CALL_ROOTS");
+        cached = (v != NULL && v[0] == '0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+/* Entry addresses of compiled bodies that cannot collect, open addressing. */
+static uintptr_t *gNoCollect;
+static size_t     gNoCollectCap, gNoCollectCount;
+
+static size_t noCollectSlot(uintptr_t key, size_t cap) {
+    return (size_t)((key >> 4) * 0x9E3779B97F4A7C15ull) & (cap - 1u);
+}
+
+void jitNoCollectRecord(const uint8_t *code, bool noCollect) {
+    if (code == NULL || !noCollect) return;
+    if ((gNoCollectCount + 1u) * 2u > gNoCollectCap) {
+        size_t cap = gNoCollectCap ? gNoCollectCap * 2u : 256u;
+        uintptr_t *grown = calloc(cap, sizeof *grown);
+        if (grown == NULL) return;
+        for (size_t i = 0; i < gNoCollectCap; i++) {
+            uintptr_t k = gNoCollect[i];
+            if (k == 0) continue;
+            size_t at = noCollectSlot(k, cap);
+            while (grown[at] != 0) at = (at + 1u) & (cap - 1u);
+            grown[at] = k;
+        }
+        free(gNoCollect);
+        gNoCollect = grown;
+        gNoCollectCap = cap;
+    }
+    uintptr_t key = (uintptr_t)code;
+    size_t at = noCollectSlot(key, gNoCollectCap);
+    while (gNoCollect[at] != 0) {
+        if (gNoCollect[at] == key) return;
+        at = (at + 1u) & (gNoCollectCap - 1u);
+    }
+    gNoCollect[at] = key;
+    gNoCollectCount++;
+}
+
+static bool jitNoCollectKnown(const uint8_t *code) {
+    if (code == NULL || gNoCollectCap == 0) return false;
+    uintptr_t key = (uintptr_t)code;
+    size_t at = noCollectSlot(key, gNoCollectCap);
+    while (gNoCollect[at] != 0) {
+        if (gNoCollect[at] == key) return true;
+        at = (at + 1u) & (gNoCollectCap - 1u);
+    }
+    return false;
+}
+
+/* Whether a bare `bl` to `cfn`'s compiled entry may leave its roots out; the
+ * caller then announces the call with callExempt so that this body stays
+ * collect-free in turn. `hasSelfSlow`: the site finishes a deoptimised callee
+ * in the interpreter, which collects. */
+bool jitCallSkipsRoots(const Emit *e, const ObjFunction *cfn, bool hasSelfSlow) {
+    if (!jitLeafCallRoots() || e->osr || hasSelfSlow) return false;
+    return jitNoCollectKnown(cfn->jitFunc);
+}
+
+_Static_assert(offsetof(JitCallDesc, link) == 0 &&
+               offsetof(JitCallDesc, nroots) == 8,
+               "emitChainLink stores link and nroots as one pair");
+
+/* Links this frame's descriptor onto gJitFrames around a bare `bl`, which
+ * pushes no roots, with `nroots` roots already filled: the old head and the
+ * count go down as one pair. */
+void emitChainLink(Emit *e, unsigned nroots) {
+    unsigned d = e->descOffset;
+    emitChainHeadAddr(e, JIT_SCRATCH_A);
+    emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+    emit(e, jaiA64MovzX(JIT_SCRATCH_C, nroots, 0));
+    if (d + 8u <= 504u) {
+        emit(e, jaiA64StpOff(JIT_SCRATCH_B, JIT_SCRATCH_C, 31, (int32_t)d));
+    } else {
+        emit(e, jaiA64StrX(JIT_SCRATCH_B, 31, d));
+        emit(e, jaiA64StrX(JIT_SCRATCH_C, 31, d + 8u));
+    }
+    emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
+    emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+}
+
+/* Puts back the head emitChainLink saved. x0 and x1 carry the callee's
+ * answer, so only the scratches are touched. */
+void emitChainUnlink(Emit *e) {
+    emit(e, jaiA64LdrX(JIT_SCRATCH_B, 31, e->descOffset));
+    emitChainHeadAddr(e, JIT_SCRATCH_A);
+    emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
 }
 
 bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,

@@ -263,18 +263,10 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
      * allocate -- OP_GET_SLICE builds a fresh list without ever counting as a
      * heap write. */
     unsigned callRoots = 0;
-    if (!emitRootFill(e, e->descOffset, &callRoots)) { e->failed = true; return false; }
-    if (callRoots > 0) {
-        unsigned dd = e->descOffset;
-        emit(e, jaiA64MovzX(JIT_SCRATCH_A, callRoots, 0));
-        emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
-                           dd + (unsigned)offsetof(JitCallDesc, nroots)));
-        emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
-        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-        emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, dd));
-        emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
-                           (unsigned)offsetof(JitCallDesc, link)));
-        emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+    bool leaf = jitCallSkipsRoots(e, cfn, writes);
+    if (!leaf) {
+        if (!emitRootFill(e, e->descOffset, &callRoots)) { e->failed = true; return false; }
+        if (callRoots > 0) emitChainLink(e, callRoots);
     }
 
     unsigned firstArg = firstIdx - (e->depth - e->valueDepth);
@@ -287,16 +279,10 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     }
     emitConst64(e, JIT_SCRATCH_D, (int64_t)(uintptr_t)cfn->jitFunc);
     noteScratchClobber(e);
+    if (leaf) e->callExempt = true;
     emit(e, jaiA64Blr(JIT_SCRATCH_D));
 
-    if (callRoots > 0) {
-        unsigned dd = e->descOffset;
-        emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
-        emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, dd));
-        emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
-                           (unsigned)offsetof(JitCallDesc, link)));
-        emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-    }
+    if (callRoots > 0) emitChainUnlink(e);
 
     unsigned si = 0;
     if (writes) {

@@ -18,9 +18,19 @@
 
 #if (defined(__aarch64__) || defined(__arm64__))
 
-/* A descriptor call pushes its roots via a C helper; a self-call (bare `bl`) does not, so callee-saved
- * registers are invisible to a collection inside the callee -- the tier refuses allocate-then-self-call for exactly this reason. */
+/* The compiled frames whose descriptors hold roots right now, innermost first. A
+ * bare `bl` links its own around the call (emitChainLink); a C helper links the
+ * descriptor it was handed (jitRootsIn) when the roots are raw, and pushes them
+ * as a range otherwise. */
 JitCallDesc *gJitFrames;
+
+/* See jit_internal.h. Read before main so the emitter, the marker and every
+ * helper agree on one layout for the life of the process. */
+bool gJitRawRoots = true;
+__attribute__((constructor)) static void jitRawRootsInit(void) {
+    const char *v = getenv("JAITHON_JIT_RAW_ROOTS");
+    gJitRawRoots = !(v != NULL && v[0] == '0');
+}
 
 /* An empty dict the tier hands out as the SAMPLE for a value it knows is a
  * dict but cannot see -- a declared `dict[K, V]` field read off a receiver
@@ -110,7 +120,12 @@ bool jitOsrSelfGlobal(void) {
 }
 void jaiJitMarkFrames(void) {
     for (JitCallDesc *f = gJitFrames; f != NULL; f = f->link) {
-        for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);
+        if (gJitRawRoots) {
+            Obj **raw = jitRawRootArray(f);
+            for (int64_t i = 0; i < f->nroots; i++) jaiGCMark(raw[i]);
+        } else {
+            for (int64_t i = 0; i < f->nroots; i++) jaiGCMarkValue(f->roots[i]);
+        }
     }
     if (gDictExemplar != NULL) jaiGCMarkObject((Obj *)gDictExemplar);
     if (gJitIterSpare != NULL) jaiGCMarkValue(OBJ_VAL((Obj *)gJitIterSpare));
@@ -127,7 +142,7 @@ bool jitIterRecycle(void) {
     return cached != 0;
 }
 
-/* Roots go in as a RANGE (jaiGCPushRootRange/Pop), not copied one at a time -- copying individually
+/* Roots go in by reference (jitRootsIn/Out), never copied one at a time -- copying individually
  * was O(roots) per call-out; a bulk jaiGCPushRoots variant was tried and reverted, since it still copied every value. Returns 0 on success, 1 with an exception pending. */
 /* Not a deopt: overflow raises directly, since the interpreter would also throw here. A bail is only
  * sound before any write; raising stays sound after a field store has already happened. */
@@ -187,10 +202,10 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
 
 /* Receiver is args[0], exactly where callNativeAt wants it, so no bound wrapper is made. Roots as jitCallOut does, since push and its kin allocate. */
 int jitInvokeMethod(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     bool ok = jaiCallMethodWithReceiver(d->callee, d->args, (int)d->argc,
                                         &d->result);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return ok ? 0 : 1;
 }
 
@@ -198,10 +213,10 @@ int jitInvokeMethod(JitCallDesc *d) {
  * descriptor's callee slot -- there is no method Value to put there -- and the
  * resolve happens per call against the shared megamorphic table. */
 int jitInvokeByName(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     bool ok = jaiInvokeMethodByName(AS_STRING(d->callee), d->args,
                                     (int)d->argc, &d->result);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return ok ? 0 : 1;
 }
 
@@ -210,10 +225,10 @@ int jitInvokeByName(JitCallDesc *d) {
  * succeeds teaches it the receiver's class. */
 int jitInvokeByNameLearn(JitCallDesc *d) {
     Value receiver = d->args[0];
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     bool ok = jaiInvokeMethodByName(AS_STRING(d->callee), d->args,
                                     (int)d->argc, &d->result);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     if (!ok) return 1;
     jaiInvokeCacheLearn((InlineCache *)(uintptr_t)d->aux, receiver,
                         AS_STRING(d->callee));
@@ -221,21 +236,21 @@ int jitInvokeByNameLearn(JitCallDesc *d) {
 }
 
 int jitInvokeNative(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     bool ok = jaiInvokeNativeWithReceiver(d->callee, d->args, (int)d->argc,
                                           &d->result);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return ok ? 0 : 1;
 }
 
 /* Allocates (jaiListNew), so roots go down first as for any call out of compiled code. */
 int jitBuildList(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     ObjList *list = jaiListNew((int)d->argc);
     for (int64_t i = 0; i < d->argc; i++) jaiListPut(list, (int)i, d->args[i]);
     list->count = (int)d->argc;
     d->result = OBJ_VAL(list);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return 0;
 }
 
@@ -248,9 +263,9 @@ int jitBuildList(JitCallDesc *d) {
  * therefore collect. Returns 1 having thrown. */
 int jitContains(JitCallDesc *d) {
     bool contains = false;
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     bool ok = jaiContainsOp(d->args[1], d->args[0], &contains);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     if (!ok) return 1;
     d->result = BOOL_VAL(contains);
     return 0;
@@ -269,46 +284,46 @@ int jitNotContains(JitCallDesc *d) {
  * range goes down and a raise comes back as 1 for the descriptor's threw
  * branch. */
 int jitBuildDict(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     ObjDict *dict = jaiDictNew();
     jaiGCPushRoot(OBJ_VAL(dict));
     for (int64_t i = 0; i + 1 < d->argc; i += 2) {
         (void)jaiDictSet(dict, d->args[i], d->args[i + 1]);
         if (vm.hasException) {
             jaiGCPopRoot();
-            jaiGCPopRootRange();
+            jitRootsOut(d);
             return 1;
         }
     }
     jaiGCPopRoot();
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     d->result = OBJ_VAL(dict);
     return 0;
 }
 
 /* `{a, b}`. Same shape, one operand per element. */
 int jitBuildSet(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     ObjSet *set = jaiSetNew();
     jaiGCPushRoot(OBJ_VAL(set));
     for (int64_t i = 0; i < d->argc; i++) {
         (void)jaiSetAdd(set, d->args[i]);
         if (vm.hasException) {
             jaiGCPopRoot();
-            jaiGCPopRootRange();
+            jitRootsOut(d);
             return 1;
         }
     }
     jaiGCPopRoot();
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     d->result = OBJ_VAL(set);
     return 0;
 }
 
 int jitBuildTuple(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     ObjTuple *tuple = jaiTupleNew(d->args, (int)d->argc);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     d->result = OBJ_VAL(tuple);
     return 0;
 }
@@ -323,9 +338,9 @@ int jitBuildTuple(JitCallDesc *d) {
  * answers without a call -- interned string pointers, a folded enum unit, two
  * registers -- and each is strictly better where it applies. */
 int jitValuesEqual(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     bool equal = jaiValuesEqual(d->args[0], d->args[1]);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     if (vm.hasException) return 1;
     d->result = BOOL_VAL(equal);
     return 0;
@@ -349,9 +364,9 @@ bool jitObjEquality(void) {
  * for any call out of compiled code. NULL back means the concatenation
  * overflowed UINT32_MAX and already threw. */
 int jitStringConcat(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     ObjString *s = jaiStringConcat(AS_STRING(d->args[0]), AS_STRING(d->args[1]));
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     if (s == NULL) return 1;
     d->result = OBJ_VAL(s);
     return 0;
@@ -359,14 +374,14 @@ int jitStringConcat(JitCallDesc *d) {
 
 /* args: start, stop, inclusive-flag. Allocates twice (range + iterator), so roots go down first as usual. */
 int jitMakeRangeIter(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     ObjRange *r = jaiRangeNew(AS_INT(d->args[0]), AS_INT(d->args[1]), 1,
                               AS_INT(d->args[2]) != 0);
     jaiGCPushRoot(OBJ_VAL(r));
     ObjIter *it = jaiIterNew(ITER_RANGE, OBJ_VAL(r));
     jaiGCPopRoot();
     d->result = OBJ_VAL(it);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return 0;
 }
 
@@ -380,7 +395,7 @@ int jitMakeRangeIter(JitCallDesc *d) {
  * failures with no useful message, which is how this arm's first draft
  * announced that it had reached here with a string. */
 int jitMakeIter(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     Value src = d->args[0];
     IterKind k;
     if (IS_LIST(src)) {
@@ -388,7 +403,7 @@ int jitMakeIter(JitCallDesc *d) {
     } else if (IS_STRING(src)) {
         k = ITER_STRING;
     } else {
-        jaiGCPopRootRange();
+        jitRootsOut(d);
         (void)jaiThrow(vm.cTypeError, "'%s' is not iterable",
                        jaiTypeNameStatic(src));
         return 1;
@@ -408,7 +423,7 @@ int jitMakeIter(JitCallDesc *d) {
         it = jaiIterNew(k, src);
     }
     d->result = OBJ_VAL(it);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return 0;
 }
 
@@ -418,11 +433,11 @@ int jitMakeIter(JitCallDesc *d) {
  * compiled code. The emitted guard has already proved the receiver is a dict;
  * the test here is the same belt-and-braces jitMakeIter carries. */
 int jitMakeItemsIter(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     Value src = d->args[0];
     ObjIter *it = IS_DICT(src) ? jaiIterNew(ITER_DICT_ITEMS, src) : NULL;
     if (it != NULL) d->result = OBJ_VAL(it);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return it != NULL ? 0 : 1;
 }
 
@@ -431,11 +446,11 @@ int jitMakeItemsIter(JitCallDesc *d) {
  * guard has already proved the receiver is a dict; the test here is the same
  * belt-and-braces jitMakeItemsIter carries. */
 int jitMakeDictKeysIter(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     Value src = d->args[0];
     ObjIter *it = IS_DICT(src) ? jaiIterNew(ITER_DICT_KEYS, src) : NULL;
     if (it != NULL) d->result = OBJ_VAL(it);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return it != NULL ? 0 : 1;
 }
 
@@ -446,26 +461,26 @@ int jitMakeDictKeysIter(JitCallDesc *d) {
  * belt-and-braces jitMakeItemsIter carries, and it RAISES on the way out for
  * the reason jitMakeIter's comment gives. */
 int jitMakeEnumIter(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     Value src = d->args[0];
     if (!IS_LIST(src)) {
-        jaiGCPopRootRange();
+        jitRootsOut(d);
         (void)jaiThrow(vm.cTypeError, "'%s' object has no method 'enumerate'",
                        jaiTypeNameStatic(src));
         return 1;
     }
     ObjIter *it = jaiIterNewListEnum(AS_LIST(src));
     d->result = OBJ_VAL(it);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return 0;
 }
 
 /* f-string: the interpreter's parts, read off the operand stack, land here contiguously in args[].
  * Builtin path only -- compiler checks at compile time that the module hasn't rebound `str`; a rebind retires this form. */
 int jitFormat(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     ObjString *formatted = jaiValueFormat(d->args, (int)d->argc);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     if (formatted == NULL) return 1;
     d->result = OBJ_VAL(formatted);
     return 0;
@@ -708,15 +723,15 @@ ObjIter *jitIterAlloc(Obj *source) {
 }
 
 int jitNewInstance(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     ObjInstance *inst = jaiInstanceNew((ObjClass *)(uintptr_t)AS_OBJ(d->callee));
     d->result = OBJ_VAL(inst);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return 0;
 }
 
 int jitGetSlice(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     uint8_t flags = (uint8_t)d->aux;
     bool hasStart = (flags & 1) != 0, hasStop = (flags & 2) != 0,
          hasStep = (flags & 4) != 0;
@@ -726,7 +741,7 @@ int jitGetSlice(JitCallDesc *d) {
     Value stepV  = hasStep  ? d->args[at++] : NULL_VAL;
     bool ok = jaiSliceGet(d->args[0], startV, stopV, stepV,
                           hasStart, hasStop, hasStep, &d->result);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return ok ? 0 : 1;
 }
 
@@ -736,18 +751,18 @@ int jitGetSlice(JitCallDesc *d) {
  * be kept in step with it. Pure apart from that throw, but it can allocate the
  * exception, so the roots go down first. */
 int jitGetIndexDict(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     bool ok = jaiIndexGet(d->args[0], d->args[1], &d->result);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return ok ? 0 : 1;
 }
 
 /* Dict store: unlike a list store there's no offset to normalise, it's a table probe either way --
  * this only saves the dispatch and indexSet's type ladder, not the probe itself. */
 int jitSetIndexDict(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     (void)jaiDictSet(AS_DICT(d->args[0]), d->args[1], d->args[2]);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return vm.hasException ? 1 : 0;
 }
 
@@ -1101,9 +1116,9 @@ int64_t jitDictHasStr(Obj *container, Obj *needle, Value *result,
 }
 
 int jitCallOut(JitCallDesc *d) {
-    jaiGCPushRootRange(d->roots, (int)d->nroots);
+    jitRootsIn(d);
     bool ok = jaiCallValue(d->callee, (int)d->argc, d->args, &d->result);
-    jaiGCPopRootRange();
+    jitRootsOut(d);
     return ok ? 0 : 1;
 }
 

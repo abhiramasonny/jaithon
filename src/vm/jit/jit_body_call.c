@@ -339,18 +339,10 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             /* Roots before the branch: a `blr` pushes none, and the callee
              * may allocate. */
             unsigned callRoots = 0;
-            if (!emitRootFill(e, e->descOffset, &callRoots)) return false;
-            if (callRoots > 0) {
-                unsigned dd = e->descOffset;
-                emit(e, jaiA64MovzX(JIT_SCRATCH_A, callRoots, 0));
-                emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
-                                   dd + (unsigned)offsetof(JitCallDesc, nroots)));
-                emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
-                emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, dd));
-                emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
-                                   (unsigned)offsetof(JitCallDesc, link)));
-                emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
+            bool leaf = jitCallSkipsRoots(e, cfn, !cfn->jitFuncNoWrite);
+            if (!leaf) {
+                if (!emitRootFill(e, e->descOffset, &callRoots)) return false;
+                if (callRoots > 0) emitChainLink(e, callRoots);
             }
 
             unsigned firstArg = cidx + 1u - (e->depth - e->valueDepth);
@@ -361,16 +353,10 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
             emitConst64(e, JIT_SCRATCH_D,
                         (int64_t)(uintptr_t)cfn->jitFunc);
             noteScratchClobber(e);
+            if (leaf) e->callExempt = true;
             emit(e, jaiA64Blr(JIT_SCRATCH_D));
 
-            if (callRoots > 0) {
-                unsigned dd = e->descOffset;
-                emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
-                emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, dd));
-                emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
-                                   (unsigned)offsetof(JitCallDesc, link)));
-                emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-            }
+            if (callRoots > 0) emitChainUnlink(e);
             /* x1 carries the callee's verdict. It used to BAIL here,
              * which is sound only where partial execution is invisible --
              * true of the function tier, whose locals are registers and
@@ -524,18 +510,7 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
          * there is something to root. */
         unsigned selfRoots = 0;
         if (!emitRootFill(e, e->descOffset, &selfRoots)) return false;
-        if (selfRoots > 0) {
-            unsigned d = e->descOffset;
-            emit(e, jaiA64MovzX(JIT_SCRATCH_A, selfRoots, 0));
-            emit(e, jaiA64StrX(JIT_SCRATCH_A, 31,
-                               d + (unsigned)offsetof(JitCallDesc, nroots)));
-            emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
-            emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-            emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
-            emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
-                               (unsigned)offsetof(JitCallDesc, link)));
-            emit(e, jaiA64StrX(JIT_SCRATCH_C, JIT_SCRATCH_A, 0));
-        }
+        if (selfRoots > 0) emitChainLink(e, selfRoots);
 
         /* The arguments sit in the top `argc` value registers, in order.
          * They move to x0.. which nothing else is using. */
@@ -557,14 +532,7 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
          * later exit go through the epilogue, and a frame still on the
          * chain then points at a stack slot that no longer exists. x0 and
          * x1 carry the callee's answer, so only the scratches are free. */
-        if (selfRoots > 0) {
-            unsigned d = e->descOffset;
-            emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitFrames);
-            emit(e, jaiA64AddXImm(JIT_SCRATCH_C, 31, d));
-            emit(e, jaiA64LdrX(JIT_SCRATCH_B, JIT_SCRATCH_C,
-                               (unsigned)offsetof(JitCallDesc, link)));
-            emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
-        }
+        if (selfRoots > 0) emitChainUnlink(e);
         /* x1 is the callee's verdict, each needing a different response here (this used to be one `bail`,
          * which is why queens' `place` never compiled -- a bail re-runs the whole caller, unsound above `cols[row] = col`):
          *   0  value is in x0. Costs one compare, one not-taken branch.

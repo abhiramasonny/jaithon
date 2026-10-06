@@ -1856,6 +1856,8 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
         e.overflowStub[i] = (int)e.count;
         emit(&e, jaiA64MovzX(0, i, 0));
         emitConst64(&e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&jitThrowOverflow);
+        /* Collects only to raise: see jitCallSkipsRoots. */
+        e.callExempt = true;
         emit(&e, jaiA64Blr(JIT_SCRATCH_A));
         emit(&e, jaiA64MovzX(0, 0, 0));
         emitEpilogue(&e, 2);
@@ -2220,6 +2222,7 @@ static bool compileFuncOnce(ObjClosure *closure, Value *slotBase,
     }
 
     fn->jitFunc = entry;
+    jitNoCollectRecord(entry, !e.mayCollect);
     return true;
 }
 
