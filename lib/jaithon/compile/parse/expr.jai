@@ -70,17 +70,23 @@ pub fn _parse_subscript(p: Parser, object: Node, open_index: int) -> Node {
 pub fn _parse_postfix(p: Parser) -> Node {
     var expr = _parse_primary(p)
 
-    # Each arm is its own function so the loop holds nothing but `expr`. Written
-    # inline, the arms' locals shared frame slots -- `optional` a bool in one,
-    # `open_index` an int in the next -- and a compiled form of the loop was
-    # entered with whichever kind the last iteration left there and refused.
+    # No two arms keep a local of their own. Written inline, the arms' locals
+    # shared frame slots -- `optional` a bool in one, `open_index` an int in
+    # the next -- and a compiled form of the loop was entered with whichever
+    # kind the last iteration left there and refused. The member arm moves
+    # out; the call arm stays inline, with its index declared out here, because
+    # it recurses through `_parse_args`: a helper around it would add a frame
+    # per nesting level and run a cold parser out of frames a few levels sooner.
+    var open_index = 0
     loop {
         if p._check(TokenKind.Dot) or p._check(TokenKind.QuestionDot) {
             let member = _parse_member_access(p, expr)
             if member == null { break }
             expr = member ?? expr
         } elif p._check(TokenKind.LParen) {
-            expr = _parse_call(p, expr)
+            open_index = p.current
+            p._advance()
+            expr = _finish_call(_parse_args(p, open_index), p, expr, open_index)
         } elif p._check(TokenKind.LBracket) {
             expr = _parse_subscript(p, expr, p.current)
         } else {
@@ -103,11 +109,9 @@ pub fn _parse_member_access(p: Parser, expr: Node) -> Node? {
     return _member(kind, p._join_token(expr.span, name_token), expr, name ?? "")
 }
 
-#: `expr(args)`, with the parser on the `(`.
-pub fn _parse_call(p: Parser, expr: Node) -> Node {
-    let open_index = p.current
-    p._advance()
-    let args = _parse_args(p, open_index)
+#: `expr(args)` once its arguments are parsed, with the parser past the `)`.
+#: The arguments come first so the caller parses them before this frame exists.
+pub fn _finish_call(args: list[dict[str, any]], p: Parser, expr: Node, open_index: int) -> Node {
     return _call(_join(expr.span, p._span_since(open_index)), expr, args)
 }
 
