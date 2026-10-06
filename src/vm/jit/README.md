@@ -458,6 +458,7 @@ this table complete in both directions.
 | `JAITHON_JIT_MODULE_FIELD` | on | Reading a module member as a field. |
 | `JAITHON_JIT_STATIC_FIELD` | on | Reading a class's `statics` table. |
 | `JAITHON_JIT_SOFT_FIELD` | on | Refuse a field arm softly rather than declining the body. |
+| `JAITHON_JIT_SOFT_ANY_FIELD` | on | Interpret a cold read of a declared-`any` field rather than declining the body. |
 | `JAITHON_JIT_FIELD_DECL_KIND` | on | Trust a field's declared type as its kind. |
 | `JAITHON_JIT_ELEM_DECL` | on | Trust a list's declared element type. |
 | `JAITHON_JIT_LIST_PROBE` | on | Read an element kind off a live list. |
@@ -1142,6 +1143,7 @@ All default **on**; all turned off with `=0`, except the four numeric ones.
 | `JAITHON_JIT_MODULE_FIELD` | `moduleFieldOn` | reading `math.PI` and its kin. |
 | `JAITHON_JIT_FIELD_DECL_KIND` | `jitDeclaredFieldKindEnabled` | `declaredScalarFieldKind`'s `OP_GET_FIELD` arm. |
 | `JAITHON_JIT_SOFT_FIELD` | `jitSoftField` | taking the soft unarmed path for a name that is not a field of the pinned class -- non-OSR only, because inside a loop nothing is cold. |
+| `JAITHON_JIT_SOFT_ANY_FIELD` | `jitSoftAnyField` | the same soft unarmed path for `OP_GET_FIELD_LOCAL` on a field declared `any` (or of no kind `declaredScalarFieldKind` predicts) when the measuring walk had no live instance in the receiver's local to sample. The condition is "no sample", not "cold": a hot read with an unsampled receiver takes it too, and the unarmed path's refusal of an unconditional stop before the body's first branch is what keeps that from deopting every call (a hot read after an always-taken branch measured 1.60x faster with the switch on, in review). Reached after the `SLOT_MAYBE_INST` null guard, so that guard spends one deopt record it did not need. Non-OSR only, as above. `token.value ?? 0.0` on the parser's float-literal arm was the shape: it declined `_parse_primary`, and with it every rung of the expression ladder, each of which calls the one below first. On the final branch, off: 138.1M interpreted instructions on `check --no-cache lib/jaithon`; on: 128.9M, and 2.3% fewer instructions retired -- but cycles moved 0.998x median / 1.009x by min against a 1.63% A-vs-A floor (cycles.py --env, n=7). Kept on as cycle-neutral; the compiler's 1.12x came from the data-shape changes this unblocked, not from the switch. tests/lang/test_jit_cold_any_field.jai. |
 | `JAITHON_JIT_RET_LIST` | `retListKindOn` | promoting an observed list return from `SLOT_OBJ` to `SLOT_LIST`. |
 | `JAITHON_JIT_LIST_PROBE` | `listProbeOn` | accepting a predicted-list receiver. |
 | `JAITHON_JIT_RET_OBJTYPE` | `retObjTypeOn` | keeping the callee's observed object type. |

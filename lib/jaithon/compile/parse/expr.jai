@@ -14,7 +14,7 @@ from jaithon.ast import Node, NodeKind, OpKind
 from jaithon.compile.diag import Code
 from jaithon.compile.token import TokenFlags, TokenKind
 from jaithon.compile.parse.state import Parser
-from jaithon.compile.parse.node_build import _binary, _join, _member, _node, _unary
+from jaithon.compile.parse.node_build import _binary, _call, _index, _join, _member, _node, _unary
 from jaithon.compile.parse.token_class import _additive_op, _compare_op, _multiplicative_op
 from jaithon.compile.parse.predicate import _is_numeric_literal
 from jaithon.compile.parse.primary import _close_sequence, _parse_args, _parse_primary, _spelled
@@ -59,35 +59,34 @@ pub fn _parse_subscript(p: Parser, object: Node, open_index: int) -> Node {
         _close_sequence(p, TokenKind.RBracket, "]", "generic argument list", open_index)
         let generic_span = _join(object.span, p._span_since(open_index))
         let tuple = _node(NodeKind.TupleLit, generic_span, {"items": args})
-        return _node(NodeKind.Index, generic_span, {"object": object, "index": tuple})
+        return _index(generic_span, object, tuple)
     }
 
     _close_sequence(p, TokenKind.RBracket, "]", "index expression", open_index)
     let span = _join(object.span, p._span_since(open_index))
-    return _node(NodeKind.Index, span, {"object": object, "index": start ?? p._error_expr(span)})
+    return _index(span, object, start ?? p._error_expr(span))
 }
 
 pub fn _parse_postfix(p: Parser) -> Node {
     var expr = _parse_primary(p)
 
+    # No two arms keep a local of their own. Written inline, the arms' locals
+    # shared frame slots -- `optional` a bool in one, `open_index` an int in
+    # the next -- and a compiled form of the loop was entered with whichever
+    # kind the last iteration left there and refused. The member arm moves
+    # out; the call arm stays inline, with its index declared out here, because
+    # it recurses through `_parse_args`: a helper around it would add a frame
+    # per nesting level and run a cold parser out of frames a few levels sooner.
+    var open_index = 0
     loop {
         if p._check(TokenKind.Dot) or p._check(TokenKind.QuestionDot) {
-            let optional = p._check(TokenKind.QuestionDot)
-            p._advance()
-            let name_token = p._peek()
-            let name = p._expect_ident_name("a member name after `.`")
-            if name == null { break }
-            let kind = optional ? NodeKind.OptMember : NodeKind.Member
-            expr = _member(kind, p._join_token(expr.span, name_token), expr, name)
+            let member = _parse_member_access(p, expr)
+            if member == null { break }
+            expr = member ?? expr
         } elif p._check(TokenKind.LParen) {
-            let open_index = p.current
+            open_index = p.current
             p._advance()
-            let args = _parse_args(p, open_index)
-            expr = _node(
-                NodeKind.Call,
-                _join(expr.span, p._span_since(open_index)),
-                {"callee": expr, "args": args}
-            )
+            expr = _finish_call(_parse_args(p, open_index), p, expr, open_index)
         } elif p._check(TokenKind.LBracket) {
             expr = _parse_subscript(p, expr, p.current)
         } else {
@@ -96,6 +95,24 @@ pub fn _parse_postfix(p: Parser) -> Node {
         if p.panic_mode { break }
     }
     return expr
+}
+
+#: `expr.name` or `expr?.name`, with the parser on the `.` or `?.`; null when
+#: no name follows, which `_expect_ident_name` has already reported.
+pub fn _parse_member_access(p: Parser, expr: Node) -> Node? {
+    let optional = p._check(TokenKind.QuestionDot)
+    p._advance()
+    let name_token = p._peek()
+    let name = p._expect_ident_name("a member name after `.`")
+    if name == null { return null }
+    let kind = optional ? NodeKind.OptMember : NodeKind.Member
+    return _member(kind, p._join_token(expr.span, name_token), expr, name ?? "")
+}
+
+#: `expr(args)` once its arguments are parsed, with the parser past the `)`.
+#: The arguments come first so the caller parses them before this frame exists.
+pub fn _finish_call(args: list[dict[str, any]], p: Parser, expr: Node, open_index: int) -> Node {
+    return _call(_join(expr.span, p._span_since(open_index)), expr, args)
 }
 
 # --- the precedence ladder (§4.1) ------------------------------------
@@ -124,15 +141,23 @@ pub fn _parse_unary(p: Parser) -> Node {
         p.expr_depth -= 1
         return p._error_expr(p._cur_span())
     }
-    defer { p.expr_depth -= 1 }
-
+    # The depth comes back down by hand on every way out, not in a `defer`:
+    # the compiled tier has no arm for one, and a `defer` here kept this rung
+    # -- and with it every rung above, each of which calls the one below
+    # first -- interpreted. Nothing in the parser throws to unwind past it.
     let kind = p._kind()
     if kind == TokenKind.Minus {
         let folded = _parse_neg_magnitude(p)
-        if folded != null { return folded ?? p._error_expr(p._cur_span()) }
+        if folded != null {
+            let literal = folded ?? p._error_expr(p._cur_span())
+            p.expr_depth -= 1
+            return literal
+        }
     }
     if kind != TokenKind.Minus and kind != TokenKind.Plus and kind != TokenKind.Tilde {
-        return _parse_power(p)
+        let power = _parse_power(p)
+        p.expr_depth -= 1
+        return power
     }
     let start_index = p.current
     p._advance()
@@ -143,7 +168,9 @@ pub fn _parse_unary(p: Parser) -> Node {
     } elif kind == TokenKind.Plus {
         op = OpKind.Pos
     }
-    return _unary(p._span_since(start_index), op, operand)
+    let unary = _unary(p._span_since(start_index), op, operand)
+    p.expr_depth -= 1
+    return unary
 }
 
 pub fn _parse_multiplicative(p: Parser) -> Node {
@@ -195,13 +222,20 @@ pub fn _parse_bit_xor(p: Parser) -> Node {
         let op_span = p._cur_span()
         p._advance()
         let right = _parse_bit_and(p)
-        if not p.trial_active and _is_numeric_literal(left) and _is_numeric_literal(right) {
-            p.diagnostics.warn(
-                Code.W0105_DEPRECATED,
-                op_span,
-                "`^` is bitwise xor in Jaithon 3, not exponentiation",
-                note: "the power operator is `**`"
-            )
+        # Nested rather than `and`-chained, as `_parse_ident_primary` explains:
+        # a call to a function the compiled tier has not compiled cannot be
+        # stepped over inside an `and`.
+        if not p.trial_active {
+            if _is_numeric_literal(left) {
+                if _is_numeric_literal(right) {
+                    p.diagnostics.warn(
+                        Code.W0105_DEPRECATED,
+                        op_span,
+                        "`^` is bitwise xor in Jaithon 3, not exponentiation",
+                        note: "the power operator is `**`"
+                    )
+                }
+            }
         }
         left = _binary(NodeKind.Binary, OpKind.Bxor, left, right)
         if p.panic_mode { break }
@@ -291,12 +325,13 @@ pub fn _parse_not(p: Parser) -> Node {
         p.expr_depth -= 1
         return p._error_expr(p._cur_span())
     }
-    defer { p.expr_depth -= 1 }
-
+    # By hand rather than in a `defer`; see `_parse_unary`.
     let start_index = p.current
     p._advance()
     let operand = _parse_not(p)
-    return _unary(p._span_since(start_index), OpKind.Not, operand)
+    let negated = _unary(p._span_since(start_index), OpKind.Not, operand)
+    p.expr_depth -= 1
+    return negated
 }
 
 pub fn _parse_and(p: Parser) -> Node {
@@ -336,16 +371,20 @@ pub fn _parse_expression(p: Parser) -> Node {
         p.expr_depth -= 1
         return p._error_expr(p._cur_span())
     }
-    defer { p.expr_depth -= 1 }
-
+    # By hand rather than in a `defer`; see `_parse_unary`.
     let cond = _parse_coalesce(p)
-    if not p._match(TokenKind.Question) { return cond }
+    if not p._match(TokenKind.Question) {
+        p.expr_depth -= 1
+        return cond
+    }
     let then_expr = _parse_expression(p)
     p._expect(TokenKind.Colon, "`:` in a conditional expression")
     let else_expr = _parse_expression(p)
-    return _node(
+    let ternary = _node(
         NodeKind.Ternary,
         _join(cond.span, else_expr.span),
         {"cond": cond, "thenExpr": then_expr, "elseExpr": else_expr}
     )
+    p.expr_depth -= 1
+    return ternary
 }

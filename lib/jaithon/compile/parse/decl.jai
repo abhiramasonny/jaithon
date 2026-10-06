@@ -12,7 +12,7 @@ from jaithon.ast import DeclKind, Node, NodeKind, Span, TypeExpr, Visibility
 from jaithon.compile.diag import Code
 from jaithon.compile.token import TokenKind
 from jaithon.compile.parse.state import Parser
-from jaithon.compile.parse.node_build import _field, _generic, _import_item, _node, _param, _variant
+from jaithon.compile.parse.node_build import _field, _generic, _import_item, _node, _param, _var_decl, _variant
 from jaithon.compile.parse.type_expr import _parse_type, _parse_type_list
 from jaithon.compile.parse.primary import _close_sequence
 from jaithon.compile.parse.expr import _parse_expression
@@ -248,17 +248,7 @@ pub fn _parse_var_decl(p: Parser, visibility: Visibility, start_index: int) -> N
     }
     p._end_statement()
 
-    return _node(
-        NodeKind.VarDecl,
-        p._span_since(start_index),
-        {
-            "varDeclKind": decl_kind,
-            "pattern": pattern,
-            "declaredType": declared,
-            "init": init,
-            "visibility": visibility,
-        }
-    )
+    return _var_decl(p._span_since(start_index), decl_kind, pattern, declared, init, visibility)
 }
 
 pub fn _parse_class_decl(p: Parser, visibility: Visibility, start_index: int) -> Node? {

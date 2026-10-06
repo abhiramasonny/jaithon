@@ -4,6 +4,7 @@
 #: annotation to semantic type, the type-name scope that resolves against, and
 #: the program-level passes that run before anything is checked.
 from jaithon.ast import Node, NodeKind, Span, TypeExpr, TypeKind
+from jaithon.ast.schema import _WALK_SLOTS
 from jaithon.compile.check.decl import layout_decl, push_generics, register_decl
 from jaithon.compile.check.decl import signature_of
 from jaithon.compile.check.expr import E0410_UNKNOWN_MEMBER
@@ -403,19 +404,49 @@ class _DeclSites {
     }
 }
 
+const _SITE_NONE = 0
+const _SITE_TYPE = 1
+const _SITE_IMPORT = 2
+const _SITE_ALIAS = 3
+const _SITE_FUNCTION = 4
+
+#: Which list of `_DeclSites` a node of each declaring kind goes on.
+let _SITE_OF: dict[NodeKind, int] = {
+    NodeKind.ClassDecl: _SITE_TYPE,
+    NodeKind.TraitDecl: _SITE_TYPE,
+    NodeKind.EnumDecl: _SITE_TYPE,
+    NodeKind.Import: _SITE_IMPORT,
+    NodeKind.FromImport: _SITE_IMPORT,
+    NodeKind.TypeDecl: _SITE_ALIAS,
+    NodeKind.FnDecl: _SITE_FUNCTION,
+}
+
+#: A node's own slots are read through `_WALK_SLOTS`, which leaves out the ones
+#: whose tag says they hold a name, a flag, an operator or a type -- the walk
+#: used to call itself on each of those only to find nothing. The order of the
+#: visit, and so of every list in `sites`, is unchanged.
 fn _collect_sites(sites: _DeclSites, node: any, in_record: bool) -> void {
     if node is Node {
         let kind = node.kind
-        if kind == NodeKind.ClassDecl or kind == NodeKind.TraitDecl or kind == NodeKind.EnumDecl {
-            if not in_record { sites.types.push(node) }
-        } elif kind == NodeKind.Import or kind == NodeKind.FromImport {
-            sites.imports.push(node)
-        } elif kind == NodeKind.TypeDecl {
-            sites.aliases.push(node)
-        } elif kind == NodeKind.FnDecl {
-            sites.functions.push(node)
+        # One lookup rather than seven `NodeKind` compares, which every node
+        # that declares nothing -- nearly all of them -- used to run in full.
+        let site = _SITE_OF.get(kind, _SITE_NONE)
+        if site != _SITE_NONE {
+            if site == _SITE_TYPE {
+                if not in_record { sites.types.push(node) }
+            } elif site == _SITE_IMPORT {
+                sites.imports.push(node)
+            } elif site == _SITE_ALIAS {
+                sites.aliases.push(node)
+            } else {
+                sites.functions.push(node)
+            }
         }
-        for value in node.fields { _collect_sites(sites, value, in_record) }
+        let fields = node.fields
+        for slot in _WALK_SLOTS[kind] {
+            if slot < 0 { break }
+            _collect_sites(sites, fields[slot], in_record)
+        }
     } elif node is list {
         for item in node { _collect_sites(sites, item, in_record) }
     } elif node is dict {

@@ -135,18 +135,23 @@ pub fn _parse_type(p: Parser) -> TypeExpr {
         p.expr_depth -= 1
         return _type(TypeKind.Infer, p._cur_span())
     }
-    defer { p.expr_depth -= 1 }
-
+    # By hand rather than in a `defer`, which the compiled tier has no arm
+    # for; nothing in the parser throws to unwind past it.
     let start_index = p.current
     let first = _parse_postfix_type(p)
-    if not p._check(TokenKind.Pipe) { return first }
+    if not p._check(TokenKind.Pipe) {
+        p.expr_depth -= 1
+        return first
+    }
 
     var parts: list[TypeExpr] = [first]
     while p._match(TokenKind.Pipe) {
         parts.push(_parse_postfix_type(p))
         if p._check(TokenKind.Eof) { break }
     }
-    return _type(TypeKind.Union, p._span_since(start_index), args: parts)
+    let union = _type(TypeKind.Union, p._span_since(start_index), args: parts)
+    p.expr_depth -= 1
+    return union
 }
 
 pub fn _parse_type_list(p: Parser) -> list[TypeExpr] {

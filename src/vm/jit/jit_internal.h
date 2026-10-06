@@ -1722,6 +1722,7 @@ bool buildListExemplar(const Emit *e, unsigned first, unsigned n,
                               Value *out);
 bool dictUniformValue(ObjDict *dict, Value *out);
 bool jitSoftField(void);
+bool jitSoftAnyField(void);
 bool jitMembership(void);
 bool jitTuple(void);
 bool jitNegate(void);

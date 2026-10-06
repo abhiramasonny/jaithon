@@ -223,18 +223,23 @@ pub fn _parse_pattern(p: Parser) -> Node {
         p.expr_depth -= 1
         return _node(NodeKind.PatWildcard, p._cur_span())
     }
-    defer { p.expr_depth -= 1 }
-
+    # By hand rather than in a `defer`, which the compiled tier has no arm
+    # for; nothing in the parser throws to unwind past it.
     let start_index = p.current
     let first = _parse_pattern_primary(p)
-    if not p._check(TokenKind.Pipe) { return first }
+    if not p._check(TokenKind.Pipe) {
+        p.expr_depth -= 1
+        return first
+    }
 
     var alternatives: list[Node] = [first]
     while p._match(TokenKind.Pipe) {
         alternatives.push(_parse_pattern_primary(p))
         if p.panic_mode or p._check(TokenKind.Eof) { break }
     }
-    return _pat_seq(NodeKind.PatOr, p._span_since(start_index), alternatives, -1)
+    let either = _pat_seq(NodeKind.PatOr, p._span_since(start_index), alternatives, -1)
+    p.expr_depth -= 1
+    return either
 }
 
 pub fn _expr_to_pattern(p: Parser, expr: Node) -> Node? {

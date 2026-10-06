@@ -14,7 +14,8 @@ from jaithon.ast import Node, NodeKind, OpKind, TypeExpr, Visibility
 from jaithon.compile.diag import Code
 from jaithon.compile.token import TokenKind
 from jaithon.compile.parse.state import Parser, parse_declaration, parse_fn_rest
-from jaithon.compile.parse.node_build import _arg, _arm, _catch, _ident, _match_node, _node
+from jaithon.compile.parse.node_build import _arg, _arm, _block, _catch, _expr_stmt, _ident, _match_node, _node
+from jaithon.compile.parse.node_build import _assign, _if, _return
 from jaithon.compile.parse.token_class import _assign_op
 from jaithon.compile.parse.predicate import _is_assign_target, _starts_bare_argument
 from jaithon.compile.parse.type_expr import _parse_type_list
@@ -37,11 +38,11 @@ pub fn _parse_block(p: Parser) -> Node {
         p._skip_newlines()
     }
     _close_sequence(p, TokenKind.RBrace, "}", "block", start_index)
-    return _node(NodeKind.Block, p._span_since(start_index), {"stmts": stmts})
+    return _block(p._span_since(start_index), stmts)
 }
 
 pub fn _empty_block(p: Parser) -> Node {
-    return _node(NodeKind.Block, p._cur_span(), {"stmts": []})
+    return _block(p._cur_span(), [])
 }
 
 pub fn _expect_block(p: Parser, what: str) -> Node {
@@ -83,11 +84,7 @@ pub fn _parse_if(p: Parser, as_expr: bool) -> Node {
     }
 
     let kind = as_expr ? NodeKind.IfExpr : NodeKind.If
-    return _node(
-        kind,
-        p._span_since(start_index),
-        {"cond": cond, "thenBranch": then_branch, "elseBranch": else_branch}
-    )
+    return _if(kind, p._span_since(start_index), cond, then_branch, else_branch)
 }
 
 pub fn _parse_while(p: Parser, label: str?, start_index: int) -> Node {
@@ -232,7 +229,7 @@ pub fn _parse_expr_or_assign(p: Parser) -> Node {
     let compound = compound_op != null
     if not compound and not p._check(TokenKind.Eq) {
         p._end_statement()
-        return _node(NodeKind.ExprStmt, p._span_since(start_index), {"expr": target})
+        return _expr_stmt(p._span_since(start_index), target)
     }
 
     let op_span = p._cur_span()
@@ -259,16 +256,7 @@ pub fn _parse_expr_or_assign(p: Parser) -> Node {
 
     let value = _parse_expression(p)
     p._end_statement()
-    return _node(
-        NodeKind.Assign,
-        p._span_since(start_index),
-        {
-            "target": target,
-            "value": value,
-            "op": compound_op ?? OpKind.Add,
-            "isCompound": compound,
-        }
-    )
+    return _assign(p._span_since(start_index), target, value, compound_op ?? OpKind.Add, compound)
 }
 
 pub fn _parse_legacy_call_statement(p: Parser, name: str) -> Node {
@@ -300,7 +288,7 @@ pub fn _parse_legacy_call_statement(p: Parser, name: str) -> Node {
         p._span_since(start_index),
         {"callee": _ident(name_span, name_token.word), "args": args}
     )
-    let stmt = _node(NodeKind.ExprStmt, call.span, {"expr": call})
+    let stmt = _expr_stmt(call.span, call)
     p._end_statement()
     return stmt
 }
@@ -373,7 +361,7 @@ pub fn _parse_statement(p: Parser) -> Node? {
         p._advance()
         let value = p._starts_expression() ? _parse_expression(p) : null
         p._end_statement()
-        return _node(NodeKind.Return, p._span_since(start_index), {"value": value})
+        return _return(p._span_since(start_index), value)
     }
     if kind == TokenKind.KwThrow {
         p._advance()

@@ -12,7 +12,9 @@
  *      `vmThrow`, which walks handlers and frames explicitly.
  */
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 
@@ -29,8 +31,19 @@
 VM vm;
 
 /* Nested runLoop() invocations, one per re-entry from native code. Each costs
- * a C stack frame, so it is bounded well below the interpreter frame limit. */
+ * C stack, so re-entry is bounded by the thread's real stack (runStackFloor):
+ * compiled code calling interpreted code re-enters once per call, and a fixed
+ * count let a recursion that alternates between the tiers fail long before
+ * the interpreter's own frame limit. The count is the bound only on a thread
+ * whose stack bounds are unknown. */
 #define JAI_MAX_NESTED_RUN 128
+/* Below this many nested runs the stack is not checked at all, which keeps
+ * the thread-local read off the commonest, shallowest re-entries. runLoop's
+ * frame is about 22 KB (its opcode buffers are inline: moving them out
+ * changed the loop's shape, so its trained profile no longer applied and the
+ * interpreter ran 5-13% slower), so this many fit with room to spare in the
+ * smallest stack the margin below allows for, 512 KB. */
+#define JAI_RUN_STACK_CHECK_DEPTH 8
 int sRunDepth;
 
 /* An exception suspended by a `finally` that was reached while unwinding.
@@ -3513,11 +3526,57 @@ vmThrow: {
     }
 }
 
+/* The lowest address a run() may start at on this thread, or 1 when the
+ * bounds are unknown. The margin left below it is for everything that is not
+ * a re-entry -- natives, imports, the collector, raising the error itself --
+ * an eighth of the stack, 64 KB to 1 MB. Like the tier's stackLimit, it is
+ * read off the thread's own bounds rather than the first caller's sp. */
+static _Thread_local uintptr_t sRunStackFloor;
+
+static uintptr_t runStackFloor(void) {
+    if (sRunStackFloor != 0) return sRunStackFloor;
+#if defined(__APPLE__)
+    pthread_t self = pthread_self();
+    uintptr_t top  = (uintptr_t)pthread_get_stackaddr_np(self);
+    size_t    size = pthread_get_stacksize_np(self);
+    if (top == 0 || size == 0 || size > top) {
+        sRunStackFloor = 1;
+        return 1;
+    }
+    size_t margin = size / 8;
+    if (margin < 64u * 1024u) margin = 64u * 1024u;
+    if (margin > 1024u * 1024u) margin = 1024u * 1024u;
+    sRunStackFloor = (margin >= size) ? 1 : top - size + margin;
+#else
+    sRunStackFloor = 1;
+#endif
+    return sRunStackFloor;
+}
+
+/* Whether this re-entry would leave too little stack below it. Kept out of
+ * run(): reading a thread-local costs a call on Darwin, and run() is entered
+ * once per compiled-to-interpreted call. */
+static JAI_NOINLINE bool runStackExhausted(void) {
+    uintptr_t floor = runStackFloor();
+    if (floor == 1) return sRunDepth >= JAI_MAX_NESTED_RUN;
+    return (uintptr_t)__builtin_frame_address(0) < floor;
+}
+
+/* The depth at which this re-entry is refused: 0 once the stack is
+ * exhausted, otherwise never. A bound rather than a bool so that run()'s test
+ * stays the single `>=` the trained profile was recorded against -- clang
+ * hashes a condition's operators, and an `&&` or a bare call there dropped
+ * run()'s counts. */
+static inline int runReentryBound(void) {
+    if (sRunDepth < JAI_RUN_STACK_CHECK_DEPTH) return INT_MAX;
+    return runStackExhausted() ? 0 : INT_MAX;
+}
+
 JaiRunResult run(int baseFrameCount) {
-    if (sRunDepth >= JAI_MAX_NESTED_RUN) {
+    if (sRunDepth >= runReentryBound()) {
         (void)jaiThrow(vm.cRecursionError,
-                       "maximum native re-entry depth exceeded (%d)",
-                       JAI_MAX_NESTED_RUN);
+                       "maximum native re-entry depth exceeded (%d nested)",
+                       sRunDepth);
         while (vm.frameCount > baseFrameCount) popFrameForUnwind();
         return JAI_RUN_RUNTIME_ERROR;
     }
