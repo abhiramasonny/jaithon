@@ -646,6 +646,17 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
                            &e->selfSlow[si].deoptKind)) {
             return false;
         }
+        /* A self-call is an effect, as a writing direct call is. Verdict 4
+         * FINISHES the inner activation in the interpreter, and that runs
+         * whatever it has left -- a tail the walk never compiled (the
+         * `print` after a lambda), a callee's own interpreted tail -- so this
+         * activation may have written by the time it continues here. If it
+         * then deoptimised and its body still claimed jitFuncNoWrite, a
+         * compiled caller would answer by running it again from the top:
+         * `via(r, 1)` pushed twice once a field guard after the call failed.
+         * The flag is the whole body's, so every recursive body is a writer;
+         * its callers finish it from its record instead of re-running it. */
+        e->wroteHeap = true;
         off += 2;
         break;
     } while (0);
