@@ -339,8 +339,12 @@ pub class SGD: Optimizer {
     pub fn name(self) -> str { return "SGD" }
 
     #: Apply one SGD update to every given parameter, using its `.grad`.
+    #:
+    #: The settings are made once a step, not once a parameter: they are the
+    #: same numbers for every one of them, and each call allocated a list.
     pub fn step(self, parameters: list[Tensor]) -> void {
-        for parameter in parameters { apply_update(parameter, self.settings(), self.kind()) }
+        let settings = self.settings()
+        for parameter in parameters { apply_update(parameter, settings, 0) }
     }
 }
 
@@ -388,6 +392,7 @@ pub class Adam: Optimizer {
 
     #: Apply one Adam update to every given parameter, using its `.grad`.
     pub fn step(self, parameters: list[Tensor]) -> void {
-        for parameter in parameters { apply_update(parameter, self.settings(), self.kind()) }
+        let settings = self.settings()
+        for parameter in parameters { apply_update(parameter, settings, 1) }
     }
 }
