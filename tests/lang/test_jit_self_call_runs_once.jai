@@ -17,7 +17,7 @@
 #: self-call fails its class guard, and count the writes. The last needs no
 #: swap: the finished inner call answers null where the compiled self-call
 #: took an int, and the outer activation deoptimises on that.
-# jit-compiles: sc_leaf_push, sc_via_closure, sc_rec_direct, sc_via_direct, sc_tail_writer, sc_rec_tail, sc_via_tail, sc_rec_osr, sc_rec_bumps, sc_drive_bumps, sc_rec_tally, sc_drive_tally, sc_rec_null, sc_via_null, sc_mid_make, sc_via_make
+# jit-compiles: sc_leaf_push, sc_via_closure, sc_rec_direct, sc_via_direct, sc_tail_writer, sc_rec_tail, sc_via_tail, sc_rec_osr, sc_rec_bumps, sc_drive_bumps, sc_rec_tally, sc_drive_tally, sc_rec_null, sc_via_null, sc_mid_make, sc_via_make, sc_walk_osr
 from std.test import assert_eq
 
 let WARM = 300
@@ -178,6 +178,38 @@ fn test_an_osr_loop_runs_a_finished_self_call_once() -> void {
     reset()
     let t = sc_loop_osr(100000, 99500)
     assert_eq(t, 99500 + 500 * 2)
+    assert_eq(len(log), 100000)
+}
+
+#: The loop is inside the recursive body itself. Its OSR form cannot use the
+#: self-call arm (instruction 0 of a loop form is not the function's entry),
+#: so it calls its own whole-body form as an ordinary compiled global -- and
+#: re-ran it from the top when that form deoptimised after its self-call. The
+#: swap is in the interpreted tail, so nothing this body compiled writes.
+fn sc_walk_osr(n: int, k: int) -> int {
+    if n > 1 {
+        var t = 0
+        for i in 0..k {
+            t = t + sc_walk_osr(n - 1, k)
+        }
+        return t
+    }
+    if n > 0 {
+        let v = sc_walk_osr(n - 1, k)
+        return v + holder.k
+    }
+    let g = |x| x + n
+    log.push(1)
+    if len(log) == k - 300 {
+        holder = Wide(2)
+    }
+    return 0
+}
+
+fn test_a_loop_form_of_the_recursive_body_runs_it_once() -> void {
+    reset()
+    let t = sc_walk_osr(2, 100000)
+    assert_eq(t, 99699 + 301 * 2)
     assert_eq(len(log), 100000)
 }
 
