@@ -177,12 +177,18 @@ fn next_step(parameter: Tensor) -> int {
 }
 
 #: Allocate optimizer buffers before the first timed step.
-pub fn prepare_state(parameters: list[Tensor], settings: list[float]) -> void {
+#:
+#: `kind` is the optimizer's own, and a state that is already there for it is
+#: kept. This used to prepare a plain descent's state whatever the optimizer
+#: was, on the reasoning that a state of the wrong kind is replaced on the
+#: first step anyway -- which is true, and is the bug: `Sequential` prepares on
+#: every `fit`, so an Adam model fitted an epoch at a time had its moments and
+#: step count thrown away at the start of every one, and trained a different
+#: model from one fitted in a single call.
+pub fn prepare_state(parameters: list[Tensor], settings: list[float], kind: int = 0) -> void {
+    let moments = wants_moments(kind, settings)
     for parameter in parameters {
-        #: The kind is not passed in here, and a state built for the wrong
-        #: one would be thrown away on the first step anyway, so this only
-        #: warms what a plain descent needs and lets `apply_update` decide.
-        let state = state_for(parameter, 0, wants_moments(0, settings))
+        let state = state_for(parameter, kind, moments)
         if state.settings is null { state.settings = Buffer.of(settings) }
     }
 }

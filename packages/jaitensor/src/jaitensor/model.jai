@@ -448,7 +448,7 @@ pub class Sequential {
         }
         let optimizer = self.optimizer_value
         if optimizer is not null and not self.fused_sgd {
-            prepare_state(self._parameters(), optimizer.settings())
+            prepare_state(self._parameters(), optimizer.settings(), optimizer.kind())
         }
         if training { self._try_compiling(dataset, batch_size, classes) }
     }
