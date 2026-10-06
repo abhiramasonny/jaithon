@@ -398,6 +398,49 @@ fn test_row_reductions_break_ties_at_the_lowest_column() -> void {
     assert_throws(ValueError, || jl.row_topk(m, 4))
 }
 
+#: The host's answer: every column ranked by value (descending when
+#: `largest`), equal values by column ascending, the first `k` kept. The
+#: values are small integers, so one numeric key carries both orders.
+fn host_topk(values: list[float], rows: int, columns: int, k: int, largest: bool) -> list[int] {
+    var picked: list[int] = []
+    let sign = if largest { -1.0 } else { 1.0 }
+    for row in 0..rows {
+        var order = [column for column in 0..columns]
+        let base = row * columns
+        order.sort(key: |c| sign * values[base + c] * 100000.0 + float(c))
+        for slot in 0..k { picked.push(order[slot]) }
+    }
+    return picked
+}
+
+#: Duplicates everywhere, so the tie order is what is being tested: equal
+#: values must come out smallest column first, at every capacity the one-pass
+#: kernel has and past it, with a row wide enough that many threads share it.
+fn test_row_topk_breaks_ties_at_the_lowest_column_in_one_pass() -> void {
+    if not jl.is_available() { return }
+    let rows = 7
+    let columns = 3001
+    var values: list[float] = []
+    for index in 0..rows * columns { values.push(float((index * 7919 + index // 13) % 23)) }
+    let m = Tensor([rows, columns], values)
+    defer { m.free() }
+    for k in [1, 4, 5, 8, 9, 16, 17, 32, 33] {
+        for largest in [true, false] {
+            let (top, at) = jl.row_topk(m, k, largest: largest)
+            let got = jl.to_values(at)
+            let got_values = jl.to_values(top)
+            top.free()
+            at.free()
+            let want = host_topk(values, rows, columns, k, largest)
+            for slot in 0..rows * k {
+                let row = slot // k
+                assert_eq(int(got[slot]), want[slot], f"k {k} largest {largest} slot {slot}")
+                assert_eq(got_values[slot], values[row * columns + want[slot]], f"k {k} value")
+            }
+        }
+    }
+}
+
 fn test_class_aggregation_gathers_the_sufficient_statistics() -> void {
     if not jl.is_available() { return }
     let labels = jl.vector([0.0, 1.0, 1.0, 2.0])

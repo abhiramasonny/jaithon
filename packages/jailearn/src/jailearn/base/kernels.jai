@@ -482,6 +482,111 @@ kernel void base_row_topk(device const float* m [[buffer(0)]],
     }
 }
 
+/* Whether `(s, i)` outranks `(t, j)`: the larger score, and on a tie the
+ * smaller column. Every top-k here ranks by this one rule, so the tie order
+ * is the same whichever kernel answered. */
+static inline bool topk_before(float s, uint i, float t, uint j) {
+    return s > t || (s == t && i < j);
+}
+
+/* The `k` best entries of each row in one pass, a threadgroup a row.
+ *
+ * `base_row_topk` gives a row one thread and `k` passes over it, so a
+ * thousand-row distance matrix ran on a thousand threads making five strided
+ * sweeps each. Here a row's threads take its columns a group-width apart --
+ * adjacent threads, adjacent columns, so the reads coalesce -- and each keeps
+ * its own best `K` in registers: `K` is a template constant so the insertion
+ * below unrolls onto fixed slots, and a runtime `k` at most `K` reads only the
+ * head of it. Then `k` rounds pick the best head across the group, a simd
+ * butterfly and one slot per simdgroup in threadgroup memory, and the thread
+ * that owned the winner pops it. Ranking is `topk_before` on `sign * value`,
+ * so equal values come out smallest column first, as `base_row_topk` does.
+ *
+ * `fused` reads `m` as the raw product `a.bT` and ranks the distance
+ * `max(left[first + row] + right[j] - 2 m, 0)` that `base_dist_finish` would
+ * have written, so a neighbour search never makes that pass over the whole
+ * matrix. Rows are written at `first + row`, which is how a search over bands
+ * of queries fills one answer. A row with fewer than `k` ranked entries pads
+ * with column `columns`, as `base_row_topk` does. */
+template <uint K>
+kernel void base_row_topk_group(device const float* m [[buffer(0)]],
+                                device float* values [[buffer(1)]],
+                                device float* index [[buffer(2)]],
+                                device const float* left [[buffer(3)]],
+                                device const float* right [[buffer(4)]],
+                                constant uint& rows [[buffer(5)]],
+                                constant uint& columns [[buffer(6)]],
+                                constant uint& k [[buffer(7)]],
+                                constant uint& largest [[buffer(8)]],
+                                constant uint& fused [[buffer(9)]],
+                                constant uint& first [[buffer(10)]],
+                                uint row [[threadgroup_position_in_grid]],
+                                uint lid [[thread_index_in_threadgroup]],
+                                uint threads [[threads_per_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float heads[32];
+    threadgroup uint owners[32];
+    if (row >= rows) return;
+    const uint none = 0xFFFFFFFFu;
+    float sign = largest != 0u ? 1.0f : -1.0f;
+    float best[K];
+    uint at[K];
+    #pragma unroll
+    for (uint p = 0u; p < K; ++p) { best[p] = -INFINITY; at[p] = none; }
+    device const float* line = m + ulong(row) * ulong(columns);
+    float offset = fused != 0u ? left[first + row] : 0.0f;
+    for (uint j = lid; j < columns; j += threads) {
+        float value = line[j];
+        if (fused != 0u) value = max(offset + right[j] - 2.0f * value, 0.0f);
+        float s = sign * value;
+        if (!topk_before(s, j, best[K - 1u], at[K - 1u])) continue;
+        best[K - 1u] = s;
+        at[K - 1u] = j;
+        #pragma unroll
+        for (uint p = K - 1u; p > 0u; --p) {
+            if (topk_before(best[p], at[p], best[p - 1u], at[p - 1u])) {
+                float ts = best[p]; best[p] = best[p - 1u]; best[p - 1u] = ts;
+                uint ti = at[p]; at[p] = at[p - 1u]; at[p - 1u] = ti;
+            }
+        }
+    }
+    uint warps = (threads + 31u) / 32u;
+    for (uint slot = 0u; slot < k; ++slot) {
+        float s = best[0];
+        uint i = at[0];
+        for (ushort hop = 16; hop > 0; hop >>= 1) {
+            float s2 = simd_shuffle_xor(s, hop);
+            uint i2 = simd_shuffle_xor(i, hop);
+            if (topk_before(s2, i2, s, i)) { s = s2; i = i2; }
+        }
+        if (lane == 0u) { heads[warp] = s; owners[warp] = i; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float top = heads[0];
+        uint pick = owners[0];
+        for (uint w = 1u; w < warps; ++w) {
+            if (topk_before(heads[w], owners[w], top, pick)) { top = heads[w]; pick = owners[w]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0u) {
+            ulong out = ulong(first + row) * ulong(k) + slot;
+            values[out] = sign * top;
+            index[out] = float(pick == none ? columns : pick);
+        }
+        if (at[0] == pick) {
+            #pragma unroll
+            for (uint p = 0u; p + 1u < K; ++p) { best[p] = best[p + 1u]; at[p] = at[p + 1u]; }
+            best[K - 1u] = -INFINITY;
+            at[K - 1u] = none;
+        }
+    }
+}
+
+template [[host_name("base_row_topk4")]] [[kernel]] decltype(base_row_topk_group<4>) base_row_topk_group<4>;
+template [[host_name("base_row_topk8")]] [[kernel]] decltype(base_row_topk_group<8>) base_row_topk_group<8>;
+template [[host_name("base_row_topk16")]] [[kernel]] decltype(base_row_topk_group<16>) base_row_topk_group<16>;
+template [[host_name("base_row_topk32")]] [[kernel]] decltype(base_row_topk_group<32>) base_row_topk_group<32>;
+
 /* One total per class and column, a threadgroup striding the samples.
  *
  * `power` 0 counts each class and ignores `values`, 1 sums the column and 2

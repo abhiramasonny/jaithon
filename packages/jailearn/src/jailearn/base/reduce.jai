@@ -1,4 +1,5 @@
 #: Reductions down a matrix's columns and along its rows, and the sorts underneath.
+from std.gpu import Buffer
 from std.os import env_or
 
 from jaitensor import Tensor
@@ -200,14 +201,73 @@ pub fn row_argmin(m: Tensor) -> Tensor {
     return index
 }
 
+#: `JAILEARN_ROW_TOPK=0` restores one thread per row making `k` passes, for
+#: every `k`, instead of the one-pass threadgroup kernel.
+let _ROW_TOPK = env_or("JAILEARN_ROW_TOPK", "1") != "0"
+
+#: The largest `k` the one-pass kernel holds in registers; beyond it
+#: `row_topk` makes `k` passes, which at that size is a partial sort anyway.
+pub const TOPK_ONE_PASS_MAX: int = 32
+
+fn topk_capacity(k: int) -> int {
+    var capacity = 4
+    while capacity < k { capacity *= 2 }
+    return capacity
+}
+
+#: Threads per row: enough that each folds about sixteen columns, a whole
+#: number of simdgroups, at most a full group.
+fn topk_threads(columns: int) -> int {
+    var threads = 32
+    while threads < 256 and threads * 16 < columns { threads *= 2 }
+    return threads
+}
+
+#: Whether `row_topk_into` takes a `k` this large in one pass.
+pub fn topk_one_pass(k: int) -> bool { return _ROW_TOPK and k <= TOPK_ONE_PASS_MAX }
+
+#: Write the best `k` of each of `rows` rows of `m` into rows `first..` of
+#: `values` and `index`, in one pass (`topk_one_pass(k)` must hold).
+#:
+#: With `left` and `right`, `m` is read as the product `a.bT` and ranked as
+#: the squared distance `left[first + row] + right[column] - 2 m`, clamped at
+#: zero; that is how `distance.nearest_rows` searches without a finishing
+#: pass over the matrix.
+pub fn row_topk_into(
+    m: Buffer,
+    rows: int,
+    columns: int,
+    k: int,
+    largest: bool,
+    values: Tensor,
+    index: Tensor,
+    first: int = 0,
+    left: Buffer? = null,
+    right: Buffer? = null
+) -> void {
+    if not topk_one_pass(k) { throw ValueError(f"k {k} is past the one-pass top-k") }
+    let fused = left is not null and right is not null
+    let threads = topk_threads(columns)
+    base_kernel(f"base_row_topk{topk_capacity(k)}").dispatch_async(
+        [m, values.buffer(), index.buffer(), left ?? m, right ?? m],
+        rows * threads,
+        [rows, columns, k, if largest { 1 } else { 0 }, if fused { 1 } else { 0 }, first],
+        group_size: threads
+    )
+}
+
 #: The `k` best entries of every row: `(values, indices)`, both `[n_rows, k]`.
 #: `largest` false picks the smallest, which is what a neighbour search wants
-#: out of a distance matrix.
+#: out of a distance matrix. Equal values come out smallest column first.
 pub fn row_topk(m: Tensor, k: int, largest: bool = true) -> tuple[Tensor, Tensor] {
     check_matrix(m, "m")
     if k <= 0 or k > m.shape[1] { throw ValueError(f"cannot take {k} of {m.shape[1]} columns") }
     let values = Tensor([m.shape[0], k])
     let index = Tensor([m.shape[0], k])
+    if topk_one_pass(k) {
+        row_topk_into(m.buffer(), m.shape[0], m.shape[1], k, largest, values, index)
+        return (values, index)
+    }
     let wanted = if largest { 1 } else { 0 }
     base_kernel("base_row_topk").dispatch_async(
         [m.buffer(), values.buffer(), index.buffer()],
