@@ -13,7 +13,8 @@
 #: ```
 import std.math
 from std.gpu import Kernel
-from ..core.linalg import inverse, matmul, symmetric_eigen, transpose
+from ..core.linalg import device_product, device_scatter, inverse, matmul, on_device
+from ..core.linalg import symmetric_eigen, transpose
 from ..core.mat import Mat, merge
 from ..core.types import CV_32F, CV_64F, CV_MAKETYPE, CV_MAT_CN, CV_MAT_DEPTH
 from ..core.types import Point, Rect, Scalar, Size
@@ -527,6 +528,19 @@ pub fn calc_covar_matrix(samples: Mat, normalise: bool = true) -> tuple[Mat, Mat
     let rows = samples.rows
     let width = samples.cols * samples.channels()
     if rows < 2 { throw ValueError("a covariance needs at least two samples") }
+    if on_device(rows * width * width) and samples.channels() == 1 {
+        let scattered = device_scatter(samples)
+        if scattered is not null {
+            let (centre, scatter) = scattered
+            let divisor = if normalise { float(rows - 1) } else { 1.0 }
+            var covariance: list[float] = []
+            for value in scatter { covariance.push(value / divisor) }
+            return (
+                Mat.from_list(width, width, CV_MAKETYPE(CV_32F, 1), covariance),
+                Mat.from_list(1, width, CV_MAKETYPE(CV_32F, 1), centre)
+            )
+        }
+    }
     let values = samples.to_list()
 
     var centre: list[float] = []
@@ -573,6 +587,12 @@ pub fn mahalanobis(a: Mat, b: Mat, inverse_covariance: Mat) -> float {
 
 #: `src` times its own transpose, or the other way round.
 pub fn mul_transposed(src: Mat, a_ta: bool = true) -> Mat {
+    let outer = if a_ta { src.cols } else { src.rows }
+    let inner = if a_ta { src.rows } else { src.cols }
+    if on_device(outer * inner * outer) {
+        let product = device_product(src, src, trans_a: a_ta, trans_b: not a_ta)
+        if product is not null { return product }
+    }
     if a_ta { return matmul(transpose(src), src) }
     return matmul(src, transpose(src))
 }

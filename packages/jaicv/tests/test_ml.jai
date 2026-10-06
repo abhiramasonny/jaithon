@@ -6,7 +6,9 @@ from std.test import assert_eq, assert_near, assert_true
 from jaicv.core.mat import Mat
 from jaicv.core.types import CV_32FC1
 from jaicv.ml.models import d_trees_create, r_trees_create, svm_create
-from jaicv.core.linalg import symmetric_eigen_of
+from jaicv.core.linalg import matmul as linalg_matmul, on_device, symmetric_eigen_of
+from jaicv.core.misc import calc_covar_matrix, mul_transposed
+from jaicv.core.cluster import PCA
 
 fn have_gpu() -> bool { return gpu.is_available() }
 
@@ -409,4 +411,122 @@ fn test_the_svm_stops_at_the_optimum_of_its_dual() -> void {
         if predicted[index] == truth[index] { right += 1 }
     }
     assert_true(right >= 180, f"only {right} of 200 unseen points classified correctly")
+}
+
+# --- products, covariances and PCA big enough to go to the device -----------
+
+fn noise(count: int, seed: int, spread: float, shift: float) -> list[float] {
+    var state = seed
+    var out: list[float] = []
+    for _index in 0..count {
+        state = next_state(state)
+        out.push((float((state >> 8) % 20001) / 10000.0 - 1.0) * spread + shift)
+    }
+    return out
+}
+
+fn test_a_large_product_agrees_with_the_host_sum() -> void {
+    if not have_gpu() { return }
+    let (rows, inner, cols) = (300, 200, 40)
+    assert_true(on_device(rows * inner * cols), "this product is meant to reach the device")
+    let left = noise(rows * inner, 11, 1.0, 0.0)
+    let right = noise(inner * cols, 12, 1.0, 0.0)
+    let got = linalg_matmul(
+        Mat.from_list(rows, inner, CV_32FC1, left),
+        Mat.from_list(inner, cols, CV_32FC1, right)
+    )
+    let a = Mat.from_list(rows, inner, CV_32FC1, left).to_list()
+    let b = Mat.from_list(inner, cols, CV_32FC1, right).to_list()
+    let values = got.to_list()
+    var worst = 0.0
+    for r in 0..rows {
+        for c in 0..cols {
+            var total = 0.0
+            for k in 0..inner { total += a[r * inner + k] * b[k * cols + c] }
+            worst = max(worst, math.fabs(values[r * cols + c] - total))
+        }
+    }
+    assert_true(worst < 1e-3, f"device product is {worst} from the host sum")
+
+    #: Both orientations of `mul_transposed`.
+    let source = Mat.from_list(rows, inner, CV_32FC1, left)
+    let gram = mul_transposed(source, true).to_list()
+    let outer = mul_transposed(source, false).to_list()
+    worst = 0.0
+    for i in 0..inner {
+        for j in 0..inner {
+            var total = 0.0
+            for k in 0..rows { total += a[k * inner + i] * a[k * inner + j] }
+            worst = max(worst, math.fabs(gram[i * inner + j] - total))
+        }
+    }
+    for i in 0..rows {
+        for j in 0..rows {
+            var total = 0.0
+            for k in 0..inner { total += a[i * inner + k] * a[j * inner + k] }
+            worst = max(worst, math.fabs(outer[i * rows + j] - total))
+        }
+    }
+    assert_true(worst < 1e-3, f"device mul_transposed is {worst} from the host sum")
+}
+
+fn test_a_large_covariance_and_pca_agree_with_double_precision() -> void {
+    if not have_gpu() { return }
+    let (rows, width) = (20000, 9)
+    assert_true(on_device(rows * width * width), "this covariance is meant to reach the device")
+    var values: list[float] = []
+    let base = noise(rows * width, 21, 1.0, 0.0)
+    for r in 0..rows {
+        for c in 0..width {
+            #: Columns of different spread, mixed a little, far from the origin.
+            let mixed = base[r * width + c] * (1.0 + float(c)) + 0.3 * base[r * width + (c + 1) % width]
+            values.push(mixed + 50.0)
+        }
+    }
+    let samples = Mat.from_list(rows, width, CV_32FC1, values)
+    let seen = samples.to_list()
+    var centre: list[float] = []
+    for c in 0..width {
+        var total = 0.0
+        for r in 0..rows { total += seen[r * width + c] }
+        centre.push(total / float(rows))
+    }
+    var want: list[float] = []
+    for i in 0..width {
+        for j in 0..width {
+            var total = 0.0
+            for r in 0..rows { total += (seen[r * width + i] - centre[i]) * (seen[r * width + j] - centre[j]) }
+            want.push(total / float(rows - 1))
+        }
+    }
+    let (covariance, mean) = calc_covar_matrix(samples)
+    let got = covariance.to_list()
+    let got_mean = mean.to_list()
+    for c in 0..width { assert_near(got_mean[c], centre[c], 1e-4) }
+    for index in 0..width * width {
+        assert_true(math.fabs(got[index] - want[index]) <= 1e-4 * (1.0 + math.fabs(want[index])), f"covariance entry {index}: {got[index]} against {want[index]}")
+    }
+
+    let (want_values, want_vectors) = symmetric_eigen_of(want, width)
+    let analysis = PCA(samples, 4)
+    let vectors = analysis.eigenvectors.to_list()
+    for k in 0..4 {
+        assert_true(math.fabs(analysis.eigenvalues[k] - want_values[k]) <= 1e-4 * want_values[k], f"eigenvalue {k}")
+        var dot = 0.0
+        for c in 0..width { dot += vectors[k * width + c] * want_vectors[k * width + c] }
+        #: Same direction AND the same sign as the double-precision solve.
+        assert_true(dot > 0.9999, f"eigenvector {k} is at {dot} to the double-precision one")
+    }
+
+    #: The projection of every sample, against the host's.
+    let projected = analysis.project(samples).to_list()
+    var worst = 0.0
+    for r in 0..rows {
+        for k in 0..4 {
+            var total = 0.0
+            for c in 0..width { total += (seen[r * width + c] - got_mean[c]) * vectors[k * width + c] }
+            worst = max(worst, math.fabs(projected[r * 4 + k] - total))
+        }
+    }
+    assert_true(worst < 1e-3, f"device projection is {worst} from the host sum")
 }
