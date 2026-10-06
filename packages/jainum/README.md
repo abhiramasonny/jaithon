@@ -199,3 +199,4 @@ its module loads, and is on unless set to `0`.
 | `JAINUM_BINARY4` | one element a thread, one wrap divide each, for dense and row-repeating real `+ - * /`, instead of four a thread; bit-identical |
 | `JAINUM_NARROW_FINISH` | a full group a segment for a chunked fold's finish, instead of a finish as wide as the chunk count (up to a group); bit-identical |
 | `JAINUM_SHUFFLE_TREE` | the last five rounds of a fold's tree through threadgroup memory and barriers, instead of simd shuffles; bit-identical |
+| `JAINUM_TALL_SVD` | the full Householder bidiagonalization for every host SVD, instead of `A = QR` first (column-major, contiguous runs) and the SVD of the small `R` for a matrix at least twice as tall as wide; `lstsq` then never forms `U`, taking `U^T b` straight from the reflectors. The same factorization to rounding: `svd`, `svdvals`, `lstsq`, `pinv`, `matrix_rank` and `cond` all take it |

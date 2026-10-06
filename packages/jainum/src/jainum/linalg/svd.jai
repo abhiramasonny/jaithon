@@ -1,5 +1,6 @@
 #: `A = U S V^T`: bidiagonalize, then chase the superdiagonal to zero.
 import std.math
+from std.os import env_or
 from .common import FLOAT32_EPS, QR_ITERATIONS, _identity_block, _transpose_host
 from .qr import _column_reflector, _reflect_across, _reflect_from, _row_reflector
 from .rotate import _givens, _rotate_columns, _swap_columns
@@ -235,6 +236,209 @@ fn _svd_finish(
     }
 }
 
+#: `JAINUM_TALL_SVD=0` takes a tall matrix through the full bidiagonalization
+#: like any other, instead of factoring `A = QR` first and the small `R`.
+let _TALL_SVD = env_or("JAINUM_TALL_SVD", "1") != "0"
+
+#: How much taller than wide a matrix must be before `_svd_host` takes the QR
+#: first. LAPACK's crossover for the same choice sits near 1.6; two keeps the
+#: square-ish cases on the path every existing test was written against.
+const TALL_RATIO: int = 2
+
+#: `sum a[ai..] * b[bi..]` over `count` contiguous values.
+#: Four running totals, because one is a chain of dependent adds that runs at
+#: the adder's latency rather than its throughput.
+fn _dot_run(a: list[float], ai: int, b: list[float], bi: int, count: int) -> float {
+    var t0 = 0.0
+    var t1 = 0.0
+    var t2 = 0.0
+    var t3 = 0.0
+    let whole = count - count % 4
+    var index = 0
+    while index < whole {
+        t0 += a[ai + index] * b[bi + index]
+        t1 += a[ai + index + 1] * b[bi + index + 1]
+        t2 += a[ai + index + 2] * b[bi + index + 2]
+        t3 += a[ai + index + 3] * b[bi + index + 3]
+        index += 4
+    }
+    while index < count {
+        t0 += a[ai + index] * b[bi + index]
+        index += 1
+    }
+    return (t0 + t1) + (t2 + t3)
+}
+
+#: `b[bi..] -= factor * a[ai..]` over `count` contiguous values.
+fn _axpy_run(a: list[float], ai: int, b: list[float], bi: int, count: int, factor: float) -> void {
+    for index in 0..count { b[bi + index] -= factor * a[ai + index] }
+}
+
+#: Apply the reflector `vs[step * m ..]` (rows `step..m`) to every column of
+#: the column-major `target`, `columns` wide, from column `first`.
+fn _reflect_columns(
+    target: list[float],
+    m: int,
+    columns: int,
+    vs: list[float],
+    step: int,
+    vnorm: float,
+    first: int
+) -> void {
+    if vnorm == 0.0 { return }
+    let count = m - step
+    let vbase = step * m + step
+    for column in first..columns {
+        let at = column * m + step
+        let dot = _dot_run(vs, vbase, target, at, count)
+        _axpy_run(vs, vbase, target, at, count, 2.0 * dot / vnorm)
+    }
+}
+
+#: Householder QR of a column-major `m x n` matrix, in place: the top `n x n`
+#: of `cols` becomes `R` (read it as `cols[j * m + i]`, `i <= j`) and the
+#: reflectors are returned beside their `v^T v`. Every pass over a column is
+#: a contiguous run, which is the whole reason for the transpose: the
+#: row-major `_householder_qr` strides a full row between neighbours, and
+#: at a hundred thousand rows that is a cache line per multiply.
+fn _qr_columns(cols: list[float], m: int, n: int) -> (list[float], list[float]) {
+    var vs = [0.0] * (n * m)
+    var norms = [0.0] * n
+    for step in 0..n {
+        let at = step * m + step
+        let count = m - step
+        let sigma = _dot_run(cols, at, cols, at, count)
+        if sigma == 0.0 { continue }
+        let alpha = if cols[at] > 0.0 { -math.sqrt(sigma) } else { math.sqrt(sigma) }
+        let vbase = step * m + step
+        _copy_run(cols, at, vs, vbase, count)
+        vs[vbase] -= alpha
+        let vnorm = _dot_run(vs, vbase, vs, vbase, count)
+        norms[step] = vnorm
+        _reflect_columns(cols, m, n, vs, step, vnorm, step + 1)
+        _zero_run(cols, at, count)
+        cols[at] = alpha
+    }
+    return (vs, norms)
+}
+
+#: The thin SVD of a tall matrix through `A = QR`: `R = Ur S V^T` is a
+#: square problem of the width, and `U = Q [Ur; 0]` is the reflectors
+#: applied to `Ur`. The cubic-in-the-width work moves onto an `n x n` matrix
+#: and what is left in the height is two passes of reflections, where the
+#: bidiagonalization accumulated `U` through every bulge-chasing rotation.
+#: The same factorization as before, so the same singular values to rounding.
+fn _svd_tall(values: list[float], m: int, n: int, vectors: bool) -> (list[float], list[float], list[float]) {
+    var cols = [0.0] * (m * n)
+    _gather_columns(values, cols, m, n, m)
+    let (vs, norms) = _qr_columns(cols, m, n)
+    var r = [0.0] * (n * n)
+    _upper_rows(cols, r, m, n)
+    let (ur, s, vt) = _svd_host(r, n, n, false, vectors)
+    if not vectors { return ([], s, []) }
+    var basis = [0.0] * (m * n)
+    _gather_columns(ur, basis, n, n, m)
+    var step = n - 1
+    while step >= 0 {
+        _reflect_columns(basis, m, n, vs, step, norms[step], 0)
+        step -= 1
+    }
+    var u = [0.0] * (m * n)
+    _scatter_rows(basis, u, m, n)
+    return (u, s, vt)
+}
+
+#: Whether `_svd_host` takes a matrix this shape through the QR first; a
+#: least squares solve asks so that it can take `_tall_projection` instead.
+pub fn _takes_qr_first(m: int, n: int) -> bool {
+    return _TALL_SVD and n > 0 and m >= TALL_RATIO * n
+}
+
+#: What a least squares solve needs of a tall `A` without ever forming `U`:
+#: `(U^T b, S, V^T)`, with `U^T b` as `n x wide`. `Q^T b` is the reflectors
+#: applied to `b`; its top `n` rows are `[Ur^T 0] Q^T b`'s input, and the
+#: height is walked twice -- the factorization and the right-hand side --
+#: rather than four times.
+pub fn _tall_projection(
+    values: list[float],
+    m: int,
+    n: int,
+    rhs: list[float],
+    wide: int
+) -> (list[float], list[float], list[float]) {
+    var cols = [0.0] * (m * n)
+    _gather_columns(values, cols, m, n, m)
+    let (vs, norms) = _qr_columns(cols, m, n)
+    var r = [0.0] * (n * n)
+    _upper_rows(cols, r, m, n)
+    var targets = [0.0] * (m * wide)
+    _gather_columns(rhs, targets, m, wide, m)
+    for step in 0..n { _reflect_columns(targets, m, wide, vs, step, norms[step], 0) }
+    let (ur, s, vt) = _svd_host(r, n, n, false, true)
+    var projected = [0.0] * (n * wide)
+    _project_top(ur, targets, projected, m, n, wide)
+    return (projected, s, vt)
+}
+
+#: `Ur^T (Q^T b)[0..n]`, with `Q^T b` column-major and `m` tall.
+fn _project_top(ur: list[float], targets: list[float], out: list[float], m: int, n: int, wide: int) -> void {
+    for step in 0..n {
+        for column in 0..wide {
+            var total = 0.0
+            for row in 0..n { total += ur[row * n + step] * targets[column * m + row] }
+            out[step * wide + column] = total
+        }
+    }
+}
+
+#: Rows `0..rows` of the row-major `values` (`n` wide) into the column-major
+#: `cols`, whose columns are `height` long. Each of these copies is its own
+#: function because a body with several loops and calls runs out of room
+#: for the JIT's loop forms, and stays interpreted.
+#: Taken in blocks of rows, so the strided side of the copy stays in cache
+#: across the columns instead of missing once per element.
+fn _gather_columns(values: list[float], cols: list[float], rows: int, n: int, height: int) -> void {
+    var start = 0
+    while start < rows {
+        let stop = min(start + TRANSPOSE_BLOCK, rows)
+        for column in 0..n {
+            let base = column * height
+            for row in start..stop { cols[base + row] = values[row * n + column] }
+        }
+        start = stop
+    }
+}
+
+#: The column-major `cols` (`m` tall, `n` wide) back to row-major `out`.
+fn _scatter_rows(cols: list[float], out: list[float], m: int, n: int) -> void {
+    var start = 0
+    while start < m {
+        let stop = min(start + TRANSPOSE_BLOCK, m)
+        for column in 0..n {
+            let base = column * m
+            for row in start..stop { out[row * n + column] = cols[base + row] }
+        }
+        start = stop
+    }
+}
+
+const TRANSPOSE_BLOCK: int = 32
+
+#: The upper triangle of the column-major `cols` as a row-major `n x n`.
+fn _upper_rows(cols: list[float], r: list[float], m: int, n: int) -> void {
+    for row in 0..n {
+        for column in row..n { r[row * n + column] = cols[column * m + row] }
+    }
+}
+
+fn _copy_run(source: list[float], si: int, target: list[float], ti: int, count: int) -> void {
+    for index in 0..count { target[ti + index] = source[si + index] }
+}
+
+fn _zero_run(target: list[float], at: int, count: int) -> void {
+    for index in 0..count { target[at + index] = 0.0 }
+}
+
 #: `A = U S V^T`, singular values descending.
 #:
 #: `full` decides whether `U` carries the `m - n` further columns that span
@@ -256,6 +460,9 @@ pub fn _svd_host(
         if not vectors { return ([], s, []) }
         let wide = if full { n } else { m }
         return (_transpose_host(vt, m, m), s, _transpose_host(ut, n, wide))
+    }
+    if _TALL_SVD and n > 0 and m >= TALL_RATIO * n and not (vectors and full) {
+        return _svd_tall(values, m, n, vectors)
     }
     var work = [value for value in values]
     let ucols = if not vectors { 0 } elif full { m } else { n }
