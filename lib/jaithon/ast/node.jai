@@ -98,6 +98,10 @@ pub class Node {
     #: `ValueError` here; one in the wrong ORDER is the caller's bug, so every
     #: builder written against this is pinned by a test against `init`.
     #:
+    #: The node takes `slots` itself, not a copy: pass a fresh list. Two nodes
+    #: built from one list share their fields, and a write through either
+    #: changes both.
+    #:
     #: ```
     #: Node.of_slots(NodeKind.Member, Span.none(), [Node.ident("a"), "b"])
     #: ```
