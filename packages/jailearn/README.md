@@ -99,6 +99,16 @@ Metal entry points are prefixed with their module's short name —
 `base.cached_kernel(source, entry)` caches on the entry name alone and two
 modules that both picked `assign` would silently share one kernel.
 
+## Switches
+
+Fast paths with an older path beside them, kept one environment variable away
+so a change can be measured as an A/B in one binary. Each is read once, when
+its module loads, and is on unless set to `0`.
+
+| Switch | Off restores |
+| --- | --- |
+| `JAILEARN_HOST_SOLVE` | the device Cholesky factor and substitutions (two dispatches a column, one a row) for every order, instead of reading a system of order up to `HOST_SOLVE_ORDER` (256) back and solving it on the host in double precision; 50x50 goes from about 200 dependent dispatches to one read back |
+
 ## Tests
 
 ```sh

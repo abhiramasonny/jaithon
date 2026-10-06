@@ -494,6 +494,90 @@ fn test_cholesky_solves_the_normal_equations() -> void {
     let indefinite = jl.matrix([[1.0, 2.0], [2.0, 1.0]])
     defer { indefinite.free() }
     assert_throws(ValueError, || jl.cholesky_factor(indefinite))
+    assert_throws(ValueError, || jl.cholesky_solve(indefinite, b))
+
+    #: A NaN anywhere in the lower triangle reaches a pivot and refuses.
+    let missing = jl.matrix([[4.0, 2.0], [math.NAN, 3.0]])
+    defer { missing.free() }
+    assert_throws(ValueError, || jl.cholesky_factor(missing))
+}
+
+#: `M MT + order I`, which is positive definite and well conditioned, with a
+#: right-hand side of two columns.
+fn spd_system(order: int) -> tuple[list[float], list[float]] {
+    var m: list[float] = []
+    for index in 0..order * order { m.push(math.sin(float(index) * 0.37 + 0.11)) }
+    var a = [0.0 for _slot in 0..order * order]
+    for row in 0..order {
+        for column in 0..order {
+            var total = 0.0
+            for k in 0..order { total += m[row * order + k] * m[column * order + k] }
+            a[row * order + column] = total + (if row == column { float(order) } else { 0.0 })
+        }
+    }
+    var b: list[float] = []
+    for index in 0..order * 2 { b.push(math.cos(float(index) * 0.23)) }
+    return (a, b)
+}
+
+fn assert_solves(a: list[float], x: list[float], b: list[float], order: int, what: str) -> void {
+    let rhs = b.len() // order
+    for row in 0..order {
+        for column in 0..rhs {
+            var total = 0.0
+            for k in 0..order { total += a[row * order + k] * x[k * rhs + column] }
+            assert_near(total, b[row * rhs + column], 1e-3, f"{what} row {row}")
+        }
+    }
+}
+
+#: Small systems are factored on the host, large ones on the device; both have
+#: to solve the system, and refuse the same matrices.
+fn check_solve_at(order: int) -> void {
+    let (values, rhs) = spd_system(order)
+    let a = Tensor([order, order], values)
+    defer { a.free() }
+    let b = Tensor([order, 2], rhs)
+    defer { b.free() }
+    let x = jl.cholesky_solve(a, b)
+    defer { x.free() }
+    assert_eq(x.shape, [order, 2])
+    assert_solves(values, jl.to_values(x), rhs, order, f"order {order}")
+
+    let l = jl.cholesky_factor(a)
+    defer { l.free() }
+    let forward = jl.triangular_solve(l, b)
+    defer { forward.free() }
+    let back = jl.triangular_solve(l, forward, transposed: true)
+    defer { back.free() }
+    let direct = jl.to_values(x)
+    let stepped = jl.to_values(back)
+    for index in 0..direct.len() {
+        assert_near(stepped[index], direct[index], 1e-4, f"order {order} substitution")
+    }
+
+    #: Negated, the same matrix has a negative first pivot.
+    let negated = jt.scale(a, -1.0)
+    defer { negated.free() }
+    assert_throws(ValueError, || jl.cholesky_factor(negated))
+    assert_throws(ValueError, || jl.cholesky_solve(negated, b))
+}
+
+fn test_cholesky_solves_on_both_sides_of_the_host_order() -> void {
+    if not jl.is_available() { return }
+    check_solve_at(37)
+    check_solve_at(jl.HOST_SOLVE_ORDER + 3)
+
+    #: The host entry point for a caller that already holds the system, with a
+    #: damping term on the diagonal.
+    let (values, rhs) = spd_system(5)
+    let solved = jl.host_cholesky_solve(values, rhs, 5)
+    assert_solves(values, solved, rhs, 5, "host_cholesky_solve")
+    let damped = jl.host_cholesky_solve(values, rhs, 5, damping: 2.0)
+    var shifted = [value for value in values]
+    for index in 0..5 { shifted[index * 5 + index] += 2.0 }
+    assert_solves(shifted, damped, rhs, 5, "damped host_cholesky_solve")
+    assert_throws(ValueError, || jl.host_cholesky_solve([1.0, 2.0, 2.0, 1.0], [1.0, 1.0], 2))
 }
 
 fn test_the_estimator_protocol_defaults() -> void {

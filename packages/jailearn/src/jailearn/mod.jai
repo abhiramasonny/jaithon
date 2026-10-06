@@ -34,6 +34,7 @@ from .base import param_float, param_int, param_str, params_of, random_normal
 from .base import random_uniform, require_target, rng_for, row_argmax, row_argmin
 from .base import row_extreme, row_topk, scatter_add_rows, select_columns, sort_columns
 from .base import take_rows, to_rows, to_values, triangular_solve, vector
+from .base import HOST_SOLVE_ORDER, host_cholesky_solve
 
 from .pipeline import ColumnTransformer, FeatureUnion, NESTED, Pipeline
 from .pipeline import REMAINDER_DROP, REMAINDER_PASSTHROUGH, make_column_transformer
@@ -56,6 +57,7 @@ export { bincount, class_sums, class_sumsq, scatter_add_rows, count_equal }
 export { kmeanspp_seed, rng_for, random_uniform, random_normal }
 export { MAX_CLASSES, distinct_values }
 export { cholesky_factor, triangular_solve, cholesky_solve, diagonal }
+export { HOST_SOLVE_ORDER, host_cholesky_solve }
 export { cached_kernel }
 
 export { Pipeline, ColumnTransformer, FeatureUnion, make_pipeline, make_column_transformer }

@@ -38,7 +38,8 @@ from .base.classes import bincount, class_sums, class_sumsq, scatter_add_rows
 from .base.elementwise import affine_columns, count_equal, nan_mask
 from .base.random import kmeanspp_seed, random_normal, random_uniform, rng_for
 from .base.labels import LabelIndex, MAX_CLASSES, distinct_values
-from .base.solve import cholesky_factor, cholesky_solve, diagonal, triangular_solve
+from .base.solve import HOST_SOLVE_ORDER, cholesky_factor, cholesky_solve, diagonal
+from .base.solve import host_cholesky_solve, triangular_solve
 from .base.estimator import Estimator, EstimatorKind, Scorer, default_score
 
 export { cached_kernel }
@@ -54,5 +55,6 @@ export { bincount, class_sums, class_sumsq, scatter_add_rows }
 export { affine_columns, count_equal, nan_mask }
 export { kmeanspp_seed, random_normal, random_uniform, rng_for }
 export { LabelIndex, MAX_CLASSES, distinct_values }
-export { cholesky_factor, cholesky_solve, diagonal, triangular_solve }
+export { HOST_SOLVE_ORDER, cholesky_factor, cholesky_solve, diagonal, host_cholesky_solve }
+export { triangular_solve }
 export { Estimator, EstimatorKind, Scorer, default_score }
