@@ -139,6 +139,14 @@ pub fn matmul(a: Mat, b: Mat) -> Mat {
         let product = device_product(a, b)
         if product is not null { return product }
     }
+    return host_matmul(a, b)
+}
+
+#: `matmul` on the host whatever the size, summing in double precision: for
+#: an iteration that has to converge further than float32 sums can take it,
+#: such as Levenberg-Marquardt's normal equations.
+pub fn host_matmul(a: Mat, b: Mat) -> Mat {
+    if a.cols != b.rows { throw ValueError(f"cannot multiply {a} by {b}") }
     let left = a.values()
     let right = b.values()
     var out: list[float] = []
@@ -606,8 +614,8 @@ pub fn levenberg_marquardt(
         let r = residual(parameters)
         let residual_matrix = Mat.from_list(r.len(), 1, CV_MAKETYPE(CV_32F, 1), r)
         let jt = transpose(j)
-        let normal = matmul(jt, j)
-        let gradient = matmul(jt, residual_matrix)
+        let normal = host_matmul(jt, j)
+        let gradient = host_matmul(jt, residual_matrix)
 
         var improved = false
         for _attempt in 0..12 {
