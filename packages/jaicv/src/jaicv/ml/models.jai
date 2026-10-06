@@ -586,6 +586,35 @@ class TreeNode {
     }
 }
 
+#: What every node of one tree's growth shares: the samples by row and by
+#: column, the responses, each response's class (when classifying) and a
+#: per-sample flag the split writes before it divides the sorted orders.
+class _TreeData {
+    pub var rows: list[list[float]]
+    pub var targets: list[float]
+    pub var columns: list[list[float]]
+    pub var classes: list[int]
+    pub var class_count: int
+    pub var side: list[bool]
+
+    pub fn init(
+        self,
+        rows: list[list[float]],
+        targets: list[float],
+        columns: list[list[float]],
+        classes: list[int],
+        class_count: int,
+        side: list[bool]
+    ) {
+        self.rows = rows
+        self.targets = targets
+        self.columns = columns
+        self.classes = classes
+        self.class_count = class_count
+        self.side = side
+    }
+}
+
 #: A decision tree, split on one feature at a time.
 pub class DTrees {
     pub var max_depth: int
@@ -601,6 +630,14 @@ pub class DTrees {
     }
 
     #: Grow the tree.
+    #:
+    #: Each feature is sorted once, here, and every node after that keeps its
+    #: samples in that order by splitting the parent's lists, so finding a
+    #: split is one sweep per feature with the class counts (or the sums)
+    #: carried along it. Trying every threshold by partitioning the node and
+    #: scoring both halves from scratch was the square of the node's size per
+    #: feature: ten thousand samples of twenty features took 134 seconds to
+    #: grow eight levels.
     pub fn train(self, samples: Mat, responses: Mat) -> bool {
         let rows = rows_of(samples)
         let targets = column_of(responses)
@@ -610,71 +647,246 @@ pub class DTrees {
         self.nodes = []
         var indices: list[int] = []
         for index in 0..rows.len() { indices.push(index) }
-        self.grow(rows, targets, indices, 0)
+        if rows.len() == 0 {
+            self.nodes.push(TreeNode(-1, 0.0, self.answer(targets, indices), -1, -1))
+            return true
+        }
+        let width = rows[0].len()
+        var columns: list[list[float]] = []
+        var orders: list[list[int]] = []
+        for feature in 0..width {
+            var column: list[float] = []
+            for row in rows { column.push(row[feature]) }
+            var order: list[int] = []
+            for index in 0..rows.len() { order.push(index) }
+            order.sort(key: |at| column[at])
+            columns.push(column)
+            orders.push(order)
+        }
+        var labels: list[float] = []
+        var classes: list[int] = []
+        if not self.regression {
+            for value in targets {
+                if not labels.contains(value) { labels.push(value) }
+            }
+            labels.sort()
+            for value in targets {
+                var slot = 0
+                while labels[slot] != value { slot += 1 }
+                classes.push(slot)
+            }
+        }
+        var side: list[bool] = []
+        for _index in 0..rows.len() { side.push(false) }
+        let tree = _TreeData(rows, targets, columns, classes, labels.len(), side)
+        self.grow(tree, indices, orders, 0)
         return true
     }
 
-    fn grow(
-        self,
-        rows: list[list[float]],
-        targets: list[float],
-        indices: list[int],
-        depth: int
-    ) -> int {
+    #: The tree as OpenCV's `getNodes` gives it: each node's split feature (or
+    #: -1 for a leaf), threshold, value and children, in the order they were
+    #: grown.
+    pub fn get_nodes(self) -> list[tuple[int, float, float, int, int]] {
+        var out: list[tuple[int, float, float, int, int]] = []
+        for node in self.nodes {
+            out.push((node.feature, node.threshold, node.value, node.left, node.right))
+        }
+        return out
+    }
+
+    #: Grow the node holding `indices` (in sample order), with `orders[f]` the
+    #: same samples sorted by feature `f`.
+    #:
+    #: The split chosen is exactly the one scoring every threshold of every
+    #: feature from scratch would choose: the lowest score, the first feature
+    #: and then the first threshold among equal ones, and only if it beats the
+    #: node as it is. The sweep's running totals round differently from
+    #: scoring each half on its own, so the sweep only shortlists: every
+    #: threshold within a hair of its best is scored again the old way, in the
+    #: old order, and the comparison is made on those scores. A tie between
+    #: features -- two columns splitting the samples identically -- is common
+    #: in small integer data, and is broken the way it always was.
+    fn grow(self, tree: _TreeData, indices: list[int], orders: list[list[int]], depth: int) -> int {
+        let targets = tree.targets
         let here = self.nodes.len()
         self.nodes.push(TreeNode(-1, 0.0, self.answer(targets, indices), -1, -1))
         if depth >= self.max_depth or indices.len() < self.min_sample_count * 2 { return here }
         if self.pure(targets, indices) { return here }
 
-        let width = rows[0].len()
+        let parent = self.impurity(targets, indices)
+        if parent <= 0.0 { return here }
+
+        let width = tree.columns.len()
+        let count = indices.len()
+        let slack = 1e-8 * parent
+        var near_feature: list[int] = []
+        var near_threshold: list[float] = []
+        var near_score: list[float] = []
+        var forced: list[bool] = []
+        var best_seen = parent
+
+        if self.regression {
+            var origin = 0.0
+            for index in indices { origin += targets[index] }
+            origin /= float(count)
+            var all_sum = 0.0
+            var all_squares = 0.0
+            for index in indices {
+                let gap = targets[index] - origin
+                all_sum += gap
+                all_squares += gap * gap
+            }
+            for feature in 0..width {
+                let column = tree.columns[feature]
+                let order = orders[feature]
+                var left_sum = 0.0
+                var left_squares = 0.0
+                for at in 0..count - 1 {
+                    let index = order[at]
+                    let gap = targets[index] - origin
+                    left_sum += gap
+                    left_squares += gap * gap
+                    let value = column[index]
+                    let next = column[order[at + 1]]
+                    if next == value { continue }
+                    let threshold = (value + next) * 0.5
+                    if threshold >= next {
+                        near_feature.push(feature)
+                        near_threshold.push(threshold)
+                        near_score.push(best_seen)
+                        forced.push(true)
+                        continue
+                    }
+                    let on_left = float(at + 1)
+                    let on_right = float(count - at - 1)
+                    let right_sum = all_sum - left_sum
+                    let left_error = max(left_squares - left_sum * left_sum / on_left, 0.0)
+                    let right_error = max(all_squares - left_squares - right_sum * right_sum / on_right, 0.0)
+                    let score = (left_error + right_error) / float(count)
+                    if score > best_seen + slack { continue }
+                    if score < best_seen { best_seen = score }
+                    near_feature.push(feature)
+                    near_threshold.push(threshold)
+                    near_score.push(score)
+                    forced.push(false)
+                }
+            }
+        } else {
+            let classes = tree.classes
+            var totals: list[int] = []
+            for _slot in 0..tree.class_count { totals.push(0) }
+            for index in indices { totals[classes[index]] += 1 }
+            var total_squares = 0
+            for value in totals { total_squares += value * value }
+            var left: list[int] = []
+            var right: list[int] = []
+            for _slot in 0..tree.class_count {
+                left.push(0)
+                right.push(0)
+            }
+            for feature in 0..width {
+                let column = tree.columns[feature]
+                let order = orders[feature]
+                for slot in 0..tree.class_count {
+                    left[slot] = 0
+                    right[slot] = totals[slot]
+                }
+                var left_squares = 0
+                var right_squares = total_squares
+                for at in 0..count - 1 {
+                    let index = order[at]
+                    let label_slot = classes[index]
+                    left_squares += 2 * left[label_slot] + 1
+                    left[label_slot] += 1
+                    right_squares -= 2 * right[label_slot] - 1
+                    right[label_slot] -= 1
+                    let value = column[index]
+                    let next = column[order[at + 1]]
+                    if next == value { continue }
+                    let threshold = (value + next) * 0.5
+                    if threshold >= next {
+                        near_feature.push(feature)
+                        near_threshold.push(threshold)
+                        near_score.push(best_seen)
+                        forced.push(true)
+                        continue
+                    }
+                    let on_left = float(at + 1)
+                    let on_right = float(count - at - 1)
+                    let left_gini = on_left - float(left_squares) / on_left
+                    let right_gini = on_right - float(right_squares) / on_right
+                    let score = (left_gini + right_gini) / float(count)
+                    if score > best_seen + slack { continue }
+                    if score < best_seen { best_seen = score }
+                    near_feature.push(feature)
+                    near_threshold.push(threshold)
+                    near_score.push(score)
+                    forced.push(false)
+                }
+            }
+        }
+
         var best_feature = -1
         var best_threshold = 0.0
-        var best_score = self.impurity(targets, indices)
-        if best_score <= 0.0 { return here }
-
-        for feature in 0..width {
-            var values: list[float] = []
-            for index in indices { values.push(rows[index][feature]) }
-            values.sort()
-            for at in 1..values.len() {
-                if values[at] == values[at - 1] { continue }
-                let threshold = (values[at] + values[at - 1]) * 0.5
-                var left: list[int] = []
-                var right: list[int] = []
-                for index in indices {
-                    if rows[index][feature] <= threshold {
-                        left.push(index)
-                    } else {
-                        right.push(index)
-                    }
+        var best_score = parent
+        let rows = tree.rows
+        for slot in 0..near_feature.len() {
+            if not forced[slot] and near_score[slot] > best_seen + slack { continue }
+            let feature = near_feature[slot]
+            let threshold = near_threshold[slot]
+            var left: list[int] = []
+            var right: list[int] = []
+            for index in indices {
+                if rows[index][feature] <= threshold {
+                    left.push(index)
+                } else {
+                    right.push(index)
                 }
-                if left.len() == 0 or right.len() == 0 { continue }
-                #: The split is scored by how much less mixed the two halves
-                #: are than the whole, weighted by how many samples each holds.
-                let score = (float(left.len()) * self.impurity(targets, left) + float(right.len()) * self.impurity(targets, right)) /
-                    float(indices.len())
-                if score < best_score {
-                    best_score = score
-                    best_feature = feature
-                    best_threshold = threshold
-                }
+            }
+            if left.len() == 0 or right.len() == 0 { continue }
+            #: The split is scored by how much less mixed the two halves
+            #: are than the whole, weighted by how many samples each holds.
+            let score = (float(left.len()) * self.impurity(targets, left) + float(right.len()) * self.impurity(targets, right)) /
+                float(count)
+            if score < best_score {
+                best_score = score
+                best_feature = feature
+                best_threshold = threshold
             }
         }
         if best_feature < 0 { return here }
 
+        let side = tree.side
         var left: list[int] = []
         var right: list[int] = []
         for index in indices {
-            if rows[index][best_feature] <= best_threshold {
+            let goes_left = rows[index][best_feature] <= best_threshold
+            side[index] = goes_left
+            if goes_left {
                 left.push(index)
             } else {
                 right.push(index)
             }
         }
+        var left_orders: list[list[int]] = []
+        var right_orders: list[list[int]] = []
+        for order in orders {
+            var to_left: list[int] = []
+            var to_right: list[int] = []
+            for index in order {
+                if side[index] {
+                    to_left.push(index)
+                } else {
+                    to_right.push(index)
+                }
+            }
+            left_orders.push(to_left)
+            right_orders.push(to_right)
+        }
         self.nodes[here].feature = best_feature
         self.nodes[here].threshold = best_threshold
-        self.nodes[here].left = self.grow(rows, targets, left, depth + 1)
-        self.nodes[here].right = self.grow(rows, targets, right, depth + 1)
+        self.nodes[here].left = self.grow(tree, left, left_orders, depth + 1)
+        self.nodes[here].right = self.grow(tree, right, right_orders, depth + 1)
         return here
     }
 
