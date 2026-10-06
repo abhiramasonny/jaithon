@@ -192,13 +192,9 @@ Device paths are switched the same way:
 | `JAICV_GF_SELECT` | `good_features_to_track` ranks only the strongest candidates it can use; off, it ranks every one |
 | `JAICV_GF_SURVEY` | `good_features_to_track` finds its floor and its cut in one pass and one read back; off, `min_max` and then a count against the floor |
 | `JAICV_DEVICE_LINALG` | `core.linalg.matmul` at a million multiply-adds or more, `mul_transposed`, `calc_covar_matrix` and `PCA`'s covariance and projection go through jaitensor's GEMM; off, the host loops in double precision |
-| `JAICV_KMEANS_STAGED` | `kmeans` assigns samples with the centres staged in threadgroup memory, reading each sample once; off, once per centre. Same labels bit for bit |
-| `JAICV_KMEANS_TILED` | `kmeans`' staged assignment reads the samples into threadgroup memory a tile at a time, consecutive threads reading consecutive values; off, each thread reads its own row. Same labels bit for bit |
-| `JAICV_KMEANS_COLUMNS` | `kmeans` totals its groups a column per threadgroup, reading the labels once per column; off, once per centre and column. Same sums bit for bit |
-| `JAICV_KMEANS_TRANSPOSED` | `kmeans` totals each column from a copy of the samples laid out by column, made once per call, so the reads are one coalesced sweep; off, from the samples as they lie. Same sums bit for bit |
+| `JAICV_KMEANS_STAGED` | `kmeans` assigns samples of eight or more columns with the centres staged in threadgroup memory, reading each sample once; off, once per centre. Same labels bit for bit |
 | `JAICV_KMEANS_IN_PLACE` | `kmeans` reads a continuous matrix's samples where they lie; off, through a host list and a fresh upload |
 | `JAICV_LOGISTIC_DEVICE` | `LogisticRegression.train` forms the gradient on the device once the samples hold 65,536 values or more; off, on the host |
-
 ## Device memory
 
 Device memory is not garbage collected, so every operation releases the

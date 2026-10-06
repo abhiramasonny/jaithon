@@ -185,143 +185,6 @@ kernel void kmeans_assign_staged(device const float* values [[buffer(0)]],
     nearest[id] = best;
 }
 
-/* `kmeans_assign_staged` with the samples read a tile at a time.
- *
- * A thread per sample reading its own row strides the device memory by the
- * row's width, so every load in a simdgroup touches a different cache line.
- * Here the threadgroup's 256 rows are copied eight columns at a time into
- * threadgroup memory, consecutive threads reading consecutive values, and
- * each thread then takes its row's eight from there. Every thread still adds
- * its row's values in column order, so the labels and distances are the same
- * bit for bit. Dispatched in groups of exactly 256. */
-kernel void kmeans_assign_tiled(device const float* values [[buffer(0)]],
-                                device const float* centres [[buffer(1)]],
-                                device float* labels [[buffer(2)]],
-                                device float* nearest [[buffer(3)]],
-                                constant uint& samples [[buffer(4)]],
-                                constant uint& width [[buffer(5)]],
-                                constant uint& k [[buffer(6)]],
-                                uint id [[thread_position_in_grid]],
-                                uint lid [[thread_index_in_threadgroup]],
-                                uint group [[threadgroup_position_in_grid]]) {
-    const uint GROUP = 256u;
-    const uint TILE = 8u;
-    const uint STRIDE = TILE + 1u;
-    threadgroup float staged[4096];
-    threadgroup float tile[256 * 9];
-    for (uint i = lid; i < k * width; i += GROUP) staged[i] = centres[i];
-    float totals[16];
-    for (uint c = 0u; c < 16u; ++c) totals[c] = 0.0f;
-    uint first = group * GROUP;
-    for (uint column = 0u; column < width; column += TILE) {
-        uint span = min(TILE, width - column);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = lid; i < GROUP * span; i += GROUP) {
-            uint row = i / span;
-            uint at = i - row * span;
-            uint sample = first + row;
-            tile[row * STRIDE + at] = sample < samples ? values[sample * width + column + at] : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint at = 0u; at < span; ++at) {
-            float value = tile[lid * STRIDE + at];
-            uint index = column + at;
-            for (uint c = 0u; c < 16u && c < k; ++c) {
-                float gap = value - staged[c * width + index];
-                totals[c] = fma(gap, gap, totals[c]);
-            }
-        }
-    }
-    if (id >= samples) return;
-    float best = INFINITY;
-    uint pick = 0u;
-    for (uint c = 0u; c < 16u && c < k; ++c) {
-        if (totals[c] < best) {
-            best = totals[c];
-            pick = c;
-        }
-    }
-    labels[id] = float(pick);
-    nearest[id] = best;
-}
-
-/* `kmeans_gather` in one pass over the labels per column instead of one per
- * centre and column.
- *
- * The old form gave every (centre, column) slot its own threadgroup, and each
- * of those 409 groups -- for eight centres of fifty columns -- read all the
- * labels to find its few members. Here a group takes a whole column (or the
- * counts and the cost, in the last group), and each thread keeps one running
- * total per centre in threadgroup memory as it walks its samples. Each thread
- * walks the same samples in the same order the old one did, and the totals
- * are combined across the group the same way, so every sum comes out the same
- * bit for bit. For k up to 16. */
-kernel void kmeans_gather_columns(device const float* values [[buffer(0)]],
-                                  device const float* labels [[buffer(1)]],
-                                  device const float* nearest [[buffer(2)]],
-                                  device float* sums [[buffer(3)]],
-                                  constant uint& samples [[buffer(4)]],
-                                  constant uint& width [[buffer(5)]],
-                                  constant uint& k [[buffer(6)]],
-                                  constant uint& by_column [[buffer(7)]],
-                                  uint column [[threadgroup_position_in_grid]],
-                                  uint lid [[thread_index_in_threadgroup]],
-                                  uint lane [[thread_index_in_simdgroup]],
-                                  uint warp [[simdgroup_index_in_threadgroup]]) {
-    const uint GROUP = 256u;
-    threadgroup float running[256 * 17];
-    threadgroup float lanes[17 * 32];
-    uint slots = k + 1u;
-    for (uint c = 0u; c < slots; ++c) running[lid * 17u + c] = 0.0f;
-    for (uint j = lid; j < 17u * 32u; j += GROUP) lanes[j] = 0.0f;
-    if (column < width) {
-        for (uint sample = lid; sample < samples; sample += GROUP) {
-            uint centre = uint(labels[sample]);
-            float value = by_column != 0u ? values[column * samples + sample] : values[sample * width + column];
-            if (centre < k) running[lid * 17u + centre] += value;
-        }
-    } else {
-        for (uint sample = lid; sample < samples; sample += GROUP) {
-            uint centre = uint(labels[sample]);
-            if (centre < k) running[lid * 17u + centre] += 1.0f;
-        }
-        for (uint sample = lid; sample < samples; sample += GROUP) {
-            running[lid * 17u + k] += nearest[sample];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint used = column < width ? k : slots;
-    for (uint c = 0u; c < used; ++c) {
-        float total = simd_sum(running[lid * 17u + c]);
-        if (lane == 0u) lanes[c * 32u + warp] = total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid != 0u) return;
-    for (uint c = 0u; c < used; ++c) {
-        float answer = 0.0f;
-        for (uint j = 0u; j < 32u; j++) answer += lanes[c * 32u + j];
-        if (column < width) {
-            sums[c * width + column] = answer;
-        } else {
-            sums[k * width + c] = answer;
-        }
-    }
-}
-
-/* The samples a column at a time: `target[column * samples + sample]`. With
- * the samples laid out this way `kmeans_gather_columns` reads each column in
- * one coalesced sweep rather than a value per row. */
-kernel void kmeans_transpose(device const float* values [[buffer(0)]],
-                             device float* target [[buffer(1)]],
-                             constant uint& samples [[buffer(2)]],
-                             constant uint& width [[buffer(3)]],
-                             uint id [[thread_position_in_grid]]) {
-    if (id >= samples * width) return;
-    uint sample = id / width;
-    uint column = id - sample * width;
-    target[column * samples + sample] = values[id];
-}
-
 /* Copy `count` values from one buffer to another. */
 kernel void kmeans_copy(device const float* source [[buffer(0)]],
                         device float* target [[buffer(1)]],
@@ -357,19 +220,17 @@ fn squared_to_centre(
 }
 
 #: `JAICV_KMEANS_STAGED=0` assigns samples with the kernel that reads each
-#: sample once per centre, and `JAICV_KMEANS_TILED=0` with the staged one
-#: that reads each sample's row straight from device memory;
-#: `JAICV_KMEANS_COLUMNS=0` totals the groups with the one that reads every
-#: label once per centre and column; and `JAICV_KMEANS_IN_PLACE=0` copies the
-#: samples to the host and back rather than reading them where they lie. All
-#: four give the same answer either way.
+#: sample once per centre, and `JAICV_KMEANS_IN_PLACE=0` copies the samples to
+#: the host and back rather than reading them where they lie. Both give the
+#: same answer either way.
 let _KMEANS_STAGED = env_or("JAICV_KMEANS_STAGED", "1") != "0"
-let _KMEANS_TILED = env_or("JAICV_KMEANS_TILED", "1") != "0"
-let _KMEANS_COLUMNS = env_or("JAICV_KMEANS_COLUMNS", "1") != "0"
 let _KMEANS_IN_PLACE = env_or("JAICV_KMEANS_IN_PLACE", "1") != "0"
-#: `JAICV_KMEANS_TRANSPOSED=0` totals the groups from the samples as they are
-#: laid out, a row at a time, instead of from a copy laid out by column.
-let _KMEANS_TRANSPOSED = env_or("JAICV_KMEANS_TRANSPOSED", "1") != "0"
+
+#: Below this many columns the staged assignment loses to the plain one --
+#: 0.56 ms against 0.29 at 307,200 samples of three, under the GPU lock --
+#: because there is too little in a row to repay staging the centres. From
+#: eight up it wins: 0.35 against 0.75 ms at eight, 0.71 against 2.07 at fifty.
+let KMEANS_STAGED_WIDTH = 8
 
 #: Split samples into `k` groups, each around its own centre.
 #:
@@ -422,21 +283,7 @@ pub fn kmeans(
     defer { held_nearest.free() }
     defer { gathered.free() }
 
-    let staged = _KMEANS_STAGED and k <= 16 and k * width <= 4096
-    let by_column = _KMEANS_COLUMNS and k <= 16
-    #: The totals read the samples a column at a time, so they read them from
-    #: a copy laid out that way, made once for every attempt and iteration.
-    let held_columns: Buffer? = if by_column and _KMEANS_TRANSPOSED and width > 1 {
-        let copy = Buffer(samples * width)
-        kernel_for("kmeans_transpose").dispatch_async([held_values, copy], samples * width, [samples, width])
-        copy
-    } else {
-        null
-    }
-    defer {
-        if held_columns is not null { held_columns.free() }
-    }
-    let layout = if held_columns is not null { 1 } else { 0 }
+    let staged = _KMEANS_STAGED and width >= KMEANS_STAGED_WIDTH and k <= 16 and k * width <= 4096
     var state = if seed == 0 { 1 } else { seed }
     var best_centres: list[float] = []
     var best_cost = 1e300
@@ -499,14 +346,7 @@ pub fn kmeans(
             #: the centres, the totals and the counts come back, which is
             #: `k * width + k + 1` numbers however many samples there are.
             held_centres.upload(centres)
-            if staged and _KMEANS_TILED {
-                kernel_for("kmeans_assign_tiled").dispatch_async(
-                    [held_values, held_centres, held_labels, held_nearest],
-                    (samples + 255) // 256 * 256,
-                    [samples, width, k],
-                    group_size: 256
-                )
-            } elif staged {
+            if staged {
                 kernel_for("kmeans_assign_staged").dispatch_async(
                     [held_values, held_centres, held_labels, held_nearest],
                     samples,
@@ -520,21 +360,12 @@ pub fn kmeans(
                     [samples, width, k]
                 )
             }
-            if by_column {
-                kernel_for("kmeans_gather_columns").dispatch_async(
-                    [held_columns ?? held_values, held_labels, held_nearest, gathered],
-                    (width + 1) * 256,
-                    [samples, width, k, layout],
-                    group_size: 256
-                )
-            } else {
-                kernel_for("kmeans_gather").dispatch_async(
-                    [held_values, held_labels, held_nearest, gathered],
-                    (k * width + k + 1) * 256,
-                    [samples, width, k],
-                    group_size: 256
-                )
-            }
+            kernel_for("kmeans_gather").dispatch_async(
+                [held_values, held_labels, held_nearest, gathered],
+                (k * width + k + 1) * 256,
+                [samples, width, k],
+                group_size: 256
+            )
 
             var sums = gathered.download()
             var counts: list[int] = []
