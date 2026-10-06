@@ -17,7 +17,7 @@
 #: self-call fails its class guard, and count the writes. The last needs no
 #: swap: the finished inner call answers null where the compiled self-call
 #: took an int, and the outer activation deoptimises on that.
-# jit-compiles: sc_leaf_push, sc_via_closure, sc_rec_direct, sc_via_direct, sc_tail_writer, sc_rec_tail, sc_via_tail, sc_rec_osr, sc_rec_bumps, sc_drive_bumps, sc_rec_tally, sc_drive_tally, sc_rec_null, sc_via_null
+# jit-compiles: sc_leaf_push, sc_via_closure, sc_rec_direct, sc_via_direct, sc_tail_writer, sc_rec_tail, sc_via_tail, sc_rec_osr, sc_rec_bumps, sc_drive_bumps, sc_rec_tally, sc_drive_tally, sc_rec_null, sc_via_null, sc_mid_make, sc_via_make
 from std.test import assert_eq
 
 let WARM = 300
@@ -268,4 +268,59 @@ fn test_a_self_call_answered_with_another_kind_runs_once() -> void {
     t += sc_via_null(sc_rec_null, 1, true)
     assert_eq(t, WARM * 7 + 100)
     assert_eq(len(log), WARM + 1)
+}
+
+#: The same hole one arm over, found auditing every place a compiled body runs
+#: Jaithon code and carries on: a method reached through the descriptor (it
+#: never compiles -- the function tier refuses a dict) whose result is a
+#: nullable instance. That arm recorded the call as an effect for every other
+#: result kind and returned early for this one, so `sc_mid_make` advertised
+#: jitFuncNoWrite and `sc_via_make` re-ran it, counting `made` twice.
+class Made {
+    pub var v: int
+
+    pub fn init(self, v: int) { self.v = v }
+}
+
+class Factory {
+    pub var made: int
+
+    pub fn init(self) { self.made = 0 }
+
+    pub fn make(self, x: int) -> Made? {
+        var d = {"k": 1}
+        self.made = self.made + 1
+        if x < 0 {
+            return null
+        }
+        return Made(x + d["k"])
+    }
+}
+
+var fac: Factory = Factory()
+
+fn sc_mid_make(x: int) -> int {
+    let m = fac.make(x)
+    if m is null {
+        return 0
+    }
+    return m.v + holder.k
+}
+
+fn sc_via_make(f: fn(int) -> int, x: int) -> int {
+    let q = f(x)
+    return q + 0
+}
+
+fn test_a_nullable_method_result_counts_once() -> void {
+    reset()
+    fac = Factory()
+    var t = 0
+    for i in 0..WARM {
+        t += sc_via_make(sc_mid_make, i % 3 - 1)
+    }
+    holder = Wide(2)
+    t += sc_via_make(sc_mid_make, 1)
+    assert_eq(t, WARM / 3 * 5 + 4)
+    assert_eq(fac.made, WARM + 1)
 }
