@@ -266,7 +266,7 @@ fn _dot_run(a: list[float], ai: int, b: list[float], bi: int, count: int) -> flo
         t0 += a[ai + index] * b[bi + index]
         index += 1
     }
-    return (t0 + t1) + (t2 + t3)
+    return t0 + t1 + (t2 + t3)
 }
 
 #: `b[bi..] -= factor * a[ai..]` over `count` contiguous values.
@@ -328,7 +328,12 @@ fn _qr_columns(cols: list[float], m: int, n: int) -> (list[float], list[float]) 
 #: and what is left in the height is two passes of reflections, where the
 #: bidiagonalization accumulated `U` through every bulge-chasing rotation.
 #: The same factorization as before, so the same singular values to rounding.
-fn _svd_tall(values: list[float], m: int, n: int, vectors: bool) -> (list[float], list[float], list[float]) {
+fn _svd_tall(
+    values: list[float],
+    m: int,
+    n: int,
+    vectors: bool
+) -> (list[float], list[float], list[float]) {
     var cols = [0.0] * (m * n)
     _gather_columns(values, cols, m, n, m)
     let (vs, norms) = _qr_columns(cols, m, n)
@@ -381,7 +386,14 @@ pub fn _tall_projection(
 }
 
 #: `Ur^T (Q^T b)[0..n]`, with `Q^T b` column-major and `m` tall.
-fn _project_top(ur: list[float], targets: list[float], out: list[float], m: int, n: int, wide: int) -> void {
+fn _project_top(
+    ur: list[float],
+    targets: list[float],
+    out: list[float],
+    m: int,
+    n: int,
+    wide: int
+) -> void {
     for step in 0..n {
         for column in 0..wide {
             var total = 0.0

@@ -104,13 +104,17 @@ const _SCALE_BELOW: float = 1.0e-100
 #: Like `syev`, and numpy's `eigh`, the values are accurate to the rounding of
 #: the largest one rather than each to its own relative precision; Jacobi,
 #: behind the switch, is the relatively accurate one.
-pub fn _tridiagonal_eigh(values: list[float], n: int, vectors: bool) -> (bool, list[float], list[float]) {
+pub fn _tridiagonal_eigh(
+    values: list[float],
+    n: int,
+    vectors: bool
+) -> (bool, list[float], list[float]) {
     var v = [value for value in values]
     var d = [0.0 for _index in 0..n]
     if n == 0 { return (true, d, v) }
     let largest = _largest_entry(values)
     if largest < 0.0 { return (false, d, v) }
-    let scaled = largest > _SCALE_ABOVE or (largest > 0.0 and largest < _SCALE_BELOW)
+    let scaled = largest > _SCALE_ABOVE or largest > 0.0 and largest < _SCALE_BELOW
     if scaled {
         for index in 0..n * n { v[index] /= largest }
     }
@@ -125,7 +129,6 @@ pub fn _tridiagonal_eigh(values: list[float], n: int, vectors: bool) -> (bool, l
     if not vectors { return (true, d, [0.0 for _slot in 0..0]) }
     return (true, d, v)
 }
-
 
 #: Householder reduction of the symmetric `v` (row-major, lower triangle
 #: read) to tridiagonal form: the diagonal into `d`, the subdiagonal into
@@ -275,7 +278,15 @@ fn _implicit_ql(v: list[float], d: list[float], e: list[float], n: int, rows: in
 
 #: One implicitly shifted QL sweep over rows `l..=m` of the tridiagonal,
 #: returning the shift it took out of `d`.
-fn _ql_sweep(v: list[float], d: list[float], e: list[float], n: int, rows: int, l: int, m: int) -> float {
+fn _ql_sweep(
+    v: list[float],
+    d: list[float],
+    e: list[float],
+    n: int,
+    rows: int,
+    l: int,
+    m: int
+) -> float {
     let g0 = d[l]
     let p0 = (d[l + 1] - g0) / (2.0 * e[l])
     var r0 = _hypot(p0, 1.0)
@@ -318,7 +329,6 @@ fn _ql_sweep(v: list[float], d: list[float], e: list[float], n: int, rows: int, 
     d[l] = c * q
     return h0
 }
-
 
 #: `A = Q L Q^T` for a symmetric `A`, by cyclic Jacobi, eigenvalues ascending.
 #:

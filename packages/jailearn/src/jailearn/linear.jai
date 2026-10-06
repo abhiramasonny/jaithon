@@ -282,15 +282,15 @@ pub class StandardScaler: Estimator {
         self.width = x.shape[1]
         let (mean, variance) = column_moments(x)
         if _SCALER_ON_DEVICE {
-            linear_kernel("lin_scaler_state").dispatch_async(
-                [mean.buffer(), variance.buffer()],
-                self.width,
-                [
-                    self.width,
-                    if self.with_mean { 1 } else { 0 },
-                    if self.with_std { 1 } else { 0 },
-                ]
-            )
+            linear_kernel("lin_scaler_state").dispatch_async([mean.buffer(), variance.buffer()], self.width, [self.width, if self.with_mean {
+                1
+            } else {
+                0
+            }, if self.with_std {
+                1
+            } else {
+                0
+            }])
             self.mean_ = mean
             self.scale_ = variance
             return
@@ -517,17 +517,19 @@ pub class Ridge: Estimator {
         }
         let packed = Tensor([rows, stride])
         let anything = x.buffer()
-        linear_kernel("lin_ridge_pack").dispatch_async(
-            [
-                x.buffer(),
-                target.buffer(),
-                if mean is not null { mean.buffer() } else { anything },
-                if target_mean is not null { target_mean.buffer() } else { anything },
-                packed.buffer(),
-            ],
-            rows * stride,
-            [rows, width, stride, if self.fit_intercept { 1 } else { 0 }]
-        )
+        linear_kernel("lin_ridge_pack").dispatch_async([x.buffer(), target.buffer(), if mean is not null {
+            mean.buffer()
+        } else {
+            anything
+        }, if target_mean is not null {
+            target_mean.buffer()
+        } else {
+            anything
+        }, packed.buffer()], rows * stride, [rows, width, stride, if self.fit_intercept {
+            1
+        } else {
+            0
+        }])
         let product = jt.matmul(packed, packed, trans_a: true)
         packed.free()
         let g = product.download()
@@ -718,47 +720,52 @@ pub class LogisticRegression: Estimator {
         descent.run(fn(iteration: int) -> float {
             weights.upload(theta)
             if _LOGIT_FUSED {
-                linear_kernel("lin_logit_rows_fused").dispatch_async(
-                    [design.buffer(), weights.buffer(), codes.buffer(), rhs.buffer()],
-                    rows,
-                    [rows, padded, stride]
-                )
+                linear_kernel("lin_logit_rows_fused").dispatch_async([design.buffer(), weights.buffer(), codes.buffer(), rhs.buffer()], rows, [rows, padded, stride])
             } else {
                 let margins = jt.matmul(design, weights)
-                linear_kernel("lin_logit_rows").dispatch_async(
-                    [design.buffer(), margins.buffer(), codes.buffer(), rhs.buffer()],
-                    rows * stride,
-                    [rows, padded, stride]
-                )
+                linear_kernel("lin_logit_rows").dispatch_async([design.buffer(), margins.buffer(), codes.buffer(), rhs.buffer()], rows * stride, [rows, padded, stride])
                 margins.free()
             }
             let product = jt.matmul(design, rhs, trans_a: true)
             let g = product.download()
             product.free()
-
             var penalty = 0.0
-            for index in 0..width { penalty += theta[index] * theta[index] }
+            for index in 0..width {
+                penalty += theta[index] * theta[index]
+            }
             let objective = c * g[width * stride + padded + 1] + 0.5 * penalty
-            if math.is_nan(objective) { return math.NAN }
+            if math.is_nan(objective) {
+                return math.NAN
+            }
             if started and objective > best + 1.0e-6 * math.fabs(best) and step > 1.0e-6 {
                 step *= 0.5
-                for index in 0..order { theta[index] = previous[index] + step * direction[index] }
+                for index in 0..order {
+                    theta[index] = previous[index] + step * direction[index]
+                }
                 return 1.0
             }
-
             var gradient = [0.0 for _slot in 0..order]
             var largest = 0.0
             for a in 0..order {
-                let ridge = if a < width { theta[a] } else { 0.0 }
+                let ridge = if a < width {
+                    theta[a]
+                } else {
+                    0.0
+                }
                 gradient[a] = c * g[a * stride + padded] + ridge
                 largest = max(largest, math.fabs(gradient[a]) * mean_scale)
             }
-            if largest <= floor { return 0.0 }
-
+            if largest <= floor {
+                return 0.0
+            }
             var hessian = [0.0 for _slot in 0..order * order]
             for a in 0..order {
-                for b in 0..order { hessian[a * order + b] = c * g[a * stride + b] }
-                if a < width { hessian[a * order + a] += 1.0 }
+                for b in 0..order {
+                    hessian[a * order + b] = c * g[a * stride + b]
+                }
+                if a < width {
+                    hessian[a * order + a] += 1.0
+                }
             }
             let newton = newton_direction(hessian, gradient, order)
             var moved = 0.0
@@ -773,7 +780,11 @@ pub class LogisticRegression: Estimator {
             best = objective
             started = true
             step = 1.0
-            return if moved <= 1.0e-7 * size { 0.0 } else { moved }
+            return if moved <= 1.0e-7 * size {
+                0.0
+            } else {
+                moved
+            }
         })
         self.n_iter_ = descent.n_iter
         self.converged_ = descent.converged
@@ -818,15 +829,13 @@ pub class LogisticRegression: Estimator {
         let evaluate = fn(theta: list[float]) -> tuple[float, list[float]] {
             var w = [0.0] * (lanes * padded)
             for k in 0..classes {
-                for j in 0..order { w[k * padded + j] = theta[k * order + j] }
+                for j in 0..order {
+                    w[k * padded + j] = theta[k * order + j]
+                }
             }
             weights.upload(w)
             let scores = jt.matmul(design, weights, trans_b: true)
-            linear_kernel("lin_softmax_rows").dispatch_async(
-                [scores.buffer(), codes.buffer(), residual.buffer()],
-                rows,
-                [rows, classes, lanes, stride]
-            )
+            linear_kernel("lin_softmax_rows").dispatch_async([scores.buffer(), codes.buffer(), residual.buffer()], rows, [rows, classes, lanes, stride])
             scores.free()
             let product = jt.matmul(residual, design, trans_a: true)
             let g = product.download()
@@ -836,7 +845,11 @@ pub class LogisticRegression: Estimator {
             for k in 0..classes {
                 for j in 0..order {
                     let at = k * order + j
-                    let ridge = if j < width { theta[at] } else { 0.0 }
+                    let ridge = if j < width {
+                        theta[at]
+                    } else {
+                        0.0
+                    }
                     penalty += ridge * ridge
                     gradient[at] = c * g[k * padded + j] + ridge
                 }
@@ -980,12 +993,14 @@ pub class LogisticRegression: Estimator {
     }
 
     pub fn get_params(self) -> Params {
-        return params_of([
-            ("C", self.C),
-            ("fit_intercept", self.fit_intercept),
-            ("max_iter", self.max_iter),
-            ("tol", self.tol),
-        ])
+        return params_of(
+            [
+                ("C", self.C),
+                ("fit_intercept", self.fit_intercept),
+                ("max_iter", self.max_iter),
+                ("tol", self.tol),
+            ]
+        )
     }
 
     pub fn set_params(self, params: Params) -> void {

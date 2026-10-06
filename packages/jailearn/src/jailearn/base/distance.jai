@@ -99,8 +99,16 @@ pub fn nearest_rows(
         jt.matmul(block, b, trans_b: true, out: target)
         if one_pass {
             row_topk_into(
-                target.buffer(), rows, points, k, false, values, index,
-                first: first, left: left.buffer(), right: right.buffer()
+                target.buffer(),
+                rows,
+                points,
+                k,
+                false,
+                values,
+                index,
+                first: first,
+                left: left.buffer(),
+                right: right.buffer()
             )
         } else {
             base_kernel("base_dist_finish").dispatch_async(
@@ -126,7 +134,11 @@ pub fn nearest_rows(
 
 fn copy_rows(part: Tensor, whole: Tensor, offset: int) -> void {
     let window = whole.view(offset, [part.size])
-    base_kernel("base_copy").dispatch_async([part.buffer(), window.buffer()], part.size, [part.size, 1])
+    base_kernel("base_copy").dispatch_async(
+        [part.buffer(), window.buffer()],
+        part.size,
+        [part.size, 1]
+    )
     window.free()
 }
 

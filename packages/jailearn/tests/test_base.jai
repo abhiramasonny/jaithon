@@ -577,13 +577,13 @@ fn test_label_index_maps_arbitrary_codes_both_ways() -> void {
 fn test_distinct_values_holds_at_scale_and_at_the_limit() -> void {
     if not jl.is_available() { return }
     var many: list[float] = []
-    for index in 0..50000 { many.push([2.5, -1.0, 7.0][(index * 7) % 3]) }
+    for index in 0..50000 { many.push([2.5, -1.0, 7.0][index * 7 % 3]) }
     let repeated = Tensor([50000], many)
     defer { repeated.free() }
     assert_values(jl.distinct_values(repeated), [-1.0, 2.5, 7.0], "three classes, many times")
 
     var spread: list[float] = []
-    for index in 0..9000 { spread.push(float((index * 37) % jl.MAX_CLASSES) * 0.5 - 7.0) }
+    for index in 0..9000 { spread.push(float(index * 37 % jl.MAX_CLASSES) * 0.5 - 7.0) }
     let wide = Tensor([9000], spread)
     defer { wide.free() }
     let found = jl.distinct_values(wide)

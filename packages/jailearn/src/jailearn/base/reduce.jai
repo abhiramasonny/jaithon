@@ -248,12 +248,15 @@ pub fn row_topk_into(
     if not topk_one_pass(k) { throw ValueError(f"k {k} is past the one-pass top-k") }
     let fused = left is not null and right is not null
     let threads = topk_threads(columns)
-    base_kernel(f"base_row_topk{topk_capacity(k)}").dispatch_async(
-        [m, values.buffer(), index.buffer(), left ?? m, right ?? m],
-        rows * threads,
-        [rows, columns, k, if largest { 1 } else { 0 }, if fused { 1 } else { 0 }, first],
-        group_size: threads
-    )
+    base_kernel(f"base_row_topk{topk_capacity(k)}").dispatch_async([m, values.buffer(), index.buffer(), left ?? m, right ?? m], rows * threads, [rows, columns, k, if largest {
+        1
+    } else {
+        0
+    }, if fused {
+        1
+    } else {
+        0
+    }, first], group_size: threads)
 }
 
 #: The `k` best entries of every row: `(values, indices)`, both `[n_rows, k]`.

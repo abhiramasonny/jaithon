@@ -227,7 +227,9 @@ fn check_ridge_against_host(rows: int, width: int, offset: float) -> void {
         for a in 0..width {
             let left = values[i * width + a] - centres[a]
             rhs[a] += left * (target[i] - middle)
-            for b in 0..width { system[a * width + b] += left * (values[i * width + b] - centres[b]) }
+            for b in 0..width {
+                system[a * width + b] += left * (values[i * width + b] - centres[b])
+            }
         }
     }
     for a in 0..width { system[a * width + a] += 2.0 }
@@ -239,7 +241,12 @@ fn check_ridge_against_host(rows: int, width: int, offset: float) -> void {
     }
     var intercept = middle
     for j in 0..width { intercept -= centres[j] * want[j] }
-    assert_near(model.intercept_, intercept, 2e-3 * max(1.0, math.fabs(intercept)), f"{width} intercept")
+    assert_near(
+        model.intercept_,
+        intercept,
+        2e-3 * max(1.0, math.fabs(intercept)),
+        f"{width} intercept"
+    )
 }
 
 fn test_ridge_matches_the_host_normal_equations() -> void {
@@ -279,9 +286,42 @@ fn test_logistic_regression_matches_sklearn() -> void {
     defer { x.free() }
     defer { y.free() }
     let cases: list[tuple[float, bool, list[float], float]] = [
-        (1.0, true, [0.5267232, -2.6057907, 0.5334995, 0.3912605, 1.3343498], 2.3092815),
-        (0.1, true, [-0.3577779, -0.9729115, -0.0144722, 0.2627082, 0.6384113], 2.0821466),
-        (1.0, false, [2.8996225, -2.842107, 0.2829699, 0.6658263, 2.0753875], 0.0),
+        (
+            1.0,
+            true,
+            [
+                0.5267232,
+                -2.6057907,
+                0.5334995,
+                0.3912605,
+                1.3343498,
+            ],
+            2.3092815
+        ),
+        (
+            0.1,
+            true,
+            [
+                -0.3577779,
+                -0.9729115,
+                -0.0144722,
+                0.2627082,
+                0.6384113,
+            ],
+            2.0821466
+        ),
+        (
+            1.0,
+            false,
+            [
+                2.8996225,
+                -2.842107,
+                0.2829699,
+                0.6658263,
+                2.0753875,
+            ],
+            0.0
+        ),
     ]
     for (c, intercept, coef, bias) in cases {
         let model = LogisticRegression(C: c, fit_intercept: intercept)
@@ -292,7 +332,12 @@ fn test_logistic_regression_matches_sklearn() -> void {
             assert_eq(fitted.shape, [1, 5])
             let got = fitted.download()
             for (index, want) in coef.enumerate() {
-                assert_near(got[index], want, 1e-3 * max(1.0, math.fabs(want)), f"C {c} coef {index}")
+                assert_near(
+                    got[index],
+                    want,
+                    1e-3 * max(1.0, math.fabs(want)),
+                    f"C {c} coef {index}"
+                )
             }
         }
         assert_near(model.intercept_, bias, 1e-3 * max(1.0, math.fabs(bias)), f"C {c} intercept")
@@ -329,7 +374,11 @@ fn test_multinomial_logistic_regression_matches_sklearn() -> void {
     let (x, _two) = logistic_data()
     defer { x.free() }
     defer { _two.free() }
-    let weights = [[1.0, -0.5, 0.3, 0.0, 0.8], [-0.7, 1.2, 0.0, 0.4, -0.3], [0.2, 0.1, -1.1, 0.9, 0.0]]
+    let weights = [
+        [1.0, -0.5, 0.3, 0.0, 0.8],
+        [-0.7, 1.2, 0.0, 0.4, -0.3],
+        [0.2, 0.1, -1.1, 0.9, 0.0],
+    ]
     let values = x.download()
     var labels: list[float] = []
     for i in 0..200 {
@@ -348,16 +397,54 @@ fn test_multinomial_logistic_regression_matches_sklearn() -> void {
     let y = Tensor([200], labels)
     defer { y.free() }
     let cases: list[tuple[float, bool, list[float], list[float]]] = [
-        (1.0, true, [
-            0.921495, -1.1577, 0.745035, -0.690657, 0.773432,
-            -0.912808, 1.500597, 0.829982, -0.074597, -0.483631,
-            -0.008687, -0.342898, -1.575017, 0.765254, -0.289802,
-        ], [0.46118, -0.646521, 0.185341]),
-        (0.3, false, [
-            1.050079, -0.897648, 0.564756, -0.404177, 0.72196,
-            -1.047837, 1.129401, 0.582024, -0.140759, -0.505767,
-            -0.002242, -0.231753, -1.14678, 0.544936, -0.216193,
-        ], [0.0, 0.0, 0.0]),
+        (
+            1.0,
+            true,
+            [
+                0.921495,
+                -1.1577,
+                0.745035,
+                -0.690657,
+                0.773432,
+                -0.912808,
+                1.500597,
+                0.829982,
+                -0.074597,
+                -0.483631,
+                -0.008687,
+                -0.342898,
+                -1.575017,
+                0.765254,
+                -0.289802,
+            ],
+            [
+                0.46118,
+                -0.646521,
+                0.185341,
+            ]
+        ),
+        (
+            0.3,
+            false,
+            [
+                1.050079,
+                -0.897648,
+                0.564756,
+                -0.404177,
+                0.72196,
+                -1.047837,
+                1.129401,
+                0.582024,
+                -0.140759,
+                -0.505767,
+                -0.002242,
+                -0.231753,
+                -1.14678,
+                0.544936,
+                -0.216193,
+            ],
+            [0.0, 0.0, 0.0]
+        ),
     ]
     for (c, intercept, coef, bias) in cases {
         let model = LogisticRegression(C: c, fit_intercept: intercept, tol: 1.0e-7, max_iter: 500)
@@ -368,7 +455,12 @@ fn test_multinomial_logistic_regression_matches_sklearn() -> void {
             assert_eq(fitted.shape, [3, 5])
             let got = fitted.download()
             for (index, want) in coef.enumerate() {
-                assert_near(got[index], want, 1e-3 * max(1.0, math.fabs(want)), f"C {c} coef {index}")
+                assert_near(
+                    got[index],
+                    want,
+                    1e-3 * max(1.0, math.fabs(want)),
+                    f"C {c} coef {index}"
+                )
             }
         }
         for (index, want) in bias.enumerate() {
@@ -391,7 +483,9 @@ fn test_multinomial_logistic_regression_matches_sklearn() -> void {
     assert_eq(proba.shape, [6, 3])
     let shares = proba.download()
     let want = [0.273362, 0.69505, 0.031588, 0.276119, 0.667641, 0.05624]
-    for index in 0..6 { assert_near(shares[index], want[index], 1e-4, f"multinomial proba {index}") }
+    for index in 0..6 {
+        assert_near(shares[index], want[index], 1e-4, f"multinomial proba {index}")
+    }
     let scores = model.decision_function(head)
     defer { scores.free() }
     assert_eq(scores.shape, [6, 3])
