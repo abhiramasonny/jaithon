@@ -34,6 +34,9 @@ static bool emitCallOutResult(Emit *e, SlotKind rk, uint32_t rshape,
     unsigned rat = e->descOffset + (unsigned)offsetof(JitCallDesc, result);
     if (rk == SLOT_MAYBE_INST) {
         emitMaybeInstResult(e, pushReg(e) - 1, rat, rshape, after);
+        /* The call ran, whatever kind it answered with, so this is the
+         * effect the line at the bottom records for every other kind. */
+        e->wroteHeap = true;
         return true;
     }
     unsigned wantTag = rk == SLOT_INT   ? VAL_INT
