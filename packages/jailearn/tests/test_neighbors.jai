@@ -16,11 +16,22 @@ fn assert_values(actual: list[float], expected: list[float], what: str, tol: flo
 }
 
 fn training() -> Tensor {
-    return jl.matrix([
-        [0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0],
-        [5.0, 5.0], [6.0, 5.0], [5.0, 6.0], [6.0, 6.0],
-        [0.0, 5.0], [1.0, 5.0], [0.0, 6.0], [1.0, 6.5],
-    ])
+    return jl.matrix(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [5.0, 5.0],
+            [6.0, 5.0],
+            [5.0, 6.0],
+            [6.0, 6.0],
+            [0.0, 5.0],
+            [1.0, 5.0],
+            [0.0, 6.0],
+            [1.0, 6.5],
+        ]
+    )
 }
 
 fn classes() -> Tensor {
@@ -55,10 +66,27 @@ fn test_classifier_matches_sklearn() -> void {
     let proba = uniform.predict_proba(q)
     defer { proba.free() }
     assert_eq(proba.shape, [5, 3])
-    assert_values(jl.to_values(proba), [
-        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.3333333, 0.0, 0.6666667,
-        0.0, 0.6666667, 0.3333333, 0.6666667, 0.3333333, 0.0,
-    ], "uniform predict_proba")
+    assert_values(
+        jl.to_values(proba),
+        [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.3333333,
+            0.0,
+            0.6666667,
+            0.0,
+            0.6666667,
+            0.3333333,
+            0.6666667,
+            0.3333333,
+            0.0,
+        ],
+        "uniform predict_proba"
+    )
 
     let weighted = KNeighborsClassifier(3, weights: "distance")
     defer { weighted.free() }
@@ -69,10 +97,27 @@ fn test_classifier_matches_sklearn() -> void {
     assert_values(jl.to_values(picked), [3.0, 7.0, 9.0, 7.0, 7.0], "distance predict")
     let shares = weighted.predict_proba(q)
     defer { shares.free() }
-    assert_values(jl.to_values(shares), [
-        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.2443596, 0.0, 0.7556404,
-        0.0, 0.6666667, 0.3333333, 0.0, 1.0, 0.0,
-    ], "distance predict_proba")
+    assert_values(
+        jl.to_values(shares),
+        [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.2443596,
+            0.0,
+            0.7556404,
+            0.0,
+            0.6666667,
+            0.3333333,
+            0.0,
+            1.0,
+            0.0,
+        ],
+        "distance predict_proba"
+    )
 
     #: scikit-learn's 0.8333: the last row's two nearest are class 9.
     assert_near(uniform.score(x, y), 10.0 / 12.0, 1e-6, "training accuracy")
@@ -125,11 +170,28 @@ fn test_kneighbors_orders_ties_by_index() -> void {
     let (distances, index) = model.kneighbors(q)
     defer { distances.free() }
     defer { index.free() }
-    assert_values(jl.to_values(distances), [
-        0.2236068, 0.8062258, 0.9219544, 0.6403124, 0.6403124, 0.781025,
-        0.4472136, 0.8944272, 0.9219544, 2.8284271, 2.8284271, 2.8284271,
-        0.0, 1.0, 1.0,
-    ], "kneighbors distances", tol: 1e-4)
+    assert_values(
+        jl.to_values(distances),
+        [
+            0.2236068,
+            0.8062258,
+            0.9219544,
+            0.6403124,
+            0.6403124,
+            0.781025,
+            0.4472136,
+            0.8944272,
+            0.9219544,
+            2.8284271,
+            2.8284271,
+            2.8284271,
+            0.0,
+            1.0,
+            1.0,
+        ],
+        "kneighbors distances",
+        tol: 1e-4
+    )
     let at = jl.to_values(index)
     assert_values(at[0:3], [0.0, 1.0, 2.0], "first query")
     assert_values(at[6:9], [10.0, 8.0, 11.0], "third query")
