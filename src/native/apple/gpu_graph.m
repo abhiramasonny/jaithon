@@ -93,6 +93,59 @@ bool prefetchBatchFeeds(JaiGpuBuffer *x, size_t xOff, size_t xStride, size_t xBy
     return true;
 }
 
+/* How many different graphs or executables one command buffer may carry.
+ *
+ * From macOS 27, MPSGraph attaches a residency set to the command buffer for
+ * each graph it encodes (GPU::MemrefBufferizer::useResidency), and IOGPU
+ * aborts the process once a command buffer holds more than 32 of them:
+ * "command buffer residency set limit of 32 exceeded". A network compiled one
+ * executable per layer -- YOLOv8's sixty-odd convolutions -- queues more than
+ * that between two waits. Each distinct graph costs two sets (16 graphs fit,
+ * the 17th aborts); encoding the same graph again adds none, so a training loop
+ * that runs one executable two hundred times never comes near it. The limit is
+ * 8 rather than 16 so a graph that one day brings more sets still fits; YOLOv8
+ * runs at the same speed from 6 to 16 (4.2-5.3 ms a frame either way).
+ *
+ * Past the limit the open buffer is committed with MPSCommandBuffer's own
+ * commitAndContinue, the same move MPSGraph makes internally: the batch keeps
+ * its number, the buffer that finally commits it still carries the completion
+ * handler, and the queue runs the two halves in order, so a reader waiting on
+ * the batch still waits for every part of it.
+ * JAITHON_GPU_GRAPHS_PER_BUFFER overrides the limit; 0 turns the split off. */
+static NSHashTable *gGraphsOnBuffer;
+static __weak id<MTLCommandBuffer> gGraphsBuffer;
+
+static int graphsPerBuffer(void) {
+    static int limit = -1;
+    if (limit < 0) {
+        const char *setting = getenv("JAITHON_GPU_GRAPHS_PER_BUFFER");
+        limit = setting != NULL ? atoi(setting) : 8;
+        if (limit < 0) limit = 0;
+    }
+    return limit;
+}
+
+static void makeResidencyRoom(MPSCommandBuffer *mps, id graph) {
+    const int limit = graphsPerBuffer();
+    if (limit == 0 || graph == nil) return;
+    if (gGraphsOnBuffer == nil) {
+        gGraphsOnBuffer = [NSHashTable hashTableWithOptions:
+            NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality];
+    }
+    if (gGraphsBuffer != mps.rootCommandBuffer) {
+        [gGraphsOnBuffer removeAllObjects];
+        gGraphsBuffer = mps.rootCommandBuffer;
+    }
+    if ([gGraphsOnBuffer containsObject:graph]) return;
+    if (gGraphsOnBuffer.count >= (NSUInteger)limit) {
+        [mps commitAndContinue];
+        meterNoteMpsSwap();
+        [gGraphsOnBuffer removeAllObjects];
+        gGraphsBuffer = mps.rootCommandBuffer;
+    }
+    [gGraphsOnBuffer addObject:graph];
+}
+
 bool encodeGraphOnAsync(MPSGraph *graph,
                                NSDictionary<MPSGraphTensor *, MPSGraphTensorData *> *feeds,
                                NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results) {
@@ -101,6 +154,7 @@ bool encodeGraphOnAsync(MPSGraph *graph,
     MPSCommandBuffer *mps =
         [MPSCommandBuffer commandBufferWithCommandBuffer:gAsyncCommands];
     if (mps == nil) return false;
+    makeResidencyRoom(mps, graph);
     static MPSGraphExecutionDescriptor *execDesc;
     static dispatch_once_t execOnce;
     dispatch_once(&execOnce, ^{
@@ -337,6 +391,7 @@ static bool encodeMlpExecutableOnAsyncArrays(
     MPSCommandBuffer *mps =
         [MPSCommandBuffer commandBufferWithCommandBuffer:gAsyncCommands];
     if (mps == nil) return false;
+    makeResidencyRoom(mps, exec);
     if (@available(macOS 12.0, *)) {
         [exec encodeToCommandBuffer:mps
                          inputsArray:inputs
