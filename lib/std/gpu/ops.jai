@@ -78,7 +78,9 @@ pub fn mha_async(
         throw ValueError("mha_async scale must be positive")
     }
     if causal and keys < seq {
-        throw ValueError(f"mha_async causal needs at least as many keys as queries, got {keys} < {seq}")
+        throw ValueError(
+            f"mha_async causal needs at least as many keys as queries, got {keys} < {seq}"
+        )
     }
     return __prim__.gpu_mha_buffers(
         query.handle_of(),

@@ -374,7 +374,12 @@ fn test_attention_layer_forward_value_with_gradients_recorded() -> void {
     defer { layer.free() }
     layer.build(dim, Random.with_seed(3))
     let params = layer.parameters()
-    let weights = [params[0].download(), params[1].download(), params[2].download(), params[3].download()]
+    let weights = [
+        params[0].download(),
+        params[1].download(),
+        params[2].download(),
+        params[3].download(),
+    ]
     let xs = wave(seq * dim, 0.3)
     let x = Tensor([seq, dim], xs, requires_grad: true)
     defer { x.free() }
@@ -509,7 +514,11 @@ fn test_attention_layer_trains_inside_sequential() -> void {
     for sample in 0..samples {
         let label = sample % classes
         for column in 0..width {
-            features.push(if column % classes == label { 1.0 } else { 0.1 * math.sin(float(sample + column)) })
+            features.push(if column % classes == label {
+                1.0
+            } else {
+                0.1 * math.sin(float(sample + column))
+            })
         }
         labels.push(float(label))
     }
@@ -561,7 +570,9 @@ fn torch_cases() -> list[TorchCase] {
         for offset in 1..5 {
             rows.push([float(text) for text in lines[index + offset].split(" ")])
         }
-        cases.push(TorchCase(int(header[1]), int(header[2]), int(header[3]), float(header[4]), rows))
+        cases.push(
+            TorchCase(int(header[1]), int(header[2]), int(header[3]), float(header[4]), rows)
+        )
         index += 5
     }
     return cases
@@ -614,7 +625,13 @@ fn test_causal_attention_matches_torch() -> void {
             let gradient = tensor.grad
             assert_true(gradient is not null)
             if gradient is not null {
-                assert_samples_near(gradient.download(), recorded.rows[slot + 1], positions, 2e-4, 1e-3)
+                assert_samples_near(
+                    gradient.download(),
+                    recorded.rows[slot + 1],
+                    positions,
+                    2e-4,
+                    1e-3
+                )
             }
         }
         free_all(held)
@@ -695,7 +712,16 @@ fn test_batched_attention_matches_each_sequence_alone() -> void {
         for b in 0..batch {
             let lo = b * seq * dim
             let hi = lo + seq * dim
-            let expected = host_attention(qs[lo:hi], ks[lo:hi], vs[lo:hi], seq, seq, heads, hd, true)
+            let expected = host_attention(
+                qs[lo:hi],
+                ks[lo:hi],
+                vs[lo:hi],
+                seq,
+                seq,
+                heads,
+                hd,
+                true
+            )
             assert_values_near(got[lo:hi], expected, if grad { 1e-4 } else { 4e-3 })
         }
         if grad {

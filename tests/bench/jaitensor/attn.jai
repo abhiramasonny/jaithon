@@ -130,16 +130,7 @@ fn main() -> int {
     let shapes = if level == "easy" {
         [("attn-256", 256, 256, 8, false), ("attn-512", 512, 512, 8, false), ("attn-1024", 1024, 512, 8, false)]
     } else {
-        [
-            ("attn-256", 256, 256, 8, false),
-            ("attn-512", 512, 512, 8, false),
-            ("attn-1024", 1024, 512, 8, false),
-            ("attn-1024-wide", 1024, 1024, 16, false),
-            ("attn-2048", 2048, 1024, 16, false),
-            ("attn-4096", 4096, 1024, 16, false),
-            ("attn-1024-causal", 1024, 1024, 16, true),
-            ("attn-4096-causal", 4096, 1024, 16, true),
-        ]
+        [("attn-256", 256, 256, 8, false), ("attn-512", 512, 512, 8, false), ("attn-1024", 1024, 512, 8, false), ("attn-1024-wide", 1024, 1024, 16, false), ("attn-2048", 2048, 1024, 16, false), ("attn-4096", 4096, 1024, 16, false), ("attn-1024-causal", 1024, 1024, 16, true), ("attn-4096-causal", 4096, 1024, 16, true)]
     }
     let only = env_or("ATTN_ONLY", "")
     for (name, seq, dim, heads, causal) in shapes {

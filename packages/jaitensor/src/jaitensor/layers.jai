@@ -795,7 +795,16 @@ pub class MultiHeadAttention: Layer {
     }
 
     #: `forward` with the cache on: `x` holds only the rows not seen yet.
-    fn forward_cached(self, x: Tensor, wq: Tensor, wk: Tensor, wv: Tensor, wo: Tensor, keys: Tensor, values: Tensor) -> Tensor {
+    fn forward_cached(
+        self,
+        x: Tensor,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor,
+        keys: Tensor,
+        values: Tensor
+    ) -> Tensor {
         let rows = x.shape[0]
         let capacity = keys.shape[0]
         if self.cached + rows > capacity {
