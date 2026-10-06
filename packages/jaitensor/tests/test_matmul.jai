@@ -1,7 +1,7 @@
 #: The matmul routes: tile plans, the staged and MPS kernels, and the fused affine.
 import jaitensor as jt
 import std.gpu as gpu
-from jaitensor.gemm import default_plan, plan_from_text
+from jaitensor.gemm import Plan, bucket_extent, default_plan, dispatch_plan, plan_from_text
 from jaitensor.ops import matmul_backend
 from jaitensor.tensor import Tensor
 from std.random import Random
@@ -105,11 +105,213 @@ fn test_tiled_matmul_matches_cpu_on_ragged_tiles() -> void {
     }
 }
 
-fn test_default_plan_prefers_large_tiles_then_splits() -> void {
-    assert_eq(default_plan(512, 784, 8192).to_str(), "gemm128x128:1")
-    assert_eq(default_plan(1024, 3072, 2048).to_str(), "gemm128x128:2")
-    assert_eq(default_plan(512, 784, 256).to_str(), "gemm128x64:8")
+fn test_default_plan_prefers_direct_kernels_then_splits() -> void {
+    #: Small aligned products take a direct kernel, not the staged one that
+    #: cost three times the GPU time at 64 cubed.
+    assert_eq(default_plan(64, 64, 64).to_str(), "direct32x32:1")
+    #: Unsplit while a split would keep under 256 steps of K: summing the
+    #: partials is a second dispatch.
+    assert_eq(default_plan(128, 128, 128).to_str(), "direct32x32:1")
+    assert_eq(default_plan(512, 784, 256).to_str(), "direct32x32:2")
+    assert_eq(default_plan(1024, 384, 384).to_str(), "direct32x32:1")
+    #: Ragged shapes keep the staged kernel, the largest tile that still makes
+    #: a few threadgroups, then splits.
     assert_eq(default_plan(8, 7, 5).to_str(), "gemm32x32:1")
+    assert_eq(default_plan(100, 100, 100).to_str(), "gemm32x32:1")
+    #: Large products go to the graph wherever a device can run it.
+    if gpu.is_available() {
+        assert_eq(default_plan(512, 784, 8192).to_str(), "mpsgraph:1")
+        assert_eq(default_plan(1024, 768, 768).to_str(), "mpsgraph:1")
+    }
+}
+
+fn test_default_plan_splits_a_tall_skinny_product_past_sixteen() -> void {
+    #: X^T X and X^T y over 10k samples: four and two output tiles, so
+    #: sixteen splits left the device mostly idle.
+    assert_eq(default_plan(50, 10000, 50).to_str(), "gemm32x32:32")
+    assert_eq(default_plan(50, 10000, 1).to_str(), "gemm32x32:32")
+    #: A product with tiles enough of its own is never split that far.
+    assert_eq(default_plan(8, 7, 5).to_str(), "gemm32x32:1")
+    #: Deeper still, the graph: it splits K itself, and beat every kernel
+    #: plan at 100k samples.
+    if gpu.is_available() {
+        assert_eq(default_plan(50, 100000, 50).to_str(), "mpsgraph:1")
+        assert_eq(default_plan(50, 100000, 1).to_str(), "mpsgraph:1")
+    }
+}
+
+fn test_plan_from_text_reads_a_bare_name_as_one_split() -> void {
+    let graph = plan_from_text("mpsgraph")
+    assert_true(graph is not null)
+    assert_eq(graph.to_str(), "mpsgraph:1")
+    let kernel = plan_from_text("direct32x32")
+    assert_true(kernel is not null)
+    assert_eq(kernel.to_str(), "direct32x32:1")
+    assert_eq(plan_from_text("gemm32x32:64").to_str(), "gemm32x32:64")
+    assert_true(plan_from_text("no-such-kernel") is null)
+    assert_true(plan_from_text("gemm32x32:many") is null)
+    assert_true(plan_from_text("gemm32x32:0") is null)
+}
+
+fn test_bucket_extent_rounds_up_by_quarter_octaves() -> void {
+    assert_eq(bucket_extent(1), 1)
+    assert_eq(bucket_extent(29), 32)
+    assert_eq(bucket_extent(64), 64)
+    assert_eq(bucket_extent(65), 80)
+    assert_eq(bucket_extent(1024), 1024)
+    assert_eq(bucket_extent(1025), 1280)
+    #: Neighbouring sample counts share a plan, so a new fold is not a new
+    #: tuning pass.
+    assert_eq(bucket_extent(77777), bucket_extent(80000))
+}
+
+fn plan_named(text: str) -> Plan {
+    let plan = plan_from_text(text)
+    if plan is null { throw AssertionError(f"{text} names no plan") }
+    return plan
+}
+
+#: Host reference for `op(a) x op(b)` in float64.
+fn host_reference(
+    a: list[float],
+    b: list[float],
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool,
+    trans_b: bool
+) -> list[float] {
+    var out = [0.0 for _index in 0..rows * columns]
+    for row in 0..rows {
+        for column in 0..columns {
+            var total = 0.0
+            for k in 0..inner {
+                let av = if trans_a { a[k * rows + row] } else { a[row * inner + k] }
+                let bv = if trans_b { b[column * inner + k] } else { b[k * columns + column] }
+                total += av * bv
+            }
+            out[row * columns + column] = total
+        }
+    }
+    return out
+}
+
+fn assert_plan_matches_host(
+    plan: Plan,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool,
+    trans_b: bool,
+    same_operand: bool = false
+) -> void {
+    let a = if trans_a { device_tensor([inner, rows], 11) } else { device_tensor([rows, inner], 11) }
+    let b = if same_operand {
+        a
+    } elif trans_b {
+        device_tensor([columns, inner], 12)
+    } else {
+        device_tensor([inner, columns], 12)
+    }
+    let out = jt.Tensor([rows, columns])
+    defer { a.free() }
+    defer {
+        if not same_operand { b.free() }
+    }
+    defer { out.free() }
+    out.buffer().fill(1.0e9)
+    dispatch_plan(
+        plan,
+        a.buffer(),
+        b.buffer(),
+        out.buffer(),
+        out.buffer(),
+        rows,
+        inner,
+        columns,
+        trans_a: trans_a,
+        trans_b: trans_b
+    )
+    let got = out.download()
+    let want = host_reference(a.download(), b.download(), rows, inner, columns, trans_a, trans_b)
+    let what = f"{plan.to_str()} {rows}x{inner}x{columns} ta={trans_a} tb={trans_b}"
+    for at in 0..want.len() {
+        if not (got[at] - want[at] < 1e-3 * (1.0 + inner) and want[at] - got[at] < 1e-3 * (1.0 + inner)) {
+            throw AssertionError(f"{what}: element {at} is {got[at]}, want {want[at]}")
+        }
+    }
+}
+
+fn test_padded_graph_route_matches_host_on_ragged_widths() -> void {
+    if not jt.is_available() { return }
+    let graph = plan_named("mpsgraph")
+    let samples = 300
+    for width in [1, 2, 3, 5, 49, 50, 51, 63] {
+        #: The gram, both operands one buffer: padded once.
+        assert_plan_matches_host(graph, width, samples, width, true, false, same_operand: true)
+        #: X^T y: a one-wide result.
+        assert_plan_matches_host(graph, width, samples, 1, true, false)
+        #: X W and A B^T: padding the inner axis of both operands.
+        assert_plan_matches_host(graph, samples, width, 3, false, false)
+        assert_plan_matches_host(graph, 7, width, 5, false, true)
+        assert_plan_matches_host(graph, 6, width, 9, true, true)
+    }
+}
+
+fn test_padded_graph_route_applies_the_epilogue() -> void {
+    if not jt.is_available() { return }
+    let rows = 9
+    let inner = 50
+    let columns = 7
+    let x = device_tensor([rows, inner], 21)
+    let w = device_tensor([inner, columns], 22)
+    let bias = device_tensor([columns], 23)
+    let out = jt.Tensor([rows, columns])
+    defer { x.free() }
+    defer { w.free() }
+    defer { bias.free() }
+    defer { out.free() }
+    dispatch_plan(
+        plan_named("mpsgraph"),
+        x.buffer(),
+        w.buffer(),
+        out.buffer(),
+        bias.buffer(),
+        rows,
+        inner,
+        columns,
+        epilogue: 2
+    )
+    let got = out.download()
+    let plain = host_reference(x.download(), w.download(), rows, inner, columns, false, false)
+    let shift = bias.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            let want = max(plain[row * columns + column] + shift[column], 0.0)
+            assert_near(got[row * columns + column], want, 1e-3)
+        }
+    }
+}
+
+fn test_deep_split_matches_host() -> void {
+    if not jt.is_available() { return }
+    for text in ["gemm32x32:64", "gemm32x32:256", "gemm64x64:128"] {
+        assert_plan_matches_host(plan_named(text), 50, 20000, 50, true, false, same_operand: true)
+        assert_plan_matches_host(plan_named(text), 50, 20000, 1, true, false)
+    }
+}
+
+fn test_ragged_tall_skinny_matmul_matches_host() -> void {
+    if not jt.is_available() { return }
+    #: Whatever the planner picks for it, statically or tuned.
+    let x = device_tensor([20000, 50], 31)
+    defer { x.free() }
+    let gram = jt.matmul(x, x, trans_a: true)
+    defer { gram.free() }
+    let got = gram.download()
+    let values = x.download()
+    let want = host_reference(values, values, 50, 20000, 50, true, false)
+    for at in 0..want.len() { assert_near(got[at], want[at], 0.1) }
 }
 
 fn test_matmul_backend_reports_a_known_plan() -> void {
