@@ -125,8 +125,14 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
         let shape = __prim__.graph_plan_output_shape(plan, index)
         #: A shape the compiler could not settle, or a scalar -- there is no
         #: rank-zero tensor here to receive one. Either way the interpreter
-        #: should have this graph.
-        if shape.len() == 0 {
+        #: should have this graph. A settled rank with an open dimension is
+        #: the same thing: no output buffer could be sized for it, and taking
+        #: the plan anyway throws on the first run instead of falling back.
+        var open = shape.len() == 0
+        for dim in shape {
+            if dim < 0 { open = true }
+        }
+        if open {
             __prim__.graph_plan_free(plan)
             return null
         }
