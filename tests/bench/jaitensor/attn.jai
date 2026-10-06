@@ -23,21 +23,30 @@ let MIN_REPEATS = 24
 let MAX_REPEATS = 4096
 
 #: How many repeats of this shape fill `TARGET_SECONDS`, from a short probe.
-fn repeats_for(seq: int, dim: int, heads: int, floor: int) -> int {
+#:
+#: The probe's inputs are filled exactly as `time_attn`'s are. Left as
+#: whatever the allocator handed back, they held denormals, infinities and
+#: NaNs, which the kernel runs at a different speed: at 4096 an unfilled call
+#: took 20.5 ms against 11.8 filled, so the repeat count was sized for a
+#: kernel that is never the one timed.
+fn repeats_for(seq: int, dim: int, heads: int, floor: int, causal: bool) -> int {
     let q = Tensor([seq, dim])
     let k = Tensor([seq, dim])
     let v = Tensor([seq, dim])
     defer { q.free() }
     defer { k.free() }
     defer { v.free() }
+    q.buffer().fill_uniform(-1.0, 1.0, 1)
+    k.buffer().fill_uniform(-1.0, 1.0, 2)
+    v.buffer().fill_uniform(-1.0, 1.0, 3)
     for _warm in 0..WARMUP {
-        let throwaway = multi_head_attention(q, k, v, heads)
+        let throwaway = multi_head_attention(q, k, v, heads, causal: causal)
         throwaway.free()
     }
     gpu.synchronize()
     let started = Instant.now()
     for _probe in 0..8 {
-        let throwaway = multi_head_attention(q, k, v, heads)
+        let throwaway = multi_head_attention(q, k, v, heads, causal: causal)
         throwaway.free()
     }
     gpu.synchronize()
@@ -49,7 +58,7 @@ fn repeats_for(seq: int, dim: int, heads: int, floor: int) -> int {
     return wanted
 }
 
-fn time_attn(seq: int, dim: int, heads: int, repeats: int) -> tuple[float, bool] {
+fn time_attn(seq: int, dim: int, heads: int, repeats: int, causal: bool) -> tuple[float, bool] {
     let q = Tensor([seq, dim])
     let k = Tensor([seq, dim])
     let v = Tensor([seq, dim])
@@ -64,7 +73,7 @@ fn time_attn(seq: int, dim: int, heads: int, repeats: int) -> tuple[float, bool]
     #: timing the first few dispatches measures the clock coming up rather than
     #: the kernel. The peer benchmark warms up by the same rule.
     for _warm in 0..max(repeats, WARMUP) {
-        let throwaway = multi_head_attention(q, k, v, heads)
+        let throwaway = multi_head_attention(q, k, v, heads, causal: causal)
         throwaway.free()
     }
     gpu.synchronize()
@@ -74,9 +83,9 @@ fn time_attn(seq: int, dim: int, heads: int, repeats: int) -> tuple[float, bool]
     #: a working set of tens of megabytes between this side and its cache,
     #: which is a difference in the harness, not in the operation.
     let started = Instant.now()
-    var output = multi_head_attention(q, k, v, heads)
+    var output = multi_head_attention(q, k, v, heads, causal: causal)
     for _i in 1..repeats {
-        let made = multi_head_attention(q, k, v, heads)
+        let made = multi_head_attention(q, k, v, heads, causal: causal)
         output.free()
         output = made
     }
@@ -109,18 +118,32 @@ fn main() -> int {
     warmup_q.free()
     warmup_k.free()
     warmup_v.free()
+    #: The causal rows count half the products: the masked half is work
+    #: neither side should do, and both sides report the same count.
     let shapes = if level == "easy" {
-        [("attn-256", 256, 256, 8), ("attn-512", 512, 512, 8), ("attn-1024", 1024, 512, 8)]
+        [("attn-256", 256, 256, 8, false), ("attn-512", 512, 512, 8, false), ("attn-1024", 1024, 512, 8, false)]
     } else {
-        [("attn-256", 256, 256, 8), ("attn-512", 512, 512, 8), ("attn-1024", 1024, 512, 8), ("attn-1024-wide", 1024, 1024, 16), ("attn-2048", 2048, 1024, 16), ("attn-4096", 4096, 1024, 16)]
+        [
+            ("attn-256", 256, 256, 8, false),
+            ("attn-512", 512, 512, 8, false),
+            ("attn-1024", 1024, 512, 8, false),
+            ("attn-1024-wide", 1024, 1024, 16, false),
+            ("attn-2048", 2048, 1024, 16, false),
+            ("attn-4096", 4096, 1024, 16, false),
+            ("attn-1024-causal", 1024, 1024, 16, true),
+            ("attn-4096-causal", 4096, 1024, 16, true),
+        ]
     }
-    for (name, seq, dim, heads) in shapes {
-        let counted = repeats_for(seq, dim, heads, max(repeats, MIN_REPEATS))
-        let (seconds, valid) = time_attn(seq, dim, heads, counted)
+    let only = env_or("ATTN_ONLY", "")
+    for (name, seq, dim, heads, causal) in shapes {
+        if only != "" and only != name { continue }
+        let counted = repeats_for(seq, dim, heads, max(repeats, MIN_REPEATS), causal)
+        let (seconds, valid) = time_attn(seq, dim, heads, counted, causal)
         if verbose { print(f"{name}: {seconds / float(counted):.6f}s") }
         #: Reported as though it had run `repeats` times; see gemm.jai.
         let scaled = seconds / float(counted) * float(repeats)
-        let flops = 4 * seq * seq * dim * repeats
+        let full = 4 * seq * seq * dim * repeats
+        let flops = if causal { full // 2 } else { full }
         let check = if valid { "ok" } else { "invalid" }
         print(f"jtb\t{name}\t{scaled:.9f}\t{flops}\t0\t{check}\tamp-f16-f32")
     }
