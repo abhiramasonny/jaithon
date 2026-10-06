@@ -7,7 +7,7 @@ from .elementwise import scale
 from .kernels import cached_attn_kernel, f32_bits
 from .matmul import matmul, raw_matmul, raw_matmul_batched
 from .reduce import softmax
-from .shape import cat, merge_heads, split_heads
+from .shape import cat, merge_heads, reshape, split_heads
 
 #: Scaled dot-product attention for rank-two `[seq, dim]` tensors.
 pub fn scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor) -> Tensor {
@@ -36,33 +36,60 @@ pub fn scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor) -
 
 #: Per-head scaled-dot-product attention on packed `[seq, dim]` Q/K/V.
 #:
+#: `query` is `[tq, dim]` and `key`/`value` are `[tk, dim]`; the two lengths
+#: may differ, which is what decoding against cached keys needs. Rank three
+#: `[batch, t, dim]` folds the batch into the head axis, so every sequence in
+#: the batch is attended separately in one dispatch.
+#:
+#: `causal` masks query row `i` to key rows `0..=i + tk - tq`: with equal
+#: lengths that is the usual lower triangle, and a query block that continues
+#: a longer key sequence sees its own prefix. It needs `tk >= tq`.
+#:
 #: The fused device path is a Metal prefill kernel: packed `[seq, heads, hd]`
 #: stays packed, Q/K/V stream through half SRAM, and QK/PV use simdgroup MMA.
-#: MPSGraph SDPA is the fallback when the kernel cannot run. Last resort is
-#: GEMM. Scale is `1 / sqrt(head_dim)`.
-pub fn multi_head_attention(query: Tensor, key: Tensor, value: Tensor, heads: int) -> Tensor {
-    if heads == 1 { return scaled_dot_product_attention(query, key, value) }
+#: A single query row takes a decode kernel that splits the keys across
+#: threadgroups instead. MPSGraph SDPA is the fallback when neither can run.
+#: Last resort is GEMM. Scale is `1 / sqrt(head_dim)`.
+pub fn multi_head_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    heads: int,
+    causal: bool = false
+) -> Tensor {
+    if query.rank() == 3 or key.rank() == 3 or value.rank() == 3 {
+        return mha_batched(query, key, value, heads, causal)
+    }
+    if heads == 1 and not causal { return scaled_dot_product_attention(query, key, value) }
     if query.rank() != 2 or key.rank() != 2 or value.rank() != 2 {
         throw ValueError("multi_head_attention needs rank-two Q, K, V")
     }
     if heads <= 0 {
         throw ValueError(f"multi_head_attention needs a positive head count, got {heads}")
     }
-    if query.shape != key.shape or query.shape != value.shape {
+    if key.shape != value.shape or query.shape[1] != key.shape[1] {
         throw ValueError(
             f"multi_head_attention Q/K/V shape mismatch: {query.shape} {key.shape} {value.shape}"
         )
     }
     let seq = query.shape[0]
+    let kv_seq = key.shape[0]
     let dim = query.shape[1]
     if dim % heads != 0 {
         throw ValueError(f"multi_head_attention dim {dim} must divide heads {heads}")
     }
+    if causal and kv_seq < seq {
+        throw ValueError(
+            f"causal multi_head_attention needs at least as many keys as queries, got {kv_seq} < {seq}"
+        )
+    }
     let hd = dim // heads
     let factor = 1.0 / math.sqrt(float(hd))
     if query.requires_grad or key.requires_grad or value.requires_grad {
-        if mha_mma_ok(seq, hd) { return mha_by_mma(query, key, value, heads, seq, hd, factor) }
-        return mha_by_ops(query, key, value, heads, seq, hd, factor)
+        if seq == kv_seq and mha_mma_ok(seq, hd) {
+            return mha_by_mma(query, key, value, heads, seq, hd, factor, causal)
+        }
+        return mha_by_ops(query, key, value, heads, seq, kv_seq, hd, factor, causal)
     }
     let output = Tensor(query.shape)
     if gpu.mha_async(
@@ -73,9 +100,15 @@ pub fn multi_head_attention(query: Tensor, key: Tensor, value: Tensor, heads: in
         seq,
         heads,
         hd,
-        factor
+        factor,
+        causal: causal,
+        kv_seq: kv_seq
     ) {
         return output
+    }
+    if causal or seq != kv_seq {
+        output.free()
+        return mha_by_ops(query, key, value, heads, seq, kv_seq, hd, factor, causal)
     }
     if seq >= 16 and hd >= 32 and hd <= 64 {
         let q_tiles = (seq + 15) // 16
@@ -103,12 +136,68 @@ pub fn multi_head_attention(query: Tensor, key: Tensor, value: Tensor, heads: in
     return mha_by_gemm(query, key, value, heads, seq, hd, factor)
 }
 
+#: Rank-three attention: `[batch, t, dim]`, one sequence per batch row.
+#:
+#: The batch folds into the head axis. `[batch, t, dim]` read as
+#: `[batch * t, dim]` is exactly `merge_heads`'s packed layout with `batch`
+#: heads of width `dim`, so one `merge_heads` gives `[t, batch * dim]`, whose
+#: columns are `batch * heads` heads of the original width. Attention runs
+#: once over all of them and `split_heads` undoes the fold. Both copies carry
+#: their own gradients, so this is differentiable whenever the inputs are.
+fn mha_batched(query: Tensor, key: Tensor, value: Tensor, heads: int, causal: bool) -> Tensor {
+    if query.rank() != 3 or key.rank() != 3 or value.rank() != 3 {
+        throw ValueError(
+            f"batched multi_head_attention needs rank-three Q, K, V, got {query.shape} {key.shape} {value.shape}"
+        )
+    }
+    if key.shape != value.shape or query.shape[0] != key.shape[0] or query.shape[2] != key.shape[2] {
+        throw ValueError(
+            f"multi_head_attention Q/K/V shape mismatch: {query.shape} {key.shape} {value.shape}"
+        )
+    }
+    let batch = query.shape[0]
+    let seq = query.shape[1]
+    let kv_seq = key.shape[1]
+    let dim = query.shape[2]
+    let qf = fold_batch(query)
+    let kf = fold_batch(key)
+    let vf = fold_batch(value)
+    let folded = multi_head_attention(qf, kf, vf, heads * batch, causal: causal)
+    release_unrecorded(qf)
+    release_unrecorded(kf)
+    release_unrecorded(vf)
+    let split = split_heads(folded, batch)
+    release_unrecorded(folded)
+    if split.creator is not null { return reshape(split, [batch, seq, dim]) }
+    #: Unrecorded, `split` already holds the answer in `[batch, seq, dim]`
+    #: order; the result adopts its buffer rather than viewing it, since a
+    #: view would dangle once `split` was freed.
+    return Tensor([batch, seq, dim], storage: split.buffer())
+}
+
+#: `[batch, t, dim]` to `[t, batch * dim]`.
+fn fold_batch(input: Tensor) -> Tensor {
+    let batch = input.shape[0]
+    let seq = input.shape[1]
+    let flat = reshape(input, [batch * seq, input.shape[2]])
+    let folded = merge_heads(flat, batch, seq)
+    release_unrecorded(flat)
+    return folded
+}
+
+#: Free an intermediate unless an autograd graph recorded it; a recorded one
+#: is released by whoever frees what `backward()` or `discard_graph()` returns.
+fn release_unrecorded(tensor: Tensor) -> void {
+    if tensor.creator is null { tensor.free() }
+}
+
 #: Whether the batched simdgroup-matrix attention kernels can take this shape.
 #:
-#: They tile in 8x8 fragments with no masking, so the sequence has to fill
-#: whole 64-row patches, and the head dimension has to be exactly the 64 the
-#: 2x2 of simdgroups covers. Everything else keeps `mha_by_ops`, which has no
-#: shape restriction at all.
+#: They tile in 8x8 fragments with no partial-tile masking, so the sequence
+#: has to fill whole 64-row patches, and the head dimension has to be exactly
+#: the 64 the 2x2 of simdgroups covers. A causal mask is whole tiles plus the
+#: diagonal one, which the softmax handles. Everything else keeps
+#: `mha_by_ops`, which has no shape restriction at all.
 fn mha_mma_ok(seq: int, hd: int) -> bool {
     return hd == 64 and seq % 64 == 0
 }
@@ -131,6 +220,12 @@ fn mha_mma_ok(seq: int, hd: int) -> bool {
 #:
 #: The score matrix is still written out, unlike the fused inference kernel,
 #: because the backward pass has to read it. Nothing else is materialised.
+#:
+#: Causal, every kernel skips the 64x64 patches above the diagonal: the score
+#: products are not computed, the softmax zeroes only up to the edge of the
+#: diagonal patch, and the context and transposed products stop (or start) at
+#: that patch. Nothing ever reads the skipped patches, so they are never
+#: written either, and at seq 1024 that is 120 of 256 patches per head.
 fn mha_by_mma(
     query: Tensor,
     key: Tensor,
@@ -138,32 +233,35 @@ fn mha_by_mma(
     heads: int,
     seq: int,
     hd: int,
-    factor: float
+    factor: float,
+    causal: bool
 ) -> Tensor {
     let tiles = seq // 64
+    let mask = if causal { 1 } else { 0 }
+    let causal_rows = if causal { seq } else { 0 }
     let probs = Tensor([heads * seq, seq])
     cached_attn_kernel("mha_scores_mma").dispatch_async(
         [query.buffer(), key.buffer(), probs.buffer()],
         tiles * tiles * heads * 64,
-        [seq, heads, hd, tiles],
+        [seq, heads, hd, tiles, mask],
         group_size: 64
     )
     cached_attn_kernel("mha_softmax_scaled").dispatch_async(
         [probs.buffer()],
         heads * seq * 256,
-        [heads * seq, seq, f32_bits(factor)],
+        [heads * seq, seq, f32_bits(factor), causal_rows, 64],
         group_size: 256
     )
     let output = Tensor([seq, heads * hd])
     cached_attn_kernel("mha_context_mma").dispatch_async(
         [probs.buffer(), value.buffer(), output.buffer()],
         tiles * heads * 64,
-        [seq, heads, hd],
+        [seq, heads, hd, mask],
         group_size: 64
     )
     if query.requires_grad or key.requires_grad or value.requires_grad {
         output.attach_creator(GradNode([query, key, value], fn(upstream: Tensor) -> list[Tensor] {
-            return mha_mma_grads(upstream, query, key, value, probs, heads, seq, hd, factor)
+            return mha_mma_grads(upstream, query, key, value, probs, heads, seq, hd, factor, causal)
         }, extras: [probs]))
     }
     return output
@@ -186,10 +284,13 @@ fn mha_mma_grads(
     heads: int,
     seq: int,
     hd: int,
-    factor: float
+    factor: float,
+    causal: bool
 ) -> list[Tensor] {
     let tiles = seq // 64
     let dim = heads * hd
+    let mask = if causal { 1 } else { 0 }
+    let causal_rows = if causal { seq } else { 0 }
     let grad_q = Tensor([seq, dim])
     let grad_k = Tensor([seq, dim])
     let grad_v = Tensor([seq, dim])
@@ -197,31 +298,31 @@ fn mha_mma_grads(
     cached_attn_kernel("mha_scores_mma").dispatch_async(
         [upstream.buffer(), value.buffer(), grad_probs.buffer()],
         tiles * tiles * heads * 64,
-        [seq, heads, hd, tiles],
+        [seq, heads, hd, tiles, mask],
         group_size: 64
     )
     cached_attn_kernel("mha_transposed_mma").dispatch_async(
         [probs.buffer(), upstream.buffer(), grad_v.buffer()],
         tiles * heads * 64,
-        [seq, heads, hd],
+        [seq, heads, hd, mask],
         group_size: 64
     )
     cached_attn_kernel("mha_softmax_backward_scaled").dispatch_async(
         [probs.buffer(), grad_probs.buffer()],
         heads * seq * 256,
-        [heads * seq, seq, f32_bits(factor)],
+        [heads * seq, seq, f32_bits(factor), causal_rows, 64],
         group_size: 256
     )
     cached_attn_kernel("mha_context_mma").dispatch_async(
         [grad_probs.buffer(), key.buffer(), grad_q.buffer()],
         tiles * heads * 64,
-        [seq, heads, hd],
+        [seq, heads, hd, mask],
         group_size: 64
     )
     cached_attn_kernel("mha_transposed_mma").dispatch_async(
         [grad_probs.buffer(), query.buffer(), grad_k.buffer()],
         tiles * heads * 64,
-        [seq, heads, hd],
+        [seq, heads, hd, mask],
         group_size: 64
     )
     grad_probs.free()
@@ -249,34 +350,49 @@ fn mha_mma_grads(
 #: GEMMs below write into a view of the single gradient buffer instead, so
 #: each element is written exactly once. Adding zero is exact, so the answer
 #: is unchanged bit for bit.
+#:
+#: `seq` query rows attend `kv_seq` key rows. A causal mask is applied by the
+#: softmax, which zeroes every masked entry so the GEMMs reading the whole
+#: matrix see nothing past each row's limit; it also serves as the inference
+#: route for a causal or uneven shape the device kernels cannot take.
 fn mha_by_ops(
     query: Tensor,
     key: Tensor,
     value: Tensor,
     heads: int,
     seq: int,
+    kv_seq: int,
     hd: int,
-    factor: float
+    factor: float,
+    causal: bool
 ) -> Tensor {
+    let causal_rows = if causal { seq } else { 0 }
     let qs = split_heads(query, heads)
     let ks = split_heads(key, heads)
     let vs = split_heads(value, heads)
-    let probs = Tensor([heads * seq, seq])
-    raw_matmul_batched(qs, ks, probs, heads, seq, hd, seq, seq * hd, seq * hd, trans_b: true)
+    let probs = Tensor([heads * seq, kv_seq])
+    raw_matmul_batched(qs, ks, probs, heads, seq, hd, kv_seq, seq * hd, kv_seq * hd, trans_b: true)
     cached_attn_kernel("mha_softmax_scaled").dispatch_async(
         [probs.buffer()],
         heads * seq * 256,
-        [heads * seq, seq, f32_bits(factor)],
+        [heads * seq, kv_seq, f32_bits(factor), causal_rows, 0],
         group_size: 256
     )
     let context = Tensor([heads * seq, hd])
-    raw_matmul_batched(probs, vs, context, heads, seq, seq, hd, seq * seq, seq * hd)
+    raw_matmul_batched(probs, vs, context, heads, seq, kv_seq, hd, seq * kv_seq, kv_seq * hd)
     if qs.requires_grad or ks.requires_grad or vs.requires_grad {
         context.attach_creator(GradNode([qs, ks, vs], fn(upstream: Tensor) -> list[Tensor] {
-            return mha_grads(upstream, qs, ks, vs, probs, heads, seq, hd, factor)
+            return mha_grads(upstream, qs, ks, vs, probs, heads, seq, kv_seq, hd, factor, causal)
         }, extras: [probs]))
+        return merge_heads(context, heads, seq)
     }
-    return merge_heads(context, heads, seq)
+    let output = merge_heads(context, heads, seq)
+    qs.free()
+    ks.free()
+    vs.free()
+    probs.free()
+    context.free()
+    return output
 }
 
 #: Gradients of `mha_by_ops` with respect to the split-head Q, K and V.
@@ -295,13 +411,16 @@ fn mha_grads(
     probs: Tensor,
     heads: int,
     seq: int,
+    kv_seq: int,
     hd: int,
-    factor: float
+    factor: float,
+    causal: bool
 ) -> list[Tensor] {
+    let causal_rows = if causal { seq } else { 0 }
     let grad_q = Tensor([heads * seq, hd])
-    let grad_k = Tensor([heads * seq, hd])
-    let grad_v = Tensor([heads * seq, hd])
-    let grad_probs = Tensor([heads * seq, seq])
+    let grad_k = Tensor([heads * kv_seq, hd])
+    let grad_v = Tensor([heads * kv_seq, hd])
+    let grad_probs = Tensor([heads * seq, kv_seq])
     raw_matmul_batched(
         upstream,
         vs,
@@ -309,9 +428,9 @@ fn mha_grads(
         heads,
         seq,
         hd,
-        seq,
+        kv_seq,
         seq * hd,
-        seq * hd,
+        kv_seq * hd,
         trans_b: true
     )
     raw_matmul_batched(
@@ -319,29 +438,29 @@ fn mha_grads(
         upstream,
         grad_v,
         heads,
-        seq,
+        kv_seq,
         seq,
         hd,
-        seq * seq,
+        seq * kv_seq,
         seq * hd,
         trans_a: true
     )
     cached_attn_kernel("mha_softmax_backward_scaled").dispatch_async(
         [probs.buffer(), grad_probs.buffer()],
         heads * seq * 256,
-        [heads * seq, seq, f32_bits(factor)],
+        [heads * seq, kv_seq, f32_bits(factor), causal_rows, 0],
         group_size: 256
     )
-    raw_matmul_batched(grad_probs, ks, grad_q, heads, seq, seq, hd, seq * seq, seq * hd)
+    raw_matmul_batched(grad_probs, ks, grad_q, heads, seq, kv_seq, hd, seq * kv_seq, kv_seq * hd)
     raw_matmul_batched(
         grad_probs,
         qs,
         grad_k,
         heads,
-        seq,
+        kv_seq,
         seq,
         hd,
-        seq * seq,
+        seq * kv_seq,
         seq * hd,
         trans_a: true
     )

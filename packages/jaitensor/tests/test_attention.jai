@@ -4,6 +4,7 @@ import std.gpu as gpu
 import std.math
 from jaitensor.layers import MultiHeadAttention
 from jaitensor.tensor import Tensor
+from std.io import Path
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
 
@@ -527,4 +528,176 @@ fn test_attention_layer_trains_inside_sequential() -> void {
     assert_eq(history.loss.len(), 3)
     for value in history.loss { assert_true(math.is_finite(value)) }
     assert_true(history.loss[2] < history.loss[0])
+}
+
+#: One recorded torch case: `[seq, heads * hd]` causal attention.
+class TorchCase {
+    pub let seq: int
+    pub let hd: int
+    pub let heads: int
+    pub let loss: float
+    pub let rows: list[list[float]]
+
+    pub fn init(self, seq: int, hd: int, heads: int, loss: float, rows: list[list[float]]) {
+        self.seq = seq
+        self.hd = hd
+        self.heads = heads
+        self.loss = loss
+        self.rows = rows
+    }
+}
+
+fn torch_cases() -> list[TorchCase] {
+    let lines = Path("packages/jaitensor/tests/oracle/causal_sdpa.txt").read_text().split("\n")
+    var cases: list[TorchCase] = []
+    var index = 0
+    while index + 4 < lines.len() {
+        let header = lines[index].split(" ")
+        if header.len() != 5 or header[0] != "case" {
+            index += 1
+            continue
+        }
+        var rows: list[list[float]] = []
+        for offset in 1..5 {
+            rows.push([float(text) for text in lines[index + offset].split(" ")])
+        }
+        cases.push(TorchCase(int(header[1]), int(header[2]), int(header[3]), float(header[4]), rows))
+        index += 5
+    }
+    return cases
+}
+
+fn sample_positions(size: int) -> list[int] {
+    return [(j * 7919 + 13) % size for j in 0..64]
+}
+
+fn assert_samples_near(
+    values: list[float],
+    expected: list[float],
+    positions: list[int],
+    absolute: float,
+    relative: float
+) -> void {
+    for (j, position) in positions.enumerate() {
+        let want = expected[j]
+        assert_near(values[position], want, absolute + relative * math.fabs(want))
+    }
+}
+
+#: Causal attention against PyTorch's `scaled_dot_product_attention` with
+#: `is_causal=True`, run in float64 by tests/oracle/causal_sdpa.py.
+#:
+#: Each case runs twice: with gradients, which takes the MMA kernels at
+#: sequences that fill 64-row patches with hd 64 and the op composition
+#: otherwise, and without, which takes the flash prefill kernel (or the decode
+#: kernel at one row). The lengths straddle the 64-row patch and the 32-key
+#: tile on purpose: 63, 64 and 65 put the diagonal at every edge.
+fn test_causal_attention_matches_torch() -> void {
+    if not jt.is_available() { return }
+    let cases = torch_cases()
+    assert_eq(cases.len(), 12)
+    for recorded in cases {
+        let seq = recorded.seq
+        let dim = recorded.heads * recorded.hd
+        let positions = sample_positions(seq * dim)
+        let w = Tensor([seq, dim], wave(seq * dim, 2.5))
+        let q = Tensor([seq, dim], wave(seq * dim, 0.1), requires_grad: true)
+        let k = Tensor([seq, dim], wave(seq * dim, 0.9), requires_grad: true)
+        let v = Tensor([seq, dim], wave(seq * dim, 1.7), requires_grad: true)
+        let y = jt.multi_head_attention(q, k, v, recorded.heads, causal: true)
+        let product = jt.multiply(y, w)
+        let total = jt.sum(product)
+        let held = total.backward()
+        assert_near(total.download()[0], recorded.loss, 1e-3 + 1e-4 * math.fabs(recorded.loss))
+        assert_samples_near(y.download(), recorded.rows[0], positions, 1e-4, 1e-4)
+        for (slot, tensor) in [q, k, v].enumerate() {
+            let gradient = tensor.grad
+            assert_true(gradient is not null)
+            if gradient is not null {
+                assert_samples_near(gradient.download(), recorded.rows[slot + 1], positions, 2e-4, 1e-3)
+            }
+        }
+        free_all(held)
+        total.free()
+        let qi = Tensor([seq, dim], wave(seq * dim, 0.1))
+        let ki = Tensor([seq, dim], wave(seq * dim, 0.9))
+        let vi = Tensor([seq, dim], wave(seq * dim, 1.7))
+        let fast = jt.multi_head_attention(qi, ki, vi, recorded.heads, causal: true)
+        #: The prefill kernel holds Q, K and V in half precision.
+        assert_samples_near(fast.download(), recorded.rows[0], positions, 4e-3, 4e-3)
+        free_all([w, q, k, v, qi, ki, vi, fast])
+    }
+}
+
+#: Every inference route against the host, including the ones the torch cases
+#: do not reach: fewer queries than keys (a continued sequence), the decode
+#: kernel at one to seven rows, the MPSGraph fallback at a head width neither
+#: device kernel takes, and one head.
+fn check_route(tq: int, tk: int, heads: int, hd: int, causal: bool, tolerance: float) -> void {
+    let dim = heads * hd
+    let qs = wave(tq * dim, 0.2)
+    let ks = wave(tk * dim, 1.3)
+    let vs = wave(tk * dim, 2.4)
+    let q = Tensor([tq, dim], qs)
+    let k = Tensor([tk, dim], ks)
+    let v = Tensor([tk, dim], vs)
+    let y = jt.multi_head_attention(q, k, v, heads, causal: causal)
+    let expected = host_attention(qs, ks, vs, tq, tk, heads, hd, causal)
+    assert_values_near(y.download(), expected, tolerance)
+    let qg = Tensor([tq, dim], qs, requires_grad: true)
+    let yg = jt.multi_head_attention(qg, k, v, heads, causal: causal)
+    assert_values_near(yg.download(), expected, 1e-4)
+    free_all(yg.discard_graph())
+    free_all([q, k, v, y, qg, yg])
+}
+
+fn test_attention_routes_match_the_host() -> void {
+    if not jt.is_available() { return }
+    for hd in [32, 64] {
+        for tq in [1, 2, 7] {
+            check_route(tq, 300, 3, hd, true, 1e-4)
+            check_route(tq, 300, 3, hd, false, 1e-4)
+        }
+        check_route(65, 130, 2, hd, true, 4e-3)
+        check_route(65, 130, 2, hd, false, 4e-3)
+        check_route(100, 100, 2, hd, true, 4e-3)
+    }
+    check_route(40, 40, 2, 16, true, 2e-3)
+    check_route(3, 50, 2, 16, true, 2e-3)
+    check_route(70, 70, 1, 32, true, 4e-3)
+}
+
+#: `[batch, t, dim]` folds the batch into the head axis: each sequence must
+#: come out exactly as if it had been attended on its own, both routes.
+fn test_batched_attention_matches_each_sequence_alone() -> void {
+    if not jt.is_available() { return }
+    let batch = 3
+    let seq = 20
+    let heads = 2
+    let hd = 32
+    let dim = heads * hd
+    let qs = wave(batch * seq * dim, 0.4)
+    let ks = wave(batch * seq * dim, 1.4)
+    let vs = wave(batch * seq * dim, 2.2)
+    for grad in [false, true] {
+        let q = Tensor([batch, seq, dim], qs, requires_grad: grad)
+        let k = Tensor([batch, seq, dim], ks)
+        let v = Tensor([batch, seq, dim], vs)
+        let y = jt.multi_head_attention(q, k, v, heads, causal: true)
+        assert_eq(y.shape, [batch, seq, dim])
+        let got = y.download()
+        for b in 0..batch {
+            let lo = b * seq * dim
+            let hi = lo + seq * dim
+            let expected = host_attention(qs[lo:hi], ks[lo:hi], vs[lo:hi], seq, seq, heads, hd, true)
+            assert_values_near(got[lo:hi], expected, if grad { 1e-4 } else { 4e-3 })
+        }
+        if grad {
+            let total = jt.sum(y)
+            free_all(total.backward())
+            total.free()
+            assert_true(q.grad is not null)
+        }
+        free_all([q, k, v, y])
+    }
 }

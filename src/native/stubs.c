@@ -290,7 +290,10 @@ bool jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset, JaiGpuBuffer *b,
 
 bool jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff, JaiGpuBuffer *k, size_t kOff,
                      JaiGpuBuffer *v, size_t vOff, JaiGpuBuffer *out, size_t outOff,
-                     uint32_t seq, uint32_t heads, uint32_t hd, float scale) {
+                     uint32_t seq, uint32_t kvSeq, uint32_t heads, uint32_t hd, float scale,
+                     bool causal) {
+    (void)kvSeq;
+    (void)causal;
     (void)q;
     (void)qOff;
     (void)k;
