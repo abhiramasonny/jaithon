@@ -2,7 +2,7 @@
 #: eigenvalue problems.
 from ..array import NDArray, element_count
 from .common import _emit, _extend, _require_square, _slice_matrix, _stacked
-from .eigen import _eig_host, _jacobi_eigh, _symmetrize
+from .eigen import _eig_host, _symmetric_eigh, _symmetrize
 from .qr import _accumulate_reflectors, _householder_qr, _upper_triangle
 from .svd import _svd_host
 
@@ -92,7 +92,7 @@ pub fn eigh(a: NDArray, uplo: str = "L") -> (NDArray, NDArray) {
     var bases: list[float] = []
     for index in 0..element_count(batch) {
         let matrix = _symmetrize(values, index * n * n, n, lower)
-        let (w, q) = _jacobi_eigh(matrix, n, true)
+        let (w, q) = _symmetric_eigh(matrix, n, true)
         _extend(spectra, w)
         _extend(bases, q)
     }
@@ -107,7 +107,7 @@ pub fn eigvalsh(a: NDArray, uplo: str = "L") -> NDArray {
     var out: list[float] = []
     for index in 0..element_count(batch) {
         let matrix = _symmetrize(values, index * n * n, n, lower)
-        let (w, _q) = _jacobi_eigh(matrix, n, false)
+        let (w, _q) = _symmetric_eigh(matrix, n, false)
         _extend(out, w)
     }
     return _emit(out, batch + [n])

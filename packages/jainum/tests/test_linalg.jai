@@ -17,6 +17,7 @@ from jainum.linalg import BLOCKED_FROM, BLOCKED_PANEL, blocked_panel
 from jainum.linalg import cholesky, cond, det, eig, eigh, eigvals, eigvalsh
 from jainum.linalg import inv, lstsq, lu_factor, lu_solve, matrix_rank, norm
 from jainum.linalg import pinv, qr, slogdet, solve, svd, svdvals, triangular_solve
+from jainum.linalg.eigen import _jacobi_eigh, _tridiagonal_eigh
 
 fn have_gpu() -> bool { return gpu.is_available() }
 
@@ -1280,4 +1281,64 @@ fn test_a_zero_row_and_a_zero_column_leave_every_loop_alone() -> void {
     let value = det(a)
     defer { value.free() }
     assert_near(value.item(), 0.0, 1e-6, "a matrix with an empty column has no determinant")
+}
+
+#: The tridiagonal QL `eigh` now takes, against Jacobi and against the
+#: spectrum a matrix was built from, in double precision on the host: a
+#: random symmetric 40x40, one with a triple and a double eigenvalue, the
+#: zero matrix, a 1x1, and matrices far outside float32's range, which are
+#: scaled first so nothing in the iteration overflows. A NaN refuses, so the
+#: caller falls back to Jacobi.
+fn test_the_tridiagonal_eigh_agrees_with_jacobi() -> void {
+    let n = 40
+    let noise = spread(n * n, 59)
+    var a = [0.0 for _slot in 0..n * n]
+    for row in 0..n {
+        for column in 0..=row {
+            a[row * n + column] = noise[row * n + column]
+            a[column * n + row] = noise[row * n + column]
+        }
+    }
+    let (answered, w, v) = _tridiagonal_eigh(a, n, true)
+    assert_true(answered, "a finite matrix gets an answer")
+    let (jacobi, _basis) = _jacobi_eigh(a, n, false)
+    assert_close(w, jacobi, 1e-12, "the same spectrum Jacobi finds")
+    let (_again, alone, _none) = _tridiagonal_eigh(a, n, false)
+    assert_close(alone, w, 0.0, "the values-only path is the same arithmetic")
+    assert_identity(product(transposed(v, n, n), n, n, v, n), n, 1e-12, "orthonormal vectors")
+    assert_close(
+        product(a, n, n, v, n),
+        product(v, n, n, diagonal_matrix(w), n),
+        1e-12,
+        "a v = v w"
+    )
+
+    let wanted = [-2.0, 1.0, 1.0, 1.0, 3.0, 3.0]
+    let built = conjugated(rotation(6, 61), diagonal_matrix(wanted), 6)
+    let (_ok, repeated, basis) = _tridiagonal_eigh(built, 6, true)
+    assert_close(repeated, wanted, 1e-12, "repeated eigenvalues")
+    assert_identity(product(transposed(basis, 6, 6), 6, 6, basis, 6), 6, 1e-12, "a basis for each")
+
+    let (_z, zeros, eye) = _tridiagonal_eigh([0.0 for _slot in 0..9], 3, true)
+    assert_close(zeros, [0.0, 0.0, 0.0], 0.0, "the zero matrix")
+    assert_identity(eye, 3, 0.0, "has the identity for its vectors")
+    let (_o, single, unit) = _tridiagonal_eigh([-4.5], 1, true)
+    assert_close(single, [-4.5], 0.0, "a 1x1")
+    assert_close(unit, [1.0], 0.0, "a 1x1's vector")
+
+    let huge = [value * 1.0e200 for value in built]
+    let (_h, large, _lv) = _tridiagonal_eigh(huge, 6, true)
+    for index in 0..6 {
+        assert_near(large[index] / 1.0e200, wanted[index], 1e-12, "scaled past float32")
+    }
+    let tiny = [value * 1.0e-200 for value in built]
+    let (_t, small, _sv) = _tridiagonal_eigh(tiny, 6, false)
+    for index in 0..6 {
+        assert_near(small[index] * 1.0e200, wanted[index], 1e-12, "scaled below float32")
+    }
+
+    var broken = [value for value in built]
+    broken[7] = math.NAN
+    let (refused, _bw, _bv) = _tridiagonal_eigh(broken, 6, true)
+    assert_true(not refused, "a NaN refuses rather than spinning")
 }
