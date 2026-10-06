@@ -437,7 +437,7 @@ fn noise(count: int, seed: int, spread: float, shift: float) -> list[float] {
 
 fn test_a_large_product_agrees_with_the_host_sum() -> void {
     if not have_gpu() { return }
-    let (rows, inner, cols) = (300, 200, 40)
+    let (rows, inner, cols) = (120, 100, 90)
     assert_true(on_device(rows * inner * cols), "this product is meant to reach the device")
     let left = noise(rows * inner, 11, 1.0, 0.0)
     let right = noise(inner * cols, 12, 1.0, 0.0)
@@ -458,7 +458,12 @@ fn test_a_large_product_agrees_with_the_host_sum() -> void {
     }
     assert_true(worst < 1e-3, f"device product is {worst} from the host sum")
 
-    #: Both orientations of `mul_transposed`.
+    #: Both orientations of `mul_transposed`. The sizes keep every product
+    #: above the device threshold and below the size the GEMM tunes at.
+    assert_true(
+        on_device(inner * rows * inner) and on_device(rows * inner * rows),
+        "meant for the device"
+    )
     let source = Mat.from_list(rows, inner, CV_32FC1, left)
     let gram = mul_transposed(source, true).to_list()
     let outer = mul_transposed(source, false).to_list()
