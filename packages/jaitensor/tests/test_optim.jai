@@ -235,17 +235,9 @@ fn test_fitting_epoch_by_epoch_keeps_the_optimiser_state() -> void {
                 let layers: list[Layer] = if shape == "fused" {
                     [jt.Dense(256, activation: jt.Activation.Relu), jt.Dense(4, activation: jt.Activation.Softmax)]
                 } elif shape == "autograd" {
-                    [
-                        jt.Dense(16, activation: jt.Activation.Relu),
-                        jt.LayerNorm(),
-                        jt.Dense(4, activation: jt.Activation.Softmax),
-                    ]
+                    [jt.Dense(16, activation: jt.Activation.Relu), jt.LayerNorm(), jt.Dense(4, activation: jt.Activation.Softmax)]
                 } else {
-                    [
-                        jt.Dense(16, activation: jt.Activation.Relu),
-                        jt.Dense(8, activation: jt.Activation.Relu),
-                        jt.Dense(4, activation: jt.Activation.Softmax),
-                    ]
+                    [jt.Dense(16, activation: jt.Activation.Relu), jt.Dense(8, activation: jt.Activation.Relu), jt.Dense(4, activation: jt.Activation.Softmax)]
                 }
                 let model = jt.Sequential(layers)
                 let optimizer: Optimizer = if name == "adam" {
@@ -257,11 +249,23 @@ fn test_fitting_epoch_by_epoch_keeps_the_optimiser_state() -> void {
                 var trace: list[float] = []
                 if epoch_at_a_time {
                     for _epoch in 0..3 {
-                        let history = model.fit(data, epochs: 1, batch_size: 16, verbose: false, plot_path: null)
+                        let history = model.fit(
+                            data,
+                            epochs: 1,
+                            batch_size: 16,
+                            verbose: false,
+                            plot_path: null
+                        )
                         trace.push(history.loss[0])
                     }
                 } else {
-                    let history = model.fit(data, epochs: 3, batch_size: 16, verbose: false, plot_path: null)
+                    let history = model.fit(
+                        data,
+                        epochs: 3,
+                        batch_size: 16,
+                        verbose: false,
+                        plot_path: null
+                    )
                     trace.extend(history.loss)
                 }
                 let want = if shape == "fused" { "fused-mlp" } else { shape }
@@ -271,8 +275,7 @@ fn test_fitting_epoch_by_epoch_keeps_the_optimiser_state() -> void {
                 data.free()
             }
             for index in 0..3 {
-                assert math.fabs(traces[1][index] - traces[0][index]) < 1e-5,
-                    f"{shape} {name} epoch {index}: {traces[1]} against {traces[0]}"
+                assert math.fabs(traces[1][index] - traces[0][index]) < 1e-5, f"{shape} {name} epoch {index}: {traces[1]} against {traces[0]}"
             }
         }
     }

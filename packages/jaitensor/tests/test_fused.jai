@@ -242,15 +242,43 @@ fn test_the_device_epoch_counts_what_the_steps_count() -> void {
                     if by_epoch {
                         if deep {
                             gpu.mlp3_sgd_epoch(
-                                x.buffer(), w1, b1, w2, b2, w3, b3, w4, b4, y.buffer(), loss,
-                                samples, batch, inputs, hidden, classes, rate,
-                                flush_every: 2, correct_acc: correct
+                                x.buffer(),
+                                w1,
+                                b1,
+                                w2,
+                                b2,
+                                w3,
+                                b3,
+                                w4,
+                                b4,
+                                y.buffer(),
+                                loss,
+                                samples,
+                                batch,
+                                inputs,
+                                hidden,
+                                classes,
+                                rate,
+                                flush_every: 2,
+                                correct_acc: correct
                             )
                         } else {
                             gpu.mlp_sgd_epoch(
-                                x.buffer(), w1, b1, w4, b4, y.buffer(), loss,
-                                samples, batch, inputs, hidden, classes, rate,
-                                flush_every: 2, correct_acc: correct
+                                x.buffer(),
+                                w1,
+                                b1,
+                                w4,
+                                b4,
+                                y.buffer(),
+                                loss,
+                                samples,
+                                batch,
+                                inputs,
+                                hidden,
+                                classes,
+                                rate,
+                                flush_every: 2,
+                                correct_acc: correct
                             )
                         }
                     } else {
@@ -259,13 +287,39 @@ fn test_the_device_epoch_counts_what_the_steps_count() -> void {
                             let ys = y.view(step * batch, [batch])
                             if deep {
                                 gpu.mlp3_sgd_step(
-                                    xs.buffer(), w1, b1, w2, b2, w3, b3, w4, b4, ys.buffer(), loss,
-                                    batch, inputs, hidden, classes, rate, correct_acc: correct
+                                    xs.buffer(),
+                                    w1,
+                                    b1,
+                                    w2,
+                                    b2,
+                                    w3,
+                                    b3,
+                                    w4,
+                                    b4,
+                                    ys.buffer(),
+                                    loss,
+                                    batch,
+                                    inputs,
+                                    hidden,
+                                    classes,
+                                    rate,
+                                    correct_acc: correct
                                 )
                             } else {
                                 gpu.mlp_sgd_step(
-                                    xs.buffer(), w1, b1, w4, b4, ys.buffer(), loss,
-                                    batch, inputs, hidden, classes, rate, correct_acc: correct
+                                    xs.buffer(),
+                                    w1,
+                                    b1,
+                                    w4,
+                                    b4,
+                                    ys.buffer(),
+                                    loss,
+                                    batch,
+                                    inputs,
+                                    hidden,
+                                    classes,
+                                    rate,
+                                    correct_acc: correct
                                 )
                             }
                             xs.free()
@@ -287,7 +341,12 @@ fn test_the_device_epoch_counts_what_the_steps_count() -> void {
             y.free()
             assert_eq(got.len(), want.len())
             for index in 0..got.len() {
-                assert_near(got[index], want[index], 1e-4, f"deep {deep} steps {steps} slot {index}")
+                assert_near(
+                    got[index],
+                    want[index],
+                    1e-4,
+                    f"deep {deep} steps {steps} slot {index}"
+                )
             }
             assert got[1] > 0.0
         }
