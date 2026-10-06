@@ -1184,6 +1184,12 @@ JitArmResult emitInvoke(Emit *e, ObjFunction *fn, ObjClosure *closure,
             if (rkind == SLOT_MAYBE_INST) {
                 emitMaybeInstResult(e, pushReg(e) - 1, rat, rshape,
                                     (uint32_t)(off + 7));
+                /* The method ran -- interpreted, through the descriptor --
+                 * so this body has an effect a re-run would repeat, exactly
+                 * as for every other result kind below. Leaving it unset
+                 * let `fac.make(x)` count twice once a guard after it
+                 * failed and a compiled caller re-ran this body. */
+                e->wroteHeap = true;
                 off += 7;
                 break;
             }
