@@ -6,6 +6,7 @@ from std.test import assert_eq, assert_near, assert_true
 from jaicv.core.mat import Mat
 from jaicv.core.types import CV_32FC1
 from jaicv.ml.models import d_trees_create, r_trees_create
+from jaicv.core.linalg import symmetric_eigen_of
 
 fn have_gpu() -> bool { return gpu.is_available() }
 
@@ -243,4 +244,96 @@ fn test_a_forest_still_votes_for_the_class_it_was_shown() -> void {
     forest.train(samples, Mat.from_list(90, 1, CV_32FC1, labels))
     let predicted = forest.predict(samples).to_list()
     for at in 0..90 { assert_eq(predicted[at], labels[at], f"sample {at}") }
+}
+
+# --- Jacobi with the pivot found by scanning every off-diagonal -------------
+
+fn ref_eigen(source: list[float], n: int) -> tuple[list[float], list[float]] {
+    var m: list[float] = []
+    var v: list[float] = []
+    for index in 0..n * n {
+        m.push(source[index])
+        v.push(if index % n == index // n { 1.0 } else { 0.0 })
+    }
+    for _turn in 0..max(100, 12 * n * (n - 1) // 2) {
+        if n < 2 { break }
+        var largest = 0.0
+        var p = 0
+        var q = 1
+        for row in 0..n {
+            for column in row + 1..n {
+                let size = math.fabs(m[row * n + column])
+                if size > largest {
+                    largest = size
+                    p = row
+                    q = column
+                }
+            }
+        }
+        if largest < 1e-14 { break }
+        let theta = 0.5 * math.atan2(2.0 * m[p * n + q], m[p * n + p] - m[q * n + q])
+        let c = math.cos(theta)
+        let s = math.sin(theta)
+        for k in 0..n {
+            let mkp = m[k * n + p]
+            let mkq = m[k * n + q]
+            m[k * n + p] = c * mkp + s * mkq
+            m[k * n + q] = -s * mkp + c * mkq
+        }
+        for k in 0..n {
+            let mpk = m[p * n + k]
+            let mqk = m[q * n + k]
+            m[p * n + k] = c * mpk + s * mqk
+            m[q * n + k] = -s * mpk + c * mqk
+        }
+        for k in 0..n {
+            let vkp = v[k * n + p]
+            let vkq = v[k * n + q]
+            v[k * n + p] = c * vkp + s * vkq
+            v[k * n + q] = -s * vkp + c * vkq
+        }
+    }
+    var order: list[int] = []
+    for index in 0..n {
+        var at = order.len()
+        while at > 0 and m[index * n + index] > m[order[at - 1] * n + order[at - 1]] { at -= 1 }
+        order.insert(at, index)
+    }
+    var values: list[float] = []
+    var vectors: list[float] = []
+    for index in order {
+        values.push(m[index * n + index])
+        for row in 0..n { vectors.push(v[row * n + index]) }
+    }
+    return (values, vectors)
+}
+
+#: A symmetric matrix; `coarse` ones are small integers, so equal entries --
+#: and so ties for the pivot -- are everywhere.
+fn symmetric(n: int, seed: int, coarse: bool) -> list[float] {
+    var state = seed
+    var out: list[float] = []
+    for _index in 0..n * n { out.push(0.0) }
+    for row in 0..n {
+        for column in row..n {
+            state = next_state(state)
+            let raw = (state >> 8) % 2001
+            let value = if coarse { float(raw % 5) - 2.0 } else { float(raw) / 1000.0 - 1.0 }
+            out[row * n + column] = value
+            out[column * n + row] = value
+        }
+    }
+    return out
+}
+
+fn test_eigen_rotates_through_the_same_pivots_as_a_full_scan() -> void {
+    for n in [1, 2, 3, 5, 8, 13, 24, 50] {
+        for coarse in [false, true] {
+            let source = symmetric(n, 0xE16E + n * 31 + (if coarse { 7 } else { 0 }), coarse)
+            let (want_values, want_vectors) = ref_eigen(source, n)
+            let (values, vectors) = symmetric_eigen_of(source, n)
+            assert_eq(values, want_values, f"{n} by {n} coarse={coarse}: values")
+            assert_eq(vectors, want_vectors, f"{n} by {n} coarse={coarse}: vectors")
+        }
+    }
 }

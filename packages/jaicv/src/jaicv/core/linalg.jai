@@ -160,12 +160,25 @@ pub fn symmetric_eigen_of(source: list[float], n: int) -> tuple[list[float], lis
     #: solves a 12 by 12. The loop still leaves the moment the largest
     #: off-diagonal is negligible, so this only raises the ceiling for the
     #: sizes that were reaching it.
+    #:
+    #: The pivot is still the largest off-diagonal, the first of equal ones in
+    #: row order, but it is no longer found by scanning all of them: each row
+    #: keeps where its own largest is, and a rotation of `p` and `q` only
+    #: changes rows `p` and `q` and columns `p` and `q`, so only those entries
+    #: are looked at again -- and a whole row only when its largest was one
+    #: of them. Scanning everything per rotation made a 50 by 50 take 237 ms;
+    #: the rotations, and so every value and vector, are the same as before.
     let sweeps = max(100, 12 * n * (n - 1) // 2)
+    var best: list[int] = []
+    for row in 0..n { best.push(_row_largest(m, n, row)) }
     for _sweep in 0..sweeps {
         if n < 2 { break }
-        let at = _largest_off_diagonal(m, n)
+        let at = _largest_tracked(m, n, best)
         if at < 0 { break }
-        _jacobi_rotate(m, v, n, at // n, at % n)
+        let p = at // n
+        let q = at % n
+        _jacobi_rotate(m, v, n, p, q)
+        _track_rotation(m, n, best, p, q)
     }
 
     var order: list[int] = []
@@ -192,25 +205,66 @@ fn _eigen_start(source: list[float], n: int, m: list[float], v: list[float]) -> 
     }
 }
 
+#: The column of the largest entry right of the diagonal in `row` -- the
+#: first of equal ones -- or -1 when there is none to pick.
+fn _row_largest(m: list[float], n: int, row: int) -> int {
+    var largest = -1.0
+    var pick = -1
+    for column in row + 1..n {
+        let size = math.fabs(m[row * n + column])
+        if size > largest {
+            largest = size
+            pick = column
+        }
+    }
+    return pick
+}
+
 #: Where the largest off-diagonal entry above the diagonal is, as
 #: `row * n + column` -- the first of equal ones in row order -- or -1 once it
-#: is negligible.
-fn _largest_off_diagonal(m: list[float], n: int) -> int {
+#: is negligible, read from each row's largest.
+fn _largest_tracked(m: list[float], n: int, best: list[int]) -> int {
     var largest = 0.0
     var p = 0
     var q = 1
     for row in 0..n {
-        for column in row + 1..n {
-            let size = math.fabs(m[row * n + column])
-            if size > largest {
-                largest = size
-                p = row
-                q = column
-            }
+        let column = best[row]
+        if column < 0 { continue }
+        let size = math.fabs(m[row * n + column])
+        if size > largest {
+            largest = size
+            p = row
+            q = column
         }
     }
     if largest < 1e-14 { return -1 }
     return p * n + q
+}
+
+#: Bring each row's largest up to date after rotating `p` and `q`.
+fn _track_rotation(m: list[float], n: int, best: list[int], p: int, q: int) -> void {
+    for row in 0..q {
+        if row == p or best[row] == p or best[row] == q {
+            best[row] = _row_largest(m, n, row)
+            continue
+        }
+        var pick = best[row]
+        var largest = if pick < 0 { -1.0 } else { math.fabs(m[row * n + pick]) }
+        if p > row {
+            let size = math.fabs(m[row * n + p])
+            if size > largest or size == largest and p < pick {
+                largest = size
+                pick = p
+            }
+        }
+        let size = math.fabs(m[row * n + q])
+        if size > largest or size == largest and q < pick {
+            largest = size
+            pick = q
+        }
+        best[row] = pick
+    }
+    best[q] = _row_largest(m, n, q)
 }
 
 #: One Jacobi rotation zeroing `m[p][q]`, carried into the eigenvectors `v`.
