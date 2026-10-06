@@ -2,14 +2,14 @@
 #: against the definitions they replaced or against what they promise.
 import std.gpu as gpu
 import std.math
-from std.test import assert_eq, assert_near, assert_true
+from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaicv.core.mat import Mat
 from jaicv.core.types import CV_32FC1
 from jaicv.ml.models import d_trees_create, r_trees_create, svm_create
 from jaicv.ml.models import LogisticRegression, LOGISTIC_DEVICE_VALUES
 from jaicv.core.linalg import matmul as linalg_matmul, on_device, symmetric_eigen_of
 from jaicv.core.misc import calc_covar_matrix, mul_transposed
-from jaicv.core.cluster import PCA, SOURCE as KMEANS_SOURCE
+from jaicv.core.cluster import kmeans, PCA, SOURCE as KMEANS_SOURCE
 from std.gpu import Buffer, Kernel
 
 fn have_gpu() -> bool { return gpu.is_available() }
@@ -679,4 +679,12 @@ fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> vo
         }
         for buffer in held { buffer.free() }
     }
+}
+
+fn test_kmeans_over_a_nan_refuses_rather_than_returning_garbage() -> void {
+    if not have_gpu() { return }
+    var values = noise(400, 41, 1.0, 0.0)
+    values[37] = math.NAN
+    let data = Mat.from_list(200, 2, CV_32FC1, values)
+    assert_throws(Error, || kmeans(data, 3, 2, 5))
 }

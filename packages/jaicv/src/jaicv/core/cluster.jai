@@ -594,6 +594,12 @@ pub fn kmeans(
         }
     }
 
+    if best_centres.len() == 0 {
+        #: Every attempt's cost was NaN, so none was ever the best: the
+        #: samples hold a NaN. There are no labels to give.
+        best_held.free()
+        throw ValueError("kmeans found no grouping with a finite cost")
+    }
     let labels_out = Mat(samples, 1, CV_MAKETYPE(CV_32S, 1), storage: best_held)
     return (best_cost, labels_out, Mat.from_list(k, width, CV_MAKETYPE(CV_32F, 1), best_centres))
 }
