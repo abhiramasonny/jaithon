@@ -701,3 +701,83 @@ fn test_batched_attention_matches_each_sequence_alone() -> void {
         free_all([q, k, v, y])
     }
 }
+
+#: A cached layer fed a prompt and then one row at a time gives, for every new
+#: row, what the uncached causal layer gives for that row of the whole prefix,
+#: and allocates nothing that outlives a step.
+fn check_cache_matches_whole_prefix(dim: int, heads: int, prompt: int, total: int) -> void {
+    let layer = jt.MultiHeadAttention(dim, heads: heads, causal: true)
+    defer { layer.free() }
+    layer.build(dim, Random.with_seed(7))
+    for parameter in layer.parameters() { parameter.requires_grad = false }
+    let xs = wave(total * dim, 0.6)
+    let whole = Tensor([total, dim], xs)
+    defer { whole.free() }
+    let reference = layer.forward(whole)
+    let expected = reference.download()
+    reference.free()
+    layer.start_cache(total)
+    var got: list[float] = []
+    var live = -1
+    var start = 0
+    while start < total {
+        let count = if start == 0 { prompt } else { 1 }
+        let rows = whole.view(start * dim, [count, dim])
+        let y = layer.forward(rows)
+        for value in y.download() { got.push(value) }
+        y.free()
+        rows.free()
+        start += count
+        gpu.synchronize()
+        if start > prompt + 1 {
+            if live < 0 { live = gpu.live_buffers() }
+            assert_eq(gpu.live_buffers(), live)
+        }
+    }
+    assert_eq(layer.cache_length(), total)
+    #: The whole-prefix forward takes the half-precision prefill kernel; the
+    #: decode kernel reads float32.
+    assert_values_near(got, expected, 4e-3)
+    layer.reset_cache()
+    assert_eq(layer.cache_length(), 0)
+    let again = whole.view(0, [prompt, dim])
+    let first = layer.forward(again)
+    assert_values_near(first.download(), expected[0:prompt * dim], 4e-3)
+    first.free()
+    again.free()
+    layer.free_cache()
+}
+
+fn test_attention_layer_cache_matches_the_whole_prefix() -> void {
+    if not jt.is_available() { return }
+    check_cache_matches_whole_prefix(128, 2, 5, 40)
+    check_cache_matches_whole_prefix(384, 6, 17, 150)
+    check_cache_matches_whole_prefix(8, 2, 3, 12)
+}
+
+#: A causal layer trains: the mask is part of the differentiable path too.
+fn test_causal_attention_layer_trains() -> void {
+    if not jt.is_available() { return }
+    let seq = 128
+    let dim = 128
+    let layer = jt.MultiHeadAttention(dim, heads: 2, causal: true)
+    defer { layer.free() }
+    layer.build(dim, Random.with_seed(2))
+    let x = Tensor([seq, dim], wave(seq * dim, 0.25))
+    let target = Tensor([seq, dim], wave(seq * dim, 1.25))
+    defer { x.free() }
+    defer { target.free() }
+    let optimizer = jt.SGD(learning_rate: 0.05)
+    var losses: list[float] = []
+    for _step in 0..4 {
+        jt.zero_grad(layer.parameters())
+        let y = layer.forward(x)
+        let loss = jt.mse(y, target)
+        losses.push(loss.download()[0])
+        free_all(loss.backward())
+        loss.free()
+        optimizer.step(layer.parameters())
+    }
+    for value in losses { assert_true(math.is_finite(value)) }
+    assert_true(losses[3] < losses[0])
+}
