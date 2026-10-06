@@ -11,6 +11,7 @@
 #: ```
 import std.math
 from std.gpu import Buffer, Kernel
+from std.os import env_or
 from ..core.linalg import device_centred_product, device_scatter, matmul, on_device
 from ..core.linalg import symmetric_eigen, transpose
 from ..core.mat import Mat
@@ -32,7 +33,9 @@ fn squared_distance(values: list[float], a: int, b: int, width: int) -> float {
     return total
 }
 
-let SOURCE = """#include <metal_stdlib>
+#: The kernels kmeans runs. Public so the tests can hold the replacement
+#: kernels to the ones they replaced, bit for bit.
+pub let SOURCE = """#include <metal_stdlib>
 using namespace metal;
 
 /* Which centre each sample belongs to, and how far away it is.
@@ -140,6 +143,116 @@ kernel void kmeans_gather(device const float* values [[buffer(0)]],
     for (uint j = 0u; j < 32u; j++) answer += lanes[j];
     sums[slot] = answer;
 }
+
+/* `kmeans_assign` with the centres staged in threadgroup memory and one
+ * running total per centre in registers, so each sample's values are read
+ * once rather than once per centre. The arithmetic per centre is the same,
+ * in the same order, so the labels and distances are the same bit for bit.
+ * For k up to 16 and k * width up to 4096. */
+kernel void kmeans_assign_staged(device const float* values [[buffer(0)]],
+                                 device const float* centres [[buffer(1)]],
+                                 device float* labels [[buffer(2)]],
+                                 device float* nearest [[buffer(3)]],
+                                 constant uint& samples [[buffer(4)]],
+                                 constant uint& width [[buffer(5)]],
+                                 constant uint& k [[buffer(6)]],
+                                 uint id [[thread_position_in_grid]],
+                                 uint lid [[thread_index_in_threadgroup]],
+                                 uint tg [[threads_per_threadgroup]]) {
+    threadgroup float staged[4096];
+    for (uint i = lid; i < k * width; i += tg) staged[i] = centres[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (id >= samples) return;
+    float totals[16];
+    for (uint c = 0u; c < 16u; ++c) totals[c] = 0.0f;
+    uint base = id * width;
+    for (uint index = 0u; index < width; ++index) {
+        float value = values[base + index];
+        for (uint c = 0u; c < k; ++c) {
+            float gap = value - staged[c * width + index];
+            totals[c] = fma(gap, gap, totals[c]);
+        }
+    }
+    float best = INFINITY;
+    uint pick = 0u;
+    for (uint c = 0u; c < k; ++c) {
+        if (totals[c] < best) {
+            best = totals[c];
+            pick = c;
+        }
+    }
+    labels[id] = float(pick);
+    nearest[id] = best;
+}
+
+/* `kmeans_gather` in one pass over the labels per column instead of one per
+ * centre and column.
+ *
+ * The old form gave every (centre, column) slot its own threadgroup, and each
+ * of those 409 groups -- for eight centres of fifty columns -- read all the
+ * labels to find its few members. Here a group takes a whole column (or the
+ * counts and the cost, in the last group), and each thread keeps one running
+ * total per centre in threadgroup memory as it walks its samples. Each thread
+ * walks the same samples in the same order the old one did, and the totals
+ * are combined across the group the same way, so every sum comes out the same
+ * bit for bit. For k up to 16. */
+kernel void kmeans_gather_columns(device const float* values [[buffer(0)]],
+                                  device const float* labels [[buffer(1)]],
+                                  device const float* nearest [[buffer(2)]],
+                                  device float* sums [[buffer(3)]],
+                                  constant uint& samples [[buffer(4)]],
+                                  constant uint& width [[buffer(5)]],
+                                  constant uint& k [[buffer(6)]],
+                                  uint column [[threadgroup_position_in_grid]],
+                                  uint lid [[thread_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    threadgroup float running[256 * 17];
+    threadgroup float lanes[17 * 32];
+    uint slots = k + 1u;
+    for (uint c = 0u; c < slots; ++c) running[lid * 17u + c] = 0.0f;
+    for (uint j = lid; j < 17u * 32u; j += GROUP) lanes[j] = 0.0f;
+    if (column < width) {
+        for (uint sample = lid; sample < samples; sample += GROUP) {
+            uint centre = uint(labels[sample]);
+            if (centre < k) running[lid * 17u + centre] += values[sample * width + column];
+        }
+    } else {
+        for (uint sample = lid; sample < samples; sample += GROUP) {
+            uint centre = uint(labels[sample]);
+            if (centre < k) running[lid * 17u + centre] += 1.0f;
+        }
+        for (uint sample = lid; sample < samples; sample += GROUP) {
+            running[lid * 17u + k] += nearest[sample];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint used = column < width ? k : slots;
+    for (uint c = 0u; c < used; ++c) {
+        float total = simd_sum(running[lid * 17u + c]);
+        if (lane == 0u) lanes[c * 32u + warp] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid != 0u) return;
+    for (uint c = 0u; c < used; ++c) {
+        float answer = 0.0f;
+        for (uint j = 0u; j < 32u; j++) answer += lanes[c * 32u + j];
+        if (column < width) {
+            sums[c * width + column] = answer;
+        } else {
+            sums[k * width + c] = answer;
+        }
+    }
+}
+
+/* Copy `count` values from one buffer to another. */
+kernel void kmeans_copy(device const float* source [[buffer(0)]],
+                        device float* target [[buffer(1)]],
+                        constant uint& count [[buffer(2)]],
+                        uint id [[thread_position_in_grid]]) {
+    if (id < count) target[id] = source[id];
+}
 """
 
 var _kernels: dict[str, Kernel] = {}
@@ -167,6 +280,15 @@ fn squared_to_centre(
     return total
 }
 
+#: `JAICV_KMEANS_STAGED=0` assigns samples with the kernel that reads each
+#: sample once per centre; `JAICV_KMEANS_COLUMNS=0` totals the groups with the
+#: one that reads every label once per centre and column; and
+#: `JAICV_KMEANS_IN_PLACE=0` copies the samples to the host and back rather
+#: than reading them where they lie. All three give the same answer either way.
+let _KMEANS_STAGED = env_or("JAICV_KMEANS_STAGED", "1") != "0"
+let _KMEANS_COLUMNS = env_or("JAICV_KMEANS_COLUMNS", "1") != "0"
+let _KMEANS_IN_PLACE = env_or("JAICV_KMEANS_IN_PLACE", "1") != "0"
+
 #: Split samples into `k` groups, each around its own centre.
 #:
 #: Returns how tightly the groups sit — the summed squared distance from each
@@ -191,24 +313,36 @@ pub fn kmeans(
     let samples = data.rows
     let width = data.cols * data.channels()
     if samples < k { throw ValueError(f"{samples} samples cannot make {k} groups") }
-    let values = data.values()
 
-    #: One set of device buffers for every attempt and every iteration: the
-    #: samples never change, and the rest are `k`-sized.
-    let held_values = Buffer(max(1, samples * width))
-    held_values.upload(values)
+    #: The samples are read where they already are when they lie in one run:
+    #: copying them to the host as a list and back again cost 18 ms of a
+    #: 212 ms run at 100,000 samples of fifty features, for nothing. The host
+    #: copy is made only if an empty group needs it.
+    let in_place = _KMEANS_IN_PLACE and data.is_continuous() and samples * width > 0
+    var host_values: list[float]? = null
+    let held_values = if in_place {
+        data.storage.view(data.offset, samples * width)
+    } else {
+        let copy = Buffer(max(1, samples * width))
+        let values = data.values()
+        copy.upload(values)
+        host_values = values
+        copy
+    }
     let held_centres = Buffer(max(1, k * width))
     let held_labels = Buffer(max(1, samples))
     let held_nearest = Buffer(max(1, samples))
     let gathered = Buffer(k * width + k + 1)
+    let best_held = Buffer(max(1, samples))
     defer { held_values.free() }
     defer { held_centres.free() }
     defer { held_labels.free() }
     defer { held_nearest.free() }
     defer { gathered.free() }
 
+    let staged = _KMEANS_STAGED and k <= 16 and k * width <= 4096
+    let by_column = _KMEANS_COLUMNS and k <= 16
     var state = if seed == 0 { 1 } else { seed }
-    var best_labels: list[int] = []
     var best_centres: list[float] = []
     var best_cost = 1e300
 
@@ -216,7 +350,7 @@ pub fn kmeans(
         var centres: list[float] = []
         state = next_random(state)
         let first = state % samples
-        for index in 0..width { centres.push(values[first * width + index]) }
+        for value in _sample_row(held_values, host_values, first, width) { centres.push(value) }
 
         #: How far each sample is from the nearest centre chosen so far, kept
         #: as centres are added rather than worked out again each time. Redoing
@@ -232,26 +366,23 @@ pub fn kmeans(
         )
         var distances = held_nearest.download()
         while centres.len() // width < k {
-            var total = 0.0
-            for sample in 0..samples { total += distances[sample] }
             var chosen = samples - 1
-            if flags & KMEANS_PP_CENTERS != 0 and total > 0.0 {
-                state = next_random(state)
-                let target = float(state % 1000000) / 1000000.0 * total
-                var running = 0.0
-                for sample in 0..samples {
-                    running += distances[sample]
-                    if running >= target {
-                        chosen = sample
-                        break
-                    }
+            if flags & KMEANS_PP_CENTERS != 0 {
+                let total = _total(distances)
+                if total > 0.0 {
+                    state = next_random(state)
+                    let target = float(state % 1000000) / 1000000.0 * total
+                    chosen = _first_reaching(distances, target, samples - 1)
+                } else {
+                    state = next_random(state)
+                    chosen = state % samples
                 }
             } else {
                 state = next_random(state)
                 chosen = state % samples
             }
             let added = centres.len() // width
-            for index in 0..width { centres.push(values[chosen * width + index]) }
+            for value in _sample_row(held_values, host_values, chosen, width) { centres.push(value) }
             if centres.len() // width < k {
                 held_centres.upload(centres)
                 kernel_for("kmeans_seed").dispatch_async(
@@ -264,32 +395,46 @@ pub fn kmeans(
         }
 
         var labels: list[int] = []
-        for _index in 0..samples { labels.push(0) }
-        var cost = 0.0
         var labels_are_current = false
         for _round in 0..iterations {
             var moved = 0.0
-            cost = 0.0
             #: Assignment and the totals it feeds both run on the device; only
             #: the centres, the totals and the counts come back, which is
             #: `k * width + k + 1` numbers however many samples there are.
             held_centres.upload(centres)
-            kernel_for("kmeans_assign").dispatch_async(
-                [held_values, held_centres, held_labels, held_nearest],
-                samples,
-                [samples, width, k]
-            )
-            kernel_for("kmeans_gather").dispatch_async(
-                [held_values, held_labels, held_nearest, gathered],
-                (k * width + k + 1) * 256,
-                [samples, width, k],
-                group_size: 256
-            )
+            if staged {
+                kernel_for("kmeans_assign_staged").dispatch_async(
+                    [held_values, held_centres, held_labels, held_nearest],
+                    samples,
+                    [samples, width, k],
+                    group_size: 256
+                )
+            } else {
+                kernel_for("kmeans_assign").dispatch_async(
+                    [held_values, held_centres, held_labels, held_nearest],
+                    samples,
+                    [samples, width, k]
+                )
+            }
+            if by_column {
+                kernel_for("kmeans_gather_columns").dispatch_async(
+                    [held_values, held_labels, held_nearest, gathered],
+                    (width + 1) * 256,
+                    [samples, width, k],
+                    group_size: 256
+                )
+            } else {
+                kernel_for("kmeans_gather").dispatch_async(
+                    [held_values, held_labels, held_nearest, gathered],
+                    (k * width + k + 1) * 256,
+                    [samples, width, k],
+                    group_size: 256
+                )
+            }
 
             var sums = gathered.download()
             var counts: list[int] = []
             for centre in 0..k { counts.push(int(sums[k * width + centre] + 0.5)) }
-            cost = sums[k * width + k]
             labels_are_current = false
             for centre in 0..k {
                 if counts[centre] == 0 {
@@ -299,10 +444,12 @@ pub fn kmeans(
                     #: it almost never happens, so the labels come back only
                     #: when it does.
                     if not labels_are_current {
-                        let read = held_labels.download()
-                        for sample in 0..samples { labels[sample] = int(read[sample] + 0.5) }
+                        labels = []
+                        for value in held_labels.download() { labels.push(int(value + 0.5)) }
                         labels_are_current = true
                     }
+                    let values = host_values ?? data.values()
+                    host_values = values
                     var furthest = 0
                     var worst = -1.0
                     for sample in 0..samples {
@@ -331,28 +478,53 @@ pub fn kmeans(
         #: to steer the iterations but not to report: at a cost of a couple of
         #: million the last digits are gone. Summed once more here, in full
         #: precision, so what comes back is what the host used to return.
-        let settled = held_nearest.download()
-        cost = 0.0
-        for sample in 0..samples { cost += settled[sample] }
+        let cost = _total(held_nearest.download())
 
         if cost < best_cost {
             best_cost = cost
-            if not labels_are_current {
-                let read = held_labels.download()
-                for sample in 0..samples { labels[sample] = int(read[sample] + 0.5) }
-            }
-            best_labels = [label for label in labels]
+            #: The labels stay on the device: they are already the floats a
+            #: label matrix holds, so the best attempt's are copied aside there
+            #: rather than read back, turned into integers and sent again.
+            kernel_for("kmeans_copy").dispatch_async([held_labels, best_held], samples, [samples])
             best_centres = [value for value in centres]
         }
     }
 
-    var label_values: list[float] = []
-    for label in best_labels { label_values.push(float(label)) }
+    let labels_out = Mat(samples, 1, CV_MAKETYPE(CV_32S, 1), storage: best_held)
     return (
         best_cost,
-        Mat.from_list(samples, 1, CV_MAKETYPE(CV_32S, 1), label_values),
+        labels_out,
         Mat.from_list(k, width, CV_MAKETYPE(CV_32F, 1), best_centres)
     )
+}
+
+#: One sample's values: from the host copy when there is one, otherwise read
+#: off the device.
+fn _sample_row(held: Buffer, host: list[float]?, sample: int, width: int) -> list[float] {
+    if host is not null {
+        var out: list[float] = []
+        for index in 0..width { out.push(host[sample * width + index]) }
+        return out
+    }
+    return held.download(sample * width, width)
+}
+
+#: The sum of `values`, in order and in double precision.
+fn _total(values: list[float]) -> float {
+    var total = 0.0
+    for value in values { total += value }
+    return total
+}
+
+#: The first index at which the running sum of `values` reaches `target`, or
+#: `otherwise` if it never does.
+fn _first_reaching(values: list[float], target: float, otherwise: int) -> int {
+    var running = 0.0
+    for index in 0..values.len() {
+        running += values[index]
+        if running >= target { return index }
+    }
+    return otherwise
 }
 
 fn next_random(state: int) -> int {

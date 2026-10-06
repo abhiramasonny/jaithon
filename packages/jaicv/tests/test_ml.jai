@@ -6,9 +6,11 @@ from std.test import assert_eq, assert_near, assert_true
 from jaicv.core.mat import Mat
 from jaicv.core.types import CV_32FC1
 from jaicv.ml.models import d_trees_create, r_trees_create, svm_create
+from jaicv.ml.models import LogisticRegression, LOGISTIC_DEVICE_VALUES
 from jaicv.core.linalg import matmul as linalg_matmul, on_device, symmetric_eigen_of
 from jaicv.core.misc import calc_covar_matrix, mul_transposed
-from jaicv.core.cluster import PCA
+from jaicv.core.cluster import PCA, SOURCE as KMEANS_SOURCE
+from std.gpu import Buffer, Kernel
 
 fn have_gpu() -> bool { return gpu.is_available() }
 
@@ -529,4 +531,85 @@ fn test_a_large_covariance_and_pca_agree_with_double_precision() -> void {
         }
     }
     assert_true(worst < 1e-3, f"device projection is {worst} from the host sum")
+}
+
+# --- logistic regression's device gradient takes the host's steps -----------
+
+fn test_logistic_regression_on_the_device_takes_the_host_steps() -> void {
+    if not have_gpu() { return }
+    let (count, width) = (3000, 21)
+    assert_true(count * (width + 1) >= LOGISTIC_DEVICE_VALUES, "this set is meant to reach the device")
+    let features = noise(count * width, 31, 2.0, 0.5)
+    var labels: list[float] = []
+    for r in 0..count {
+        var score = 0.3
+        for c in 0..width { score += features[r * width + c] * (if c % 3 == 0 { 1.0 } else { -0.4 }) }
+        labels.push(if score > 0.0 { 4.0 } else { -1.0 })
+    }
+    let samples = Mat.from_list(count, width, CV_32FC1, features)
+    let responses = Mat.from_list(count, 1, CV_32FC1, labels)
+    let model = LogisticRegression()
+    model.iterations = 60
+    model.train(samples, responses)
+    let got = model.get_learnt_thetas().to_list()
+
+    #: The same descent, with the gradient summed on the host in double.
+    let seen = samples.to_list()
+    var weights: list[float] = []
+    for _index in 0..width + 1 { weights.push(0.0) }
+    for _step in 0..60 {
+        var gradient: list[float] = []
+        for _index in 0..width + 1 { gradient.push(0.0) }
+        for r in 0..count {
+            var total = weights[width]
+            for c in 0..width { total += weights[c] * seen[r * width + c] }
+            let error = 1.0 / (1.0 + math.exp(-total)) - (if labels[r] == 4.0 { 1.0 } else { 0.0 })
+            gradient[width] += error
+            for c in 0..width { gradient[c] += error * seen[r * width + c] }
+        }
+        let scale = model.learning_rate / float(count)
+        for c in 0..width { weights[c] -= scale * (gradient[c] + model.regularisation * weights[c]) }
+        weights[width] -= scale * gradient[width]
+    }
+    assert_near(got[0], weights[width], 1e-4)
+    for c in 0..width { assert_near(got[c + 1], weights[c], 1e-4) }
+
+    let predicted = model.predict(samples).to_list()
+    var right = 0
+    for r in 0..count {
+        if predicted[r] == labels[r] { right += 1 }
+    }
+    assert_true(right > count * 9 // 10, f"only {right} of {count} training samples classified correctly")
+}
+
+# --- the kmeans kernels that replaced the per-centre ones agree bit for bit --
+
+fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> void {
+    if not have_gpu() { return }
+    for shape in [(5000, 7, 5), (20000, 50, 8), (3001, 3, 16), (777, 64, 1)] {
+        let (count, width, k) = shape
+        let values = Buffer.of(noise(count * width, count + width, 3.0, 1.0))
+        let centres = Buffer.of(noise(k * width, k * 7 + 1, 3.0, 1.0))
+        var held: list[Buffer] = []
+        for _index in 0..4 { held.push(Buffer(count)) }
+        let first_sums = Buffer(k * width + k + 1)
+        let second_sums = Buffer(k * width + k + 1)
+        Kernel.compile(KMEANS_SOURCE, "kmeans_assign").dispatch_async(
+            [values, centres, held[0], held[1]], count, [count, width, k]
+        )
+        Kernel.compile(KMEANS_SOURCE, "kmeans_assign_staged").dispatch_async(
+            [values, centres, held[2], held[3]], count, [count, width, k], group_size: 256
+        )
+        Kernel.compile(KMEANS_SOURCE, "kmeans_gather").dispatch_async(
+            [values, held[0], held[1], first_sums], (k * width + k + 1) * 256, [count, width, k], group_size: 256
+        )
+        Kernel.compile(KMEANS_SOURCE, "kmeans_gather_columns").dispatch_async(
+            [values, held[0], held[1], second_sums], (width + 1) * 256, [count, width, k], group_size: 256
+        )
+        assert_eq(held[2].download(), held[0].download(), f"{shape}: labels")
+        assert_eq(held[3].download(), held[1].download(), f"{shape}: distances")
+        assert_eq(second_sums.download(), first_sums.download(), f"{shape}: totals")
+        for buffer in [values, centres, first_sums, second_sums] { buffer.free() }
+        for buffer in held { buffer.free() }
+    }
 }
