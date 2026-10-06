@@ -28,10 +28,19 @@ MIN_REPEATS = 24
 MAX_REPEATS = 4096
 
 
+def uniform(rows: int, columns: int) -> torch.Tensor:
+    """Values in [-1, 1), as attn.jai fills its inputs.
+
+    Normal draws reach past 1, and a causal row 0 attends only to itself, so
+    its output is v[0] verbatim: the validity check below, which bounds every
+    output by 1.01, flagged correct results as invalid."""
+    return torch.rand(rows, columns, device="mps") * 2.0 - 1.0
+
+
 def repeats_for(seq: int, dim: int, heads: int, floor: int, causal: bool) -> int:
-    q = torch.randn(seq, dim, device="mps")
-    k = torch.randn(seq, dim, device="mps")
-    v = torch.randn(seq, dim, device="mps")
+    q = uniform(seq, dim)
+    k = uniform(seq, dim)
+    v = uniform(seq, dim)
     with torch.autocast(device_type="mps", dtype=torch.float16, cache_enabled=False):
         for _ in range(WARMUP):
             packed_mha(q, k, v, heads, causal)
@@ -48,9 +57,9 @@ def repeats_for(seq: int, dim: int, heads: int, floor: int, causal: bool) -> int
 
 
 def time_attn(seq: int, dim: int, heads: int, repeats: int, causal: bool):
-    q = torch.randn(seq, dim, device="mps")
-    k = torch.randn(seq, dim, device="mps")
-    v = torch.randn(seq, dim, device="mps")
+    q = uniform(seq, dim)
+    k = uniform(seq, dim)
+    v = uniform(seq, dim)
     torch.mps.synchronize()
     # See the note in gemm.jai: the GPU needs to have been busy for a while
     # before it runs at its working speed, and both sides warm up by the same
