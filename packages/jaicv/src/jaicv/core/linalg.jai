@@ -322,13 +322,17 @@ fn _eigen_start(source: list[float], n: int, m: list[float], v: list[float]) -> 
     }
 }
 
+#: `math.fabs` without the call into `math`, for the pivot search's loops.
+#: The same for every number but -0.0, which compares equal either way.
+fn _magnitude(x: float) -> float { return if x < 0.0 { -x } else { x } }
+
 #: The column of the largest entry right of the diagonal in `row` -- the
 #: first of equal ones -- or -1 when there is none to pick.
 fn _row_largest(m: list[float], n: int, row: int) -> int {
     var largest = -1.0
     var pick = -1
     for column in row + 1..n {
-        let size = math.fabs(m[row * n + column])
+        let size = _magnitude(m[row * n + column])
         if size > largest {
             largest = size
             pick = column
@@ -347,7 +351,7 @@ fn _largest_tracked(m: list[float], n: int, best: list[int]) -> int {
     for row in 0..n {
         let column = best[row]
         if column < 0 { continue }
-        let size = math.fabs(m[row * n + column])
+        let size = _magnitude(m[row * n + column])
         if size > largest {
             largest = size
             p = row
@@ -366,15 +370,15 @@ fn _track_rotation(m: list[float], n: int, best: list[int], p: int, q: int) -> v
             continue
         }
         var pick = best[row]
-        var largest = if pick < 0 { -1.0 } else { math.fabs(m[row * n + pick]) }
+        var largest = if pick < 0 { -1.0 } else { _magnitude(m[row * n + pick]) }
         if p > row {
-            let size = math.fabs(m[row * n + p])
+            let size = _magnitude(m[row * n + p])
             if size > largest or size == largest and p < pick {
                 largest = size
                 pick = p
             }
         }
-        let size = math.fabs(m[row * n + q])
+        let size = _magnitude(m[row * n + q])
         if size > largest or size == largest and q < pick {
             largest = size
             pick = q
