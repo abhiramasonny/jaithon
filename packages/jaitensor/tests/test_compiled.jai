@@ -8,9 +8,9 @@ import std.gpu as gpu
 import std.math
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
-from jaitensor import Tensor
+from jaitensor import Dataset, Optimizer, Tensor
 from jaitensor.compiled import compile_step, compiled_step_allowed, refusal
-from jaitensor.compiled import set_compiled_step
+from jaitensor.compiled import set_compiled_step, set_flat_policy
 from jaitensor.layers import Activation, AvgPool2d, Conv2d, Dense, Embedding, Flatten, Layer
 from jaitensor.layers import LayerNorm, MaxPool2d
 from jaitensor.losses import SparseCategoricalCrossentropy
@@ -706,4 +706,94 @@ fn test_a_narrowed_step_trains_where_the_wide_one_does() -> void {
         math.fabs(wide_last) * 0.05 + 1e-3,
         "ten narrowed steps should land within a few percent of ten wide ones"
     )
+}
+
+#: A flat set a dense model can actually fit: each row carries its class.
+fn learnable_rows(samples: int, width: int, classes: int, seed: int) -> Dataset {
+    let rng = Random.with_seed(seed)
+    var features: list[float] = []
+    var labels: list[float] = []
+    for sample in 0..samples {
+        let kind = sample % classes
+        for slot in 0..width {
+            let signal = if slot % classes == kind { 1.0 } else { 0.0 }
+            features.push(signal + (rng.next_float() - 0.5) * 0.2)
+        }
+        labels.push(float(kind))
+    }
+    return Dataset(Tensor([samples, width], features), Tensor([samples], labels))
+}
+
+fn optimizer_named(name: str) -> Optimizer {
+    if name == "adam" { return jt.Adam(learning_rate: 0.01) }
+    if name == "momentum" { return SGD(learning_rate: 0.05, momentum: 0.9) }
+    return SGD(learning_rate: 0.1)
+}
+
+#: A dense model on flat rows trains through the compiled step, and lands
+#: where the static path does, epoch after epoch.
+#:
+#: The step used to be tried only for images, so this model -- two hidden
+#: layers, nothing the hand-fused kernels take -- always fell to the static
+#: path. Several epochs, and every optimiser, because the compiled step carries
+#: momentum and Adam's moments itself: state that is not carried looks right
+#: for one step and wrong for every one after.
+fn test_a_flat_dataset_trains_through_the_compiled_step_and_agrees() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    let policy = set_flat_policy(2)
+    defer { set_flat_policy(policy) }
+    for name in ["sgd", "momentum", "adam"] {
+        var seen: list[list[float]] = []
+        for compiled in [true, false] {
+            set_compiled_step(compiled)
+            let data = learnable_rows(128, 20, 4, 9)
+            let model = jt.Sequential(
+                [
+                    Dense(32, activation: Activation.Relu),
+                    Dense(16, activation: Activation.Relu),
+                    Dense(4, activation: Activation.Softmax),
+                ]
+            )
+            model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+            let history = model.fit(data, epochs: 6, batch_size: 32, verbose: false, plot_path: null)
+            let want = if compiled { "compiled" } else { "static" }
+            assert_eq(model.training_route(), want, f"{name} took the wrong path")
+            for value in history.loss { assert_true(math.is_finite(value), f"{name} loss {value}") }
+            seen.push(history.loss)
+            model.free()
+            data.free()
+        }
+        for (index, value) in seen[0].enumerate() {
+            assert_near(value, seen[1][index], 1e-4, f"{name} epoch {index}")
+        }
+        assert_true(seen[0][5] < seen[0][0] * 0.5, f"{name} is not learning: {seen[0]}")
+    }
+}
+
+#: A flat dataset takes the compiled step only when the batch that does not
+#: fill is a sliver of the epoch. The step is built for one batch size and
+#: leaves that batch untrained, which the static path does not -- so a hundred
+#: rows at a batch of thirty-two, where four would never be seen, stay static.
+fn test_a_flat_dataset_with_a_large_tail_stays_static() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    for (samples, want) in [(100, "static"), (128, "compiled"), (2050, "compiled")] {
+        let data = learnable_rows(samples, 20, 4, 5)
+        let model = jt.Sequential(
+            [
+                Dense(16, activation: Activation.Relu),
+                Dense(16, activation: Activation.Relu),
+                Dense(4, activation: Activation.Softmax),
+            ]
+        )
+        model.compile(optimizer: SGD(learning_rate: 0.1), loss: SparseCategoricalCrossentropy())
+        model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
+        assert_eq(model.training_route(), want, f"{samples} rows")
+        model.free()
+        data.free()
+    }
 }

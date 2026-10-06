@@ -1,6 +1,7 @@
 #: The paths that skip autograd: the fused epoch kernels and the compiled static step.
 import jaitensor as jt
 from jaitensor import Dataset
+from jaitensor.compiled import set_flat_policy
 from jaitensor.ops import dense_static_forward
 from std.test import assert_eq, assert_near
 import std.gpu as gpu
@@ -106,6 +107,9 @@ fn test_execution_plan_built_on_compile() -> void {
 
 fn test_static_step_reduces_loss() -> void {
     if not jt.is_available() { return }
+    #: Flat rows would take the compiled step now; this is about the static one.
+    let policy = set_flat_policy(0)
+    defer { set_flat_policy(policy) }
     let data = separable_data(8)
     defer { data.free() }
     let model = jt.Sequential(
@@ -127,6 +131,9 @@ fn test_static_step_reduces_loss() -> void {
 
 fn test_static_step_matches_autograd_weights() -> void {
     if not jt.is_available() { return }
+    #: Flat rows would take the compiled step now; this is about the static one.
+    let policy = set_flat_policy(0)
+    defer { set_flat_policy(policy) }
     let data = separable_data(8)
     defer { data.free() }
     let static_model = jt.Sequential(

@@ -593,6 +593,84 @@ pub fn set_compiled_step(on: bool) -> void { _allowed = if on { 1 } else { 0 } }
 #: turns it off can put it back the way it found it.
 pub fn compiled_step_allowed() -> bool { return allowed() }
 
+var _flat = -1
+
+fn flat_policy() -> int {
+    if _flat < 0 {
+        let text = env("JAITENSOR_COMPILED_FLAT") ?? "1"
+        _flat = if text == "0" { 0 } elif text == "2" { 2 } else { 1 }
+    }
+    return _flat
+}
+
+#: Whether a model fitted on a flat (rank-2) dataset trains through a compiled
+#: step.
+#:
+#: Only images ever did, so a dense model on flat rows missed it whenever it
+#: missed the hand-fused shapes -- two hidden layers, a width under 256, an
+#: optimiser carrying state -- and fell to the static path: thirty-odd kernels
+#: a step where this is one graph. An image model is the same graph behind a
+#: Flatten that is only a reshape. Measured 2026-10-05 on fashion, three
+#: epochs, under the GPU lock (n=5, alternated): [784-512-512-10] SGD b512
+#: 267 ms static to 171 compiled, [784-128-64-10] Adam b64 1340 to 1073,
+#: [784-32-10] SGD b32 518 to 330, and no shape tried was slower compiled
+#: ([784-128-10] Adam b512 was the closest, 112.6 against 113.0). So there is
+#: no size floor.
+#:
+#: What is gated is the batch that does not fill: a compiled step is built for
+#: one batch size and leaves a short last batch untrained, which the static
+#: path does not. Flat data compiles only when that tail is at most a
+#: sixty-fourth of the epoch -- 96 of fashion's 60000 rows at b512 -- so a
+#: small table with a large batch keeps every row it has.
+#:
+#: `JAITENSOR_COMPILED_FLAT`: 0 never compiles for a flat dataset (the old
+#: rule), 2 compiles whatever the tail, and anything else is the default
+#: above. Read once; `set_flat_policy` overrides it in-process.
+pub fn flat_step_wanted(samples: int, batch_size: int) -> bool {
+    let policy = flat_policy()
+    if policy == 0 { return false }
+    if policy == 2 { return true }
+    if batch_size <= 0 or samples < batch_size { return false }
+    return (samples % batch_size) * 64 <= samples
+}
+
+var _fused_mlp = -1
+
+#: Whether a model the fused forward-backward kernels take, trained with
+#: momentum or Adam, keeps that path rather than a compiled step.
+#:
+#: That path fuses the forward and backward passes and then runs the update
+#: as one kernel per parameter; the compiled step fuses the update into the
+#: graph and carries the optimiser's state through it. The graph loses:
+#: [784-256-10] on fashion at b512, three epochs, measured 2026-10-05 under
+#: the GPU lock (n=5, alternated), Adam 88.0 ms fused against 119.7 compiled
+#: and momentum 85.9 against 92.1 -- Adam's update is a dozen graph operations
+#: a parameter, and encoding them costs more than the kernels they replace.
+#: So the fused kernels are kept; `JAITENSOR_FUSED_MLP_STEP=0` compiles them
+#: instead. Read once; `set_prefer_fused_mlp_step` overrides it in-process.
+pub fn prefer_fused_mlp_step() -> bool {
+    if _fused_mlp < 0 {
+        _fused_mlp = if (env("JAITENSOR_FUSED_MLP_STEP") ?? "1") == "0" { 0 } else { 1 }
+    }
+    return _fused_mlp == 1
+}
+
+#: Override `JAITENSOR_FUSED_MLP_STEP` from inside the process. Returns the
+#: preference it replaced.
+pub fn set_prefer_fused_mlp_step(prefer: bool) -> bool {
+    let was = prefer_fused_mlp_step()
+    _fused_mlp = if prefer { 1 } else { 0 }
+    return was
+}
+
+#: Override `JAITENSOR_COMPILED_FLAT` from inside the process (0, 1 or 2), so
+#: a test can compare the paths in one run. Returns the policy it replaced.
+pub fn set_flat_policy(policy: int) -> int {
+    let was = flat_policy()
+    _flat = policy
+    return was
+}
+
 #: Build a compiled step for `layers`, or null when they cannot be expressed.
 #:
 #: `input_shape` is one batch's worth including the batch dimension. SGD with
