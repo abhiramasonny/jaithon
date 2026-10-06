@@ -495,7 +495,12 @@ fn _encode_padded(
         a_padded_rows,
         a_padded_columns
     )
-    let shared = a.storage.handle_of() == b.storage.handle_of() and a_at == b_at and a_rows == b_rows and a_columns == b_columns and a_padded_rows == b_padded_rows and a_padded_columns == b_padded_columns
+    let shared = a.storage.handle_of() == b.storage.handle_of() and
+        a_at == b_at and
+        a_rows == b_rows and
+        a_columns == b_columns and
+        a_padded_rows == b_padded_rows and
+        a_padded_columns == b_padded_columns
     let (right, owns_right) = if shared {
         (left, false)
     } else {

@@ -166,7 +166,11 @@ fn test_a_shape_is_tuned_only_once_it_has_earned_it() -> void {
     let previous = env("JAITENSOR_GEMM_CACHE")
     set_env("JAITENSOR_GEMM_CACHE", path.to_str())
     defer {
-        if previous is not null { set_env("JAITENSOR_GEMM_CACHE", previous) } else { unset_env("JAITENSOR_GEMM_CACHE") }
+        if previous is not null {
+            set_env("JAITENSOR_GEMM_CACHE", previous)
+        } else {
+            unset_env("JAITENSOR_GEMM_CACHE")
+        }
         if path.exists() { path.remove() }
     }
     let rows = 1000
@@ -240,7 +244,11 @@ fn assert_plan_matches_host(
     trans_b: bool,
     same_operand: bool = false
 ) -> void {
-    let a = if trans_a { device_tensor([inner, rows], 11) } else { device_tensor([rows, inner], 11) }
+    let a = if trans_a {
+        device_tensor([inner, rows], 11)
+    } else {
+        device_tensor([rows, inner], 11)
+    }
     let b = if same_operand {
         a
     } elif trans_b {

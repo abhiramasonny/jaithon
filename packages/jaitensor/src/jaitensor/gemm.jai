@@ -801,11 +801,13 @@ pub fn default_plan(
 ) -> Plan {
     if _STATIC_DIRECT {
         let work = rows * inner * columns
-        let large = work >= MPS_STATIC_WORK or (work >= TUNE_MIN_WORK and deep_product(rows, inner, columns))
+        let large = work >= MPS_STATIC_WORK or
+            work >= TUNE_MIN_WORK and deep_product(rows, inner, columns)
         if large and mps_possible(rows, inner, columns, trans_a, trans_b) { return MPS_PLAN }
         var direct = -1
         let wide = CONFIGS[DIRECT_WIDE]
-        if config_allowed(wide, rows, inner, columns) and tile_count(wide, rows, columns) >= TARGET_GROUPS {
+        if config_allowed(wide, rows, inner, columns) and
+            tile_count(wide, rows, columns) >= TARGET_GROUPS {
             direct = DIRECT_WIDE
         } elif config_allowed(CONFIGS[DIRECT_NARROW], rows, inner, columns) {
             direct = DIRECT_NARROW
@@ -827,7 +829,14 @@ pub fn default_plan(
 }
 
 #: Whether `plan` can run this exact shape.
-fn plan_legal(plan: Plan, rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> bool {
+fn plan_legal(
+    plan: Plan,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool,
+    trans_b: bool
+) -> bool {
     if plan.config < 0 { return mps_possible(rows, inner, columns, trans_a, trans_b) }
     let config = CONFIGS[plan.config]
     if not config_allowed(config, rows, inner, columns) { return false }
@@ -1111,7 +1120,11 @@ fn encode_mps(
     let b_padded_rows = if trans_b { padded_columns } else { padded_inner }
     let b_padded_columns = if trans_b { padded_inner } else { padded_columns }
     let (left, owns_left) = padded_operand(a, a_rows, a_columns, a_padded_rows, a_padded_columns)
-    let shared = a.handle_of() == b.handle_of() and a_rows == b_rows and a_columns == b_columns and a_padded_rows == b_padded_rows and a_padded_columns == b_padded_columns
+    let shared = a.handle_of() == b.handle_of() and
+        a_rows == b_rows and
+        a_columns == b_columns and
+        a_padded_rows == b_padded_rows and
+        a_padded_columns == b_padded_columns
     let (right, owns_right) = if shared {
         (left, false)
     } else {
@@ -1369,7 +1382,9 @@ fn autotune(
     let fallback = default_plan(rows, inner, columns, trans_a, trans_b)
     let plans = candidates(rows, inner, columns, trans_a, trans_b)
     if plans.len() <= 1 {
-        if verbose { print(f"tune {rows}x{inner}x{columns} ta={trans_a} tb={trans_b} has one candidate") }
+        if verbose {
+            print(f"tune {rows}x{inner}x{columns} ta={trans_a} tb={trans_b} has one candidate")
+        }
         return if plans.len() == 1 { plans[0] } else { fallback }
     }
     let each = warm_clock(fallback, a, b, output, bias, rows, inner, columns, trans_a, trans_b)
@@ -1385,7 +1400,9 @@ fn autotune(
         if round >= TUNE_ROUNDS {
             var round_cost = 0.0
             for index in 0..plans.len() {
-                if alive[index] { round_cost += best_seen[index] * float(repeats) + TUNE_SYNC_SECONDS }
+                if alive[index] {
+                    round_cost += best_seen[index] * float(repeats) + TUNE_SYNC_SECONDS
+                }
             }
             if opening.elapsed().to_seconds() + round_cost > TUNE_BUDGET_SECONDS { break }
         }
@@ -1403,19 +1420,8 @@ fn autotune(
                 if round == 0 {
                     encode(plan, a, b, output, bias, rows, inner, columns, trans_a, trans_b, 0)
                 }
-                seconds = run_repeats(
-                    plan,
-                    a,
-                    b,
-                    output,
-                    bias,
-                    rows,
-                    inner,
-                    columns,
-                    trans_a,
-                    trans_b,
-                    repeats
-                ) / float(repeats)
+                seconds = run_repeats(plan, a, b, output, bias, rows, inner, columns, trans_a, trans_b, repeats) /
+                    float(repeats)
             } catch _error: Error {
                 alive[index] = false
                 continue
@@ -1430,7 +1436,9 @@ fn autotune(
         }
         var fastest = -1.0
         for index in 0..plans.len() {
-            if alive[index] and best_seen[index] >= 0.0 and (fastest < 0.0 or best_seen[index] < fastest) {
+            if alive[index] and
+                best_seen[index] >= 0.0 and
+                (fastest < 0.0 or best_seen[index] < fastest) {
                 fastest = best_seen[index]
             }
         }
@@ -1545,7 +1553,12 @@ class Route {
         trans_b: bool,
         amp: bool
     ) -> bool {
-        return self.rows == rows and self.inner == inner and self.columns == columns and self.trans_a == trans_a and self.trans_b == trans_b and self.amp == amp
+        return self.rows == rows and
+            self.inner == inner and
+            self.columns == columns and
+            self.trans_a == trans_a and
+            self.trans_b == trans_b and
+            self.amp == amp
     }
 }
 
@@ -1557,14 +1570,8 @@ var _buckets: dict[str, Bucket] = {}
 fn resolve(route: Route) -> Plan {
     route.version = route.bucket.version
     let tuned = route.bucket.plan
-    if tuned is not null and plan_legal(
-        tuned,
-        route.rows,
-        route.inner,
-        route.columns,
-        route.trans_a,
-        route.trans_b
-    ) {
+    if tuned is not null and
+        plan_legal(tuned, route.rows, route.inner, route.columns, route.trans_a, route.trans_b) {
         return tuned
     }
     return default_plan(route.rows, route.inner, route.columns, route.trans_a, route.trans_b)
@@ -1580,14 +1587,9 @@ fn route_for(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) 
     let amp = gpu.mixed_precision()
     let key_bits = memo_key(rows, inner, columns, trans_a, trans_b) * 2 + (if amp { 1 } else { 0 })
     let remembered = _memo
-    if remembered is not null and _memo_key == key_bits and remembered.matches(
-        rows,
-        inner,
-        columns,
-        trans_a,
-        trans_b,
-        amp
-    ) {
+    if remembered is not null and
+        _memo_key == key_bits and
+        remembered.matches(rows, inner, columns, trans_a, trans_b, amp) {
         return remembered
     }
     let found = _routes.get(key_bits, null)
