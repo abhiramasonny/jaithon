@@ -81,8 +81,9 @@ static bool encodeFlashAttn(id<MTLBuffer> qBuf, size_t qOff,
     [gAsyncEncoder setBytes:&kseq length:sizeof(kseq) atIndex:7];
     [gAsyncEncoder setBytes:&causalFlag length:sizeof(causalFlag) atIndex:8];
     const uint32_t qTiles = (seq + 63u) / 64u;
-    [gAsyncEncoder dispatchThreadgroups:MTLSizeMake(qTiles, heads, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+    /* Causal grids are heads by tiles, longest tile first; see the kernel. */
+    const MTLSize grid = causal ? MTLSizeMake(heads, qTiles, 1) : MTLSizeMake(qTiles, heads, 1);
+    [gAsyncEncoder dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
     return true;
 }
 

@@ -321,7 +321,15 @@ kernel void mha_context_mma(device const float* p [[buffer(0)]],
     uint tiles = seq / 64u;
     uint tile_m = wid % tiles;
     uint head = wid / tiles;
-    /* Causal: the probabilities right of this patch's diagonal tile are zero. */
+    /* Causal: the probabilities right of this patch's diagonal tile are zero,
+     * so the last patch walks the whole row and the first one tile of it.
+     * The grid is handed out longest first -- every head's last patch, then
+     * every head's second-last -- so the long ones are not left to run alone
+     * at the end of the dispatch. */
+    if (causal != 0u) {
+        tile_m = tiles - 1u - wid / heads;
+        head = wid % heads;
+    }
     uint k_end = causal != 0u ? (tile_m + 1u) * 64u : seq;
     uint m0 = tile_m * 64u + sg * 32u;
     device const float* A = p + (ulong)head * seq * seq + (ulong)m0 * seq;
@@ -375,7 +383,13 @@ kernel void mha_transposed_mma(device const float* p [[buffer(0)]],
     uint tile_m = wid % tiles;
     uint head = wid / tiles;
     /* Causal: key m is seen only by queries at or after it, so the column of
-     * probabilities this patch reads is zero above its diagonal tile. */
+     * probabilities this patch reads is zero above its diagonal tile. The
+     * first patch is the longest here; hand them out in that order, as the
+     * context kernel does. */
+    if (causal != 0u) {
+        tile_m = wid / heads;
+        head = wid % heads;
+    }
     uint k_begin = causal != 0u ? tile_m * 64u : 0u;
     uint m0 = tile_m * 64u + sg * 32u;
     device const float* A = p + (ulong)head * seq * seq + m0;
