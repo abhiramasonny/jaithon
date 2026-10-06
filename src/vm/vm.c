@@ -464,9 +464,9 @@ static bool formatViaUserStr(ObjModule *module, ObjString *name, int count,
  * long before it ran out of interpreter frames. Kept out of line, they cost
  * stack only while they run. */
 
-/* OP_UNPACK's body, after the shape checks: writes the `count` targets over
- * `dest`, the source's own slot and the ones above it, rightmost first, so
- * the leftmost target ends up on top. `source` stays rooted in dest[0] until
+/* OP_UNPACK's body when a target takes the rest, after the shape checks:
+ * writes the `count` targets over `dest`, the source's own slot and the ones
+ * above it, rightmost first, so the leftmost target ends up on top. `source` stays rooted in dest[0] until
  * the final copy, which is after the one allocation. */
 static JAI_NOINLINE void unpackOnto(Value *dest, Value source, int count,
                                     int restIndex, int fixed, int available) {
@@ -2671,6 +2671,17 @@ static JaiRunResult runLoop(int baseFrameCount) {
 
         if (count > JAI_MAX_ARGS) {
             THROW(vm.cRuntimeError, "too many destructuring targets");
+        }
+        if (!hasRest) {
+            /* The common `let (a, b) = ...`: nothing allocates, so the items
+             * go straight over the source's slot and the ones above it,
+             * rightmost first, without unpackOnto's call and buffer. */
+            const Value *items = IS_LIST(source) ? jaiListBox(AS_LIST(source))
+                                                 : AS_TUPLE(source)->items;
+            Value *dest = stackTop - 1;
+            for (int i = 0; i < count; i++) dest[i] = items[count - 1 - i];
+            stackTop += count - 1;
+            VM_NEXT();
         }
         unpackOnto(stackTop - 1, source, count, restIndex, fixed, available);
         LOAD_STATE();
