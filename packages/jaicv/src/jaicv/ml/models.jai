@@ -294,24 +294,39 @@ pub fn normal_bayes_classifier_create() -> NormalBayesClassifier {
 
 #: A support vector machine.
 #:
-#: Trained by sequential minimal optimisation: repeatedly pick the pair of
-#: multipliers that most violates the conditions the solution has to satisfy,
-#: and solve for those two exactly. Every step is a closed form, so there is no
-#: inner solver and nothing to converge except the choice of pairs.
+#: Trained the way libsvm -- and so OpenCV, whose solver is libsvm's -- trains
+#: one: sequential minimal optimisation of the dual, two multipliers at a
+#: time, each pair solved in closed form. The pair is chosen by second-order
+#: working-set selection: the multiplier that most violates the optimality
+#: conditions, and the partner whose step would lower the objective most. The
+#: gradient of the objective is kept up to date as the multipliers move, so
+#: choosing a pair costs one pass over the samples rather than a decision
+#: function per sample, and the kernel's rows are computed once when they are
+#: first needed and kept while memory allows.
+#:
+#: The machine it replaced paired each sample with the next one along and
+#: recomputed every decision from scratch: 500 samples took 21 seconds and
+#: 2000 did not finish, and it stopped wherever its pass count ran out rather
+#: than at an optimum.
 pub class SVM {
     pub var kernel_type: int
     pub var c: float
     pub var gamma: float
     pub var degree: float
     pub var coef0: float
+    #: The solver stops after `iterations` steps per sample if it has not met
+    #: `tolerance` first.
     pub var iterations: int
+    #: How far from optimal the solution may be: libsvm's `eps`.
     pub var tolerance: float
     var samples: list[list[float]]
     var targets: list[float]
     var alphas: list[float]
+    var support: list[int]
     var bias: float
     var positive: float
     var negative: float
+    var trained: bool
 
     pub fn init(self) {
         self.kernel_type = SVM_RBF
@@ -324,9 +339,11 @@ pub class SVM {
         self.samples = []
         self.targets = []
         self.alphas = []
+        self.support = []
         self.bias = 0.0
         self.positive = 1.0
         self.negative = 0.0
+        self.trained = false
     }
 
     #: Choose the kernel, which is what decides the shape of the boundary.
@@ -360,7 +377,6 @@ pub class SVM {
     fn decide(self, query: list[float]) -> float {
         var total = self.bias
         for index in 0..self.samples.len() {
-            if self.alphas[index] == 0.0 { continue }
             total += self.alphas[index] *
                 self.targets[index] *
                 self.kernel(self.samples[index], query)
@@ -387,80 +403,68 @@ pub class SVM {
 
         var signs: list[float] = []
         for value in targets { signs.push(if value == self.positive { 1.0 } else { -1.0 }) }
-        self.samples = rows
-        self.targets = signs
-        self.alphas = []
-        for _index in 0..rows.len() { self.alphas.push(0.0) }
-        self.bias = 0.0
-
         let count = rows.len()
-        for _pass in 0..self.iterations {
-            var changed = 0
-            for i in 0..count {
-                let error_i = self.decide(rows[i]) - signs[i]
-                let violates = signs[i] * error_i < -self.tolerance and self.alphas[i] < self.c or
-                    signs[i] * error_i > self.tolerance and self.alphas[i] > 0.0
-                if not violates { continue }
-                #: The partner is chosen as the next sample along, which
-                #: converges as surely as the heuristic pick and costs nothing
-                #: to find.
-                let j = (i + 1 + _pass) % count
-                if j == i { continue }
-                let error_j = self.decide(rows[j]) - signs[j]
-                let old_i = self.alphas[i]
-                let old_j = self.alphas[j]
-
-                var low = 0.0
-                var high = self.c
-                if signs[i] != signs[j] {
-                    low = max(0.0, old_j - old_i)
-                    high = min(self.c, self.c + old_j - old_i)
-                } else {
-                    low = max(0.0, old_i + old_j - self.c)
-                    high = min(self.c, old_i + old_j)
-                }
-                if high - low < 1e-12 { continue }
-
-                let kii = self.kernel(rows[i], rows[i])
-                let kjj = self.kernel(rows[j], rows[j])
-                let kij = self.kernel(rows[i], rows[j])
-                let curvature = 2.0 * kij - kii - kjj
-                if curvature >= -1e-12 { continue }
-
-                var moved_j = old_j - signs[j] * (error_i - error_j) / curvature
-                if moved_j > high { moved_j = high }
-                if moved_j < low { moved_j = low }
-                if math.fabs(moved_j - old_j) < 1e-9 { continue }
-                let moved_i = old_i + signs[i] * signs[j] * (old_j - moved_j)
-
-                self.alphas[i] = moved_i
-                self.alphas[j] = moved_j
-
-                let b1 = self.bias -
-                    error_i -
-                    signs[i] * (moved_i - old_i) * kii -
-                    signs[j] * (moved_j - old_j) * kij
-                let b2 = self.bias -
-                    error_j -
-                    signs[i] * (moved_i - old_i) * kij -
-                    signs[j] * (moved_j - old_j) * kjj
-                if moved_i > 0.0 and moved_i < self.c {
-                    self.bias = b1
-                } elif moved_j > 0.0 and moved_j < self.c {
-                    self.bias = b2
-                } else {
-                    self.bias = (b1 + b2) * 0.5
-                }
-                changed += 1
-            }
-            if changed == 0 { break }
+        let width = rows[0].len()
+        var flat: list[float] = []
+        for row in rows {
+            for value in row { flat.push(value) }
         }
+        let q = _SvmRows(self.kernel_type, self.gamma, self.degree, self.coef0, flat, count, width, signs)
+
+        var alpha: list[float] = []
+        var gradient: list[float] = []
+        for _index in 0..count {
+            alpha.push(0.0)
+            gradient.push(-1.0)
+        }
+        let limit = max(10000, self.iterations * count)
+        for _step in 0..limit {
+            let i = _svm_first(signs, alpha, gradient, self.c)
+            if i < 0 { break }
+            let j = _svm_partner(q.row(i), q.diagonal, signs, alpha, gradient, self.c, i, self.tolerance)
+            if j < 0 { break }
+            _svm_step(q.row(i), q.row(j), q.diagonal, signs, alpha, gradient, self.c, i, j)
+        }
+
+        let rho = _svm_rho(signs, alpha, gradient, self.c)
+        self.bias = -rho
+        self.samples = []
+        self.targets = []
+        self.alphas = []
+        self.support = []
+        for index in 0..count {
+            if alpha[index] <= 0.0 { continue }
+            self.samples.push(rows[index])
+            self.targets.push(signs[index])
+            self.alphas.push(alpha[index])
+            self.support.push(index)
+        }
+        self.trained = true
         return true
+    }
+
+    #: The support vectors, one per row -- OpenCV's `getSupportVectors`.
+    pub fn get_support_vectors(self) -> Mat {
+        var out: list[float] = []
+        for row in self.samples {
+            for value in row { out.push(value) }
+        }
+        let width = if self.samples.len() > 0 { self.samples[0].len() } else { 0 }
+        return Mat.from_list(self.samples.len(), width, CV_MAKETYPE(CV_32F, 1), out)
+    }
+
+    #: OpenCV's `getDecisionFunction`: the offset `rho`, each support vector's
+    #: signed weight, and which training sample each support vector was. The
+    #: decision for `x` is the sum of `weight * kernel(sv, x)` less `rho`.
+    pub fn get_decision_function(self) -> tuple[float, list[float], list[int]] {
+        var weights: list[float] = []
+        for index in 0..self.alphas.len() { weights.push(self.alphas[index] * self.targets[index]) }
+        return (-self.bias, weights, self.support)
     }
 
     #: Which side of the boundary each sample falls on.
     pub fn predict(self, samples: Mat) -> Mat {
-        if self.samples.len() == 0 { throw RuntimeError("this model has not been trained") }
+        if not self.trained { throw RuntimeError("this model has not been trained") }
         var out: list[float] = []
         for query in rows_of(samples) {
             out.push(if self.decide(query) >= 0.0 { self.positive } else { self.negative })
@@ -474,6 +478,313 @@ pub class SVM {
         for query in rows_of(samples) { out.push(self.decide(query)) }
         return column_mat(out)
     }
+}
+
+#: How many entries of the signed kernel matrix training keeps at once.
+let SVM_ROW_BUDGET = 1 << 23
+
+#: Rows of the signed kernel matrix `Q[i][j] = y_i y_j K(x_i, x_j)`, each
+#: computed the first time it is asked for and kept while they fit in
+#: `SVM_ROW_BUDGET` entries; past that the oldest kept row is dropped.
+class _SvmRows {
+    pub var kernel_type: int
+    pub var gamma: float
+    pub var degree: float
+    pub var coef0: float
+    pub var flat: list[float]
+    pub var count: int
+    pub var width: int
+    pub var signs: list[float]
+    pub var rows: list[list[float]]
+    pub var present: list[bool]
+    pub var missing: list[float]
+    pub var kept: list[int]
+    pub var oldest: int
+    pub var capacity: int
+    pub var diagonal: list[float]
+
+    pub fn init(
+        self,
+        kernel_type: int,
+        gamma: float,
+        degree: float,
+        coef0: float,
+        flat: list[float],
+        count: int,
+        width: int,
+        signs: list[float]
+    ) {
+        self.kernel_type = kernel_type
+        self.gamma = gamma
+        self.degree = degree
+        self.coef0 = coef0
+        self.flat = flat
+        self.count = count
+        self.width = width
+        self.signs = signs
+        #: A row not kept holds a one-entry stand-in rather than nothing, so
+        #: every element of `rows` is a list of floats the compiled code can
+        #: read the kind of; `present` says which are real.
+        self.missing = [0.0]
+        self.rows = []
+        self.present = []
+        for _index in 0..count {
+            self.rows.push(self.missing)
+            self.present.push(false)
+        }
+        self.kept = []
+        self.oldest = 0
+        self.capacity = max(2, SVM_ROW_BUDGET // max(count, 1))
+        self.diagonal = []
+        for index in 0..count { self.diagonal.push(_svm_kernel_at(self, index, index)) }
+    }
+
+    pub fn row(self, i: int) -> list[float] {
+        if self.present[i] { return self.rows[i] }
+        if self.kept.len() - self.oldest >= self.capacity {
+            let dropped = self.kept[self.oldest]
+            self.rows[dropped] = self.missing
+            self.present[dropped] = false
+            self.oldest += 1
+        }
+        var out: list[float] = []
+        _svm_fill_row(self, i, out)
+        self.rows[i] = out
+        self.present[i] = true
+        self.kept.push(i)
+        return out
+    }
+}
+
+fn _svm_kernel_at(q: _SvmRows, i: int, j: int) -> float {
+    let flat = q.flat
+    let width = q.width
+    let a = i * width
+    let b = j * width
+    var total = 0.0
+    if q.kernel_type == SVM_LINEAR or q.kernel_type == SVM_POLY {
+        for index in 0..width { total += flat[a + index] * flat[b + index] }
+        if q.kernel_type == SVM_LINEAR { return total }
+        return (q.gamma * total + q.coef0) ** q.degree
+    }
+    for index in 0..width {
+        let gap = flat[a + index] - flat[b + index]
+        total += gap * gap
+    }
+    return math.exp(-q.gamma * total)
+}
+
+fn _svm_fill_row(q: _SvmRows, i: int, out: list[float]) -> void {
+    let signs = q.signs
+    let sign = signs[i]
+    if q.kernel_type != SVM_RBF {
+        for j in 0..q.count { out.push(sign * signs[j] * _svm_kernel_at(q, i, j)) }
+        return
+    }
+    _svm_rbf_row(q.flat, q.width, q.count, signs, q.present, -q.gamma, i, out)
+    #: The matrix is symmetric, and a kept row already holds the entries
+    #: skipped above, worked out from the same two samples the same way.
+    let rows = q.rows
+    let kept = q.kept
+    for at in q.oldest..kept.len() {
+        let j = kept[at]
+        out[j] = rows[j][i]
+    }
+}
+
+fn _svm_rbf_row(
+    flat: list[float],
+    width: int,
+    count: int,
+    signs: list[float],
+    present: list[bool],
+    scale: float,
+    i: int,
+    out: list[float]
+) -> void {
+    let sign = signs[i]
+    let a = i * width
+    var total = 0.0
+    var gap = 0.0
+    for j in 0..count {
+        if present[j] {
+            out.push(0.0)
+            continue
+        }
+        let b = j * width
+        total = 0.0
+        for index in 0..width {
+            gap = flat[a + index] - flat[b + index]
+            total += gap * gap
+        }
+        out.push(sign * signs[j] * math.exp(scale * total))
+    }
+}
+
+#: libsvm's second-order working-set selection, first half: the multiplier
+#: that most violates the optimality conditions, or -1 if none can move.
+fn _svm_first(signs: list[float], alpha: list[float], gradient: list[float], c: float) -> int {
+    var largest = -1e300
+    var pick = -1
+    for t in 0..signs.len() {
+        if signs[t] > 0.0 {
+            if alpha[t] < c and -gradient[t] >= largest {
+                largest = -gradient[t]
+                pick = t
+            }
+        } elif alpha[t] > 0.0 and gradient[t] >= largest {
+            largest = gradient[t]
+            pick = t
+        }
+    }
+    return pick
+}
+
+#: The second half: the partner for `pick` whose step lowers the objective
+#: most, given `row`, the signed kernel row of `pick` -- or -1 once the
+#: largest violation of the optimality conditions is under `tolerance`.
+fn _svm_partner(
+    row: list[float],
+    diagonal: list[float],
+    signs: list[float],
+    alpha: list[float],
+    gradient: list[float],
+    c: float,
+    pick: int,
+    tolerance: float
+) -> int {
+    let largest = -signs[pick] * gradient[pick]
+    let own = diagonal[pick]
+    let sign = signs[pick]
+    var second = -1e300
+    var partner = -1
+    var least = 1e300
+    var difference = 0.0
+    var curvature = 0.0
+    var gain = 0.0
+    for t in 0..signs.len() {
+        if signs[t] > 0.0 {
+            if alpha[t] <= 0.0 { continue }
+            difference = largest + gradient[t]
+            if gradient[t] >= second { second = gradient[t] }
+            curvature = own + diagonal[t] - 2.0 * sign * row[t]
+        } else {
+            if alpha[t] >= c { continue }
+            difference = largest - gradient[t]
+            if -gradient[t] >= second { second = -gradient[t] }
+            curvature = own + diagonal[t] + 2.0 * sign * row[t]
+        }
+        if difference <= 0.0 { continue }
+        if curvature <= 0.0 { curvature = 1e-12 }
+        gain = -(difference * difference) / curvature
+        if gain <= least {
+            least = gain
+            partner = t
+        }
+    }
+    if largest + second < tolerance { return -1 }
+    return partner
+}
+
+#: Move the pair `i`, `j` to the optimum along the constraint, clipped to the
+#: box, and carry the change into the gradient.
+fn _svm_step(
+    row_i: list[float],
+    row_j: list[float],
+    diagonal: list[float],
+    signs: list[float],
+    alpha: list[float],
+    gradient: list[float],
+    c: float,
+    i: int,
+    j: int
+) -> void {
+    let old_i = alpha[i]
+    let old_j = alpha[j]
+    if signs[i] != signs[j] {
+        var curvature = diagonal[i] + diagonal[j] + 2.0 * row_i[j]
+        if curvature <= 0.0 { curvature = 1e-12 }
+        let delta = (-gradient[i] - gradient[j]) / curvature
+        let difference = old_i - old_j
+        alpha[i] = old_i + delta
+        alpha[j] = old_j + delta
+        if difference > 0.0 {
+            if alpha[j] < 0.0 {
+                alpha[j] = 0.0
+                alpha[i] = difference
+            }
+        } elif alpha[i] < 0.0 {
+            alpha[i] = 0.0
+            alpha[j] = -difference
+        }
+        if difference > 0.0 {
+            if alpha[i] > c {
+                alpha[i] = c
+                alpha[j] = c - difference
+            }
+        } elif alpha[j] > c {
+            alpha[j] = c
+            alpha[i] = c + difference
+        }
+    } else {
+        var curvature = diagonal[i] + diagonal[j] - 2.0 * row_i[j]
+        if curvature <= 0.0 { curvature = 1e-12 }
+        let delta = (gradient[i] - gradient[j]) / curvature
+        let total = old_i + old_j
+        alpha[i] = old_i - delta
+        alpha[j] = old_j + delta
+        if total > c {
+            if alpha[i] > c {
+                alpha[i] = c
+                alpha[j] = total - c
+            }
+        } elif alpha[j] < 0.0 {
+            alpha[j] = 0.0
+            alpha[i] = total
+        }
+        if total > c {
+            if alpha[j] > c {
+                alpha[j] = c
+                alpha[i] = total - c
+            }
+        } elif alpha[i] < 0.0 {
+            alpha[i] = 0.0
+            alpha[j] = total
+        }
+    }
+    _svm_carry(gradient, row_i, alpha[i] - old_i, row_j, alpha[j] - old_j)
+}
+
+fn _svm_carry(
+    gradient: list[float],
+    row_i: list[float],
+    moved_i: float,
+    row_j: list[float],
+    moved_j: float
+) -> void {
+    for k in 0..gradient.len() { gradient[k] += row_i[k] * moved_i + row_j[k] * moved_j }
+}
+
+#: The offset: the average over the multipliers strictly inside the box,
+#: or the middle of the range the bounded ones allow when there are none.
+fn _svm_rho(signs: list[float], alpha: list[float], gradient: list[float], c: float) -> float {
+    var upper = 1e300
+    var lower = -1e300
+    var free = 0
+    var total = 0.0
+    for index in 0..signs.len() {
+        let value = signs[index] * gradient[index]
+        if alpha[index] >= c {
+            if signs[index] < 0.0 { upper = min(upper, value) } else { lower = max(lower, value) }
+        } elif alpha[index] <= 0.0 {
+            if signs[index] > 0.0 { upper = min(upper, value) } else { lower = max(lower, value) }
+        } else {
+            free += 1
+            total += value
+        }
+    }
+    if free > 0 { return total / float(free) }
+    return (upper + lower) * 0.5
 }
 
 #: Build a support vector machine.

@@ -5,7 +5,7 @@ import std.math
 from std.test import assert_eq, assert_near, assert_true
 from jaicv.core.mat import Mat
 from jaicv.core.types import CV_32FC1
-from jaicv.ml.models import d_trees_create, r_trees_create
+from jaicv.ml.models import d_trees_create, r_trees_create, svm_create
 from jaicv.core.linalg import symmetric_eigen_of
 
 fn have_gpu() -> bool { return gpu.is_available() }
@@ -336,4 +336,77 @@ fn test_eigen_rotates_through_the_same_pivots_as_a_full_scan() -> void {
             assert_eq(vectors, want_vectors, f"{n} by {n} coarse={coarse}: vectors")
         }
     }
+}
+
+# --- the support vector machine reaches the optimum it promises -------------
+
+#: Two interleaved classes no line separates: the sign of `x * y`, with the
+#: labels given as 3 and 7 so nothing leans on them being 0 and 1.
+fn checkerboard(count: int, seed: int) -> tuple[Mat, Mat, list[float]] {
+    var state = seed
+    var features: list[float] = []
+    var labels: list[float] = []
+    for _sample in 0..count {
+        state = next_state(state)
+        let x = float((state >> 8) % 4001) / 1000.0 - 2.0
+        state = next_state(state)
+        let y = float((state >> 8) % 4001) / 1000.0 - 2.0
+        features.push(x)
+        features.push(y)
+        labels.push(if x * y > 0.0 { 7.0 } else { 3.0 })
+    }
+    return (Mat.from_list(count, 2, CV_32FC1, features), Mat.from_list(count, 1, CV_32FC1, labels), labels)
+}
+
+fn test_the_svm_stops_at_the_optimum_of_its_dual() -> void {
+    if not have_gpu() { return }
+    let (samples, responses, labels) = checkerboard(240, 0x5B3)
+    let model = svm_create()
+    model.set_gamma(0.5)
+    model.set_c(4.0)
+    model.train(samples, responses)
+    let (rho, weights, support) = model.get_decision_function()
+    assert_true(support.len() > 0, "no support vectors")
+    assert_eq(model.get_support_vectors().rows, support.len())
+
+    #: The weights are the multipliers signed by class, and the multipliers of
+    #: the two classes have to balance.
+    var balance = 0.0
+    var alpha: list[float] = []
+    for _index in 0..labels.len() { alpha.push(0.0) }
+    for at in 0..support.len() {
+        balance += weights[at]
+        alpha[support[at]] = math.fabs(weights[at])
+    }
+    assert_true(math.fabs(balance) < 1e-9, f"the multipliers do not balance: {balance}")
+
+    #: The Karush-Kuhn-Tucker conditions, to the solver's tolerance: a sample
+    #: with no weight is outside the margin, one at the bound is inside it, and
+    #: one in between sits on it.
+    let decisions = model.decision_function(samples).to_list()
+    let slack = 2.0 * model.tolerance
+    var free = 0
+    for index in 0..labels.len() {
+        let sign = if labels[index] == 7.0 { 1.0 } else { -1.0 }
+        let margin = sign * decisions[index]
+        if alpha[index] == 0.0 {
+            assert_true(margin >= 1.0 - slack, f"sample {index}: weightless but margin {margin}")
+        } elif alpha[index] >= model.c {
+            assert_true(margin <= 1.0 + slack, f"sample {index}: at the bound but margin {margin}")
+        } else {
+            free += 1
+            assert_true(math.fabs(margin - 1.0) <= slack, f"sample {index}: free but margin {margin}")
+        }
+    }
+    assert_true(free > 0, "no multiplier strictly inside the box")
+    assert_true(rho == rho, "rho is not a number")
+
+    #: And it has learned the pattern: fresh points from the same board.
+    let (unseen, _responses, truth) = checkerboard(200, 0xA11)
+    let predicted = model.predict(unseen).to_list()
+    var right = 0
+    for index in 0..truth.len() {
+        if predicted[index] == truth[index] { right += 1 }
+    }
+    assert_true(right >= 180, f"only {right} of 200 unseen points classified correctly")
 }
