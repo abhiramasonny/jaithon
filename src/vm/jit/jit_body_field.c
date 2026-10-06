@@ -287,11 +287,23 @@ JitArmResult emitGetFieldLocal(Emit *e, ObjFunction *fn, const uint8_t *code,
             if (!jitDeclaredFieldKindEnabled() ||
                 !declaredScalarFieldKind(info->typeId, &lkind, &ltag)) {
                 /* Nothing to sample and nothing declared: the measuring
-                 * walk never reached this read with a live receiver, so it
-                 * has not RUN since the body was entered. Interpreted from
-                 * here rather than the whole body declined -- the cold-path
-                 * rule the `not a field` arm above follows, with the same
-                 * `!e->osr` (inside a loop nothing is cold).
+                 * walk reached this read without a live instance in the
+                 * receiver's local, so there is no kind to predict.
+                 * Interpreted from here rather than the whole body declined
+                 * -- the soft rule the `not a field` arm above follows, with
+                 * the same `!e->osr` (inside a loop every exit is paid each
+                 * iteration). The condition is "no sample", not "cold": a
+                 * hot read with an unsampled receiver takes this path too,
+                 * and the unarmed path's own rule -- no unconditional stop
+                 * before the body's first branch -- is what keeps that from
+                 * deopting on every call.
+                 *
+                 * Unlike that arm, this one is reached AFTER the
+                 * SLOT_MAYBE_INST null guard above has been emitted, so the
+                 * "nothing half-emitted" rule does not hold here: the guard
+                 * and the unarmed stop both deopt at this pc with the same
+                 * stack, which is harmless, but the guard spends one record
+                 * of JIT_MAX_DEOPT that it could not have needed.
                  *
                  * `token.value ?? 0.0` on the parser's float-literal path is
                  * the shape: one cold read of an `any` field kept
