@@ -15,6 +15,12 @@ from std.time import Instant
 import std.gpu as gpu
 import std.math
 
+#: Warm to a wall-clock floor, not a count: one epoch of fashion is a few tens
+#: of milliseconds, which does not bring the GPU up to its working clock. Both
+#: sides use the same rule (see the .py twin).
+let WARM_SECONDS = 0.5
+let WARM_EPOCH_CAP = 40
+
 const SIDE = 32
 const CHANNELS = 3
 const CLASSES = 10
@@ -75,8 +81,12 @@ fn run(name: str, width: int, samples: int, batch_size: int, epochs: int, verbos
         loss: SparseCategoricalCrossentropy(),
         mixed_precision: true
     )
-    model.fit(train, epochs: 1, batch_size: batch_size, verbose: false, plot_path: null)
-    gpu.synchronize()
+    let warming = Instant.now()
+    for _round in 0..WARM_EPOCH_CAP {
+        model.fit(train, epochs: 1, batch_size: batch_size, verbose: false, plot_path: null)
+        gpu.synchronize()
+        if warming.elapsed().to_seconds() >= WARM_SECONDS { break }
+    }
     let started = Instant.now()
     let history = model.fit(
         train,

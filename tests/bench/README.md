@@ -29,6 +29,27 @@ finite, bounded, nonzero result samples; attention additionally checks the
 softmax convex bound; MLP requires finite positive loss that does not diverge.
 `result: ok` therefore describes computed values, not matching metadata.
 
+The training peers (`mlp.py`, `conv.py`, `norm.py`) cut batches by slicing
+the resident tensors, which is what the Jaithon side does. They used
+`DataLoader(TensorDataset(...))`, and torch 2.13's `TensorDataset` has no
+`__getitems__`, so every batch was one indexing op per sample plus a collate --
+about 2.6 ms of a 2.6 ms step on fashion -- and every training ratio read
+1.4-3.6x in Jaithon's favour. Both sides warm to a wall-clock floor
+(`WARM_SECONDS`, 0.5 s of whole epochs) rather than a single epoch, which on
+the small rows is tens of milliseconds and does not bring the GPU up to its
+clock. Recaptured 2026-10-05 under `scripts/bench/gpu_lock.sh`, sides
+alternated per row, n=5, ratio = median of per-round torch/jaithon (hard):
+
+    fashion 2.92x  mnist 3.14x  kmnist 3.25x  fashion-deep 1.71x  mnist-deep 1.73x
+    cifar10 1.16x  cifar100 1.16x  fashion-wide 1.11x  fashion-xl 1.02x
+    mnist-xl 1.24x  cifar-wide 1.12x  cifar-deep 1.21x  cifar-bottleneck 1.11x
+    cifar100-wide 1.35x  cifar100-deep 1.21x  conv-small 2.29x  conv-wide 1.47x
+    norm-small 1.26x  norm-wide 1.45x  total 1.39x
+
+The old loader had fashion at 11.76x, mnist-xl 1.99x, cifar-bottleneck 2.65x
+and conv-wide 1.64x. Any note quoting a training ratio from before this is
+measuring the peer's loader.
+
 The PyTorch GEMM peer intentionally avoids `out=` inside autocast: PyTorch
 implements `out=` matmul as float32, bypassing autocast. It also disables the
 cross-call autocast cache because Jaithon's float32 buffers are recast on each
