@@ -717,6 +717,12 @@ pub class LayerNorm: Layer {
     fn __str__(self) -> str { return f"LayerNorm({self.width})" }
 }
 
+#: Free an intermediate unless an autograd graph recorded it; a recorded one
+#: is released by whoever frees what `backward()` or `discard_graph()` returns.
+fn release_unrecorded(tensor: Tensor) -> void {
+    if tensor.creator is null { tensor.free() }
+}
+
 #: Multi-head self-attention over rank-two `[seq, dim]` inputs.
 pub class MultiHeadAttention: Layer {
     pub let heads: int
@@ -770,11 +776,17 @@ pub class MultiHeadAttention: Layer {
         let k = matmul(x, wk)
         let v = matmul(x, wv)
         let context = multi_head_attention(q, k, v, self.heads)
-        q.free()
-        k.free()
-        v.free()
+        #: A recorded projection belongs to the graph: attention's backward
+        #: reads q, k and v, and the output product's backward reads
+        #: `context`, so freeing them here made the first `backward()` of any
+        #: model holding this layer throw. `backward()` or `discard_graph()`
+        #: hands them back to the caller to free. Only a value no graph
+        #: recorded is still ours to release.
+        release_unrecorded(q)
+        release_unrecorded(k)
+        release_unrecorded(v)
         let output = matmul(context, wo)
-        context.free()
+        release_unrecorded(context)
         return output
     }
 

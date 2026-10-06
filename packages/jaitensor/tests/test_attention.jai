@@ -1,6 +1,8 @@
 #: Attention, fused and flash, against the same arithmetic written one head at a time.
 import jaitensor as jt
+import std.gpu as gpu
 import std.math
+from jaitensor.layers import MultiHeadAttention
 from jaitensor.tensor import Tensor
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
@@ -290,4 +292,239 @@ fn test_multi_head_attention_tiled_gradients_match_per_head() -> void {
     for (index, values) in collected[0].enumerate() {
         assert_values_near(values, collected[1][index], 1e-3)
     }
+}
+
+#: Deterministic values in [-1, 1] that a host reference can rebuild exactly.
+fn wave(count: int, phase: float) -> list[float] {
+    var out: list[float] = []
+    for index in 0..count { out.push(math.sin(float(index) * 0.731 + phase)) }
+    return out
+}
+
+#: Attention computed on the host in float64, for `query` `[tq, heads * hd]`
+#: against `key`/`value` `[tk, heads * hd]`. With `causal`, query row `i`
+#: sees key rows up to `i + tk - tq`, which is the alignment a KV cache needs.
+fn host_attention(
+    query: list[float],
+    key: list[float],
+    value: list[float],
+    tq: int,
+    tk: int,
+    heads: int,
+    hd: int,
+    causal: bool
+) -> list[float] {
+    let dim = heads * hd
+    let factor = 1.0 / math.sqrt(float(hd))
+    var out: list[float] = [0.0 for _ in 0..tq * dim]
+    for h in 0..heads {
+        for i in 0..tq {
+            let limit = if causal { i + tk - tq + 1 } else { tk }
+            var scores: list[float] = []
+            var peak = -1.0e300
+            for j in 0..limit {
+                var dot = 0.0
+                for d in 0..hd { dot += query[i * dim + h * hd + d] * key[j * dim + h * hd + d] }
+                let s = dot * factor
+                scores.push(s)
+                if s > peak { peak = s }
+            }
+            var total = 0.0
+            for j in 0..limit {
+                scores[j] = math.exp(scores[j] - peak)
+                total += scores[j]
+            }
+            for d in 0..hd {
+                var acc = 0.0
+                for j in 0..limit { acc += scores[j] * value[j * dim + h * hd + d] }
+                out[i * dim + h * hd + d] = acc / total
+            }
+        }
+    }
+    return out
+}
+
+fn host_matmul(a: list[float], b: list[float], rows: int, inner: int, columns: int) -> list[float] {
+    var out: list[float] = [0.0 for _ in 0..rows * columns]
+    for r in 0..rows {
+        for c in 0..columns {
+            var acc = 0.0
+            for i in 0..inner { acc += a[r * inner + i] * b[i * columns + c] }
+            out[r * columns + c] = acc
+        }
+    }
+    return out
+}
+
+fn free_all(tensors: list[Tensor]) -> void {
+    for tensor in tensors { if not tensor.is_freed() { tensor.free() } }
+}
+
+#: The layer's forward value with gradients recorded, against the host.
+#:
+#: With `requires_grad` the layer takes the differentiable route, which shares
+#: no code with the fused inference kernel; this is the value training sees.
+fn test_attention_layer_forward_value_with_gradients_recorded() -> void {
+    if not jt.is_available() { return }
+    let seq = 6
+    let dim = 8
+    let heads = 2
+    let layer = jt.MultiHeadAttention(dim, heads: heads)
+    defer { layer.free() }
+    layer.build(dim, Random.with_seed(3))
+    let params = layer.parameters()
+    let weights = [params[0].download(), params[1].download(), params[2].download(), params[3].download()]
+    let xs = wave(seq * dim, 0.3)
+    let x = Tensor([seq, dim], xs, requires_grad: true)
+    defer { x.free() }
+    let y = layer.forward(x)
+    let got = y.download()
+    free_all(y.discard_graph())
+    y.free()
+    let q = host_matmul(xs, weights[0], seq, dim, dim)
+    let k = host_matmul(xs, weights[1], seq, dim, dim)
+    let v = host_matmul(xs, weights[2], seq, dim, dim)
+    let context = host_attention(q, k, v, seq, seq, heads, dim // heads, false)
+    let expected = host_matmul(context, weights[3], seq, dim, dim)
+    assert_values_near(got, expected, 1e-4)
+}
+
+#: `sum(layer(x) * w)` for the finite-difference checks below, freeing the
+#: graph it built.
+fn layer_objective(layer: MultiHeadAttention, x: Tensor, w: Tensor) -> float {
+    let y = layer.forward(x)
+    let product = jt.multiply(y, w)
+    let total = jt.sum(product)
+    let value = total.download()[0]
+    free_all(total.discard_graph())
+    total.free()
+    return value
+}
+
+#: The layer's gradients for its query weights and its input, against a
+#: central difference. This is the backward the layer could not run at all
+#: while its forward freed the projections the graph reads.
+fn test_attention_layer_gradients_match_finite_differences() -> void {
+    if not jt.is_available() { return }
+    let seq = 5
+    let dim = 8
+    let heads = 2
+    let layer = jt.MultiHeadAttention(dim, heads: heads)
+    defer { layer.free() }
+    layer.build(dim, Random.with_seed(4))
+    let wq = layer.parameters()[0]
+    let wv = layer.parameters()[2]
+    let xs = wave(seq * dim, 1.1)
+    let w = Tensor([seq, dim], wave(seq * dim, 2.0))
+    defer { w.free() }
+    let x = Tensor([seq, dim], xs, requires_grad: true)
+    defer { x.free() }
+    let y = layer.forward(x)
+    let product = jt.multiply(y, w)
+    let total = jt.sum(product)
+    let held = total.backward()
+    let gx = x.grad
+    let gq = wq.grad
+    let gv = wv.grad
+    assert_true(gx is not null and gq is not null and gv is not null)
+    if gx is null or gq is null or gv is null { return }
+    let grad_x = gx.download()
+    let grad_q = gq.download()
+    let grad_v = gv.download()
+    free_all(held)
+    total.free()
+    let eps = 1e-3
+    for (target, analytic) in [(wq, grad_q), (wv, grad_v)] {
+        let base = target.download()
+        for index in 0..base.len() {
+            var plus = [value for value in base]
+            plus[index] += eps
+            target.upload(plus)
+            let up = layer_objective(layer, x, w)
+            var minus = [value for value in base]
+            minus[index] -= eps
+            target.upload(minus)
+            let down = layer_objective(layer, x, w)
+            target.upload(base)
+            let expected = (up - down) / (2.0 * eps)
+            assert_near(analytic[index], expected, max(1e-2, math.fabs(expected) * 5e-3))
+        }
+    }
+    for index in 0..xs.len() {
+        var plus = [value for value in xs]
+        plus[index] += eps
+        let xp = Tensor([seq, dim], plus)
+        let up = layer_objective(layer, xp, w)
+        xp.free()
+        var minus = [value for value in xs]
+        minus[index] -= eps
+        let xm = Tensor([seq, dim], minus)
+        let down = layer_objective(layer, xm, w)
+        xm.free()
+        let expected = (up - down) / (2.0 * eps)
+        assert_near(grad_x[index], expected, max(1e-2, math.fabs(expected) * 5e-3))
+    }
+}
+
+#: Three SGD steps on a hand-written model: the loss falls and nothing leaks.
+fn test_attention_layer_trains_in_a_hand_written_model() -> void {
+    if not jt.is_available() { return }
+    let seq = 64
+    let dim = 128
+    let layer = jt.MultiHeadAttention(dim, heads: 2)
+    defer { layer.free() }
+    layer.build(dim, Random.with_seed(1))
+    let x = Tensor([seq, dim], wave(seq * dim, 0.5))
+    let target = Tensor([seq, dim], wave(seq * dim, 1.7))
+    defer { x.free() }
+    defer { target.free() }
+    let optimizer = jt.SGD(learning_rate: 0.05)
+    var losses: list[float] = []
+    var live_after_first = 0
+    for step in 0..6 {
+        jt.zero_grad(layer.parameters())
+        let y = layer.forward(x)
+        let loss = jt.mse(y, target)
+        losses.push(loss.download()[0])
+        free_all(loss.backward())
+        loss.free()
+        optimizer.step(layer.parameters())
+        gpu.synchronize()
+        if step == 1 { live_after_first = gpu.live_buffers() }
+        if step > 1 { assert_eq(gpu.live_buffers(), live_after_first) }
+    }
+    for value in losses { assert_true(math.is_finite(value)) }
+    assert_true(losses[5] < losses[0])
+}
+
+#: The layer inside `Sequential`, where `fit` frees what `backward()` returns.
+fn test_attention_layer_trains_inside_sequential() -> void {
+    if not jt.is_available() { return }
+    let samples = 32
+    let width = 16
+    let classes = 4
+    var features: list[float] = []
+    var labels: list[float] = []
+    for sample in 0..samples {
+        let label = sample % classes
+        for column in 0..width {
+            features.push(if column % classes == label { 1.0 } else { 0.1 * math.sin(float(sample + column)) })
+        }
+        labels.push(float(label))
+    }
+    let data = jt.Dataset(Tensor([samples, width], features), Tensor([samples], labels))
+    defer { data.free() }
+    let model = jt.Sequential(
+        [
+            jt.Dense(width),
+            jt.MultiHeadAttention(width, heads: 2),
+            jt.Dense(classes, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { model.free() }
+    model.compile(optimizer: jt.Adam(learning_rate: 0.01), loss: jt.SparseCategoricalCrossentropy())
+    let history = model.fit(data, epochs: 3, batch_size: samples, verbose: false, plot_path: null)
+    assert_eq(history.loss.len(), 3)
+    for value in history.loss { assert_true(math.is_finite(value)) }
+    assert_true(history.loss[2] < history.loss[0])
 }
