@@ -266,8 +266,17 @@ int              jaiGraphSoftmaxCrossEntropy(JaiGraphBuilder *b, int logits, int
  * See graphbuild.m. */
 bool             jaiGraphGradients(JaiGraphBuilder *b, int loss, const int *wants,
                                    int count, int *out);
+/* How a plan chooses between encoding into the shared command buffer and
+ * letting MPSGraph run it: by the latency of one call (the default, and what a
+ * live loop wants), or by the throughput of calls back to back (what a training
+ * loop wants). Anything else takes the default, which
+ * JAITHON_GRAPH_ROUTE_POLICY can set. See graphbuild.m. */
+enum { JAI_GRAPH_POLICY_DEFAULT = -1, JAI_GRAPH_POLICY_LATENCY = 0,
+       JAI_GRAPH_POLICY_THROUGHPUT = 1 };
 JaiGraphPlan    *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
-                                 const int *outputs, int outputCount);
+                                 const int *outputs, int outputCount, int policy);
+/* The MPSGraph optimisation level for a graph that is only ever encoded. */
+int              jaiGraphEncodedLevel(void);
 int              jaiGraphPlanOutputRank(JaiGraphPlan *plan, int index);
 bool             jaiGraphPlanOutputShape(JaiGraphPlan *plan, int index,
                                          int64_t *dims, int rank);

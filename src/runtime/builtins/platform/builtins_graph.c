@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "native/native.h"
+#include "runtime/builtins/platform/builtins_gpu.h"
 #include "vm/gc.h"
 
 static bool requireBuilder(Value v, int index, const char *fnName, JaiGraphBuilder **out) {
@@ -92,10 +93,50 @@ static bool nGraphInput(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* A constant whose numbers are already on the device, read where they are.
+ *
+ * Every weight of an imported model is a tensor before the plan is built, and
+ * handing one over as a list meant downloading it into boxed floats only for
+ * the line below to narrow them back into the array they came from. Storage is
+ * shared, so the buffer's own memory is that array; jaiGpuMapRead waits for any
+ * queued work that writes it. */
+static bool graphConstantFromBuffer(JaiGraphBuilder *builder, Value handle, Value shape,
+                                    Value *out) {
+    GpuBuffer *held;
+    if (!requireBuffer(handle, 2, "graph_constant", &held)) return false;
+    int64_t *dims;
+    int rank;
+    if (!intsOf(shape, 3, "graph_constant", &dims, &rank)) return false;
+    int64_t count = 1;
+    for (int i = 0; i < rank; i++) {
+        if (dims[i] < 0 || (dims[i] != 0 && count > INT64_MAX / dims[i])) {
+            count = -1;
+            break;
+        }
+        count *= dims[i];
+    }
+    if (count < 0 || count > held->count) {
+        freeInts(dims, rank);
+        return jaiThrow(vm.cValueError,
+                        "graph_constant(): the shape wants more values than the buffer's %lld",
+                        (long long)held->count);
+    }
+    const float *raw = count > 0 ? jaiGpuMapRead(held->buffer, (size_t)held->origin, (size_t)count)
+                                 : NULL;
+    if (count > 0 && raw == NULL) {
+        freeInts(dims, rank);
+        return jaiThrow(vm.cRuntimeError, "graph_constant(): the buffer could not be read");
+    }
+    *out = INT_VAL(jaiGraphConstant(builder, raw, dims, rank));
+    freeInts(dims, rank);
+    return true;
+}
+
 static bool nGraphConstant(int argc, Value *args, Value *out) {
     (void)argc;
     JaiGraphBuilder *builder;
     if (!requireBuilder(args[0], 1, "graph_constant", &builder)) return false;
+    if (IS_INT(args[1])) return graphConstantFromBuffer(builder, args[1], args[2], out);
     ObjList *values;
     if (!jaiArgList(args[1], 2, "graph_constant", &values)) return false;
     int64_t *dims;
@@ -624,12 +665,36 @@ static bool nGraphGradients(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `graph_compile(builder, inputs, outputs, policy = null)`. The policy says
+ * how the plan picks its route: "latency" times one call at a time, which is
+ * right for a live loop and is the default; "throughput" times calls back to
+ * back, which is right for a training step. Null takes the default, which
+ * JAITHON_GRAPH_ROUTE_POLICY can change. See graphbuild.m. */
+static bool policyOf(int argc, Value *args, int *policy) {
+    *policy = JAI_GRAPH_POLICY_DEFAULT;
+    if (argc < 4 || IS_NULL(args[3])) return true;
+    ObjString *name;
+    if (!jaiArgString(args[3], 4, "graph_compile", &name)) return false;
+    if (strcmp(name->chars, "latency") == 0) {
+        *policy = JAI_GRAPH_POLICY_LATENCY;
+        return true;
+    }
+    if (strcmp(name->chars, "throughput") == 0) {
+        *policy = JAI_GRAPH_POLICY_THROUGHPUT;
+        return true;
+    }
+    return jaiThrow(vm.cValueError,
+                    "graph_compile(): the route policy is \"latency\" or \"throughput\", "
+                    "not \"%s\"", name->chars);
+}
+
 static bool nGraphCompile(int argc, Value *args, Value *out) {
-    (void)argc;
     JaiGraphBuilder *builder;
     int64_t *inputs = NULL, *outputs = NULL;
     int inCount = 0, outCount = 0;
+    int policy;
     if (!requireBuilder(args[0], 1, "graph_compile", &builder)) return false;
+    if (!policyOf(argc, args, &policy)) return false;
     if (!intsOf(args[1], 2, "graph_compile", &inputs, &inCount)) return false;
     if (!intsOf(args[2], 3, "graph_compile", &outputs, &outCount)) {
         freeInts(inputs, inCount);
@@ -639,7 +704,7 @@ static bool nGraphCompile(int argc, Value *args, Value *out) {
     int *outIds = outCount > 0 ? JAI_ALLOC(int, (size_t)outCount) : NULL;
     for (int i = 0; i < inCount; i++) in[i] = (int)inputs[i];
     for (int i = 0; i < outCount; i++) outIds[i] = (int)outputs[i];
-    JaiGraphPlan *plan = jaiGraphCompile(builder, in, inCount, outIds, outCount);
+    JaiGraphPlan *plan = jaiGraphCompile(builder, in, inCount, outIds, outCount, policy);
     if (in != NULL) JAI_FREE_ARRAY(int, in, (size_t)inCount);
     if (outIds != NULL) JAI_FREE_ARRAY(int, outIds, (size_t)outCount);
     freeInts(inputs, inCount);
@@ -787,7 +852,7 @@ void jaiRegisterGraphPrimitives(void) {
     jaiDefineNative("__prim__.graph_onehot",         nGraphOneHot,         3, 3);
     jaiDefineNative("__prim__.graph_softmax_cross_entropy", nGraphSoftmaxCrossEntropy, 5, 5);
     jaiDefineNative("__prim__.graph_gradients",      nGraphGradients,      3, 3);
-    jaiDefineNative("__prim__.graph_compile",        nGraphCompile,        3, 3);
+    jaiDefineNative("__prim__.graph_compile",        nGraphCompile,        3, 4);
     jaiDefineNative("__prim__.graph_plan_output_shape", nGraphPlanOutputShape, 2, 2);
     jaiDefineNative("__prim__.graph_run",            nGraphRun,            3, 3);
     jaiDefineNative("__prim__.graph_plan_free",      nGraphPlanFree,       1, 1);

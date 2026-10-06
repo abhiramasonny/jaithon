@@ -161,7 +161,9 @@ bool encodeGraphOnAsync(MPSGraph *graph,
         execDesc = [MPSGraphExecutionDescriptor new];
         if (@available(macOS 12.3, *)) {
             MPSGraphCompilationDescriptor *comp = [MPSGraphCompilationDescriptor new];
-            comp.optimizationLevel = MPSGraphOptimizationLevel1;
+            /* Only ever encoded, so level one's placement buys nothing; see
+             * jaiGraphEncodedLevel in graphbuild.m. */
+            comp.optimizationLevel = (MPSGraphOptimization)jaiGraphEncodedLevel();
             execDesc.compilationDescriptor = comp;
         }
     });
@@ -352,7 +354,9 @@ MPSGraphExecutable *compiledGraph(MPSGraph *graph,
         MPSGraphCompilationDescriptor *comp = nil;
         if (@available(macOS 12.3, *)) {
             comp = [MPSGraphCompilationDescriptor new];
-            comp.optimizationLevel = MPSGraphOptimizationLevel1;
+            /* Every executable compiled here is encoded, never run; see
+             * jaiGraphEncodedLevel in graphbuild.m. */
+            comp.optimizationLevel = (MPSGraphOptimization)jaiGraphEncodedLevel();
         }
         return [graph compileWithDevice:nil
                                   feeds:types
