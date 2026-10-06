@@ -20,6 +20,22 @@ fn _jacobi_off(a: list[float], n: int) -> (float, float) {
     return (off, on)
 }
 
+#: The rotation `(c, s)` that zeroes `a[p][r]`, Rutishauser's stable form.
+#:
+#: Its own function because the square roots are calls on the `math` module,
+#: and a module call anywhere in the sweep's body keeps the whole sweep out of
+#: the JIT: with them here the rotation loop compiles and eigh 50x50 is about
+#: twice as fast. `hypot(theta, 1)` is `sqrt(theta^2 + 1)` with the overflow
+#: taken out, which past `1e150` is `|theta|` to every bit a double holds.
+fn _jacobi_angle(app: float, arr: float, apr: float) -> (float, float) {
+    let theta = (app - arr) / (2.0 * apr)
+    let size = if theta >= 0.0 { theta } else { -theta }
+    let root = if size > 1.0e150 { size } else { math.sqrt(theta * theta + 1.0) }
+    let t = if theta >= 0.0 { 1.0 / (theta + root) } else { -1.0 / (root - theta) }
+    let c = 1.0 / math.sqrt(1.0 + t * t)
+    return (c, t * c)
+}
+
 #: `A = Q L Q^T` for a symmetric `A`, by cyclic Jacobi, eigenvalues ascending.
 #:
 #: Jacobi and not a tridiagonal QL: at these sizes it is a small constant more
@@ -37,11 +53,7 @@ pub fn _jacobi_eigh(values: list[float], n: int, vectors: bool) -> (list[float],
             for r in p + 1..n {
                 let apr = a[p * n + r]
                 if apr == 0.0 { continue }
-                let theta = (a[p * n + p] - a[r * n + r]) / (2.0 * apr)
-                let root = math.hypot(theta, 1.0)
-                let t = if theta >= 0.0 { 1.0 / (theta + root) } else { -1.0 / (root - theta) }
-                let c = 1.0 / math.sqrt(1.0 + t * t)
-                let s = t * c
+                let (c, s) = _jacobi_angle(a[p * n + p], a[r * n + r], apr)
                 _rotate_columns(a, n, n, p, r, c, s)
                 _rotate_rows(a, n, p, r, c, s)
                 a[p * n + r] = 0.0
