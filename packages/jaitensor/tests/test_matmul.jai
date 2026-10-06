@@ -1,7 +1,7 @@
 #: The matmul routes: tile plans, the staged and MPS kernels, and the fused affine.
 import jaitensor as jt
 import std.gpu as gpu
-from jaitensor.gemm import Plan, bucket_extent, default_plan, dispatch_plan, plan_from_text
+from jaitensor.gemm import Plan, bucket_extent, default_plan, dispatch_plan, plan_from_text, reload_plans
 from jaitensor.ops import matmul_backend
 from jaitensor.tensor import Tensor
 from std.io import Path
@@ -157,20 +157,38 @@ fn test_plan_from_text_reads_a_bare_name_as_one_split() -> void {
 
 fn test_a_shape_is_tuned_only_once_it_has_earned_it() -> void {
     if not jt.is_available() { return }
+    #: The switches that turn tuning off or make it eager are a different
+    #: policy, not this one.
+    if (env("JAITENSOR_AUTOTUNE") ?? "1") == "0" { return }
+    if (env("JAITENSOR_GEMM_LAZY_TUNE") ?? "1") == "0" { return }
+    if env("JAITENSOR_GEMM_PLAN") is not null { return }
+    #: Twice, each time against a fresh cache file. The second pass is the
+    #: check that `reload_plans` is a fresh start: the planner keeps what it
+    #: read from the first file it opened and memoises every route, so
+    #: without it the second file was never tuned into -- and on a machine
+    #: whose own cache held this bucket, neither was the first.
+    for round in 0..2 {
+        tuned_once_earned(Path(temp_dir()).join(f"jaitensor-lazy-plans-{pid()}-{round}.tsv"))
+    }
+}
+
+fn tuned_once_earned(path: Path) -> void {
     #: Every new shape used to be tuned on its first call -- 0.5 s for each
     #: row count of a generation, 8-19 s for a first Ridge fit. Now the
     #: first calls run the static plan and write nothing; a tuning pass, and
     #: a cache row keyed on the shape's BUCKET, come only once the shape has
     #: done work worth tuning for.
-    let path = Path(temp_dir()).join(f"jaitensor-lazy-plans-{pid()}.tsv")
     let previous = env("JAITENSOR_GEMM_CACHE")
+    if path.exists() { path.remove() }
     set_env("JAITENSOR_GEMM_CACHE", path.to_str())
+    reload_plans()
     defer {
         if previous is not null {
             set_env("JAITENSOR_GEMM_CACHE", previous)
         } else {
             unset_env("JAITENSOR_GEMM_CACHE")
         }
+        reload_plans()
         if path.exists() { path.remove() }
     }
     let rows = 1000

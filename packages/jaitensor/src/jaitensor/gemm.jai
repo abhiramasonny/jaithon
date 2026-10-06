@@ -1565,6 +1565,25 @@ class Route {
 var _routes: dict[int, Route] = {}
 var _buckets: dict[str, Bucket] = {}
 
+#: Forget every plan and request count this process holds, and read the plan
+#: cache again -- from wherever `JAITENSOR_GEMM_CACHE` points now -- on the
+#: next product.
+#:
+#: The cache is read once and every shape's route memoised, so pointing the
+#: variable somewhere else mid-process changed nothing: the planner went on
+#: believing the first file it read. A test of when tuning happens therefore
+#: passed or failed on what the machine's own cache happened to hold. Call
+#: this after changing the variable.
+pub fn reload_plans() -> void {
+    _cache = {}
+    _cache_loaded = false
+    _cache_dirty = false
+    _buckets = {}
+    _routes = {}
+    _memo_key = -1
+    _memo = null
+}
+
 #: The plan this exact shape runs: the bucket's tuned plan where it is legal
 #: for this member of the bucket, and the static plan otherwise.
 fn resolve(route: Route) -> Plan {
