@@ -16,7 +16,7 @@
 #: The fixtures are hex rather than lists of byte literals because `jaithon fmt`
 #: breaks an over-long element list one element per line, which would spread a
 #: hundred-byte message over a hundred lines.
-from std.math import INF, copysign, is_nan
+from std.math import INF, copysign, is_nan, ldexp
 from std.test import assert_contains, assert_eq, assert_throws, assert_true
 from jaicv.dnn.protobuf import Field, MAX_FIELD_NUMBER
 from jaicv.dnn.protobuf import WIRE_END_GROUP, WIRE_I32, WIRE_I64, WIRE_LEN
@@ -526,4 +526,53 @@ fn test_reading_a_field_as_the_wrong_kind_throws() -> void {
 fn test_an_end_group_wire_type_is_named_in_errors() -> void {
     let error = assert_throws(ValueError, || as_string(Field(1, WIRE_END_GROUP)))
     assert_contains(error.message, "end-group", "the wire type is named, not numbered")
+}
+
+#: The binary32 value of a bit pattern, the long way: the reference the native
+#: decoder behind `packed_floats` is held to.
+fn reference_f32(bits: int) -> float {
+    let exponent = bits >> 23 & 0xFF
+    let fraction = bits & 0x7FFFFF
+    var value = 0.0
+    if exponent == 0 {
+        value = ldexp(float(fraction), -149)
+    } elif exponent == 255 {
+        value = if fraction == 0 { INF } else { 0.0 * INF }
+    } else {
+        value = ldexp(float(fraction) + 8388608.0, exponent - 150)
+    }
+    if bits >> 31 & 1 == 1 { return -value }
+    return value
+}
+
+#: Thousands of patterns from every exponent, both signs and the denormal and
+#: NaN ranges, decoded natively from an unaligned offset and compared bit for
+#: bit with the long way round.
+fn test_the_native_float_decode_matches_the_reference() -> void {
+    var raw: list[int] = [0xAA, 0xBB, 0xCC]
+    var patterns: list[int] = []
+    var state = 12345
+    for index in 0..4096 {
+        state = (state * 1103515245 + 12345) % 2147483648
+        let exponent = index % 256
+        let bits = index // 256 % 2 << 31 | exponent << 23 | state & 0x7FFFFF
+        patterns.push(bits)
+        for shift in [0, 8, 16, 24] { raw.push(bits >> shift & 0xFF) }
+    }
+    let data = bytes(raw)
+    let decoded = __prim__.bytes_f32_le(data, 3, patterns.len())
+    assert_eq(decoded.len(), patterns.len(), "one float per four bytes")
+    for (index, bits) in patterns.enumerate() {
+        let want = reference_f32(bits)
+        let got = decoded[index]
+        if is_nan(want) {
+            assert_true(is_nan(got), f"pattern {bits} should be NaN, got {got}")
+        } else {
+            assert_eq(got, want, f"pattern {bits}")
+            assert_eq(copysign(1.0, got), copysign(1.0, want), f"pattern {bits} sign")
+        }
+    }
+    assert_eq(__prim__.bytes_f32_le(data, 3, 0).len(), 0, "no floats is an empty list")
+    assert_throws(ValueError, || __prim__.bytes_f32_le(data, 4, patterns.len()))
+    assert_throws(ValueError, || __prim__.bytes_f32_le(data, -1, 1))
 }

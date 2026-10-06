@@ -34,6 +34,7 @@
 #: ```
 from std.core import Printable
 from std.math import INF, NAN, ldexp
+from std.os import env
 
 #: Wire type 0: a base-128 varint, holding every integer and boolean kind.
 pub let WIRE_VARINT = 0
@@ -63,6 +64,16 @@ let MAX_GROUP_DEPTH = 100
 
 #: `2**63 - 1`, the mask that turns the arithmetic `>>` into a logical one.
 let LOW_63 = 0x7FFFFFFFFFFFFFFF
+
+#: Whether bytes are copied out a block at a time and floats decoded natively.
+#:
+#: The two slow paths are kept, behind `JAICV_ONNX_FAST=0`, because they are
+#: the reference the fast ones are measured and checked against. A YOLOv8n
+#: import spent 515 of its 745 ms copying weights one boxed byte at a time
+#: through a comprehension -- three times over, once per level of nesting a
+#: weight sits under -- and most of the rest decoding three million floats
+#: with `ldexp`.
+let FAST = env("JAICV_ONNX_FAST") != "0"
 
 #: One field, as it sits on the wire.
 #:
@@ -197,7 +208,11 @@ class Cursor {
     #: The next `count` bytes, copied out.
     pub fn take(self, count: int, number: int) -> bytes {
         self.check(count, number)
-        let out = bytes([self.data[self.at + index] for index in 0..count])
+        let out = if FAST {
+            self.data.slice(self.at, self.at + count)
+        } else {
+            bytes([self.data[self.at + index] for index in 0..count])
+        }
         self.at += count
         return out
     }
@@ -268,7 +283,11 @@ pub fn parse_message(data: bytes) -> list[Field] {
         } elif wire == WIRE_START_GROUP {
             let start = cursor.at
             let stop = scan_group(cursor, number)
-            field.data = bytes([data[index] for index in start..stop])
+            field.data = if FAST {
+                data.slice(start, stop)
+            } else {
+                bytes([data[index] for index in start..stop])
+            }
         } elif wire == WIRE_END_GROUP {
             throw ValueError(f"field {number}: an end-group tag with no group open")
         } else {
@@ -451,9 +470,14 @@ fn packed_width(field: Field, width: int, reading: str) -> int {
 }
 
 #: Every value of a packed `float` repeat.
+#:
+#: Natively when it can be: the reinterpretation of four little-endian bytes
+#: as a binary32 is exactly what `f32_from_bits` spells out, and doing it in a
+#: loop here cost 64 to 105 ns a float.
 pub fn packed_floats(field: Field) -> list[float] {
     let count = packed_width(field, 4, "a packed float repeat")
     let data = field.data
+    if FAST { return __prim__.bytes_f32_le(data, 0, count) }
     var out: list[float] = []
     for index in 0..count {
         out.push(f32_from_bits(little_endian(data, index * 4, 4)))
