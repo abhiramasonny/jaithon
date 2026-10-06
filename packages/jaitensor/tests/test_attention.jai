@@ -665,6 +665,12 @@ fn test_attention_routes_match_the_host() -> void {
     check_route(40, 40, 2, 16, true, 2e-3)
     check_route(3, 50, 2, 16, true, 2e-3)
     check_route(70, 70, 1, 32, true, 4e-3)
+    #: The decode kernel takes any head width that is a multiple of 32 up to
+    #: 128; the prefill kernel only 32 and 64, so these longer queries go to
+    #: MPSGraph.
+    check_route(1, 200, 2, 128, true, 1e-4)
+    check_route(3, 200, 2, 96, false, 1e-4)
+    check_route(20, 40, 2, 128, true, 2e-3)
 }
 
 #: `[batch, t, dim]` folds the batch into the head axis: each sequence must
