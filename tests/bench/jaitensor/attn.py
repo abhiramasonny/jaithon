@@ -55,9 +55,15 @@ def time_attn(seq: int, dim: int, heads: int, repeats: int, causal: bool):
     # See the note in gemm.jai: the GPU needs to have been busy for a while
     # before it runs at its working speed, and both sides warm up by the same
     # rule so the two are comparable.
+    warm_seconds = float(os.environ.get("WARM_SECONDS", "2.0"))
+    warm_started = time.perf_counter()
+    warmed = 0
     with torch.autocast(device_type="mps", dtype=torch.float16, cache_enabled=False):
-        for _ in range(max(repeats, WARMUP)):
+        while warmed < max(repeats, WARMUP) or time.perf_counter() - warm_started < warm_seconds:
             packed_mha(q, k, v, heads, causal)
+            warmed += 1
+            if warmed % 16 == 0:
+                torch.mps.synchronize()
     torch.mps.synchronize()
     started = time.perf_counter()
     # Exactly one result stays alive, which is what the jai side does and what

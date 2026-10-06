@@ -39,9 +39,16 @@ def main() -> None:
     b2 = torch.zeros(dim, device=d)
     ib = torch.zeros(dim * 4, device=d)
 
+    # At least WARMUP blocks and at least WARM_SECONDS of them, as vit.jai.
+    warm_seconds = float(os.environ.get("WARM_SECONDS", "2.0"))
+    warm_started = time.perf_counter()
+    warmed = 0
     with torch.autocast(device_type=d, dtype=torch.float16, cache_enabled=False):
-        for _ in range(WARMUP):
+        while warmed < WARMUP or time.perf_counter() - warm_started < warm_seconds:
             block(x, qw, ow, w1, w2, g1, b1, g2, b2, ib, heads)
+            warmed += 1
+            if warmed % 8 == 0:
+                torch.mps.synchronize()
     torch.mps.synchronize()
     started = time.perf_counter()
     with torch.autocast(device_type=d, dtype=torch.float16, cache_enabled=False):

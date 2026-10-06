@@ -80,9 +80,18 @@ fn main() -> int {
     let inner_bias = Tensor.zeros([dim * 4])
     for t in [x, qw, ow, w1, w2] { t.buffer().fill_uniform(-0.05, 0.05, 3) }
 
-    for _w in 0..warmup {
+    #: At least `warmup` blocks and at least `WARM_SECONDS` of them: the
+    #: count alone is a tenth of a second of GPU work at 1024 tokens, which
+    #: does not bring the clock up (see the warm-by-the-clock note in
+    #: gemm.jai). The peer warms by the same rule.
+    let warm_seconds = float(env_or("WARM_SECONDS", "2.0"))
+    let warm_started = Instant.now()
+    var warmed = 0
+    while warmed < warmup or warm_started.elapsed().to_seconds() < warm_seconds {
         let out = block(x, qw, ow, w1, w2, g1, b1, g2, b2, inner_bias, heads)
         out.free()
+        warmed += 1
+        if warmed % 8 == 0 { gpu.synchronize() }
     }
     gpu.synchronize()
     #: One result stays alive so the work cannot be elided, and each earlier

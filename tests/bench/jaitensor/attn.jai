@@ -71,10 +71,17 @@ fn time_attn(seq: int, dim: int, heads: int, repeats: int, causal: bool) -> tupl
     #: The GPU does not run at its working speed until it has been busy for a
     #: while, and one call is nowhere near enough. See the note in gemm.jai:
     #: timing the first few dispatches measures the clock coming up rather than
-    #: the kernel. The peer benchmark warms up by the same rule.
-    for _warm in 0..max(repeats, WARMUP) {
+    #: the kernel. A count alone is not enough either -- 24 calls of attn-256
+    #: are a few milliseconds of work -- so the warm-up also runs for at least
+    #: `WARM_SECONDS`. The peer benchmark warms up by the same rule.
+    let warm_seconds = float(env_or("WARM_SECONDS", "2.0"))
+    let warm_started = Instant.now()
+    var warmed = 0
+    while warmed < max(repeats, WARMUP) or warm_started.elapsed().to_seconds() < warm_seconds {
         let throwaway = multi_head_attention(q, k, v, heads, causal: causal)
         throwaway.free()
+        warmed += 1
+        if warmed % 16 == 0 { gpu.synchronize() }
     }
     gpu.synchronize()
     #: One result stays alive so the work cannot be elided, and each earlier
