@@ -150,6 +150,80 @@ kernel void layer_norm_params_backward(device const float* input [[buffer(0)]],
     grad_beta[i] = b;
 }
 
+/* The same sums spread over the whole device.
+ *
+ * One thread to a column put a 768-wide normalisation on 768 threads, each
+ * walking all 1024 rows in turn: two dozen simdgroups on a GPU with room for
+ * well over a thousand, and the parameter pass cost several times the input
+ * pass beside it. Here a threadgroup takes 32 columns and a strip of rows;
+ * each of its eight simdgroups walks every eighth row of the strip with its
+ * lanes on adjacent columns, so every read is one 128-byte line, and the
+ * eight partial sums meet in threadgroup memory. With more than one strip the
+ * strips' sums land in `part_*` and `layer_norm_params_join` adds them in a
+ * fixed order, so the answer does not depend on scheduling. */
+kernel void layer_norm_params_partials(device const float* input [[buffer(0)]],
+                                       device const float* upstream [[buffer(1)]],
+                                       device float* part_gamma [[buffer(2)]],
+                                       device float* part_beta [[buffer(3)]],
+                                       device const float* row_mean [[buffer(4)]],
+                                       device const float* row_inv [[buffer(5)]],
+                                       constant uint& rows [[buffer(6)]],
+                                       constant uint& width [[buffer(7)]],
+                                       constant uint& blocks [[buffer(8)]],
+                                       constant uint& rows_each [[buffer(9)]],
+                                       uint group [[threadgroup_position_in_grid]],
+                                       uint lane [[thread_index_in_simdgroup]],
+                                       uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint WARPS = 8u;
+    const uint block = group % blocks;
+    const uint strip = group / blocks;
+    const uint column = block * 32u + lane;
+    const uint first = strip * rows_each;
+    const uint last = min(rows, first + rows_each);
+    threadgroup float shared_g[WARPS * 32u];
+    threadgroup float shared_b[WARPS * 32u];
+    float g = 0.0f;
+    float b = 0.0f;
+    if (column < width) {
+        for (uint row = first + warp; row < last; row += WARPS) {
+            const uint at = row * width + column;
+            const float dy = upstream[at];
+            g += dy * (input[at] - row_mean[row]) * row_inv[row];
+            b += dy;
+        }
+    }
+    shared_g[warp * 32u + lane] = g;
+    shared_b[warp * 32u + lane] = b;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (warp != 0u || column >= width) return;
+    float tg = 0.0f;
+    float tb = 0.0f;
+    for (uint w = 0u; w < WARPS; ++w) {
+        tg += shared_g[w * 32u + lane];
+        tb += shared_b[w * 32u + lane];
+    }
+    part_gamma[strip * width + column] = tg;
+    part_beta[strip * width + column] = tb;
+}
+
+kernel void layer_norm_params_join(device const float* part_gamma [[buffer(0)]],
+                                   device const float* part_beta [[buffer(1)]],
+                                   device float* grad_gamma [[buffer(2)]],
+                                   device float* grad_beta [[buffer(3)]],
+                                   constant uint& strips [[buffer(4)]],
+                                   constant uint& width [[buffer(5)]],
+                                   uint i [[thread_position_in_grid]]) {
+    if (i >= width) return;
+    float g = 0.0f;
+    float b = 0.0f;
+    for (uint s = 0u; s < strips; ++s) {
+        g += part_gamma[s * width + i];
+        b += part_beta[s * width + i];
+    }
+    grad_gamma[i] = g;
+    grad_beta[i] = b;
+}
+
 kernel void norm_channel_backward(device const float* input [[buffer(0)]],
                                   device const float* mean [[buffer(1)]],
                                   device const float* variance [[buffer(2)]],
