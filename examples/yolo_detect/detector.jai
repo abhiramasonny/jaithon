@@ -385,8 +385,9 @@ pub fn finish_detect(pending: Pending) -> list[Detection] {
 }
 
 #: One frame, from image to detections. The graph is passed in rather than
-#: reopened, because loading the 12 MB of weights costs about two seconds and
-#: a camera loop must do it once.
+#: reopened, because loading the weights is several frames' worth of work --
+#: tens of milliseconds for yolov8n, half a second for yolov8x -- and a camera
+#: loop must do it once.
 #:
 #: This waits for the network before returning. A loop that has other work to
 #: do meanwhile should use `start_detect` and `finish_detect` instead.
