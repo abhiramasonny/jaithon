@@ -591,7 +591,7 @@ fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> vo
         let values = Buffer.of(noise(count * width, count + width, 3.0, 1.0))
         let centres = Buffer.of(noise(k * width, k * 7 + 1, 3.0, 1.0))
         var held: list[Buffer] = []
-        for _index in 0..4 { held.push(Buffer(count)) }
+        for _index in 0..6 { held.push(Buffer(count)) }
         let first_sums = Buffer(k * width + k + 1)
         let second_sums = Buffer(k * width + k + 1)
         Kernel.compile(KMEANS_SOURCE, "kmeans_assign").dispatch_async(
@@ -599,6 +599,9 @@ fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> vo
         )
         Kernel.compile(KMEANS_SOURCE, "kmeans_assign_staged").dispatch_async(
             [values, centres, held[2], held[3]], count, [count, width, k], group_size: 256
+        )
+        Kernel.compile(KMEANS_SOURCE, "kmeans_assign_tiled").dispatch_async(
+            [values, centres, held[4], held[5]], (count + 255) // 256 * 256, [count, width, k], group_size: 256
         )
         Kernel.compile(KMEANS_SOURCE, "kmeans_gather").dispatch_async(
             [values, held[0], held[1], first_sums], (k * width + k + 1) * 256, [count, width, k], group_size: 256
@@ -608,6 +611,8 @@ fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> vo
         )
         assert_eq(held[2].download(), held[0].download(), f"{shape}: labels")
         assert_eq(held[3].download(), held[1].download(), f"{shape}: distances")
+        assert_eq(held[4].download(), held[0].download(), f"{shape}: tiled labels")
+        assert_eq(held[5].download(), held[1].download(), f"{shape}: tiled distances")
         assert_eq(second_sums.download(), first_sums.download(), f"{shape}: totals")
         for buffer in [values, centres, first_sums, second_sums] { buffer.free() }
         for buffer in held { buffer.free() }

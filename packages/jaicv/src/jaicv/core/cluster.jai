@@ -168,14 +168,74 @@ kernel void kmeans_assign_staged(device const float* values [[buffer(0)]],
     uint base = id * width;
     for (uint index = 0u; index < width; ++index) {
         float value = values[base + index];
-        for (uint c = 0u; c < k; ++c) {
+        for (uint c = 0u; c < 16u && c < k; ++c) {
             float gap = value - staged[c * width + index];
             totals[c] = fma(gap, gap, totals[c]);
         }
     }
     float best = INFINITY;
     uint pick = 0u;
-    for (uint c = 0u; c < k; ++c) {
+    for (uint c = 0u; c < 16u && c < k; ++c) {
+        if (totals[c] < best) {
+            best = totals[c];
+            pick = c;
+        }
+    }
+    labels[id] = float(pick);
+    nearest[id] = best;
+}
+
+/* `kmeans_assign_staged` with the samples read a tile at a time.
+ *
+ * A thread per sample reading its own row strides the device memory by the
+ * row's width, so every load in a simdgroup touches a different cache line.
+ * Here the threadgroup's 256 rows are copied eight columns at a time into
+ * threadgroup memory, consecutive threads reading consecutive values, and
+ * each thread then takes its row's eight from there. Every thread still adds
+ * its row's values in column order, so the labels and distances are the same
+ * bit for bit. Dispatched in groups of exactly 256. */
+kernel void kmeans_assign_tiled(device const float* values [[buffer(0)]],
+                                device const float* centres [[buffer(1)]],
+                                device float* labels [[buffer(2)]],
+                                device float* nearest [[buffer(3)]],
+                                constant uint& samples [[buffer(4)]],
+                                constant uint& width [[buffer(5)]],
+                                constant uint& k [[buffer(6)]],
+                                uint id [[thread_position_in_grid]],
+                                uint lid [[thread_index_in_threadgroup]],
+                                uint group [[threadgroup_position_in_grid]]) {
+    const uint GROUP = 256u;
+    const uint TILE = 8u;
+    const uint STRIDE = TILE + 1u;
+    threadgroup float staged[4096];
+    threadgroup float tile[256 * 9];
+    for (uint i = lid; i < k * width; i += GROUP) staged[i] = centres[i];
+    float totals[16];
+    for (uint c = 0u; c < 16u; ++c) totals[c] = 0.0f;
+    uint first = group * GROUP;
+    for (uint column = 0u; column < width; column += TILE) {
+        uint span = min(TILE, width - column);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = lid; i < GROUP * span; i += GROUP) {
+            uint row = i / span;
+            uint at = i - row * span;
+            uint sample = first + row;
+            tile[row * STRIDE + at] = sample < samples ? values[sample * width + column + at] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint at = 0u; at < span; ++at) {
+            float value = tile[lid * STRIDE + at];
+            uint index = column + at;
+            for (uint c = 0u; c < 16u && c < k; ++c) {
+                float gap = value - staged[c * width + index];
+                totals[c] = fma(gap, gap, totals[c]);
+            }
+        }
+    }
+    if (id >= samples) return;
+    float best = INFINITY;
+    uint pick = 0u;
+    for (uint c = 0u; c < 16u && c < k; ++c) {
         if (totals[c] < best) {
             best = totals[c];
             pick = c;
@@ -281,11 +341,14 @@ fn squared_to_centre(
 }
 
 #: `JAICV_KMEANS_STAGED=0` assigns samples with the kernel that reads each
-#: sample once per centre; `JAICV_KMEANS_COLUMNS=0` totals the groups with the
-#: one that reads every label once per centre and column; and
-#: `JAICV_KMEANS_IN_PLACE=0` copies the samples to the host and back rather
-#: than reading them where they lie. All three give the same answer either way.
+#: sample once per centre, and `JAICV_KMEANS_TILED=0` with the staged one
+#: that reads each sample's row straight from device memory;
+#: `JAICV_KMEANS_COLUMNS=0` totals the groups with the one that reads every
+#: label once per centre and column; and `JAICV_KMEANS_IN_PLACE=0` copies the
+#: samples to the host and back rather than reading them where they lie. All
+#: four give the same answer either way.
 let _KMEANS_STAGED = env_or("JAICV_KMEANS_STAGED", "1") != "0"
+let _KMEANS_TILED = env_or("JAICV_KMEANS_TILED", "1") != "0"
 let _KMEANS_COLUMNS = env_or("JAICV_KMEANS_COLUMNS", "1") != "0"
 let _KMEANS_IN_PLACE = env_or("JAICV_KMEANS_IN_PLACE", "1") != "0"
 
@@ -402,7 +465,14 @@ pub fn kmeans(
             #: the centres, the totals and the counts come back, which is
             #: `k * width + k + 1` numbers however many samples there are.
             held_centres.upload(centres)
-            if staged {
+            if staged and _KMEANS_TILED {
+                kernel_for("kmeans_assign_tiled").dispatch_async(
+                    [held_values, held_centres, held_labels, held_nearest],
+                    (samples + 255) // 256 * 256,
+                    [samples, width, k],
+                    group_size: 256
+                )
+            } elif staged {
                 kernel_for("kmeans_assign_staged").dispatch_async(
                     [held_values, held_centres, held_labels, held_nearest],
                     samples,
