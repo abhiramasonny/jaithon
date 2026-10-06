@@ -72,6 +72,9 @@ static unsigned rawScratch(const RawFill *f) {
 static bool emitRootFillRaw(Emit *e, unsigned d, unsigned *nrootsOut) {
     RawFill f = { e, d + (unsigned)offsetof(JitCallDesc, roots), 0u, -1 };
     for (unsigned slot = e->base; slot < e->base + e->locals; slot++) {
+        /* An inline's home is dead outside the inline and never zeroed: as a
+         * bare pointer it would hand the marker whatever the slot last held. */
+        if (e->inlHomeLo != 0 && slot >= e->inlHomeLo) continue;
         SlotKind k = e->localKind[slot];
         if (k != SLOT_INST && k != SLOT_LIST && k != SLOT_OBJ &&
             k != SLOT_ITER && k != SLOT_MAYBE_INST) {
@@ -245,7 +248,13 @@ static bool jitNoCollectKnown(const uint8_t *code) {
  * collect-free in turn. `hasSelfSlow`: the site finishes a deoptimised callee
  * in the interpreter, which collects. */
 bool jitCallSkipsRoots(const Emit *e, const ObjFunction *cfn, bool hasSelfSlow) {
-    if (!jitLeafCallRoots() || e->osr || hasSelfSlow) return false;
+    /* Inside a `try` the raise is not this frame's way out but its handler's
+     * way in, and the handler reads the registers this skip left unrooted.
+     * raiseExitAllowed refuses such a call today; this keeps the skip sound
+     * if a handler is ever resumed in the compiled frame. */
+    if (!jitLeafCallRoots() || e->osr || hasSelfSlow || e->inProtected) {
+        return false;
+    }
     return jitNoCollectKnown(cfn->jitFunc);
 }
 
