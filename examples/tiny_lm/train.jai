@@ -151,7 +151,9 @@ fn write_with(
     while window.len() > CONTEXT { window.remove_at(0) }
 
     for _step in 0..260 {
-        let scores = model.predict(Tensor([1, CONTEXT], window))
+        let context = Tensor([1, CONTEXT], window)
+        let scores = model.predict(context)
+        context.free()
         let row = scores.download()
         #: The head already gives probabilities, so temperature reshapes them
         #: rather than the raw scores: a power below one sharpens, above one
