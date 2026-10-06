@@ -20,6 +20,7 @@ static NSMutableDictionary<NSString *, id<MTLLibrary>> *gSourceLibraries;
  * waitTimeoutSeconds for what these bound and why. */
 #define JAI_GPU_KERNEL_COMMIT 64
 #define JAI_GPU_BATCH_UNITS 4096
+#define JAI_GPU_FIRST_BATCH_UNITS 512
 #define JAI_GPU_BATCH_MS 250
 #define JAI_GPU_WAIT_SECONDS 120.0
 
@@ -54,6 +55,18 @@ static int gEncoderStatus = -1;
  * finished batches. Written by Metal's completion thread, read by the
  * encoder, so it is an atomic; 0 until the first batch finishes. */
 static _Atomic double gUnitSeconds;
+/* When the open batch began, and when the last finished batch ended, on the
+ * clock Metal's GPUEndTime uses (CLOCK_UPTIME_RAW). A batch's GPU time is
+ * taken as its end less the later of those two, not as GPUEndTime less
+ * GPUStartTime: MPSGraph commits a batch part way through (commitAndContinue)
+ * and the buffer that finally carries the handler starts only at the last
+ * part, which read a 1.5 ms dispatch as a fifth of that. */
+static double gOpenedAt;
+static _Atomic double gLastEnd;
+
+static double uptimeNow(void) {
+    return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9;
+}
 /* Every batch at or below this has finished. Written both by a thread that
  * waited for one and by Metal's own completion handler on a thread of its
  * own, so it is an atomic rather than something the queue lock covers -- the
@@ -387,12 +400,16 @@ static bool shouldCommitLocked(bool afterGraph) {
     }
     const unsigned units = gOpenEncoded + gOpenGraphs;
     const int cap = batchCapUnits();
-    if (cap > 0 && units >= (unsigned)cap) return true;
+    if (cap <= 0) return false;
+    const double perUnit = atomic_load_explicit(&gUnitSeconds, memory_order_relaxed);
+    /* Until one batch has finished there is no estimate, and a first batch
+     * of four thousand heavy units is seconds of work; the first one is cut
+     * short instead, which costs a loop that waits nothing. */
+    const unsigned most = perUnit > 0.0 || cap < JAI_GPU_FIRST_BATCH_UNITS
+        ? (unsigned)cap : JAI_GPU_FIRST_BATCH_UNITS;
+    if (units >= most) return true;
     const double capSeconds = batchCapSeconds();
-    if (capSeconds > 0.0) {
-        const double perUnit = atomic_load_explicit(&gUnitSeconds, memory_order_relaxed);
-        if (perUnit > 0.0 && perUnit * (double)units >= capSeconds) return true;
-    }
+    if (capSeconds > 0.0 && perUnit > 0.0 && perUnit * (double)units >= capSeconds) return true;
     return false;
 }
 
@@ -405,6 +422,7 @@ static void ensureInFlight(void) {
  * exists for the work about to be encoded into it. */
 void beginBatchLocked(void) {
     gOpenBatch = ++gBatchCounter;
+    gOpenedAt = uptimeNow();
 }
 
 /* Note that whatever is being encoded now may write `b`.
@@ -718,16 +736,20 @@ static void commitOpenLocked(void) {
     const uint64_t mine = gOpenBatch;
     const uint32_t encoded = gOpenEncoded;
     const uint32_t units = gOpenEncoded + gOpenGraphs;
+    const double openedAt = gOpenedAt;
     [gAsyncCommands addCompletedHandler:^(id<MTLCommandBuffer> done) {
         meterNote(done, encoded);
+        const double ended = done.GPUEndTime;
+        const double previous = atomic_load_explicit(&gLastEnd, memory_order_relaxed);
+        if (ended > previous) atomic_store_explicit(&gLastEnd, ended, memory_order_relaxed);
         if ([done status] == MTLCommandBufferStatusError) {
             recordCommandError(done, mine);
             atomic_store(&gErrorPending, true);
-        } else if (units > 0) {
-            /* A swap MPSGraph made part way leaves only the tail's time on
-             * this buffer, so this can only under-estimate; the dispatch cap
-             * is the backstop for that. */
-            const double took = done.GPUEndTime - done.GPUStartTime;
+        } else if (units > 0 && ended > 0.0) {
+            /* From whichever came later, the batch opening or the one before
+             * it ending: anything else on the queue in between is counted
+             * too, which can only over-estimate and so only commit sooner. */
+            const double took = ended - (previous > openedAt ? previous : openedAt);
             if (took > 0.0) {
                 const double perUnit = took / (double)units;
                 const double seen = atomic_load_explicit(&gUnitSeconds, memory_order_relaxed);
