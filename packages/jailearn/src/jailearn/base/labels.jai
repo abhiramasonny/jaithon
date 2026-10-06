@@ -59,8 +59,11 @@ let _HASH_LABELS = env_or("JAILEARN_HASH_LABELS", "1") != "0"
 const LABEL_SLOTS: int = 8192
 
 fn hashed_distinct(y: Tensor) -> list[float] {
-    let table = Tensor([LABEL_SLOTS])
-    let counter = Tensor([2])
+    #: The table and its two counters share one allocation, so the answer
+    #: comes back in a single read.
+    let whole = Tensor([LABEL_SLOTS + 2])
+    let table = whole.view(0, [LABEL_SLOTS])
+    let counter = whole.view(LABEL_SLOTS, [2])
     base_kernel("base_distinct_reset").dispatch_async(
         [table.buffer(), counter.buffer()],
         LABEL_SLOTS,
@@ -71,22 +74,25 @@ fn hashed_distinct(y: Tensor) -> list[float] {
         y.size,
         [y.size, LABEL_SLOTS]
     )
-    #: The table's bit patterns ARE the float values, and an empty slot's
-    #: all-ones pattern reads back as a NaN. More distinct values than slots
-    #: fills every slot, so the count alone catches overflow; `counter[1]`
-    #: says a sample was NaN, which is no class at all.
-    let slots = table.download()
-    let flags = counter.download()
     table.free()
     counter.free()
+    #: The table's bit patterns ARE the float values, and an empty slot's
+    #: all-ones pattern reads back as a NaN. More distinct values than slots
+    #: fills every slot, so the count alone catches overflow; the second
+    #: counter says a sample was NaN, which is no class at all.
+    let slots = whole.download()
+    whole.free()
     var kept: list[float] = []
-    for value in slots {
-        if not math.is_nan(value) { kept.push(value) }
+    for index in 0..LABEL_SLOTS {
+        let value = slots[index]
+        #: `value == value` is false only for a NaN, and unlike a call to
+        #: `math.is_nan` it keeps this loop compiled.
+        if value == value { kept.push(value) }
     }
     if kept.len() > MAX_CLASSES {
         throw ValueError(f"{kept.len()} distinct values exceeds the {MAX_CLASSES} this supports")
     }
-    if flags[1] != 0.0 { throw ValueError("a label is NaN, which is no class") }
+    if slots[LABEL_SLOTS + 1] != 0.0 { throw ValueError("a label is NaN, which is no class") }
     return merge_sort(kept)
 }
 
