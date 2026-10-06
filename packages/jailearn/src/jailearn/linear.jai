@@ -24,8 +24,8 @@ from jaitensor import Tensor
 from .base import Estimator, EstimatorKind, Params
 from .base import affine_columns, cached_kernel, check_fitted, check_matrix, check_pair
 from .base import check_width, cholesky_solve, column_moments, param_bool, param_float
-from .base import params_of
-from .shared import linear_scores
+from .base import LabelIndex, host_cholesky_solve, param_int, params_of, require_target
+from .shared import Descent, linear_scores
 
 let SOURCE = """#include <metal_stdlib>
 using namespace metal;
@@ -47,6 +47,80 @@ kernel void lin_scaler_state(device float* mean [[buffer(0)]],
     bool usable = with_std != 0u && deviation > 1.0e-12f;
     variance[id] = usable ? precise::divide(1.0f, deviation) : 1.0f;
     if (with_mean == 0u) mean[id] = 0.0f;
+}
+
+/* `X` copied into a design `padded` columns wide: its own columns, a column
+ * of ones (the intercept, and the row that sums everything else in a
+ * product), then zeros to a multiple of four so the products below take the
+ * GEMM's fast route. Zero columns add nothing to any product. */
+kernel void lin_augment(device const float* x [[buffer(0)]],
+                        device float* design [[buffer(1)]],
+                        constant uint& rows [[buffer(2)]],
+                        constant uint& width [[buffer(3)]],
+                        constant uint& padded [[buffer(4)]],
+                        uint id [[thread_position_in_grid]]) {
+    if (id >= rows * padded) return;
+    uint row = id / padded;
+    uint column = id - row * padded;
+    design[id] = column < width ? x[row * width + column] : (column == width ? 1.0f : 0.0f);
+}
+
+/* One Newton step's right-hand side for a binary logistic loss, a row at a
+ * time: `p = sigmoid(z)`, then the row of `[s * design | p - t | loss | 0..]`
+ * with `s = p (1 - p)`, so one product `designT . this` holds the weighted
+ * Hessian, the gradient and -- in the ones row -- the total loss together.
+ * Both `p` and `1 - p` come from `exp(-|z|)`, which never overflows and never
+ * loses `1 - p` to cancellation when `p` is near one. */
+kernel void lin_logit_rows(device const float* design [[buffer(0)]],
+                           device const float* z [[buffer(1)]],
+                           device const float* t [[buffer(2)]],
+                           device float* out [[buffer(3)]],
+                           constant uint& rows [[buffer(4)]],
+                           constant uint& padded [[buffer(5)]],
+                           constant uint& stride [[buffer(6)]],
+                           uint id [[thread_position_in_grid]]) {
+    if (id >= rows * stride) return;
+    uint row = id / stride;
+    uint column = id - row * stride;
+    float margin = z[row];
+    float e = exp(-fabs(margin));
+    float near = 1.0f / (1.0f + e);
+    float far = e / (1.0f + e);
+    float p = margin >= 0.0f ? near : far;
+    float q = margin >= 0.0f ? far : near;
+    float value = 0.0f;
+    if (column < padded) {
+        value = p * q * design[row * padded + column];
+    } else if (column == padded) {
+        value = t[row] > 0.5f ? -q : p;
+    } else if (column == padded + 1u) {
+        float signed_margin = t[row] > 0.5f ? margin : -margin;
+        value = max(-signed_margin, 0.0f) + log(1.0f + exp(-fabs(signed_margin)));
+    }
+    out[id] = value;
+}
+
+/* `sigmoid(z)`, stably, as the probability of the second class beside the
+ * first's. */
+kernel void lin_logit_proba(device const float* z [[buffer(0)]],
+                            device float* out [[buffer(1)]],
+                            constant uint& rows [[buffer(2)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id >= rows) return;
+    float margin = z[id];
+    float e = exp(-fabs(margin));
+    float near = 1.0f / (1.0f + e);
+    float far = e / (1.0f + e);
+    float p = margin >= 0.0f ? near : far;
+    out[id * 2u] = margin >= 0.0f ? far : near;
+    out[id * 2u + 1u] = p;
+}
+
+kernel void lin_threshold(device const float* z [[buffer(0)]],
+                          device float* out [[buffer(1)]],
+                          constant uint& rows [[buffer(2)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id < rows) out[id] = z[id] > 0.0f ? 1.0f : 0.0f;
 }
 
 /* `-mean * scale`, the offset `affine_columns` adds after it multiplies. */
@@ -341,4 +415,258 @@ pub class Ridge: Estimator {
 #: Ordinary least squares -- `Ridge` with no penalty, under scikit-learn's name.
 pub fn linear_regression(fit_intercept: bool = true) -> Ridge {
     return Ridge(0.0, fit_intercept)
+}
+
+fn round_up4(n: int) -> int { return (n + 3) // 4 * 4 }
+
+#: Two-class logistic regression with scikit-learn's objective:
+#: `C * sum(log(1 + exp(-y z))) + |w|^2 / 2`, the intercept unpenalised.
+#:
+#: Fitted by Newton's method rather than scikit-learn's L-BFGS. With the
+#: features in the tens, the Hessian is small enough to solve on the host
+#: (`host_cholesky_solve`) and costs one product to form, so each iteration is
+#: two dispatches over the samples and one read back of a `(d+1) x (d+3)`
+#: matrix: `lin_logit_rows` lays out `[s * X1 | p - t | loss]` beside the
+#: design `X1 = [X | 1]`, and `X1T` times that is the weighted Hessian, the
+#: gradient and the loss at once. Newton's quadratic convergence then takes
+#: around eight of those where L-BFGS takes tens of gradient evaluations.
+#:
+#: A step that raises the objective is halved until it does not, which is all
+#: the globalisation a strictly convex objective needs; a Hessian float32 left
+#: barely definite is damped on its diagonal until it factors.
+#:
+#: The fit stops when the largest gradient component of the MEAN loss --
+#: scikit-learn's scale for `tol` -- is below `tol / 100`, or when a step no
+#: longer moves the coefficients; tighter than scikit-learn's own stop, so the
+#: two land on the same optimum rather than on two points near it.
+pub class LogisticRegression: Estimator {
+    pub var C: float
+    pub var fit_intercept: bool
+    pub var max_iter: int
+    pub var tol: float
+    pub var coef_: Tensor?
+    pub var intercept_: float
+    pub var classes_: list[float]
+    pub var n_iter_: int
+    pub var converged_: bool
+    var width: int
+    var labels: LabelIndex?
+
+    pub fn init(
+        self,
+        C: float = 1.0,
+        fit_intercept: bool = true,
+        max_iter: int = 100,
+        tol: float = 1.0e-4
+    ) {
+        if C <= 0.0 { throw ValueError(f"LogisticRegression needs a positive C, got {C}") }
+        if max_iter <= 0 { throw ValueError(f"max_iter must be positive, got {max_iter}") }
+        self.C = C
+        self.fit_intercept = fit_intercept
+        self.max_iter = max_iter
+        self.tol = tol
+        self.coef_ = null
+        self.intercept_ = 0.0
+        self.classes_ = []
+        self.n_iter_ = 0
+        self.converged_ = false
+        self.width = 0
+        self.labels = null
+    }
+
+    pub fn kind(self) -> EstimatorKind { return EstimatorKind.Classifier }
+
+    pub fn fit(self, x: Tensor, y: Tensor? = null) -> void {
+        check_matrix(x)
+        let target = require_target(y, "LogisticRegression")
+        check_pair(x, target)
+        self.free()
+        let labels = LabelIndex.from_labels(target)
+        if labels.count() != 2 {
+            let count = labels.count()
+            labels.free()
+            throw ValueError(f"LogisticRegression here is two-class; y has {count} classes")
+        }
+        self.labels = labels
+        self.classes_ = labels.classes
+        let codes = labels.encode(target)
+        defer { codes.free() }
+
+        let rows = x.shape[0]
+        let width = x.shape[1]
+        self.width = width
+        let padded = round_up4(width + 1)
+        let stride = round_up4(padded + 2)
+        let order = if self.fit_intercept { width + 1 } else { width }
+        let design = Tensor([rows, padded])
+        defer { design.free() }
+        linear_kernel("lin_augment").dispatch_async(
+            [x.buffer(), design.buffer()],
+            rows * padded,
+            [rows, width, padded]
+        )
+        let rhs = Tensor([rows, stride])
+        defer { rhs.free() }
+        let weights = Tensor([padded, 1])
+        defer { weights.free() }
+
+        let c = self.C
+        let mean_scale = 1.0 / (c * float(rows))
+        let floor = self.tol / 100.0
+        var theta = [0.0 for _slot in 0..padded]
+        var previous = [0.0 for _slot in 0..padded]
+        var direction = [0.0 for _slot in 0..padded]
+        var step = 1.0
+        var best = 0.0
+        var started = false
+
+        let descent = Descent(self.max_iter, 0.0)
+        descent.run(fn(iteration: int) -> float {
+            weights.upload(theta)
+            let margins = jt.matmul(design, weights)
+            linear_kernel("lin_logit_rows").dispatch_async(
+                [design.buffer(), margins.buffer(), codes.buffer(), rhs.buffer()],
+                rows * stride,
+                [rows, padded, stride]
+            )
+            margins.free()
+            let product = jt.matmul(design, rhs, trans_a: true)
+            let g = product.download()
+            product.free()
+
+            var penalty = 0.0
+            for index in 0..width { penalty += theta[index] * theta[index] }
+            let objective = c * g[width * stride + padded + 1] + 0.5 * penalty
+            if math.is_nan(objective) { return math.NAN }
+            if started and objective > best + 1.0e-6 * math.fabs(best) and step > 1.0e-6 {
+                step *= 0.5
+                for index in 0..order { theta[index] = previous[index] + step * direction[index] }
+                return 1.0
+            }
+
+            var gradient = [0.0 for _slot in 0..order]
+            var largest = 0.0
+            for a in 0..order {
+                let ridge = if a < width { theta[a] } else { 0.0 }
+                gradient[a] = c * g[a * stride + padded] + ridge
+                largest = max(largest, math.fabs(gradient[a]) * mean_scale)
+            }
+            if largest <= floor { return 0.0 }
+
+            var hessian = [0.0 for _slot in 0..order * order]
+            for a in 0..order {
+                for b in 0..order { hessian[a * order + b] = c * g[a * stride + b] }
+                if a < width { hessian[a * order + a] += 1.0 }
+            }
+            let newton = newton_direction(hessian, gradient, order)
+            var moved = 0.0
+            var size = 1.0
+            for index in 0..order {
+                previous[index] = theta[index]
+                direction[index] = -newton[index]
+                theta[index] -= newton[index]
+                moved = max(moved, math.fabs(newton[index]))
+                size = max(size, math.fabs(theta[index]))
+            }
+            best = objective
+            started = true
+            step = 1.0
+            return if moved <= 1.0e-7 * size { 0.0 } else { moved }
+        })
+        self.n_iter_ = descent.n_iter
+        self.converged_ = descent.converged
+        self.coef_ = Tensor([1, width], theta[0:width])
+        self.intercept_ = if self.fit_intercept { theta[width] } else { 0.0 }
+    }
+
+    #: `X . coef_ + intercept_`, the log-odds of the second class.
+    pub fn decision_function(self, x: Tensor) -> Tensor {
+        check_fitted(self.is_fitted(), "LogisticRegression")
+        check_width(x, self.width, "LogisticRegression")
+        let coef = self.coef_
+        if coef is null { throw RuntimeError("LogisticRegression lost its coefficients") }
+        let bias = Tensor([1], [self.intercept_])
+        defer { bias.free() }
+        let scores = linear_scores(x, coef, bias)
+        return jt.reshape(scores, [x.shape[0]])
+    }
+
+    #: `[n_samples, 2]`, the columns in the order of `classes_`.
+    pub fn predict_proba(self, x: Tensor) -> Tensor {
+        let scores = self.decision_function(x)
+        defer { scores.free() }
+        let out = Tensor([x.shape[0], 2])
+        linear_kernel("lin_logit_proba").dispatch_async(
+            [scores.buffer(), out.buffer()],
+            x.shape[0],
+            [x.shape[0]]
+        )
+        return out
+    }
+
+    #: The second class where the log-odds are positive, as scikit-learn.
+    pub fn predict(self, x: Tensor) -> Tensor {
+        let scores = self.decision_function(x)
+        defer { scores.free() }
+        let codes = Tensor([x.shape[0]])
+        defer { codes.free() }
+        linear_kernel("lin_threshold").dispatch_async(
+            [scores.buffer(), codes.buffer()],
+            x.shape[0],
+            [x.shape[0]]
+        )
+        let labels = self.labels
+        if labels is null { throw RuntimeError("LogisticRegression lost its classes") }
+        return labels.decode(codes)
+    }
+
+    pub fn get_params(self) -> Params {
+        return params_of([
+            ("C", self.C),
+            ("fit_intercept", self.fit_intercept),
+            ("max_iter", self.max_iter),
+            ("tol", self.tol),
+        ])
+    }
+
+    pub fn set_params(self, params: Params) -> void {
+        self.C = param_float(params, "C", self.C)
+        self.fit_intercept = param_bool(params, "fit_intercept", self.fit_intercept)
+        self.max_iter = param_int(params, "max_iter", self.max_iter)
+        self.tol = param_float(params, "tol", self.tol)
+    }
+
+    pub fn clone_unfitted(self) -> LogisticRegression {
+        return LogisticRegression(self.C, self.fit_intercept, self.max_iter, self.tol)
+    }
+
+    pub fn is_fitted(self) -> bool { return self.coef_ is not null }
+
+    pub fn feature_count(self) -> int { return self.width }
+
+    pub fn free(self) -> void {
+        let coef = self.coef_
+        if coef is not null { coef.free() }
+        let labels = self.labels
+        if labels is not null { labels.free() }
+        self.coef_ = null
+        self.labels = null
+        self.intercept_ = 0.0
+    }
+}
+
+#: Solve `H d = g`, damping the diagonal by growing multiples of its largest
+#: entry until float32's rounding no longer leaves `H` indefinite.
+fn newton_direction(hessian: list[float], gradient: list[float], order: int) -> list[float] {
+    var scale = 0.0
+    for index in 0..order { scale = max(scale, math.fabs(hessian[index * order + index])) }
+    var damping = 0.0
+    for _attempt in 0..12 {
+        try {
+            return host_cholesky_solve(hessian, gradient, order, damping: damping)
+        } catch _refused: ValueError {
+            damping = if damping == 0.0 { 1.0e-7 * max(scale, 1.0) } else { damping * 10.0 }
+        }
+    }
+    throw RuntimeError("the logistic Hessian would not factor, even damped")
 }

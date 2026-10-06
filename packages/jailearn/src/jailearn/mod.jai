@@ -64,8 +64,8 @@ export { cached_kernel }
 
 export { Pipeline, ColumnTransformer, FeatureUnion, make_pipeline, make_column_transformer }
 
-from .linear import Ridge, StandardScaler, linear_regression
-export { StandardScaler, Ridge, linear_regression }
+from .linear import LogisticRegression, Ridge, StandardScaler, linear_regression
+export { StandardScaler, Ridge, LogisticRegression, linear_regression }
 
 from .neighbors import KNeighborsClassifier, KNeighborsRegressor
 export { KNeighborsClassifier, KNeighborsRegressor }

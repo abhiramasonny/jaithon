@@ -8,9 +8,11 @@
 #: `clone_unfitted` really is unfitted, that `get_params` round-trips through
 #: `set_params`, and that an unfitted estimator refuses rather than guessing.
 import std.gpu as gpu
+import std.math
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaitensor import Tensor
-from jailearn import Estimator, EstimatorKind, Params, Pipeline, Ridge, StandardScaler
+from jailearn import Estimator, EstimatorKind, LogisticRegression, Params, Pipeline, Ridge
+from jailearn import StandardScaler
 from jailearn import linear_regression, make_pipeline
 from jailearn.base import matrix
 
@@ -186,6 +188,114 @@ fn test_the_estimator_contract_holds() -> void {
     defer { narrow.free() }
     assert_throws(ValueError, || ridge.predict(narrow))
     assert_throws(ValueError, || Ridge(-1.0))
+}
+
+#: Two hundred rows of five features and labels -1 and 2, built by a formula
+#: so scikit-learn could be run on exactly the same numbers.
+fn logistic_data() -> tuple[Tensor, Tensor] {
+    let rows = 200
+    let width = 5
+    let truth = [1.5, -2.0, 0.7, 0.0, 1.1]
+    var values: list[float] = []
+    var labels: list[float] = []
+    for i in 0..rows {
+        var score = 0.8 * math.sin(5.1 * float(i)) + 0.3
+        for j in 0..width {
+            let wave = math.sin(1.3 * float(i) + 0.7 * float(j))
+            let value = wave + 0.5 * math.cos(0.37 * float(i) * float(j))
+            values.push(value)
+            score += value * truth[j]
+        }
+        labels.push(if score > 0.0 { 2.0 } else { -1.0 })
+    }
+    return (Tensor([rows, width], values), Tensor([rows], labels))
+}
+
+#: Against scikit-learn's `LogisticRegression(C, fit_intercept, tol=1e-12)`,
+#: which converged to the optimum these coefficients are, at three settings.
+fn test_logistic_regression_matches_sklearn() -> void {
+    if not have_gpu() { return }
+    let (x, y) = logistic_data()
+    defer { x.free() }
+    defer { y.free() }
+    let cases: list[tuple[float, bool, list[float], float]] = [
+        (1.0, true, [0.5267232, -2.6057907, 0.5334995, 0.3912605, 1.3343498], 2.3092815),
+        (0.1, true, [-0.3577779, -0.9729115, -0.0144722, 0.2627082, 0.6384113], 2.0821466),
+        (1.0, false, [2.8996225, -2.842107, 0.2829699, 0.6658263, 2.0753875], 0.0),
+    ]
+    for (c, intercept, coef, bias) in cases {
+        let model = LogisticRegression(C: c, fit_intercept: intercept)
+        model.fit(x, y)
+        let fitted = model.coef_
+        assert_true(fitted is not null, "fit records coefficients")
+        if fitted is not null {
+            assert_eq(fitted.shape, [1, 5])
+            let got = fitted.download()
+            for (index, want) in coef.enumerate() {
+                assert_near(got[index], want, 1e-3 * max(1.0, math.fabs(want)), f"C {c} coef {index}")
+            }
+        }
+        assert_near(model.intercept_, bias, 1e-3 * max(1.0, math.fabs(bias)), f"C {c} intercept")
+        assert_true(model.converged_, f"C {c} converged")
+        assert_true(model.n_iter_ < 30, f"C {c} took {model.n_iter_} Newton steps")
+        model.free()
+    }
+
+    let model = LogisticRegression()
+    defer { model.free() }
+    model.fit(x, y)
+    assert_eq(model.kind(), EstimatorKind.Classifier)
+    assert_close(model.classes_, [-1.0, 2.0], "classes_")
+    let head = x.view(0, [6, 5])
+    defer { head.free() }
+    let predicted = model.predict(head)
+    defer { predicted.free() }
+    assert_close(predicted.download(), [2.0, -1.0, -1.0, 2.0, 2.0, 2.0], "predict")
+    let proba = model.predict_proba(head)
+    defer { proba.free() }
+    assert_eq(proba.shape, [6, 2])
+    let shares = proba.download()
+    let want = [0.1159787, 0.8840213, 0.7546127, 0.2453873, 0.5703635, 0.4296365]
+    for index in 0..6 { assert_near(shares[index], want[index], 1e-4, f"predict_proba {index}") }
+    let scores = model.decision_function(head)
+    defer { scores.free() }
+    assert_near(scores.download()[0], math.log(0.8840213 / 0.1159787), 1e-3, "decision_function")
+}
+
+fn test_logistic_regression_keeps_the_contract() -> void {
+    if not have_gpu() { return }
+    let (x, y) = logistic_data()
+    defer { x.free() }
+    defer { y.free() }
+    let model = LogisticRegression(C: 0.5, max_iter: 50)
+    defer { model.free() }
+    assert_throws(RuntimeError, || model.predict(x))
+    model.fit(x, y)
+    assert_eq(model.feature_count(), 5)
+    let other = LogisticRegression()
+    defer { other.free() }
+    other.set_params(model.get_params())
+    assert_near(other.C, 0.5, 1e-12, "set_params reads C")
+    assert_eq(other.max_iter, 50)
+    let fresh = model.clone_unfitted()
+    defer { fresh.free() }
+    assert_true(not fresh.is_fitted(), "a clone is unfitted")
+    assert_throws(ValueError, || LogisticRegression(C: 0.0))
+
+    let three = Tensor([200], [float(i % 3) for i in 0..200])
+    defer { three.free() }
+    assert_throws(ValueError, || model.fit(x, three))
+
+    #: One step cannot converge, and says so.
+    let short = LogisticRegression(max_iter: 1)
+    defer { short.free() }
+    short.fit(x, y)
+    assert_true(not short.converged_, "one Newton step is not convergence")
+
+    let piped = make_pipeline([StandardScaler(), LogisticRegression()])
+    defer { piped.free() }
+    piped.fit(x, y)
+    assert_true(piped.score(x, y) > 0.8, "a scaled logistic regression fits its own data")
 }
 
 #: The package's own estimators have to go into its own pipeline. Both of these
