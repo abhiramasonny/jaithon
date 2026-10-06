@@ -19,13 +19,13 @@ import std.math
 import jaitensor as jt
 from jaitensor import Tensor
 
-from .base import EstimatorKind, Params
+from .base import Estimator, EstimatorKind, Params
 from .base import affine_columns, check_fitted, check_matrix, check_pair, check_width
 from .base import cholesky_solve, column_moments, param_bool, param_float, params_of
 from .shared import linear_scores
 
 #: Centre every column and scale it to unit variance.
-pub class StandardScaler {
+pub class StandardScaler: Estimator {
     pub var with_mean: bool
     pub var with_std: bool
     pub var mean_: Tensor?
@@ -134,7 +134,7 @@ pub class StandardScaler {
 }
 
 #: Least squares with an L2 penalty, through the normal equations.
-pub class Ridge {
+pub class Ridge: Estimator {
     pub var alpha: float
     pub var fit_intercept: bool
     pub var coef_: Tensor?

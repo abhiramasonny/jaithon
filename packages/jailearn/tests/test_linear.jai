@@ -10,7 +10,8 @@
 import std.gpu as gpu
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaitensor import Tensor
-from jailearn import EstimatorKind, Ridge, StandardScaler, linear_regression
+from jailearn import Estimator, EstimatorKind, Params, Pipeline, Ridge, StandardScaler
+from jailearn import linear_regression, make_pipeline
 from jailearn.base import matrix
 
 fn have_gpu() -> bool { return gpu.is_available() }
@@ -185,4 +186,52 @@ fn test_the_estimator_contract_holds() -> void {
     defer { narrow.free() }
     assert_throws(ValueError, || ridge.predict(narrow))
     assert_throws(ValueError, || Ridge(-1.0))
+}
+
+#: The package's own estimators have to go into its own pipeline. Both of these
+#: once lacked the `Estimator` conformance, so `make_pipeline` refused them
+#: with a TypeError, while the suite stayed green because only test-local
+#: estimators had ever been piped.
+fn test_a_pipeline_takes_the_real_estimators() -> void {
+    if not have_gpu() { return }
+    let x = sample()
+    defer { x.free() }
+    let y = target()
+    defer { y.free() }
+
+    let scaler = StandardScaler()
+    defer { scaler.free() }
+    let ridge = Ridge(1.0)
+    defer { ridge.free() }
+    let scaled = scaler.fit_transform(x)
+    defer { scaled.free() }
+    ridge.fit(scaled, y)
+    let alone = ridge.predict(scaled)
+    defer { alone.free() }
+
+    let piped = make_pipeline([StandardScaler(), Ridge(1.0)])
+    defer { piped.free() }
+    piped.fit(x, y)
+    assert_eq(piped.kind(), EstimatorKind.Regressor)
+    let together = piped.predict(x)
+    defer { together.free() }
+    assert_close(together.download(), alone.download(), "piped predictions")
+    assert_near(piped.score(x, y), ridge.score(scaled, y), 1e-5, "piped score")
+
+    #: Named steps, and a parameter routed down to one of them.
+    let named = Pipeline([("scale", StandardScaler()), ("ridge", Ridge(5.0))])
+    defer { named.free() }
+    let routed_alpha: Params = {"ridge__alpha": 1.0}
+    named.set_params(routed_alpha)
+    named.fit(x, y)
+    let routed = named.predict(x)
+    defer { routed.free() }
+    assert_close(routed.download(), alone.download(), "routed alpha")
+
+    #: And as plain trait values, which is what a search holds.
+    let generic: Estimator = StandardScaler(false, true)
+    defer { generic.free() }
+    let copy = generic.clone_unfitted()
+    defer { copy.free() }
+    assert_true(not copy.is_fitted(), "a cloned scaler is unfitted")
 }
