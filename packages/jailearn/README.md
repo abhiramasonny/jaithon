@@ -121,6 +121,7 @@ its module loads, and is on unless set to `0`.
 | `JAILEARN_ROW_TOPK` | one thread per row making `k` passes (`base_row_topk`) for every `k`, instead of a threadgroup per row folding its columns in one coalesced pass into per-thread registers and merging the heads, for `k` up to `TOPK_ONE_PASS_MAX` (32); the same tie order, so the same answer. It also turns `nearest_rows` back into a finished distance matrix and a separate top-k |
 | `JAILEARN_RIDGE_PACKED` | `Ridge.fit` as a centred copy of `X`, then `XT X` and `XT y` as two products at the feature width (off the GEMM's fast route at widths not divisible by four), with the means read back before centring and the target summed on the host, instead of one product over a packed `[Xc \| yc \| 0..]` four-aligned operand and one wait |
 | `JAILEARN_LOGIT_FUSED` | a separate product for `LogisticRegression`'s margins each Newton iteration, instead of taking each row's margin inside the row kernel |
+| `JAILEARN_HASH_LABELS` | `distinct_values` as a device bitonic sort of the labels (a dispatch per network stage) and an atomic compaction, and `LabelIndex.fit_codes` as `encode` with its reduction and wait, instead of one pass into a 8192-slot open-addressed table that also refuses a NaN label |
 | `JAILEARN_SCALER_ON_DEVICE` | reading the moments back and building `StandardScaler`'s state on the host, two waits on the device per `fit_transform`, instead of one in-place kernel and no wait |
 
 ## Tests

@@ -673,15 +673,14 @@ pub class LogisticRegression: Estimator {
         let target = require_target(y, "LogisticRegression")
         check_pair(x, target)
         self.free()
-        let labels = LabelIndex.from_labels(target)
+        let (labels, codes) = LabelIndex.fit_codes(target)
+        defer { codes.free() }
         if labels.count() < 2 {
             labels.free()
             throw ValueError("LogisticRegression needs samples of at least two classes")
         }
         self.labels = labels
         self.classes_ = labels.classes
-        let codes = labels.encode(target)
-        defer { codes.free() }
         if labels.count() > 2 {
             self.fit_multinomial(x, codes, labels.count())
             return

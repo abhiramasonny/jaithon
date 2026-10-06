@@ -186,8 +186,8 @@ pub class KNeighborsClassifier: Estimator {
         weighting_code(self.weights)
         self.free()
         self.index.fit(x, self.n_neighbors)
-        let labels = LabelIndex.from_labels(target)
-        self.codes = labels.encode(target)
+        let (labels, codes) = LabelIndex.fit_codes(target)
+        self.codes = codes
         self.classes_ = labels.classes
         self.labels = labels
     }

@@ -570,6 +570,49 @@ fn test_label_index_maps_arbitrary_codes_both_ways() -> void {
     index.free()
 }
 
+#: The distinct values come out ascending and exact at every scale the
+#: classifiers meet: many repeats of a few classes, thousands of classes up to
+#: the limit, zero of either sign as one value, and one class past the limit
+#: refused rather than truncated.
+fn test_distinct_values_holds_at_scale_and_at_the_limit() -> void {
+    if not jl.is_available() { return }
+    var many: list[float] = []
+    for index in 0..50000 { many.push([2.5, -1.0, 7.0][(index * 7) % 3]) }
+    let repeated = Tensor([50000], many)
+    defer { repeated.free() }
+    assert_values(jl.distinct_values(repeated), [-1.0, 2.5, 7.0], "three classes, many times")
+
+    var spread: list[float] = []
+    for index in 0..9000 { spread.push(float((index * 37) % jl.MAX_CLASSES) * 0.5 - 7.0) }
+    let wide = Tensor([9000], spread)
+    defer { wide.free() }
+    let found = jl.distinct_values(wide)
+    assert_eq(found.len(), jl.MAX_CLASSES, "every class up to the limit")
+    for index in 0..found.len() {
+        assert_near(found[index], float(index) * 0.5 - 7.0, 1e-9, f"class {index}")
+    }
+
+    let signed = jl.vector([0.0, -0.0, 1.0, -0.0])
+    defer { signed.free() }
+    assert_values(jl.distinct_values(signed), [0.0, 1.0], "zero of either sign is one value")
+
+    let too_many = Tensor([jl.MAX_CLASSES + 1], [float(i) for i in 0..jl.MAX_CLASSES + 1])
+    defer { too_many.free() }
+    assert_throws(ValueError, || jl.distinct_values(too_many))
+
+    #: A fit indexes and encodes in one step, skipping `encode`'s check; a NaN
+    #: label must still be refused rather than coded as a class.
+    let y = jl.vector([5.0, 3.0, 5.0])
+    defer { y.free() }
+    let (index, codes) = LabelIndex.fit_codes(y)
+    defer { index.free() }
+    defer { codes.free() }
+    assert_values(jl.to_values(codes), [1.0, 0.0, 1.0], "fit_codes")
+    let broken = jl.vector([1.0, math.NAN, 2.0])
+    defer { broken.free() }
+    assert_throws(ValueError, || LabelIndex.fit_codes(broken))
+}
+
 fn test_cholesky_solves_the_normal_equations() -> void {
     if not jl.is_available() { return }
     let a = jl.matrix([[4.0, 2.0], [2.0, 3.0]])

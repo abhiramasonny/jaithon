@@ -744,6 +744,60 @@ kernel void base_unique_from_sorted(device const float* sorted [[buffer(0)]],
     if (slot < capacity) out[slot] = sorted[id];
 }
 
+/* The distinct values of a vector, gathered into an open-addressed table of
+ * `slots` (a power of two) float bit patterns that starts out all `EMPTY`.
+ *
+ * Each sample hashes its bits and probes linearly: a slot that already holds
+ * them is a plain read, so once the handful of classes are in, the samples
+ * behind them cost one load each and no atomic; an empty slot is claimed by
+ * compare-and-swap, and the winner bumps `counter[0]`. A NaN, which is no
+ * class, or a sample that probes every slot without a home sets `counter[1]`.
+ * `-0.0` is folded onto `0.0`, which is how the sorted route's `==` saw
+ * them. */
+kernel void base_distinct_hash(device const float* values [[buffer(0)]],
+                               device atomic_uint* table [[buffer(1)]],
+                               device atomic_uint* counter [[buffer(2)]],
+                               constant uint& count [[buffer(3)]],
+                               constant uint& slots [[buffer(4)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    const uint empty = 0xFFFFFFFFu;
+    float value = values[id];
+    if (not_a_number(value)) {
+        atomic_store_explicit(&counter[1], 0x3F800000u, memory_order_relaxed);
+        return;
+    }
+    uint bits = value == 0.0f ? 0u : as_type<uint>(value);
+    uint at = (bits * 2654435761u) & (slots - 1u);
+    for (uint probe = 0u; probe < slots; ++probe) {
+        uint held = atomic_load_explicit(&table[at], memory_order_relaxed);
+        if (held == bits) return;
+        if (held == empty) {
+            uint expected = empty;
+            if (atomic_compare_exchange_weak_explicit(&table[at], &expected, bits,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed)) {
+                atomic_fetch_add_explicit(&counter[0], 1u, memory_order_relaxed);
+                return;
+            }
+            if (expected == bits) return;
+            /* Lost the slot to another value: look at this one again. */
+            if (expected == empty) { probe--; continue; }
+        }
+        at = (at + 1u) & (slots - 1u);
+    }
+    atomic_store_explicit(&counter[1], 0x3F800000u, memory_order_relaxed);
+}
+
+/* `base_distinct_hash`'s table set to EMPTY and its two counters to zero. */
+kernel void base_distinct_reset(device uint* table [[buffer(0)]],
+                                device uint* counter [[buffer(1)]],
+                                constant uint& slots [[buffer(2)]],
+                                uint id [[thread_position_in_grid]]) {
+    if (id < slots) table[id] = 0xFFFFFFFFu;
+    if (id < 2u) counter[id] = 0u;
+}
+
 kernel void base_counter_value(device const atomic_uint* counter [[buffer(0)]],
                                device float* out [[buffer(1)]],
                                uint id [[thread_position_in_grid]]) {
