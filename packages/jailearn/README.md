@@ -87,7 +87,10 @@ linear helpers (`add_bias`, `linear_scores`, `soft_threshold`,
 `column_norms`), and `Descent`, which is why every iterative fit in the
 package reports `n_iter` and `converged` the same way.
 
-`linear.jai` holds `StandardScaler`, `Ridge` and `linear_regression`;
+`linear.jai` holds `StandardScaler`, `Ridge`, `linear_regression` and
+`LogisticRegression` (scikit-learn's L2 objective: Newton for two classes,
+each iteration one product that yields the weighted Hessian, the gradient and
+the loss together; L-BFGS with a device gradient for the multinomial case);
 `neighbors.jai` holds `KNeighborsClassifier` and `KNeighborsRegressor`, a
 brute-force search built on `nearest_rows` -- one GEMM per band of queries and
 a one-pass top-k that ranks the raw product, so the distance matrix is never
