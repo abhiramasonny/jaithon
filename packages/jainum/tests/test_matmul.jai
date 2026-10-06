@@ -290,6 +290,57 @@ fn test_the_leading_axes_stack_and_broadcast() -> void {
     assert_eq(wide.shape, [2, 5, 3, 3])
 }
 
+fn test_a_ragged_width_reaches_mps_through_padding() -> void {
+    if not have_gpu() { return }
+
+    #: Widths that are not a multiple of four used to be refused by MPS and
+    #: fall to the fold kernel, 75 times slower at 100k x 50. Each is now run
+    #: on zero-padded copies, so each is checked: the gram (one buffer read
+    #: twice, padded once), a weight product padding the inner axis of both
+    #: operands, and the transposed-right product a distance matrix takes.
+    for width in [1, 2, 3, 5, 49, 50, 51, 63] {
+        let samples = max(2000, 4194304 // (width * width) + 1)
+        let x = spread([samples, width], width * 7 + 1)
+        let flipped = transpose(x)
+        let gram = matmul(flipped, x)
+        assert_close(
+            gram.to_list(),
+            host_product(flipped.to_list(), x.to_list(), width, samples, width),
+            f"gram at width {width}"
+        )
+        gram.free()
+        x.free()
+        check_layout(samples, width, 3, false, false, f"a weight product at width {width}")
+    }
+    for width in [49, 50, 51, 63] {
+        check_layout(300, width, 500, false, true, f"a distance product at width {width}")
+        check_layout(300, width, 501, true, true, f"both flipped at width {width}")
+    }
+}
+
+fn test_a_padded_plane_past_the_first_reads_its_own_values() -> void {
+    if not have_gpu() { return }
+
+    #: A batch whose planes are each a small result over a long inner axis
+    #: goes plane by plane, so the padded route is handed an offset into the
+    #: operands and into the result. 18 columns needs padding.
+    let a = spread([3, 20, 12000], 48)
+    let b = spread([3, 12000, 18], 49)
+    defer { a.free() }
+    defer { b.free() }
+    let product = matmul(a, b)
+    defer { product.free() }
+    let av = a.to_list()
+    let bv = b.to_list()
+    let cv = product.to_list()
+    for plane in 0..3 {
+        let left = av[plane * 240000:(plane + 1) * 240000]
+        let right = bv[plane * 216000:(plane + 1) * 216000]
+        let got = cv[plane * 360:(plane + 1) * 360]
+        assert_close(got, host_product(left, right, 20, 12000, 18), f"padded plane {plane}")
+    }
+}
+
 fn test_a_plane_past_the_first_reads_its_own_values() -> void {
     if not have_gpu() { return }
 

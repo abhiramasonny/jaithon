@@ -57,6 +57,7 @@
 #: ```
 import std.gpu as gpu
 from std.gpu import Buffer
+from std.os import env_or
 
 from .array import BOOL, INT32, NDArray, OP_MUL, OP_SUB, PRELUDE
 from .array import GROUP, binary_arith, broadcast_shapes, contiguous_strides
@@ -78,6 +79,17 @@ const FOLD_OUTPUTS = TILE * TILE
 #: Picked at the shape the benchmark measures -- 256 cubed is 16.7 million --
 #: with room above it; a plane larger than this earns its own graph call.
 const _BATCH_MPS_FLOOR = 64 * 1024 * 1024
+
+#: `JAINUM_MATMUL_PAD=0` keeps a product whose stored rows are not a multiple
+#: of four floats off MPS, on the fold and tiled kernels, instead of running it
+#: on zero-padded copies (`_encode_padded`). At 100k x 50 the gram is 62 ms on
+#: the fold kernel and about a millisecond padded.
+let _PAD_MPS = env_or("JAINUM_MATMUL_PAD", "1") != "0"
+
+#: Multiplies below which an unaligned product stays on the kernels here: the
+#: copies and the graph's encode cost tens of microseconds, which a product
+#: this small does not earn back.
+const _PAD_MPS_WORK = 4 * 1024 * 1024
 
 #: Threadgroups the two-pass dot product runs over at most, so that the second
 #: pass folds what one group can hold: 1024 partials is four per thread.
@@ -323,6 +335,38 @@ kernel void mm_dot_finish(device float* out [[buffer(0)]],
     for (uint j = 0u; j < ND_WARPS; j++) sum += warp_totals[j];
     out[out_at] = sum;
 }
+
+/* A row-major `src_rows x src_columns` plane starting at `src_at`, copied into
+ * a zero-filled `dst_rows x dst_columns` one so that MPS can read it. Zero and
+ * not just anything finite: a padded inner position meets the other operand's
+ * padding, and 0 * NaN is NaN. */
+kernel void mm_pad(device float* dst [[buffer(0)]],
+                   device const float* src [[buffer(1)]],
+                   constant uint& src_rows [[buffer(2)]],
+                   constant uint& src_columns [[buffer(3)]],
+                   constant uint& dst_rows [[buffer(4)]],
+                   constant uint& dst_columns [[buffer(5)]],
+                   constant uint& src_at [[buffer(6)]],
+                   uint id [[thread_position_in_grid]]) {
+    if (id >= dst_rows * dst_columns) return;
+    const uint r = id / dst_columns;
+    const uint c = id - r * dst_columns;
+    dst[id] = (r < src_rows && c < src_columns) ? src[src_at + r * src_columns + c] : 0.0f;
+}
+
+/* The top-left `rows x columns` of a padded product, written at `out_at`. */
+kernel void mm_unpad(device float* out [[buffer(0)]],
+                     device const float* src [[buffer(1)]],
+                     constant uint& rows [[buffer(2)]],
+                     constant uint& columns [[buffer(3)]],
+                     constant uint& src_columns [[buffer(4)]],
+                     constant uint& out_at [[buffer(5)]],
+                     uint id [[thread_position_in_grid]]) {
+    if (id >= rows * columns) return;
+    const uint r = id / columns;
+    const uint c = id - r * columns;
+    out[out_at + id] = src[r * src_columns + c];
+}
 """
 
 #: The dtype a product carries. Two booleans multiply and *sum*, which is
@@ -338,7 +382,8 @@ fn _product_dtype(a: int, b: int) -> int {
 #:
 #: The columns of each matrix *as it is stored* must be a multiple of four
 #: floats — a transposed operand is stored with the other extent innermost, so
-#: the flag decides which of the two is checked.
+#: the flag decides which of the two is checked. A large product that fails
+#: this still reaches MPS, through `_encode_padded`.
 fn _mps_ready(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> bool {
     let a_columns = if trans_a { rows } else { inner }
     let b_columns = if trans_b { inner } else { columns }
@@ -378,6 +423,118 @@ fn _plane(a: NDArray) -> (NDArray, bool, bool) {
 fn _window(store: Buffer, at: int, count: int) -> (Buffer, bool) {
     if at == 0 { return (store, false) }
     return (store.view(at, count), true)
+}
+
+#: `store` read from `at` as a row-major `rows x columns` plane, in a buffer
+#: MPS can take as a `padded_rows x padded_columns` one: a zero-filled copy, or
+#: the plane itself (as a window) when nothing needs padding. The flag says the
+#: caller frees what came back.
+fn _padded_plane(
+    store: Buffer,
+    at: int,
+    rows: int,
+    columns: int,
+    padded_rows: int,
+    padded_columns: int
+) -> (Buffer, bool) {
+    if rows == padded_rows and columns == padded_columns {
+        return _window(store, at, rows * columns)
+    }
+    let copy = Buffer(padded_rows * padded_columns)
+    kernel_of(SOURCE, "mm_pad").dispatch_async(
+        [copy, store],
+        padded_rows * padded_columns,
+        [rows, columns, padded_rows, padded_columns, at]
+    )
+    return (copy, true)
+}
+
+fn _round_up_4(extent: int) -> int { return (extent + 3) // 4 * 4 }
+
+#: One product through MPS on zero-padded copies of whatever MPS cannot read.
+#:
+#: MPS reads a matrix by its row bytes, so a stored row must be a multiple of
+#: four floats; anything else used to go to the fold or tiled kernel, and a
+#: 100k x 50 gram took 62 ms there against 0.82 at width 48. Every extent some
+#: matrix stores innermost is rounded up to four -- the inner one as well when
+#: either operand stores it innermost -- the operands that change shape are
+#: copied into zero-filled planes, and the product of those is cut back into
+#: `out`. Zeros along the inner axis add nothing; the extra rows and columns of
+#: the padded result are never read. A copy is released once encoded: the
+#: queue is serial, so whatever reuses it runs after this. One plane read the
+#: same way on both sides -- `matmul(transpose(x), x)` -- is padded once.
+fn _encode_padded(
+    out: NDArray,
+    out_at: int,
+    a: NDArray,
+    a_at: int,
+    trans_a: bool,
+    b: NDArray,
+    b_at: int,
+    trans_b: bool,
+    rows: int,
+    inner: int,
+    columns: int
+) -> void {
+    let padded_rows = if trans_a { _round_up_4(rows) } else { rows }
+    let padded_inner = if not trans_a or trans_b { _round_up_4(inner) } else { inner }
+    let padded_columns = _round_up_4(columns)
+    let a_rows = if trans_a { inner } else { rows }
+    let a_columns = if trans_a { rows } else { inner }
+    let a_padded_rows = if trans_a { padded_inner } else { padded_rows }
+    let a_padded_columns = if trans_a { padded_rows } else { padded_inner }
+    let b_rows = if trans_b { columns } else { inner }
+    let b_columns = if trans_b { inner } else { columns }
+    let b_padded_rows = if trans_b { padded_columns } else { padded_inner }
+    let b_padded_columns = if trans_b { padded_inner } else { padded_columns }
+    let (left, owns_left) = _padded_plane(
+        a.storage,
+        a_at,
+        a_rows,
+        a_columns,
+        a_padded_rows,
+        a_padded_columns
+    )
+    let shared = a.storage.handle_of() == b.storage.handle_of() and a_at == b_at and a_rows == b_rows and a_columns == b_columns and a_padded_rows == b_padded_rows and a_padded_columns == b_padded_columns
+    let (right, owns_right) = if shared {
+        (left, false)
+    } else {
+        _padded_plane(b.storage, b_at, b_rows, b_columns, b_padded_rows, b_padded_columns)
+    }
+    if padded_rows == rows and padded_columns == columns {
+        let (result, owns_result) = _window(out.storage, out_at, rows * columns)
+        gpu.matmul_async(
+            left,
+            right,
+            result,
+            padded_rows,
+            padded_inner,
+            padded_columns,
+            trans_a: trans_a,
+            trans_b: trans_b
+        )
+        if owns_result { result.free() }
+    } else {
+        let wide = Buffer(padded_rows * padded_columns)
+        gpu.matmul_async(
+            left,
+            right,
+            wide,
+            padded_rows,
+            padded_inner,
+            padded_columns,
+            trans_a: trans_a,
+            trans_b: trans_b
+        )
+        kernel_of(SOURCE, "mm_unpad").dispatch_async(
+            [out.storage, wide],
+            rows * columns,
+            [rows, columns, padded_columns, out_at]
+        )
+        wide.free()
+    }
+    if owns_left { left.free() }
+    if owns_right { right.free() }
 }
 
 #: A vector dot product: partials over a fixed grid, then one group folds them.
@@ -448,6 +605,10 @@ fn _encode(
         if owns_left { left.free() }
         if owns_right { right.free() }
         if owns_result { result.free() }
+        return
+    }
+    if _PAD_MPS and rows * inner * columns >= _PAD_MPS_WORK {
+        _encode_padded(out, out_at, a, a_at, trans_a, b, b_at, trans_b, rows, inner, columns)
         return
     }
     var flags = 0
