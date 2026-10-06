@@ -2139,9 +2139,10 @@ class Gen:
                   f"    }}\n") if nullable else ""
         arg = f"n % {sr.randint(2, 4)} + {sr.randint(0, 1)}"
         lines = []
+        # Every site is a compiled helper rather than the probe itself: a
+        # probe rarely compiles whole, and over 400 seeds a call made from
+        # one found the bug in none of the 42 programs that drew it.
         site = sr.randrange(5)
-        if nullable and site in (2, 3):
-            site -= 2
         if site == 0:
             # Through a function parameter: the closure-call arm.
             via = self.fresh("scv")
@@ -2163,13 +2164,52 @@ class Gen:
                 f"}}")
             lines.append(f"acc = acc +% {drive}({arg})")
         elif site == 2:
-            # A function value held in the probe's own local.
-            g = self.fresh("g")
-            lines.append(f"let {g}: fn(int) -> int = {rec}")
-            lines.append(f"acc = acc +% {g}({arg})")
+            # One level further out: the forwarder reads `holder` after the
+            # call, so it is the body that deoptimises -- and it wrote nothing
+            # it compiled either, because its callee claimed not to.
+            fw = self.fresh("sco")
+            drive = self.fresh("scd")
+            helpers.append(
+                f"fn {fw}(x: int) -> int {{\n"
+                f"    let q = {rec}(x)\n"
+                f"{settle}"
+                f"    return q + {holder}.k\n"
+                f"}}")
+            helpers.append(
+                f"fn {drive}(x: int) -> int {{\n"
+                f"    let q = {fw}(x)\n"
+                f"    return q + 0\n"
+                f"}}")
+            lines.append(f"acc = acc +% {drive}({arg})")
         elif site == 3:
-            # A direct call in the probe itself.
-            lines.append(f"acc = acc +% {rec}({arg})")
+            # A method that calls it and then reads `holder`: the method
+            # itself writes nothing it compiled, so its own compiled caller
+            # re-ran it when the read deoptimised.
+            user = self.fresh("ScUse")
+            uobj = self.fresh("scu")
+            drive = self.fresh("scm")
+            msettle = (f"        if r is null {{\n"
+                       f"            return {miss}\n"
+                       f"        }}\n") if nullable else ""
+            classes.append(
+                f"class {user} {{\n"
+                f"    pub var u: int\n"
+                f"    pub fn init(self) {{\n"
+                f"        self.u = 1\n"
+                f"    }}\n"
+                f"    pub fn go(self, x: int) -> int {{\n"
+                f"        let r = {rec}(x)\n"
+                f"{msettle}"
+                f"        return r + {holder}.k\n"
+                f"    }}\n"
+                f"}}")
+            helpers.append(f"var {uobj}: {user} = {user}()")
+            helpers.append(
+                f"fn {drive}(x: int) -> int {{\n"
+                f"    let q = {uobj}.go(x)\n"
+                f"    return q + 0\n"
+                f"}}")
+            lines.append(f"acc = acc +% {drive}({arg})")
         else:
             # A loop calling it through a parameter, for the OSR tier.
             loop = self.fresh("scp")
