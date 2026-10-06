@@ -652,27 +652,44 @@ fn flat_policy() -> int {
 #: a step where this is one graph. An image model is the same graph behind a
 #: Flatten that is only a reshape. Measured 2026-10-05 on fashion, three
 #: epochs, under the GPU lock (n=5, alternated): [784-512-512-10] SGD b512
-#: 267 ms static to 171 compiled, [784-128-64-10] Adam b64 1340 to 1073,
-#: [784-32-10] SGD b32 518 to 330, and no shape tried was slower compiled
-#: ([784-128-10] Adam b512 was the closest, 112.6 against 113.0). So there is
-#: no size floor.
+#: 267 ms static to 171 compiled, [784-128-64-10] momentum b64 1242 to 989,
+#: [784-32-10] SGD b32 518 to 330. Plain descent and momentum add two or three
+#: graph operations a parameter, and no shape tried with them was slower
+#: compiled, so for them there is no size floor.
 #:
-#: What is gated is the batch that does not fill: a compiled step is built for
+#: Adam is gated on the work in a step, `work` -- the batch times the
+#: parameter count, roughly the multiply-adds of one forward pass. Its update
+#: is a dozen graph operations a parameter where the static path runs one
+#: kernel, and when the arithmetic is small the step is all host work, so
+#: encoding those operations decides it, and which side wins moves with
+#: whatever else the machine is doing. [784-128-64-10] Adam b64 (7M) read
+#: 1267 ms static against 1468 compiled in one session of five alternated
+#: rounds, every round the same way, and 947 against 739 in another, again
+#: every round; [784-128-10] b512 (52M) tied at 112.6 against 113.0. A step
+#: that only sometimes wins is not taken: below `ADAM_FLAT_MIN_WORK` an Adam
+#: model stays on the static path it had before flat data compiled.
+#:
+#: Also gated is the batch that does not fill: a compiled step is built for
 #: one batch size and leaves a short last batch untrained, which the static
 #: path does not. Flat data compiles only when that tail is at most a
 #: sixty-fourth of the epoch -- 96 of fashion's 60000 rows at b512 -- so a
 #: small table with a large batch keeps every row it has.
 #:
 #: `JAITENSOR_COMPILED_FLAT`: 0 never compiles for a flat dataset (the old
-#: rule), 2 compiles whatever the tail, and anything else is the default
-#: above. Read once; `set_flat_policy` overrides it in-process.
-pub fn flat_step_wanted(samples: int, batch_size: int) -> bool {
+#: rule), 2 compiles whatever the tail and the work, and anything else is the
+#: default above. Read once; `set_flat_policy` overrides it in-process.
+pub fn flat_step_wanted(samples: int, batch_size: int, adam: bool = false, work: int = 0) -> bool {
     let policy = flat_policy()
     if policy == 0 { return false }
     if policy == 2 { return true }
     if batch_size <= 0 or samples < batch_size { return false }
-    return (samples % batch_size) * 64 <= samples
+    if samples % batch_size * 64 > samples { return false }
+    return not adam or work >= ADAM_FLAT_MIN_WORK
 }
+
+#: The least work a step (batch times parameters) must carry before an Adam
+#: model on flat rows is compiled; see `flat_step_wanted`.
+pub let ADAM_FLAT_MIN_WORK = 64 * 1024 * 1024
 
 var _fused_mlp = -1
 

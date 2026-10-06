@@ -757,7 +757,13 @@ fn test_a_flat_dataset_trains_through_the_compiled_step_and_agrees() -> void {
                 ]
             )
             model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
-            let history = model.fit(data, epochs: 6, batch_size: 32, verbose: false, plot_path: null)
+            let history = model.fit(
+                data,
+                epochs: 6,
+                batch_size: 32,
+                verbose: false,
+                plot_path: null
+            )
             let want = if compiled { "compiled" } else { "static" }
             assert_eq(model.training_route(), want, f"{name} took the wrong path")
             for value in history.loss { assert_true(math.is_finite(value), f"{name} loss {value}") }
@@ -797,10 +803,19 @@ fn test_evaluate_between_fits_keeps_the_optimiser_state() -> void {
                 Dense(4, activation: Activation.Softmax),
             ]
         )
-        model.compile(optimizer: jt.Adam(learning_rate: 0.01), loss: SparseCategoricalCrossentropy())
+        model.compile(
+            optimizer: jt.Adam(learning_rate: 0.01),
+            loss: SparseCategoricalCrossentropy()
+        )
         var trace: list[float] = []
         for _round in 0..3 {
-            let history = model.fit(data, epochs: 1, batch_size: 16, verbose: false, plot_path: null)
+            let history = model.fit(
+                data,
+                epochs: 1,
+                batch_size: 16,
+                verbose: false,
+                plot_path: null
+            )
             trace.push(history.loss[0])
             if interrupted { model.evaluate(data, batch_size: 8) }
         }
@@ -835,6 +850,32 @@ fn test_a_flat_dataset_with_a_large_tail_stays_static() -> void {
         model.compile(optimizer: SGD(learning_rate: 0.1), loss: SparseCategoricalCrossentropy())
         model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
         assert_eq(model.training_route(), want, f"{samples} rows")
+        model.free()
+        data.free()
+    }
+}
+
+#: Adam on flat rows compiles only when a step carries enough arithmetic to
+#: pay for encoding its update, a dozen graph operations a parameter; below
+#: that the static path's one kernel a parameter is quicker. Plain descent
+#: and momentum add two or three operations and compile at any size.
+fn test_a_small_adam_model_on_flat_rows_stays_static() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    for (name, want) in [("adam", "static"), ("momentum", "compiled"), ("sgd", "compiled")] {
+        let data = learnable_rows(128, 20, 4, 7)
+        let model = jt.Sequential(
+            [
+                Dense(16, activation: Activation.Relu),
+                Dense(16, activation: Activation.Relu),
+                Dense(4, activation: Activation.Softmax),
+            ]
+        )
+        model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+        model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
+        assert_eq(model.training_route(), want, name)
         model.free()
         data.free()
     }

@@ -413,7 +413,13 @@ pub class Sequential {
         self.freed = true
     }
 
-    fn _prepare(self, dataset: Dataset, epochs: int, batch_size: int, training: bool = true) -> void {
+    fn _prepare(
+        self,
+        dataset: Dataset,
+        epochs: int,
+        batch_size: int,
+        training: bool = true
+    ) -> void {
         self._check_live()
         if epochs <= 0 { throw ValueError(f"epochs must be positive, got {epochs}") }
         if batch_size <= 0 { throw ValueError(f"batch_size must be positive, got {batch_size}") }
@@ -517,7 +523,12 @@ pub class Sequential {
             return shape
         }
         if dataset.features.rank() != 2 { return null }
-        if not flat_step_wanted(dataset.samples, batch_size) { return null }
+        var parameters = 0
+        for parameter in self._parameters() { parameters += parameter.size }
+        let adam = kind == 1
+        if not flat_step_wanted(dataset.samples, batch_size, adam: adam, work: batch_size * parameters) {
+            return null
+        }
         shape.push(dataset.feature_count)
         return shape
     }
