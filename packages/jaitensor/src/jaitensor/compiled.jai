@@ -665,9 +665,11 @@ fn flat_policy() -> int {
 #: whatever else the machine is doing. [784-128-64-10] Adam b64 (7M) read
 #: 1267 ms static against 1468 compiled in one session of five alternated
 #: rounds, every round the same way, and 947 against 739 in another, again
-#: every round; [784-128-10] b512 (52M) tied at 112.6 against 113.0. A step
-#: that only sometimes wins is not taken: below `ADAM_FLAT_MIN_WORK` an Adam
-#: model stays on the static path it had before flat data compiled.
+#: every round. Under a load average of 10-40 (n=4, paired ratios
+#: static/compiled): 7M 0.82x, [784-512-512-10] b64 (43M) 0.58x, b512
+#: (343M) 0.73x, and only b2048 (1.4G) won, 1.18x (1.02-1.43x). A step that
+#: only sometimes wins is not taken: below `ADAM_FLAT_MIN_WORK` an Adam model
+#: stays on the static path it had before flat data compiled.
 #:
 #: Also gated is the batch that does not fill: a compiled step is built for
 #: one batch size and leaves a short last batch untrained, which the static
@@ -689,7 +691,7 @@ pub fn flat_step_wanted(samples: int, batch_size: int, adam: bool = false, work:
 
 #: The least work a step (batch times parameters) must carry before an Adam
 #: model on flat rows is compiled; see `flat_step_wanted`.
-pub let ADAM_FLAT_MIN_WORK = 64 * 1024 * 1024
+pub let ADAM_FLAT_MIN_WORK = 1024 * 1024 * 1024
 
 var _fused_mlp = -1
 
