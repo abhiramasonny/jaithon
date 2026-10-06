@@ -199,6 +199,73 @@ fn test_column_statistics_use_two_passes() -> void {
     assert_near(jl.to_values(spread)[0], 1.0, 1e-3, "variance far from the origin")
 }
 
+fn host_column_check(rows: int, width: int, offset: float) -> void {
+    var values: list[float] = []
+    var masked: list[float] = []
+    for index in 0..rows * width {
+        values.push(offset + math.sin(float(index) * 0.7311) * float(1 + index % 7))
+        masked.push(if index % 5 == 0 { 1.0 } else { 0.0 })
+    }
+    let x = Tensor([rows, width], values)
+    defer { x.free() }
+    let mask = Tensor([rows, width], masked)
+    defer { mask.free() }
+    let (mean, variance) = jl.column_moments(x, ddof: 1)
+    defer { mean.free() }
+    defer { variance.free() }
+    let (low, high) = jl.column_min_max(x)
+    defer { low.free() }
+    defer { high.free() }
+    let kept = jl.masked_column_mean(x, mask)
+    defer { kept.free() }
+    let means = jl.to_values(mean)
+    let spreads = jl.to_values(variance)
+    let lows = jl.to_values(low)
+    let highs = jl.to_values(high)
+    let keeps = jl.to_values(kept)
+    for column in 0..width {
+        var total = 0.0
+        var smallest = values[column]
+        var largest = values[column]
+        var kept_total = 0.0
+        var kept_count = 0.0
+        for row in 0..rows {
+            let value = values[row * width + column]
+            total += value
+            smallest = min(smallest, value)
+            largest = max(largest, value)
+            if masked[row * width + column] == 0.0 {
+                kept_total += value
+                kept_count += 1.0
+            }
+        }
+        let centre = total / float(rows)
+        var squares = 0.0
+        for row in 0..rows {
+            let gap = values[row * width + column] - centre
+            squares += gap * gap
+        }
+        let what = f"{rows}x{width} column {column}"
+        assert_near(means[column], centre, 1e-3 + 1e-6 * math.fabs(offset), f"{what} mean")
+        assert_near(spreads[column], squares / float(rows - 1), 2e-3, f"{what} variance")
+        assert_near(lows[column], smallest, 1e-3, f"{what} min")
+        assert_near(highs[column], largest, 1e-3, f"{what} max")
+        let expected = if kept_count > 0.0 { kept_total / kept_count } else { 0.0 }
+        assert_near(keeps[column], expected, 1e-3 + 1e-6 * math.fabs(offset), f"{what} masked")
+    }
+}
+
+#: The column statistics cut the samples into tiles and fold per-tile
+#: partials, so they are checked here at shapes that make many tiles, columns
+#: wider than a threadgroup, a single column, and a mean far from the spread.
+fn test_column_statistics_fold_tiles_of_rows() -> void {
+    if not jl.is_available() { return }
+    host_column_check(20011, 3, 0.0)
+    host_column_check(700, 300, 0.0)
+    host_column_check(9001, 1, 0.0)
+    host_column_check(4099, 7, 10000.0)
+}
+
 fn test_masked_mean_and_nan_mask_make_an_imputer() -> void {
     if not jl.is_available() { return }
     let x = jl.matrix([[1.0, math.NAN], [3.0, 20.0]])

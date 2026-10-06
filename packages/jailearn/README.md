@@ -108,6 +108,8 @@ its module loads, and is on unless set to `0`.
 | Switch | Off restores |
 | --- | --- |
 | `JAILEARN_HOST_SOLVE` | the device Cholesky factor and substitutions (two dispatches a column, one a row) for every order, instead of reading a system of order up to `HOST_SOLVE_ORDER` (256) back and solving it on the host in double precision; 50x50 goes from about 200 dependent dispatches to one read back |
+| `JAILEARN_COLUMN_TILES` | one threadgroup per column striding the samples, two passes, for `column_moments`, `column_min_max` and `masked_column_mean`, instead of row tiles read as whole consecutive rows, folded per tile with Welford's update and merged by Chan's rule in a second small dispatch |
+| `JAILEARN_SCALER_ON_DEVICE` | reading the moments back and building `StandardScaler`'s state on the host, two waits on the device per `fit_transform`, instead of one in-place kernel and no wait |
 
 ## Tests
 

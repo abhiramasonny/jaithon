@@ -1,14 +1,47 @@
 #: Reductions down a matrix's columns and along its rows, and the sorts underneath.
+from std.os import env_or
+
 from jaitensor import Tensor
 
 from .kernels import base_kernel
 from .params import check_matrix
+
+#: `JAILEARN_COLUMN_TILES=0` restores one threadgroup per column, striding
+#: the samples, instead of row tiles folded into per-group partials.
+let _COLUMN_TILES = env_or("JAILEARN_COLUMN_TILES", "1") != "0"
+
+#: Elements each thread of a tile should fold before its partial is worth
+#: writing; it sets how many tiles the samples are cut into.
+const TILE_WORK: int = 32
+const MAX_TILES: int = 1024
 
 fn column_reduce(x: Tensor, mask: Tensor, mode: int, ddof: int) -> tuple[Tensor, Tensor] {
     check_matrix(x)
     let width = x.shape[1]
     let first = Tensor([width])
     let second = Tensor([width])
+    if _COLUMN_TILES {
+        let rows = x.shape[0]
+        let wanted = (rows * width + 256 * TILE_WORK - 1) // (256 * TILE_WORK)
+        let cut = max(1, min(min(wanted, MAX_TILES), rows))
+        let tile = (rows + cut - 1) // cut
+        let groups = if tile > 0 { (rows + tile - 1) // tile } else { 1 }
+        let partials = Tensor([width * groups * 3])
+        base_kernel("base_column_partials").dispatch_async(
+            [x.buffer(), mask.buffer(), partials.buffer()],
+            groups * 256,
+            [rows, width, mode, tile, groups],
+            group_size: 256
+        )
+        base_kernel("base_column_finish").dispatch_async(
+            [partials.buffer(), first.buffer(), second.buffer()],
+            width * 256,
+            [width, mode, groups, max(ddof, 0)],
+            group_size: 256
+        )
+        partials.free()
+        return (first, second)
+    }
     base_kernel("base_column_reduce").dispatch_async(
         [x.buffer(), mask.buffer(), first.buffer(), second.buffer()],
         width * 256,
