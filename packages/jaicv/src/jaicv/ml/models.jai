@@ -5,9 +5,13 @@
 #: `train` and `predict`. The factory functions are named the way OpenCV names
 #: them, so `k_nearest_create()` stands where `cv2.ml.KNearest_create()` would.
 #:
-#: These run on the host. A model is trained once on data that fits in memory
-#: and then asked about a handful of samples at a time; the arithmetic is small
-#: next to the cost of getting it to the device and back.
+#: Most of the work here is on the host, and is made affordable by the
+#: algorithm rather than the processor: trees sort each feature once and sweep
+#: it, and the support vector machine is libsvm's solver with its gradient
+#: kept up to date. Logistic regression's gradient over a large training set
+#: is a pair of matrix products, so that one goes to the device. Nearest
+#: neighbours still measures every query against every sample on the host:
+#: 1,000 queries against 10,000 samples of fifty features take about 1.4 s.
 #:
 #: ```
 #: let model = svm_create()
@@ -15,7 +19,10 @@
 #: let predicted = model.predict(unseen)
 #: ```
 import std.math
-from ..core.linalg import inverse, matmul, symmetric_eigen, transpose
+import jaitensor as jt
+from jaitensor import Tensor
+from std.os import env_or
+from ..core.linalg import device_view, inverse, matmul, symmetric_eigen, transpose
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_MAKETYPE
 
@@ -790,6 +797,13 @@ fn _svm_rho(signs: list[float], alpha: list[float], gradient: list[float], c: fl
 #: Build a support vector machine.
 pub fn svm_create() -> SVM { return SVM() }
 
+#: A training set with at least this many values, counting the intercept's
+#: column, has its gradient formed on the device.
+pub let LOGISTIC_DEVICE_VALUES = 1 << 16
+
+#: `JAICV_LOGISTIC_DEVICE=0` forms every gradient on the host.
+let _LOGISTIC_DEVICE = env_or("JAICV_LOGISTIC_DEVICE", "1") != "0"
+
 #: Fit a boundary that is a plane in the features, by gradient descent on the
 #: logistic loss.
 pub class LogisticRegression {
@@ -810,10 +824,17 @@ pub class LogisticRegression {
     }
 
     #: Fit the model.
+    #:
+    #: Full-batch gradient descent, the same steps whichever processor forms
+    #: the gradient. Over a large training set the gradient goes to the
+    #: device: it is the samples times the weights, a sigmoid, and the
+    #: samples' transpose times the errors -- two matrix-vector products --
+    #: where the host loop took 1.7 s for 10,000 samples of fifty features and
+    #: 35 s for 100,000. The weights stay on the host, in double precision,
+    #: and are updated there exactly as before; only the gradient is float32.
     pub fn train(self, samples: Mat, responses: Mat) -> bool {
-        let rows = rows_of(samples)
         let targets = column_of(responses)
-        if rows.len() != targets.len() {
+        if samples.rows != targets.len() {
             throw ValueError("there has to be one response per sample")
         }
         var labels: list[float] = []
@@ -825,10 +846,14 @@ pub class LogisticRegression {
         self.negative = labels[0]
         self.positive = labels[1]
 
-        let width = rows[0].len()
+        let width = samples.cols * samples.channels()
         self.weights = []
         for _index in 0..width + 1 { self.weights.push(0.0) }
+        if _LOGISTIC_DEVICE and samples.rows * (width + 1) >= LOGISTIC_DEVICE_VALUES {
+            if self.descend_on_device(samples, targets, width) { return true }
+        }
 
+        let rows = rows_of(samples)
         for _step in 0..self.iterations {
             var gradient: list[float] = []
             for _index in 0..width + 1 { gradient.push(0.0) }
@@ -839,17 +864,69 @@ pub class LogisticRegression {
                 gradient[width] += error
                 for column in 0..width { gradient[column] += error * rows[index][column] }
             }
-            let scale = self.learning_rate / float(rows.len())
-            for column in 0..width {
-                #: The penalty pulls the weights back towards zero, which is
-                #: what keeps a separable problem from running them off to
-                #: infinity.
-                self.weights[column] -= scale *
-                    (gradient[column] + self.regularisation * self.weights[column])
-            }
-            self.weights[width] -= scale * gradient[width]
+            self.step(gradient, rows.len())
         }
         return true
+    }
+
+    #: Move the weights down `gradient`, summed over `count` samples.
+    fn step(self, gradient: list[float], count: int) -> void {
+        let width = self.weights.len() - 1
+        let scale = self.learning_rate / float(count)
+        for column in 0..width {
+            #: The penalty pulls the weights back towards zero, which is
+            #: what keeps a separable problem from running them off to
+            #: infinity.
+            self.weights[column] -= scale *
+                (gradient[column] + self.regularisation * self.weights[column])
+        }
+        self.weights[width] -= scale * gradient[width]
+    }
+
+    #: Descend with the gradient formed on the device, or return false when
+    #: the samples are not a plain run of floats there.
+    #:
+    #: A column of ones is appended to the samples once, so the intercept is
+    #: one more weight and its gradient comes out of the same product.
+    fn descend_on_device(self, samples: Mat, targets: list[float], width: int) -> bool {
+        let x = device_view(samples)
+        if x is null { return false }
+        let count = samples.rows
+        let ones = Tensor.full([count, 1], 1.0)
+        let augmented = jt.cat([x, ones], axis: -1)
+        x.free()
+        ones.free()
+        var wanted: list[float] = []
+        for value in targets { wanted.push(if value == self.positive { 1.0 } else { 0.0 }) }
+        let truth = Tensor([count, 1], values: wanted)
+        for _step in 0..self.iterations {
+            let weights = Tensor([width + 1, 1], values: self.weights)
+            let scores = jt.matmul(augmented, weights)
+            weights.free()
+            let predicted = jt.sigmoid(scores)
+            scores.free()
+            let errors = jt.subtract(predicted, truth)
+            predicted.free()
+            let summed = jt.matmul(augmented, errors, trans_a: true)
+            errors.free()
+            let gradient = summed.download()
+            summed.free()
+            self.step(gradient, count)
+        }
+        augmented.free()
+        truth.free()
+        return true
+    }
+
+    #: The fitted parameters as one row, intercept first: the layout
+    #: OpenCV's `getLearntThetas` uses, since it puts the column of ones in
+    #: front of the samples.
+    pub fn get_learnt_thetas(self) -> Mat {
+        if self.weights.len() == 0 { throw RuntimeError("this model has not been trained") }
+        let width = self.weights.len() - 1
+        var out = [self.weights[width]]
+        for column in 0..width { out.push(self.weights[column]) }
+        return Mat.from_list(1, width + 1, CV_MAKETYPE(CV_32F, 1), out)
     }
 
     fn probability(self, query: list[float]) -> float {
