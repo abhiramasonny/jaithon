@@ -4,6 +4,8 @@ import std.gpu as gpu
 from jaitensor.gemm import Plan, bucket_extent, default_plan, dispatch_plan, plan_from_text
 from jaitensor.ops import matmul_backend
 from jaitensor.tensor import Tensor
+from std.io import Path
+from std.os import env, pid, set_env, temp_dir, unset_env
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
 
@@ -151,6 +153,39 @@ fn test_plan_from_text_reads_a_bare_name_as_one_split() -> void {
     assert_true(plan_from_text("no-such-kernel") is null)
     assert_true(plan_from_text("gemm32x32:many") is null)
     assert_true(plan_from_text("gemm32x32:0") is null)
+}
+
+fn test_a_shape_is_tuned_only_once_it_has_earned_it() -> void {
+    if not jt.is_available() { return }
+    #: Every new shape used to be tuned on its first call -- 0.5 s for each
+    #: row count of a generation, 8-19 s for a first Ridge fit. Now the
+    #: first calls run the static plan and write nothing; a tuning pass, and
+    #: a cache row keyed on the shape's BUCKET, come only once the shape has
+    #: done work worth tuning for.
+    let path = Path(temp_dir()).join(f"jaitensor-lazy-plans-{pid()}.tsv")
+    let previous = env("JAITENSOR_GEMM_CACHE")
+    set_env("JAITENSOR_GEMM_CACHE", path.to_str())
+    defer {
+        if previous is not null { set_env("JAITENSOR_GEMM_CACHE", previous) } else { unset_env("JAITENSOR_GEMM_CACHE") }
+        if path.exists() { path.remove() }
+    }
+    let rows = 1000
+    let inner = 1000
+    let columns = 96
+    let a = device_tensor([rows, inner], 41)
+    let b = device_tensor([inner, columns], 42)
+    let out = jt.Tensor([rows, columns])
+    defer { a.free() }
+    defer { b.free() }
+    defer { out.free() }
+    for _call in 0..3 { jt.matmul(a, b, out: out) }
+    gpu.synchronize()
+    assert_true(not path.exists(), "three calls are not worth a tuning pass")
+    for _call in 0..2000 { jt.matmul(a, b, out: out) }
+    gpu.synchronize()
+    assert_true(path.exists(), "two thousand calls are")
+    assert_true(path.read_text().contains("\t1024\t1024\t96\t0\t0\t"), "keyed on the bucket")
+    assert_gpu_matmul_probes(out, a, b, rows, inner, columns)
 }
 
 fn test_bucket_extent_rounds_up_by_quarter_octaves() -> void {

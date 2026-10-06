@@ -1618,6 +1618,9 @@ fn route_for(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) 
         MPS_PLAN
     )
     route.plan = resolve(route)
+    #: Routes are cheap to rebuild and a program can ask for any number of
+    #: shapes; buckets, which carry the counts, are kept.
+    if _routes.len() >= 4096 { _routes = {} }
     _routes[key_bits] = route
     _memo_key = key_bits
     _memo = route
@@ -1722,8 +1725,14 @@ pub fn planned_backend(
     trans_b: bool = false
 ) -> str {
     let forced = forced_plan()
-    if forced is not null and plan_legal(forced, rows, inner, columns, trans_a, trans_b) {
-        return forced.to_str()
+    if forced is not null {
+        let runs = if forced.config < 0 {
+            mps_possible(rows, inner, columns, trans_a, trans_b)
+        } else {
+            config_allowed(CONFIGS[forced.config], rows, inner, columns)
+        }
+        if runs { return forced.to_str() }
+        return default_plan(rows, inner, columns, trans_a, trans_b).to_str()
     }
     load_cache()
     let cached = _cache.get(shape_key(rows, inner, columns, trans_a, trans_b), null)
