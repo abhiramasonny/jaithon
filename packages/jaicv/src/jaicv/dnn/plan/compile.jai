@@ -7,6 +7,11 @@ from .emit import emit
 from .plan import Plan
 from ..graph import Graph, run_graph
 
+#: Whether a weight goes into the graph from its device buffer. Read once;
+#: `JAICV_PLAN_DEVICE_CONSTANTS=0` downloads it into a list first, as the
+#: compiler did before, which is the comparison for the faster way.
+let DEVICE_CONSTANTS = env("JAICV_PLAN_DEVICE_CONSTANTS") != "0"
+
 #: Compile `graph` for the shapes `feeds` has, or nothing when it cannot be.
 #:
 #: The survey run is a real execution of the model, so this costs about what
@@ -50,10 +55,13 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
     var state = Build(builder, shapes, wanted, known, graph.initializers)
 
     #: Weights too large to fold are still constants in the graph, just ones
-    #: whose numbers are handed over rather than reasoned about.
+    #: whose numbers are handed over rather than reasoned about -- straight
+    #: from the device buffer they already sit in, rather than downloaded into
+    #: a list of boxed floats only to be narrowed back into the same array.
     for (name, weight) in graph.initializers.items() {
         if state.constants.get(name, null) is not null { continue }
-        state.ids[name] = __prim__.graph_constant(builder, weight.download(), dims_of(weight.shape))
+        let source = if DEVICE_CONSTANTS { weight.buffer().handle_of() } else { weight.download() }
+        state.ids[name] = __prim__.graph_constant(builder, source, dims_of(weight.shape))
     }
     var inputs: list[int] = []
     for name in graph.inputs {
@@ -116,7 +124,11 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
         }
         outputs.push(id)
     }
-    let plan = __prim__.graph_compile(builder, inputs, outputs)
+    #: By latency, explicitly: a detector hands over one frame and draws the
+    #: one before it, so one call's turnaround is what it waits on, and
+    #: JAITHON_GRAPH_ROUTE_POLICY (which changes the default for callers that
+    #: name none) should not move it.
+    let plan = __prim__.graph_compile(builder, inputs, outputs, "latency")
     __prim__.graph_free(builder)
     if plan is null { return null }
 
