@@ -14,6 +14,7 @@ from jaitensor import Tensor
 from jailearn import Estimator, EstimatorKind, LogisticRegression, Params, Pipeline, Ridge
 from jailearn import StandardScaler
 from jailearn import linear_regression, make_pipeline
+import jailearn as jl
 from jailearn.base import matrix
 
 fn have_gpu() -> bool { return gpu.is_available() }
@@ -188,6 +189,65 @@ fn test_the_estimator_contract_holds() -> void {
     defer { narrow.free() }
     assert_throws(ValueError, || ridge.predict(narrow))
     assert_throws(ValueError, || Ridge(-1.0))
+}
+
+#: Ridge against the normal equations solved on the host in double
+#: precision, at a width the host solve takes and one past it, with features
+#: whose means sit far from their spread -- which is what centring on the
+#: device, before the product, has to survive.
+fn check_ridge_against_host(rows: int, width: int, offset: float) -> void {
+    var values: list[float] = []
+    var target: list[float] = []
+    for i in 0..rows {
+        var total = 0.25
+        for j in 0..width {
+            let wave = math.sin(0.917 * float(i * width + j) + 0.3)
+            values.push(offset + wave)
+            total += wave * math.cos(float(j))
+        }
+        target.push(total + 0.1 * math.sin(3.3 * float(i)))
+    }
+    let x = Tensor([rows, width], values)
+    defer { x.free() }
+    let y = Tensor([rows], target)
+    defer { y.free() }
+    let model = Ridge(2.0)
+    defer { model.free() }
+    model.fit(x, y)
+
+    var centres = [0.0 for _j in 0..width]
+    var middle = 0.0
+    for i in 0..rows {
+        for j in 0..width { centres[j] += values[i * width + j] / float(rows) }
+        middle += target[i] / float(rows)
+    }
+    var system = [0.0 for _s in 0..width * width]
+    var rhs = [0.0 for _s in 0..width]
+    for i in 0..rows {
+        for a in 0..width {
+            let left = values[i * width + a] - centres[a]
+            rhs[a] += left * (target[i] - middle)
+            for b in 0..width { system[a * width + b] += left * (values[i * width + b] - centres[b]) }
+        }
+    }
+    for a in 0..width { system[a * width + a] += 2.0 }
+    let want = jl.host_cholesky_solve(system, rhs, width)
+    let coef = model.coef_
+    if coef is not null {
+        let got = coef.download()
+        for j in 0..width { assert_near(got[j], want[j], 2e-3, f"{rows}x{width} coef {j}") }
+    }
+    var intercept = middle
+    for j in 0..width { intercept -= centres[j] * want[j] }
+    assert_near(model.intercept_, intercept, 2e-3 * max(1.0, math.fabs(intercept)), f"{width} intercept")
+}
+
+fn test_ridge_matches_the_host_normal_equations() -> void {
+    if not have_gpu() { return }
+    check_ridge_against_host(500, 7, 0.0)
+    check_ridge_against_host(500, 7, 300.0)
+    #: Few rows, so the product stays under the GEMM tuner's threshold.
+    check_ridge_against_host(60, 259, 0.0)
 }
 
 #: Two hundred rows of five features and labels -1 and 2, built by a formula

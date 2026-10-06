@@ -24,7 +24,8 @@ from jaitensor import Tensor
 from .base import Estimator, EstimatorKind, Params
 from .base import affine_columns, cached_kernel, check_fitted, check_matrix, check_pair
 from .base import check_width, cholesky_solve, column_moments, param_bool, param_float
-from .base import LabelIndex, host_cholesky_solve, param_int, params_of, require_target
+from .base import HOST_SOLVE_ORDER, LabelIndex, host_cholesky_solve, param_int, params_of
+from .base import require_target
 from .shared import Descent, linear_scores
 
 let SOURCE = """#include <metal_stdlib>
@@ -100,6 +101,65 @@ kernel void lin_logit_rows(device const float* design [[buffer(0)]],
     out[id] = value;
 }
 
+/* `lin_logit_rows` with the margin taken here, one thread a row: the row's
+ * dot product with `theta`, then its whole output row. Saves the product
+ * that would otherwise write the margins and its dispatch. */
+kernel void lin_logit_rows_fused(device const float* design [[buffer(0)]],
+                                 device const float* theta [[buffer(1)]],
+                                 device const float* t [[buffer(2)]],
+                                 device float* out [[buffer(3)]],
+                                 constant uint& rows [[buffer(4)]],
+                                 constant uint& padded [[buffer(5)]],
+                                 constant uint& stride [[buffer(6)]],
+                                 uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    device const float4* line = (device const float4*)(design + ulong(row) * padded);
+    device const float4* weights = (device const float4*)theta;
+    float4 acc = 0.0f;
+    for (uint j = 0u; j < padded / 4u; ++j) acc += line[j] * weights[j];
+    float margin = acc.x + acc.y + acc.z + acc.w;
+    float e = exp(-fabs(margin));
+    float near = 1.0f / (1.0f + e);
+    float far = e / (1.0f + e);
+    float p = margin >= 0.0f ? near : far;
+    float q = margin >= 0.0f ? far : near;
+    float s = p * q;
+    device float4* target = (device float4*)(out + ulong(row) * stride);
+    for (uint j = 0u; j < padded / 4u; ++j) target[j] = s * line[j];
+    bool positive = t[row] > 0.5f;
+    float signed_margin = positive ? margin : -margin;
+    float loss = max(-signed_margin, 0.0f) + log(1.0f + exp(-fabs(signed_margin)));
+    target[padded / 4u] = float4(positive ? -q : p, loss, 0.0f, 0.0f);
+    for (uint j = padded / 4u + 1u; j < stride / 4u; ++j) target[j] = 0.0f;
+}
+
+/* The normal equations' operand for a ridge fit, `stride` columns a row:
+ * the row less the column means, then the target less its mean, then zeros
+ * to a multiple of four, so that ONE product `thisT . this` holds `XcT Xc`
+ * and `XcT yc` together and takes the GEMM's fast route whatever the width.
+ * `centre` 0 leaves both uncentred (no intercept). */
+kernel void lin_ridge_pack(device const float* x [[buffer(0)]],
+                           device const float* y [[buffer(1)]],
+                           device const float* mean [[buffer(2)]],
+                           device const float* target_mean [[buffer(3)]],
+                           device float* out [[buffer(4)]],
+                           constant uint& rows [[buffer(5)]],
+                           constant uint& width [[buffer(6)]],
+                           constant uint& stride [[buffer(7)]],
+                           constant uint& centre [[buffer(8)]],
+                           uint id [[thread_position_in_grid]]) {
+    if (id >= rows * stride) return;
+    uint row = id / stride;
+    uint column = id - row * stride;
+    float value = 0.0f;
+    if (column < width) {
+        value = x[row * width + column] - (centre != 0u ? mean[column] : 0.0f);
+    } else if (column == width) {
+        value = y[row] - (centre != 0u ? target_mean[0] : 0.0f);
+    }
+    out[id] = value;
+}
+
 /* `sigmoid(z)`, stably, as the probability of the second class beside the
  * first's. */
 kernel void lin_logit_proba(device const float* z [[buffer(0)]],
@@ -140,6 +200,16 @@ fn linear_kernel(entry: str) -> Kernel { return cached_kernel(SOURCE, entry) }
 #: building the scaler's state on the host, which waits for the device twice
 #: per `fit_transform`.
 let _SCALER_ON_DEVICE = env_or("JAILEARN_SCALER_ON_DEVICE", "1") != "0"
+
+#: `JAILEARN_LOGIT_FUSED=0` takes a logistic fit's margins with a separate
+#: product (`jt.matmul`) before the row kernel, instead of inside it.
+let _LOGIT_FUSED = env_or("JAILEARN_LOGIT_FUSED", "1") != "0"
+
+#: `JAILEARN_RIDGE_PACKED=0` restores `Ridge.fit` as two products over a
+#: centred copy of `X` (`XT X`, then `XT y`) with the means read back before
+#: centring and the target summed on the host, instead of one product over a
+#: packed `[Xc | yc | 0..]` and a single wait.
+let _RIDGE_PACKED = env_or("JAILEARN_RIDGE_PACKED", "1") != "0"
 
 #: Centre every column and scale it to unit variance.
 pub class StandardScaler: Estimator {
@@ -307,6 +377,10 @@ pub class Ridge: Estimator {
         self.free()
         self.width = x.shape[1]
         let rows = x.shape[0]
+        if _RIDGE_PACKED {
+            self.fit_packed(x, target)
+            return
+        }
 
         var centres = [0.0 for _index in 0..self.width]
         var middle = 0.0
@@ -374,6 +448,76 @@ pub class Ridge: Estimator {
         self.coef_ = jt.reshape(weights, [1, self.width])
         if owns_design { design.free() }
         if owns_response { response.free() }
+    }
+
+    #: The fit as one product: `lin_ridge_pack` lays out `[Xc | yc | 0..]`
+    #: and its gram holds both sides of the normal equations, read back once
+    #: and solved on the host when the width allows (`HOST_SOLVE_ORDER`).
+    #: Centred on the device with `column_moments`, so the precision argument
+    #: for centring first holds exactly as before; only the means cross back,
+    #: after the wait the solve needed anyway.
+    fn fit_packed(self, x: Tensor, target: Tensor) -> void {
+        let rows = x.shape[0]
+        let width = self.width
+        let stride = round_up4(width + 1)
+        var mean: Tensor? = null
+        var target_mean: Tensor? = null
+        if self.fit_intercept {
+            let column = target.view(0, [rows, 1])
+            let (centres, spread) = column_moments(x)
+            let (middle, target_spread) = column_moments(column)
+            spread.free()
+            target_spread.free()
+            column.free()
+            mean = centres
+            target_mean = middle
+        }
+        let packed = Tensor([rows, stride])
+        let anything = x.buffer()
+        linear_kernel("lin_ridge_pack").dispatch_async(
+            [
+                x.buffer(),
+                target.buffer(),
+                if mean is not null { mean.buffer() } else { anything },
+                if target_mean is not null { target_mean.buffer() } else { anything },
+                packed.buffer(),
+            ],
+            rows * stride,
+            [rows, width, stride, if self.fit_intercept { 1 } else { 0 }]
+        )
+        let product = jt.matmul(packed, packed, trans_a: true)
+        packed.free()
+        let g = product.download()
+        product.free()
+
+        var system = [0.0 for _slot in 0..width * width]
+        var rhs = [0.0 for _slot in 0..width]
+        for a in 0..width {
+            for b in 0..width { system[a * width + b] = g[a * stride + b] }
+            system[a * width + a] += self.alpha
+            rhs[a] = g[a * stride + width]
+        }
+        var slopes: list[float] = []
+        if width <= HOST_SOLVE_ORDER {
+            slopes = host_cholesky_solve(system, rhs, width)
+        } else {
+            let a = Tensor([width, width], system)
+            let b = Tensor([width], rhs)
+            let solved = cholesky_solve(a, b)
+            slopes = solved.download()
+            a.free()
+            b.free()
+            solved.free()
+        }
+        if mean is not null and target_mean is not null {
+            let centres = mean.download()
+            var offset = target_mean.download()[0]
+            for index in 0..width { offset -= centres[index] * slopes[index] }
+            self.intercept_ = offset
+            mean.free()
+            target_mean.free()
+        }
+        self.coef_ = Tensor([1, width], slopes)
     }
 
     pub fn predict(self, x: Tensor) -> Tensor {
@@ -523,13 +667,21 @@ pub class LogisticRegression: Estimator {
         let descent = Descent(self.max_iter, 0.0)
         descent.run(fn(iteration: int) -> float {
             weights.upload(theta)
-            let margins = jt.matmul(design, weights)
-            linear_kernel("lin_logit_rows").dispatch_async(
-                [design.buffer(), margins.buffer(), codes.buffer(), rhs.buffer()],
-                rows * stride,
-                [rows, padded, stride]
-            )
-            margins.free()
+            if _LOGIT_FUSED {
+                linear_kernel("lin_logit_rows_fused").dispatch_async(
+                    [design.buffer(), weights.buffer(), codes.buffer(), rhs.buffer()],
+                    rows,
+                    [rows, padded, stride]
+                )
+            } else {
+                let margins = jt.matmul(design, weights)
+                linear_kernel("lin_logit_rows").dispatch_async(
+                    [design.buffer(), margins.buffer(), codes.buffer(), rhs.buffer()],
+                    rows * stride,
+                    [rows, padded, stride]
+                )
+                margins.free()
+            }
             let product = jt.matmul(design, rhs, trans_a: true)
             let g = product.download()
             product.free()
