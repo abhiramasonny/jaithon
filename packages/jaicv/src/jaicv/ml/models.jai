@@ -822,6 +822,11 @@ pub let LOGISTIC_DEVICE_VALUES = 1 << 16
 #: `JAICV_LOGISTIC_DEVICE=0` forms every gradient on the host.
 let _LOGISTIC_DEVICE = env_or("JAICV_LOGISTIC_DEVICE", "1") != "0"
 
+#: `JAICV_LOGISTIC_RESIDENT=0` reads each step's gradient back and updates
+#: the weights on the host, in double precision, instead of keeping them on
+#: the device for the whole descent.
+let _LOGISTIC_RESIDENT = env_or("JAICV_LOGISTIC_RESIDENT", "1") != "0"
+
 #: Fit a boundary that is a plane in the features, by gradient descent on the
 #: logistic loss.
 pub class LogisticRegression {
@@ -848,8 +853,8 @@ pub class LogisticRegression {
     #: device: it is the samples times the weights, a sigmoid, and the
     #: samples' transpose times the errors -- two matrix-vector products --
     #: where the host loop took 1.7 s for 10,000 samples of fifty features and
-    #: 35 s for 100,000. The weights stay on the host, in double precision,
-    #: and are updated there exactly as before; only the gradient is float32.
+    #: 35 s for 100,000. On the device the weights are float32 (see
+    #: `descend_resident`); on the host they are double.
     pub fn train(self, samples: Mat, responses: Mat) -> bool {
         let targets = column_of(responses)
         if samples.rows != targets.len() {
@@ -917,6 +922,12 @@ pub class LogisticRegression {
         var wanted: list[float] = []
         for value in targets { wanted.push(if value == self.positive { 1.0 } else { 0.0 }) }
         let truth = Tensor([count, 1], values: wanted)
+        if _LOGISTIC_RESIDENT {
+            self.descend_resident(augmented, truth, width)
+            augmented.free()
+            truth.free()
+            return true
+        }
         for _step in 0..self.iterations {
             let weights = Tensor([width + 1, 1], values: self.weights)
             let scores = jt.matmul(augmented, weights)
@@ -934,6 +945,70 @@ pub class LogisticRegression {
         augmented.free()
         truth.free()
         return true
+    }
+
+    #: The same descent with the weights kept on the device too, so the steps
+    #: queue one behind another with nothing read back until the last.
+    #:
+    #: Reading the gradient back each step put a round trip to the device in
+    #: every one of the 500. And the samples' transpose times the errors is a
+    #: matrix-vector product whose inner dimension is the whole training set,
+    #: which the GEMM splits too few ways: 3.5 ms of a 4.2 ms step at 100,000
+    #: samples. Here it is the errors spread along each feature's row of the
+    #: transposed samples, multiplied in and summed along the row -- three
+    #: passes over memory a reduction can split as finely as it likes.
+    #:
+    #: Each step is seven dispatches, and at 10,000 samples it is the
+    #: dispatches, not the arithmetic, that cost: the targets are spread along
+    #: every row once, negated, so adding the predictions to them is the
+    #: subtraction too, and the transposed samples carry the step size, so the
+    #: summed rows are already the step.
+    #:
+    #: The weights are float32 here, where the host keeps them in double.
+    fn descend_resident(self, augmented: Tensor, truth: Tensor, width: int) -> void {
+        let count = augmented.shape[0]
+        let columns = width + 1
+        let scale = self.learning_rate / float(count)
+        let transposed = jt.transpose(augmented)
+        let turned = jt.scale(transposed, scale)
+        transposed.free()
+        let negated = jt.scale(truth, -1.0)
+        let negated_row = jt.reshape(negated, [count])
+        let zeros = Tensor.zeros([columns, count])
+        let spread = jt.add(zeros, negated_row)
+        zeros.free()
+        negated_row.free()
+        negated.free()
+        var keep: list[float] = []
+        for _column in 0..width { keep.push(1.0 - scale * self.regularisation) }
+        keep.push(1.0)
+        let decay = Tensor([columns, 1], values: keep)
+        var weights = Tensor([columns, 1], values: self.weights)
+        for _step in 0..self.iterations {
+            let scores = jt.matmul(augmented, weights)
+            let predicted = jt.sigmoid(scores)
+            scores.free()
+            let flat = jt.reshape(predicted, [count])
+            let errors = jt.add(spread, flat)
+            flat.free()
+            predicted.free()
+            let products = jt.multiply(turned, errors)
+            errors.free()
+            let summed = jt.sum(products, axis: -1)
+            products.free()
+            let moved = jt.reshape(summed, [columns, 1])
+            let kept = jt.multiply(weights, decay)
+            weights.free()
+            weights = jt.subtract(kept, moved)
+            kept.free()
+            moved.free()
+            summed.free()
+        }
+        self.weights = weights.download()
+        weights.free()
+        decay.free()
+        spread.free()
+        turned.free()
     }
 
     #: The fitted parameters as one row, intercept first: the layout

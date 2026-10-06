@@ -195,6 +195,7 @@ Device paths are switched the same way:
 | `JAICV_KMEANS_STAGED` | `kmeans` assigns samples of eight or more columns with the centres staged in threadgroup memory, reading each sample once; off, once per centre. Same labels bit for bit |
 | `JAICV_KMEANS_IN_PLACE` | `kmeans` reads a continuous matrix's samples where they lie; off, through a host list and a fresh upload |
 | `JAICV_LOGISTIC_DEVICE` | `LogisticRegression.train` forms the gradient on the device once the samples hold 65,536 values or more; off, on the host |
+| `JAICV_LOGISTIC_RESIDENT` | `LogisticRegression.train`'s device descent keeps the weights on the device, in float32, and reads nothing back until the last step; off, each step's gradient comes back and the weights are updated on the host in double |
 ## Device memory
 
 Device memory is not garbage collected, so every operation releases the
