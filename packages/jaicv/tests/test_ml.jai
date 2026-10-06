@@ -607,14 +607,21 @@ fn test_kmeans_staged_and_column_kernels_match_the_originals_bit_for_bit() -> vo
             [values, held[0], held[1], first_sums], (k * width + k + 1) * 256, [count, width, k], group_size: 256
         )
         Kernel.compile(KMEANS_SOURCE, "kmeans_gather_columns").dispatch_async(
-            [values, held[0], held[1], second_sums], (width + 1) * 256, [count, width, k], group_size: 256
+            [values, held[0], held[1], second_sums], (width + 1) * 256, [count, width, k, 0], group_size: 256
+        )
+        let columns = Buffer(count * width)
+        let third_sums = Buffer(k * width + k + 1)
+        Kernel.compile(KMEANS_SOURCE, "kmeans_transpose").dispatch_async([values, columns], count * width, [count, width])
+        Kernel.compile(KMEANS_SOURCE, "kmeans_gather_columns").dispatch_async(
+            [columns, held[0], held[1], third_sums], (width + 1) * 256, [count, width, k, 1], group_size: 256
         )
         assert_eq(held[2].download(), held[0].download(), f"{shape}: labels")
         assert_eq(held[3].download(), held[1].download(), f"{shape}: distances")
         assert_eq(held[4].download(), held[0].download(), f"{shape}: tiled labels")
         assert_eq(held[5].download(), held[1].download(), f"{shape}: tiled distances")
         assert_eq(second_sums.download(), first_sums.download(), f"{shape}: totals")
-        for buffer in [values, centres, first_sums, second_sums] { buffer.free() }
+        assert_eq(third_sums.download(), first_sums.download(), f"{shape}: totals by column")
+        for buffer in [values, centres, first_sums, second_sums, third_sums, columns] { buffer.free() }
         for buffer in held { buffer.free() }
     }
 }

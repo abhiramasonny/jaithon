@@ -195,6 +195,7 @@ Device paths are switched the same way:
 | `JAICV_KMEANS_STAGED` | `kmeans` assigns samples with the centres staged in threadgroup memory, reading each sample once; off, once per centre. Same labels bit for bit |
 | `JAICV_KMEANS_TILED` | `kmeans`' staged assignment reads the samples into threadgroup memory a tile at a time, consecutive threads reading consecutive values; off, each thread reads its own row. Same labels bit for bit |
 | `JAICV_KMEANS_COLUMNS` | `kmeans` totals its groups a column per threadgroup, reading the labels once per column; off, once per centre and column. Same sums bit for bit |
+| `JAICV_KMEANS_TRANSPOSED` | `kmeans` totals each column from a copy of the samples laid out by column, made once per call, so the reads are one coalesced sweep; off, from the samples as they lie. Same sums bit for bit |
 | `JAICV_KMEANS_IN_PLACE` | `kmeans` reads a continuous matrix's samples where they lie; off, through a host list and a fresh upload |
 | `JAICV_LOGISTIC_DEVICE` | `LogisticRegression.train` forms the gradient on the device once the samples hold 65,536 values or more; off, on the host |
 

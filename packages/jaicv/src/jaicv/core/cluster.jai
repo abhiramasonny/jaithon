@@ -263,6 +263,7 @@ kernel void kmeans_gather_columns(device const float* values [[buffer(0)]],
                                   constant uint& samples [[buffer(4)]],
                                   constant uint& width [[buffer(5)]],
                                   constant uint& k [[buffer(6)]],
+                                  constant uint& by_column [[buffer(7)]],
                                   uint column [[threadgroup_position_in_grid]],
                                   uint lid [[thread_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]],
@@ -276,7 +277,8 @@ kernel void kmeans_gather_columns(device const float* values [[buffer(0)]],
     if (column < width) {
         for (uint sample = lid; sample < samples; sample += GROUP) {
             uint centre = uint(labels[sample]);
-            if (centre < k) running[lid * 17u + centre] += values[sample * width + column];
+            float value = by_column != 0u ? values[column * samples + sample] : values[sample * width + column];
+            if (centre < k) running[lid * 17u + centre] += value;
         }
     } else {
         for (uint sample = lid; sample < samples; sample += GROUP) {
@@ -304,6 +306,20 @@ kernel void kmeans_gather_columns(device const float* values [[buffer(0)]],
             sums[k * width + c] = answer;
         }
     }
+}
+
+/* The samples a column at a time: `target[column * samples + sample]`. With
+ * the samples laid out this way `kmeans_gather_columns` reads each column in
+ * one coalesced sweep rather than a value per row. */
+kernel void kmeans_transpose(device const float* values [[buffer(0)]],
+                             device float* target [[buffer(1)]],
+                             constant uint& samples [[buffer(2)]],
+                             constant uint& width [[buffer(3)]],
+                             uint id [[thread_position_in_grid]]) {
+    if (id >= samples * width) return;
+    uint sample = id / width;
+    uint column = id - sample * width;
+    target[column * samples + sample] = values[id];
 }
 
 /* Copy `count` values from one buffer to another. */
@@ -351,6 +367,9 @@ let _KMEANS_STAGED = env_or("JAICV_KMEANS_STAGED", "1") != "0"
 let _KMEANS_TILED = env_or("JAICV_KMEANS_TILED", "1") != "0"
 let _KMEANS_COLUMNS = env_or("JAICV_KMEANS_COLUMNS", "1") != "0"
 let _KMEANS_IN_PLACE = env_or("JAICV_KMEANS_IN_PLACE", "1") != "0"
+#: `JAICV_KMEANS_TRANSPOSED=0` totals the groups from the samples as they are
+#: laid out, a row at a time, instead of from a copy laid out by column.
+let _KMEANS_TRANSPOSED = env_or("JAICV_KMEANS_TRANSPOSED", "1") != "0"
 
 #: Split samples into `k` groups, each around its own centre.
 #:
@@ -405,6 +424,22 @@ pub fn kmeans(
 
     let staged = _KMEANS_STAGED and k <= 16 and k * width <= 4096
     let by_column = _KMEANS_COLUMNS and k <= 16
+    #: The totals read the samples a column at a time, so they read them from
+    #: a copy laid out that way, made once for every attempt and iteration.
+    let held_columns: Buffer? = if by_column and _KMEANS_TRANSPOSED and width > 1 {
+        let copy = Buffer(samples * width)
+        kernel_for("kmeans_transpose").dispatch_async(
+            [held_values, copy],
+            samples * width,
+            [samples, width]
+        )
+        copy
+    } else {
+        null
+    }
+    defer {
+        if held_columns is not null { held_columns.free() }
+    }
     var state = if seed == 0 { 1 } else { seed }
     var best_centres: list[float] = []
     var best_cost = 1e300
@@ -488,9 +523,9 @@ pub fn kmeans(
             }
             if by_column {
                 kernel_for("kmeans_gather_columns").dispatch_async(
-                    [held_values, held_labels, held_nearest, gathered],
+                    [held_columns ?? held_values, held_labels, held_nearest, gathered],
                     (width + 1) * 256,
-                    [samples, width, k],
+                    [samples, width, k, if held_columns is not null { 1 } else { 0 }],
                     group_size: 256
                 )
             } else {
