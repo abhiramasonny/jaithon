@@ -574,3 +574,37 @@ fn test_a_pipeline_takes_the_real_estimators() -> void {
     defer { copy.free() }
     assert_true(not copy.is_fitted(), "a cloned scaler is unfitted")
 }
+
+#: Prediction hands back a tensor that owns its storage. A one-target score
+#: was a `jt.reshape` of the product, which is a view: freeing it never freed
+#: the product, so every `predict`, `predict_proba` and `decision_function`
+#: of a two-class logistic regression -- and every `Ridge.predict` -- left one
+#: buffer behind.
+fn test_predictions_release_everything_they_allocate() -> void {
+    if not have_gpu() { return }
+    let (x, y) = logistic_data()
+    defer { x.free() }
+    defer { y.free() }
+    let model = LogisticRegression()
+    defer { model.free() }
+    model.fit(x, y)
+    let ridge = Ridge(1.0)
+    defer { ridge.free() }
+    ridge.fit(x, y)
+    gpu.synchronize()
+    let before = gpu.live_buffers()
+    for _call in 0..10 {
+        model.decision_function(x).free()
+        model.predict(x).free()
+        model.predict_proba(x).free()
+        ridge.predict(x).free()
+    }
+    gpu.synchronize()
+    assert_eq(gpu.live_buffers(), before, "live buffers after forty predictions")
+    let scores = model.decision_function(x)
+    defer { scores.free() }
+    assert_eq(scores.shape, [200], "two-class scores are one per sample")
+    let fitted = ridge.predict(x)
+    defer { fitted.free() }
+    assert_eq(fitted.shape, [200], "ridge predicts one value per sample")
+}

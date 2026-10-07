@@ -572,10 +572,7 @@ pub class Ridge: Estimator {
         if coef is null { throw RuntimeError("Ridge lost its coefficients") }
         let bias = Tensor([1], [self.intercept_])
         defer { bias.free() }
-        #: Again a view over `scores`, so `scores` is not freed: the caller
-        #: owns what comes back and freeing it releases the one allocation.
-        let scores = linear_scores(x, coef, bias)
-        return jt.reshape(scores, [x.shape[0]])
+        return linear_scores(x, coef, bias, flat: true)
     }
 
     pub fn get_params(self) -> Params {
@@ -944,9 +941,7 @@ pub class LogisticRegression: Estimator {
         if coef is null { throw RuntimeError("LogisticRegression lost its coefficients") }
         let bias = Tensor([self.intercepts_.len()], self.intercepts_)
         defer { bias.free() }
-        let scores = linear_scores(x, coef, bias)
-        if self.multinomial() { return scores }
-        return jt.reshape(scores, [x.shape[0]])
+        return linear_scores(x, coef, bias, flat: not self.multinomial())
     }
 
     #: `[n_samples, n_classes]`, the columns in the order of `classes_`.
