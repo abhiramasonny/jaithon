@@ -608,3 +608,93 @@ fn test_predictions_release_everything_they_allocate() -> void {
     defer { fitted.free() }
     assert_eq(fitted.shape, [200], "ridge predicts one value per sample")
 }
+
+fn wide_logistic_data(rows: int, width: int) -> tuple[Tensor, Tensor] {
+    var values: list[float] = []
+    var labels: list[float] = []
+    for i in 0..rows {
+        var score = 0.6 * math.sin(3.7 * float(i))
+        for j in 0..width {
+            let value = math.sin(0.917 * float(i * width + j) + 0.3) + 0.3 * math.cos(float(j))
+            values.push(value)
+            score += value * math.sin(1.7 * float(j)) / math.sqrt(float(width))
+        }
+        labels.push(if score > 0.0 { 1.0 } else { 0.0 })
+    }
+    return (Tensor([rows, width], values), Tensor([rows], labels))
+}
+
+#: Two classes past `JAILEARN_NEWTON_MAX_ORDER` coefficients take L-BFGS:
+#: Newton's Hessian is factored on the host, a cubic cost that at three
+#: hundred features made a fit six times slower than scikit-learn's. Both
+#: solvers reach the same optimum, and the wide fit no longer pays the factor.
+fn test_a_wide_two_class_fit_takes_lbfgs() -> void {
+    if not have_gpu() { return }
+    let (x, y) = wide_logistic_data(1500, 80)
+    defer { x.free() }
+    defer { y.free() }
+    let newton = LogisticRegression(tol: 1.0e-6, solver: "newton-cholesky")
+    defer { newton.free() }
+    newton.fit(x, y)
+    let quasi = LogisticRegression(tol: 1.0e-6, solver: "lbfgs")
+    defer { quasi.free() }
+    quasi.fit(x, y)
+    let chosen = LogisticRegression()
+    defer { chosen.free() }
+    chosen.fit(x, y)
+    assert_eq(newton.solver_, "newton-cholesky", "asked for Newton")
+    assert_eq(quasi.solver_, "lbfgs", "asked for L-BFGS")
+    assert_eq(chosen.solver_, "lbfgs", "81 coefficients take L-BFGS by default")
+    assert_true(quasi.converged_, "L-BFGS converged")
+    #: The features' column means make the intercept and the coefficients
+    #: nearly collinear, so the optimum sits in a valley flat enough that two
+    #: points with a gradient under `tol` differ in the intercept by 6e-3.
+    #: The log-odds they give every sample are what is determined.
+    let first = newton.decision_function(x)
+    defer { first.free() }
+    let second = quasi.decision_function(x)
+    defer { second.free() }
+    let newton_odds = first.download()
+    let quasi_odds = second.download()
+    for index in 0..1500 {
+        assert_near(quasi_odds[index], newton_odds[index], 2.0e-3, f"log-odds of sample {index}")
+    }
+
+    let small = LogisticRegression()
+    defer { small.free() }
+    let (narrow, labels) = logistic_data()
+    defer { narrow.free() }
+    defer { labels.free() }
+    small.fit(narrow, labels)
+    assert_eq(small.solver_, "newton-cholesky", "six coefficients take Newton by default")
+    assert_throws(ValueError, || LogisticRegression(solver: "sag"))
+    let tuned = LogisticRegression()
+    defer { tuned.free() }
+    let bad_c: Params = {"C": 0.0}
+    assert_throws(ValueError, || tuned.set_params(bad_c))
+    let bad_iter: Params = {"max_iter": 0}
+    assert_throws(ValueError, || tuned.set_params(bad_iter))
+    let picked: Params = {"solver": "lbfgs"}
+    tuned.set_params(picked)
+    assert_eq(tuned.clone_unfitted().solver, "lbfgs", "the solver survives a clone")
+}
+
+#: A NaN in X is refused as bad input by every solver, where the multinomial
+#: fit used to die inside its line search on a comparison with a NaN.
+fn test_logistic_regression_refuses_a_nan() -> void {
+    if not have_gpu() { return }
+    let x = jl.matrix([[0.0, 1.0], [1.0, math.NAN], [2.0, 0.5], [3.0, 2.0]])
+    defer { x.free() }
+    let two = jl.vector([0.0, 1.0, 0.0, 1.0])
+    defer { two.free() }
+    let three = jl.vector([0.0, 1.0, 2.0, 1.0])
+    defer { three.free() }
+    for solver in ["newton-cholesky", "lbfgs"] {
+        let model = LogisticRegression(solver: solver)
+        defer { model.free() }
+        assert_throws(ValueError, || model.fit(x, two))
+    }
+    let multinomial = LogisticRegression()
+    defer { multinomial.free() }
+    assert_throws(ValueError, || multinomial.fit(x, three))
+}

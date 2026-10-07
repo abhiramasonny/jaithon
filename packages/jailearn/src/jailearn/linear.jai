@@ -25,7 +25,7 @@ from .base import Estimator, EstimatorKind, Params
 from .base import affine_columns, cached_kernel, check_fitted, check_matrix, check_pair
 from .base import check_width, cholesky_solve, column_moments, param_bool, param_float
 from .base import HOST_SOLVE_ORDER, LabelIndex, host_cholesky_solve, param_int, params_of
-from .base import require_target, row_argmax
+from .base import param_str, require_target, row_argmax
 from .shared import Descent, linear_scores
 
 let SOURCE = """#include <metal_stdlib>
@@ -131,6 +131,28 @@ kernel void lin_logit_rows_fused(device const float* design [[buffer(0)]],
     float loss = max(-signed_margin, 0.0f) + log(1.0f + exp(-fabs(signed_margin)));
     target[padded / 4u] = float4(positive ? -q : p, loss, 0.0f, 0.0f);
     for (uint j = padded / 4u + 1u; j < stride / 4u; ++j) target[j] = 0.0f;
+}
+
+/* One row of a two-class logistic loss from its margin `z`: `[p - t | loss
+ * | 0 | 0]` into `out`, four wide. `outT . design` is then the gradient in
+ * its first row and, through the design's ones column, the total loss in
+ * the second -- everything L-BFGS needs, and no Hessian. */
+kernel void lin_logit_residual(device const float* z [[buffer(0)]],
+                               device const float* t [[buffer(1)]],
+                               device float4* out [[buffer(2)]],
+                               constant uint& rows [[buffer(3)]],
+                               uint row [[thread_position_in_grid]]) {
+    if (row >= rows) return;
+    float margin = z[row];
+    float e = exp(-fabs(margin));
+    float near = 1.0f / (1.0f + e);
+    float far = e / (1.0f + e);
+    float p = margin >= 0.0f ? near : far;
+    float q = margin >= 0.0f ? far : near;
+    bool positive = t[row] > 0.5f;
+    float signed_margin = positive ? margin : -margin;
+    float loss = max(-signed_margin, 0.0f) + log(1.0f + exp(-fabs(signed_margin)));
+    out[row] = float4(positive ? -q : p, loss, 0.0f, 0.0f);
 }
 
 /* One row of a multinomial logistic loss: from the scores `z` (`zstride`
@@ -247,6 +269,15 @@ let _SCALER_ON_DEVICE = env_or("JAILEARN_SCALER_ON_DEVICE", "1") != "0"
 #: `JAILEARN_LOGIT_FUSED=0` takes a logistic fit's margins with a separate
 #: product (`jt.matmul`) before the row kernel, instead of inside it.
 let _LOGIT_FUSED = env_or("JAILEARN_LOGIT_FUSED", "1") != "0"
+
+#: The largest order (features, plus one for an intercept) a two-class fit
+#: takes Newton's method at; past it, L-BFGS. Newton's iteration forms a
+#: `d x d` Hessian on the device and factors it on the host, and the factor is
+#: cubic: at three hundred features it was six times slower than
+#: scikit-learn, at a thousand two hundred and forty. L-BFGS needs only the
+#: gradient, two thin products an evaluation. `JAILEARN_NEWTON_MAX_ORDER`
+#: moves the crossover.
+let _NEWTON_MAX_ORDER = int(env_or("JAILEARN_NEWTON_MAX_ORDER", "64"))
 
 #: `JAILEARN_RIDGE_PACKED=0` restores `Ridge.fit` as two products over a
 #: centred copy of `X` (`XT X`, then `XT y`) with the means read back before
@@ -609,8 +640,10 @@ fn round_up4(n: int) -> int { return (n + 3) // 4 * 4 }
 #: `C * sum(log(1 + exp(-y z))) + |w|^2 / 2` for two classes, the
 #: multinomial (softmax) loss for more, the intercepts unpenalised.
 #:
-#: More than two classes take `fit_multinomial` (L-BFGS, as scikit-learn).
-#: Two are fitted by Newton's method rather than scikit-learn's L-BFGS. With the
+#: More than two classes take `fit_multinomial` (L-BFGS, as scikit-learn),
+#: and so do two classes past `JAILEARN_NEWTON_MAX_ORDER` features
+#: (`fit_binary_lbfgs`). Otherwise two are fitted by Newton's method rather
+#: than scikit-learn's L-BFGS. With the
 #: features in the tens, the Hessian is small enough to solve on the host
 #: (`host_cholesky_solve`) and costs one product to form, so each iteration is
 #: two dispatches over the samples and one read back of a `(d+1) x (d+3)`
@@ -639,6 +672,13 @@ pub class LogisticRegression: Estimator {
     pub var classes_: list[float]
     pub var n_iter_: int
     pub var converged_: bool
+    #: `"auto"`, `"lbfgs"` or `"newton-cholesky"`, scikit-learn's names.
+    #: `"auto"` takes Newton for two classes up to `JAILEARN_NEWTON_MAX_ORDER`
+    #: coefficients and L-BFGS otherwise; Newton is two-class only, so more
+    #: classes always take L-BFGS.
+    pub var solver: str
+    #: The solver the last `fit` used.
+    pub var solver_: str
     var width: int
     var labels: LabelIndex?
 
@@ -647,10 +687,14 @@ pub class LogisticRegression: Estimator {
         C: float = 1.0,
         fit_intercept: bool = true,
         max_iter: int = 100,
-        tol: float = 1.0e-4
+        tol: float = 1.0e-4,
+        solver: str = "auto"
     ) {
         if C <= 0.0 { throw ValueError(f"LogisticRegression needs a positive C, got {C}") }
         if max_iter <= 0 { throw ValueError(f"max_iter must be positive, got {max_iter}") }
+        check_solver(solver)
+        self.solver = solver
+        self.solver_ = ""
         self.C = C
         self.fit_intercept = fit_intercept
         self.max_iter = max_iter
@@ -681,6 +725,7 @@ pub class LogisticRegression: Estimator {
         self.labels = labels
         self.classes_ = labels.classes
         if labels.count() > 2 {
+            self.solver_ = "lbfgs"
             self.fit_multinomial(x, codes, labels.count())
             return
         }
@@ -691,6 +736,16 @@ pub class LogisticRegression: Estimator {
         let padded = round_up4(width + 1)
         let stride = round_up4(padded + 2)
         let order = if self.fit_intercept { width + 1 } else { width }
+        let newton = if self.solver == "auto" {
+            order <= _NEWTON_MAX_ORDER
+        } else {
+            self.solver == "newton-cholesky"
+        }
+        self.solver_ = if newton { "newton-cholesky" } else { "lbfgs" }
+        if not newton {
+            self.fit_binary_lbfgs(x, codes)
+            return
+        }
         let design = Tensor([rows, padded])
         defer { design.free() }
         linear_kernel("lin_augment").dispatch_async(
@@ -732,6 +787,9 @@ pub class LogisticRegression: Estimator {
             }
             let objective = c * g[width * stride + padded + 1] + 0.5 * penalty
             if math.is_nan(objective) {
+                if not started {
+                    throw ValueError("the logistic loss is not finite at zero: X holds a NaN or an infinity")
+                }
                 return math.NAN
             }
             if started and objective > best + 1.0e-6 * math.fabs(best) and step > 1.0e-6 {
@@ -854,68 +912,12 @@ pub class LogisticRegression: Estimator {
             return (c * g[classes * padded + width] + 0.5 * penalty, gradient)
         }
 
-        var theta = [0.0] * count
-        var (objective, gradient) = evaluate(theta)
-        var steps: list[list[float]] = []
-        var turns: list[list[float]] = []
-        var weights_of: list[float] = []
-        var iterations = 0
-        var converged = false
-        while iterations < self.max_iter {
-            var largest = 0.0
-            for value in gradient { largest = max(largest, math.fabs(value)) }
-            if largest * mean_scale <= self.tol {
-                converged = true
-                break
-            }
-            let direction = lbfgs_direction(gradient, steps, turns, weights_of)
-            var slope = dot_of(gradient, direction)
-            if slope >= 0.0 {
-                steps = []
-                turns = []
-                weights_of = []
-                for index in 0..count { direction[index] = -gradient[index] / largest }
-                slope = dot_of(gradient, direction)
-            }
-            var t = 1.0
-            var trial = [0.0] * count
-            var (next_objective, next_gradient) = (objective, gradient)
-            for _halving in 0..40 {
-                for index in 0..count { trial[index] = theta[index] + t * direction[index] }
-                let (value, slopes) = evaluate(trial)
-                next_objective = value
-                next_gradient = slopes
-                #: The loss is a float32 sum, good to about a millionth of
-                #: itself; near the optimum the decrease Armijo asks for is
-                #: smaller than that, and demanding it anyway stalls the
-                #: search a thousandth short of where the gradient says the
-                #: optimum is. So a step inside the sum's rounding passes.
-                let noise = 1.0e-6 * math.fabs(objective)
-                if value <= objective + 1.0e-4 * t * slope + noise { break }
-                t *= 0.5
-            }
-            var step = [0.0] * count
-            var turn = [0.0] * count
-            for index in 0..count {
-                step[index] = trial[index] - theta[index]
-                turn[index] = next_gradient[index] - gradient[index]
-            }
-            let curvature = dot_of(step, turn)
-            if curvature > 1.0e-12 * math.sqrt(dot_of(step, step) * dot_of(turn, turn)) {
-                steps.push(step)
-                turns.push(turn)
-                weights_of.push(1.0 / curvature)
-                if steps.len() > LBFGS_MEMORY {
-                    steps = steps[1:]
-                    turns = turns[1:]
-                    weights_of = weights_of[1:]
-                }
-            }
-            theta = trial
-            objective = next_objective
-            gradient = next_gradient
-            iterations += 1
-        }
+        let (theta, iterations, converged) = lbfgs_minimise(
+            evaluate,
+            count,
+            self.max_iter,
+            self.tol / mean_scale
+        )
         self.n_iter_ = iterations
         self.converged_ = converged
         var coef = [0.0] * (classes * width)
@@ -927,6 +929,69 @@ pub class LogisticRegression: Estimator {
         self.coef_ = Tensor([classes, width], coef)
         self.intercepts_ = bias
         self.intercept_ = 0.0
+    }
+
+    #: Two classes past `_NEWTON_MAX_ORDER`: the two-class objective by
+    #: L-BFGS, scikit-learn's own solver for it. An evaluation is the margins
+    #: as one product, `lin_logit_residual`, and the gradient and the loss as
+    #: a second product read back together. Stops on `tol`, as
+    #: `fit_multinomial` does.
+    fn fit_binary_lbfgs(self, x: Tensor, codes: Tensor) -> void {
+        let rows = x.shape[0]
+        let width = x.shape[1]
+        let padded = round_up4(width + 1)
+        let order = if self.fit_intercept { width + 1 } else { width }
+        let design = Tensor([rows, padded])
+        defer { design.free() }
+        linear_kernel("lin_augment").dispatch_async(
+            [x.buffer(), design.buffer()],
+            rows * padded,
+            [rows, width, padded]
+        )
+        let weights = Tensor([padded, 1])
+        defer { weights.free() }
+        let residual = Tensor([rows, 4])
+        defer { residual.free() }
+        let c = self.C
+        let mean_scale = 1.0 / (c * float(rows))
+
+        let evaluate = fn(theta: list[float]) -> tuple[float, list[float]] {
+            var w = [0.0] * padded
+            for j in 0..order {
+                w[j] = theta[j]
+            }
+            weights.upload(w)
+            let margins = jt.matmul(design, weights)
+            linear_kernel("lin_logit_residual").dispatch_async([margins.buffer(), codes.buffer(), residual.buffer()], rows, [rows])
+            margins.free()
+            let product = jt.matmul(residual, design, trans_a: true)
+            let g = product.download()
+            product.free()
+            var penalty = 0.0
+            var gradient = [0.0] * order
+            for j in 0..order {
+                let ridge = if j < width {
+                    theta[j]
+                } else {
+                    0.0
+                }
+                penalty += ridge * ridge
+                gradient[j] = c * g[j] + ridge
+            }
+            return (c * g[padded + width] + 0.5 * penalty, gradient)
+        }
+
+        let (theta, iterations, converged) = lbfgs_minimise(
+            evaluate,
+            order,
+            self.max_iter,
+            self.tol / mean_scale
+        )
+        self.n_iter_ = iterations
+        self.converged_ = converged
+        self.coef_ = Tensor([1, width], theta[0:width])
+        self.intercept_ = if self.fit_intercept { theta[width] } else { 0.0 }
+        self.intercepts_ = [self.intercept_]
     }
 
     fn multinomial(self) -> bool { return self.classes_.len() > 2 }
@@ -994,19 +1059,27 @@ pub class LogisticRegression: Estimator {
                 ("fit_intercept", self.fit_intercept),
                 ("max_iter", self.max_iter),
                 ("tol", self.tol),
+                ("solver", self.solver),
             ]
         )
     }
 
     pub fn set_params(self, params: Params) -> void {
-        self.C = param_float(params, "C", self.C)
+        let c = param_float(params, "C", self.C)
+        let max_iter = param_int(params, "max_iter", self.max_iter)
+        if c <= 0.0 { throw ValueError(f"LogisticRegression needs a positive C, got {c}") }
+        if max_iter <= 0 { throw ValueError(f"max_iter must be positive, got {max_iter}") }
+        self.C = c
         self.fit_intercept = param_bool(params, "fit_intercept", self.fit_intercept)
-        self.max_iter = param_int(params, "max_iter", self.max_iter)
+        self.max_iter = max_iter
         self.tol = param_float(params, "tol", self.tol)
+        let solver = param_str(params, "solver", self.solver)
+        check_solver(solver)
+        self.solver = solver
     }
 
     pub fn clone_unfitted(self) -> LogisticRegression {
-        return LogisticRegression(self.C, self.fit_intercept, self.max_iter, self.tol)
+        return LogisticRegression(self.C, self.fit_intercept, self.max_iter, self.tol, self.solver)
     }
 
     pub fn is_fitted(self) -> bool { return self.coef_ is not null }
@@ -1021,6 +1094,12 @@ pub class LogisticRegression: Estimator {
         self.coef_ = null
         self.labels = null
         self.intercept_ = 0.0
+    }
+}
+
+fn check_solver(solver: str) -> void {
+    if solver != "auto" and solver != "lbfgs" and solver != "newton-cholesky" {
+        throw ValueError(f"solver must be 'auto', 'lbfgs' or 'newton-cholesky', got '{solver}'")
     }
 }
 
@@ -1071,6 +1150,91 @@ fn lbfgs_direction(
     }
     for slot in 0..count { q[slot] = -q[slot] }
     return q
+}
+
+#: Minimise a smooth convex objective by L-BFGS from zero: `evaluate` returns
+#: the objective and its gradient at a point of `count` values, and the search
+#: stops once no gradient component is larger than `stop`, or after
+#: `max_iter` iterations. Returns `(point, iterations, converged)`.
+#:
+#: Each step backtracks from the full L-BFGS step until Armijo's decrease
+#: holds; a direction that does not descend restarts from steepest descent. A
+#: loss that is not finite at zero means the data holds a NaN or an infinity,
+#: and is refused as such.
+fn lbfgs_minimise(
+    evaluate: fn(list[float]) -> tuple[float, list[float]],
+    count: int,
+    max_iter: int,
+    stop: float
+) -> tuple[list[float], int, bool] {
+    var theta = [0.0] * count
+    var (objective, gradient) = evaluate(theta)
+    var finite = math.is_finite(objective)
+    for value in gradient { finite = finite and math.is_finite(value) }
+    if not finite {
+        throw ValueError("the logistic loss is not finite at zero: X holds a NaN or an infinity")
+    }
+    var steps: list[list[float]] = []
+    var turns: list[list[float]] = []
+    var weights_of: list[float] = []
+    var iterations = 0
+    var converged = false
+    while iterations < max_iter {
+        var largest = 0.0
+        for value in gradient { largest = max(largest, math.fabs(value)) }
+        if largest <= stop {
+            converged = true
+            break
+        }
+        let direction = lbfgs_direction(gradient, steps, turns, weights_of)
+        var slope = dot_of(gradient, direction)
+        if slope >= 0.0 {
+            steps = []
+            turns = []
+            weights_of = []
+            for index in 0..count { direction[index] = -gradient[index] / largest }
+            slope = dot_of(gradient, direction)
+        }
+        var t = 1.0
+        var trial = [0.0] * count
+        var (next_objective, next_gradient) = (objective, gradient)
+        for _halving in 0..40 {
+            for index in 0..count { trial[index] = theta[index] + t * direction[index] }
+            let (value, slopes) = evaluate(trial)
+            next_objective = value
+            next_gradient = slopes
+            #: The loss is a float32 sum, good to about a millionth of
+            #: itself; near the optimum the decrease Armijo asks for is
+            #: smaller than that, and demanding it anyway stalls the
+            #: search a thousandth short of where the gradient says the
+            #: optimum is. So a step inside the sum's rounding passes.
+            let noise = 1.0e-6 * math.fabs(objective)
+            if value <= objective + 1.0e-4 * t * slope + noise { break }
+            t *= 0.5
+        }
+        var step = [0.0] * count
+        var turn = [0.0] * count
+        for index in 0..count {
+            step[index] = trial[index] - theta[index]
+            turn[index] = next_gradient[index] - gradient[index]
+        }
+        let curvature = dot_of(step, turn)
+        if curvature > 1.0e-12 * math.sqrt(dot_of(step, step) * dot_of(turn, turn)) {
+            steps.push(step)
+            turns.push(turn)
+            weights_of.push(1.0 / curvature)
+            if steps.len() > LBFGS_MEMORY {
+                steps = steps[1:]
+                turns = turns[1:]
+                weights_of = weights_of[1:]
+            }
+        }
+        theta = trial
+        objective = next_objective
+        gradient = next_gradient
+        iterations += 1
+    }
+    return (theta, iterations, converged)
 }
 
 #: Solve `H d = g`, damping the diagonal by growing multiples of its largest
