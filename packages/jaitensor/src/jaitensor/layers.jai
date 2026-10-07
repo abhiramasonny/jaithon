@@ -6,6 +6,7 @@ from .ops import conv2d, conv2d_out_dim, dense_affine, dense_static_backward, de
 from .ops import dropout, gather_rows, gelu, layer_norm, leaky_relu, max_pool2d, avg_pool2d
 from .ops import relu, reshape, sigmoid, softmax, tanh
 from .ops import batch_norm, group_norm, multi_head_attention, silu, matmul
+from .ops.attention import hand_to_graph
 from .ops.matmul import raw_matmul
 from .tensor import Tensor
 
@@ -718,12 +719,6 @@ pub class LayerNorm: Layer {
     fn __str__(self) -> str { return f"LayerNorm({self.width})" }
 }
 
-#: Free an intermediate unless an autograd graph recorded it; a recorded one
-#: is released by whoever frees what `backward()` or `discard_graph()` returns.
-fn release_unrecorded(tensor: Tensor) -> void {
-    if tensor.creator is null { tensor.free() }
-}
-
 #: Multi-head self-attention over rank-two `[seq, dim]` inputs.
 #:
 #: `causal` lets each position attend only to itself and the positions before
@@ -872,17 +867,17 @@ pub class MultiHeadAttention: Layer {
         let k = matmul(x, wk)
         let v = matmul(x, wv)
         let context = multi_head_attention(q, k, v, self.heads, causal: self.causal)
-        #: A recorded projection belongs to the graph: attention's backward
-        #: reads q, k and v, and the output product's backward reads
-        #: `context`, so freeing them here made the first `backward()` of any
-        #: model holding this layer throw. `backward()` or `discard_graph()`
-        #: hands them back to the caller to free. Only a value no graph
-        #: recorded is still ours to release.
-        release_unrecorded(q)
-        release_unrecorded(k)
-        release_unrecorded(v)
+        #: Attention's backward reads q, k and v, and the output product's
+        #: backward reads `context`, so freeing them here made the first
+        #: `backward()` of any model holding this layer throw. Whether one is
+        #: still read depends on its consumer, not on itself: a frozen
+        #: projection records nothing, yet attention's graph reads it as soon
+        #: as any other input trains. `hand_to_graph` gives each to the graph
+        #: that reads it, for `backward()` or `discard_graph()` to return, and
+        #: frees only what no graph reads.
+        hand_to_graph(context, [q, k, v])
         let output = matmul(context, wo)
-        release_unrecorded(context)
+        hand_to_graph(output, [context])
         return output
     }
 

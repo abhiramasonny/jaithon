@@ -44,7 +44,9 @@ pub fn scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor) -
 #:
 #: `causal` masks query row `i` to key rows `0..=i + tk - tq`: with equal
 #: lengths that is the usual lower triangle, and a query block that continues
-#: a longer key sequence sees its own prefix. It needs `tk >= tq`.
+#: a longer key sequence sees its own prefix. It needs `tk >= tq`. That is the
+#: bottom-right alignment; torch's `is_causal=True` aligns top left, and the
+#: two differ whenever `tq < tk`.
 #:
 #: The fused device path is a Metal prefill kernel: packed `[seq, heads, hd]`
 #: stays packed, Q/K/V stream through half SRAM, and QK/PV use simdgroup MMA.
@@ -164,11 +166,9 @@ fn mha_batched(query: Tensor, key: Tensor, value: Tensor, heads: int, causal: bo
     let kf = fold_batch(key)
     let vf = fold_batch(value)
     let folded = multi_head_attention(qf, kf, vf, heads * batch, causal: causal)
-    release_unrecorded(qf)
-    release_unrecorded(kf)
-    release_unrecorded(vf)
+    hand_to_graph(folded, [qf, kf, vf])
     let split = split_heads(folded, batch)
-    release_unrecorded(folded)
+    hand_to_graph(split, [folded])
     if split.creator is not null { return reshape(split, [batch, seq, dim]) }
     #: Unrecorded, `split` already holds the answer in `[batch, seq, dim]`
     #: order; the result adopts its buffer rather than viewing it, since a
@@ -192,10 +192,34 @@ fn release_unrecorded(tensor: Tensor) -> void {
     if tensor.creator is null { tensor.free() }
 }
 
+#: Settle the intermediates `consumer` was computed from, once nothing else
+#: will read them in the forward pass.
+#:
+#: One a graph recorded already belongs to it. One no graph recorded may still
+#: be read by `consumer`'s backward: an input with no gradient of its own
+#: beside one that has one, such as a frozen projection, or the copy of a
+#: plain key next to a query that trains. Freeing that made the backward
+#: throw, and keeping it without telling the graph leaked it, since
+#: `backward()` returns only what has a creator. So it rides on `consumer`'s
+#: node as an extra and comes back with the rest. Only when `consumer`
+#: recorded nothing is it freed here.
+pub fn hand_to_graph(consumer: Tensor, tensors: list[Tensor]) -> void {
+    let node = consumer.creator
+    for tensor in tensors {
+        if tensor.creator is not null { continue }
+        if node is not null {
+            node.extras.push(tensor)
+        } else {
+            tensor.free()
+        }
+    }
+}
+
 #: Whether the attention softmax kernels keep a row in registers between their
 #: passes. `JAITENSOR_ATTN_SOFTMAX_HOLD=0` restores the re-reading loops, for
-#: an A/B in one binary; the answer is the same bit for bit either way. Read
-#: once.
+#: an A/B in one binary. The answer is the same bit for bit at head width 64,
+#: whose scale is exact, and within about an ulp at other widths, where the
+#: compiler fuses the two spellings differently. Read once.
 var _softmax_hold: int = -1
 
 fn softmax_hold() -> int {
@@ -403,9 +427,14 @@ fn mha_by_ops(
     let context = Tensor([heads * seq, hd])
     raw_matmul_batched(probs, vs, context, heads, seq, kv_seq, hd, seq * kv_seq, kv_seq * hd)
     if qs.requires_grad or ks.requires_grad or vs.requires_grad {
+        #: The backward reads all three split copies. One made from an input
+        #: with no gradient has no creator, so `backward()` would never hand
+        #: it back; it goes with `probs` instead.
+        var kept = [probs]
+        for split in [qs, ks, vs] { if split.creator is null { kept.push(split) } }
         context.attach_creator(GradNode([qs, ks, vs], fn(upstream: Tensor) -> list[Tensor] {
             return mha_grads(upstream, qs, ks, vs, probs, heads, seq, kv_seq, hd, factor, causal)
-        }, extras: [probs]))
+        }, extras: kept))
         return merge_heads(context, heads, seq)
     }
     let output = merge_heads(context, heads, seq)

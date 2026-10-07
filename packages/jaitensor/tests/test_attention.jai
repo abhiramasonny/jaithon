@@ -813,3 +813,138 @@ fn test_causal_attention_layer_trains() -> void {
     for value in losses { assert_true(math.is_finite(value)) }
     assert_true(losses[3] < losses[0])
 }
+
+#: Gradients of `sum(attention(q, k, v) * w)` for whichever of Q, K and V
+#: train, as host lists in Q, K, V order; an input that does not train gives
+#: an empty list. Runs `steps` times and checks the last runs allocate
+#: nothing that outlives a step.
+fn batched_grads(
+    shape: list[int],
+    heads: int,
+    causal: bool,
+    trains: list[bool],
+    steps: int
+) -> list[list[float]] {
+    let count = shape[0] * shape[1] * shape[2]
+    let inputs = [
+        Tensor(shape, wave(count, 0.3), requires_grad: trains[0]),
+        Tensor(shape, wave(count, 1.1), requires_grad: trains[1]),
+        Tensor(shape, wave(count, 2.3), requires_grad: trains[2]),
+    ]
+    let w = Tensor(shape, wave(count, 0.9))
+    var grads: list[list[float]] = [[], [], []]
+    var live = -1
+    for step in 0..steps {
+        let y = jt.multi_head_attention(inputs[0], inputs[1], inputs[2], heads, causal: causal)
+        let total = jt.sum(jt.multiply(y, w))
+        let held = total.backward()
+        for (index, input) in inputs.enumerate() {
+            let g = input.grad
+            if trains[index] {
+                assert_true(g is not null)
+                if g is not null { grads[index] = g.download() }
+            }
+            if g is not null { g.free() }
+            input.grad = null
+        }
+        free_all(held)
+        free_all([total, y])
+        gpu.synchronize()
+        if step == 1 { live = gpu.live_buffers() }
+        if step > 1 { assert_eq(gpu.live_buffers(), live) }
+    }
+    free_all(inputs)
+    w.free()
+    return grads
+}
+
+#: Rank-three attention where only some of Q, K and V train. The folded copy
+#: of a plain input has no creator, but the backward still reads it: it used
+#: to be freed (the MMA route threw on backward) or never returned (the ops
+#: route leaked four buffers a step). Each gradient must equal the one the
+#: same input gets when all three train.
+fn test_batched_attention_trains_with_some_inputs_plain() -> void {
+    if not jt.is_available() { return }
+    #: MMA route causal, MMA route plain, and the ops route.
+    let cases = [([2, 64, 64], 1, true), ([2, 64, 128], 2, false), ([2, 20, 64], 2, true)]
+    for (shape, heads, causal) in cases {
+        let all = batched_grads(shape, heads, causal, [true, true, true], 1)
+        for trains in [[true, false, false], [false, true, true], [false, false, true]] {
+            let some = batched_grads(shape, heads, causal, trains, 4)
+            for index in 0..3 {
+                if trains[index] { assert_values_near(some[index], all[index], 1e-5) }
+            }
+        }
+    }
+}
+
+#: Rank-two attention through the ops route with only Q training: the split
+#: copies of K and V are returned by `backward()` instead of leaking.
+fn test_attention_ops_route_returns_plain_split_copies() -> void {
+    if not jt.is_available() { return }
+    let all = batched_grads([1, 20, 64], 2, false, [true, true, true], 1)
+    let some = batched_grads([1, 20, 64], 2, false, [true, false, false], 4)
+    assert_values_near(some[0], all[0], 1e-5)
+}
+
+#: Gradients of the layer's parameters with some of them frozen, as host
+#: lists (empty for a frozen one), over `steps` steps that must not grow the
+#: live buffer count.
+fn layer_grads_with_frozen(frozen: list[int], causal: bool, steps: int) -> list[list[float]] {
+    let seq = 64
+    let dim = 64
+    let layer = jt.MultiHeadAttention(dim, heads: 1, causal: causal)
+    defer { layer.free() }
+    layer.build(dim, Random.with_seed(3))
+    let params = layer.parameters()
+    for index in frozen { params[index].requires_grad = false }
+    let x = Tensor([seq, dim], wave(seq * dim, 0.4))
+    let w = Tensor([seq, dim], wave(seq * dim, 1.9))
+    var grads: list[list[float]] = [[], [], [], []]
+    var live = -1
+    for step in 0..steps {
+        jt.zero_grad(params)
+        let y = layer.forward(x)
+        let total = jt.sum(jt.multiply(y, w))
+        let held = total.backward()
+        #: A frozen parameter that feeds a recorded product may still be
+        #: handed a gradient (matmul's backward fills both operands), so
+        #: only the trained ones are checked; `zero_grad` frees the rest.
+        for (index, param) in params.enumerate() {
+            if index in frozen { continue }
+            let g = param.grad
+            assert_true(g is not null)
+            if g is not null { grads[index] = g.download() }
+        }
+        free_all(held)
+        free_all([total, y])
+        gpu.synchronize()
+        if step == 1 { live = gpu.live_buffers() }
+        if step > 1 { assert_eq(gpu.live_buffers(), live) }
+    }
+    jt.zero_grad(params)
+    free_all([x, w])
+    return grads
+}
+
+#: The layer with some projections frozen and an input that does not train.
+#: A frozen projection records nothing, but attention's backward reads it as
+#: soon as another projection trains, and the output product's backward reads
+#: the context when only `wo` trains; freeing either made backward throw.
+#: Freezing one parameter must not change any other's gradient.
+fn test_attention_layer_trains_with_frozen_projections() -> void {
+    if not jt.is_available() { return }
+    for causal in [false, true] {
+        let all = layer_grads_with_frozen([], causal, 1)
+        for frozen in [[0], [1], [2], [0, 1, 2], [3], [0, 2]] {
+            let some = layer_grads_with_frozen(frozen, causal, 4)
+            #: With all three projections frozen attention records nothing,
+            #: so it takes the half-precision inference kernel, and `wo`'s
+            #: gradient reads that context.
+            let tolerance = if frozen.len() == 3 { 1e-2 } else { 1e-4 }
+            for index in 0..4 {
+                if not index in frozen { assert_values_near(some[index], all[index], tolerance) }
+            }
+        }
+    }
+}
