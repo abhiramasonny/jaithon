@@ -40,11 +40,14 @@ since the names in `coco.jai` no longer describe it.
 
 Measured on `bus.jpg`, same code path, only `YOLO_MODEL` different:
 
-| model | load | inference | best person |
-| --- | --- | --- | --- |
-| yolov8n 640 | 1.8 s | 217 ms | 0.891 |
-| yolov8s 640 | 6.1 s | 246 ms | 0.915 |
-| yolov8n 1280 | 1.9 s | 312 ms | 0.809 |
+| model | inference | best person |
+| --- | --- | --- |
+| yolov8n 640 | 217 ms | 0.891 |
+| yolov8s 640 | 246 ms | 0.915 |
+| yolov8n 1280 | 312 ms | 0.809 |
+
+Loading the ONNX file now takes about 24 ms for yolov8n and 66 ms for yolov8s
+(it was 1.8 s and 6.1 s): the weights are copied in blocks and decoded natively.
 
 A file exported with dynamic axes declares no shape at all; the detector says
 so and falls back to 640 and 80 classes rather than guessing quietly.
