@@ -517,9 +517,10 @@ pub class Ridge: Estimator {
             self.intercept_ = offset
         }
 
-        #: The reshape shares `weights`' storage, so `coef_` becomes its owner
-        #: and `weights` must not be freed as well -- see the note above.
-        self.coef_ = jt.reshape(weights, [1, self.width])
+        #: `coef_` takes over `weights`' storage itself, not a view of it: a
+        #: reshape is a view, whose `free` never released the solve's answer,
+        #: so every refit on this route left one buffer behind.
+        self.coef_ = Tensor([1, self.width], storage: weights.buffer())
         if owns_design { design.free() }
         if owns_response { response.free() }
     }
