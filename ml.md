@@ -121,6 +121,23 @@ each head at `1 / sqrt(head_dim)`, and concatenates the context. Sequences of
 length 16+ with `head_dim <= 64` use a tiled flash kernel (no `seq x seq`
 buffer). Other shapes use the MMA/MPS GEMM path.
 
+`multi_head_attention(q, k, v, heads, causal: true)` masks query row `i` to
+keys `0..=i + tk - tq`. With `tq == tk` that is the usual lower triangle. With
+fewer queries than keys the mask is aligned bottom right, so a query block that
+continues a cached sequence sees its own prefix. torch's `is_causal=True`
+aligns top left instead, and the two differ whenever `tq < tk`. `q` may be
+`[tq, dim]` against `[tk, dim]` keys, and rank-three `[batch, t, dim]` folds
+the batch into the head axis. `MultiHeadAttention(dim, heads, causal: true)`
+carries the flag. `start_cache(max_seq)` keeps projected keys and values on
+the device, so each `forward` then takes only the new rows. `reset_cache` and
+`free_cache` end a sequence. The cached forward records no gradient, so do not
+train a layer while its cache is on. A/B switches, each read once:
+`JAITHON_GPU_MHA_DECODE=0` sends short queries to the prefill kernel instead of
+the split-key decode kernel. `JAITENSOR_LN_PARAM_STRIPS=0` restores the
+one-thread-per-column LayerNorm parameter gradient.
+`JAITENSOR_ATTN_SOFTMAX_HOLD=0` makes the attention softmax re-read rows
+instead of holding them in registers.
+
 `gather_rows` records a scatter-add into the source so `Embedding` can train.
 `group_norm` is NHWC, one mean/variance per sample per group. `tril` zeros the
 strict upper triangle of a rank-two tensor. `binary_cross_entropy_with_logits`

@@ -138,8 +138,11 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
 
     /* A row that fits is read once and written once: the three passes below
      * read it three times, which at seq 1024 and 12 heads is 48 MB a pass of
-     * a kernel that is nothing but bandwidth. Same operations on the same
-     * values in the same order, so the answer is bit for bit the same. */
+     * a kernel that is nothing but bandwidth. Same operations in the same
+     * order, but the compiler fuses and schedules the two spellings
+     * differently: with a head width whose scale is a power of two (64) the
+     * answer is the same bit for bit, and otherwise it moves by about an ulp
+     * (at most 2e-5 on a gradient, measured at hd 8, 32 and 48). */
     if (hold != 0u && valid <= GROUP * SOFTMAX_HELD) {
         float held[SOFTMAX_HELD];
         float top = floor_value;
