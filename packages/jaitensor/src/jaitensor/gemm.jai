@@ -8,9 +8,9 @@
 #:
 #: A shape runs the static plan until it has earned a tuning pass: plans are
 #: kept per BUCKET of shapes (rows and inner dimension rounded up to a quarter
-#: octave, columns exact), and a bucket is tuned only once it has been asked
-#: for `TUNE_MIN_REQUESTS` times and the work routed through it is estimated
-#: to have cost `TUNE_PAYBACK_SECONDS`. `JAITENSOR_AUTOTUNE=0` keeps the static
+#: octave, columns exact), and a bucket is tuned only once one of its exact
+#: shapes has been asked for `TUNE_MIN_REQUESTS` times and the work it did is
+#: estimated to have cost `TUNE_PAYBACK_SECONDS`. `JAITENSOR_AUTOTUNE=0` keeps the static
 #: heuristic instead, `JAITENSOR_AUTOTUNE_VERBOSE=1` prints every candidate it
 #: timed, `JAITENSOR_GEMM_CACHE` overrides the cache path, and
 #: `JAITENSOR_GEMM_PLAN` forces one plan for every shape (`name` or
@@ -511,12 +511,26 @@ let DEEP_MIN_INNER = 16384
 #: Fewest steps of K each split of a static plan keeps; see `filling_splits`.
 let STATIC_SPLIT_DEPTH = 256
 
+#: The same floor for a staged static plan. Staged kernels run where no direct
+#: tile divides the shape, and there the split is what fills the device: 300
+#: cubed ran at 270 GFLOPS unsplit on `gemm64x32` and 625 split four ways,
+#: 75 steps of K each.
+let STAGED_SPLIT_DEPTH = 64
+
+#: Multiply-adds per element the padded copies move, above which a large
+#: product that MPS can only read through zero-padded copies still goes to the
+#: graph statically. A copy of the big operand is a full pass over it, and on a
+#: tall-skinny output that is most of what the product costs: 500000x130x10
+#: (9 multiply-adds per copied element) ran 29.5 ms padded on the graph against
+#: 24.9 on `gemm64x32`, where 100000x50x128 (123) ran 0.97 padded against 1.5.
+let PAD_MPS_RATIO = 32
+
 #: How many times a bucket must be asked for before it may be tuned. A shape
 #: that is used once or twice can never earn back what measuring it costs.
 let TUNE_MIN_REQUESTS = 3
 
-#: Estimated seconds of GEMM work a bucket must have run, on its static plan,
-#: before it is tuned.
+#: Estimated seconds of GEMM work one shape must have run, on its static plan,
+#: before its bucket is tuned.
 #:
 #: Tuning every new shape on its first call stalled whole programs: a 128-token
 #: generation tuned 385 row counts at half a second each, 204 s against 0.93 s
@@ -534,6 +548,23 @@ let TUNE_PAYBACK_SECONDS = 0.15
 #: few hundred calls of a warm-up rather than in the middle of a timed loop.
 let TUNE_ASSUMED_FLOPS = 2.0e12
 let TUNE_ASSUMED_CALL_SECONDS = 0.00002
+
+#: And the rate it assumes operands move at, for a product that is bound by
+#: memory rather than arithmetic: a 100000x50x1 product does a millionth of
+#: the arithmetic of a 1024-cubed one and still reads 20 MB.
+let TUNE_ASSUMED_BYTES_PER_SECOND = 2.0e11
+
+#: The arithmetic rate assumed instead where the static plan is a staged
+#: kernel, which is where the static plan is furthest behind a tuned one: the
+#: staged kernels ran ragged shapes at 0.1-0.9 TFLOPS, where the graph ran
+#: 100x4096x300 at 1.7 and 2000x20x2000 at 1.1. Charged at 2 TFLOPS, those
+#: buckets needed over a thousand calls -- half a second of real work, more
+#: than a short program does -- before they were tuned at all.
+let TUNE_ASSUMED_STAGED_FLOPS = 5.0e11
+
+#: Tuning passes a bucket may lose to a queue that would not drain in time
+#: (see `tune_bucket`) before it settles on its static plan for the process.
+let TUNE_MAX_ATTEMPTS = 3
 
 #: Wall-clock ceiling on one tuning pass, warm-up included. Candidates still
 #: unmeasured when it runs out are not measured.
@@ -558,10 +589,12 @@ let TUNE_MPS_MARGIN = 1.1
 let TUNE_MIN_SECONDS = 0.004
 
 #: How many rounds the candidates are timed in, turn about; each keeps its
-#: fastest reading. `TUNE_ROUNDS` always run (budget permitting); more, up to
-#: `TUNE_MAX_ROUNDS`, run while a whole round still fits in the budget, which
-#: for a large shape down to two graph candidates is several more readings of
-#: a decision that is otherwise inside the device's drift.
+#: fastest reading. Up to `TUNE_ROUNDS` run while the budget lasts -- a long
+#: candidate list can be cut short inside one, and then the winner is chosen
+#: among candidates holding unequal numbers of readings -- and more, up to
+#: `TUNE_MAX_ROUNDS`, only while a whole round still fits, which for a large
+#: shape down to two graph candidates is several more readings of a decision
+#: that is otherwise inside the device's drift.
 let TUNE_ROUNDS = 3
 let TUNE_MAX_ROUNDS = 8
 
@@ -634,13 +667,15 @@ var _forced: Plan? = null
 
 fn forced_plan() -> Plan? {
     if _forced_read { return _forced }
-    _forced_read = true
     let text = env("JAITENSOR_GEMM_PLAN")
-    if text is not null {
+    if text is not null and text.len() > 0 {
         let parsed = plan_from_text(text)
         #: It used to fall back to tuning without a word, so `mpsgraph` --
         #: which needed to be spelled `mpsgraph:1` -- measured nothing it
-        #: claimed to and looked like a result.
+        #: claimed to and looked like a result. The value is not marked read
+        #: until it parses, so every product raises, not only the first: a
+        #: harness that catches per test would otherwise run all but one of
+        #: them unforced.
         if parsed is null {
             throw ValueError(
                 f"JAITENSOR_GEMM_PLAN={text} names no plan; expected a kernel name or mpsgraph, optionally followed by :splits"
@@ -648,6 +683,7 @@ fn forced_plan() -> Plan? {
         }
         _forced = parsed
     }
+    _forced_read = true
     return _forced
 }
 
@@ -716,9 +752,35 @@ fn mps_aligned(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool
 
 #: Whether the MPSGraph route can run this shape: natively when it is aligned,
 #: and through a zero-padded copy otherwise (see `encode_mps`).
+#:
+#: Never for an empty inner axis: MPS refuses `k == 0` outright, and the
+#: product is all zeros, which any kernel writes.
 fn mps_possible(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> bool {
-    if not gpu.is_available() { return false }
+    if inner <= 0 or not gpu.is_available() { return false }
     return _PAD or mps_aligned(rows, inner, columns, trans_a, trans_b)
+}
+
+#: Elements the padded MPS route copies for this shape: each operand that has
+#: to be padded, and the padded result when it has to be cut back. Zero when
+#: MPS reads the shape as stored. Mirrors `encode_mps`.
+fn padded_elements(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> int {
+    if mps_aligned(rows, inner, columns, trans_a, trans_b) { return 0 }
+    let padded_rows = if trans_a { round_up_4(rows) } else { rows }
+    let padded_inner = if not trans_a or trans_b { round_up_4(inner) } else { inner }
+    let padded_columns = round_up_4(columns)
+    var copied = 0
+    if padded_rows != rows or padded_inner != inner { copied += padded_rows * padded_inner }
+    if padded_inner != inner or padded_columns != columns {
+        copied += padded_inner * padded_columns
+    }
+    if padded_rows != rows or padded_columns != columns { copied += padded_rows * padded_columns }
+    return copied
+}
+
+#: Whether the graph's own speed pays for the copies padding it would take.
+fn padding_pays(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> bool {
+    return rows * inner * columns >=
+        PAD_MPS_RATIO * padded_elements(rows, inner, columns, trans_a, trans_b)
 }
 
 fn tile_count(config: Config, rows: int, columns: int) -> int {
@@ -764,7 +826,10 @@ let DIRECT_WIDE = config_index("direct32x64")
 #: partials, and on a short K that is most of the product -- 128 cubed ran
 #: 16.3 us split in two against 12.6 us whole.
 fn filling_splits(config: Config, rows: int, inner: int, columns: int) -> int {
-    let depth = if _STATIC_DIRECT { STATIC_SPLIT_DEPTH } else { 0 }
+    var depth = 0
+    if _STATIC_DIRECT {
+        depth = if config.staged { STAGED_SPLIT_DEPTH } else { STATIC_SPLIT_DEPTH }
+    }
     var splits = 1
     for candidate in split_counts() {
         if not split_allowed(config, rows, inner, columns, candidate) { continue }
@@ -775,23 +840,71 @@ fn filling_splits(config: Config, rows: int, inner: int, columns: int) -> int {
 }
 
 #: Whether a product is far deeper than it is wide: an `X^T X` or `X^T y` over
-#: many samples. MPS splits K itself and beat every kernel plan on these --
-#: 0.80 ms for a 100k x 50 gram against 1.45 for the best split kernel, and
-#: 0.46 against 0.82 for `X^T y` -- once its encode is small beside the work.
+#: many samples. Where no direct kernel divides one, MPS splits K itself and
+#: beat every staged plan -- 0.80 ms for a 100k x 50 gram against 1.45 for the
+#: best split kernel, and 0.46 against 0.82 for `X^T y` -- once its encode is
+#: small beside the work. Where a direct kernel does divide it, the graph is
+#: no rule: at widths 96 and 160 it ran a 40000-deep gram four times slower
+#: than `direct32x32:16`, and at 80, 112 and 192 it tied.
 fn deep_product(rows: int, inner: int, columns: int) -> bool {
     return inner >= DEEP_MIN_INNER and inner >= 16 * rows and inner >= 16 * columns
 }
 
+#: Whether the output has too few tiles to fill the device without splitting
+#: K, even in the narrowest direct tile. These are the products where a split
+#: kernel and the graph trade places shape by shape, so neither may be assumed.
+fn small_output(rows: int, columns: int) -> bool {
+    return tile_count(CONFIGS[DIRECT_NARROW], rows, columns) < TARGET_GROUPS
+}
+
+#: The direct kernel the static plan would use for this shape, or -1.
+fn static_direct(rows: int, inner: int, columns: int) -> int {
+    let wide = CONFIGS[DIRECT_WIDE]
+    if config_allowed(wide, rows, inner, columns) and
+        tile_count(wide, rows, columns) >= TARGET_GROUPS {
+        return DIRECT_WIDE
+    }
+    if config_allowed(CONFIGS[DIRECT_NARROW], rows, inner, columns) { return DIRECT_NARROW }
+    return -1
+}
+
+#: The staged tile a static plan uses where no direct kernel fits.
+#:
+#: `gemm64x32` wherever it still makes `MIN_TILES` threadgroups, else
+#: `gemm32x32`. The largest tile was the rule before, and on a narrow output it
+#: computed mostly padding: 100000x50x1 ran at 6 GFLOPS on `gemm128x128` and
+#: 20 on `gemm64x32`. Across the ragged shapes a tuner was run on --
+#: 300x300x300, 1000x1000x96, 100x4096x300, 2000x20x2000, 500000x130x10 --
+#: `gemm64x32`, split to fill the device, was the best staged plan or within
+#: a few percent of it every time.
+fn static_staged(rows: int, columns: int) -> int {
+    let medium = config_index("gemm64x32")
+    if tile_count(CONFIGS[medium], rows, columns) >= MIN_TILES { return medium }
+    return config_index("gemm32x32")
+}
+
 #: The routing a shape gets without measuring anything.
 #:
-#: Large products go to MPSGraph. Below that a direct kernel runs wherever its
-#: tile divides the shape: staged `gemm32x32` cost 15.6 us of GPU time per
-#: 64-cubed product against about 5 for `direct32x32`, and among tuned plans
-#: the direct kernels won 59 times to the staged one's once. Anything ragged
-#: takes the largest staged tile that still produces a few threadgroups. Either
-#: way K is then split until the device has enough threadgroups to stay busy;
-#: shrinking the tile instead costs arithmetic intensity, so splitting is
+#: A direct kernel runs wherever its tile divides the shape: staged
+#: `gemm32x32` cost 15.6 us of GPU time per 64-cubed product against about 5
+#: for `direct32x32`, and among tuned plans the direct kernels won 59 times to
+#: the staged one's once. The graph takes a large product whose output fills
+#: the device -- where every tuned cache on record chose it -- if its padded
+#: copies, when it needs them, are small beside the product; and a deep one
+#: no direct kernel divides (see `deep_product`). An output too small to fill
+#: the device keeps the direct kernel and splits K instead: there the best
+#: plan for 256x5000x256 and 256x8192x128 was `direct32x32:16`, ahead of the
+#: graph. Anything else ragged takes the staged tile `static_staged` picks.
+#: Either way K is then split until the device has enough threadgroups to stay
+#: busy; shrinking the tile instead costs arithmetic intensity, so splitting is
 #: always tried first.
+#:
+#: Never the graph for a ragged product below `MPS_STATIC_WORK`, though the
+#: graph won the tuning pass for most of them: a new MPSGraph shape costs about
+#: 3.2 ms on its first call, against 0.4 for the kernel, and a program that
+#: walks through row counts -- a generation, the folds of a cross-validation --
+#: would pay that for every one of them. A bucket that is used enough is tuned
+#: onto the graph anyway.
 pub fn default_plan(
     rows: int,
     inner: int,
@@ -801,21 +914,18 @@ pub fn default_plan(
 ) -> Plan {
     if _STATIC_DIRECT {
         let work = rows * inner * columns
-        let large = work >= MPS_STATIC_WORK or
-            work >= TUNE_MIN_WORK and deep_product(rows, inner, columns)
-        if large and mps_possible(rows, inner, columns, trans_a, trans_b) { return MPS_PLAN }
-        var direct = -1
-        let wide = CONFIGS[DIRECT_WIDE]
-        if config_allowed(wide, rows, inner, columns) and
-            tile_count(wide, rows, columns) >= TARGET_GROUPS {
-            direct = DIRECT_WIDE
-        } elif config_allowed(CONFIGS[DIRECT_NARROW], rows, inner, columns) {
-            direct = DIRECT_NARROW
+        let direct = static_direct(rows, inner, columns)
+        let small = small_output(rows, columns)
+        if mps_possible(rows, inner, columns, trans_a, trans_b) and not (direct >= 0 and small) {
+            let deep = work >= TUNE_MIN_WORK and deep_product(rows, inner, columns)
+            if deep and direct < 0 { return MPS_PLAN }
+            if work >= MPS_STATIC_WORK and padding_pays(rows, inner, columns, trans_a, trans_b) {
+                return MPS_PLAN
+            }
         }
-        if direct >= 0 {
-            let config = CONFIGS[direct]
-            return Plan(config.entry, direct, filling_splits(config, rows, inner, columns))
-        }
+        let chosen = if direct >= 0 { direct } else { static_staged(rows, columns) }
+        let config = CONFIGS[chosen]
+        return Plan(config.entry, chosen, filling_splits(config, rows, inner, columns))
     }
     var chosen = 4
     for (index, config) in CONFIGS.enumerate() {
@@ -885,9 +995,13 @@ fn tune_epoch(element: str) -> str {
     #: became per bucket and the tuner learned to alternate and abandon,
     #: and when the static plan learned the direct kernels -- 305 of the 417
     #: rows a machine had cached were staged static plans, which nothing
-    #: would otherwise have re-derived. The switches are in it because each
-    #: changes what a tuning pass can choose between.
-    var extra = f"|{MIN_TILES}|{TARGET_GROUPS}|policy=lazy-buckets-3|{MPS_STATIC_WORK}|{TUNE_MPS_MARGIN}"
+    #: would otherwise have re-derived. It moved again (4) when kernels were
+    #: let back in against a static graph plan on small outputs and padded
+    #: shapes, and when a starved pass stopped being written down. The
+    #: switches are in it because each changes what a tuning pass can choose
+    #: between.
+    var extra = f"|{MIN_TILES}|{TARGET_GROUPS}|policy=lazy-buckets-4|{MPS_STATIC_WORK}|{TUNE_MPS_MARGIN}"
+    extra = extra + f"|{PAD_MPS_RATIO}|{STAGED_SPLIT_DEPTH}"
     extra = extra + f"|{_LAZY_TUNE}|{_PAD}|{_STATIC_DIRECT}|{_DEEP_SPLITS}"
     for candidate in split_counts() { extra = extra + f",{candidate}" }
     #: FNV-1a over the bytes (jaiHashBytes), so it is the same number in every
@@ -898,18 +1012,22 @@ fn tune_epoch(element: str) -> str {
 }
 
 #: The extent a plan is keyed on: the next power of two up to 64, then the
-#: next quarter octave (64, 80, 96, 112, 128, 160, ...).
+#: next quarter octave (64, 80, 96, 112, 128, 160, ...). Zero is its own
+#: bucket: an empty inner axis shared the one-deep bucket, and a graph plan
+#: tuned there failed on it, because MPS refuses `k == 0`.
 #:
 #: A plan is a property of a shape's rough proportions far more than of its
 #: exact extent, and keying on the exact one is what made every new row count
 #: of a generation, and every new `n_samples` of a cross-validation fold, a
 #: fresh tuning pass. A quarter octave keeps shapes within 25% of each other
-#: together. Every bucket above 64 is a multiple of 16, so a plan tuned at a
-#: bucket's top edge is usually legal across it; where it is not -- a direct
-#: kernel whose tile does not divide a ragged member -- `plan_legal` sends that
-#: member to the static plan instead.
+#: together. A bucket is tuned on whichever of its members earns the pass (see
+#: `plan_for`), and that member's plan is then borrowed by every other one it
+#: is legal for; every bucket above 64 is a multiple of 16, so it usually is.
+#: Where it is not -- a direct kernel whose tile does not divide a ragged
+#: member -- `plan_legal` sends that member to the static plan instead.
 pub fn bucket_extent(extent: int) -> int {
-    if extent <= 1 { return 1 }
+    if extent <= 0 { return 0 }
+    if extent == 1 { return 1 }
     if extent <= 64 {
         var power = 1
         while power < extent { power = power * 2 }
@@ -928,6 +1046,18 @@ fn shape_key(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) 
     let prefix = f"{gpu.device_name()}\tv{tune_epoch(element)}\t{element}"
     if not _LAZY_TUNE { return f"{prefix}\t{rows}\t{inner}\t{columns}\t{a_flag}\t{b_flag}" }
     return f"{prefix}\t{bucket_extent(rows)}\t{bucket_extent(inner)}\t{columns}\t{a_flag}\t{b_flag}"
+}
+
+#: The plan-cache row this shape reads and writes: the bucket it falls in,
+#: under this build's epoch, on this device.
+pub fn cache_key(
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> str {
+    return shape_key(rows, inner, columns, trans_a, trans_b)
 }
 
 var _memo_key = -1
@@ -1260,22 +1390,40 @@ fn encode(
 #: way in, or when no direct kernel divides the shape: in float they ran at
 #: 513-980 GFLOPS against 1.7-3.7 TFLOPS for direct and 5.8 for the graph,
 #: and were half of every float pass.
-fn candidates(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> list[Plan] {
+pub fn candidates(
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> list[Plan] {
     var found: list[Plan] = []
     if mps_possible(rows, inner, columns, trans_a, trans_b) {
         found.push(MPS_PLAN)
         if gpu.mixed_precision() { found.push(MPS16_PLAN) }
     }
     let fallback = default_plan(rows, inner, columns, trans_a, trans_b)
-    #: Where the static plan is the graph, only the graph's two precisions
-    #: compete. Every tuned cache on record chose the graph for these sizes,
-    #: and the exceptions did not hold up: `direct32x32:1` cached for
-    #: 1024x768x768 ran 0.29 ms against the graph's 0.21, and a direct kernel
-    #: tuned for 4096x3072x1024 ran at two thirds of the graph's rate --
-    #: queued as one long command buffer, where the graph commits its own, it
-    #: was also killed by the GPU watchdog.
-    if fallback.config < 0 { return found }
-    found.push(fallback)
+    #: Where the static plan is the graph on a large output it reads as
+    #: stored, only the graph's two precisions compete. Every tuned cache on
+    #: record chose the graph for these, and the exceptions did not hold up:
+    #: `direct32x32:1` cached for 1024x768x768 ran 0.29 ms against the graph's
+    #: 0.21, and a direct kernel tuned for 4096x3072x1024 ran at two thirds of
+    #: the graph's rate -- queued as one long command buffer, where the graph
+    #: commits its own, it was also killed by the GPU watchdog.
+    #:
+    #: Anywhere else the graph is only the static guess, and kernels are
+    #: timed against it. Pinning it was a permanent loss on the shapes it
+    #: guesses wrong: a 40000-deep gram at width 96 ran four times slower on
+    #: the graph than on `direct32x32:16`, with no pass ever allowed to see it,
+    #: and a padded 500000x130x10 ran 1.18x slower than `gemm64x32`.
+    if fallback.config < 0 {
+        let graph_only = mps_aligned(rows, inner, columns, trans_a, trans_b) and
+            rows * inner * columns >= MPS_STATIC_WORK and
+            not small_output(rows, columns)
+        if graph_only { return found }
+    } else {
+        found.push(fallback)
+    }
     var direct_legal = false
     for (index, config) in CONFIGS.enumerate() {
         if config.staged or not config_allowed(config, rows, inner, columns) { continue }
@@ -1352,6 +1500,14 @@ fn warm_clock(
     return eight / 8.0
 }
 
+var _last_candidates = 0
+var _last_measured = 0
+
+#: How many candidates the most recent tuning pass in this process had, and
+#: how many of them it timed. For tests and profilers: a pass that timed fewer
+#: than two of several chose nothing.
+pub fn last_tune_counts() -> tuple[int, int] { return (_last_candidates, _last_measured) }
+
 #: Time the candidates for one shape and return the fastest.
 #:
 #: Every candidate is timed in each of `TUNE_ROUNDS` rounds, the order turned
@@ -1378,9 +1534,17 @@ fn autotune(
     trans_b: bool
 ) -> Plan {
     let verbose = autotune_verbose()
+    #: The caller's queue drains before the clock starts. A bucket can earn
+    #: its pass in the middle of an asynchronous loop, and the pass's first
+    #: wait is then for everything that loop queued: with more than the
+    #: budget in flight, no candidate was ever timed, and the static plan was
+    #: written down as the tuned one -- for every later process too.
+    gpu.synchronize()
     let opening = Instant.now()
     let fallback = default_plan(rows, inner, columns, trans_a, trans_b)
     let plans = candidates(rows, inner, columns, trans_a, trans_b)
+    _last_candidates = plans.len()
+    _last_measured = 0
     if plans.len() <= 1 {
         if verbose {
             print(f"tune {rows}x{inner}x{columns} ta={trans_a} tb={trans_b} has one candidate")
@@ -1456,6 +1620,7 @@ fn autotune(
     for index in 0..plans.len() {
         let seconds = best_seen[index]
         if seconds < 0.0 { continue }
+        _last_measured += 1
         if best_time < 0.0 or seconds < best_time {
             best = plans[index]
             best_time = seconds
@@ -1483,21 +1648,18 @@ class Bucket {
     pub let key: str
     #: The tuned plan, or null while the bucket runs on static plans.
     pub var plan: Plan?
-    #: Calls routed through the bucket while it had no plan.
-    pub var requests: int
-    #: Estimated seconds of work those calls did.
-    pub var credit: float
     #: Tuned, read back from the cache, or tried and failed: never tune again.
     pub var settled: bool
+    #: Passes that timed too few candidates to choose; see `tune_bucket`.
+    pub var attempts: int
     #: Bumped whenever `plan` changes, so routes know to look again.
     pub var version: int
 
     pub fn init(self, key: str, plan: Plan?) {
         self.key = key
         self.plan = plan
-        self.requests = 0
-        self.credit = 0.0
         self.settled = plan is not null
+        self.attempts = 0
         self.version = 0
     }
 }
@@ -1513,8 +1675,12 @@ class Route {
     pub let bucket: Bucket
     #: Never tuned: too small to be worth it, or tuning is off.
     pub let fixed: bool
-    #: Estimated seconds one call costs, for the bucket's credit.
+    #: Estimated seconds one call costs; see `TUNE_PAYBACK_SECONDS`.
     pub let estimate: float
+    #: Calls of this exact shape while its bucket had no plan.
+    pub var requests: int
+    #: Estimated seconds of work those calls did.
+    pub var credit: float
     pub var plan: Plan
     pub var version: int
 
@@ -1540,6 +1706,8 @@ class Route {
         self.bucket = bucket
         self.fixed = fixed
         self.estimate = estimate
+        self.requests = 0
+        self.credit = 0.0
         self.plan = plan
         self.version = -1
     }
@@ -1567,7 +1735,7 @@ var _buckets: dict[str, Bucket] = {}
 
 #: Forget every plan and request count this process holds, and read the plan
 #: cache again -- from wherever `JAITENSOR_GEMM_CACHE` points now -- on the
-#: next product.
+#: next product. `JAITENSOR_GEMM_PLAN` is read again too.
 #:
 #: The cache is read once and every shape's route memoised, so pointing the
 #: variable somewhere else mid-process changed nothing: the planner went on
@@ -1575,6 +1743,10 @@ var _buckets: dict[str, Bucket] = {}
 #: passed or failed on what the machine's own cache happened to hold. Call
 #: this after changing the variable.
 pub fn reload_plans() -> void {
+    _forced_read = false
+    _forced = null
+    _last_candidates = 0
+    _last_measured = 0
     _cache = {}
     _cache_loaded = false
     _cache_dirty = false
@@ -1597,9 +1769,12 @@ fn resolve(route: Route) -> Plan {
 }
 
 #: Estimated seconds one call of this shape takes; see `TUNE_PAYBACK_SECONDS`.
-fn estimated_seconds(rows: int, inner: int, columns: int) -> float {
+fn estimated_seconds(rows: int, inner: int, columns: int, staged: bool) -> float {
     let flops = 2.0 * float(rows) * float(inner) * float(columns)
-    return TUNE_ASSUMED_CALL_SECONDS + flops / TUNE_ASSUMED_FLOPS
+    let bytes = 4.0 *
+        (float(rows) * float(inner) + float(inner) * float(columns) + float(rows) * float(columns))
+    let rate = if staged { TUNE_ASSUMED_STAGED_FLOPS } else { TUNE_ASSUMED_FLOPS }
+    return TUNE_ASSUMED_CALL_SECONDS + max(flops / rate, bytes / TUNE_ASSUMED_BYTES_PER_SECOND)
 }
 
 fn route_for(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> Route {
@@ -1626,6 +1801,8 @@ fn route_for(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) 
         bucket = made
     }
     let fixed = not autotune_enabled() or rows * inner * columns < TUNE_MIN_WORK
+    let fallback = default_plan(rows, inner, columns, trans_a, trans_b)
+    let staged = fallback.config >= 0 and CONFIGS[fallback.config].staged
     let route = Route(
         rows,
         inner,
@@ -1635,7 +1812,7 @@ fn route_for(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) 
         amp,
         bucket,
         fixed,
-        estimated_seconds(rows, inner, columns),
+        estimated_seconds(rows, inner, columns, staged),
         MPS_PLAN
     )
     route.plan = resolve(route)
@@ -1685,6 +1862,27 @@ fn tune_bucket(
     }
     sample_a.free()
     sample_b.free()
+    #: A pass that timed fewer than two of several candidates chose nothing,
+    #: and believing it would write the static plan down as measured, never
+    #: to be looked at again. The bucket keeps its static plan and has to earn
+    #: another pass; after `TUNE_MAX_ATTEMPTS` it stops trying for this
+    #: process, still without writing anything.
+    if _last_candidates > 1 and _last_measured < 2 {
+        bucket.attempts += 1
+        for route in _routes.values() {
+            if route.bucket is bucket {
+                route.requests = 0
+                route.credit = 0.0
+            }
+        }
+        bucket.settled = bucket.attempts >= TUNE_MAX_ATTEMPTS
+        if autotune_verbose() {
+            print(
+                f"tune {rows}x{inner}x{columns} timed {_last_measured} of {_last_candidates}; not kept"
+            )
+        }
+        return
+    }
     bucket.plan = plan
     bucket.version += 1
     _cache[bucket.key] = plan
@@ -1722,9 +1920,16 @@ pub fn plan_for(
     let route = route_for(rows, inner, columns, trans_a, trans_b)
     let bucket = route.bucket
     if not route.fixed and not bucket.settled {
-        bucket.requests += 1
-        bucket.credit += route.estimate
-        let earned = bucket.requests >= TUNE_MIN_REQUESTS and bucket.credit >= TUNE_PAYBACK_SECONDS
+        #: Earned by one exact shape, not by the bucket as a whole: a
+        #: generation walks a bucket's row counts one after another, each for
+        #: a few dozen calls, and pooled, sixteen of them earned passes whose
+        #: plan -- often a graph, compiled again for every new row count --
+        #: was never paid back: 6.1 s for a 768-wide, 12-layer generation of
+        #: 128 tokens against 4.4 s on static plans. A shape that recurs earns
+        #: it alone, and its plan is still borrowed by the rest of the bucket.
+        route.requests += 1
+        route.credit += route.estimate
+        let earned = route.requests >= TUNE_MIN_REQUESTS and route.credit >= TUNE_PAYBACK_SECONDS
         if earned or not _LAZY_TUNE {
             tune_bucket(bucket, output, bias, rows, inner, columns, trans_a, trans_b)
         }
