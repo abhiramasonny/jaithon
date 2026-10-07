@@ -453,6 +453,20 @@ static bool formatViaUserStr(ObjModule *module, ObjString *name, int count,
                 VM_NEXT();                                                     \
             }                                                                  \
         }                                                                      \
+        if (IS_NUMBER(_a) && IS_NUMBER(_b)) {                                  \
+            double _x = IS_INT(_a) ? (double)AS_INT(_a) : AS_FLOAT(_a);        \
+            double _y = IS_INT(_b) ? (double)AS_INT(_b) : AS_FLOAT(_b);        \
+            if (!isnan(_x) && !isnan(_y) &&                                    \
+                (!IS_INT(_a) || (AS_INT(_a) >= -9007199254740992LL &&          \
+                                 AS_INT(_a) <= 9007199254740992LL)) &&         \
+                (!IS_INT(_b) || (AS_INT(_b) >= -9007199254740992LL &&          \
+                                 AS_INT(_b) <= 9007199254740992LL))) {         \
+                bool _r = _x cop _y;                                           \
+                DROP(1);                                                       \
+                stackTop[-1] = BOOL_VAL(_r);                                   \
+                VM_NEXT();                                                     \
+            }                                                                  \
+        }                                                                      \
     } while (0)
 
 /* A jump condition must be a bool. There is no truthiness in Jaithon (spec
@@ -883,6 +897,15 @@ static JaiRunResult runLoop(int baseFrameCount) {
             stackTop[-1] = FLOAT_VAL(r);
             VM_NEXT();
         }
+        if (IS_NUMBER(stackTop[-1]) && IS_NUMBER(stackTop[-2])) {
+            double x = IS_INT(stackTop[-2]) ? (double)AS_INT(stackTop[-2])
+                                            : AS_FLOAT(stackTop[-2]);
+            double y = IS_INT(stackTop[-1]) ? (double)AS_INT(stackTop[-1])
+                                            : AS_FLOAT(stackTop[-1]);
+            DROP(1);
+            stackTop[-1] = FLOAT_VAL(x + y);
+            VM_NEXT();
+        }
         BINARY(arithmetic, OP_ADD);
     }
 
@@ -902,6 +925,15 @@ static JaiRunResult runLoop(int baseFrameCount) {
             double r = AS_FLOAT(stackTop[-2]) - AS_FLOAT(stackTop[-1]);
             DROP(1);
             stackTop[-1] = FLOAT_VAL(r);
+            VM_NEXT();
+        }
+        if (IS_NUMBER(stackTop[-1]) && IS_NUMBER(stackTop[-2])) {
+            double x = IS_INT(stackTop[-2]) ? (double)AS_INT(stackTop[-2])
+                                            : AS_FLOAT(stackTop[-2]);
+            double y = IS_INT(stackTop[-1]) ? (double)AS_INT(stackTop[-1])
+                                            : AS_FLOAT(stackTop[-1]);
+            DROP(1);
+            stackTop[-1] = FLOAT_VAL(x - y);
             VM_NEXT();
         }
         BINARY(arithmetic, OP_SUB);
@@ -925,11 +957,52 @@ static JaiRunResult runLoop(int baseFrameCount) {
             stackTop[-1] = FLOAT_VAL(r);
             VM_NEXT();
         }
+        if (IS_NUMBER(stackTop[-1]) && IS_NUMBER(stackTop[-2])) {
+            double x = IS_INT(stackTop[-2]) ? (double)AS_INT(stackTop[-2])
+                                            : AS_FLOAT(stackTop[-2]);
+            double y = IS_INT(stackTop[-1]) ? (double)AS_INT(stackTop[-1])
+                                            : AS_FLOAT(stackTop[-1]);
+            DROP(1);
+            stackTop[-1] = FLOAT_VAL(x * y);
+            VM_NEXT();
+        }
         BINARY(arithmetic, OP_MUL);
     }
 
-    VM_CASE(OP_DIV):       BINARY(arithmetic, OP_DIV);
-    VM_CASE(OP_FLOORDIV):  BINARY(arithmetic, OP_FLOORDIV);
+    VM_CASE(OP_DIV): {
+        /* int/int answers a float (spec §3.3); everything numeric is inlined
+         * so float-heavy `any`-typed code skips the SAVE/LOAD round trip and
+         * the dunder probe. Zero divisors take the slow path, which owns the
+         * exact division-by-zero diagnostics. */
+        if (JAI_LIKELY(IS_NUMBER(stackTop[-1]) && IS_NUMBER(stackTop[-2]))) {
+            double y = IS_INT(stackTop[-1]) ? (double)AS_INT(stackTop[-1])
+                                            : AS_FLOAT(stackTop[-1]);
+            if (JAI_LIKELY(y != 0.0)) {
+                double x = IS_INT(stackTop[-2]) ? (double)AS_INT(stackTop[-2])
+                                                : AS_FLOAT(stackTop[-2]);
+                DROP(1);
+                stackTop[-1] = FLOAT_VAL(x / y);
+                VM_NEXT();
+            }
+        }
+        BINARY(arithmetic, OP_DIV);
+    }
+    VM_CASE(OP_FLOORDIV): {
+        /* Integer floor division inlined with Python floor semantics (the
+         * result takes the divisor's sign). Zero and INT64_MIN // -1 go slow:
+         * one reports division-by-zero, the other integer overflow. */
+        if (JAI_LIKELY(IS_INT(stackTop[-1]) && IS_INT(stackTop[-2]))) {
+            int64_t y = AS_INT(stackTop[-1]), x = AS_INT(stackTop[-2]);
+            if (JAI_LIKELY(y != 0 && !(x == INT64_MIN && y == -1))) {
+                int64_t q = x / y, r = x % y;
+                if (r != 0 && ((r < 0) != (y < 0))) q -= 1;
+                DROP(1);
+                stackTop[-1] = INT_VAL(q);
+                VM_NEXT();
+            }
+        }
+        BINARY(arithmetic, OP_FLOORDIV);
+    }
 
     VM_CASE(OP_MOD): {
         /* Floor remainder, inlined for int %% int: it is 8.3% of loop_sum and
@@ -943,6 +1016,23 @@ static JaiRunResult runLoop(int baseFrameCount) {
                 if (r != 0 && ((r < 0) != (y < 0))) r += y;
                 DROP(1);
                 stackTop[-1] = INT_VAL(r);
+                VM_NEXT();
+            }
+        }
+        if (IS_NUMBER(stackTop[-1]) && IS_NUMBER(stackTop[-2]) &&
+            (IS_FLOAT(stackTop[-1]) || IS_FLOAT(stackTop[-2]))) {
+            /* Only when a float is involved: two ints either took the fast
+             * path above or are the zero and INT64_MIN %% -1 cases the slow
+             * path owns (the latter must stay an int 0, not a float -0.0). */
+            double y = IS_INT(stackTop[-1]) ? (double)AS_INT(stackTop[-1])
+                                            : AS_FLOAT(stackTop[-1]);
+            if (y != 0.0) {
+                double x = IS_INT(stackTop[-2]) ? (double)AS_INT(stackTop[-2])
+                                                : AS_FLOAT(stackTop[-2]);
+                double r = fmod(x, y);
+                if (r != 0.0 && ((r < 0.0) != (y < 0.0))) r += y;
+                DROP(1);
+                stackTop[-1] = FLOAT_VAL(r);
                 VM_NEXT();
             }
         }
