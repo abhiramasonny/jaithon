@@ -90,7 +90,13 @@ fn hashed_distinct(y: Tensor) -> list[float] {
         if value == value { kept.push(value) }
     }
     if kept.len() > MAX_CLASSES {
-        throw ValueError(f"{kept.len()} distinct values exceeds the {MAX_CLASSES} this supports")
+        #: A full table stopped counting: the labels hold at least this many.
+        let many = if kept.len() >= LABEL_SLOTS {
+            f"at least {kept.len()}"
+        } else {
+            f"{kept.len()}"
+        }
+        throw ValueError(f"{many} distinct values exceeds the {MAX_CLASSES} this supports")
     }
     if slots[LABEL_SLOTS + 1] != 0.0 { throw ValueError("a label is NaN, which is no class") }
     return merge_sort(kept)

@@ -6,6 +6,7 @@ import std.math
 from jailearn import Estimator, EstimatorKind, LabelIndex, Params
 from jaitensor import Tensor
 from std.test import assert_eq, assert_near, assert_throws, assert_true
+from std.time import Instant
 
 fn assert_values(
     actual: list[float],
@@ -676,6 +677,44 @@ fn test_distinct_values_holds_at_scale_and_at_the_limit() -> void {
     let broken = jl.vector([1.0, math.NAN, 2.0])
     defer { broken.free() }
     assert_throws(ValueError, || LabelIndex.fit_codes(broken))
+}
+
+fn best_label_time(y: Tensor) -> float {
+    var best = 1.0e9
+    for _run in 0..7 {
+        let start = Instant.now()
+        let found = jl.distinct_values(y)
+        best = min(best, start.elapsed().to_millis())
+        assert_true(found.len() > 0, "some class")
+    }
+    return best
+}
+
+#: Integer-valued labels used to share one home slot in the label table: a
+#: product's low bits depend only on the multiplicand's low bits, and those
+#: are zero for a float holding an integer, so 0..1023 hashed to one slot and
+#: every sample walked a chain as long as the classes. Four thousand classes
+#: took about five times as long as three; with the product's high bits the
+#: two are within the cost of sorting the larger answer.
+fn test_distinct_values_spreads_integer_labels() -> void {
+    if not jl.is_available() { return }
+    let samples = 10000
+    let many = Tensor([samples], [float(index % 4000) for index in 0..samples])
+    defer { many.free() }
+    let few = Tensor([samples], [float(index % 3) for index in 0..samples])
+    defer { few.free() }
+    let found = jl.distinct_values(many)
+    assert_eq(found.len(), 4000, "four thousand classes")
+    for index in 0..4000 { assert_near(found[index], float(index), 0.0, f"class {index}") }
+    best_label_time(many)
+    best_label_time(few)
+    var worst = 0.0
+    for _round in 0..2 {
+        let wide = best_label_time(many)
+        let narrow = best_label_time(few)
+        worst = max(worst, wide / max(narrow, 0.05))
+    }
+    assert_true(worst < 3.0, f"4000 classes took {worst}x as long as 3")
 }
 
 fn test_cholesky_solves_the_normal_equations() -> void {

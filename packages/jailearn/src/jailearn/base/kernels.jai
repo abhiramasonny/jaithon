@@ -784,7 +784,11 @@ kernel void base_distinct_hash(device const float* values [[buffer(0)]],
         return;
     }
     uint bits = value == 0.0f ? 0u : as_type<uint>(value);
-    uint at = (bits * 2654435761u) & (slots - 1u);
+    /* The HIGH bits of the product: a product's low bits depend only on the
+     * multiplicand's low bits, and an integer-valued float's low mantissa
+     * bits are all zero, so taking the low ones put every label from 0 to
+     * 1023 on one home slot and made each sample walk the whole chain. */
+    uint at = slots > 1u ? (bits * 2654435761u) >> (32u - ctz(slots)) : 0u;
     for (uint probe = 0u; probe < slots; ++probe) {
         uint held = atomic_load_explicit(&table[at], memory_order_relaxed);
         if (held == bits) return;
