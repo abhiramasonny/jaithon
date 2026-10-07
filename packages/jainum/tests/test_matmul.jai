@@ -15,7 +15,7 @@ import std.gpu as gpu
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jainum.array import BOOL, FLOAT32, INT32, NDArray, element_count, sl
 from jainum.manipulate import transpose
-from jainum.matmul import cross, dot, einsum, inner, kron, matmul, matrix_power
+from jainum.matmul import cross, dot, einsum, inner, kron, matmul, matmul_route, matrix_power
 from jainum.matmul import outer, tensordot, vdot
 
 fn have_gpu() -> bool { return gpu.is_available() }
@@ -294,10 +294,11 @@ fn test_a_ragged_width_reaches_mps_through_padding() -> void {
     if not have_gpu() { return }
 
     #: Widths that are not a multiple of four used to be refused by MPS and
-    #: fall to the fold kernel, 75 times slower at 100k x 50. Each is now run
-    #: on zero-padded copies, so each is checked: the gram (one buffer read
-    #: twice, padded once), a weight product padding the inner axis of both
-    #: operands, and the transposed-right product a distance matrix takes.
+    #: fall to the fold kernel, 75 times slower at 100k x 50. Each is checked
+    #: on whichever route it now takes: the gram (one buffer read twice,
+    #: padded once), a tall weight product (left on the tiled kernel, which
+    #: beats padding it), and the transposed-right product a distance matrix
+    #: takes (padded).
     for width in [1, 2, 3, 5, 49, 50, 51, 63] {
         let samples = max(2000, 4194304 // (width * width) + 1)
         let x = spread([samples, width], width * 7 + 1)
@@ -316,6 +317,37 @@ fn test_a_ragged_width_reaches_mps_through_padding() -> void {
         check_layout(300, width, 500, false, true, f"a distance product at width {width}")
         check_layout(300, width, 501, true, true, f"both flipped at width {width}")
     }
+}
+
+fn test_padding_is_taken_only_where_the_kernel_it_replaces_is_slow() -> void {
+    if not have_gpu() { return }
+    #: Strided fold reads that many outputs share -- the gram -- and a tiled
+    #: kernel with too few tiles to fill the device are what padding is for.
+    assert_eq(matmul_route(50, 100000, 50, true, false), "padded")
+    assert_eq(matmul_route(30, 100000, 30, true, false), "padded")
+    assert_eq(matmul_route(300, 4000, 30), "padded")
+    #: A product heavy beside what padding copies goes to the graph too.
+    assert_eq(matmul_route(1000, 50, 10000), "padded")
+    #: A contiguous fold already runs at bandwidth: padding was 5.7-8.3x
+    #: slower on a 50x100000 matrix-vector product, 2.2x at 1000 rows, and
+    #: 3.4x on a transposed-right one.
+    assert_eq(matmul_route(50, 100000, 1), "fold")
+    assert_eq(matmul_route(1000, 100000, 1), "fold")
+    #: X^T y is strided but reads its operands about once: 0.25 ms folded,
+    #: 0.27 padded.
+    assert_eq(matmul_route(50, 100000, 1, true, false), "fold")
+    assert_eq(matmul_route(20, 300000, 7, false, true), "fold")
+    #: A tall tiled product copies its big operand to pad it, which costs more
+    #: than the product: 2-3.4x slower at 100k x 50 times 10 or 64, 2M x 3
+    #: times 3, 1M x 7 times 5, 200k x 13 times 3.
+    assert_eq(matmul_route(100000, 50, 10), "tile")
+    assert_eq(matmul_route(100000, 50, 64), "tile")
+    assert_eq(matmul_route(2000000, 3, 3), "tile")
+    assert_eq(matmul_route(1000000, 7, 5), "tile")
+    assert_eq(matmul_route(200000, 13, 3), "tile")
+    #: Aligned and single-output products are untouched.
+    assert_eq(matmul_route(64, 100000, 64, true, false), "mps")
+    assert_eq(matmul_route(1, 100000, 1), "dot")
 }
 
 fn test_a_padded_plane_past_the_first_reads_its_own_values() -> void {

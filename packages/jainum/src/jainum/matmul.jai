@@ -91,6 +91,24 @@ let _PAD_MPS = env_or("JAINUM_MATMUL_PAD", "1") != "0"
 #: this small does not earn back.
 const _PAD_MPS_WORK = 4 * 1024 * 1024
 
+#: Multiplies per padded element above which a product the tiled kernel would
+#: run is worth padding for. The copies are a full pass over every operand
+#: that changes shape, and where that operand is the big one the tiled kernel
+#: had already finished: X(100k,50) @ W(50,64), 61 multiplies per copied
+#: element, ran 0.39 ms tiled and 0.74 padded, where M(20000,100) @ W(100,30),
+#: 94 of them, ran 0.15 tiled and 0.09 padded.
+const _PAD_MPS_RATIO = 80
+
+#: Tiles below which the tiled kernel leaves the device mostly idle, so
+#: padding pays whatever it copies: 300x4000x30 is five threadgroups, 15.9 ms
+#: for twenty products tiled and 1.86 padded.
+const _PAD_TILE_FLOOR = 32
+
+#: Half the re-read factor `2 rows columns / (rows + columns)` at which a
+#: strided fold is worth padding away: four means the operands are read eight
+#: times over. A 50-wide gram is 50 times, `X^T y` under twice.
+const _FOLD_REREADS = 4
+
 #: Threadgroups the two-pass dot product runs over at most, so that the second
 #: pass folds what one group can hold: 1024 partials is four per thread.
 const DOT_GROUPS = 1024
@@ -451,6 +469,69 @@ fn _padded_plane(
 
 fn _round_up_4(extent: int) -> int { return (extent + 3) // 4 * 4 }
 
+#: Elements the padded route copies: each operand that changes shape, and the
+#: padded result when it has to be cut back. Mirrors `_encode_padded`.
+fn _padded_elements(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> int {
+    let padded_rows = if trans_a { _round_up_4(rows) } else { rows }
+    let padded_inner = if not trans_a or trans_b { _round_up_4(inner) } else { inner }
+    let padded_columns = _round_up_4(columns)
+    var copied = 0
+    if padded_rows != rows or padded_inner != inner { copied += padded_rows * padded_inner }
+    if padded_inner != inner or padded_columns != columns {
+        copied += padded_inner * padded_columns
+    }
+    if padded_rows != rows or padded_columns != columns { copied += padded_rows * padded_columns }
+    return copied
+}
+
+#: Whether a product MPS cannot read as stored should run on padded copies
+#: rather than on the fold or tiled kernel it would otherwise take.
+#:
+#: Only where that kernel is slow for a reason the copies fix. The fold kernel
+#: runs one threadgroup per output, and each output reads a whole row of `a`
+#: and column of `b`: when either is read with a stride and many outputs share
+#: it -- the gram `X^T X` -- every threadgroup walks memory a column at a time,
+#: and a 100k x 50 gram took 30-60 ms there against under a millisecond
+#: padded. With one output per row (`X^T y`) the operands are read about once
+#: and the fold won, 0.25 ms against 0.27. Read contiguously it already runs
+#: at bandwidth (a 20 MB matrix-vector product in 48 us), and padding made
+#: those 2-8x slower, so it is left alone. The tiled kernel is slow when the
+#: output gives it too few tiles to fill the device, and otherwise only loses
+#: to the graph when the product is heavy beside what padding copies
+#: (`_PAD_MPS_RATIO`).
+fn _padding_pays(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> bool {
+    if not _PAD_MPS or rows * inner * columns < _PAD_MPS_WORK { return false }
+    if rows * columns <= FOLD_OUTPUTS {
+        let a_step = if trans_a { rows } else { 1 }
+        let b_step = if trans_b { 1 } else { columns }
+        let strided = a_step != 1 or b_step != 1
+        #: How many times the fold reads the operands over, 2rc / (r + c),
+        #: at least eight.
+        return strided and rows * columns >= _FOLD_REREADS * (rows + columns)
+    }
+    let tiles = (columns + TILE - 1) // TILE * ((rows + TILE - 1) // TILE)
+    if tiles < _PAD_TILE_FLOOR { return true }
+    return rows * inner * columns >=
+        _PAD_MPS_RATIO * _padded_elements(rows, inner, columns, trans_a, trans_b)
+}
+
+#: Which route one `rows x inner x columns` product takes: `"dot"`, `"mps"`,
+#: `"padded"` (MPS on zero-padded copies), `"fold"` or `"tile"`. What `_encode`
+#: does, without doing it.
+pub fn matmul_route(
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> str {
+    if rows == 1 and columns == 1 { return "dot" }
+    if _mps_ready(rows, inner, columns, trans_a, trans_b) { return "mps" }
+    if _padding_pays(rows, inner, columns, trans_a, trans_b) { return "padded" }
+    if rows * columns <= FOLD_OUTPUTS { return "fold" }
+    return "tile"
+}
+
 #: One product through MPS on zero-padded copies of whatever MPS cannot read.
 #:
 #: MPS reads a matrix by its row bytes, so a stored row must be a multiple of
@@ -572,10 +653,11 @@ fn _encode_dot(
 
 #: One `rows` by `columns` product, encoded and not waited on.
 #:
-#: The four routes in the order they are tried: a single output is a reduction
-#: and nothing else; MPS takes whatever its row rule allows; a result small
-#: enough to fit one tile folds along the inner axis instead; everything else
-#: is the tiled kernel.
+#: The routes in the order they are tried: a single output is a reduction and
+#: nothing else; MPS takes whatever its row rule allows, and on zero-padded
+#: copies whatever `_padding_pays` says it should; a result small enough to
+#: fit one tile folds along the inner axis instead; everything else is the
+#: tiled kernel. `matmul_route` names the one a shape takes.
 fn _encode(
     out: NDArray,
     out_at: int,
@@ -612,7 +694,7 @@ fn _encode(
         if owns_result { result.free() }
         return
     }
-    if _PAD_MPS and rows * inner * columns >= _PAD_MPS_WORK {
+    if _padding_pays(rows, inner, columns, trans_a, trans_b) {
         _encode_padded(out, out_at, a, a_at, trans_a, b, b_at, trans_b, rows, inner, columns)
         return
     }
