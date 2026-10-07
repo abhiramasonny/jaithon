@@ -1041,3 +1041,29 @@ fn test_the_optimiser_state_survives_a_change_of_batch_size_and_path() -> void {
         }
     }
 }
+
+#: A dataset smaller than one batch never runs a compiled step -- the epoch
+#: has no full batch to give it -- so the model must not hold one and say it
+#: trained through it. Pictures, because flat rows already had that rule.
+fn test_a_dataset_smaller_than_a_batch_does_not_report_the_compiled_step() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    let rows = learnable_rows(16, 20, 4, 19)
+    let data = Dataset(rows.features.view(0, [16, 5, 4, 1]), rows.labels.view(0, [16]))
+    let model = Sequential(
+        [
+            Flatten(),
+            Dense(16, activation: Activation.Relu),
+            Dense(16, activation: Activation.Relu),
+            Dense(4, activation: Activation.Softmax),
+        ]
+    )
+    model.compile(optimizer: optimizer_named("momentum"), loss: SparseCategoricalCrossentropy())
+    model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
+    let route = model.training_route()
+    assert_true(route != "compiled", f"sixteen pictures at a batch of 32 reported {route}")
+    model.free()
+    rows.free()
+}
