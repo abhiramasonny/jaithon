@@ -60,6 +60,8 @@ class SliceLoader:
         b = self.batch_size
         for i in range(self.count):
             yield self.x[i * b:(i + 1) * b], self.y[i * b:(i + 1) * b]
+
+
 SIDE = 32
 CHANNELS = 3
 CLASSES = 10
