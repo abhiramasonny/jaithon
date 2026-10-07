@@ -31,6 +31,7 @@ from std.os import env
 from std.gpu import Buffer
 from .layers import Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Flatten, Layer, LayerNorm
 from .layers import MaxPool2d
+from .ops import cached_kernel
 from .optimizers import moment_buffers, set_steps_taken, steps_taken
 from .tensor import Tensor
 
@@ -568,13 +569,23 @@ pub class CompiledStep {
         }
     }
 
+    #: Copied on the device, queued behind the step that wrote them. Through
+    #: the host this was a download and an upload of every parameter: 2 to 3
+    #: ms a call on [784-512-512-10], paid at the end of every epoch with an
+    #: odd number of steps.
     fn settle_values(self) -> void {
         if not self.live_is_shadow { return }
+        let kernel = cached_kernel("copy_offset")
         for (index, param) in self.params.enumerate() {
-            param.buffer().upload(self.shadow[index].download())
+            kernel.dispatch_async([self.shadow[index], param.buffer()], param.size, [0, param.size])
         }
         for index in 0..self.carried.len() {
-            self.carried[index].upload(self.carried_shadow[index].download())
+            let count = self.carried[index].count
+            kernel.dispatch_async(
+                [self.carried_shadow[index], self.carried[index]],
+                count,
+                [0, count]
+            )
         }
         self.live_is_shadow = false
     }
