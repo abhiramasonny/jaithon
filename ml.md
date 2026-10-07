@@ -135,8 +135,8 @@ train a layer while its cache is on. A/B switches, each read once:
 `JAITHON_GPU_MHA_DECODE=0` sends short queries to the prefill kernel instead of
 the split-key decode kernel. `JAITENSOR_LN_PARAM_STRIPS=0` restores the
 one-thread-per-column LayerNorm parameter gradient.
-`JAITENSOR_ATTN_SOFTMAX_HOLD=0` makes the attention softmax re-read rows
-instead of holding them in registers.
+`JAITENSOR_ATTN_SOFTMAX_HOLD=1` makes the attention softmax hold rows in
+registers instead of re-reading them. It is off by default.
 
 `gather_rows` records a scatter-add into the source so `Embedding` can train.
 `group_norm` is NHWC, one mean/variance per sample per group. `tril` zeros the

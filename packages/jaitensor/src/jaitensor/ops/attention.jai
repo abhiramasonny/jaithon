@@ -216,18 +216,21 @@ pub fn hand_to_graph(consumer: Tensor, tensors: list[Tensor]) -> void {
 }
 
 #: Whether the attention softmax kernels keep a row in registers between their
-#: passes. `JAITENSOR_ATTN_SOFTMAX_HOLD=0` restores the re-reading loops, for
-#: an A/B in one binary. The answer is the same bit for bit at head width 64,
-#: whose scale is exact, and within about an ulp at other widths, where the
-#: compiler fuses the two spellings differently. Read once.
+#: passes. Off by default: `JAITENSOR_ATTN_SOFTMAX_HOLD=1` takes the `_held`
+#: kernels, for an A/B in one binary. Holding measured about 10% faster on
+#: the plain softmax kernels at seq 1024 but neutral end to end, and 7-10%
+#: slower end to end on a 512/512/8 training step. The answer is the same bit
+#: for bit at head width 64, whose scale is exact, and within about an ulp at
+#: other widths, where the compiler fuses the two spellings differently. Read
+#: once.
 var _softmax_hold: int = -1
 
-fn softmax_hold() -> int {
+fn softmax_entry(name: str) -> str {
     if _softmax_hold < 0 {
         let text = env("JAITENSOR_ATTN_SOFTMAX_HOLD")
-        _softmax_hold = if text is not null and text == "0" { 0 } else { 1 }
+        _softmax_hold = if text is not null and text == "1" { 1 } else { 0 }
     }
-    return _softmax_hold
+    return if _softmax_hold == 1 { name + "_held" } else { name }
 }
 
 #: Threadgroups `mha_scores_mma` needs per head: every 64x64 patch, or with a
@@ -292,10 +295,10 @@ fn mha_by_mma(
         [seq, heads, hd, tiles, mask],
         group_size: 64
     )
-    cached_attn_kernel("mha_softmax_scaled").dispatch_async(
+    cached_attn_kernel(softmax_entry("mha_softmax_scaled")).dispatch_async(
         [probs.buffer()],
         heads * seq * 256,
-        [heads * seq, seq, f32_bits(factor), causal_rows, 64, softmax_hold()],
+        [heads * seq, seq, f32_bits(factor), causal_rows, 64],
         group_size: 256
     )
     let output = Tensor([seq, heads * hd])
@@ -353,10 +356,10 @@ fn mha_mma_grads(
         [seq, heads, hd, mask],
         group_size: 64
     )
-    cached_attn_kernel("mha_softmax_backward_scaled").dispatch_async(
+    cached_attn_kernel(softmax_entry("mha_softmax_backward_scaled")).dispatch_async(
         [probs.buffer(), grad_probs.buffer()],
         heads * seq * 256,
-        [heads * seq, seq, f32_bits(factor), causal_rows, 64, softmax_hold()],
+        [heads * seq, seq, f32_bits(factor), causal_rows, 64],
         group_size: 256
     )
     cached_attn_kernel("mha_context_mma").dispatch_async(
@@ -418,10 +421,10 @@ fn mha_by_ops(
     let vs = split_heads(value, heads)
     let probs = Tensor([heads * seq, kv_seq])
     raw_matmul_batched(qs, ks, probs, heads, seq, hd, kv_seq, seq * hd, kv_seq * hd, trans_b: true)
-    cached_attn_kernel("mha_softmax_scaled").dispatch_async(
+    cached_attn_kernel(softmax_entry("mha_softmax_scaled")).dispatch_async(
         [probs.buffer()],
         heads * seq * 256,
-        [heads * seq, kv_seq, f32_bits(factor), causal_rows, 0, softmax_hold()],
+        [heads * seq, kv_seq, f32_bits(factor), causal_rows, 0],
         group_size: 256
     )
     let context = Tensor([heads * seq, hd])
@@ -496,10 +499,10 @@ fn mha_grads(
         seq * hd,
         trans_a: true
     )
-    cached_attn_kernel("mha_softmax_backward_scaled").dispatch_async(
+    cached_attn_kernel(softmax_entry("mha_softmax_backward_scaled")).dispatch_async(
         [probs.buffer(), grad_probs.buffer()],
         heads * seq * 256,
-        [heads * seq, kv_seq, f32_bits(factor), causal_rows, 0, softmax_hold()],
+        [heads * seq, kv_seq, f32_bits(factor), causal_rows, 0],
         group_size: 256
     )
     raw_matmul_batched(grad_probs, ks, grad_q, heads, seq, kv_seq, hd, seq * kv_seq, kv_seq * hd)

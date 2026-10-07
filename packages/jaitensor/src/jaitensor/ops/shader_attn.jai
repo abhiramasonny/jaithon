@@ -114,13 +114,13 @@ constant constexpr uint SOFTMAX_HELD = 8u;
  * elements read and written twice. The products are the same float32
  * multiplies the separate pass did, in the same order, so the answer is
  * bit-for-bit what `softmax(scale(scores, factor))` gave. */
-kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
+template <uint HOLD>
+[[kernel]] void mha_softmax_scaled_t(device float* scores [[buffer(0)]],
                                constant uint& rows [[buffer(1)]],
                                constant uint& columns [[buffer(2)]],
                                constant uint& scale_bits [[buffer(3)]],
                                constant uint& causal_rows [[buffer(4)]],
                                constant uint& zero_span [[buffer(5)]],
-                               constant uint& hold [[buffer(6)]],
                                uint row [[threadgroup_position_in_grid]],
                                uint lid [[thread_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]],
@@ -143,7 +143,7 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
      * differently: with a head width whose scale is a power of two (64) the
      * answer is the same bit for bit, and otherwise it moves by about an ulp
      * (at most 2e-5 on a gradient, measured at hd 8, 32 and 48). */
-    if (hold != 0u && valid <= GROUP * SOFTMAX_HELD) {
+    if (HOLD != 0u && valid <= GROUP * SOFTMAX_HELD) {
         float held[SOFTMAX_HELD];
         float top = floor_value;
 #pragma clang loop unroll(full)
@@ -206,20 +206,29 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
     for (uint i = valid + lid; i < stop; i += GROUP) scores[base + i] = 0.0f;
 }
 
+/* The held path is a separate instance, not a runtime flag: compiled into
+ * the one kernel, its registers were allocated even when the branch never
+ * ran, and the plain softmax at seq 512 measured slower than before the
+ * held path existed. `_held` is the opt-in variant. */
+template [[host_name("mha_softmax_scaled")]] [[kernel]]
+decltype(mha_softmax_scaled_t<0u>) mha_softmax_scaled_t<0u>;
+template [[host_name("mha_softmax_scaled_held")]] [[kernel]]
+decltype(mha_softmax_scaled_t<1u>) mha_softmax_scaled_t<1u>;
+
 /* The gradient of the above, also in place and for the same reason.
  *
  * `grad` arrives holding d(probs) and leaves holding d(scores); the reduction
  * has read every element it needs before the write loop starts. The factor
  * multiplies last, as it did when `scale` was the op after this one, so the
  * rounding is unchanged. */
-kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
+template <uint HOLD>
+[[kernel]] void mha_softmax_backward_scaled_t(device const float* probs [[buffer(0)]],
                                         device float* grad [[buffer(1)]],
                                         constant uint& rows [[buffer(2)]],
                                         constant uint& columns [[buffer(3)]],
                                         constant uint& scale_bits [[buffer(4)]],
                                         constant uint& causal_rows [[buffer(5)]],
                                         constant uint& zero_span [[buffer(6)]],
-                                        constant uint& hold [[buffer(7)]],
                                         uint row [[threadgroup_position_in_grid]],
                                         uint lid [[thread_index_in_threadgroup]],
                                         uint lane [[thread_index_in_simdgroup]],
@@ -234,7 +243,7 @@ kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
     const uint stop = causal_stop(valid, columns, causal_rows, zero_span);
 
     /* As in the forward: a row that fits is read once, not twice. */
-    if (hold != 0u && valid <= GROUP * SOFTMAX_HELD) {
+    if (HOLD != 0u && valid <= GROUP * SOFTMAX_HELD) {
         float held_p[SOFTMAX_HELD];
         float held_g[SOFTMAX_HELD];
         float part = 0.0f;
@@ -278,6 +287,11 @@ kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
         grad[base + i] = factor * (probs[base + i] * (grad[base + i] - total));
     for (uint i = valid + lid; i < stop; i += GROUP) grad[base + i] = 0.0f;
 }
+
+template [[host_name("mha_softmax_backward_scaled")]] [[kernel]]
+decltype(mha_softmax_backward_scaled_t<0u>) mha_softmax_backward_scaled_t<0u>;
+template [[host_name("mha_softmax_backward_scaled_held")]] [[kernel]]
+decltype(mha_softmax_backward_scaled_t<1u>) mha_softmax_backward_scaled_t<1u>;
 
 kernel void mha_scores(device const float* query [[buffer(0)]],
                        device const float* key [[buffer(1)]],
