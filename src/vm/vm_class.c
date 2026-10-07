@@ -426,6 +426,45 @@ bool jaiSetProperty(Value receiver, ObjString *name, Value value) {
 /* Type tests                                                           */
 /* ------------------------------------------------------------------ */
 
+static bool sameName(const ObjString *have, const ObjString *want) {
+    return have != NULL && have->length == want->length &&
+           memcmp(have->chars, want->chars, want->length) == 0;
+}
+
+/* Whether a trait, or one of its supertraits, is spelled `name`. Depth-limited
+ * like traitSatisfies, for the same reason: a cyclic trait graph is rejected
+ * by the checker, but the VM must not hang on one. */
+static bool traitNamed(const ObjTrait *trait, const ObjString *name, int depth) {
+    if (trait == NULL || depth > 32) return false;
+    if (sameName(trait->name, name)) return true;
+    for (uint16_t i = 0; i < trait->superCount; i++) {
+        if (traitNamed(trait->supers[i], name, depth + 1)) return true;
+    }
+    return false;
+}
+
+/* Whether an instance's class, a superclass of it, or a trait any of them
+ * implements is spelled `name`.
+ *
+ * The last resort for a guard whose name the running module cannot resolve.
+ * A boundary guard is emitted in the CALLER, naming the type the callee
+ * declared: `model.compile(optimizer)` from a module that imported `SGD` and
+ * `Sequential` but never `Optimizer` guards on "Optimizer", and the caller's
+ * module has no such binding to resolve it through. Comparing the value's own
+ * type name then rejected every implementer, though the checker had already
+ * proved the call sound. Matching by spelling means two same-named traits in
+ * different modules both pass, which is what the checker accepted. */
+static bool instanceNamesType(Value value, const ObjString *name) {
+    if (!IS_INSTANCE(value)) return false;
+    for (const ObjClass *k = AS_INSTANCE(value)->klass; k != NULL; k = k->superclass) {
+        if (sameName(k->name, name)) return true;
+        for (uint16_t i = 0; i < k->traitCount; i++) {
+            if (traitNamed(k->traits[i], name, 0)) return true;
+        }
+    }
+    return false;
+}
+
 /* Does `value` satisfy the type named by a constant? The constant is a class,
  * a trait, an enum, or — when the type was not resolvable at compile time —
  * the spelling of a primitive type. */
@@ -478,6 +517,8 @@ bool valueMatchesType(Value value, Value typeConstant) {
             if (IS_CLASS(declared) || IS_TRAIT(declared) || IS_ENUM(declared)) {
                 return valueMatchesType(value, declared);
             }
+        } else if (instanceNamesType(value, name)) {
+            return true;
         }
         return strcmp(jaiTypeNameStatic(value), name->chars) == 0;
     }

@@ -851,7 +851,76 @@ static bool primListPackArgb(int argc, Value *args, Value *out) {
     return true;
 }
 
+/* `bytes_f32_le(data, start, count)` -- `count` little-endian binary32 values
+ * from `data` at byte `start`, as a list of floats.
+ *
+ * Every weight in an ONNX, Caffe or TensorFlow file arrives this way, and the
+ * Jaithon decoder -- four byte reads, a shift-or, and `ldexp` for the exponent
+ * -- cost 64 to 105 ns a float: a third of a second for YOLOv8n's three
+ * million and five seconds for YOLOv8x's sixty-eight. The bits ARE a float,
+ * so this reinterprets them; widening to double is exact for every pattern,
+ * denormals, infinities and signed zeros included. A NaN keeps its sign and
+ * payload where the Jaithon decoder gave the canonical one, which no consumer
+ * of a weight can tell apart. */
+#define JAI_F32_DECODE_CHUNK 65536
+
+typedef struct {
+    const uint8_t *src;
+    Value         *items;
+} F32DecodeWork;
+
+static void f32DecodeRange(void *context, size_t start, size_t end) {
+    const F32DecodeWork *work = (const F32DecodeWork *)context;
+    for (size_t i = start; i < end; i++) {
+        const uint8_t *at = work->src + i * 4;
+        const uint32_t bits = (uint32_t)at[0] | (uint32_t)at[1] << 8 |
+                              (uint32_t)at[2] << 16 | (uint32_t)at[3] << 24;
+        float value;
+        memcpy(&value, &bits, sizeof value);
+        work->items[i] = FLOAT_VAL((double)value);
+    }
+}
+
+static bool primBytesF32Le(int argc, Value *args, Value *out) {
+    (void)argc;
+    ObjBytes *b;
+    int64_t start, count;
+    if (!primBytesReceiver(args[0], "bytes_f32_le", &b)) return false;
+    if (!jaiStrWantInt(args[1], "bytes_f32_le", "the start", &start)) return false;
+    if (!jaiStrWantInt(args[2], "bytes_f32_le", "the count", &count)) return false;
+    if (start < 0 || count < 0 || start > (int64_t)b->length ||
+        count > ((int64_t)b->length - start) / 4) {
+        return jaiThrow(vm.cValueError,
+                        "bytes_f32_le(): %lld floats at byte %lld run past the %u bytes",
+                        (long long)count, (long long)start, b->length);
+    }
+    if (count > INT32_MAX) {
+        return jaiThrow(vm.cValueError,
+                        "bytes_f32_le(): %lld is more elements than a list holds",
+                        (long long)count);
+    }
+    ObjList *list = jaiListNew((int)count);
+    if (list == NULL) return false;
+    if (count == 0) {
+        *out = OBJ_VAL(list);
+        return true;
+    }
+    jaiGCPushRoot(OBJ_VAL(list));
+    const bool reserved = jaiListReserveExact(list, (int)count);
+    jaiGCPopRoot();
+    if (!reserved) return false;
+    /* The source is read through `b` after an allocation, which is safe
+     * because `args[0]` roots it for the length of the call. */
+    F32DecodeWork work = {b->data + start, list->items};
+    jaiParallelChunks((size_t)count, JAI_F32_DECODE_CHUNK, f32DecodeRange, &work);
+    list->count = (int)count;
+    list->version++;
+    *out = OBJ_VAL(list);
+    return true;
+}
+
 void jaiBytesRegisterPrimitives(ObjModule *ns) {
+    jaiStrDefinePrim(ns, "bytes_f32_le",   primBytesF32Le,    3, 3);
     jaiStrDefinePrim(ns, "bytes_quantise", primBytesQuantise, 1, 2);
     jaiStrDefinePrim(ns, "list_filled",    primListFilled,    1, 2);
     jaiStrDefinePrim(ns, "grid_nonzero",   primGridNonzero,   6, 6);

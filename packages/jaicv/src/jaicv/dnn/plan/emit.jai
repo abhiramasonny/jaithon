@@ -488,7 +488,17 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
         #: sampling is left to the interpreter rather than approximated, since
         #: being one pixel out is the kind of difference that survives a test
         #: and shows up in a detection.
-        let placing = attr_str(node, "coordinate_transformation_mode", "half_pixel")
+        #: Upsample has neither attribute: it always reads the source
+        #: coordinate as `out / scale` and takes the floor, which is what
+        #: Resize calls asymmetric and floor. Reading Resize's defaults for it
+        #: sampled half a pixel over, which the shape of its output hid for
+        #: as long as the resize could not compile.
+        let upsample = node.op == "Upsample"
+        let placing = if upsample {
+            "asymmetric"
+        } else {
+            attr_str(node, "coordinate_transformation_mode", "half_pixel")
+        }
         var center = 0
         var corners = 0
         if placing == "asymmetric" {
@@ -501,7 +511,11 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
         } else {
             return false
         }
-        let rounding = ROUNDING_CODES.get(attr_str(node, "nearest_mode", "round_prefer_floor"), -1)
+        let rounding = ROUNDING_CODES.get(if upsample {
+            "floor"
+        } else {
+            attr_str(node, "nearest_mode", "round_prefer_floor")
+        }, -1)
         if rounding < 0 and sampling == "nearest" { return false }
         state.ids[out] = __prim__.graph_resize(b, state.id_of(node.inputs[0]), want[2], want[3], max(rounding, 0), center, corners, if sampling == "linear" {
             1

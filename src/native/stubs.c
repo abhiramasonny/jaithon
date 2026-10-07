@@ -791,8 +791,8 @@ bool jaiGraphGradients(JaiGraphBuilder *b, int loss, const int *wants, int count
     (void)b; (void)loss; (void)wants; (void)count; (void)out; return false;
 }
 JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *in, int inCount,
-                              const int *out, int outCount) {
-    (void)b; (void)in; (void)inCount; (void)out; (void)outCount; return NULL;
+                              const int *out, int outCount, int policy) {
+    (void)b; (void)in; (void)inCount; (void)out; (void)outCount; (void)policy; return NULL;
 }
 int jaiGraphPlanOutputRank(JaiGraphPlan *plan, int index) { (void)plan; (void)index; return -1; }
 bool jaiGraphPlanOutputShape(JaiGraphPlan *plan, int index, int64_t *dims, int rank) {

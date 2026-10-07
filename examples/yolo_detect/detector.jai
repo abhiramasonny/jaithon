@@ -104,6 +104,10 @@ pub fn letterbox(image: Mat, input: int = INPUT) -> tuple[Mat, float, int, int] 
         cv.BORDER_CONSTANT,
         Scalar(114.0, 114.0, 114.0)
     )
+    #: Only the border kernel reads it, and that is queued already. Device
+    #: work runs in the order it was queued, so handing the buffer back now
+    #: cannot let anything overwrite it before the border has read it.
+    resized.release()
     return (padded, scale, left, top)
 }
 
@@ -289,8 +293,13 @@ pub fn draw(image: Mat, found: list[Detection]) -> Mat {
 #: window -- and that work runs on the processor while the network runs on the
 #: device. A loop written that way costs the slower of the two halves rather
 #: than their sum.
+#:
+#: It owns two device buffers, the network's output and the blob the network
+#: read, and `finish_detect` hands both back. Left to the collector they were
+#: fourteen megabytes a frame that nothing ever freed.
 pub class Pending {
     pub let output: Tensor
+    pub let blob: Mat
     pub let scale: float
     pub let pad_x: int
     pub let pad_y: int
@@ -301,6 +310,7 @@ pub class Pending {
     pub fn init(
         self,
         output: Tensor,
+        blob: Mat,
         scale: float,
         pad_x: int,
         pad_y: int,
@@ -309,6 +319,7 @@ pub class Pending {
         rows: int
     ) {
         self.output = output
+        self.blob = blob
         self.scale = scale
         self.pad_x = pad_x
         self.pad_y = pad_y
@@ -335,6 +346,7 @@ pub fn start_detect(model: Detector, image: Mat) -> Pending {
         Scalar(0.0, 0.0, 0.0),
         true
     )
+    padded.release()
     #: The blob is already on the device, so the tensor shares its storage
     #: rather than making a round trip through the host to say so.
     let input = cv.blob_to_tensor(blob, 3, Size(model.input, model.input))
@@ -346,20 +358,19 @@ pub fn start_detect(model: Detector, image: Mat) -> Pending {
     #: the queue over and returns, which is the whole point of coming back for
     #: the answer later.
     gpu.flush()
-    return Pending(
-        outputs[model.graph.outputs[0]],
-        scale,
-        pad_x,
-        pad_y,
-        image.cols,
-        image.rows,
-        model.rows
-    )
+    let wanted = model.graph.outputs[0]
+    let output = outputs[wanted]
+    #: A model with more than one output has its others freed here; only the
+    #: first is decoded.
+    for (name, other) in outputs.items() {
+        if name != wanted { other.free() }
+    }
+    return Pending(output, blob, scale, pad_x, pad_y, image.cols, image.rows, model.rows)
 }
 
 #: Read what `start_detect` queued. This is where the wait happens.
 pub fn finish_detect(pending: Pending) -> list[Detection] {
-    return decode(
+    let found = decode(
         pending.output,
         pending.scale,
         pending.pad_x,
@@ -368,11 +379,15 @@ pub fn finish_detect(pending: Pending) -> list[Detection] {
         pending.height,
         pending.rows
     )
+    pending.output.free()
+    pending.blob.release()
+    return found
 }
 
 #: One frame, from image to detections. The graph is passed in rather than
-#: reopened, because loading the 12 MB of weights costs about two seconds and
-#: a camera loop must do it once.
+#: reopened, because loading the weights is several frames' worth of work --
+#: tens of milliseconds for yolov8n, half a second for yolov8x -- and a camera
+#: loop must do it once.
 #:
 #: This waits for the network before returning. A loop that has other work to
 #: do meanwhile should use `start_detect` and `finish_detect` instead.

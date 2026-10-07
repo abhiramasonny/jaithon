@@ -697,6 +697,118 @@ fn test_the_graph_differentiates_itself() -> void {
     }
 }
 
+#: `x * w` with the placeholders created in the opposite order to the one the
+#: plan lists them in. The executable takes its inputs in its own order, so a
+#: plan that handed them over in the caller's would feed `x` to `w`.
+fn product_plan(policy: str?) -> Plan {
+    let builder = __prim__.graph_new()
+    let w = __prim__.graph_input(builder, [3])
+    let x = __prim__.graph_input(builder, [2, 3])
+    let product = __prim__.graph_binary(builder, x, w, 2)
+    let handle = __prim__.graph_compile(builder, [x, w], [product], policy)
+    __prim__.graph_free(builder)
+    assert_true(handle is not null, f"the {policy} product would not compile")
+    return Plan(handle, ["x", "w"], [[2, 3], [3]], ["y"], [[2, 3]])
+}
+
+#: Every route policy gives the same answer, call after call -- the first call
+#: is the one that times the two routes, and the ones after it take whichever
+#: won -- and a policy that is not one is refused rather than ignored.
+fn test_each_route_policy_runs_the_plan() -> void {
+    if not gpu.is_available() { return }
+    let xs = Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    let ws = Tensor([3], [10.0, 20.0, 30.0])
+    let want = [10.0, 40.0, 90.0, 40.0, 100.0, 180.0]
+    for policy in [null, "latency", "throughput"] {
+        let plan = product_plan(policy)
+        for call in 0..3 {
+            let produced = plan.run({"x": xs, "w": ws})
+            let got = produced["y"].download()
+            for index in 0..want.len() {
+                assert_near(got[index], want[index], 1e-6, f"{policy} call {call} at {index}")
+            }
+            produced["y"].free()
+        }
+        plan.free()
+    }
+    let builder = __prim__.graph_new()
+    let x = __prim__.graph_input(builder, [3])
+    let doubled = __prim__.graph_binary(builder, x, x, 0)
+    let refused = assert_throws(
+        ValueError,
+        || __prim__.graph_compile(builder, [x], [doubled], "fastest")
+    )
+    assert_contains(refused.message, "throughput", "names the policies there are")
+    __prim__.graph_free(builder)
+    xs.free()
+    ws.free()
+}
+
+#: A model whose output comes straight out of a Resize, with nothing after it
+#: to reshape. MPSGraph's shape inference on macOS 27 left every such output
+#: [-1, -1, -1, -1], the plan took that as its output shape, and `run_best`
+#: threw on the second frame -- the first one the plan ran -- instead of either
+#: answering or going back to the interpreter.
+fn resize_output_graph(sampling: str, placing: str) -> Graph {
+    return Graph(
+        nodes: [
+            GraphNode("Relu", name: "act", inputs: ["x"], outputs: ["h"], attrs: {}),
+            GraphNode(
+                "Resize",
+                name: "grow",
+                inputs: ["h", "", "scales"],
+                outputs: ["y"],
+                attrs: {
+                    "mode": Attr.of_str(sampling),
+                    "coordinate_transformation_mode": Attr.of_str(placing),
+                    "nearest_mode": Attr.of_str("floor"),
+                }
+            ),
+        ],
+        inputs: ["x"],
+        outputs: ["y"],
+        initializers: {"scales": Tensor([4], [1.0, 1.0, 2.0, 2.0])}
+    )
+}
+
+fn test_a_resize_output_runs_compiled_from_the_second_frame() -> void {
+    if not gpu.is_available() { return }
+    for (sampling, placing) in [("nearest", "asymmetric"), ("linear", "half_pixel")] {
+        let graph = resize_output_graph(sampling, placing)
+        var values: list[float] = []
+        for index in 0..24 { values.push(float(index % 7) * 0.75 - 2.0) }
+        let x = Tensor([1, 2, 3, 4], values)
+
+        for frame in 1..4 {
+            let planned = run_best(graph, {"x": x})
+            let plain = run_graph(graph, {"x": x})
+            assert_eq(planned["y"].shape, [1, 2, 6, 8], f"{sampling} frame {frame} shape")
+            let got = planned["y"].download()
+            let want = plain["y"].download()
+            assert_eq(got.len(), want.len(), f"{sampling} frame {frame} came back the wrong size")
+            for index in 0..got.len() {
+                assert_near(
+                    got[index],
+                    want[index],
+                    1e-3,
+                    f"{sampling} frame {frame} differs at {index}"
+                )
+            }
+            planned["y"].free()
+            plain["y"].free()
+        }
+
+        #: Falling back would also pass the loop above; the plan has to exist.
+        let plan = compile_plan(graph, {"x": x})
+        assert_true(plan is not null, f"{sampling} resize did not compile")
+        if plan is not null {
+            assert_eq(plan.output_shapes, [[1, 2, 6, 8]], f"{sampling} resize output shape")
+            plan.free()
+        }
+        x.free()
+    }
+}
+
 #: `run_best` keeps a compiled plan per graph and reuses it. Both halves of
 #: that are checked here: the reuse, and the throwing away.
 #:

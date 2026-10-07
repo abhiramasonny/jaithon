@@ -44,11 +44,17 @@ struct JaiGraphPlan {
     void *executable;   /* MPSGraphExecutable *, +1 */
     void *inputShapes;  /* NSArray<NSArray<NSNumber *> *> *, +1 */
     void *outputShapes; /* NSArray<NSArray<NSNumber *> *> *, +1 */
+    /* NSArray<NSNumber *> *, +1, or NULL when the executable takes its inputs
+     * in the caller's order: for each of the executable's inputs, which of
+     * the caller's it is. */
+    void *feedOrder;
     int   inputCount;
     int   outputCount;
     /* Which way this plan reaches the hardware: 0 not decided yet, 1 encoded
      * into the shared command buffer, 2 run by MPSGraph itself. */
     int   route;
+    /* How the route is chosen: JAI_GRAPH_POLICY_LATENCY or _THROUGHPUT. */
+    int   policy;
 };
 
 /* Encoding puts every operation into a Metal command buffer, which is a
@@ -72,6 +78,61 @@ static int forcedRoute(void) {
     if (strcmp(setting, "encode") == 0) return ROUTE_ENCODE;
     if (strcmp(setting, "run") == 0) return ROUTE_RUN;
     return ROUTE_UNDECIDED;
+}
+
+/* The policy a plan gets when its caller names none.
+ * `JAITHON_GRAPH_ROUTE_POLICY=throughput` makes every such plan a throughput
+ * one, which is how the policy is tried on a caller before the caller asks for
+ * it. Read once. */
+static int defaultPolicy(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("JAITHON_GRAPH_ROUTE_POLICY");
+        cached = (v != NULL && strcmp(v, "throughput") == 0) ? JAI_GRAPH_POLICY_THROUGHPUT
+                                                             : JAI_GRAPH_POLICY_LATENCY;
+    }
+    return cached;
+}
+
+/* `JAITHON_GRAPH_OPT_LEVEL=0` or `=1` puts every graph this runtime compiles
+ * at that MPSGraph optimisation level, which is the one-binary A/B for the
+ * level choice below. Unset (or anything else), each site picks its own.
+ * Read once. */
+static int forcedLevel(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char *v = getenv("JAITHON_GRAPH_OPT_LEVEL");
+        cached = (v != NULL && strcmp(v, "0") == 0)   ? 0
+                 : (v != NULL && strcmp(v, "1") == 0) ? 1
+                                                      : -1;
+    }
+    return cached;
+}
+
+/* The optimisation level for a graph that is only ever encoded into a command
+ * buffer, never run by MPSGraph itself.
+ *
+ * Level one's placement pass is free to put work on the Neural Engine or the
+ * CPU, which is the only thing it adds -- and for an encoded graph that is
+ * nothing worth having. It tried the Neural Engine for every graph with a
+ * half-precision cast in it, printed "error: Incompatible element type for
+ * ANE" to stderr once per compile, and on macOS 27 it did place an fp16 NCHW
+ * convolution stack there even through encodeToCommandBuffer, where it ran 15%
+ * slower than the GPU. Compile and encode cost measured the same at both
+ * levels. gpu_graph.m's two compile sites take this too. */
+int jaiGraphEncodedLevel(void) {
+    const int forced = forcedLevel();
+    if (forced >= 0) return forced;
+    return 0;
+}
+
+/* The level for a plan: a throughput plan is expected to be encoded, a
+ * latency one may well be run, and running is where placement can pay. */
+static MPSGraphOptimization planLevel(int policy) {
+    const int forced = forcedLevel();
+    if (forced >= 0) return forced == 0 ? MPSGraphOptimizationLevel0 : MPSGraphOptimizationLevel1;
+    return policy == JAI_GRAPH_POLICY_THROUGHPUT ? (MPSGraphOptimization)jaiGraphEncodedLevel()
+                                                 : MPSGraphOptimizationLevel1;
 }
 
 static NSArray<NSNumber *> *shapeOf(const int64_t *dims, int rank) {
@@ -560,21 +621,41 @@ int jaiGraphResize(JaiGraphBuilder *b, int x, int height, int width,
             MPSGraphTensor *size = [g constantWithData:data
                                                  shape:@[ @2 ]
                                               dataType:MPSDataTypeInt32];
+            MPSGraphTensor *resized = nil;
             if (bilinear) {
-                return record(b, [g resizeBilinearWithTensor:in
-                                                  sizeTensor:size
-                                                centerResult:center != 0
-                                                alignCorners:corners != 0
-                                                      layout:MPSGraphTensorNamedDataLayoutNCHW
-                                                        name:nil]);
+                resized = [g resizeBilinearWithTensor:in
+                                           sizeTensor:size
+                                         centerResult:center != 0
+                                         alignCorners:corners != 0
+                                               layout:MPSGraphTensorNamedDataLayoutNCHW
+                                                 name:nil];
+            } else {
+                resized = [g resizeNearestWithTensor:in
+                                          sizeTensor:size
+                                 nearestRoundingMode:(MPSGraphResizeNearestRoundingMode)rounding
+                                        centerResult:center != 0
+                                        alignCorners:corners != 0
+                                              layout:MPSGraphTensorNamedDataLayoutNCHW
+                                                name:nil];
             }
-            return record(b, [g resizeNearestWithTensor:in
-                                             sizeTensor:size
-                                    nearestRoundingMode:(MPSGraphResizeNearestRoundingMode)rounding
-                                           centerResult:center != 0
-                                           alignCorners:corners != 0
-                                                 layout:MPSGraphTensorNamedDataLayoutNCHW
-                                                   name:nil]);
+            if (resized == nil) return -1;
+            /* The size is a constant, but the shape inference that ships with
+             * macOS 27 does not look inside it: every sizeTensor resize comes
+             * back [-1, -1, -1, -1], and so does everything downstream of it
+             * until something reshapes. A reshape to the size this call was
+             * given puts the shape back. The static resizeTensor:size: would
+             * do that by itself, but it has no nearest rounding mode, and the
+             * rounding mode is what ONNX's nearest resize is about. N and C
+             * have to be known for the reshape to say anything true; when they
+             * are not, the compile asks the executable instead. */
+            NSArray<NSNumber *> *from = in.shape;
+            if (from != nil && from.count == 4 && from[0].longLongValue >= 0 &&
+                from[1].longLongValue >= 0) {
+                resized = [g reshapeTensor:resized
+                                 withShape:@[ from[0], from[1], @(height), @(width) ]
+                                      name:nil];
+            }
+            return record(b, resized);
         }
         return -1;
     }
@@ -858,9 +939,12 @@ bool jaiGraphGradients(JaiGraphBuilder *b, int loss, const int *wants, int count
 }
 
 JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCount,
-                              const int *outputs, int outputCount) {
+                              const int *outputs, int outputCount, int policy) {
     if (b == NULL || inputs == NULL || outputs == NULL) return NULL;
     if (inputCount < 0 || outputCount <= 0) return NULL;
+    if (policy != JAI_GRAPH_POLICY_LATENCY && policy != JAI_GRAPH_POLICY_THROUGHPUT) {
+        policy = defaultPolicy();
+    }
     @autoreleasepool {
         MPSGraph *graph = (__bridge MPSGraph *)b->graph;
         NSMutableDictionary<MPSGraphTensor *, MPSGraphShapedType *> *feeds = [NSMutableDictionary new];
@@ -884,9 +968,10 @@ JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCo
         MPSGraphCompilationDescriptor *descriptor = nil;
         if (@available(macOS 12.3, *)) {
             descriptor = [MPSGraphCompilationDescriptor new];
-            /* The level whose placement pass may put parts of the graph on the
-             * Neural Engine or the CPU rather than the GPU. */
-            descriptor.optimizationLevel = MPSGraphOptimizationLevel1;
+            /* Level one's placement pass may put parts of the graph on the
+             * Neural Engine or the CPU rather than the GPU, which only a run
+             * can use; see planLevel. */
+            descriptor.optimizationLevel = planLevel(policy);
         }
         MPSGraphExecutable *executable = [graph compileWithDevice:nil
                                                             feeds:feeds
@@ -895,13 +980,83 @@ JaiGraphPlan *jaiGraphCompile(JaiGraphBuilder *b, const int *inputs, int inputCo
                                             compilationDescriptor:descriptor];
         if (executable == nil) return NULL;
 
+        /* The executable takes its inputs in its own order, not the caller's.
+         * Every caller so far created its placeholders in the order it lists
+         * them, and MPSGraph happens to keep that order, but nothing promises
+         * it -- so the plan records where each of the executable's inputs
+         * comes from, and a run hands them over in that order. */
+        NSArray<MPSGraphTensor *> *feedTensors = executable.feedTensors;
+        NSMutableArray<NSNumber *> *feedOrder = nil;
+        if (feedTensors != nil && (int)feedTensors.count == inputCount) {
+            for (NSUInteger at = 0; at < feedTensors.count; at++) {
+                int source = -1;
+                for (int i = 0; i < inputCount; i++) {
+                    if (tensorAt(b, inputs[i]) == feedTensors[at]) {
+                        source = i;
+                        break;
+                    }
+                }
+                if (source < 0) return NULL;
+                if (feedOrder == nil && source != (int)at) {
+                    feedOrder = [NSMutableArray arrayWithCapacity:feedTensors.count];
+                    for (NSUInteger before = 0; before < at; before++) {
+                        [feedOrder addObject:@(before)];
+                    }
+                }
+                if (feedOrder != nil) [feedOrder addObject:@(source)];
+            }
+        } else if (inputCount > 0) {
+            return NULL;
+        }
+
+        /* A shape the builder could not settle is asked of the executable,
+         * which knows the input shapes it was compiled for and so can say
+         * what comes out. Shape inference on a sizeTensor resize is the case
+         * that needs it today, when the resize's batch or channels were not
+         * known either. An output that is still open after that has no
+         * buffer that could be sized for it, so there is no plan. */
+        bool open = false;
+        for (NSArray<NSNumber *> *shape in outShapes) {
+            for (NSNumber *dim in shape) {
+                if (dim.longLongValue < 0) open = true;
+            }
+        }
+        if (open) {
+            if (@available(macOS 14.0, *)) {
+                NSMutableArray<MPSGraphShapedType *> *types =
+                    [NSMutableArray arrayWithCapacity:feedTensors.count];
+                for (MPSGraphTensor *tensor in feedTensors) [types addObject:feeds[tensor]];
+                MPSGraphDevice *device =
+                    [MPSGraphDevice deviceWithMTLDevice:jaiGpuMetalDevice()];
+                NSArray<MPSGraphShapedType *> *settled =
+                    [executable getOutputTypesWithDevice:device
+                                              inputTypes:types
+                                   compilationDescriptor:descriptor];
+                if (settled == nil || settled.count != (NSUInteger)outputCount) return NULL;
+                for (int i = 0; i < outputCount; i++) {
+                    NSArray<NSNumber *> *shape = settled[(NSUInteger)i].shape;
+                    if (shape == nil) return NULL;
+                    outShapes[(NSUInteger)i] = shape;
+                }
+            } else {
+                return NULL;
+            }
+            for (NSArray<NSNumber *> *shape in outShapes) {
+                for (NSNumber *dim in shape) {
+                    if (dim.longLongValue < 0) return NULL;
+                }
+            }
+        }
+
         JaiGraphPlan *plan = JAI_ALLOC(JaiGraphPlan, 1);
         plan->executable = (__bridge_retained void *)executable;
         plan->inputShapes = (__bridge_retained void *)[inShapes copy];
         plan->outputShapes = (__bridge_retained void *)[outShapes copy];
+        plan->feedOrder = feedOrder != nil ? (__bridge_retained void *)[feedOrder copy] : NULL;
         plan->inputCount = inputCount;
         plan->outputCount = outputCount;
         plan->route = forcedRoute();
+        plan->policy = policy;
         return plan;
     }
 }
@@ -947,9 +1102,82 @@ static MPSGraphExecutableExecutionDescriptor *blockingRun(void) {
     return descriptor;
 }
 
+/* How much quicker running has to be, over a pipelined batch, before a
+ * throughput plan gives up encoding. */
+#define JAI_GRAPH_RUN_MUST_BEAT_PIPELINED 0.90
+
+static double medianOfThree(const double v[3]) {
+    double a = v[0], b = v[1], c = v[2];
+    if (a > b) { double t = a; a = b; b = t; }
+    if (b > c) { double t = b; b = c; c = t; }
+    if (a > b) { double t = a; a = b; b = t; }
+    return b;
+}
+
+/* The route for a plan that will be called back to back -- a training step,
+ * a batch over a dataset -- where what matters is how many calls a second go
+ * through, not how long one takes.
+ *
+ * The latency probe below times one call at a time, encode-and-wait against a
+ * blocking run, and that is the wrong question for a loop: encoding returns
+ * at once and lets the next call's host work overlap this one's GPU work,
+ * while running blocks on every call. Measured on a [784-512-512-10]
+ * compiled training step the two were within noise one call at a time, so the
+ * probe picked by coin toss -- and the step then read 273 ms in one process
+ * and 176-186 ms in three, with run at 302 ms and encode at 202 ms when each
+ * was forced. So each route is timed over a batch of calls in flight, the two
+ * batches alternated, three times, and the medians compared. Running has to
+ * be clearly faster to win, because the cost of guessing wrong is lopsided:
+ * encode at worst matches run, and run at worst loses all the overlap. */
+static void chooseRouteThroughput(JaiGraphPlan *plan, NSArray *feeds, NSArray *results,
+                                  id<MTLCommandQueue> queue) {
+    MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)plan->executable;
+    const int WARM = 6;
+    const int BATCH = 8;
+    const int ROUNDS = 3;
+    double encoded[3], ran[3];
+
+    for (int i = 0; i < WARM; i++) {
+        jaiGpuEncodeExecutable((__bridge void *)executable, (__bridge void *)feeds,
+                               (__bridge void *)results);
+        jaiGpuSynchronize();
+        [executable runWithMTLCommandQueue:queue inputsArray:feeds resultsArray:results
+                       executionDescriptor:blockingRun()];
+    }
+    for (int round = 0; round < ROUNDS; round++) {
+        NSDate *startedEncode = [NSDate date];
+        for (int i = 0; i < BATCH; i++) {
+            jaiGpuEncodeExecutable((__bridge void *)executable, (__bridge void *)feeds,
+                                   (__bridge void *)results);
+        }
+        jaiGpuSynchronize();
+        encoded[round] = -[startedEncode timeIntervalSinceNow];
+
+        NSDate *startedRun = [NSDate date];
+        for (int i = 0; i < BATCH; i++) {
+            [executable runWithMTLCommandQueue:queue inputsArray:feeds resultsArray:results
+                           executionDescriptor:blockingRun()];
+        }
+        ran[round] = -[startedRun timeIntervalSinceNow];
+    }
+    const double encodedMid = medianOfThree(encoded) / BATCH;
+    const double ranMid = medianOfThree(ran) / BATCH;
+    plan->route = ranMid < encodedMid * JAI_GRAPH_RUN_MUST_BEAT_PIPELINED ? ROUTE_RUN
+                                                                          : ROUTE_ENCODE;
+    if (getenv("JAITHON_GRAPH_ROUTE_REPORT") != NULL) {
+        fprintf(stderr, "[graph] throughput: encode %.2fms  run %.2fms per call  taking %s\n",
+                encodedMid * 1000.0, ranMid * 1000.0,
+                plan->route == ROUTE_RUN ? "run" : "encode");
+    }
+}
+
 static void chooseRoute(JaiGraphPlan *plan, NSArray *feeds, NSArray *results,
                         id<MTLCommandQueue> queue) {
     MPSGraphExecutable *executable = (__bridge MPSGraphExecutable *)plan->executable;
+    if (plan->policy == JAI_GRAPH_POLICY_THROUGHPUT) {
+        chooseRouteThroughput(plan, feeds, results, queue);
+        return;
+    }
 
     /* Best of several, warmed first and taken in turns.
      *
@@ -1032,6 +1260,13 @@ bool jaiGraphRun(JaiGraphPlan *plan, JaiGpuBuffer **ins, const size_t *inOffsets
             if (data == nil) return false;
             [feeds addObject:data];
         }
+        if (plan->feedOrder != NULL) {
+            NSArray<NSNumber *> *order = (__bridge NSArray *)plan->feedOrder;
+            NSMutableArray<MPSGraphTensorData *> *ordered =
+                [NSMutableArray arrayWithCapacity:feeds.count];
+            for (NSNumber *source in order) [ordered addObject:feeds[source.unsignedIntegerValue]];
+            feeds = ordered;
+        }
         NSMutableArray<MPSGraphTensorData *> *results = [NSMutableArray new];
         for (int i = 0; i < plan->outputCount; i++) {
             MPSGraphTensorData *data = (__bridge_transfer MPSGraphTensorData *)
@@ -1074,6 +1309,7 @@ void jaiGraphPlanFree(JaiGraphPlan *plan) {
         CFBridgingRelease(plan->executable);
         CFBridgingRelease(plan->inputShapes);
         CFBridgingRelease(plan->outputShapes);
+        if (plan->feedOrder != NULL) CFBridgingRelease(plan->feedOrder);
     }
     JAI_FREE(JaiGraphPlan, plan);
 }
