@@ -655,11 +655,14 @@ fn route_policy() -> str {
 #:
 #: A runtime whose `graph_compile` takes no policy rejects the fourth argument
 #: with a TypeError before it builds anything. Such a runtime only has the
-#: one-call rule, so the step is compiled under that.
+#: one-call rule, so the step is compiled under that. Any other TypeError is a
+#: fault of its own and goes on up: retrying it would build the graph twice and
+#: quietly take the other rule.
 fn compile_plan(builder: int, inputs: list[int], outputs: list[int]) -> int {
     try {
         return __prim__.graph_compile(builder, inputs, outputs, route_policy())
-    } catch _error: TypeError {
+    } catch error: TypeError {
+        if not error.message.contains("takes 3 arguments") { throw error }
         return __prim__.graph_compile(builder, inputs, outputs)
     }
 }
@@ -736,8 +739,11 @@ var _fused_mlp = -1
 #: the GPU lock (n=5, alternated), Adam 88.0 ms fused against 119.7 compiled
 #: and momentum 85.9 against 92.1 -- Adam's update is a dozen graph operations
 #: a parameter, and encoding them costs more than the kernels they replace.
-#: So the fused kernels are kept; `JAITENSOR_FUSED_MLP_STEP=0` compiles them
-#: instead. Read once; `set_prefer_fused_mlp_step` overrides it in-process.
+#: So the fused kernels are kept. `JAITENSOR_FUSED_MLP_STEP=0` offers them to
+#: the compiled step instead, which takes them only where `flat_step_wanted`
+#: does: momentum always, but Adam only past `ADAM_FLAT_MIN_WORK`, so a small
+#: Adam model stays fused unless `JAITENSOR_COMPILED_FLAT=2` lifts that gate
+#: too. Read once; `set_prefer_fused_mlp_step` overrides it in-process.
 pub fn prefer_fused_mlp_step() -> bool {
     if _fused_mlp < 0 {
         _fused_mlp = if (env("JAITENSOR_FUSED_MLP_STEP") ?? "1") == "0" { 0 } else { 1 }
