@@ -133,7 +133,9 @@ pub class Sequential {
     #: optimizer's per-parameter state (momentum, second moment, step
     #: count) — otherwise a later `compile()` with a different optimizer
     #: would silently reinterpret the previous optimizer's state as its
-    #: own.
+    #: own. That includes the state a compiled step carries in its graph,
+    #: so the step goes too, and with it anything it was built for, such as
+    #: the precision.
     pub fn compile(
         self,
         optimizer: Optimizer = SGD(),
@@ -144,6 +146,7 @@ pub class Sequential {
     ) -> void {
         self._check_live()
         if not gpu.is_available() { throw RuntimeError("jaitensor needs a GPU") }
+        self._drop_compiled_step()
         if self.input_units != 0 { reset_state(self._parameters()) }
         self.optimizer_value = optimizer
         self.loss_value = loss
@@ -408,9 +411,23 @@ pub class Sequential {
         #: climbed from 216 MB to 311 MB, where releasing them holds flat at
         #: 132 MB.
         if self.input_units != 0 { reset_state(self._parameters()) }
+        #: Before the layers: freeing the step puts the parameters' current
+        #: values back into the layers' own buffers.
+        self._drop_compiled_step()
         for layer in self.layers { layer.free() }
         self.cached_parameters = null
         self.freed = true
+    }
+
+    #: Free the compiled step, its shadow parameters, the optimiser state it
+    #: carries and its plan, leaving the parameters' values where the layers
+    #: read them. Nothing else frees a step: a model that dropped one without
+    #: this left about eighteen buffers behind.
+    fn _drop_compiled_step(self) -> void {
+        let existing = self.compiled_step
+        if existing is not null { existing.free() }
+        self.compiled_step = null
+        self.compiled_for = ""
     }
 
     fn _prepare(
@@ -473,10 +490,7 @@ pub class Sequential {
     fn _try_compiling(self, dataset: Dataset, batch_size: int, classes: int) -> void {
         let shape = self._compiled_shape(dataset, batch_size)
         if shape is null {
-            let existing = self.compiled_step
-            if existing is not null { existing.free() }
-            self.compiled_step = null
-            self.compiled_for = ""
+            self._drop_compiled_step()
             return
         }
         let optimizer = self.optimizer_value

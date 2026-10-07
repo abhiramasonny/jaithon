@@ -8,7 +8,7 @@ import std.gpu as gpu
 import std.math
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
-from jaitensor import Dataset, Optimizer, Tensor
+from jaitensor import Dataset, Optimizer, Sequential, Tensor
 from jaitensor.compiled import compile_step, compiled_step_allowed, refusal
 from jaitensor.compiled import set_compiled_step, set_flat_policy
 from jaitensor.layers import Activation, AvgPool2d, Conv2d, Dense, Embedding, Flatten, Layer
@@ -878,5 +878,102 @@ fn test_a_small_adam_model_on_flat_rows_stays_static() -> void {
         assert_eq(model.training_route(), want, name)
         model.free()
         data.free()
+    }
+}
+
+#: Pictures or flat rows, built and fitted with momentum so that the step
+#: carries state of its own.
+fn fitted_with_a_compiled_step(image: bool) -> Sequential {
+    let rows = learnable_rows(128, 20, 4, 11)
+    let data = if image {
+        Dataset(rows.features.view(0, [128, 5, 4, 1]), rows.labels.view(0, [128]))
+    } else {
+        rows
+    }
+    var layers: list[Layer] = []
+    if image { layers.push(Flatten()) }
+    layers.push(Dense(32, activation: Activation.Relu))
+    layers.push(Dense(16, activation: Activation.Relu))
+    layers.push(Dense(4, activation: Activation.Softmax))
+    let model = jt.Sequential(layers)
+    model.compile(optimizer: optimizer_named("momentum"), loss: SparseCategoricalCrossentropy())
+    model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
+    assert_eq(model.training_route(), "compiled", f"image {image}")
+    rows.free()
+    return model
+}
+
+#: Freeing a model releases its compiled step: the step's shadow copy of
+#: every parameter, the optimiser state it carries, and its plan.
+#:
+#: `free` released the layers and the optimiser's table and never touched the
+#: step, so every model that trained through one left about eighteen buffers
+#: behind -- an image model always, and since flat rows compile, any dense
+#: model trained with plain descent or momentum.
+fn test_freeing_a_model_releases_its_compiled_step() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    for image in [false, true] {
+        fitted_with_a_compiled_step(image).free()
+        gpu.synchronize()
+        __prim__.gc_collect()
+        let before = gpu.live_buffers()
+        for _round in 0..4 {
+            fitted_with_a_compiled_step(image).free()
+        }
+        gpu.synchronize()
+        __prim__.gc_collect()
+        let grown = gpu.live_buffers() - before
+        assert_true(grown <= 2, f"image {image}: four freed models left {grown} buffers")
+    }
+}
+
+#: Recompiling drops whatever the compiled step carried, as it drops the
+#: static path's state.
+#:
+#: `compile` reset the optimiser's table and left the step alone. A fit after
+#: compiling again with an optimiser of the same settings matched the step's
+#: key and ran on with the old velocity or moments -- and Adam's step count --
+#: where the static path started from rest, so the two paths trained different
+#: models from that fit on.
+fn test_recompiling_resets_the_state_a_compiled_step_carries() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    let policy = set_flat_policy(2)
+    defer { set_flat_policy(policy) }
+    for name in ["momentum", "adam"] {
+        var seen: list[list[float]] = []
+        for compiled in [true, false] {
+            set_compiled_step(compiled)
+            let data = learnable_rows(128, 20, 4, 13)
+            let model = jt.Sequential(
+                [
+                    Dense(32, activation: Activation.Relu),
+                    Dense(16, activation: Activation.Relu),
+                    Dense(4, activation: Activation.Softmax),
+                ]
+            )
+            model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+            var trace = model.fit(data, epochs: 2, batch_size: 32, verbose: false, plot_path: null).loss
+            model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+            let after = model.fit(data, epochs: 2, batch_size: 32, verbose: false, plot_path: null)
+            let want = if compiled { "compiled" } else { "static" }
+            assert_eq(model.training_route(), want, name)
+            trace.extend(after.loss)
+            seen.push(trace)
+            model.free()
+            data.free()
+        }
+        for (index, value) in seen[0].enumerate() {
+            assert_near(
+                value,
+                seen[1][index],
+                1e-4,
+                f"{name} epoch {index}: {seen[0]} against {seen[1]}"
+            )
+        }
     }
 }
