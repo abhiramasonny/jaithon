@@ -12,9 +12,11 @@ from .params import check_matrix
 let _COLUMN_TILES = env_or("JAILEARN_COLUMN_TILES", "1") != "0"
 
 #: Elements each thread of a tile should fold before its partial is worth
-#: writing; it sets how many tiles the samples are cut into.
+#: writing; it sets how many rows a tile holds, and so how many partials are
+#: written for every column -- at most one per `TILE_WORK` values read.
 const TILE_WORK: int = 32
 const MAX_TILES: int = 1024
+const TILE_GROUP: int = 256
 
 fn column_reduce(x: Tensor, mask: Tensor, mode: int, ddof: int) -> tuple[Tensor, Tensor] {
     check_matrix(x)
@@ -23,22 +25,27 @@ fn column_reduce(x: Tensor, mask: Tensor, mode: int, ddof: int) -> tuple[Tensor,
     let second = Tensor([width])
     if _COLUMN_TILES {
         let rows = x.shape[0]
-        let wanted = (rows * width + 256 * TILE_WORK - 1) // (256 * TILE_WORK)
-        let cut = max(1, min(min(wanted, MAX_TILES), rows))
-        let tile = (rows + cut - 1) // cut
-        let groups = if tile > 0 { (rows + tile - 1) // tile } else { 1 }
-        let partials = Tensor([width * groups * 3])
+        #: A group lays `span` columns across its threads and `lanes` rows
+        #: deep; a tile of `lanes * TILE_WORK` rows gives every thread
+        #: `TILE_WORK` values. Cutting by rows alone made a wide, short matrix
+        #: a tile per row, and a partials buffer three times its size.
+        let span = min(width, TILE_GROUP)
+        let lanes = TILE_GROUP // span
+        let chunks = (width + span - 1) // span
+        let tile = max(lanes * TILE_WORK, (rows + MAX_TILES - 1) // MAX_TILES)
+        let tiles = max(1, (rows + tile - 1) // tile)
+        let partials = Tensor([width * tiles * 3])
         base_kernel("base_column_partials").dispatch_async(
             [x.buffer(), mask.buffer(), partials.buffer()],
-            groups * 256,
-            [rows, width, mode, tile, groups],
-            group_size: 256
+            tiles * chunks * TILE_GROUP,
+            [rows, width, mode, tile, tiles],
+            group_size: TILE_GROUP
         )
         base_kernel("base_column_finish").dispatch_async(
-            [partials.buffer(), first.buffer(), second.buffer()],
-            width * 256,
-            [width, mode, groups, max(ddof, 0)],
-            group_size: 256
+            [partials.buffer(), first.buffer(), second.buffer(), x.buffer()],
+            width * TILE_GROUP,
+            [width, mode, tiles, max(ddof, 0)],
+            group_size: TILE_GROUP
         )
         partials.free()
         return (first, second)

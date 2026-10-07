@@ -178,9 +178,13 @@ kernel void base_column_reduce(device const float* x [[buffer(0)]],
 /* Fold one partial column statistic `(a, b, c)` into another.
  *
  * Mode 0 carries `(count, mean, M2)` and merges by Chan's rule, which is
- * Welford's update between two groups -- one pass, and as stable as the two
- * passes `base_column_reduce` makes, because no partial ever holds a raw
- * sum of squares. Mode 1 carries `(min, max)` and mode 2 `(count, sum)`. */
+ * Welford's update between two groups: one pass, and no partial ever holds a
+ * raw sum of squares. That alone is NOT as stable as the two passes
+ * `base_column_reduce` makes -- a float32 running mean rounds at the ulp of
+ * the mean, so a column whose mean dwarfs its spread lost up to two hundred
+ * times the variance's accuracy -- which is why every value is folded
+ * relative to its column's first sample (see `base_column_partials`). Mode 1
+ * carries `(min, max)` and mode 2 `(count, sum)`. */
 static inline void column_fold(
     thread float &a,
     thread float &b,
@@ -200,18 +204,27 @@ static inline void column_fold(
     a = total;
 }
 
-/* One tile of rows, every column, as a partial statistic per column.
+/* One tile of rows and one span of columns, as a partial statistic per
+ * column.
  *
  * `base_column_reduce` puts a threadgroup on each column, which is as many
  * threadgroups as the data has features -- fifty, on a machine that wants
  * thousands of threads -- and has each read with the row width as its stride.
  * Here the threads of a group sit across the columns instead (`span` of them,
  * then the next row in the next `span`), so a group's reads are whole
- * consecutive rows, and the groups split the samples. Each thread folds its
- * column's values with Welford's update, the group's lanes fold together in
- * threadgroup memory, and lane 0 writes the group's partial for the column at
- * `partials[(column * groups + group) * 3]`. Wider than a group, the columns
- * are taken a group-width at a time. */
+ * consecutive rows. The groups form a grid of row tiles by column spans:
+ * group `g` takes tile `g / chunks` and span `g % chunks`, so a wide matrix
+ * with few rows still gets a group per span rather than a handful of groups
+ * walking every span in turn. Each thread folds its column's values with
+ * Welford's update, the group's lanes fold together in threadgroup memory,
+ * and lane 0 writes the tile's partial for the column at
+ * `partials[(column * tiles + tile) * 3]`.
+ *
+ * Mode 0 folds `value - x[column]`, the column's first sample: every tile
+ * shares that shift, so Chan's merge is unchanged, and `base_column_finish`
+ * adds it back to the mean. A shifted column's mean is of the order of its
+ * spread, so the running mean no longer rounds at the scale of an offset the
+ * variance does not depend on. */
 kernel void base_column_partials(device const float* x [[buffer(0)]],
                                  device const float* mask [[buffer(1)]],
                                  device float* partials [[buffer(2)]],
@@ -219,7 +232,7 @@ kernel void base_column_partials(device const float* x [[buffer(0)]],
                                  constant uint& width [[buffer(4)]],
                                  constant uint& mode [[buffer(5)]],
                                  constant uint& tile [[buffer(6)]],
-                                 constant uint& groups [[buffer(7)]],
+                                 constant uint& tiles [[buffer(7)]],
                                  uint group [[threadgroup_position_in_grid]],
                                  uint lid [[thread_index_in_threadgroup]]) {
     threadgroup float first[GROUP];
@@ -229,48 +242,49 @@ kernel void base_column_partials(device const float* x [[buffer(0)]],
     uint lanes = GROUP / span;
     uint lane = lid / span;
     uint offset = lid - lane * span;
-    uint start = group * tile;
+    uint chunks = (width + span - 1u) / span;
+    uint which = group / chunks;
+    uint column = (group - which * chunks) * span + offset;
+    uint start = which * tile;
     uint stop = min(start + tile, rows);
-    for (uint base = 0u; base < width; base += span) {
-        uint column = base + offset;
-        bool live = lane < lanes && column < width;
-        float a = mode == 1u ? INFINITY : 0.0f;
-        float b = mode == 1u ? -INFINITY : 0.0f;
-        float c = 0.0f;
-        if (live) {
-            for (uint row = start + lane; row < stop; row += lanes) {
-                uint at = row * width + column;
-                float value = x[at];
-                if (mode == 1u) {
-                    a = min(a, value);
-                    b = max(b, value);
-                } else if (mode == 2u) {
-                    if (mask[at] != 0.0f) continue;
-                    a += 1.0f;
-                    b += value;
-                } else {
-                    a += 1.0f;
-                    float delta = value - b;
-                    b += delta / a;
-                    c += delta * (value - b);
-                }
+    bool live = lane < lanes && column < width;
+    float a = mode == 1u ? INFINITY : 0.0f;
+    float b = mode == 1u ? -INFINITY : 0.0f;
+    float c = 0.0f;
+    if (live) {
+        float shift = mode == 0u && rows > 0u ? x[column] : 0.0f;
+        for (uint row = start + lane; row < stop; row += lanes) {
+            uint at = row * width + column;
+            float value = x[at];
+            if (mode == 1u) {
+                a = min(a, value);
+                b = max(b, value);
+            } else if (mode == 2u) {
+                if (mask[at] != 0.0f) continue;
+                a += 1.0f;
+                b += value;
+            } else {
+                value -= shift;
+                a += 1.0f;
+                float delta = value - b;
+                b += delta / a;
+                c += delta * (value - b);
             }
         }
-        first[lid] = a;
-        second[lid] = b;
-        third[lid] = c;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (live && lane == 0u) {
-            for (uint other = 1u; other < lanes; ++other) {
-                uint slot = other * span + offset;
-                column_fold(a, b, c, first[slot], second[slot], third[slot], mode);
-            }
-            uint at = (column * groups + group) * 3u;
-            partials[at] = a;
-            partials[at + 1u] = b;
-            partials[at + 2u] = c;
+    }
+    first[lid] = a;
+    second[lid] = b;
+    third[lid] = c;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (live && lane == 0u) {
+        for (uint other = 1u; other < lanes; ++other) {
+            uint slot = other * span + offset;
+            column_fold(a, b, c, first[slot], second[slot], third[slot], mode);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint at = (column * tiles + which) * 3u;
+        partials[at] = a;
+        partials[at + 1u] = b;
+        partials[at + 2u] = c;
     }
 }
 
@@ -280,10 +294,11 @@ kernel void base_column_partials(device const float* x [[buffer(0)]],
 kernel void base_column_finish(device const float* partials [[buffer(0)]],
                                device float* out_first [[buffer(1)]],
                                device float* out_second [[buffer(2)]],
-                               constant uint& width [[buffer(3)]],
-                               constant uint& mode [[buffer(4)]],
-                               constant uint& groups [[buffer(5)]],
-                               constant uint& ddof [[buffer(6)]],
+                               device const float* x [[buffer(3)]],
+                               constant uint& width [[buffer(4)]],
+                               constant uint& mode [[buffer(5)]],
+                               constant uint& groups [[buffer(6)]],
+                               constant uint& ddof [[buffer(7)]],
                                uint column [[threadgroup_position_in_grid]],
                                uint lid [[thread_index_in_threadgroup]]) {
     threadgroup float first[GROUP];
@@ -318,7 +333,8 @@ kernel void base_column_finish(device const float* partials [[buffer(0)]],
         out_first[column] = a > 0.0f ? b / a : 0.0f;
         return;
     }
-    out_first[column] = b;
+    /* `base_column_partials` folded every value less the first sample. */
+    out_first[column] = a > 0.0f ? b + x[column] : 0.0f;
     out_second[column] = c / max(a - float(min(ddof, uint(a))), 1.0f);
 }
 

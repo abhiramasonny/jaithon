@@ -266,6 +266,71 @@ fn test_column_statistics_fold_tiles_of_rows() -> void {
     host_column_check(4099, 7, 10000.0)
 }
 
+#: The relative error of every column variance against a double-precision
+#: two-pass variance of the same float32 values, worst column.
+fn worst_variance_error(rows: int, width: int, offset: float) -> float {
+    var drawn: list[float] = []
+    for index in 0..rows * width {
+        drawn.push(offset + math.sin(float(index) * 0.7311 + 0.2) * 1.7)
+    }
+    let x = Tensor([rows, width], drawn)
+    defer { x.free() }
+    #: What the device holds: the draws rounded to float32.
+    let values = jl.to_values(x)
+    let (mean, variance) = jl.column_moments(x)
+    defer { mean.free() }
+    defer { variance.free() }
+    let means = jl.to_values(mean)
+    let spreads = jl.to_values(variance)
+    var worst = 0.0
+    for column in 0..width {
+        var total = 0.0
+        for row in 0..rows { total += values[row * width + column] }
+        let centre = total / float(rows)
+        var squares = 0.0
+        for row in 0..rows {
+            let gap = values[row * width + column] - centre
+            squares += gap * gap
+        }
+        let exact = squares / float(rows)
+        assert_near(means[column], centre, 1e-6 * math.fabs(offset) + 1e-5, f"mean {column}")
+        worst = max(worst, math.fabs(spreads[column] - exact) / exact)
+    }
+    return worst
+}
+
+#: A column whose mean dwarfs its spread. A float32 running mean rounds at the
+#: ulp of the mean, so Welford's update alone lost up to two hundred times the
+#: variance's accuracy at an offset of ten thousand (1.3e-4 against the
+#: two-pass kernel's 3.7e-7 at 300 x 5); every value is folded relative to
+#: the column's first sample instead, which keeps the running mean at the
+#: scale of the spread.
+fn test_column_variance_survives_a_large_offset() -> void {
+    if not jl.is_available() { return }
+    for (rows, width, offset) in [
+        (300, 5, 1.0e3),
+        (300, 5, 1.0e4),
+        (10000, 8, 1.0e4),
+        (7, 3, 1.0e4),
+        (513, 257, 1.0e4),
+        (300, 5, 1.0e5),
+    ] {
+        let worst = worst_variance_error(rows, width, offset)
+        let bound = if offset >= 1.0e5 { 1.0e-4 } else { 1.0e-5 }
+        assert_true(worst < bound, f"{rows}x{width} offset {offset}: variance off by {worst}")
+    }
+}
+
+#: A wide matrix with few rows is cut into spans of columns as well as tiles
+#: of rows; checked against the host at shapes that leave a short last span
+#: and a single tile.
+fn test_column_statistics_cut_wide_short_matrices_into_spans() -> void {
+    if not jl.is_available() { return }
+    host_column_check(40, 2000, 0.0)
+    host_column_check(3, 600, 5.0)
+    host_column_check(2, 300, 0.0)
+}
+
 fn test_masked_mean_and_nan_mask_make_an_imputer() -> void {
     if not jl.is_available() { return }
     let x = jl.matrix([[1.0, math.NAN], [3.0, 20.0]])
