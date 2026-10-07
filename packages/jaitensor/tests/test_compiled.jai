@@ -8,9 +8,9 @@ import std.gpu as gpu
 import std.math
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
-from jaitensor import Tensor
+from jaitensor import Dataset, Optimizer, Sequential, Tensor
 from jaitensor.compiled import compile_step, compiled_step_allowed, refusal
-from jaitensor.compiled import set_compiled_step
+from jaitensor.compiled import set_compiled_step, set_flat_policy
 from jaitensor.layers import Activation, AvgPool2d, Conv2d, Dense, Embedding, Flatten, Layer
 from jaitensor.layers import LayerNorm, MaxPool2d
 from jaitensor.losses import SparseCategoricalCrossentropy
@@ -706,4 +706,404 @@ fn test_a_narrowed_step_trains_where_the_wide_one_does() -> void {
         math.fabs(wide_last) * 0.05 + 1e-3,
         "ten narrowed steps should land within a few percent of ten wide ones"
     )
+}
+
+#: A flat set a dense model can actually fit: each row carries its class.
+fn learnable_rows(samples: int, width: int, classes: int, seed: int) -> Dataset {
+    let rng = Random.with_seed(seed)
+    var features: list[float] = []
+    var labels: list[float] = []
+    for sample in 0..samples {
+        let kind = sample % classes
+        for slot in 0..width {
+            let signal = if slot % classes == kind { 1.0 } else { 0.0 }
+            features.push(signal + (rng.next_float() - 0.5) * 0.2)
+        }
+        labels.push(float(kind))
+    }
+    return Dataset(Tensor([samples, width], features), Tensor([samples], labels))
+}
+
+fn optimizer_named(name: str) -> Optimizer {
+    if name == "adam" { return jt.Adam(learning_rate: 0.01) }
+    if name == "momentum" { return SGD(learning_rate: 0.05, momentum: 0.9) }
+    return SGD(learning_rate: 0.1)
+}
+
+#: A dense model on flat rows trains through the compiled step, and lands
+#: where the static path does, epoch after epoch.
+#:
+#: The step used to be tried only for images, so this model -- two hidden
+#: layers, nothing the hand-fused kernels take -- always fell to the static
+#: path. Several epochs, and every optimiser, because the compiled step carries
+#: momentum and Adam's moments itself: state that is not carried looks right
+#: for one step and wrong for every one after.
+fn test_a_flat_dataset_trains_through_the_compiled_step_and_agrees() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    let policy = set_flat_policy(2)
+    defer { set_flat_policy(policy) }
+    for name in ["sgd", "momentum", "adam"] {
+        var seen: list[list[float]] = []
+        for compiled in [true, false] {
+            set_compiled_step(compiled)
+            let data = learnable_rows(128, 20, 4, 9)
+            let model = jt.Sequential(
+                [
+                    Dense(32, activation: Activation.Relu),
+                    Dense(16, activation: Activation.Relu),
+                    Dense(4, activation: Activation.Softmax),
+                ]
+            )
+            model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+            let history = model.fit(
+                data,
+                epochs: 6,
+                batch_size: 32,
+                verbose: false,
+                plot_path: null
+            )
+            let want = if compiled { "compiled" } else { "static" }
+            assert_eq(model.training_route(), want, f"{name} took the wrong path")
+            for value in history.loss { assert_true(math.is_finite(value), f"{name} loss {value}") }
+            seen.push(history.loss)
+            model.free()
+            data.free()
+        }
+        for (index, value) in seen[0].enumerate() {
+            assert_near(value, seen[1][index], 1e-4, f"{name} epoch {index}")
+        }
+        assert_true(seen[0][5] < seen[0][0] * 0.5, f"{name} is not learning: {seen[0]}")
+    }
+}
+
+#: Evaluating between fits must not throw the compiled step away.
+#:
+#: `evaluate` prepared the model as `fit` does, and that built a compiled step
+#: for whatever batch size it was asked to evaluate at -- freeing the one
+#: training had, and with it every moment Adam had accumulated. The next fit
+#: then started Adam over from rest: a different model from fitting straight
+#: through, with nothing to say so.
+fn test_evaluate_between_fits_keeps_the_optimiser_state() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    var traces: list[list[float]] = []
+    for interrupted in [false, true] {
+        #: Pictures, so the step is compiled whatever the flat rule says.
+        let rows = learnable_rows(64, 20, 4, 3)
+        let data = Dataset(rows.features.view(0, [64, 5, 4, 1]), rows.labels.view(0, [64]))
+        let model = jt.Sequential(
+            [
+                Flatten(),
+                Dense(24, activation: Activation.Relu),
+                Dense(12, activation: Activation.Relu),
+                Dense(4, activation: Activation.Softmax),
+            ]
+        )
+        model.compile(
+            optimizer: jt.Adam(learning_rate: 0.01),
+            loss: SparseCategoricalCrossentropy()
+        )
+        var trace: list[float] = []
+        for _round in 0..3 {
+            let history = model.fit(
+                data,
+                epochs: 1,
+                batch_size: 16,
+                verbose: false,
+                plot_path: null
+            )
+            trace.push(history.loss[0])
+            if interrupted { model.evaluate(data, batch_size: 8) }
+        }
+        assert_eq(model.training_route(), "compiled")
+        traces.push(trace)
+        model.free()
+        rows.free()
+    }
+    for index in 0..traces[0].len() {
+        assert_near(traces[1][index], traces[0][index], 1e-5, f"fit {index} after an evaluate")
+    }
+}
+
+#: A short last batch is trained, not dropped. The step is built for one
+#: batch size, so that batch goes through the ordinary path -- a hundred rows
+#: at a batch of thirty-two used to leave the same four untrained every epoch,
+#: and flat data stayed off the compiled step whenever its tail was large to
+#: avoid that. Pictures and flat rows, plain descent, momentum and Adam: the
+#: two paths have to agree batch for batch, tail included.
+fn test_a_short_last_batch_is_trained_on_the_compiled_path() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    let policy = set_flat_policy(2)
+    defer { set_flat_policy(policy) }
+    for name in ["sgd", "momentum", "adam"] {
+        for image in [false, true] {
+            var seen: list[list[float]] = []
+            for compiled in [true, false] {
+                set_compiled_step(compiled)
+                let rows = learnable_rows(100, 20, 4, 5)
+                let data = if image {
+                    Dataset(rows.features.view(0, [100, 5, 4, 1]), rows.labels.view(0, [100]))
+                } else {
+                    rows
+                }
+                var layers: list[Layer] = []
+                if image { layers.push(Flatten()) }
+                layers.push(Dense(16, activation: Activation.Relu))
+                layers.push(Dense(16, activation: Activation.Relu))
+                layers.push(Dense(4, activation: Activation.Softmax))
+                let model = Sequential(layers)
+                model.compile(
+                    optimizer: optimizer_named(name),
+                    loss: SparseCategoricalCrossentropy()
+                )
+                let history = model.fit(
+                    data,
+                    epochs: 3,
+                    batch_size: 32,
+                    verbose: false,
+                    plot_path: null
+                )
+                assert_eq(model.training_route() == "compiled", compiled, f"{name} image {image}")
+                var trace = history.loss
+                trace.extend(history.accuracy)
+                seen.push(trace)
+                model.free()
+                rows.free()
+            }
+            for (index, value) in seen[0].enumerate() {
+                assert_near(
+                    value,
+                    seen[1][index],
+                    1e-3,
+                    f"{name} image {image} {index}: {seen[0]} against {seen[1]}"
+                )
+            }
+        }
+    }
+}
+
+#: Adam on flat rows compiles where its graph measured faster: a small model
+#: with two hidden layers or more, where the step is host work and one graph
+#: beats the static path's dispatches. A model with many parameters at a small
+#: batch spends its step on Adam's update, a dozen graph operations a
+#: parameter against one kernel, and stays static; so does a single hidden
+#: layer, where the static path is lean enough to tie. Plain descent and
+#: momentum add two or three operations and compile at any size.
+fn test_adam_on_flat_rows_compiles_only_where_it_measured_faster() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    for (name, hidden, compiled) in [
+        ("adam", [16, 16], true),
+        ("adam", [512, 512], false),
+        ("adam", [16], false),
+        ("momentum", [512, 512], true),
+        ("sgd", [16], true),
+    ] {
+        let data = learnable_rows(128, 20, 4, 7)
+        var layers: list[Layer] = []
+        for width in hidden { layers.push(Dense(width, activation: Activation.Relu)) }
+        layers.push(Dense(4, activation: Activation.Softmax))
+        let model = Sequential(layers)
+        model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+        model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
+        let route = model.training_route()
+        assert_eq(route == "compiled", compiled, f"{name} {hidden} took {route}")
+        model.free()
+        data.free()
+    }
+}
+
+#: Pictures or flat rows, built and fitted with momentum so that the step
+#: carries state of its own.
+fn fitted_with_a_compiled_step(image: bool) -> Sequential {
+    let rows = learnable_rows(128, 20, 4, 11)
+    let data = if image {
+        Dataset(rows.features.view(0, [128, 5, 4, 1]), rows.labels.view(0, [128]))
+    } else {
+        rows
+    }
+    var layers: list[Layer] = []
+    if image { layers.push(Flatten()) }
+    layers.push(Dense(32, activation: Activation.Relu))
+    layers.push(Dense(16, activation: Activation.Relu))
+    layers.push(Dense(4, activation: Activation.Softmax))
+    let model = jt.Sequential(layers)
+    model.compile(optimizer: optimizer_named("momentum"), loss: SparseCategoricalCrossentropy())
+    model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
+    assert_eq(model.training_route(), "compiled", f"image {image}")
+    rows.free()
+    return model
+}
+
+#: Freeing a model releases its compiled step: the step's shadow copy of
+#: every parameter, the optimiser state it carries, and its plan.
+#:
+#: `free` released the layers and the optimiser's table and never touched the
+#: step, so every model that trained through one left about eighteen buffers
+#: behind -- an image model always, and since flat rows compile, any dense
+#: model trained with plain descent or momentum.
+fn test_freeing_a_model_releases_its_compiled_step() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    for image in [false, true] {
+        fitted_with_a_compiled_step(image).free()
+        gpu.synchronize()
+        __prim__.gc_collect()
+        let before = gpu.live_buffers()
+        for _round in 0..4 {
+            fitted_with_a_compiled_step(image).free()
+        }
+        gpu.synchronize()
+        __prim__.gc_collect()
+        let grown = gpu.live_buffers() - before
+        assert_true(grown <= 2, f"image {image}: four freed models left {grown} buffers")
+    }
+}
+
+#: Recompiling drops whatever the compiled step carried, as it drops the
+#: static path's state.
+#:
+#: `compile` reset the optimiser's table and left the step alone. A fit after
+#: compiling again with an optimiser of the same settings matched the step's
+#: key and ran on with the old velocity or moments -- and Adam's step count --
+#: where the static path started from rest, so the two paths trained different
+#: models from that fit on.
+fn test_recompiling_resets_the_state_a_compiled_step_carries() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    let policy = set_flat_policy(2)
+    defer { set_flat_policy(policy) }
+    for name in ["momentum", "adam"] {
+        var seen: list[list[float]] = []
+        for compiled in [true, false] {
+            set_compiled_step(compiled)
+            let data = learnable_rows(128, 20, 4, 13)
+            let model = jt.Sequential(
+                [
+                    Dense(32, activation: Activation.Relu),
+                    Dense(16, activation: Activation.Relu),
+                    Dense(4, activation: Activation.Softmax),
+                ]
+            )
+            model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+            var trace = model.fit(data, epochs: 2, batch_size: 32, verbose: false, plot_path: null).loss
+            model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+            let after = model.fit(data, epochs: 2, batch_size: 32, verbose: false, plot_path: null)
+            let want = if compiled { "compiled" } else { "static" }
+            assert_eq(model.training_route(), want, name)
+            trace.extend(after.loss)
+            seen.push(trace)
+            model.free()
+            data.free()
+        }
+        for (index, value) in seen[0].enumerate() {
+            assert_near(
+                value,
+                seen[1][index],
+                1e-4,
+                f"{name} epoch {index}: {seen[0]} against {seen[1]}"
+            )
+        }
+    }
+}
+
+#: One model fitted in three calls, the batch size changing between them, by
+#: whatever paths the rules pick; and again with the compiled step off.
+fn fitted_in_three_sizes(
+    name: str,
+    compiled: bool,
+    sizes: list[int]
+) -> tuple[list[float], list[str]] {
+    set_compiled_step(compiled)
+    let data = learnable_rows(128, 20, 4, 17)
+    let model = Sequential(
+        [
+            Dense(32, activation: Activation.Relu),
+            Dense(16, activation: Activation.Relu),
+            Dense(4, activation: Activation.Softmax),
+        ]
+    )
+    model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+    var trace: list[float] = []
+    var routes: list[str] = []
+    for size in sizes {
+        trace.extend(
+            model.fit(data, epochs: 2, batch_size: size, verbose: false, plot_path: null).loss
+        )
+        routes.push(model.training_route())
+    }
+    model.free()
+    data.free()
+    return (trace, routes)
+}
+
+#: The optimiser's state goes on through a change of batch size, whichever
+#: path trains each fit.
+#:
+#: A compiled step is built for one batch size and carried its velocity or
+#: moments itself, starting from rest: a fit at another size built a new step
+#: and started the optimiser over, and a fit the rules sent to the static path
+#: (here a batch larger than the dataset) began from whatever the static path
+#: had last seen. The static path alone keeps one state throughout, so that is
+#: what both have to agree with.
+fn test_the_optimiser_state_survives_a_change_of_batch_size_and_path() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    for (name, policy, sizes, want) in [
+        ("momentum", 2, [32, 64, 32], ["compiled", "compiled", "compiled"]),
+        ("adam", 2, [32, 64, 32], ["compiled", "compiled", "compiled"]),
+        ("momentum", 1, [32, 256, 32], ["compiled", "static", "compiled"]),
+    ] {
+        let before = set_flat_policy(policy)
+        let (compiled, routes) = fitted_in_three_sizes(name, true, sizes)
+        let (eager, _eager_routes) = fitted_in_three_sizes(name, false, sizes)
+        set_flat_policy(before)
+        assert_eq(routes, want, f"{name} {sizes}")
+        for (index, value) in compiled.enumerate() {
+            assert_near(
+                value,
+                eager[index],
+                1e-4,
+                f"{name} {sizes} epoch {index}: {compiled} against {eager}"
+            )
+        }
+    }
+}
+
+#: A dataset smaller than one batch never runs a compiled step -- the epoch
+#: has no full batch to give it -- so the model must not hold one and say it
+#: trained through it. Pictures, because flat rows already had that rule.
+fn test_a_dataset_smaller_than_a_batch_does_not_report_the_compiled_step() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    set_compiled_step(true)
+    let rows = learnable_rows(16, 20, 4, 19)
+    let data = Dataset(rows.features.view(0, [16, 5, 4, 1]), rows.labels.view(0, [16]))
+    let model = Sequential(
+        [
+            Flatten(),
+            Dense(16, activation: Activation.Relu),
+            Dense(16, activation: Activation.Relu),
+            Dense(4, activation: Activation.Softmax),
+        ]
+    )
+    model.compile(optimizer: optimizer_named("momentum"), loss: SparseCategoricalCrossentropy())
+    model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
+    let route = model.training_route()
+    assert_true(route != "compiled", f"sixteen pictures at a batch of 32 reported {route}")
+    model.free()
+    rows.free()
 }

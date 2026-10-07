@@ -9,7 +9,8 @@ from .layers import Layer
 from .ops import add_correct_into, add_scaled_into, argmax, copy_into, softmax, warmup_kernels as warmup_ops
 from .optimizers import Optimizer, SGD, reset_state, prepare_state, warmup_kernels as warmup_opt
 from .losses import Loss, SparseCategoricalCrossentropy, sparse_ce_with_delta, warmup_kernels as warmup_loss
-from .compiled import CompiledStep, compile_step, refusal as compile_refusal
+from .compiled import CompiledStep, compile_step, flat_step_wanted, prefer_fused_mlp_step
+from .compiled import refusal as compile_refusal
 from .plan import ExecutionPlan
 from .plots import save_history_plot
 from .tensor import Tensor
@@ -132,7 +133,9 @@ pub class Sequential {
     #: optimizer's per-parameter state (momentum, second moment, step
     #: count) — otherwise a later `compile()` with a different optimizer
     #: would silently reinterpret the previous optimizer's state as its
-    #: own.
+    #: own. That includes the state a compiled step carries in its graph,
+    #: so the step goes too, and with it anything it was built for, such as
+    #: the precision.
     pub fn compile(
         self,
         optimizer: Optimizer = SGD(),
@@ -143,6 +146,7 @@ pub class Sequential {
     ) -> void {
         self._check_live()
         if not gpu.is_available() { throw RuntimeError("jaitensor needs a GPU") }
+        self._drop_compiled_step()
         if self.input_units != 0 { reset_state(self._parameters()) }
         self.optimizer_value = optimizer
         self.loss_value = loss
@@ -161,15 +165,29 @@ pub class Sequential {
     #: Return the shape-specialized execution plan, if `compile` traced one.
     pub fn execution_plan(self) -> ExecutionPlan? { return self.plan_value }
 
+    #: Which of the training paths the last `fit` took for a full batch:
+    #: "fused-sgd", "fused-mlp", "compiled", "static" or "autograd", or "" before
+    #: any `fit`. The paths must train the same model; this is how a test, or a
+    #: benchmark's route column, tells which one it measured.
+    pub fn training_route(self) -> str {
+        if self.input_units == 0 or self.optimizer_value is null { return "" }
+        if self.fused_sgd { return "fused-sgd" }
+        if self.compiled_step is not null { return "compiled" }
+        if self.fused_mlp_step { return "fused-mlp" }
+        if self._static_step_active(0) { return "static" }
+        return "autograd"
+    }
+
     #: Train for `epochs`, returning loss and accuracy histories.
     #:
-    #: A trailing batch shorter than `batch_size` is dropped on the fused and
-    #: compiled paths, which need every batch the same size: with a hundred
-    #: samples and a batch of thirty-two, four of them are never trained on
-    #: and never counted, each epoch, and the reported loss and accuracy are
-    #: over the ninety-six that were. Shuffling is off by default, so without
+    #: A trailing batch shorter than `batch_size` is dropped on the fused
+    #: paths, which need every batch the same size: with a hundred samples and
+    #: a batch of thirty-two, four of them are never trained on and never
+    #: counted, each epoch, and the reported loss and accuracy are over the
+    #: ninety-six that were. Shuffling is off by default, so without
     #: `shuffle: true` it is the same four every time. A batch size that
-    #: divides the sample count avoids it altogether.
+    #: divides the sample count avoids it altogether. The compiled path trains
+    #: that batch through the ordinary one, so it keeps all four.
     pub fn fit(
         self,
         dataset: Dataset,
@@ -230,8 +248,12 @@ pub class Sequential {
     }
 
     #: Measure loss and accuracy without updating parameters.
+    #:
+    #: Never builds a compiled step: evaluating does not use one, and building
+    #: one for a batch size training did not use threw away the step training
+    #: had -- and with it the momentum or Adam state it carries.
     pub fn evaluate(self, dataset: Dataset, batch_size: int = 2048) -> Metrics {
-        self._prepare(dataset, 1, batch_size)
+        self._prepare(dataset, 1, batch_size, training: false)
         return self._run_epoch(dataset, batch_size, false)
     }
 
@@ -386,13 +408,34 @@ pub class Sequential {
         #: take them out of it: forty models built, fitted and freed in turn
         #: climbed from 216 MB to 311 MB, where releasing them holds flat at
         #: 132 MB.
+        #: Before the layers and the optimizer's table: freeing the step puts
+        #: the parameters' current values back into the layers' own buffers,
+        #: and the state it carries back into the table's.
+        self._drop_compiled_step()
         if self.input_units != 0 { reset_state(self._parameters()) }
         for layer in self.layers { layer.free() }
         self.cached_parameters = null
         self.freed = true
     }
 
-    fn _prepare(self, dataset: Dataset, epochs: int, batch_size: int) -> void {
+    #: Free the compiled step, its shadow parameters, the optimiser state it
+    #: carries and its plan, leaving the parameters' values where the layers
+    #: read them. Nothing else frees a step: a model that dropped one without
+    #: this left about eighteen buffers behind.
+    fn _drop_compiled_step(self) -> void {
+        let existing = self.compiled_step
+        if existing is not null { existing.free() }
+        self.compiled_step = null
+        self.compiled_for = ""
+    }
+
+    fn _prepare(
+        self,
+        dataset: Dataset,
+        epochs: int,
+        batch_size: int,
+        training: bool = true
+    ) -> void {
         self._check_live()
         if epochs <= 0 { throw ValueError(f"epochs must be positive, got {epochs}") }
         if batch_size <= 0 { throw ValueError(f"batch_size must be positive, got {batch_size}") }
@@ -427,31 +470,32 @@ pub class Sequential {
         }
         let optimizer = self.optimizer_value
         if optimizer is not null and not self.fused_sgd {
-            prepare_state(self._parameters(), optimizer.settings())
+            prepare_state(self._parameters(), optimizer.settings(), optimizer.kind())
         }
-        self._try_compiling(dataset, batch_size, classes)
+        if training { self._try_compiling(dataset, batch_size, classes) }
     }
 
     #: Build the whole step as one graph when the model allows it.
     #:
-    #: Only worth trying for the models the hand-fused paths do not already
-    #: cover, and only for plain SGD: momentum carries state from one step to
-    #: the next, which would have to live inside the graph too.
+    #: Tried for every model the hand-fused paths do not cover, on images and,
+    #: since `flat_step_wanted`, on flat rows. A model the fused
+    #: forward-backward kernels take -- their shapes, but momentum or Adam --
+    #: keeps them, because they measured faster than its graph; see
+    #: `prefer_fused_mlp_step`.
+    #:
+    #: A model that is not to be compiled drops any step it still holds: the
+    #: decision can turn on the batch size now, and a step kept from a fit at
+    #: another size would be run against batches it was not built for.
     fn _try_compiling(self, dataset: Dataset, batch_size: int, classes: int) -> void {
-        if self.fused_sgd or self.fused_mlp_step { return }
-        let loss = self.loss_value
+        let shape = self._compiled_shape(dataset, batch_size)
+        if shape is null {
+            self._drop_compiled_step()
+            return
+        }
         let optimizer = self.optimizer_value
-        if loss is null or not loss.is_sparse_categorical() { return }
         if optimizer is null { return }
         let kind = optimizer.kind()
-        if kind != 0 and kind != 1 { return }
         let settings = optimizer.settings()
-        if kind == 0 and settings.len() < 3 { return }
-        if kind == 1 and settings.len() < 4 { return }
-        let image = dataset.image_shape
-        if image is null or image.len() != 3 { return }
-        var shape = [batch_size]
-        for dimension in image { shape.push(dimension) }
 
         #: Kept between calls when nothing about it has changed. Building the
         #: graph is the expensive part -- the platform compiles the whole step,
@@ -463,11 +507,46 @@ pub class Sequential {
         let existing = self.compiled_step
         if existing is not null { existing.free() }
         self.compiled_step = if kind == 1 {
-            compile_step(self.layers, shape, classes, settings[0], adam: true, beta1: settings[1], beta2: settings[2], epsilon: settings[3])
+            compile_step(self.layers, shape, classes, settings[0], adam: true, beta1: settings[1], beta2: settings[2], epsilon: settings[3], shared_state: true)
         } else {
-            compile_step(self.layers, shape, classes, settings[0], settings[1], settings[2] > 0.5)
+            compile_step(self.layers, shape, classes, settings[0], settings[1], settings[2] > 0.5, shared_state: true)
         }
         self.compiled_for = if self.compiled_step is null { "" } else { wanted }
+    }
+
+    #: One batch's input shape for a compiled step, or null when this model
+    #: and dataset should not have one.
+    fn _compiled_shape(self, dataset: Dataset, batch_size: int) -> list[int]? {
+        if self.fused_sgd { return null }
+        if self.fused_mlp_step and prefer_fused_mlp_step() { return null }
+        let loss = self.loss_value
+        let optimizer = self.optimizer_value
+        if loss is null or not loss.is_sparse_categorical() { return null }
+        if optimizer is null { return null }
+        let kind = optimizer.kind()
+        if kind != 0 and kind != 1 { return null }
+        let settings = optimizer.settings()
+        if kind == 0 and settings.len() < 3 { return null }
+        if kind == 1 and settings.len() < 4 { return null }
+        #: Not one full batch: the epoch could never run the step, and a model
+        #: holding one would say it trained through it.
+        if dataset.samples < batch_size { return null }
+        let image = dataset.image_shape
+        var shape = [batch_size]
+        if image is not null {
+            if image.len() != 3 { return null }
+            for dimension in image { shape.push(dimension) }
+            return shape
+        }
+        if dataset.features.rank() != 2 { return null }
+        var parameters = 0
+        for parameter in self._parameters() { parameters += parameter.size }
+        let adam = kind == 1
+        if not flat_step_wanted(dataset.samples, batch_size, adam: adam, parameters: parameters, layers: self.layers.len()) {
+            return null
+        }
+        shape.push(dataset.feature_count)
+        return shape
     }
 
     fn _build_from_dataset(self, dataset: Dataset) -> void {
@@ -556,12 +635,12 @@ pub class Sequential {
         if training and self.fused_sgd {
             return self._run_fused_epoch(dataset, batch_size, optimizer.settings()[0])
         }
-        if training and self.fused_mlp_step {
-            return self._run_fused_bwd_epoch(dataset, batch_size)
-        }
         let compiled = self.compiled_step
         if training and compiled is not null and dataset.samples >= batch_size {
             return self._run_compiled_epoch(compiled, dataset, batch_size)
+        }
+        if training and self.fused_mlp_step {
+            return self._run_fused_bwd_epoch(dataset, batch_size)
         }
         if self._static_step_active(batch_size) {
             return self._run_static_epoch(dataset, batch_size, training)
@@ -1171,10 +1250,40 @@ pub class Sequential {
         return activations
     }
 
+    #: One batch through the static path where the model has one, otherwise
+    #: through autograd, adding its loss and correct count to the totals.
+    fn _train_batch_eagerly(
+        self,
+        features: Tensor,
+        labels: Tensor,
+        count: int,
+        total_loss: Tensor,
+        total_correct: Tensor
+    ) -> void {
+        if self._static_step_active(count) {
+            let activations = self._static_train_batch(features, labels, total_loss, count)
+            add_correct_into(activations[activations.len() - 1], labels, total_correct)
+            for activation in activations { activation.free() }
+            return
+        }
+        let loss_fn = self.loss_value
+        let optimizer = self.optimizer_value
+        if loss_fn is null or optimizer is null { throw RuntimeError("model is not compiled") }
+        let prediction = self._forward(features, training: true)
+        let loss = loss_fn.forward(prediction, labels, total_loss, count)
+        self._zero_grad()
+        let graph = loss.backward()
+        optimizer.step(self._parameters())
+        add_correct_into(prediction, labels, total_correct)
+        loss.free()
+        for tensor in graph { tensor.free() }
+    }
+
     #: One epoch through the compiled step.
     #:
-    #: The plan is built for one batch size, so a short last batch is left to
-    #: the ordinary path rather than run against a graph that does not fit it.
+    #: The plan is built for one batch size, so a short last batch is trained
+    #: by the ordinary path rather than run against a graph that does not fit
+    #: it. Skipping it, as this did, left the same rows untrained every epoch.
     fn _run_compiled_epoch(self, step: CompiledStep, dataset: Dataset, batch_size: int) -> Metrics {
         let total_correct = Tensor.zeros([1])
         defer { total_correct.free() }
@@ -1196,6 +1305,7 @@ pub class Sequential {
         defer {
             if loader is not null { loader.free() }
         }
+        step.resume()
         while start < dataset.samples {
             var count = min(batch_size, dataset.samples - start)
             var batch_features: Tensor
@@ -1211,6 +1321,19 @@ pub class Sequential {
                 batch_labels = self._slice_labels(dataset, start, count)
             }
             if count != batch_size {
+                #: Settled, the parameters and the optimiser's state are where
+                #: the ordinary path keeps them, so it can take this batch and
+                #: the step go on from what it did.
+                step.settle()
+                self._train_batch_eagerly(
+                    batch_features,
+                    batch_labels,
+                    count,
+                    total_loss,
+                    total_correct
+                )
+                step.resume()
+                seen += count
                 batch_features.free()
                 batch_labels.free()
                 start += count

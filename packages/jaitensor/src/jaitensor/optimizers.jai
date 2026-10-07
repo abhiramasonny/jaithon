@@ -176,13 +176,40 @@ fn next_step(parameter: Tensor) -> int {
     return updated
 }
 
+#: The buffers this optimizer keeps for `parameter` -- momentum's velocity, or
+#: Adam's first and second moments -- made if it has none yet.
+#:
+#: For a path that steps the parameter some other way and must carry the same
+#: state: a compiled step reads and writes these in place of buffers of its
+#: own, so that a model moving between paths, or on to a step built for
+#: another batch size, goes on from where it was rather than from rest.
+pub fn moment_buffers(parameter: Tensor, kind: int) -> list[Buffer] {
+    let state = state_for(parameter, kind, true)
+    if kind == 0 { return [state.first_moment] }
+    return [state.first_moment, state.second_moment]
+}
+
+#: How many updates Adam has made to `parameter`; its bias correction reads it.
+pub fn steps_taken(parameter: Tensor) -> int { return _steps.get(parameter.id, 0) }
+
+#: Record that each of `parameters` has had `count` updates.
+pub fn set_steps_taken(parameters: list[Tensor], count: int) -> void {
+    for parameter in parameters { _steps[parameter.id] = count }
+}
+
 #: Allocate optimizer buffers before the first timed step.
-pub fn prepare_state(parameters: list[Tensor], settings: list[float]) -> void {
+#:
+#: `kind` is the optimizer's own, and a state that is already there for it is
+#: kept. This used to prepare a plain descent's state whatever the optimizer
+#: was, on the reasoning that a state of the wrong kind is replaced on the
+#: first step anyway -- which is true, and is the bug: `Sequential` prepares on
+#: every `fit`, so an Adam model fitted an epoch at a time had its moments and
+#: step count thrown away at the start of every one, and trained a different
+#: model from one fitted in a single call.
+pub fn prepare_state(parameters: list[Tensor], settings: list[float], kind: int = 0) -> void {
+    let moments = wants_moments(kind, settings)
     for parameter in parameters {
-        #: The kind is not passed in here, and a state built for the wrong
-        #: one would be thrown away on the first step anyway, so this only
-        #: warms what a plain descent needs and lets `apply_update` decide.
-        let state = state_for(parameter, 0, wants_moments(0, settings))
+        let state = state_for(parameter, kind, moments)
         if state.settings is null { state.settings = Buffer.of(settings) }
     }
 }
@@ -333,8 +360,12 @@ pub class SGD: Optimizer {
     pub fn name(self) -> str { return "SGD" }
 
     #: Apply one SGD update to every given parameter, using its `.grad`.
+    #:
+    #: The settings are made once a step, not once a parameter: they are the
+    #: same numbers for every one of them, and each call allocated a list.
     pub fn step(self, parameters: list[Tensor]) -> void {
-        for parameter in parameters { apply_update(parameter, self.settings(), self.kind()) }
+        let settings = self.settings()
+        for parameter in parameters { apply_update(parameter, settings, 0) }
     }
 }
 
@@ -382,6 +413,7 @@ pub class Adam: Optimizer {
 
     #: Apply one Adam update to every given parameter, using its `.grad`.
     pub fn step(self, parameters: list[Tensor]) -> void {
-        for parameter in parameters { apply_update(parameter, self.settings(), self.kind()) }
+        let settings = self.settings()
+        for parameter in parameters { apply_update(parameter, settings, 1) }
     }
 }

@@ -31,6 +31,8 @@ from std.os import env
 from std.gpu import Buffer
 from .layers import Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Flatten, Layer, LayerNorm
 from .layers import MaxPool2d
+from .ops import cached_kernel
+from .optimizers import moment_buffers, set_steps_taken, steps_taken
 from .tensor import Tensor
 
 #: Reduction kinds the graph builder takes.
@@ -469,6 +471,12 @@ pub class CompiledStep {
     #: Empty for an optimizer that carries nothing.
     var carried: list[Buffer]
     var carried_shadow: list[Buffer]
+    #: Which of `carried` belong to the optimizer's own table rather than to
+    #: this step; see `compile_step`'s `shared_state`. Those are not freed here.
+    var borrowed: list[bool]
+    #: Whether `carried[0]` is Adam's step count and is to be kept in step with
+    #: the optimizer's table, by `resume` and `settle`.
+    var shares_count: bool
     var live_is_shadow: bool
     pub let batch_size: int
     pub let classes: int
@@ -481,6 +489,8 @@ pub class CompiledStep {
         shadow: list[Buffer],
         carried: list[Buffer],
         carried_shadow: list[Buffer],
+        borrowed: list[bool],
+        shares_count: bool,
         batch_size: int,
         classes: int
     ) {
@@ -489,10 +499,21 @@ pub class CompiledStep {
         self.shadow = shadow
         self.carried = carried
         self.carried_shadow = carried_shadow
+        self.borrowed = borrowed
+        self.shares_count = shares_count
         self.live_is_shadow = false
         self.batch_size = batch_size
         self.classes = classes
         self.freed = false
+    }
+
+    #: Take up Adam's step count where the optimizer's table has it, before
+    #: the first step of a run. Another path may have stepped the parameters
+    #: since this step last did, and the bias correction reads the count.
+    pub fn resume(self) -> void {
+        if not self.shares_count { return }
+        self.settle_values()
+        self.carried[0].upload([float(steps_taken(self.params[0]))])
     }
 
     #: One step, leaving the loss on the device.
@@ -539,13 +560,32 @@ pub class CompiledStep {
 
     #: Put the current values back where the model's own tensors expect them,
     #: which matters only when the last step wrote to the shadow side.
+    #: Adam's step count goes back to the optimizer's table too, when this
+    #: step shares it.
     pub fn settle(self) -> void {
+        self.settle_values()
+        if self.shares_count {
+            set_steps_taken(self.params, int(self.carried[0].download()[0]))
+        }
+    }
+
+    #: Copied on the device, queued behind the step that wrote them. Through
+    #: the host this was a download and an upload of every parameter: 2 to 3
+    #: ms a call on [784-512-512-10], paid at the end of every epoch with an
+    #: odd number of steps.
+    fn settle_values(self) -> void {
         if not self.live_is_shadow { return }
+        let kernel = cached_kernel("copy_offset")
         for (index, param) in self.params.enumerate() {
-            param.buffer().upload(self.shadow[index].download())
+            kernel.dispatch_async([self.shadow[index], param.buffer()], param.size, [0, param.size])
         }
         for index in 0..self.carried.len() {
-            self.carried[index].upload(self.carried_shadow[index].download())
+            let count = self.carried[index].count
+            kernel.dispatch_async(
+                [self.carried_shadow[index], self.carried[index]],
+                count,
+                [0, count]
+            )
         }
         self.live_is_shadow = false
     }
@@ -555,7 +595,9 @@ pub class CompiledStep {
         self.freed = true
         self.settle()
         for buffer in self.shadow { buffer.free() }
-        for buffer in self.carried { buffer.free() }
+        for (index, buffer) in self.carried.enumerate() {
+            if not self.borrowed[index] { buffer.free() }
+        }
         for buffer in self.carried_shadow { buffer.free() }
         __prim__.graph_plan_free(self.handle)
     }
@@ -593,12 +635,178 @@ pub fn set_compiled_step(on: bool) -> void { _allowed = if on { 1 } else { 0 } }
 #: turns it off can put it back the way it found it.
 pub fn compiled_step_allowed() -> bool { return allowed() }
 
+var _route_policy: str? = null
+
+#: How a step's plan picks between encoding into the shared command buffer
+#: and letting the platform run it.
+#:
+#: A step is called back to back, a batch at a time, so what matters is how
+#: many go through a second, not how long one takes: encoding returns at once
+#: and lets the next batch's staging overlap this one's arithmetic, where a run
+#: blocks on every call. The plan's own default times one call at a time, and
+#: on a [784-512-512-10] step the two read within noise that way, so the route
+#: was a coin toss -- 273 ms in one process and 176-186 in three, 302 ms run
+#: and 202 encode when each was forced. "throughput" asks the plan to time
+#: calls back to back instead.
+#:
+#: `JAITENSOR_STEP_ROUTE_POLICY=latency` asks for the one-call rule, for an A/B
+#: in one binary. Read once.
+fn route_policy() -> str {
+    if _route_policy is null {
+        _route_policy = if (env("JAITENSOR_STEP_ROUTE_POLICY") ?? "") == "latency" {
+            "latency"
+        } else {
+            "throughput"
+        }
+    }
+    return _route_policy ?? "throughput"
+}
+
+#: Compile a step's plan under `route_policy`.
+#:
+#: A runtime whose `graph_compile` takes no policy rejects the fourth argument
+#: with a TypeError before it builds anything. Such a runtime only has the
+#: one-call rule, so the step is compiled under that. Any other TypeError is a
+#: fault of its own and goes on up: retrying it would build the graph twice and
+#: quietly take the other rule.
+fn compile_plan(builder: int, inputs: list[int], outputs: list[int]) -> int {
+    try {
+        return __prim__.graph_compile(builder, inputs, outputs, route_policy())
+    } catch error: TypeError {
+        if not error.message.contains("takes 3 arguments") { throw error }
+        return __prim__.graph_compile(builder, inputs, outputs)
+    }
+}
+
+var _flat = -1
+
+fn flat_policy() -> int {
+    if _flat < 0 {
+        let text = env("JAITENSOR_COMPILED_FLAT") ?? "1"
+        _flat = if text == "0" { 0 } elif text == "2" { 2 } else { 1 }
+    }
+    return _flat
+}
+
+#: Whether a model fitted on a flat (rank-2) dataset trains through a compiled
+#: step.
+#:
+#: Only images ever did, so a dense model on flat rows missed it whenever it
+#: missed the hand-fused shapes -- two hidden layers, a width under 256, an
+#: optimiser carrying state -- and fell to the static path: thirty-odd kernels
+#: a step where this is one graph. An image model is the same graph behind a
+#: Flatten that is only a reshape. Measured 2026-10-05 on fashion, three
+#: epochs, under the GPU lock (n=5, alternated): [784-512-512-10] SGD b512
+#: 267 ms static to 171 compiled, [784-128-64-10] momentum b64 1242 to 989,
+#: [784-32-10] SGD b32 518 to 330. Plain descent and momentum add two or three
+#: graph operations a parameter, and no shape tried with them was slower
+#: compiled, so for them there is no size floor.
+#:
+#: Adam is gated. Its update is a dozen graph operations a parameter where
+#: the static path runs one kernel, so a model with many parameters and a
+#: small batch spends its step on that update and the graph loses; a small
+#: model is all host work, and there the one graph beats the static path's
+#: thirty-odd dispatches. Measured 2026-10-07 on fashion, two epochs, under
+#: the GPU lock at a load of 4-6 (n=5, alternated, static/compiled):
+#: [784-128-64-10] b64 1.46x (1.39-1.48), b32 1.32x, b128 1.05x, b512 1.02x;
+#: [64,64] b64 1.50x; [100,50] b64 1.49x; [128,128] b64 1.31x; [150,100]
+#: b128 2.0x; [64,32] b256 1.23x; examples/digit_trainer 4.0 s to 2.8 s.
+#: Past about 200k parameters at a small batch it turns: [256,256] b64
+#: 0.79x, [384,192] 0.83x, [512,512] 0.89x, [1024,1024] b256 0.99x. With one
+#: hidden layer the static path is lean enough to tie: [96] b64 0.90x, [32]
+#: b32 1.10x. So an Adam model compiles when it has at least two hidden layers
+#: and at most `ADAM_FLAT_SMALL_PARAMETERS` parameters, or when its step
+#: carries `ADAM_FLAT_MIN_WORK` (batch times parameters, roughly the
+#: multiply-adds of one forward pass), where the arithmetic hides the update:
+#: [512,512] b2048 1.16x.
+#:
+#: Under heavy load the small-model win is the first thing to go: at a load
+#: of 10-40 the same [784-128-64-10] b64 read 0.82x, because encoding a graph
+#: is host work that competes for the processor. These numbers are for a
+#: machine doing one thing.
+#:
+#: A short last batch is no reason to stay off it: the epoch trains that
+#: batch through the ordinary path, which shares the step's parameters and
+#: optimiser state.
+#:
+#: `JAITENSOR_COMPILED_FLAT`: 0 never compiles for a flat dataset (the old
+#: rule), 2 compiles whatever the work, and anything else is the default
+#: above. Read once; `set_flat_policy` overrides it in-process.
+pub fn flat_step_wanted(
+    samples: int,
+    batch_size: int,
+    adam: bool = false,
+    parameters: int = 0,
+    layers: int = 0
+) -> bool {
+    let policy = flat_policy()
+    if policy == 0 { return false }
+    if batch_size <= 0 or samples < batch_size { return false }
+    if policy == 2 or not adam { return true }
+    if batch_size * parameters >= ADAM_FLAT_MIN_WORK { return true }
+    return layers >= 3 and parameters <= ADAM_FLAT_SMALL_PARAMETERS
+}
+
+#: The least work a step (batch times parameters) must carry before a large
+#: Adam model on flat rows is compiled; see `flat_step_wanted`.
+pub let ADAM_FLAT_MIN_WORK = 1024 * 1024 * 1024
+
+#: The most parameters an Adam model on flat rows can have and still compile
+#: at any batch size; see `flat_step_wanted`.
+pub let ADAM_FLAT_SMALL_PARAMETERS = 3 * 65536
+
+var _fused_mlp = -1
+
+#: Whether a model the fused forward-backward kernels take, trained with
+#: momentum or Adam, keeps that path rather than a compiled step.
+#:
+#: That path fuses the forward and backward passes and then runs the update
+#: as one kernel per parameter; the compiled step fuses the update into the
+#: graph and carries the optimiser's state through it. The graph loses:
+#: [784-256-10] on fashion at b512, three epochs, measured 2026-10-05 under
+#: the GPU lock (n=5, alternated), Adam 88.0 ms fused against 119.7 compiled
+#: and momentum 85.9 against 92.1 -- Adam's update is a dozen graph operations
+#: a parameter, and encoding them costs more than the kernels they replace.
+#: So the fused kernels are kept. `JAITENSOR_FUSED_MLP_STEP=0` offers them to
+#: the compiled step instead, which takes them only where `flat_step_wanted`
+#: does: momentum always, but Adam only past `ADAM_FLAT_MIN_WORK`, so a small
+#: Adam model stays fused unless `JAITENSOR_COMPILED_FLAT=2` lifts that gate
+#: too. Read once; `set_prefer_fused_mlp_step` overrides it in-process.
+pub fn prefer_fused_mlp_step() -> bool {
+    if _fused_mlp < 0 {
+        _fused_mlp = if (env("JAITENSOR_FUSED_MLP_STEP") ?? "1") == "0" { 0 } else { 1 }
+    }
+    return _fused_mlp == 1
+}
+
+#: Override `JAITENSOR_FUSED_MLP_STEP` from inside the process. Returns the
+#: preference it replaced.
+pub fn set_prefer_fused_mlp_step(prefer: bool) -> bool {
+    let was = prefer_fused_mlp_step()
+    _fused_mlp = if prefer { 1 } else { 0 }
+    return was
+}
+
+#: Override `JAITENSOR_COMPILED_FLAT` from inside the process (0, 1 or 2), so
+#: a test can compare the paths in one run. Returns the policy it replaced.
+pub fn set_flat_policy(policy: int) -> int {
+    let was = flat_policy()
+    _flat = policy
+    return was
+}
+
 #: Build a compiled step for `layers`, or null when they cannot be expressed.
 #:
 #: `input_shape` is one batch's worth including the batch dimension. SGD with
 #: or without momentum is expressed; momentum's velocity is carried through the
 #: graph as another pair of tensors, fed in and produced, the same way the
 #: parameters are.
+#:
+#: With `shared_state` the step carries the optimizer table's own velocity or
+#: moments, and keeps Adam's step count in step with it (`resume`, `settle`),
+#: where without it every step starts its optimiser from rest. A model needs
+#: it: it moves between this path and the others as the batch size changes,
+#: and the state is the same state whichever path is stepping.
 pub fn compile_step(
     layers: list[Layer],
     input_shape: list[int],
@@ -609,7 +817,8 @@ pub fn compile_step(
     adam: bool = false,
     beta1: float = 0.9,
     beta2: float = 0.999,
-    epsilon: float = 1.0e-7
+    epsilon: float = 1.0e-7,
+    shared_state: bool = false
 ) -> CompiledStep? {
     if not allowed() {
         _refusal = "compiled steps are switched off"
@@ -775,26 +984,52 @@ pub fn compile_step(
     for id in updated { outputs.push(id) }
     for id in carried_out { outputs.push(id) }
 
-    let handle = __prim__.graph_compile(builder, inputs, outputs)
+    let handle = compile_plan(builder, inputs, outputs)
     if handle < 0 {
         _refusal = "the step would not compile"
         return null
     }
     var shadow: list[Buffer] = []
     for param in state.params { shadow.push(Buffer(param.size)) }
-    #: Everything carried starts at rest, including the step count.
+    #: In the order the graph carries them: Adam's step count first, then
+    #: each parameter's velocity or pair of moments.
+    var table: list[Buffer] = []
+    if shared_state and (adam or momentum != 0.0) {
+        let kind = if adam { 1 } else { 0 }
+        for param in state.params { table.extend(moment_buffers(param, kind)) }
+    }
+    let skip = if adam { 1 } else { 0 }
+    #: Everything the step owns starts at rest, including the step count.
     var held: list[Buffer] = []
     var held_shadow: list[Buffer] = []
-    for shape in carried_sizes {
+    var borrowed: list[bool] = []
+    for (index, shape) in carried_sizes.enumerate() {
         var size = 1
         for dimension in shape { size = size * dimension }
-        let first = Buffer(size)
+        let slot = index - skip
+        if slot >= 0 and slot < table.len() {
+            held.push(table[slot])
+            borrowed.push(true)
+        } else {
+            let first = Buffer(size)
+            first.fill_zero()
+            held.push(first)
+            borrowed.push(false)
+        }
         let second = Buffer(size)
-        first.fill_zero()
         second.fill_zero()
-        held.push(first)
         held_shadow.push(second)
     }
     _refusal = null
-    return CompiledStep(handle, state.params, shadow, held, held_shadow, input_shape[0], classes)
+    return CompiledStep(
+        handle,
+        state.params,
+        shadow,
+        held,
+        held_shadow,
+        borrowed,
+        shared_state and adam,
+        input_shape[0],
+        classes
+    )
 }

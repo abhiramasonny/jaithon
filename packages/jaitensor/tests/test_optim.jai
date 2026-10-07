@@ -2,6 +2,8 @@
 import jaitensor as jt
 import std.math
 from std.test import assert_throws
+from jaitensor import Dataset, Layer, Optimizer
+from jaitensor.compiled import compiled_step_allowed, set_compiled_step
 
 fn test_sgd_step_momentum_persists_and_affects_a_second_step() -> void {
     if not jt.is_available() { return }
@@ -190,4 +192,91 @@ fn test_optimizer_configuration_rejects_invalid_values() -> void {
     let _nesterov = assert_throws(ValueError, || jt.SGD(nesterov: true))
     let _beta = assert_throws(ValueError, || jt.Adam(beta1: 1.0))
     let _epsilon = assert_throws(ValueError, || jt.Adam(epsilon: 0.0))
+}
+
+fn rows_that_carry_their_class(samples: int, width: int, classes: int) -> Dataset {
+    var features: list[float] = []
+    var labels: list[float] = []
+    var seed = 17
+    for sample in 0..samples {
+        let kind = sample % classes
+        for slot in 0..width {
+            seed = (seed * 1103515245 + 12345) % 2147483648
+            let signal = if slot % classes == kind { 1.0 } else { 0.0 }
+            features.push(signal + float(seed % 100) * 0.002)
+        }
+        labels.push(float(kind))
+    }
+    return Dataset(jt.Tensor([samples, width], features), jt.Tensor([samples], labels))
+}
+
+#: Fitting one epoch at a time trains the same model as fitting them together.
+#:
+#: Every `fit` prepares the optimiser's state, and preparing it asked for the
+#: state of a plain descent -- which, for a model trained with Adam, is a state
+#: of the wrong kind, so it was thrown away and made again from rest. Every
+#: second `fit` started Adam over: moments zeroed, step count back to one, the
+#: bias correction re-applied. A training loop that fits an epoch at a time,
+#: to evaluate or save between them, trained a different model from one that
+#: did not, and nothing said so. The static path, the fused forward-backward
+#: path and the autograd path all prepare state this way.
+fn test_fitting_epoch_by_epoch_keeps_the_optimiser_state() -> void {
+    if not jt.is_available() { return }
+    let was = compiled_step_allowed()
+    set_compiled_step(false)
+    defer { set_compiled_step(was) }
+    #: Static (two narrow hidden layers), fused forward-backward (one wide
+    #: one) and autograd (a normalisation), each with Adam and with momentum.
+    for shape in ["static", "fused", "autograd"] {
+        for name in ["adam", "momentum"] {
+            var traces: list[list[float]] = []
+            for epoch_at_a_time in [false, true] {
+                let data = rows_that_carry_their_class(64, 16, 4)
+                let layers: list[Layer] = if shape == "fused" {
+                    [jt.Dense(256, activation: jt.Activation.Relu), jt.Dense(4, activation: jt.Activation.Softmax)]
+                } elif shape == "autograd" {
+                    [jt.Dense(16, activation: jt.Activation.Relu), jt.LayerNorm(), jt.Dense(4, activation: jt.Activation.Softmax)]
+                } else {
+                    [jt.Dense(16, activation: jt.Activation.Relu), jt.Dense(8, activation: jt.Activation.Relu), jt.Dense(4, activation: jt.Activation.Softmax)]
+                }
+                let model = jt.Sequential(layers)
+                let optimizer: Optimizer = if name == "adam" {
+                    jt.Adam(learning_rate: 0.01)
+                } else {
+                    jt.SGD(learning_rate: 0.05, momentum: 0.9)
+                }
+                model.compile(optimizer: optimizer, loss: jt.SparseCategoricalCrossentropy())
+                var trace: list[float] = []
+                if epoch_at_a_time {
+                    for _epoch in 0..3 {
+                        let history = model.fit(
+                            data,
+                            epochs: 1,
+                            batch_size: 16,
+                            verbose: false,
+                            plot_path: null
+                        )
+                        trace.push(history.loss[0])
+                    }
+                } else {
+                    let history = model.fit(
+                        data,
+                        epochs: 3,
+                        batch_size: 16,
+                        verbose: false,
+                        plot_path: null
+                    )
+                    trace.extend(history.loss)
+                }
+                let want = if shape == "fused" { "fused-mlp" } else { shape }
+                assert model.training_route() == want, f"{shape} took {model.training_route()}"
+                traces.push(trace)
+                model.free()
+                data.free()
+            }
+            for index in 0..3 {
+                assert math.fabs(traces[1][index] - traces[0][index]) < 1e-5, f"{shape} {name} epoch {index}: {traces[1]} against {traces[0]}"
+            }
+        }
+    }
 }

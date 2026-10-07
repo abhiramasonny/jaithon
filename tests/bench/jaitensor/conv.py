@@ -15,9 +15,53 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
 
 REPO = Path(__file__).resolve().parents[3]
+
+
+#: Warm to a wall-clock floor, not a count: one epoch of fashion is a few tens
+#: of milliseconds, which does not bring the GPU up to its working clock. Both
+#: sides use the same rule (see the .jai twin).
+WARM_SECONDS = 0.5
+WARM_EPOCH_CAP = 40
+
+
+def warm(train_epoch) -> None:
+    opening = time.perf_counter()
+    for _ in range(WARM_EPOCH_CAP):
+        train_epoch()
+        torch.mps.synchronize()
+        if time.perf_counter() - opening >= WARM_SECONDS:
+            break
+
+
+class SliceLoader:
+    """Contiguous batches by slicing, in order, dropping the ragged tail.
+
+    Yields exactly what DataLoader(TensorDataset(x, y), batch_size,
+    shuffle=False, drop_last=True) yields. DataLoader does not slice: torch
+    2.13's TensorDataset has no __getitems__, so every batch was built from
+    one indexing op per sample plus a collate -- about 2.6 ms of a 2.6 ms step
+    on fashion, which made this peer measure its own loader and every training
+    ratio read 1.4-3.6x in jaithon's favour. Jaithon binds a window into the
+    resident dataset, so a slice is the like-for-like comparison.
+    """
+
+    def __init__(self, x: torch.Tensor, y: torch.Tensor, batch_size: int) -> None:
+        self.x = x
+        self.y = y
+        self.batch_size = batch_size
+        self.count = len(x) // batch_size
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __iter__(self):
+        b = self.batch_size
+        for i in range(self.count):
+            yield self.x[i * b:(i + 1) * b], self.y[i * b:(i + 1) * b]
+
+
 SIDE = 32
 CHANNELS = 3
 CLASSES = 10
@@ -70,12 +114,7 @@ def macs_per_sample(width: int) -> int:
 def run(name: str, width: int, samples: int, batch_size: int, epochs: int, verbose: bool) -> None:
     device = torch.device("mps")
     features, labels = load_cifar(samples)
-    loader = DataLoader(
-        TensorDataset(features.to(device), labels.to(device)),
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=True,
-    )
+    loader = SliceLoader(features.to(device), labels.to(device), batch_size)
     torch.manual_seed(7)
     model = make_model(width).to(device)
     opt = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.0)
@@ -93,8 +132,7 @@ def run(name: str, width: int, samples: int, batch_size: int, epochs: int, verbo
             epoch_loss = epoch_loss + loss.detach()
         return epoch_loss
 
-    train_epoch()
-    torch.mps.synchronize()
+    warm(train_epoch)
     started = time.perf_counter()
     epoch_losses = [train_epoch() for _ in range(epochs)]
     torch.mps.synchronize()

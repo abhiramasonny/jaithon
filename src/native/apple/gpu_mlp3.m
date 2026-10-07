@@ -4,6 +4,7 @@
 #ifdef __APPLE__
 
 #include "native/apple/gpu_internal.h"
+#include "native/apple/gpu_mlp_acc.h"
 
 static id<MTLBuffer> gMlp3ScratchW[4];
 static id<MTLBuffer> gMlp3ScratchB[4];
@@ -658,6 +659,7 @@ bool jaiGpuMlp3SgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w
     if (xOff + (size_t)steps * xStride > x->bytes) return false;
     if (labOff + (size_t)steps * labStride > labels->bytes) return false;
     const bool trackCorrect = correctAcc != NULL;
+    const bool pingAcc = trackCorrect && mlpEpochAccPingPong();
     JaiGpuBuffer *w[4] = {w1, w2, w3, w4};
     JaiGpuBuffer *b[4] = {b1, b2, b3, b4};
     size_t wOff[4] = {w1Off, w2Off, w3Off, w4Off};
@@ -751,7 +753,12 @@ bool jaiGpuMlp3SgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w
                 resultsB[cached[wBase + i * 2]] = liveW[i];
                 resultsB[cached[wBase + i * 2 + 1]] = liveB[i];
             }
-            if (trackCorrect) {
+            if (pingAcc) {
+                if (!commitMlpAccLocked()) return false;
+                mlpWireEpochAccs(feedsA, feedsB, resultsA, resultsB, gMlp3Side == 0,
+                                 cached[11], cached[12], cached[wBase + 8], cached[wBase + 9],
+                                 liveAcc, liveCorr, scratchAcc, scratchCorr);
+            } else if (trackCorrect) {
                 feedsA[cached[11]] = liveAcc;
                 feedsB[cached[11]] = liveAcc;
                 feedsA[cached[12]] = liveCorr;
@@ -799,7 +806,9 @@ bool jaiGpuMlp3SgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w
                         fromLive ? &execResultsA : &execResultsB)) {
                     return false;
                 }
-                if (trackCorrect) {
+                if (pingAcc) {
+                    mlpNoteEpochAccsLocked(lossAcc, correctAcc);
+                } else if (trackCorrect) {
                     __unsafe_unretained id<MTLBuffer> accSrcs[] = {
                         gMlpScratchAcc, gMlpScratchCorrect
                     };
@@ -827,6 +836,10 @@ bool jaiGpuMlp3SgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w
         }
         @synchronized(gQueue) {
             if (!trackCorrect && !commitMlp3WeightsLocked()) return false;
+            if (pingAcc &&
+                !mlpSettleEpochAccsLocked(steps, lossAcc, lossOff, correctAcc, correctOff)) {
+                return false;
+            }
             if (!commitMlpAccLocked()) return false;
             /* Committed and left on the books: a batch that leaves gInFlight
              * without being waited for is one no buffer can ever wait for. */

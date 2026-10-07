@@ -4,6 +4,7 @@
 #ifdef __APPLE__
 
 #include "native/apple/gpu_internal.h"
+#include "native/apple/gpu_mlp_acc.h"
 
 static id<MTLBuffer> gMlpScratchW1, gMlpScratchB1, gMlpScratchW2, gMlpScratchB2;
 id<MTLBuffer> gMlpScratchAcc, gMlpScratchCorrect;
@@ -29,6 +30,71 @@ bool commitMlpAccLocked(void) {
     if (!blitMany(srcs, dsts, offs, sizes, 1)) return false;
     gMlpAccSide = 0;
     return true;
+}
+
+/* Whether a fused epoch that counts right answers ping-pongs its loss and
+ * correct-count accumulators the way it ping-pongs the weights.
+ *
+ * It used to write both to scratch every step and copy them back with a blit
+ * encoder of their own, between one step's graph and the next: 31 us a step,
+ * 239.5 against 210.8 ms for 936 steps of fashion at b512, and every fit()
+ * paid it because fit() always counts. Now the step that reads the caller's
+ * accumulators writes scratch and the next reads scratch and writes the
+ * caller's, so the only copy left is one at the end of an epoch with an odd
+ * number of steps. JAITENSOR_FUSED_ACC_BLIT=1 puts the per-step copy back,
+ * for an A/B in one binary. Read once. Shared with gpu_mlp3.m. */
+bool mlpEpochAccPingPong(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("JAITENSOR_FUSED_ACC_BLIT");
+        on = (setting != NULL && strcmp(setting, "1") == 0) ? 0 : 1;
+    }
+    return on == 1;
+}
+
+/* Point a ping-ponged epoch's accumulators at the right side for each weight
+ * side. The first step reads the caller's buffers, whichever weight side the
+ * last call left it on, so the side that comes first is decided by `firstIsA`
+ * (side A reads the live weights). Shared with gpu_mlp3.m. */
+void mlpWireEpochAccs(NSMutableDictionary *feedsA, NSMutableDictionary *feedsB,
+                      NSMutableDictionary *resultsA, NSMutableDictionary *resultsB,
+                      bool firstIsA, MPSGraphTensor *accIn, MPSGraphTensor *corrIn,
+                      MPSGraphTensor *accOut, MPSGraphTensor *corrOut,
+                      MPSGraphTensorData *liveAcc, MPSGraphTensorData *liveCorr,
+                      MPSGraphTensorData *scratchAcc, MPSGraphTensorData *scratchCorr) {
+    NSMutableDictionary *firstFeeds = firstIsA ? feedsA : feedsB;
+    NSMutableDictionary *firstResults = firstIsA ? resultsA : resultsB;
+    NSMutableDictionary *secondFeeds = firstIsA ? feedsB : feedsA;
+    NSMutableDictionary *secondResults = firstIsA ? resultsB : resultsA;
+    firstFeeds[accIn] = liveAcc;
+    firstFeeds[corrIn] = liveCorr;
+    firstResults[accOut] = scratchAcc;
+    firstResults[corrOut] = scratchCorr;
+    secondFeeds[accIn] = scratchAcc;
+    secondFeeds[corrIn] = scratchCorr;
+    secondResults[accOut] = liveAcc;
+    secondResults[corrOut] = liveCorr;
+}
+
+/* One step of a ping-ponged epoch has been encoded. The caller's buffers are
+ * marked with the batch it went into, because that is what a fine-grained
+ * wait on them reads: their tensor data was made, and marked, before the first
+ * step, and the per-step copy that used to re-mark them is gone. */
+void mlpNoteEpochAccsLocked(JaiGpuBuffer *lossAcc, JaiGpuBuffer *correctAcc) {
+    markLocked(lossAcc);
+    markLocked(correctAcc);
+}
+
+/* The end of a ping-ponged epoch: an odd number of steps left the totals in
+ * scratch, so copy them home once. */
+bool mlpSettleEpochAccsLocked(uint32_t steps, JaiGpuBuffer *lossAcc, size_t lossOff,
+                              JaiGpuBuffer *correctAcc, size_t correctOff) {
+    if ((steps & 1u) == 0) return true;
+    __unsafe_unretained id<MTLBuffer> srcs[] = {gMlpScratchAcc, gMlpScratchCorrect};
+    JaiGpuBuffer *dsts[] = {lossAcc, correctAcc};
+    size_t offs[] = {lossOff, correctOff};
+    size_t sizes[] = {sizeof(float), sizeof(float)};
+    return blitMany(srcs, dsts, offs, sizes, 2);
 }
 
 bool commitMlpWeightsLocked(void) {
@@ -649,6 +715,7 @@ bool jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1
     if (labOff + (size_t)steps * labStride > labels->bytes) return false;
     const bool trackCorrect = correctAcc != NULL;
     if (trackCorrect && (correctAcc->buffer == NULL)) return false;
+    const bool pingAcc = trackCorrect && mlpEpochAccPingPong();
 
     const size_t w1Bytes = (size_t)inputs * (size_t)hidden * sizeof(float);
     const size_t b1Bytes = (size_t)hidden * sizeof(float);
@@ -764,7 +831,14 @@ bool jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1
             resultsB[cached[wBase + 1]] = liveB1;
             resultsB[cached[wBase + 2]] = liveW2;
             resultsB[cached[wBase + 3]] = liveB2;
-            if (trackCorrect) {
+            if (pingAcc) {
+                /* The running totals have to be in the caller's buffers
+                 * before the first step reads them there. */
+                if (!commitMlpAccLocked()) return false;
+                mlpWireEpochAccs(feedsA, feedsB, resultsA, resultsB, gMlpSide == 0,
+                                 cached[7], cached[8], cached[wBase + 4], cached[wBase + 5],
+                                 liveAcc, liveCorr, scratchAcc, scratchCorr);
+            } else if (trackCorrect) {
                 feedsA[cached[7]] = liveAcc;
                 feedsB[cached[7]] = liveAcc;
                 feedsA[cached[8]] = liveCorr;
@@ -816,7 +890,9 @@ bool jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1
                         fromLive ? &execResultsA : &execResultsB)) {
                     return false;
                 }
-                if (trackCorrect) {
+                if (pingAcc) {
+                    mlpNoteEpochAccsLocked(lossAcc, correctAcc);
+                } else if (trackCorrect) {
                     __unsafe_unretained id<MTLBuffer> accSrcs[] = {
                         gMlpScratchAcc, gMlpScratchCorrect
                     };
@@ -848,6 +924,10 @@ bool jaiGpuMlpSgdEpoch(JaiGpuBuffer *x, size_t xOff, JaiGpuBuffer *w1, size_t w1
              * scratch set while commitMlpAccLocked resets only the accumulator
              * to live, and the next epoch reads the previous scratch loss. */
             if (!trackCorrect && !commitMlpWeightsLocked()) return false;
+            if (pingAcc &&
+                !mlpSettleEpochAccsLocked(steps, lossAcc, lossOff, correctAcc, correctOff)) {
+                return false;
+            }
             if (!commitMlpAccLocked()) return false;
             /* Committed and left on the books: a batch that leaves gInFlight
              * without being waited for is one no buffer can ever wait for. */
