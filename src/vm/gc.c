@@ -36,6 +36,14 @@
 #define JAI_GC_DEFAULT_GROW_FACTOR 4.0
 #define JAI_GC_DEFAULT_MIN_HEAP    ((size_t)1 << 20)
 
+/* Initial gray-stack reserve (entries), and the cap for high-water pre-growth
+ * below. The stack is reused across collections; pre-growing it to the last
+ * collection's peak keeps marking off the system allocator on steady-state
+ * heaps. Capped so one huge collection cannot pin megabytes forever. */
+#define JAI_GC_GRAY_INIT 1024
+#define JAI_GC_GRAY_MAX_PRE 65536
+static int sGrayHighWater = JAI_GC_GRAY_INIT;
+
 /* JAITHON_GC_GROWTH=<factor> overrides the default 2.0 for an A/B, cached
  * from one getenv+strtod so it costs nothing per collection. Investigation
  * only (docs/gc-profile.md) -- gc->growFactor stays the real per-instance
@@ -104,6 +112,11 @@ void jaiGCInit(GCState *gc) {
     gc->grayStack = NULL;
     gc->grayCount = 0;
     gc->grayCapacity = 0;
+    /* Reserve the gray stack upfront: the first collections otherwise grow it
+     * one realloc at a time on the system heap in the middle of marking.
+     * 1024 pointers is 8 KiB, paid once per process. */
+    gc->grayStack = (Obj **)malloc(sizeof(Obj *) * (size_t)JAI_GC_GRAY_INIT);
+    if (gc->grayStack != NULL) gc->grayCapacity = JAI_GC_GRAY_INIT;
 
     gc->growFactor = JAI_GC_DEFAULT_GROW_FACTOR;
     gc->minHeap = JAI_GC_DEFAULT_MIN_HEAP;
@@ -237,12 +250,17 @@ void jaiGCMarkObject(Obj *obj) {
         break;
     }
 
-    GCState *g = activeGC();
+    GCState *g = jaiGCActive != NULL ? jaiGCActive : vm.gc;
     if (g == NULL) JAI_PANIC("jaiGCMarkObject called before jaiGCInit");
 
     if (g->grayCapacity < g->grayCount + 1) {
-        int newCapacity = JAI_GROW_CAP(g->grayCapacity);
-        if (newCapacity <= g->grayCapacity) JAI_PANIC("GC gray stack overflow");
+        int want = g->grayCount + 1;
+        int newCapacity = g->grayCapacity > 0 ? g->grayCapacity : JAI_GC_GRAY_INIT;
+        while (newCapacity < want) {
+            int grown = newCapacity * 2;
+            if (grown <= newCapacity) JAI_PANIC("GC gray stack overflow");
+            newCapacity = grown;
+        }
 
         //this is grown with the raw system allocator, not jaiRealloc
         Obj **grown = realloc(g->grayStack, sizeof(Obj *) * (size_t)newCapacity);
@@ -251,6 +269,8 @@ void jaiGCMarkObject(Obj *obj) {
         g->grayCapacity = newCapacity;
     }
     g->grayStack[g->grayCount++] = obj;
+    if (g->grayCount > sGrayHighWater && g->grayCount <= JAI_GC_GRAY_MAX_PRE)
+        sGrayHighWater = g->grayCount;
 }
 
 void jaiGCMarkValue(Value v) { jaiGCMarkVal(v); }
@@ -532,6 +552,9 @@ static int sweep(GCState *g) {
     const bool epoch = jaiGCEpoch;
 
     while (object != NULL) {
+        /* The sweep chases `next` through every object, live or dead; pull the
+         * following link into cache while this one is classified. */
+        __builtin_prefetch(object->next, 0, 0);
 #ifdef JAI_ALLOC_CENSUS
         jaiGCSwept++;
         if (object->isMarked != epoch) jaiGCSweptDead++;
@@ -588,6 +611,20 @@ void jaiGCCollect(void) {
     /* Everything allocated so far now reads white. */
     jaiGCEpoch = !jaiGCEpoch;
     jaiPageCollectBegin();
+
+    /* Pre-grow the gray stack to the last collection's peak (capped), so
+     * steady-state marking never reallocs mid-trace on the system heap. */
+    if (g->grayCapacity < sGrayHighWater) {
+        int want = sGrayHighWater <= JAI_GC_GRAY_MAX_PRE
+                       ? sGrayHighWater : JAI_GC_GRAY_MAX_PRE;
+        if (want > g->grayCapacity) {
+            Obj **grown = realloc(g->grayStack, sizeof(Obj *) * (size_t)want);
+            if (grown != NULL) {
+                g->grayStack = grown;
+                g->grayCapacity = want;
+            }
+        }
+    }
 
 #ifdef JAI_ALLOC_CENSUS
     double t0 = jaiClockMonotonic();
