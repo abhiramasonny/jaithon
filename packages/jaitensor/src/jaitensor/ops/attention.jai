@@ -217,12 +217,13 @@ pub fn hand_to_graph(consumer: Tensor, tensors: list[Tensor]) -> void {
 
 #: Whether the attention softmax kernels keep a row in registers between their
 #: passes. Off by default: `JAITENSOR_ATTN_SOFTMAX_HOLD=1` takes the `_held`
-#: kernels, for an A/B in one binary. Holding measured about 10% faster on
-#: the plain softmax kernels at seq 1024 but neutral end to end, and 7-10%
-#: slower end to end on a 512/512/8 training step. The answer is the same bit
-#: for bit at head width 64, whose scale is exact, and within about an ulp at
-#: other widths, where the compiler fuses the two spellings differently. Read
-#: once.
+#: kernels, for an A/B in one binary. Against plain kernels that no longer
+#: carry the held path's registers, the held ones measured slower at
+#: 1024/768/12 (softmax 0.46 against 0.32 ms, its backward 0.50 against
+#: 0.45), and 7-10% slower end to end on a 512/512/8 training step. The
+#: answer is the same bit for bit at head width 64, whose scale is exact, and
+#: within about an ulp at other widths, where the compiler fuses the two
+#: spellings differently. Read once.
 var _softmax_hold: int = -1
 
 fn softmax_entry(name: str) -> str {
