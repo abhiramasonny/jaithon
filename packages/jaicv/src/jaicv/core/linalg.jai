@@ -1,9 +1,12 @@
 #: Small dense linear algebra: the pieces geometry needs and nothing more.
 #:
-#: Everything here works on `Mat` and runs on the host. The matrices these are
-#: given are three by three, nine by nine, or a Jacobian a few dozen wide —
-#: sizes where a kernel launch costs more than the arithmetic, and where being
-#: able to read the code matters more than the last microsecond.
+#: Everything here works on `Mat` and runs on the host, in double: the
+#: matrices geometry gives it are three by three, nine by nine, or a Jacobian a
+#: few dozen wide -- sizes where a kernel launch costs more than the
+#: arithmetic, and where being able to read the code matters more than the
+#: last microsecond. The one exception is `float_matmul`, which hands a big
+#: product to the device in float32 through `core.device` for callers whose
+#: answer is float32 anyway.
 #:
 #: ```
 #: let (values, vectors) = symmetric_eigen(a)
@@ -11,10 +14,29 @@
 #: let fitted = levenberg_marquardt(residual, jacobian, start, 40)
 #: ```
 import std.math
+from std.os import env_or
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_MAKETYPE
 
-#: Matrix product.
+#: Products of at least this many multiply-adds may go to the device; smaller
+#: ones stay on the host.
+pub let DEVICE_WORK = 1 << 20
+
+#: `JAICV_DEVICE_LINALG=0` keeps every product, covariance and projection on
+#: the host whatever its size.
+let _DEVICE_LINALG = env_or("JAICV_DEVICE_LINALG", "1") != "0"
+
+#: Whether `work` multiply-adds should go to the device, for a caller that
+#: can take float32 sums.
+pub fn on_device(work: int) -> bool { return _DEVICE_LINALG and work >= DEVICE_WORK }
+
+#: Matrix product, summed in double precision on the host whatever its size.
+#:
+#: Geometry leans on this: a least-squares fit, a null space and a singular
+#: value decomposition all form normal equations, which square the condition
+#: number, and a float32 sum over tens of thousands of correspondences costs
+#: them digits OpenCV keeps. `float_matmul` is the product for callers whose
+#: answer is float32 anyway.
 pub fn matmul(a: Mat, b: Mat) -> Mat {
     if a.cols != b.rows { throw ValueError(f"cannot multiply {a} by {b}") }
     let left = a.values()
@@ -30,6 +52,19 @@ pub fn matmul(a: Mat, b: Mat) -> Mat {
         }
     }
     return Mat.from_list(a.rows, b.cols, CV_MAKETYPE(CV_32F, 1), out)
+}
+
+#: Matrix product, on the device in float32 once it is big enough to be worth
+#: a dispatch, and `matmul` otherwise: a host triple loop took 183 ms to
+#: project 100,000 samples of fifty features onto ten.
+pub fn float_matmul(a: Mat, b: Mat) -> Mat {
+    if a.cols != b.rows { throw ValueError(f"cannot multiply {a} by {b}") }
+    if on_device(a.rows * a.cols * b.cols) {
+        import jaicv.core.device as device
+        let product = device.device_product(a, b)
+        if product is not null { return product }
+    }
+    return matmul(a, b)
 }
 
 #: Matrix transpose.
@@ -160,12 +195,25 @@ pub fn symmetric_eigen_of(source: list[float], n: int) -> tuple[list[float], lis
     #: solves a 12 by 12. The loop still leaves the moment the largest
     #: off-diagonal is negligible, so this only raises the ceiling for the
     #: sizes that were reaching it.
+    #:
+    #: The pivot is still the largest off-diagonal, the first of equal ones in
+    #: row order, but it is no longer found by scanning all of them: each row
+    #: keeps where its own largest is, and a rotation of `p` and `q` only
+    #: changes rows `p` and `q` and columns `p` and `q`, so only those entries
+    #: are looked at again -- and a whole row only when its largest was one
+    #: of them. Scanning everything per rotation made a 50 by 50 take 237 ms;
+    #: the rotations, and so every value and vector, are the same as before.
     let sweeps = max(100, 12 * n * (n - 1) // 2)
+    var best: list[int] = []
+    for row in 0..n { best.push(_row_largest(m, n, row)) }
     for _sweep in 0..sweeps {
         if n < 2 { break }
-        let at = _largest_off_diagonal(m, n)
+        let at = _largest_tracked(m, n, best)
         if at < 0 { break }
-        _jacobi_rotate(m, v, n, at // n, at % n)
+        let p = at // n
+        let q = at % n
+        _jacobi_rotate(m, v, n, p, q)
+        _track_rotation(m, n, best, p, q)
     }
 
     var order: list[int] = []
@@ -192,25 +240,70 @@ fn _eigen_start(source: list[float], n: int, m: list[float], v: list[float]) -> 
     }
 }
 
+#: `math.fabs` without the call into `math`, for the pivot search's loops.
+#: The same for every number but -0.0, which compares equal either way.
+fn _magnitude(x: float) -> float { return if x < 0.0 { -x } else { x } }
+
+#: The column of the largest entry right of the diagonal in `row` -- the
+#: first of equal ones -- or -1 when there is none to pick.
+fn _row_largest(m: list[float], n: int, row: int) -> int {
+    var largest = -1.0
+    var pick = -1
+    for column in row + 1..n {
+        let size = _magnitude(m[row * n + column])
+        if size > largest {
+            largest = size
+            pick = column
+        }
+    }
+    return pick
+}
+
 #: Where the largest off-diagonal entry above the diagonal is, as
 #: `row * n + column` -- the first of equal ones in row order -- or -1 once it
-#: is negligible.
-fn _largest_off_diagonal(m: list[float], n: int) -> int {
+#: is negligible, read from each row's largest.
+fn _largest_tracked(m: list[float], n: int, best: list[int]) -> int {
     var largest = 0.0
     var p = 0
     var q = 1
     for row in 0..n {
-        for column in row + 1..n {
-            let size = math.fabs(m[row * n + column])
-            if size > largest {
-                largest = size
-                p = row
-                q = column
-            }
+        let column = best[row]
+        if column < 0 { continue }
+        let size = _magnitude(m[row * n + column])
+        if size > largest {
+            largest = size
+            p = row
+            q = column
         }
     }
     if largest < 1e-14 { return -1 }
     return p * n + q
+}
+
+#: Bring each row's largest up to date after rotating `p` and `q`.
+fn _track_rotation(m: list[float], n: int, best: list[int], p: int, q: int) -> void {
+    for row in 0..q {
+        if row == p or best[row] == p or best[row] == q {
+            best[row] = _row_largest(m, n, row)
+            continue
+        }
+        var pick = best[row]
+        var largest = if pick < 0 { -1.0 } else { _magnitude(m[row * n + pick]) }
+        if p > row {
+            let size = _magnitude(m[row * n + p])
+            if size > largest or size == largest and p < pick {
+                largest = size
+                pick = p
+            }
+        }
+        let size = _magnitude(m[row * n + q])
+        if size > largest or size == largest and q < pick {
+            largest = size
+            pick = q
+        }
+        best[row] = pick
+    }
+    best[q] = _row_largest(m, n, q)
 }
 
 #: One Jacobi rotation zeroing `m[p][q]`, carried into the eigenvectors `v`.
@@ -221,23 +314,34 @@ fn _jacobi_rotate(m: list[float], v: list[float], n: int, p: int, q: int) -> voi
     let theta = 0.5 * math.atan2(2.0 * apq, app - aqq)
     let c = math.cos(theta)
     let s = math.sin(theta)
-    for k in 0..n {
-        let mkp = m[k * n + p]
-        let mkq = m[k * n + q]
-        m[k * n + p] = c * mkp + s * mkq
-        m[k * n + q] = -s * mkp + c * mkq
+    let t = -s
+    var kp = p
+    var kq = q
+    for _k in 0..n {
+        let mkp = m[kp]
+        let mkq = m[kq]
+        m[kp] = c * mkp + s * mkq
+        m[kq] = t * mkp + c * mkq
+        kp += n
+        kq += n
     }
+    let pk = p * n
+    let qk = q * n
     for k in 0..n {
-        let mpk = m[p * n + k]
-        let mqk = m[q * n + k]
-        m[p * n + k] = c * mpk + s * mqk
-        m[q * n + k] = -s * mpk + c * mqk
+        let mpk = m[pk + k]
+        let mqk = m[qk + k]
+        m[pk + k] = c * mpk + s * mqk
+        m[qk + k] = t * mpk + c * mqk
     }
-    for k in 0..n {
-        let vkp = v[k * n + p]
-        let vkq = v[k * n + q]
-        v[k * n + p] = c * vkp + s * vkq
-        v[k * n + q] = -s * vkp + c * vkq
+    kp = p
+    kq = q
+    for _k in 0..n {
+        let vkp = v[kp]
+        let vkq = v[kq]
+        v[kp] = c * vkp + s * vkq
+        v[kq] = t * vkp + c * vkq
+        kp += n
+        kq += n
     }
 }
 

@@ -184,13 +184,18 @@ on unless set to `0`, so the two can be compared in one binary:
 | `JAICV_NATIVE_MEASURES` | `contour_area`, `moments`, `match_shapes` |
 | `JAICV_NATIVE_FIT` | `fit_ellipse`, `fit_line` |
 
-Three device paths are switched the same way:
+Device paths are switched the same way:
 
 | Switch | What it does when on |
 |---|---|
 | `JAICV_CC_DEVICE_NUMBERING` | `connected_components` numbers its labels on the device; off, the roots are read back and sorted on the host |
 | `JAICV_GF_SELECT` | `good_features_to_track` ranks only the strongest candidates it can use; off, it ranks every one |
 | `JAICV_GF_SURVEY` | `good_features_to_track` finds its floor and its cut in one pass and one read back; off, `min_max` and then a count against the floor |
+| `JAICV_DEVICE_LINALG` | `core.linalg.float_matmul` at a million multiply-adds or more, `mul_transposed`, `calc_covar_matrix` and `PCA`'s covariance and projections go through jaitensor's GEMM in float32, cut into pieces too small for its tuner to time; off, the host loops in double precision. `core.linalg.matmul`, which geometry's least-squares fits use, sums in double either way |
+| `JAICV_KMEANS_STAGED` | `kmeans` assigns samples of eight or more columns with the centres staged in threadgroup memory, reading each sample once; off, once per centre. Same labels bit for bit |
+| `JAICV_KMEANS_IN_PLACE` | `kmeans` reads a continuous matrix's samples where they lie; off, through a host list and a fresh upload |
+| `JAICV_LOGISTIC_DEVICE` | `LogisticRegression.train` forms the gradient on the device once the samples hold 65,536 values or more; off, on the host |
+| `JAICV_LOGISTIC_RESIDENT` | `LogisticRegression.train`'s device descent keeps the weights on the device, in float32, and reads nothing back until the last step, for training sets of up to 2^25 values (it holds four copies of them); off, or above that, each step's gradient comes back and the weights are updated on the host in double |
 
 ## Device memory
 

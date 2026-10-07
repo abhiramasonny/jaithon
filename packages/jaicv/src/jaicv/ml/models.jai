@@ -5,9 +5,14 @@
 #: `train` and `predict`. The factory functions are named the way OpenCV names
 #: them, so `k_nearest_create()` stands where `cv2.ml.KNearest_create()` would.
 #:
-#: These run on the host. A model is trained once on data that fits in memory
-#: and then asked about a handful of samples at a time; the arithmetic is small
-#: next to the cost of getting it to the device and back.
+#: Most of the work here is on the host, and is made affordable by the
+#: algorithm rather than the processor: trees sort each feature once and sweep
+#: it, and the support vector machine is libsvm's solver with its gradient
+#: kept up to date. Logistic regression's gradient over a large training set
+#: is a pair of matrix products, so that one goes to the device, in
+#: `ml.descent`. Nearest
+#: neighbours still measures every query against every sample on the host:
+#: 1,000 queries against 10,000 samples of fifty features take about 1.4 s.
 #:
 #: ```
 #: let model = svm_create()
@@ -15,6 +20,7 @@
 #: let predicted = model.predict(unseen)
 #: ```
 import std.math
+from std.os import env_or
 from ..core.linalg import inverse, matmul, symmetric_eigen, transpose
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_MAKETYPE
@@ -294,24 +300,39 @@ pub fn normal_bayes_classifier_create() -> NormalBayesClassifier {
 
 #: A support vector machine.
 #:
-#: Trained by sequential minimal optimisation: repeatedly pick the pair of
-#: multipliers that most violates the conditions the solution has to satisfy,
-#: and solve for those two exactly. Every step is a closed form, so there is no
-#: inner solver and nothing to converge except the choice of pairs.
+#: Trained the way libsvm -- and so OpenCV, whose solver is libsvm's -- trains
+#: one: sequential minimal optimisation of the dual, two multipliers at a
+#: time, each pair solved in closed form. The pair is chosen by second-order
+#: working-set selection: the multiplier that most violates the optimality
+#: conditions, and the partner whose step would lower the objective most. The
+#: gradient of the objective is kept up to date as the multipliers move, so
+#: choosing a pair costs one pass over the samples rather than a decision
+#: function per sample, and the kernel's rows are computed once when they are
+#: first needed and kept while memory allows.
+#:
+#: The machine it replaced paired each sample with the next one along and
+#: recomputed every decision from scratch: 500 samples took 21 seconds and
+#: 2000 did not finish, and it stopped wherever its pass count ran out rather
+#: than at an optimum.
 pub class SVM {
     pub var kernel_type: int
     pub var c: float
     pub var gamma: float
     pub var degree: float
     pub var coef0: float
+    #: The solver stops after `iterations` steps per sample if it has not met
+    #: `tolerance` first.
     pub var iterations: int
+    #: How far from optimal the solution may be: libsvm's `eps`.
     pub var tolerance: float
     var samples: list[list[float]]
     var targets: list[float]
     var alphas: list[float]
+    var support: list[int]
     var bias: float
     var positive: float
     var negative: float
+    var trained: bool
 
     pub fn init(self) {
         self.kernel_type = SVM_RBF
@@ -324,9 +345,11 @@ pub class SVM {
         self.samples = []
         self.targets = []
         self.alphas = []
+        self.support = []
         self.bias = 0.0
         self.positive = 1.0
         self.negative = 0.0
+        self.trained = false
     }
 
     #: Choose the kernel, which is what decides the shape of the boundary.
@@ -360,7 +383,6 @@ pub class SVM {
     fn decide(self, query: list[float]) -> float {
         var total = self.bias
         for index in 0..self.samples.len() {
-            if self.alphas[index] == 0.0 { continue }
             total += self.alphas[index] *
                 self.targets[index] *
                 self.kernel(self.samples[index], query)
@@ -387,80 +409,86 @@ pub class SVM {
 
         var signs: list[float] = []
         for value in targets { signs.push(if value == self.positive { 1.0 } else { -1.0 }) }
-        self.samples = rows
-        self.targets = signs
-        self.alphas = []
-        for _index in 0..rows.len() { self.alphas.push(0.0) }
-        self.bias = 0.0
-
         let count = rows.len()
-        for _pass in 0..self.iterations {
-            var changed = 0
-            for i in 0..count {
-                let error_i = self.decide(rows[i]) - signs[i]
-                let violates = signs[i] * error_i < -self.tolerance and self.alphas[i] < self.c or
-                    signs[i] * error_i > self.tolerance and self.alphas[i] > 0.0
-                if not violates { continue }
-                #: The partner is chosen as the next sample along, which
-                #: converges as surely as the heuristic pick and costs nothing
-                #: to find.
-                let j = (i + 1 + _pass) % count
-                if j == i { continue }
-                let error_j = self.decide(rows[j]) - signs[j]
-                let old_i = self.alphas[i]
-                let old_j = self.alphas[j]
-
-                var low = 0.0
-                var high = self.c
-                if signs[i] != signs[j] {
-                    low = max(0.0, old_j - old_i)
-                    high = min(self.c, self.c + old_j - old_i)
-                } else {
-                    low = max(0.0, old_i + old_j - self.c)
-                    high = min(self.c, old_i + old_j)
-                }
-                if high - low < 1e-12 { continue }
-
-                let kii = self.kernel(rows[i], rows[i])
-                let kjj = self.kernel(rows[j], rows[j])
-                let kij = self.kernel(rows[i], rows[j])
-                let curvature = 2.0 * kij - kii - kjj
-                if curvature >= -1e-12 { continue }
-
-                var moved_j = old_j - signs[j] * (error_i - error_j) / curvature
-                if moved_j > high { moved_j = high }
-                if moved_j < low { moved_j = low }
-                if math.fabs(moved_j - old_j) < 1e-9 { continue }
-                let moved_i = old_i + signs[i] * signs[j] * (old_j - moved_j)
-
-                self.alphas[i] = moved_i
-                self.alphas[j] = moved_j
-
-                let b1 = self.bias -
-                    error_i -
-                    signs[i] * (moved_i - old_i) * kii -
-                    signs[j] * (moved_j - old_j) * kij
-                let b2 = self.bias -
-                    error_j -
-                    signs[i] * (moved_i - old_i) * kij -
-                    signs[j] * (moved_j - old_j) * kjj
-                if moved_i > 0.0 and moved_i < self.c {
-                    self.bias = b1
-                } elif moved_j > 0.0 and moved_j < self.c {
-                    self.bias = b2
-                } else {
-                    self.bias = (b1 + b2) * 0.5
-                }
-                changed += 1
-            }
-            if changed == 0 { break }
+        let width = rows[0].len()
+        var flat: list[float] = []
+        for row in rows {
+            for value in row { flat.push(value) }
         }
+        let q = _SvmRows(
+            self.kernel_type,
+            self.gamma,
+            self.degree,
+            self.coef0,
+            flat,
+            count,
+            width,
+            signs
+        )
+
+        var alpha: list[float] = []
+        var gradient: list[float] = []
+        for _index in 0..count {
+            alpha.push(0.0)
+            gradient.push(-1.0)
+        }
+        let limit = max(10000, self.iterations * count)
+        for _step in 0..limit {
+            let i = _svm_first(signs, alpha, gradient, self.c)
+            if i < 0 { break }
+            let j = _svm_partner(
+                q.row(i),
+                q.diagonal,
+                signs,
+                alpha,
+                gradient,
+                self.c,
+                i,
+                self.tolerance
+            )
+            if j < 0 { break }
+            _svm_step(q.row(i), q.row(j), q.diagonal, signs, alpha, gradient, self.c, i, j)
+        }
+
+        let rho = _svm_rho(signs, alpha, gradient, self.c)
+        self.bias = -rho
+        self.samples = []
+        self.targets = []
+        self.alphas = []
+        self.support = []
+        for index in 0..count {
+            if alpha[index] <= 0.0 { continue }
+            self.samples.push(rows[index])
+            self.targets.push(signs[index])
+            self.alphas.push(alpha[index])
+            self.support.push(index)
+        }
+        self.trained = true
         return true
+    }
+
+    #: The support vectors, one per row -- OpenCV's `getSupportVectors`.
+    pub fn get_support_vectors(self) -> Mat {
+        var out: list[float] = []
+        for row in self.samples {
+            for value in row { out.push(value) }
+        }
+        let width = if self.samples.len() > 0 { self.samples[0].len() } else { 0 }
+        return Mat.from_list(self.samples.len(), width, CV_MAKETYPE(CV_32F, 1), out)
+    }
+
+    #: OpenCV's `getDecisionFunction`: the offset `rho`, each support vector's
+    #: signed weight, and which training sample each support vector was. The
+    #: decision for `x` is the sum of `weight * kernel(sv, x)` less `rho`.
+    pub fn get_decision_function(self) -> tuple[float, list[float], list[int]] {
+        var weights: list[float] = []
+        for index in 0..self.alphas.len() { weights.push(self.alphas[index] * self.targets[index]) }
+        return (-self.bias, weights, self.support)
     }
 
     #: Which side of the boundary each sample falls on.
     pub fn predict(self, samples: Mat) -> Mat {
-        if self.samples.len() == 0 { throw RuntimeError("this model has not been trained") }
+        if not self.trained { throw RuntimeError("this model has not been trained") }
         var out: list[float] = []
         for query in rows_of(samples) {
             out.push(if self.decide(query) >= 0.0 { self.positive } else { self.negative })
@@ -476,8 +504,327 @@ pub class SVM {
     }
 }
 
+#: How many entries of the signed kernel matrix training keeps at once.
+let SVM_ROW_BUDGET = 1 << 23
+
+#: Rows of the signed kernel matrix `Q[i][j] = y_i y_j K(x_i, x_j)`, each
+#: computed the first time it is asked for and kept while they fit in
+#: `SVM_ROW_BUDGET` entries; past that the oldest kept row is dropped.
+class _SvmRows {
+    pub var kernel_type: int
+    pub var gamma: float
+    pub var degree: float
+    pub var coef0: float
+    pub var flat: list[float]
+    pub var count: int
+    pub var width: int
+    pub var signs: list[float]
+    pub var rows: list[list[float]]
+    pub var present: list[bool]
+    pub var missing: list[float]
+    pub var kept: list[int]
+    pub var oldest: int
+    pub var capacity: int
+    pub var diagonal: list[float]
+
+    pub fn init(
+        self,
+        kernel_type: int,
+        gamma: float,
+        degree: float,
+        coef0: float,
+        flat: list[float],
+        count: int,
+        width: int,
+        signs: list[float]
+    ) {
+        self.kernel_type = kernel_type
+        self.gamma = gamma
+        self.degree = degree
+        self.coef0 = coef0
+        self.flat = flat
+        self.count = count
+        self.width = width
+        self.signs = signs
+        #: A row not kept holds a one-entry stand-in rather than nothing, so
+        #: every element of `rows` is a list of floats the compiled code can
+        #: read the kind of; `present` says which are real.
+        self.missing = [0.0]
+        self.rows = []
+        self.present = []
+        for _index in 0..count {
+            self.rows.push(self.missing)
+            self.present.push(false)
+        }
+        self.kept = []
+        self.oldest = 0
+        self.capacity = max(2, SVM_ROW_BUDGET // max(count, 1))
+        self.diagonal = []
+        for index in 0..count { self.diagonal.push(_svm_kernel_at(self, index, index)) }
+    }
+
+    pub fn row(self, i: int) -> list[float] {
+        if self.present[i] { return self.rows[i] }
+        if self.kept.len() - self.oldest >= self.capacity {
+            let dropped = self.kept[self.oldest]
+            self.rows[dropped] = self.missing
+            self.present[dropped] = false
+            self.oldest += 1
+        }
+        var out: list[float] = []
+        _svm_fill_row(self, i, out)
+        self.rows[i] = out
+        self.present[i] = true
+        self.kept.push(i)
+        return out
+    }
+}
+
+fn _svm_kernel_at(q: _SvmRows, i: int, j: int) -> float {
+    let flat = q.flat
+    let width = q.width
+    let a = i * width
+    let b = j * width
+    var total = 0.0
+    if q.kernel_type == SVM_LINEAR or q.kernel_type == SVM_POLY {
+        for index in 0..width { total += flat[a + index] * flat[b + index] }
+        if q.kernel_type == SVM_LINEAR { return total }
+        return (q.gamma * total + q.coef0) ** q.degree
+    }
+    for index in 0..width {
+        let gap = flat[a + index] - flat[b + index]
+        total += gap * gap
+    }
+    return math.exp(-q.gamma * total)
+}
+
+fn _svm_fill_row(q: _SvmRows, i: int, out: list[float]) -> void {
+    let signs = q.signs
+    let sign = signs[i]
+    if q.kernel_type != SVM_RBF {
+        for j in 0..q.count { out.push(sign * signs[j] * _svm_kernel_at(q, i, j)) }
+        return
+    }
+    _svm_rbf_row(q.flat, q.width, q.count, signs, q.present, -q.gamma, i, out)
+    #: The matrix is symmetric, and a kept row already holds the entries
+    #: skipped above, worked out from the same two samples the same way.
+    let rows = q.rows
+    let kept = q.kept
+    for at in q.oldest..kept.len() {
+        let j = kept[at]
+        out[j] = rows[j][i]
+    }
+}
+
+fn _svm_rbf_row(
+    flat: list[float],
+    width: int,
+    count: int,
+    signs: list[float],
+    present: list[bool],
+    scale: float,
+    i: int,
+    out: list[float]
+) -> void {
+    let sign = signs[i]
+    let a = i * width
+    var total = 0.0
+    var gap = 0.0
+    for j in 0..count {
+        if present[j] {
+            out.push(0.0)
+            continue
+        }
+        let b = j * width
+        total = 0.0
+        for index in 0..width {
+            gap = flat[a + index] - flat[b + index]
+            total += gap * gap
+        }
+        out.push(sign * signs[j] * math.exp(scale * total))
+    }
+}
+
+#: libsvm's second-order working-set selection, first half: the multiplier
+#: that most violates the optimality conditions, or -1 if none can move.
+fn _svm_first(signs: list[float], alpha: list[float], gradient: list[float], c: float) -> int {
+    var largest = -1e300
+    var pick = -1
+    for t in 0..signs.len() {
+        if signs[t] > 0.0 {
+            if alpha[t] < c and -gradient[t] >= largest {
+                largest = -gradient[t]
+                pick = t
+            }
+        } elif alpha[t] > 0.0 and gradient[t] >= largest {
+            largest = gradient[t]
+            pick = t
+        }
+    }
+    return pick
+}
+
+#: The second half: the partner for `pick` whose step lowers the objective
+#: most, given `row`, the signed kernel row of `pick` -- or -1 once the
+#: largest violation of the optimality conditions is under `tolerance`.
+fn _svm_partner(
+    row: list[float],
+    diagonal: list[float],
+    signs: list[float],
+    alpha: list[float],
+    gradient: list[float],
+    c: float,
+    pick: int,
+    tolerance: float
+) -> int {
+    let largest = -signs[pick] * gradient[pick]
+    let own = diagonal[pick]
+    let sign = signs[pick]
+    var second = -1e300
+    var partner = -1
+    var least = 1e300
+    var difference = 0.0
+    var curvature = 0.0
+    var gain = 0.0
+    for t in 0..signs.len() {
+        if signs[t] > 0.0 {
+            if alpha[t] <= 0.0 { continue }
+            difference = largest + gradient[t]
+            if gradient[t] >= second { second = gradient[t] }
+            curvature = own + diagonal[t] - 2.0 * sign * row[t]
+        } else {
+            if alpha[t] >= c { continue }
+            difference = largest - gradient[t]
+            if -gradient[t] >= second { second = -gradient[t] }
+            curvature = own + diagonal[t] + 2.0 * sign * row[t]
+        }
+        if difference <= 0.0 { continue }
+        if curvature <= 0.0 { curvature = 1e-12 }
+        gain = -(difference * difference) / curvature
+        if gain <= least {
+            least = gain
+            partner = t
+        }
+    }
+    if largest + second < tolerance { return -1 }
+    return partner
+}
+
+#: Move the pair `i`, `j` to the optimum along the constraint, clipped to the
+#: box, and carry the change into the gradient.
+fn _svm_step(
+    row_i: list[float],
+    row_j: list[float],
+    diagonal: list[float],
+    signs: list[float],
+    alpha: list[float],
+    gradient: list[float],
+    c: float,
+    i: int,
+    j: int
+) -> void {
+    let old_i = alpha[i]
+    let old_j = alpha[j]
+    if signs[i] != signs[j] {
+        var curvature = diagonal[i] + diagonal[j] + 2.0 * row_i[j]
+        if curvature <= 0.0 { curvature = 1e-12 }
+        let delta = (-gradient[i] - gradient[j]) / curvature
+        let difference = old_i - old_j
+        alpha[i] = old_i + delta
+        alpha[j] = old_j + delta
+        if difference > 0.0 {
+            if alpha[j] < 0.0 {
+                alpha[j] = 0.0
+                alpha[i] = difference
+            }
+        } elif alpha[i] < 0.0 {
+            alpha[i] = 0.0
+            alpha[j] = -difference
+        }
+        if difference > 0.0 {
+            if alpha[i] > c {
+                alpha[i] = c
+                alpha[j] = c - difference
+            }
+        } elif alpha[j] > c {
+            alpha[j] = c
+            alpha[i] = c + difference
+        }
+    } else {
+        var curvature = diagonal[i] + diagonal[j] - 2.0 * row_i[j]
+        if curvature <= 0.0 { curvature = 1e-12 }
+        let delta = (gradient[i] - gradient[j]) / curvature
+        let total = old_i + old_j
+        alpha[i] = old_i - delta
+        alpha[j] = old_j + delta
+        if total > c {
+            if alpha[i] > c {
+                alpha[i] = c
+                alpha[j] = total - c
+            }
+        } elif alpha[j] < 0.0 {
+            alpha[j] = 0.0
+            alpha[i] = total
+        }
+        if total > c {
+            if alpha[j] > c {
+                alpha[j] = c
+                alpha[i] = total - c
+            }
+        } elif alpha[i] < 0.0 {
+            alpha[i] = 0.0
+            alpha[j] = total
+        }
+    }
+    _svm_carry(gradient, row_i, alpha[i] - old_i, row_j, alpha[j] - old_j)
+}
+
+fn _svm_carry(
+    gradient: list[float],
+    row_i: list[float],
+    moved_i: float,
+    row_j: list[float],
+    moved_j: float
+) -> void {
+    for k in 0..gradient.len() { gradient[k] += row_i[k] * moved_i + row_j[k] * moved_j }
+}
+
+#: The offset: the average over the multipliers strictly inside the box,
+#: or the middle of the range the bounded ones allow when there are none.
+fn _svm_rho(signs: list[float], alpha: list[float], gradient: list[float], c: float) -> float {
+    var upper = 1e300
+    var lower = -1e300
+    var free = 0
+    var total = 0.0
+    for index in 0..signs.len() {
+        let value = signs[index] * gradient[index]
+        if alpha[index] >= c {
+            if signs[index] < 0.0 { upper = min(upper, value) } else { lower = max(lower, value) }
+        } elif alpha[index] <= 0.0 {
+            if signs[index] > 0.0 { upper = min(upper, value) } else { lower = max(lower, value) }
+        } else {
+            free += 1
+            total += value
+        }
+    }
+    if free > 0 { return total / float(free) }
+    return (upper + lower) * 0.5
+}
+
 #: Build a support vector machine.
 pub fn svm_create() -> SVM { return SVM() }
+
+#: A training set with at least this many values, counting the intercept's
+#: column, has its gradient formed on the device.
+pub let LOGISTIC_DEVICE_VALUES = 1 << 16
+
+#: `JAICV_LOGISTIC_DEVICE=0` forms every gradient on the host.
+let _LOGISTIC_DEVICE = env_or("JAICV_LOGISTIC_DEVICE", "1") != "0"
+
+#: `JAICV_LOGISTIC_RESIDENT=0` reads each step's gradient back and updates
+#: the weights on the host, in double precision, instead of keeping them on
+#: the device for the whole descent.
+let _LOGISTIC_RESIDENT = env_or("JAICV_LOGISTIC_RESIDENT", "1") != "0"
 
 #: Fit a boundary that is a plane in the features, by gradient descent on the
 #: logistic loss.
@@ -499,10 +846,17 @@ pub class LogisticRegression {
     }
 
     #: Fit the model.
+    #:
+    #: Full-batch gradient descent, the same steps whichever processor forms
+    #: the gradient. Over a large training set the gradient goes to the
+    #: device: it is the samples times the weights, a sigmoid, and the
+    #: samples' transpose times the errors -- two matrix-vector products --
+    #: where the host loop took 1.7 s for 10,000 samples of fifty features and
+    #: 35 s for 100,000. On the device the weights are float32 (see
+    #: `ml.descent`); on the host they are double.
     pub fn train(self, samples: Mat, responses: Mat) -> bool {
-        let rows = rows_of(samples)
         let targets = column_of(responses)
-        if rows.len() != targets.len() {
+        if samples.rows != targets.len() {
             throw ValueError("there has to be one response per sample")
         }
         var labels: list[float] = []
@@ -514,10 +868,29 @@ pub class LogisticRegression {
         self.negative = labels[0]
         self.positive = labels[1]
 
-        let width = rows[0].len()
+        let width = samples.cols * samples.channels()
         self.weights = []
         for _index in 0..width + 1 { self.weights.push(0.0) }
+        if _LOGISTIC_DEVICE and samples.rows * (width + 1) >= LOGISTIC_DEVICE_VALUES {
+            import jaicv.ml.descent as descent
+            var wanted: list[float] = []
+            for value in targets { wanted.push(if value == self.positive { 1.0 } else { 0.0 }) }
+            let found = descent.descend(
+                samples,
+                wanted,
+                self.weights,
+                self.learning_rate,
+                self.regularisation,
+                self.iterations,
+                _LOGISTIC_RESIDENT
+            )
+            if found is not null {
+                self.weights = found
+                return true
+            }
+        }
 
+        let rows = rows_of(samples)
         for _step in 0..self.iterations {
             var gradient: list[float] = []
             for _index in 0..width + 1 { gradient.push(0.0) }
@@ -528,17 +901,34 @@ pub class LogisticRegression {
                 gradient[width] += error
                 for column in 0..width { gradient[column] += error * rows[index][column] }
             }
-            let scale = self.learning_rate / float(rows.len())
-            for column in 0..width {
-                #: The penalty pulls the weights back towards zero, which is
-                #: what keeps a separable problem from running them off to
-                #: infinity.
-                self.weights[column] -= scale *
-                    (gradient[column] + self.regularisation * self.weights[column])
-            }
-            self.weights[width] -= scale * gradient[width]
+            self.step(gradient, rows.len())
         }
         return true
+    }
+
+    #: Move the weights down `gradient`, summed over `count` samples.
+    fn step(self, gradient: list[float], count: int) -> void {
+        let width = self.weights.len() - 1
+        let scale = self.learning_rate / float(count)
+        for column in 0..width {
+            #: The penalty pulls the weights back towards zero, which is
+            #: what keeps a separable problem from running them off to
+            #: infinity.
+            self.weights[column] -= scale *
+                (gradient[column] + self.regularisation * self.weights[column])
+        }
+        self.weights[width] -= scale * gradient[width]
+    }
+
+    #: The fitted parameters as one row, intercept first: the layout
+    #: OpenCV's `getLearntThetas` uses, since it puts the column of ones in
+    #: front of the samples.
+    pub fn get_learnt_thetas(self) -> Mat {
+        if self.weights.len() == 0 { throw RuntimeError("this model has not been trained") }
+        let width = self.weights.len() - 1
+        var out = [self.weights[width]]
+        for column in 0..width { out.push(self.weights[column]) }
+        return Mat.from_list(1, width + 1, CV_MAKETYPE(CV_32F, 1), out)
     }
 
     fn probability(self, query: list[float]) -> float {
@@ -586,6 +976,35 @@ class TreeNode {
     }
 }
 
+#: What every node of one tree's growth shares: the samples by row and by
+#: column, the responses, each response's class (when classifying) and a
+#: per-sample flag the split writes before it divides the sorted orders.
+class _TreeData {
+    pub var rows: list[list[float]]
+    pub var targets: list[float]
+    pub var columns: list[list[float]]
+    pub var classes: list[int]
+    pub var class_count: int
+    pub var side: list[bool]
+
+    pub fn init(
+        self,
+        rows: list[list[float]],
+        targets: list[float],
+        columns: list[list[float]],
+        classes: list[int],
+        class_count: int,
+        side: list[bool]
+    ) {
+        self.rows = rows
+        self.targets = targets
+        self.columns = columns
+        self.classes = classes
+        self.class_count = class_count
+        self.side = side
+    }
+}
+
 #: A decision tree, split on one feature at a time.
 pub class DTrees {
     pub var max_depth: int
@@ -601,6 +1020,14 @@ pub class DTrees {
     }
 
     #: Grow the tree.
+    #:
+    #: Each feature is sorted once, here, and every node after that keeps its
+    #: samples in that order by splitting the parent's lists, so finding a
+    #: split is one sweep per feature with the class counts (or the sums)
+    #: carried along it. Trying every threshold by partitioning the node and
+    #: scoring both halves from scratch was the square of the node's size per
+    #: feature: ten thousand samples of twenty features took 134 seconds to
+    #: grow eight levels.
     pub fn train(self, samples: Mat, responses: Mat) -> bool {
         let rows = rows_of(samples)
         let targets = column_of(responses)
@@ -610,71 +1037,251 @@ pub class DTrees {
         self.nodes = []
         var indices: list[int] = []
         for index in 0..rows.len() { indices.push(index) }
-        self.grow(rows, targets, indices, 0)
+        if rows.len() == 0 {
+            self.nodes.push(TreeNode(-1, 0.0, self.answer(targets, indices), -1, -1))
+            return true
+        }
+        let width = rows[0].len()
+        var columns: list[list[float]] = []
+        var orders: list[list[int]] = []
+        for feature in 0..width {
+            var column: list[float] = []
+            for row in rows { column.push(row[feature]) }
+            var order: list[int] = []
+            for index in 0..rows.len() { order.push(index) }
+            order.sort(key: |at| column[at])
+            columns.push(column)
+            orders.push(order)
+        }
+        var labels: list[float] = []
+        var classes: list[int] = []
+        if not self.regression {
+            for value in targets {
+                if not labels.contains(value) { labels.push(value) }
+            }
+            labels.sort()
+            for value in targets {
+                var slot = 0
+                while labels[slot] != value { slot += 1 }
+                classes.push(slot)
+            }
+        }
+        var side: list[bool] = []
+        for _index in 0..rows.len() { side.push(false) }
+        let tree = _TreeData(rows, targets, columns, classes, labels.len(), side)
+        self.grow(tree, indices, orders, 0)
         return true
     }
 
-    fn grow(
-        self,
-        rows: list[list[float]],
-        targets: list[float],
-        indices: list[int],
-        depth: int
-    ) -> int {
+    #: The tree as OpenCV's `getNodes` gives it: each node's split feature (or
+    #: -1 for a leaf), threshold, value and children, in the order they were
+    #: grown.
+    pub fn get_nodes(self) -> list[tuple[int, float, float, int, int]] {
+        var out: list[tuple[int, float, float, int, int]] = []
+        for node in self.nodes {
+            out.push((node.feature, node.threshold, node.value, node.left, node.right))
+        }
+        return out
+    }
+
+    #: Grow the node holding `indices` (in sample order), with `orders[f]` the
+    #: same samples sorted by feature `f`.
+    #:
+    #: The split chosen is exactly the one scoring every threshold of every
+    #: feature from scratch would choose: the lowest score, the first feature
+    #: and then the first threshold among equal ones, and only if it beats the
+    #: node as it is. The sweep's running totals round differently from
+    #: scoring each half on its own, so the sweep only shortlists: every
+    #: threshold within a hair of its best is scored again the old way, in the
+    #: old order, and the comparison is made on those scores. A tie between
+    #: features -- two columns splitting the samples identically -- is common
+    #: in small integer data, and is broken the way it always was.
+    fn grow(self, tree: _TreeData, indices: list[int], orders: list[list[int]], depth: int) -> int {
+        let targets = tree.targets
         let here = self.nodes.len()
         self.nodes.push(TreeNode(-1, 0.0, self.answer(targets, indices), -1, -1))
         if depth >= self.max_depth or indices.len() < self.min_sample_count * 2 { return here }
         if self.pure(targets, indices) { return here }
 
-        let width = rows[0].len()
+        let parent = self.impurity(targets, indices)
+        if parent <= 0.0 { return here }
+
+        let width = tree.columns.len()
+        let count = indices.len()
+        let slack = 1e-8 * parent
+        var near_feature: list[int] = []
+        var near_threshold: list[float] = []
+        var near_score: list[float] = []
+        var forced: list[bool] = []
+        var best_seen = parent
+
+        if self.regression {
+            var origin = 0.0
+            for index in indices { origin += targets[index] }
+            origin /= float(count)
+            var all_sum = 0.0
+            var all_squares = 0.0
+            for index in indices {
+                let gap = targets[index] - origin
+                all_sum += gap
+                all_squares += gap * gap
+            }
+            for feature in 0..width {
+                let column = tree.columns[feature]
+                let order = orders[feature]
+                var left_sum = 0.0
+                var left_squares = 0.0
+                for at in 0..count - 1 {
+                    let index = order[at]
+                    let gap = targets[index] - origin
+                    left_sum += gap
+                    left_squares += gap * gap
+                    let value = column[index]
+                    let next = column[order[at + 1]]
+                    if next == value { continue }
+                    let threshold = (value + next) * 0.5
+                    if threshold >= next {
+                        near_feature.push(feature)
+                        near_threshold.push(threshold)
+                        near_score.push(best_seen)
+                        forced.push(true)
+                        continue
+                    }
+                    let on_left = float(at + 1)
+                    let on_right = float(count - at - 1)
+                    let right_sum = all_sum - left_sum
+                    let left_error = max(left_squares - left_sum * left_sum / on_left, 0.0)
+                    let right_error = max(
+                        all_squares -
+                            left_squares -
+                            right_sum * right_sum / on_right,
+                        0.0
+                    )
+                    let score = (left_error + right_error) / float(count)
+                    if score > best_seen + slack { continue }
+                    if score < best_seen { best_seen = score }
+                    near_feature.push(feature)
+                    near_threshold.push(threshold)
+                    near_score.push(score)
+                    forced.push(false)
+                }
+            }
+        } else {
+            let classes = tree.classes
+            var totals: list[int] = []
+            for _slot in 0..tree.class_count { totals.push(0) }
+            for index in indices { totals[classes[index]] += 1 }
+            var total_squares = 0
+            for value in totals { total_squares += value * value }
+            var left: list[int] = []
+            var right: list[int] = []
+            for _slot in 0..tree.class_count {
+                left.push(0)
+                right.push(0)
+            }
+            for feature in 0..width {
+                let column = tree.columns[feature]
+                let order = orders[feature]
+                for slot in 0..tree.class_count {
+                    left[slot] = 0
+                    right[slot] = totals[slot]
+                }
+                var left_squares = 0
+                var right_squares = total_squares
+                for at in 0..count - 1 {
+                    let index = order[at]
+                    let label_slot = classes[index]
+                    left_squares += 2 * left[label_slot] + 1
+                    left[label_slot] += 1
+                    right_squares -= 2 * right[label_slot] - 1
+                    right[label_slot] -= 1
+                    let value = column[index]
+                    let next = column[order[at + 1]]
+                    if next == value { continue }
+                    let threshold = (value + next) * 0.5
+                    if threshold >= next {
+                        near_feature.push(feature)
+                        near_threshold.push(threshold)
+                        near_score.push(best_seen)
+                        forced.push(true)
+                        continue
+                    }
+                    let on_left = float(at + 1)
+                    let on_right = float(count - at - 1)
+                    let left_gini = on_left - float(left_squares) / on_left
+                    let right_gini = on_right - float(right_squares) / on_right
+                    let score = (left_gini + right_gini) / float(count)
+                    if score > best_seen + slack { continue }
+                    if score < best_seen { best_seen = score }
+                    near_feature.push(feature)
+                    near_threshold.push(threshold)
+                    near_score.push(score)
+                    forced.push(false)
+                }
+            }
+        }
+
         var best_feature = -1
         var best_threshold = 0.0
-        var best_score = self.impurity(targets, indices)
-        if best_score <= 0.0 { return here }
-
-        for feature in 0..width {
-            var values: list[float] = []
-            for index in indices { values.push(rows[index][feature]) }
-            values.sort()
-            for at in 1..values.len() {
-                if values[at] == values[at - 1] { continue }
-                let threshold = (values[at] + values[at - 1]) * 0.5
-                var left: list[int] = []
-                var right: list[int] = []
-                for index in indices {
-                    if rows[index][feature] <= threshold {
-                        left.push(index)
-                    } else {
-                        right.push(index)
-                    }
+        var best_score = parent
+        let rows = tree.rows
+        for slot in 0..near_feature.len() {
+            if not forced[slot] and near_score[slot] > best_seen + slack { continue }
+            let feature = near_feature[slot]
+            let threshold = near_threshold[slot]
+            var left: list[int] = []
+            var right: list[int] = []
+            for index in indices {
+                if rows[index][feature] <= threshold {
+                    left.push(index)
+                } else {
+                    right.push(index)
                 }
-                if left.len() == 0 or right.len() == 0 { continue }
-                #: The split is scored by how much less mixed the two halves
-                #: are than the whole, weighted by how many samples each holds.
-                let score = (float(left.len()) * self.impurity(targets, left) + float(right.len()) * self.impurity(targets, right)) /
-                    float(indices.len())
-                if score < best_score {
-                    best_score = score
-                    best_feature = feature
-                    best_threshold = threshold
-                }
+            }
+            if left.len() == 0 or right.len() == 0 { continue }
+            #: The split is scored by how much less mixed the two halves
+            #: are than the whole, weighted by how many samples each holds.
+            let score = (float(left.len()) * self.impurity(targets, left) + float(right.len()) * self.impurity(targets, right)) /
+                float(count)
+            if score < best_score {
+                best_score = score
+                best_feature = feature
+                best_threshold = threshold
             }
         }
         if best_feature < 0 { return here }
 
+        let side = tree.side
         var left: list[int] = []
         var right: list[int] = []
         for index in indices {
-            if rows[index][best_feature] <= best_threshold {
+            let goes_left = rows[index][best_feature] <= best_threshold
+            side[index] = goes_left
+            if goes_left {
                 left.push(index)
             } else {
                 right.push(index)
             }
         }
+        var left_orders: list[list[int]] = []
+        var right_orders: list[list[int]] = []
+        for order in orders {
+            var to_left: list[int] = []
+            var to_right: list[int] = []
+            for index in order {
+                if side[index] {
+                    to_left.push(index)
+                } else {
+                    to_right.push(index)
+                }
+            }
+            left_orders.push(to_left)
+            right_orders.push(to_right)
+        }
         self.nodes[here].feature = best_feature
         self.nodes[here].threshold = best_threshold
-        self.nodes[here].left = self.grow(rows, targets, left, depth + 1)
-        self.nodes[here].right = self.grow(rows, targets, right, depth + 1)
+        self.nodes[here].left = self.grow(tree, left, left_orders, depth + 1)
+        self.nodes[here].right = self.grow(tree, right, right_orders, depth + 1)
         return here
     }
 
