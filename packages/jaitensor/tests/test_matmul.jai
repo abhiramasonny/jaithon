@@ -178,13 +178,14 @@ fn test_kernels_are_timed_against_a_static_graph_plan_unless_the_output_is_large
     #: Statically the graph, but only a guess there: a tuning pass must be
     #: allowed to find a kernel that beats it, or a wrong guess is permanent.
     assert_true(has_kernel_plan(candidates(50, 100000, 50, true)), "a deep gram times kernels")
-    assert_true(
-        has_kernel_plan(candidates(100000, 50, 128)),
-        "a padded large product times kernels"
-    )
-    #: A large output the graph reads as stored is the graph's alone.
+    assert_true(has_kernel_plan(candidates(50, 100000, 1, true)), "a deep X^T y times kernels")
+    #: A large output is the graph's alone.
     assert_true(not has_kernel_plan(candidates(1024, 768, 768)), "1024x768x768 is the graph's")
     assert_true(not has_kernel_plan(candidates(4096, 4096, 4096)), "4096 cubed is the graph's")
+    #: So is one it reads through padded copies, which the static plan only
+    #: gives it where the copies are cheap: a staged kernel would take a
+    #: second a sample at 8191 cubed.
+    assert_true(not has_kernel_plan(candidates(4001, 1001, 999)), "4001x1001x999 is the graph's")
 }
 
 #: Point the planner at a fresh plan cache holding `rows`, run `body`, and put

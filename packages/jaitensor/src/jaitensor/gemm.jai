@@ -1403,22 +1403,25 @@ pub fn candidates(
         if gpu.mixed_precision() { found.push(MPS16_PLAN) }
     }
     let fallback = default_plan(rows, inner, columns, trans_a, trans_b)
-    #: Where the static plan is the graph on a large output it reads as
-    #: stored, only the graph's two precisions compete. Every tuned cache on
-    #: record chose the graph for these, and the exceptions did not hold up:
-    #: `direct32x32:1` cached for 1024x768x768 ran 0.29 ms against the graph's
-    #: 0.21, and a direct kernel tuned for 4096x3072x1024 ran at two thirds of
-    #: the graph's rate -- queued as one long command buffer, where the graph
-    #: commits its own, it was also killed by the GPU watchdog.
+    #: Where the static plan is the graph on a large output, only the graph's
+    #: two precisions compete. Every tuned cache on record chose the graph for
+    #: these, and the exceptions did not hold up: `direct32x32:1` cached for
+    #: 1024x768x768 ran 0.29 ms against the graph's 0.21, and a direct kernel
+    #: tuned for 4096x3072x1024 ran at two thirds of the graph's rate -- queued
+    #: as one long command buffer, where the graph commits its own, it was also
+    #: killed by the GPU watchdog.
     #:
-    #: Anywhere else the graph is only the static guess, and kernels are
+    #: That holds when the graph reads the operands through padded copies
+    #: too: the static plan takes the graph there only when the copies are
+    #: small beside the product, and a staged kernel timed against a large
+    #: ragged product runs a second or more per sample.
+    #:
+    #: On a small output the graph is only the static guess, and kernels are
     #: timed against it. Pinning it was a permanent loss on the shapes it
     #: guesses wrong: a 40000-deep gram at width 96 ran four times slower on
-    #: the graph than on `direct32x32:16`, with no pass ever allowed to see it,
-    #: and a padded 500000x130x10 ran 1.18x slower than `gemm64x32`.
+    #: the graph than on `direct32x32:16`, with no pass ever allowed to see it.
     if fallback.config < 0 {
-        let graph_only = mps_aligned(rows, inner, columns, trans_a, trans_b) and
-            rows * inner * columns >= MPS_STATIC_WORK and
+        let graph_only = rows * inner * columns >= MPS_STATIC_WORK and
             not small_output(rows, columns)
         if graph_only { return found }
     } else {
