@@ -9,6 +9,7 @@
 #: `set_params`, and that an unfitted estimator refuses rather than guessing.
 import std.gpu as gpu
 import std.math
+from std.os import env_or
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaitensor import Tensor
 from jailearn import Estimator, EstimatorKind, LogisticRegression, Params, Pipeline, Ridge
@@ -644,7 +645,16 @@ fn test_a_wide_two_class_fit_takes_lbfgs() -> void {
     chosen.fit(x, y)
     assert_eq(newton.solver_, "newton-cholesky", "asked for Newton")
     assert_eq(quasi.solver_, "lbfgs", "asked for L-BFGS")
-    assert_eq(chosen.solver_, "lbfgs", "81 coefficients take L-BFGS by default")
+    #: The crossover can be moved, and the suite is run with it moved.
+    let limit = int(env_or("JAILEARN_NEWTON_MAX_ORDER", "64"))
+    let by_size = fn(order: int) -> str {
+        return if order <= limit {
+            "newton-cholesky"
+        } else {
+            "lbfgs"
+        }
+    }
+    assert_eq(chosen.solver_, by_size(81), "81 coefficients by default")
     assert_true(quasi.converged_, "L-BFGS converged")
     #: The features' column means make the intercept and the coefficients
     #: nearly collinear, so the optimum sits in a valley flat enough that two
@@ -666,7 +676,7 @@ fn test_a_wide_two_class_fit_takes_lbfgs() -> void {
     defer { narrow.free() }
     defer { labels.free() }
     small.fit(narrow, labels)
-    assert_eq(small.solver_, "newton-cholesky", "six coefficients take Newton by default")
+    assert_eq(small.solver_, by_size(6), "six coefficients by default")
     assert_throws(ValueError, || LogisticRegression(solver: "sag"))
     let tuned = LogisticRegression()
     defer { tuned.free() }
