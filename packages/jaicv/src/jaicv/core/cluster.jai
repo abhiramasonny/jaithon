@@ -12,8 +12,7 @@
 import std.math
 from std.gpu import Buffer, Kernel
 from std.os import env_or
-from ..core.linalg import device_centred_product, device_scatter, matmul, on_device
-from ..core.linalg import symmetric_eigen, transpose
+from ..core.linalg import float_matmul, on_device, symmetric_eigen, transpose
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_32S, CV_MAKETYPE
 
@@ -496,8 +495,15 @@ pub class PCA {
         #: host loop below is samples times width squared multiply-adds, 650 ms
         #: of a 932 ms fit at 100,000 samples of fifty features. The device
         #: works in float32 rather than double, which the covariance is rounded
-        #: to on its way into the eigen solver anyway.
-        let scattered = if on_device(samples * width * width) { device_scatter(data) } else { null }
+        #: to on its way into the eigen solver anyway. Components whose
+        #: eigenvalues lie within a fraction of a percent of each other can come
+        #: out rotated within their plane, or with the other sign, against the
+        #: double-precision path.
+        var scattered: tuple[list[float], list[float]]? = null
+        if on_device(samples * width * width) {
+            import jaicv.core.device as device
+            scattered = device.device_scatter(data)
+        }
         if scattered is not null {
             let (found_centre, scatter) = scattered
             centre = found_centre
@@ -544,7 +550,8 @@ pub class PCA {
         let centre = self.mean.to_list()
         if on_device(data.rows * width * self.eigenvectors.rows) and
             data.cols * data.channels() == width {
-            let projected = device_centred_product(data, centre, self.eigenvectors)
+            import jaicv.core.device as device
+            let projected = device.device_centred_product(data, centre, self.eigenvectors)
             if projected is not null { return projected }
         }
         let values = data.values()
@@ -552,7 +559,7 @@ pub class PCA {
         for sample in 0..data.rows {
             for index in 0..width { centred.push(values[sample * width + index] - centre[index]) }
         }
-        return matmul(
+        return float_matmul(
             Mat.from_list(data.rows, width, CV_MAKETYPE(CV_32F, 1), centred),
             transpose(self.eigenvectors)
         )
@@ -560,7 +567,7 @@ pub class PCA {
 
     #: Map samples back out of the kept basis.
     pub fn back_project(self, data: Mat) -> Mat {
-        let restored = matmul(data, self.eigenvectors)
+        let restored = float_matmul(data, self.eigenvectors)
         let width = self.mean.cols
         let centre = self.mean.to_list()
         let values = restored.values()

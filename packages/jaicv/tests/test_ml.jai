@@ -2,12 +2,16 @@
 #: against the definitions they replaced or against what they promise.
 import std.gpu as gpu
 import std.math
+from std.io import Path
+from std.os import env, set_env, temp_dir, unset_env, pid
 from std.test import assert_eq, assert_near, assert_throws, assert_true
+from jaicv.calib3d.transform import estimate_affine_2d
 from jaicv.core.mat import Mat
-from jaicv.core.types import CV_32FC1
+from jaicv.core.types import CV_32FC1, Point2f
 from jaicv.ml.models import d_trees_create, r_trees_create, svm_create
 from jaicv.ml.models import LogisticRegression, LOGISTIC_DEVICE_VALUES
-from jaicv.core.linalg import matmul as linalg_matmul, on_device, symmetric_eigen_of
+from jaicv.core.linalg import float_matmul, on_device, symmetric_eigen_of
+from jaicv.core.device import PIECE_WORK, device_view, product as device_product
 from jaicv.core.misc import calc_covar_matrix, mul_transposed
 from jaicv.core.cluster import kmeans, PCA, SOURCE as KMEANS_SOURCE
 from std.gpu import Buffer, Kernel
@@ -441,7 +445,7 @@ fn test_a_large_product_agrees_with_the_host_sum() -> void {
     assert_true(on_device(rows * inner * cols), "this product is meant to reach the device")
     let left = noise(rows * inner, 11, 1.0, 0.0)
     let right = noise(inner * cols, 12, 1.0, 0.0)
-    let got = linalg_matmul(
+    let got = float_matmul(
         Mat.from_list(rows, inner, CV_32FC1, left),
         Mat.from_list(inner, cols, CV_32FC1, right)
     )
@@ -557,8 +561,203 @@ fn test_a_large_covariance_and_pca_agree_with_double_precision() -> void {
     assert_true(worst < 1e-3, f"device projection is {worst} from the host sum")
 }
 
+# --- device products never tune, and geometry keeps double sums -------------
+fn host_product(
+    a: list[float],
+    b: list[float],
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool,
+    trans_b: bool
+) -> list[float] {
+    var out: list[float] = []
+    for r in 0..rows {
+        for c in 0..columns {
+            var total = 0.0
+            for k in 0..inner {
+                let left = if trans_a { a[k * rows + r] } else { a[r * inner + k] }
+                let right = if trans_b { b[c * inner + k] } else { b[k * columns + c] }
+                total += left * right
+            }
+            out.push(total)
+        }
+    }
+    return out
+}
+
+fn check_piecewise(rows: int, inner: int, columns: int, trans_a: bool, trans_b: bool) -> void {
+    let a_values = noise(rows * inner, rows + 3, 1.0, 0.25)
+    let b_values = noise(inner * columns, columns + 5, 1.0, -0.5)
+    let a = if trans_a {
+        Mat.from_list(inner, rows, CV_32FC1, a_values)
+    } else {
+        Mat.from_list(rows, inner, CV_32FC1, a_values)
+    }
+    let b = if trans_b {
+        Mat.from_list(columns, inner, CV_32FC1, b_values)
+    } else {
+        Mat.from_list(inner, columns, CV_32FC1, b_values)
+    }
+    let want = host_product(a.to_list(), b.to_list(), rows, inner, columns, trans_a, trans_b)
+    let left = device_view(a)
+    let right = device_view(b)
+    if left is null or right is null { throw AssertionError("a plain Mat has a device view") }
+    let found = device_product(left, right, trans_a: trans_a, trans_b: trans_b)
+    left.free()
+    right.free()
+    assert_eq(found.shape, [rows, columns])
+    let got = found.download()
+    found.free()
+    var worst = 0.0
+    for index in 0..rows * columns {
+        worst = max(worst, math.fabs(got[index] - want[index]) / (1.0 + math.fabs(want[index])))
+    }
+    assert_true(
+        worst < 1e-4,
+        f"{rows}x{inner}x{columns} ta={trans_a} tb={trans_b} is {worst} from the host sum"
+    )
+}
+
+fn test_a_product_cut_into_pieces_agrees_with_the_host_sum() -> void {
+    if not have_gpu() { return }
+    #: Blocks of rows with a short block over, `b` read both ways.
+    check_piecewise(5003, 37, 29, false, false)
+    check_piecewise(5003, 37, 29, false, true)
+    #: Stretches of the inner dimension: with a short one over, and exactly
+    #: two whole ones.
+    check_piecewise(23, 7001, 19, true, false)
+    let piece = PIECE_WORK // (17 * 13)
+    check_piecewise(17, 2 * piece, 13, true, false)
+    #: Too wide to cut, and a transposed `a` with rows that cannot be cut.
+    check_piecewise(40, 900, 70, false, false)
+    check_piecewise(300, 400, 30, true, true)
+}
+
+#: The tuner times every candidate the first time it sees a shape, and a
+#: principal component analysis brings a new shape with every sample count: a
+#: first fit of 77,777 samples took 9.3 s. Tuning writes the plan cache, so a
+#: fresh cache file that is still absent afterwards says nothing was tuned.
+fn test_a_first_pca_of_a_new_size_is_never_tuned() -> void {
+    if not have_gpu() { return }
+    let (rows, width) = (3217, 41)
+    assert_true(rows * width * width >= 4194304, "the scatter is meant to be big enough to tune")
+    let path = Path(temp_dir()).join(f"jaicv-untuned-{pid()}.tsv")
+    if path.exists() { path.remove() }
+    let previous = env("JAITENSOR_GEMM_CACHE")
+    set_env("JAITENSOR_GEMM_CACHE", path.to_str())
+    let samples = Mat.from_list(rows, width, CV_32FC1, noise(rows * width, 41, 1.0, 3.0))
+    let analysis = PCA(samples, 0)
+    let projected = analysis.project(samples)
+    let restored = analysis.back_project(projected)
+    let (covariance, _mean) = calc_covar_matrix(samples)
+    let gram = mul_transposed(samples, true)
+    let seen = restored.to_list()[0] + covariance.to_list()[0] + gram.to_list()[0]
+    if previous is not null {
+        set_env("JAITENSOR_GEMM_CACHE", previous)
+    } else {
+        unset_env("JAITENSOR_GEMM_CACHE")
+    }
+    let tuned = path.exists()
+    if tuned { path.remove() }
+    assert_true(seen == seen, "the products came back")
+    assert_true(not tuned, "a product was tuned on its first use")
+}
+
+#: Normal equations square the condition number, so a least-squares fit over
+#: tens of thousands of pairs needs its sums in double: summed in float32 on
+#: the device the shift came out 9x and 23x further from the answer. Here the
+#: float32 product put the shift 1.0e-3 from the double fit, against 1.1e-4
+#: for the double one, whose error is the float32 points it is given.
+fn test_an_affine_fit_over_many_pairs_keeps_double_sums() -> void {
+    let count = 20000
+    let jitter = noise(count * 4, 51, 1.0, 0.0)
+    var source: list[Point2f] = []
+    var target: list[Point2f] = []
+    for index in 0..count {
+        let x = 1000.0 + (jitter[index * 4] + 1.0) * 2000.0
+        let y = 1000.0 + (jitter[index * 4 + 1] + 1.0) * 2000.0
+        source.push(Point2f(x, y))
+        target.push(
+            Point2f(
+                0.9 * x - 0.2 * y + 15.0 + 0.125 * jitter[index * 4 + 2],
+                0.1 * x + 1.1 * y - 7.0 + 0.125 * jitter[index * 4 + 3]
+            )
+        )
+    }
+    #: The same fit solved here, every sum in double.
+    var normal: list[float] = []
+    for _index in 0..18 { normal.push(0.0) }
+    var right_x: list[float] = [0.0, 0.0, 0.0]
+    var right_y: list[float] = [0.0, 0.0, 0.0]
+    for index in 0..count {
+        let row = [source[index].x, source[index].y, 1.0]
+        for i in 0..3 {
+            for j in 0..3 { normal[i * 3 + j] += row[i] * row[j] }
+            right_x[i] += row[i] * target[index].x
+            right_y[i] += row[i] * target[index].y
+        }
+    }
+    let want_x = solve_three(normal, right_x)
+    let want_y = solve_three(normal, right_y)
+    let fitted = estimate_affine_2d(source, target).to_list()
+    for i in 0..3 {
+        assert_true(
+            math.fabs(fitted[i] - want_x[i]) <= 3e-4 * (1.0 + math.fabs(want_x[i])),
+            f"x coefficient {i}: {fitted[i]} against {want_x[i]}"
+        )
+        assert_true(
+            math.fabs(fitted[3 + i] - want_y[i]) <= 3e-4 * (1.0 + math.fabs(want_y[i])),
+            f"y coefficient {i}: {fitted[3 + i]} against {want_y[i]}"
+        )
+    }
+}
+
+#: `m x = r` for a three by three `m`, by elimination with partial pivoting.
+fn solve_three(m: list[float], r: list[float]) -> list[float] {
+    var a = [value for value in m]
+    var b = [value for value in r]
+    for column in 0..3 {
+        var pivot = column
+        for row in column + 1..3 {
+            if math.fabs(a[row * 3 + column]) > math.fabs(a[pivot * 3 + column]) { pivot = row }
+        }
+        for k in 0..3 {
+            let held = a[column * 3 + k]
+            a[column * 3 + k] = a[pivot * 3 + k]
+            a[pivot * 3 + k] = held
+        }
+        let held = b[column]
+        b[column] = b[pivot]
+        b[pivot] = held
+        for row in column + 1..3 {
+            let factor = a[row * 3 + column] / a[column * 3 + column]
+            for k in column..3 { a[row * 3 + k] -= factor * a[column * 3 + k] }
+            b[row] -= factor * b[column]
+        }
+    }
+    var x: list[float] = [0.0, 0.0, 0.0]
+    for step in 0..3 {
+        let row = 2 - step
+        var total = b[row]
+        for k in row + 1..3 { total -= a[row * 3 + k] * x[k] }
+        x[row] = total / a[row * 3 + row]
+    }
+    return x
+}
+
 # --- logistic regression's device gradient takes the host's steps -----------
 fn test_logistic_regression_on_the_device_takes_the_host_steps() -> void {
+    check_logistic_against_the_host(1e-4)
+}
+
+#: A penalty big enough to move the weights, so a slip in how the device
+#: decays them shows.
+fn test_regularised_logistic_regression_on_the_device_takes_the_host_steps() -> void {
+    check_logistic_against_the_host(0.1)
+}
+
+fn check_logistic_against_the_host(regularisation: float) -> void {
     if not have_gpu() { return }
     let (count, width) = (3000, 21)
     assert_true(
@@ -578,6 +777,7 @@ fn test_logistic_regression_on_the_device_takes_the_host_steps() -> void {
     let responses = Mat.from_list(count, 1, CV_32FC1, labels)
     let model = LogisticRegression()
     model.iterations = 60
+    model.regularisation = regularisation
     model.train(samples, responses)
     let got = model.get_learnt_thetas().to_list()
 
