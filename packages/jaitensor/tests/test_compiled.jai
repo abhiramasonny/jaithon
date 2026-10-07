@@ -888,27 +888,34 @@ fn test_a_short_last_batch_is_trained_on_the_compiled_path() -> void {
     }
 }
 
-#: Adam on flat rows compiles only when a step carries enough arithmetic to
-#: pay for encoding its update, a dozen graph operations a parameter; below
-#: that the static path's one kernel a parameter is quicker. Plain descent
-#: and momentum add two or three operations and compile at any size.
-fn test_a_small_adam_model_on_flat_rows_stays_static() -> void {
+#: Adam on flat rows compiles where its graph measured faster: a small model
+#: with two hidden layers or more, where the step is host work and one graph
+#: beats the static path's dispatches. A model with many parameters at a small
+#: batch spends its step on Adam's update, a dozen graph operations a
+#: parameter against one kernel, and stays static; so does a single hidden
+#: layer, where the static path is lean enough to tie. Plain descent and
+#: momentum add two or three operations and compile at any size.
+fn test_adam_on_flat_rows_compiles_only_where_it_measured_faster() -> void {
     if not gpu.is_available() { return }
     let was = compiled_step_allowed()
     defer { set_compiled_step(was) }
     set_compiled_step(true)
-    for (name, want) in [("adam", "static"), ("momentum", "compiled"), ("sgd", "compiled")] {
+    for (name, hidden, compiled) in [
+        ("adam", [16, 16], true),
+        ("adam", [512, 512], false),
+        ("adam", [16], false),
+        ("momentum", [512, 512], true),
+        ("sgd", [16], true),
+    ] {
         let data = learnable_rows(128, 20, 4, 7)
-        let model = jt.Sequential(
-            [
-                Dense(16, activation: Activation.Relu),
-                Dense(16, activation: Activation.Relu),
-                Dense(4, activation: Activation.Softmax),
-            ]
-        )
+        var layers: list[Layer] = []
+        for width in hidden { layers.push(Dense(width, activation: Activation.Relu)) }
+        layers.push(Dense(4, activation: Activation.Softmax))
+        let model = Sequential(layers)
         model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
         model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
-        assert_eq(model.training_route(), want, name)
+        let route = model.training_route()
+        assert_eq(route == "compiled", compiled, f"{name} {hidden} took {route}")
         model.free()
         data.free()
     }

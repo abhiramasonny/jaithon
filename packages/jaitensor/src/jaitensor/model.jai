@@ -542,7 +542,7 @@ pub class Sequential {
         var parameters = 0
         for parameter in self._parameters() { parameters += parameter.size }
         let adam = kind == 1
-        if not flat_step_wanted(dataset.samples, batch_size, adam: adam, work: batch_size * parameters) {
+        if not flat_step_wanted(dataset.samples, batch_size, adam: adam, parameters: parameters, layers: self.layers.len()) {
             return null
         }
         shape.push(dataset.feature_count)

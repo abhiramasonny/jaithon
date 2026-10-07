@@ -691,19 +691,28 @@ fn flat_policy() -> int {
 #: graph operations a parameter, and no shape tried with them was slower
 #: compiled, so for them there is no size floor.
 #:
-#: Adam is gated on the work in a step, `work` -- the batch times the
-#: parameter count, roughly the multiply-adds of one forward pass. Its update
-#: is a dozen graph operations a parameter where the static path runs one
-#: kernel, and when the arithmetic is small the step is all host work, so
-#: encoding those operations decides it, and which side wins moves with
-#: whatever else the machine is doing. [784-128-64-10] Adam b64 (7M) read
-#: 1267 ms static against 1468 compiled in one session of five alternated
-#: rounds, every round the same way, and 947 against 739 in another, again
-#: every round. Under a load average of 10-40 (n=4, paired ratios
-#: static/compiled): 7M 0.82x, [784-512-512-10] b64 (43M) 0.58x, b512
-#: (343M) 0.73x, and only b2048 (1.4G) won, 1.18x (1.02-1.43x). A step that
-#: only sometimes wins is not taken: below `ADAM_FLAT_MIN_WORK` an Adam model
-#: stays on the static path it had before flat data compiled.
+#: Adam is gated. Its update is a dozen graph operations a parameter where
+#: the static path runs one kernel, so a model with many parameters and a
+#: small batch spends its step on that update and the graph loses; a small
+#: model is all host work, and there the one graph beats the static path's
+#: thirty-odd dispatches. Measured 2026-10-07 on fashion, two epochs, under
+#: the GPU lock at a load of 4-6 (n=5, alternated, static/compiled):
+#: [784-128-64-10] b64 1.46x (1.39-1.48), b32 1.32x, b128 1.05x, b512 1.02x;
+#: [64,64] b64 1.50x; [100,50] b64 1.49x; [128,128] b64 1.31x; [150,100]
+#: b128 2.0x; [64,32] b256 1.23x; examples/digit_trainer 4.0 s to 2.8 s.
+#: Past about 200k parameters at a small batch it turns: [256,256] b64
+#: 0.79x, [384,192] 0.83x, [512,512] 0.89x, [1024,1024] b256 0.99x. With one
+#: hidden layer the static path is lean enough to tie: [96] b64 0.90x, [32]
+#: b32 1.10x. So an Adam model compiles when it has at least two hidden layers
+#: and at most `ADAM_FLAT_SMALL_PARAMETERS` parameters, or when its step
+#: carries `ADAM_FLAT_MIN_WORK` (batch times parameters, roughly the
+#: multiply-adds of one forward pass), where the arithmetic hides the update:
+#: [512,512] b2048 1.16x.
+#:
+#: Under heavy load the small-model win is the first thing to go: at a load
+#: of 10-40 the same [784-128-64-10] b64 read 0.82x, because encoding a graph
+#: is host work that competes for the processor. These numbers are for a
+#: machine doing one thing.
 #:
 #: A short last batch is no reason to stay off it: the epoch trains that
 #: batch through the ordinary path, which shares the step's parameters and
@@ -712,17 +721,28 @@ fn flat_policy() -> int {
 #: `JAITENSOR_COMPILED_FLAT`: 0 never compiles for a flat dataset (the old
 #: rule), 2 compiles whatever the work, and anything else is the default
 #: above. Read once; `set_flat_policy` overrides it in-process.
-pub fn flat_step_wanted(samples: int, batch_size: int, adam: bool = false, work: int = 0) -> bool {
+pub fn flat_step_wanted(
+    samples: int,
+    batch_size: int,
+    adam: bool = false,
+    parameters: int = 0,
+    layers: int = 0
+) -> bool {
     let policy = flat_policy()
     if policy == 0 { return false }
     if batch_size <= 0 or samples < batch_size { return false }
-    if policy == 2 { return true }
-    return not adam or work >= ADAM_FLAT_MIN_WORK
+    if policy == 2 or not adam { return true }
+    if batch_size * parameters >= ADAM_FLAT_MIN_WORK { return true }
+    return layers >= 3 and parameters <= ADAM_FLAT_SMALL_PARAMETERS
 }
 
-#: The least work a step (batch times parameters) must carry before an Adam
-#: model on flat rows is compiled; see `flat_step_wanted`.
+#: The least work a step (batch times parameters) must carry before a large
+#: Adam model on flat rows is compiled; see `flat_step_wanted`.
 pub let ADAM_FLAT_MIN_WORK = 1024 * 1024 * 1024
+
+#: The most parameters an Adam model on flat rows can have and still compile
+#: at any batch size; see `flat_step_wanted`.
+pub let ADAM_FLAT_SMALL_PARAMETERS = 3 * 65536
 
 var _fused_mlp = -1
 
