@@ -31,6 +31,7 @@ from std.os import env
 from std.gpu import Buffer
 from .layers import Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Flatten, Layer, LayerNorm
 from .layers import MaxPool2d
+from .optimizers import moment_buffers, set_steps_taken, steps_taken
 from .tensor import Tensor
 
 #: Reduction kinds the graph builder takes.
@@ -469,6 +470,12 @@ pub class CompiledStep {
     #: Empty for an optimizer that carries nothing.
     var carried: list[Buffer]
     var carried_shadow: list[Buffer]
+    #: Which of `carried` belong to the optimizer's own table rather than to
+    #: this step; see `compile_step`'s `shared_state`. Those are not freed here.
+    var borrowed: list[bool]
+    #: Whether `carried[0]` is Adam's step count and is to be kept in step with
+    #: the optimizer's table, by `resume` and `settle`.
+    var shares_count: bool
     var live_is_shadow: bool
     pub let batch_size: int
     pub let classes: int
@@ -481,6 +488,8 @@ pub class CompiledStep {
         shadow: list[Buffer],
         carried: list[Buffer],
         carried_shadow: list[Buffer],
+        borrowed: list[bool],
+        shares_count: bool,
         batch_size: int,
         classes: int
     ) {
@@ -489,10 +498,21 @@ pub class CompiledStep {
         self.shadow = shadow
         self.carried = carried
         self.carried_shadow = carried_shadow
+        self.borrowed = borrowed
+        self.shares_count = shares_count
         self.live_is_shadow = false
         self.batch_size = batch_size
         self.classes = classes
         self.freed = false
+    }
+
+    #: Take up Adam's step count where the optimizer's table has it, before
+    #: the first step of a run. Another path may have stepped the parameters
+    #: since this step last did, and the bias correction reads the count.
+    pub fn resume(self) -> void {
+        if not self.shares_count { return }
+        self.settle_values()
+        self.carried[0].upload([float(steps_taken(self.params[0]))])
     }
 
     #: One step, leaving the loss on the device.
@@ -539,7 +559,16 @@ pub class CompiledStep {
 
     #: Put the current values back where the model's own tensors expect them,
     #: which matters only when the last step wrote to the shadow side.
+    #: Adam's step count goes back to the optimizer's table too, when this
+    #: step shares it.
     pub fn settle(self) -> void {
+        self.settle_values()
+        if self.shares_count {
+            set_steps_taken(self.params, int(self.carried[0].download()[0]))
+        }
+    }
+
+    fn settle_values(self) -> void {
         if not self.live_is_shadow { return }
         for (index, param) in self.params.enumerate() {
             param.buffer().upload(self.shadow[index].download())
@@ -555,7 +584,9 @@ pub class CompiledStep {
         self.freed = true
         self.settle()
         for buffer in self.shadow { buffer.free() }
-        for buffer in self.carried { buffer.free() }
+        for (index, buffer) in self.carried.enumerate() {
+            if not self.borrowed[index] { buffer.free() }
+        }
         for buffer in self.carried_shadow { buffer.free() }
         __prim__.graph_plan_free(self.handle)
     }
@@ -736,6 +767,12 @@ pub fn set_flat_policy(policy: int) -> int {
 #: or without momentum is expressed; momentum's velocity is carried through the
 #: graph as another pair of tensors, fed in and produced, the same way the
 #: parameters are.
+#:
+#: With `shared_state` the step carries the optimizer table's own velocity or
+#: moments, and keeps Adam's step count in step with it (`resume`, `settle`),
+#: where without it every step starts its optimiser from rest. A model needs
+#: it: it moves between this path and the others as the batch size changes,
+#: and the state is the same state whichever path is stepping.
 pub fn compile_step(
     layers: list[Layer],
     input_shape: list[int],
@@ -746,7 +783,8 @@ pub fn compile_step(
     adam: bool = false,
     beta1: float = 0.9,
     beta2: float = 0.999,
-    epsilon: float = 1.0e-7
+    epsilon: float = 1.0e-7,
+    shared_state: bool = false
 ) -> CompiledStep? {
     if not allowed() {
         _refusal = "compiled steps are switched off"
@@ -919,19 +957,45 @@ pub fn compile_step(
     }
     var shadow: list[Buffer] = []
     for param in state.params { shadow.push(Buffer(param.size)) }
-    #: Everything carried starts at rest, including the step count.
+    #: In the order the graph carries them: Adam's step count first, then
+    #: each parameter's velocity or pair of moments.
+    var table: list[Buffer] = []
+    if shared_state and (adam or momentum != 0.0) {
+        let kind = if adam { 1 } else { 0 }
+        for param in state.params { table.extend(moment_buffers(param, kind)) }
+    }
+    let skip = if adam { 1 } else { 0 }
+    #: Everything the step owns starts at rest, including the step count.
     var held: list[Buffer] = []
     var held_shadow: list[Buffer] = []
-    for shape in carried_sizes {
+    var borrowed: list[bool] = []
+    for (index, shape) in carried_sizes.enumerate() {
         var size = 1
         for dimension in shape { size = size * dimension }
-        let first = Buffer(size)
+        let slot = index - skip
+        if slot >= 0 and slot < table.len() {
+            held.push(table[slot])
+            borrowed.push(true)
+        } else {
+            let first = Buffer(size)
+            first.fill_zero()
+            held.push(first)
+            borrowed.push(false)
+        }
         let second = Buffer(size)
-        first.fill_zero()
         second.fill_zero()
-        held.push(first)
         held_shadow.push(second)
     }
     _refusal = null
-    return CompiledStep(handle, state.params, shadow, held, held_shadow, input_shape[0], classes)
+    return CompiledStep(
+        handle,
+        state.params,
+        shadow,
+        held,
+        held_shadow,
+        borrowed,
+        shared_state and adam,
+        input_shape[0],
+        classes
+    )
 }

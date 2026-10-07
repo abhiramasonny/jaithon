@@ -410,10 +410,11 @@ pub class Sequential {
         #: take them out of it: forty models built, fitted and freed in turn
         #: climbed from 216 MB to 311 MB, where releasing them holds flat at
         #: 132 MB.
-        if self.input_units != 0 { reset_state(self._parameters()) }
-        #: Before the layers: freeing the step puts the parameters' current
-        #: values back into the layers' own buffers.
+        #: Before the layers and the optimizer's table: freeing the step puts
+        #: the parameters' current values back into the layers' own buffers,
+        #: and the state it carries back into the table's.
         self._drop_compiled_step()
+        if self.input_units != 0 { reset_state(self._parameters()) }
         for layer in self.layers { layer.free() }
         self.cached_parameters = null
         self.freed = true
@@ -508,9 +509,9 @@ pub class Sequential {
         let existing = self.compiled_step
         if existing is not null { existing.free() }
         self.compiled_step = if kind == 1 {
-            compile_step(self.layers, shape, classes, settings[0], adam: true, beta1: settings[1], beta2: settings[2], epsilon: settings[3])
+            compile_step(self.layers, shape, classes, settings[0], adam: true, beta1: settings[1], beta2: settings[2], epsilon: settings[3], shared_state: true)
         } else {
-            compile_step(self.layers, shape, classes, settings[0], settings[1], settings[2] > 0.5)
+            compile_step(self.layers, shape, classes, settings[0], settings[1], settings[2] > 0.5, shared_state: true)
         }
         self.compiled_for = if self.compiled_step is null { "" } else { wanted }
     }
@@ -529,6 +530,9 @@ pub class Sequential {
         let settings = optimizer.settings()
         if kind == 0 and settings.len() < 3 { return null }
         if kind == 1 and settings.len() < 4 { return null }
+        #: Not one full batch: the epoch could never run the step, and a model
+        #: holding one would say it trained through it.
+        if dataset.samples < batch_size { return null }
         let image = dataset.image_shape
         var shape = [batch_size]
         if image is not null {
@@ -1250,8 +1254,9 @@ pub class Sequential {
 
     #: One epoch through the compiled step.
     #:
-    #: The plan is built for one batch size, so a short last batch is left to
-    #: the ordinary path rather than run against a graph that does not fit it.
+    #: The plan is built for one batch size, so a short last batch is skipped,
+    #: neither trained on nor counted, rather than run against a graph that
+    #: does not fit it.
     fn _run_compiled_epoch(self, step: CompiledStep, dataset: Dataset, batch_size: int) -> Metrics {
         let total_correct = Tensor.zeros([1])
         defer { total_correct.free() }
@@ -1273,6 +1278,7 @@ pub class Sequential {
         defer {
             if loader is not null { loader.free() }
         }
+        step.resume()
         while start < dataset.samples {
             var count = min(batch_size, dataset.samples - start)
             var batch_features: Tensor

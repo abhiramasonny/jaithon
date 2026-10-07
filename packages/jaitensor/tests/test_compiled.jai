@@ -977,3 +977,67 @@ fn test_recompiling_resets_the_state_a_compiled_step_carries() -> void {
         }
     }
 }
+
+#: One model fitted in three calls, the batch size changing between them, by
+#: whatever paths the rules pick; and again with the compiled step off.
+fn fitted_in_three_sizes(
+    name: str,
+    compiled: bool,
+    sizes: list[int]
+) -> tuple[list[float], list[str]] {
+    set_compiled_step(compiled)
+    let data = learnable_rows(128, 20, 4, 17)
+    let model = Sequential(
+        [
+            Dense(32, activation: Activation.Relu),
+            Dense(16, activation: Activation.Relu),
+            Dense(4, activation: Activation.Softmax),
+        ]
+    )
+    model.compile(optimizer: optimizer_named(name), loss: SparseCategoricalCrossentropy())
+    var trace: list[float] = []
+    var routes: list[str] = []
+    for size in sizes {
+        trace.extend(
+            model.fit(data, epochs: 2, batch_size: size, verbose: false, plot_path: null).loss
+        )
+        routes.push(model.training_route())
+    }
+    model.free()
+    data.free()
+    return (trace, routes)
+}
+
+#: The optimiser's state goes on through a change of batch size, whichever
+#: path trains each fit.
+#:
+#: A compiled step is built for one batch size and carried its velocity or
+#: moments itself, starting from rest: a fit at another size built a new step
+#: and started the optimiser over, and a fit the rules sent to the static path
+#: (a batch that leaves a large tail) began from whatever the static path had
+#: last seen. The static path alone keeps one state throughout, so that is
+#: what both have to agree with.
+fn test_the_optimiser_state_survives_a_change_of_batch_size_and_path() -> void {
+    if not gpu.is_available() { return }
+    let was = compiled_step_allowed()
+    defer { set_compiled_step(was) }
+    for (name, policy, sizes, want) in [
+        ("momentum", 2, [32, 64, 32], ["compiled", "compiled", "compiled"]),
+        ("adam", 2, [32, 64, 32], ["compiled", "compiled", "compiled"]),
+        ("momentum", 1, [32, 48, 32], ["compiled", "static", "compiled"]),
+    ] {
+        let before = set_flat_policy(policy)
+        let (compiled, routes) = fitted_in_three_sizes(name, true, sizes)
+        let (eager, _eager_routes) = fitted_in_three_sizes(name, false, sizes)
+        set_flat_policy(before)
+        assert_eq(routes, want, f"{name} {sizes}")
+        for (index, value) in compiled.enumerate() {
+            assert_near(
+                value,
+                eager[index],
+                1e-4,
+                f"{name} {sizes} epoch {index}: {compiled} against {eager}"
+            )
+        }
+    }
+}

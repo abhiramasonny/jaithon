@@ -176,6 +176,27 @@ fn next_step(parameter: Tensor) -> int {
     return updated
 }
 
+#: The buffers this optimizer keeps for `parameter` -- momentum's velocity, or
+#: Adam's first and second moments -- made if it has none yet.
+#:
+#: For a path that steps the parameter some other way and must carry the same
+#: state: a compiled step reads and writes these in place of buffers of its
+#: own, so that a model moving between paths, or on to a step built for
+#: another batch size, goes on from where it was rather than from rest.
+pub fn moment_buffers(parameter: Tensor, kind: int) -> list[Buffer] {
+    let state = state_for(parameter, kind, true)
+    if kind == 0 { return [state.first_moment] }
+    return [state.first_moment, state.second_moment]
+}
+
+#: How many updates Adam has made to `parameter`; its bias correction reads it.
+pub fn steps_taken(parameter: Tensor) -> int { return _steps.get(parameter.id, 0) }
+
+#: Record that each of `parameters` has had `count` updates.
+pub fn set_steps_taken(parameters: list[Tensor], count: int) -> void {
+    for parameter in parameters { _steps[parameter.id] = count }
+}
+
 #: Allocate optimizer buffers before the first timed step.
 #:
 #: `kind` is the optimizer's own, and a state that is already there for it is
