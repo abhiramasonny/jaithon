@@ -1,18 +1,4 @@
-#: Train a digit classifier on glyphs jaicv draws, then read handwriting-ish
-#: digits back with it.
-#:
 #:     jaithon run examples/digit_trainer/train.jai
-#:
-#: The point is that both halves are in this repository and neither needs a
-#: download: jaicv RENDERS the training set with `put_text`, jaitensor TRAINS
-#: on it, and jaicv draws the results back out. There is no MNIST here and no
-#: weights to fetch -- the data is generated, so the whole thing runs from a
-#: clean checkout.
-#:
-#: What makes the generated set worth training on is that every sample is
-#: distorted differently: a rotation, a scale, a shift, a stroke width and a
-#: little noise, drawn from a seeded generator. A network trained on ten
-#: pristine glyphs would memorise ten bitmaps and learn nothing.
 import jaicv as cv
 from jaicv import Mat, Point, Point2f, Rect, Scalar, Size
 from jaitensor import Activation, Adam, Dataset, Dense, Sequential
@@ -26,24 +12,17 @@ let TRAIN_PER_CLASS = 400
 let TEST_PER_CLASS = 40
 let EPOCHS = 120
 
-#: One distorted digit, as `SIDE * SIDE` values in 0..1.
 fn render_digit(digit: int, rng: Random) -> list[float] {
     var canvas = Mat.zeros(SIDE, SIDE, cv.CV_8UC1)
-    #: A scale that fills most of the box, varied enough that the network
-    #: cannot key on stroke length alone.
     let scale = 0.85 + rng.next_float() * 0.45
     let thickness = if rng.next_float() < 0.4 { 1 } else { 2 }
     let face = if rng.next_float() < 0.5 { cv.FONT_HERSHEY_SIMPLEX } else { cv.FONT_HERSHEY_DUPLEX }
     let text = f"{digit}"
     let (size, baseline) = cv.get_text_size(text, face, scale, thickness)
-    #: Centred, then shifted by a couple of pixels either way.
     let x = (SIDE - size.width) // 2 + int(rng.next_float() * 5.0) - 2
     let y = (SIDE + size.height - baseline) // 2 + int(rng.next_float() * 5.0) - 2
     cv.put_text(canvas, text, Point(x, y), face, scale, Scalar(255.0), thickness)
 
-    #: A small rotation about the centre, which is the distortion a classifier
-    #: most needs to see: a `1` leaning left and a `7` leaning right are
-    #: otherwise the easiest pair in the set to confuse.
     let angle = (rng.next_float() - 0.5) * 34.0
     let rotation = cv.get_rotation_matrix_2d(
         cv.Point2f(float(SIDE) * 0.5, float(SIDE) * 0.5),
@@ -80,8 +59,6 @@ fn build_set(per_class: int, rng: Random) -> tuple[Tensor, Tensor] {
     return (Tensor([count, SIDE * SIDE], pixels), Tensor([count], labels))
 }
 
-#: A contact sheet of what the network got wrong, which says more about a
-#: classifier than its accuracy does.
 fn write_mistakes(images: Tensor, truth: list[float], predicted: list[int]) -> int {
     var wrong: list[int] = []
     for index in 0..truth.len() {
@@ -105,8 +82,6 @@ fn write_mistakes(images: Tensor, truth: list[float], predicted: list[int]) -> i
         let big = cv.cvt_color(cv.resize(small, Size(cell, cell)), cv.COLOR_GRAY2BGR)
         let top = slot // columns * cell
         let left = slot % columns * cell
-        #: A view onto the cell, written through: `roi` shares the sheet's
-        #: storage, so copying into it copies into the sheet.
         big.copy_to(sheet.roi(Rect(left, top, cell, cell)))
         cv.put_text(
             sheet,
@@ -148,9 +123,6 @@ fn main() -> int {
         f"rendered {TRAIN_PER_CLASS * CLASSES} training and {TEST_PER_CLASS * CLASSES} test digits in {clock.elapsed().to_seconds():.1f}s"
     )
 
-    #: Deliberately a plain MLP rather than a convolutional net: on 28x28
-    #: glyphs it reaches the high nineties, trains in seconds, and keeps the
-    #: example about the two libraries meeting rather than about architecture.
     var model = Sequential(
         [
             Dense(128, activation: Activation.Relu),

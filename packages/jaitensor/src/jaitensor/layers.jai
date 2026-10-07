@@ -70,11 +70,11 @@ pub trait Layer {
 
 #: Activation applied by a dense layer.
 pub enum Activation {
-    #: Leave the layer output unchanged.
+    #: x
     Linear,
-    #: Clamp negative values to zero.
+    #: max(0,x)
     Relu,
-    #: Map values through the logistic sigmoid function.
+    #: Maps x through the logistic sigmoid function.
     Sigmoid,
     #: Map values through the hyperbolic tangent function.
     Tanh,
