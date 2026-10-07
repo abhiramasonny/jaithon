@@ -2,6 +2,7 @@
 from ..tensor import GradNode, Tensor
 from .kernels import cached_kernel, f32_bits
 from .shape import reshape
+from std.os import env
 
 #: How many masks have been drawn, so that the next one differs from the last.
 var _dropout_draws = 0
@@ -194,25 +195,103 @@ pub fn layer_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
             )
             let grad_gamma = Tensor([width])
             let grad_beta = Tensor([width])
-            let params = cached_kernel("layer_norm_params_backward")
-            params.dispatch_async(
-                [
-                    input.buffer(),
-                    upstream.buffer(),
-                    grad_gamma.buffer(),
-                    grad_beta.buffer(),
-                    row_mean.buffer(),
-                    row_inv.buffer(),
-                ],
-                width,
-                [rows, width]
-            )
+            layer_norm_params(input, upstream, grad_gamma, grad_beta, row_mean, row_inv, rows, width)
             row_mean.free()
             row_inv.free()
             return [grad_input, grad_gamma, grad_beta]
         }))
     }
     return output
+}
+
+#: Whether the layer-norm parameter gradients take the strip kernels below.
+#: `JAITENSOR_LN_PARAM_STRIPS=0` keeps the one-thread-per-column kernel they
+#: replaced, for an A/B in one binary. Read once.
+var _ln_param_strips: int = -1
+
+fn ln_param_strips_on() -> bool {
+    if _ln_param_strips < 0 {
+        let text = env("JAITENSOR_LN_PARAM_STRIPS")
+        _ln_param_strips = if text is not null and text == "0" { 0 } else { 1 }
+    }
+    return _ln_param_strips == 1
+}
+
+#: The gamma and beta gradients of `layer_norm`: column sums over every row.
+#:
+#: A threadgroup to each 32 columns and each strip of rows. The strips are
+#: sized so the grid holds about 256 threadgroups -- enough to fill the device
+#: at a 768-wide model and a thousand rows -- but never thinner than 64 rows,
+#: below which the join's extra pass costs more than the strips save. One
+#: strip writes the gradients directly and skips the join.
+fn layer_norm_params(
+    input: Tensor,
+    upstream: Tensor,
+    grad_gamma: Tensor,
+    grad_beta: Tensor,
+    row_mean: Tensor,
+    row_inv: Tensor,
+    rows: int,
+    width: int
+) -> void {
+    if not ln_param_strips_on() {
+        cached_kernel("layer_norm_params_backward").dispatch_async(
+            [
+                input.buffer(),
+                upstream.buffer(),
+                grad_gamma.buffer(),
+                grad_beta.buffer(),
+                row_mean.buffer(),
+                row_inv.buffer(),
+            ],
+            width,
+            [rows, width]
+        )
+        return
+    }
+    let blocks = (width + 31) // 32
+    let wanted = max(1, 256 // blocks)
+    let strips = max(1, min(wanted, rows // 64))
+    let rows_each = (rows + strips - 1) // strips
+    let partials = cached_kernel("layer_norm_params_partials")
+    if strips == 1 {
+        partials.dispatch_async(
+            [
+                input.buffer(),
+                upstream.buffer(),
+                grad_gamma.buffer(),
+                grad_beta.buffer(),
+                row_mean.buffer(),
+                row_inv.buffer(),
+            ],
+            blocks * 256,
+            [rows, width, blocks, rows_each],
+            group_size: 256
+        )
+        return
+    }
+    let part_gamma = Tensor([strips * width])
+    let part_beta = Tensor([strips * width])
+    partials.dispatch_async(
+        [
+            input.buffer(),
+            upstream.buffer(),
+            part_gamma.buffer(),
+            part_beta.buffer(),
+            row_mean.buffer(),
+            row_inv.buffer(),
+        ],
+        strips * blocks * 256,
+        [rows, width, blocks, rows_each],
+        group_size: 256
+    )
+    cached_kernel("layer_norm_params_join").dispatch_async(
+        [part_gamma.buffer(), part_beta.buffer(), grad_gamma.buffer(), grad_beta.buffer()],
+        width,
+        [strips, width]
+    )
+    part_gamma.free()
+    part_beta.free()
 }
 
 #: Blocks per sample for the coalesced group reduction, or zero when it does

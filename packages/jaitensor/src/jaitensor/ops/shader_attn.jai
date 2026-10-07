@@ -41,6 +41,69 @@ kernel void merge_heads(device const float* input [[buffer(0)]],
     output[s * dim + h * hd + d] = input[id];
 }
 
+/* Causal masking for the row-wise kernels below.
+ *
+ * `causal_rows` is 0 for no mask, and otherwise the number of query rows per
+ * head, Tq: row `r` of the `[heads * Tq, Tk]` matrix is query `r % Tq`, and it
+ * sees keys up to `r % Tq + Tk - Tq`, so a query block placed at the end of a
+ * longer key sequence (a KV cache) lines up with its own position. Every row
+ * keeps at least its own key, so no row is ever entirely masked.
+ *
+ * Masked entries are written as zero up to `stop`. With `zero_span` 0 that is
+ * the whole row, which a generic GEMM reading the full matrix needs; the MMA
+ * kernels never read past the 64-wide tile holding the diagonal, so they ask
+ * for zeros only up to that tile's edge and the rest of the row is never
+ * touched at all. */
+inline uint causal_limit(uint row, uint columns, uint causal_rows) {
+    if (causal_rows == 0u) return columns;
+    return min(columns, row % causal_rows + columns - causal_rows + 1u);
+}
+
+inline uint causal_stop(uint valid, uint columns, uint causal_rows, uint zero_span) {
+    if (causal_rows == 0u) return columns;
+    if (zero_span == 0u) return columns;
+    return min(columns, (valid + zero_span - 1u) / zero_span * zero_span);
+}
+
+/* A 256-thread group's max and sum, in the same order of operations the
+ * softmax kernels below spell out inline, so either path rounds alike. */
+inline float group_max_256(float value, threadgroup float* lanes, threadgroup float* shared,
+                           uint lid, uint lane, uint warp) {
+    const float floor_value = -3.402823e+38f;
+    if (lid < 32u) lanes[lid] = floor_value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    value = simd_max(value);
+    if (lane == 0u) lanes[warp] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float m = floor_value;
+        for (uint j = 0u; j < 32u; j++) m = max(m, lanes[j]);
+        *shared = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return *shared;
+}
+
+inline float group_sum_256(float value, threadgroup float* lanes, threadgroup float* shared,
+                           uint lid, uint lane, uint warp) {
+    if (lid < 32u) lanes[lid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    value = simd_sum(value);
+    if (lane == 0u) lanes[warp] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0u) {
+        float s = 0.0f;
+        for (uint j = 0u; j < 32u; j++) s += lanes[j];
+        *shared = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return *shared;
+}
+
+/* Rows up to this many columns keep their values in registers between the
+ * passes: eight a thread across the group of 256. */
+constant constexpr uint SOFTMAX_HELD = 8u;
+
 /* Row softmax of every head's scores at once, scaling as it reads.
  *
  * In place, and the aliasing is safe rather than lucky: a threadgroup owns
@@ -51,10 +114,13 @@ kernel void merge_heads(device const float* input [[buffer(0)]],
  * elements read and written twice. The products are the same float32
  * multiplies the separate pass did, in the same order, so the answer is
  * bit-for-bit what `softmax(scale(scores, factor))` gave. */
-kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
+template <uint HOLD>
+[[kernel]] void mha_softmax_scaled_t(device float* scores [[buffer(0)]],
                                constant uint& rows [[buffer(1)]],
                                constant uint& columns [[buffer(2)]],
                                constant uint& scale_bits [[buffer(3)]],
+                               constant uint& causal_rows [[buffer(4)]],
+                               constant uint& zero_span [[buffer(5)]],
                                uint row [[threadgroup_position_in_grid]],
                                uint lid [[thread_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]],
@@ -67,9 +133,46 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
     threadgroup float lanes[32];
     threadgroup float shared_peak;
     threadgroup float shared_total;
+    const uint valid = causal_limit(row, columns, causal_rows);
+    const uint stop = causal_stop(valid, columns, causal_rows, zero_span);
+
+    /* A row that fits is read once and written once: the three passes below
+     * read it three times, which at seq 1024 and 12 heads is 48 MB a pass of
+     * a kernel that is nothing but bandwidth. Same operations in the same
+     * order, but the compiler fuses and schedules the two spellings
+     * differently: with a head width whose scale is a power of two (64) the
+     * answer is the same bit for bit, and otherwise it moves by about an ulp
+     * (at most 2e-5 on a gradient, measured at hd 8, 32 and 48). */
+    if (HOLD != 0u && valid <= GROUP * SOFTMAX_HELD) {
+        float held[SOFTMAX_HELD];
+        float top = floor_value;
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            const uint i = lid + r * GROUP;
+            held[r] = i < valid ? scores[base + i] * factor : floor_value;
+            top = max(top, held[r]);
+        }
+        const float hm = group_max_256(top, lanes, &shared_peak, lid, lane, warp);
+        float sum = 0.0f;
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            if (lid + r * GROUP < valid) {
+                held[r] = exp(held[r] - hm);
+                sum += held[r];
+            }
+        }
+        const float denom = group_sum_256(sum, lanes, &shared_total, lid, lane, warp);
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            const uint i = lid + r * GROUP;
+            if (i < valid) scores[base + i] = held[r] / denom;
+        }
+        for (uint i = valid + lid; i < stop; i += GROUP) scores[base + i] = 0.0f;
+        return;
+    }
 
     float peak = floor_value;
-    for (uint i = lid; i < columns; i += GROUP) peak = max(peak, scores[base + i] * factor);
+    for (uint i = lid; i < valid; i += GROUP) peak = max(peak, scores[base + i] * factor);
     if (lid < 32u) lanes[lid] = floor_value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     peak = simd_max(peak);
@@ -84,7 +187,7 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
     const float m = shared_peak;
 
     float total = 0.0f;
-    for (uint i = lid; i < columns; i += GROUP) total += exp(scores[base + i] * factor - m);
+    for (uint i = lid; i < valid; i += GROUP) total += exp(scores[base + i] * factor - m);
     if (lid < 32u) lanes[lid] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     total = simd_sum(total);
@@ -98,9 +201,19 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float denominator = shared_total;
 
-    for (uint i = lid; i < columns; i += GROUP)
+    for (uint i = lid; i < valid; i += GROUP)
         scores[base + i] = exp(scores[base + i] * factor - m) / denominator;
+    for (uint i = valid + lid; i < stop; i += GROUP) scores[base + i] = 0.0f;
 }
+
+/* The held path is a separate instance, not a runtime flag: compiled into
+ * the one kernel, its registers were allocated even when the branch never
+ * ran, and the plain softmax at seq 512 measured slower than before the
+ * held path existed. `_held` is the opt-in variant. */
+template [[host_name("mha_softmax_scaled")]] [[kernel]]
+decltype(mha_softmax_scaled_t<0u>) mha_softmax_scaled_t<0u>;
+template [[host_name("mha_softmax_scaled_held")]] [[kernel]]
+decltype(mha_softmax_scaled_t<1u>) mha_softmax_scaled_t<1u>;
 
 /* The gradient of the above, also in place and for the same reason.
  *
@@ -108,11 +221,14 @@ kernel void mha_softmax_scaled(device float* scores [[buffer(0)]],
  * has read every element it needs before the write loop starts. The factor
  * multiplies last, as it did when `scale` was the op after this one, so the
  * rounding is unchanged. */
-kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
+template <uint HOLD>
+[[kernel]] void mha_softmax_backward_scaled_t(device const float* probs [[buffer(0)]],
                                         device float* grad [[buffer(1)]],
                                         constant uint& rows [[buffer(2)]],
                                         constant uint& columns [[buffer(3)]],
                                         constant uint& scale_bits [[buffer(4)]],
+                                        constant uint& causal_rows [[buffer(5)]],
+                                        constant uint& zero_span [[buffer(6)]],
                                         uint row [[threadgroup_position_in_grid]],
                                         uint lid [[thread_index_in_threadgroup]],
                                         uint lane [[thread_index_in_simdgroup]],
@@ -123,9 +239,37 @@ kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
     const float factor = as_type<float>(scale_bits);
     threadgroup float lanes[32];
     threadgroup float shared_dot;
+    const uint valid = causal_limit(row, columns, causal_rows);
+    const uint stop = causal_stop(valid, columns, causal_rows, zero_span);
+
+    /* As in the forward: a row that fits is read once, not twice. */
+    if (HOLD != 0u && valid <= GROUP * SOFTMAX_HELD) {
+        float held_p[SOFTMAX_HELD];
+        float held_g[SOFTMAX_HELD];
+        float part = 0.0f;
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            const uint i = lid + r * GROUP;
+            held_p[r] = 0.0f;
+            held_g[r] = 0.0f;
+            if (i < valid) {
+                held_g[r] = grad[base + i];
+                held_p[r] = probs[base + i];
+                part += held_g[r] * held_p[r];
+            }
+        }
+        const float whole = group_sum_256(part, lanes, &shared_dot, lid, lane, warp);
+#pragma clang loop unroll(full)
+        for (uint r = 0u; r < SOFTMAX_HELD; ++r) {
+            const uint i = lid + r * GROUP;
+            if (i < valid) grad[base + i] = factor * (held_p[r] * (held_g[r] - whole));
+        }
+        for (uint i = valid + lid; i < stop; i += GROUP) grad[base + i] = 0.0f;
+        return;
+    }
 
     float dot = 0.0f;
-    for (uint i = lid; i < columns; i += GROUP) dot += grad[base + i] * probs[base + i];
+    for (uint i = lid; i < valid; i += GROUP) dot += grad[base + i] * probs[base + i];
     if (lid < 32u) lanes[lid] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     dot = simd_sum(dot);
@@ -139,9 +283,15 @@ kernel void mha_softmax_backward_scaled(device const float* probs [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float total = shared_dot;
 
-    for (uint i = lid; i < columns; i += GROUP)
+    for (uint i = lid; i < valid; i += GROUP)
         grad[base + i] = factor * (probs[base + i] * (grad[base + i] - total));
+    for (uint i = valid + lid; i < stop; i += GROUP) grad[base + i] = 0.0f;
 }
+
+template [[host_name("mha_softmax_backward_scaled")]] [[kernel]]
+decltype(mha_softmax_backward_scaled_t<0u>) mha_softmax_backward_scaled_t<0u>;
+template [[host_name("mha_softmax_backward_scaled_held")]] [[kernel]]
+decltype(mha_softmax_backward_scaled_t<1u>) mha_softmax_backward_scaled_t<1u>;
 
 kernel void mha_scores(device const float* query [[buffer(0)]],
                        device const float* key [[buffer(1)]],
@@ -224,6 +374,7 @@ kernel void mha_scores_mma(device const float* a [[buffer(0)]],
                            constant uint& heads [[buffer(4)]],
                            constant uint& hd [[buffer(5)]],
                            constant uint& tiles [[buffer(6)]],
+                           constant uint& causal [[buffer(7)]],
                            uint wid [[threadgroup_position_in_grid]],
                            uint sg [[simdgroup_index_in_threadgroup]]) {
     uint dim = heads * hd;
@@ -231,6 +382,20 @@ kernel void mha_scores_mma(device const float* a [[buffer(0)]],
     uint rest = wid / tiles;
     uint tile_n = rest % tiles;
     uint head = rest / tiles;
+    /* Causal: a patch wholly above the diagonal is masked, and nothing
+     * downstream reads it, so the grid holds only the lower triangle --
+     * tiles * (tiles + 1) / 2 patches a head -- and `wid` counts along it
+     * row by row. */
+    if (causal != 0u) {
+        uint triangle = tiles * (tiles + 1u) / 2u;
+        uint t = wid % triangle;
+        head = wid / triangle;
+        tile_m = uint((sqrt(8.0f * float(t) + 1.0f) - 1.0f) * 0.5f);
+        while ((tile_m + 1u) * (tile_m + 2u) / 2u <= t) tile_m++;
+        while (tile_m * (tile_m + 1u) / 2u > t) tile_m--;
+        tile_n = t - tile_m * (tile_m + 1u) / 2u;
+    }
+    if (head >= heads) return;
     uint m0 = tile_m * 64u + sg * 32u;
     uint n0 = tile_n * 64u;
     device const float* A = a + (ulong)head * hd + (ulong)m0 * dim;
@@ -276,12 +441,23 @@ kernel void mha_context_mma(device const float* p [[buffer(0)]],
                             constant uint& seq [[buffer(3)]],
                             constant uint& heads [[buffer(4)]],
                             constant uint& hd [[buffer(5)]],
+                            constant uint& causal [[buffer(6)]],
                             uint wid [[threadgroup_position_in_grid]],
                             uint sg [[simdgroup_index_in_threadgroup]]) {
     uint dim = heads * hd;
     uint tiles = seq / 64u;
     uint tile_m = wid % tiles;
     uint head = wid / tiles;
+    /* Causal: the probabilities right of this patch's diagonal tile are zero,
+     * so the last patch walks the whole row and the first one tile of it.
+     * The grid is handed out longest first -- every head's last patch, then
+     * every head's second-last -- so the long ones are not left to run alone
+     * at the end of the dispatch. */
+    if (causal != 0u) {
+        tile_m = tiles - 1u - wid / heads;
+        head = wid % heads;
+    }
+    uint k_end = causal != 0u ? (tile_m + 1u) * 64u : seq;
     uint m0 = tile_m * 64u + sg * 32u;
     device const float* A = p + (ulong)head * seq * seq + (ulong)m0 * seq;
     device const float* B = v + (ulong)head * hd;
@@ -292,7 +468,7 @@ kernel void mha_context_mma(device const float* p [[buffer(0)]],
 #pragma clang loop unroll(full)
         for (uint j = 0u; j < 8u; ++j)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    for (uint k = 0u; k < seq; k += 8u) {
+    for (uint k = 0u; k < k_end; k += 8u) {
         simdgroup_float8x8 af[4];
         simdgroup_float8x8 bf[8];
 #pragma clang loop unroll(full)
@@ -326,12 +502,22 @@ kernel void mha_transposed_mma(device const float* p [[buffer(0)]],
                                constant uint& seq [[buffer(3)]],
                                constant uint& heads [[buffer(4)]],
                                constant uint& hd [[buffer(5)]],
+                               constant uint& causal [[buffer(6)]],
                                uint wid [[threadgroup_position_in_grid]],
                                uint sg [[simdgroup_index_in_threadgroup]]) {
     uint dim = heads * hd;
     uint tiles = seq / 64u;
     uint tile_m = wid % tiles;
     uint head = wid / tiles;
+    /* Causal: key m is seen only by queries at or after it, so the column of
+     * probabilities this patch reads is zero above its diagonal tile. The
+     * first patch is the longest here; hand them out in that order, as the
+     * context kernel does. */
+    if (causal != 0u) {
+        tile_m = wid / heads;
+        head = wid % heads;
+    }
+    uint k_begin = causal != 0u ? tile_m * 64u : 0u;
     uint m0 = tile_m * 64u + sg * 32u;
     device const float* A = p + (ulong)head * seq * seq + m0;
     device const float* B = u + (ulong)head * hd;
@@ -342,7 +528,7 @@ kernel void mha_transposed_mma(device const float* p [[buffer(0)]],
 #pragma clang loop unroll(full)
         for (uint j = 0u; j < 8u; ++j)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    for (uint k = 0u; k < seq; k += 8u) {
+    for (uint k = k_begin; k < seq; k += 8u) {
         simdgroup_float8x8 af[4];
         simdgroup_float8x8 bf[8];
 #pragma clang loop unroll(full)
