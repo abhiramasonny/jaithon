@@ -9,6 +9,12 @@
 #: went to the exception exit, and the `catch` was skipped: the error escaped
 #: to whoever called the function holding the `try`.
 #:
+#: OSR loops are the exception to the decline: a call that writes nothing
+#: (direct, indirect, or descriptor) records its offset and unwinds to the
+#: handler from the compiled loop instead of stopping it (see
+#: emitProtectedThrew). The function tier, and callees that write, still
+#: decline -- which is what every test below pins.
+#:
 #: The interpreter, and a body that has not compiled yet, get every one of
 #: these right, so each test warms the try-holder past the call threshold with
 #: a call that does not raise before making the one that does.

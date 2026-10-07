@@ -1898,6 +1898,10 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
 
     gDeopt.nstack = 0;
     gDeopt.base = 0;
+    /* Cleared on every entry: a protected call's throw-ip trampoline sets it
+     * on the raise path, and the -2 branch below reads it. Any other exit
+     * leaves it clear so vmThrow falls back to the faulting instruction. */
+    gJitThrowIp = -1;
     /* An OSR form's locals ARE the frame slots and its stub writes none, so
      * nothing here fills the mask -- clear it rather than leave the last
      * function-tier stub's behind for whoever reads the record next. */
@@ -1919,6 +1923,12 @@ int jaiJitEnterOsr(ObjClosure *closure, uint32_t top, uint32_t *resumeAt) {
             if (sunk) osrMaterializeSinks(frame->slots, NULL, 0);
             if (at == -1)
                 return osrNo(fn, top, "the compiled loop bailed out at entry");
+            /* A protected call raised: throw from the call's own offset so
+             * the unwinder finds the in-function handler. Any other raise
+             * leaves the loop-head ip, which correctly propagates out of
+             * the frame. */
+            if (gJitThrowIp >= 0 && gJitThrowIp < fn->chunk.count)
+                frame->ip = fn->chunk.code + gJitThrowIp;
             return 2;                    /* an exception is pending */
         }
     }

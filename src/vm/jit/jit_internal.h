@@ -1172,6 +1172,7 @@ typedef enum { DISCARD_NO, DISCARD_POP, DISCARD_POP_RETURN } DiscardKind;
 /* Defined in jit_runtime.c. */
 extern JitCallDesc *gJitFrames;
 extern JitDeoptRecord gDeopt;
+extern int64_t gJitThrowIp;
 
 /* JAITHON_JIT_RAW_ROOTS (default on), read once at process start. On, a
  * descriptor's roots are RAW object pointers -- `nroots` of them, packed two
@@ -1580,6 +1581,7 @@ void emitBoundsNormalise(Emit *e, unsigned rIdx, unsigned rCount,
 void branchOnOverflow(Emit *e, unsigned which, unsigned cond);
 unsigned ovfDest(const Emit *e, unsigned home);
 bool raiseExitAllowed(Emit *e, const char *what);
+bool emitProtectedThrew(Emit *e, unsigned skipCond, uint32_t callOff);
 bool negatedCondition(uint8_t cmp, unsigned *out);
 ObjClass *globalClass(ObjClosure *closure, uint32_t nameIdx);
 bool jitGlobalEnum(void);
@@ -1628,7 +1630,14 @@ bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                            unsigned nargs, void *helper);
 bool emitDescriptorFull(Emit *e, Value calleeVal, unsigned first,
                         unsigned nargs, void *helper, bool ownStatus,
-                        int calleeReg, bool noRoots);
+                        int calleeReg, bool noRoots, uint32_t protOff,
+                        bool protThrow);
+/* Like emitDescriptor, but a raise unwinds to the in-function handler at
+ * `callOff` when `protThrow` (an OSR loop inside a `try`); see
+ * emitProtectedThrew. */
+bool emitDescriptorAt(Emit *e, Value calleeVal, unsigned first,
+                             unsigned nargs, void *helper, uint32_t callOff,
+                             bool protThrow);
 bool concatOperands(const Emit *e, Value *sample);
 bool emitStringConcat(Emit *e, Value sample);
 bool nullLiteralPair(const Emit *e, uint8_t op, SlotKind ka, SlotKind kb);

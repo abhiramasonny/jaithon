@@ -152,8 +152,13 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
                            Value calleeVal, int calleeReg, unsigned cidx,
                            unsigned argc, uint32_t callOff, uint32_t after,
                            bool method) {
-    /* Either verdict path below can come back with an exception pending. */
-    if (!raiseExitAllowed(e, "a call that can raise inside a try")) return false;
+    /* Either verdict path below can come back with an exception pending.
+     * In an OSR loop inside a `try` the raise unwinds to the handler through
+     * the throw-ip trampoline below (non-writing callees only), so the refusal
+     * does not apply there; it is re-checked once `writes` is known. */
+    bool protThrow = e->osr && e->inProtected;
+    if (!protThrow &&
+        !raiseExitAllowed(e, "a call that can raise inside a try")) return false;
     if (cfn->module != caller->module) {
         e->whyNot = "a direct callee from another module";
         return false;
@@ -180,6 +185,15 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
     bool writes = !cfn->jitFuncNoWrite;
     if (writes && (calleeReg >= 0 || !IS_CLOSURE(calleeVal))) {
         e->whyNot = "a direct callee that writes and is not known here";
+        return false;
+    }
+    /* A callee that writes cannot unwind to an in-function handler from
+     * compiled code: verdict 4 is finished in the interpreter and resumes
+     * after the call, and verdict 2 has no faulting offset to throw from.
+     * Decline softly (no `failed`) so the caller falls back to the
+     * descriptor path, which throws with the effects intact. */
+    if (protThrow && writes) {
+        e->whyNot = "a call that can raise inside a try";
         return false;
     }
     /* `nargs` is how many registers the branch fills. A method's receiver is
@@ -312,15 +326,23 @@ bool emitDirectCall(Emit *e, ObjFunction *caller, ObjFunction *cfn,
         emit(e, jaiA64CbnzX(1, 0));   /* the stub re-reads x1 itself */
     } else {
         /* Verdict 2 is a pending exception: the interpreter owns it and this
-         * call must not run again. */
+         * call must not run again. In a protected OSR loop it unwinds to the
+         * handler; anywhere else it takes the shared throw exit. */
         emit(e, jaiA64SubsXImm(31, 1, 2));
-        if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
-        e->fixups[e->fixupCount].instIndex    = (int)e->count;
-        e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
-        e->fixups[e->fixupCount].conditional  = true;
-        e->fixups[e->fixupCount].depth        = -1;
-        e->fixupCount++;
-        emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+        if (protThrow) {
+            if (!emitProtectedThrew(e, JAI_A64_NE, callOff)) {
+                e->failed = true;
+                return false;
+            }
+        } else {
+            if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+            e->fixups[e->fixupCount].instIndex    = (int)e->count;
+            e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+            e->fixups[e->fixupCount].conditional  = true;
+            e->fixups[e->fixupCount].depth        = -1;
+            e->fixupCount++;
+            emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+        }
         /* Anything else -- a bail, or a guard that failed inside the callee --
          * hands the whole call back. The record is taken with the callee and
          * its arguments still on the model's stack, which is what the

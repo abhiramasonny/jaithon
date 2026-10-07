@@ -155,6 +155,13 @@ void jitThrowOverflow(int64_t which) {
 }
 
 JitDeoptRecord gDeopt;
+/* Faulting offset for the unwinder, recorded by a protected call's throw-ip
+ * trampoline and taken by vmThrow. Deliberately NOT a JitDeoptRecord field:
+ * every function-tier deopt stub writes gDeopt.ip, so sharing it would hand
+ * unrelated throws a stale offset and misdirect handler matching. Only the
+ * trampoline writes this, jaiJitEnterOsr clears it on entry, and vmThrow
+ * takes (and clears) it. */
+int64_t gJitThrowIp = -1;
 
 /* Cached: getenv is O(environ) and this sits on the hot deopt path, so leaving it uncached let ambient
  * shell-exported variable count perturb benchmarks (sort_merge moved 70ms->100ms on padding alone). Same idiom as jaiJitEnabled. */
@@ -198,6 +205,13 @@ bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
                 (long long)gDeopt.nstack);
     }
     return true;
+}
+
+/* See jit.h. */
+int64_t jaiJitTakeThrowIp(void) {
+    int64_t ip = gJitThrowIp;
+    gJitThrowIp = -1;
+    return ip;
 }
 
 /* Receiver is args[0], exactly where callNativeAt wants it, so no bound wrapper is made. Roots as jitCallOut does, since push and its kin allocate. */
@@ -1129,6 +1143,7 @@ int jitCallOut(JitCallDesc *d) {
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase) {
     (void)closure; (void)slotBase; return false;
 }
+int64_t jaiJitTakeThrowIp(void) { return -1; }
 void jaiJitMarkFrames(void) {
 }
 

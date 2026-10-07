@@ -115,6 +115,11 @@ bool jaiJitMapKernelOn(void);
 /* Populate the freshly pushed frame from the deopt record. */
 bool jaiJitApplyDeopt(ObjClosure *closure, Value *slotBase);
 
+/* Take the faulting offset a protected call's throw-ip trampoline recorded
+ * for the unwinder, resetting it to "none". -1 unless an OSR form exited
+ * with a raise inside a `try` since the last take. */
+int64_t jaiJitTakeThrowIp(void);
+
 /* Finish, in the interpreter, a compiled body that deoptimised part-way,
  * building its frame entirely from the deopt record. `*out` gets the return
  * value; false means an exception is pending. The record is a single global,

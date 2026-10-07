@@ -3515,7 +3515,12 @@ vmThrow: {
         }
         CallFrame *faulting = &vm.frames[vm.frameCount - 1];
         Chunk *chunk = frameChunk(faulting);
-        ptrdiff_t at = instStart - chunk->code;
+        /* An OSR form that exited with a raise inside a `try` names the
+         * call's own offset; everything else throws from the faulting
+         * instruction. */
+        int64_t throwIp = jaiJitTakeThrowIp();
+        ptrdiff_t at = throwIp >= 0 ? (ptrdiff_t)throwIp
+                                    : instStart - chunk->code;
         if (at < 0 || at > chunk->count) at = 0;
 
         if (!unwindToHandler(baseFrameCount, (uint32_t)at)) {

@@ -292,15 +292,19 @@ bool emitDescriptorStatus(Emit *e, Value calleeVal, unsigned first,
                                  unsigned nargs, void *helper, bool ownStatus,
                                  int calleeReg) {
     return emitDescriptorFull(e, calleeVal, first, nargs, helper, ownStatus,
-                              calleeReg, false);
+                              calleeReg, false, 0, false);
 }
 
 /* `noRoots`: a LEAF helper that never collects (it declines instead), so the
  * root fill -- a store per live object the body holds -- is skipped and the
- * descriptor carries none. */
+ * descriptor carries none. `protThrow` with `protOff`: the call sits in a
+ * `try` in an OSR loop, so a raise unwinds to the handler through the
+ * throw-ip trampoline instead of declining; `protOff` is the call's own
+ * offset (the helper prefers the outer call when inlining). */
 bool emitDescriptorFull(Emit *e, Value calleeVal, unsigned first,
                         unsigned nargs, void *helper, bool ownStatus,
-                        int calleeReg, bool noRoots) {
+                        int calleeReg, bool noRoots, uint32_t protOff,
+                        bool protThrow) {
     if (nargs > JIT_MAX_ARGS_OUT) { e->whyNot = "call argc"; return false; }
     if (!e->callsOut) { e->whyNot = "callsOut off"; return false; }
 
@@ -386,22 +390,40 @@ bool emitDescriptorFull(Emit *e, Value calleeVal, unsigned first,
 
     if (ownStatus) return true;
 
-    /* Nonzero means the callee raised; the interpreter owns it from here. */
-    if (!raiseExitAllowed(e, "a call that can raise inside a try")) return false;
+    /* Nonzero means the callee raised; the interpreter owns it from here. A
+     * descriptor call never re-executes -- the interpreter throws with the
+     * effects intact -- so the trampoline is sound for any callee, however
+     * much it writes. */
+    if (!protThrow &&
+        !raiseExitAllowed(e, "a call that can raise inside a try")) return false;
     emit(e, jaiA64SubsXImm(31, 0, 0));
-    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
-    e->fixups[e->fixupCount].instIndex    = (int)e->count;
-    e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
-    e->fixups[e->fixupCount].conditional  = true;
-    e->fixups[e->fixupCount].depth        = -1;
-    e->fixupCount++;
-    emit(e, jaiA64BCond(JAI_A64_NE, 0));
+    if (protThrow) {
+        if (!emitProtectedThrew(e, JAI_A64_EQ, protOff)) {
+            e->failed = true;
+            return false;
+        }
+    } else {
+        if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+        e->fixups[e->fixupCount].instIndex    = (int)e->count;
+        e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+        e->fixups[e->fixupCount].conditional  = true;
+        e->fixups[e->fixupCount].depth        = -1;
+        e->fixupCount++;
+        emit(e, jaiA64BCond(JAI_A64_NE, 0));
+    }
     return true;
 }
 
 bool emitDescriptor(Emit *e, Value calleeVal, unsigned first,
                            unsigned nargs, void *helper) {
     return emitDescriptorStatus(e, calleeVal, first, nargs, helper, false, -1);
+}
+
+bool emitDescriptorAt(Emit *e, Value calleeVal, unsigned first,
+                             unsigned nargs, void *helper, uint32_t callOff,
+                             bool protThrow) {
+    return emitDescriptorFull(e, calleeVal, first, nargs, helper, false, -1,
+                              false, callOff, protThrow);
 }
 
 #endif /* __aarch64__ || __arm64__ */

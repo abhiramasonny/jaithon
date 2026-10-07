@@ -265,8 +265,14 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
              * handler was skipped and the raise escaped to the caller. Every
              * other call arm asks this; this one stopped when its bail became
              * a deopt, and an inlined body above needs no answer because its
-             * guards resume at the call. See Emit::inProtected. */
-            if (!raiseExitAllowed(e, "a call that can raise inside a try")) {
+             * guards resume at the call. See Emit::inProtected.
+             *
+             * In an OSR loop the raise unwinds to the handler through the
+             * throw-ip trampoline instead (non-writing callees only); the
+             * refusal is re-checked once `writes` is known below. */
+            bool protThrow = e->osr && e->inProtected;
+            if (!protThrow &&
+                !raiseExitAllowed(e, "a call that can raise inside a try")) {
                 return false;
             }
 
@@ -319,6 +325,13 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
              * A callee whose finish would drop an argument is refused, as
              * emitDirectCall refuses it (finishDropsAnArgument). */
             bool writes = !cfn->jitFuncNoWrite;
+            /* As in emitDirectCall: a callee that writes cannot unwind to an
+             * in-function handler from compiled code. Keep declining those. */
+            if (protThrow && writes) {
+                e->whyNot = "a call that can raise inside a try";
+                e->failed = true;
+                return false;
+            }
             if (writes) {
                 if (e->selfSlowCount >= JIT_MAX_SELF_SLOW) {
                     e->whyNot = "more slow call sites than the tier tracks";
@@ -416,13 +429,20 @@ bool emitCall(Emit *e, ObjFunction *fn, const uint8_t *code, int *offp) {
                 emit(e, jaiA64CbnzX(1, 0));   /* the stub re-reads x1 itself */
             } else {
                 emit(e, jaiA64SubsXImm(31, 1, 2));
-                if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
-                e->fixups[e->fixupCount].instIndex    = (int)e->count;
-                e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
-                e->fixups[e->fixupCount].conditional  = true;
-                e->fixups[e->fixupCount].depth        = -1;
-                e->fixupCount++;
-                emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+                if (protThrow) {
+                    if (!emitProtectedThrew(e, JAI_A64_NE, (uint32_t)off)) {
+                        e->failed = true;
+                        return false;
+                    }
+                } else {
+                    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+                    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+                    e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+                    e->fixups[e->fixupCount].conditional  = true;
+                    e->fixups[e->fixupCount].depth        = -1;
+                    e->fixupCount++;
+                    emit(e, jaiA64BCond(JAI_A64_EQ, 0));
+                }
                 emit(e, jaiA64SubsXImm(31, 1, 0));
                 branchOnDeoptAt(e, JAI_A64_NE, (uint32_t)off, false);
             }

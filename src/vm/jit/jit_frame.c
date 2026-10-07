@@ -637,6 +637,36 @@ void branchOnDeoptAt(Emit *e, unsigned cond, uint32_t ip,
     emit(e, always ? jaiA64B(0) : jaiA64BCond(cond, 0));
 }
 
+/* Route a callee's raise to the in-function handler from an OSR loop inside
+ * a `try`. The caller has compared the verdict and falls through here on the
+ * raise (skipping past on `skipCond`); this records the call's offset for the
+ * unwinder and takes the shared throw exit, which syncs the locals and leaves
+ * with the exception pending. The interpreter then throws with the call as
+ * the faulting instruction instead of resuming it -- resuming would run the
+ * call a second time, whose effects already happened.
+ *
+ * Inside an inlined body the offsets are the callee's, so the record names
+ * the caller's own OP_CALL, which is the offset the protected region covers.
+ * The hot path pays one correctly-predicted not-taken branch; the store and
+ * the taken branch live on the raise path only. */
+bool emitProtectedThrew(Emit *e, unsigned skipCond, uint32_t callOff) {
+    unsigned skipPos = e->count;
+    emit(e, jaiA64BCond(skipCond, 0));
+    uint32_t ip = e->inlining ? e->inlIp : callOff;
+    emitConst64(e, JIT_SCRATCH_A, (int64_t)(uintptr_t)&gJitThrowIp);
+    emitConst64(e, JIT_SCRATCH_B, (int64_t)ip);
+    emit(e, jaiA64StrX(JIT_SCRATCH_B, JIT_SCRATCH_A, 0));
+    if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return false; }
+    e->fixups[e->fixupCount].instIndex    = (int)e->count;
+    e->fixups[e->fixupCount].targetOffset = FIXUP_THREW;
+    e->fixups[e->fixupCount].conditional  = false;
+    e->fixupCount++;
+    emit(e, jaiA64B(0));
+    if (e->failed || e->count > JIT_MAX_INSTS) { e->failed = true; return false; }
+    e->code[skipPos] = jaiA64BCond(skipCond, (int32_t)(e->count - skipPos));
+    return true;
+}
+
 /* The record branchOnDeopt takes, without the branch: the index of a deopt
  * record describing the model as it stands, for a branch to it emitted
  * somewhere else -- an out-of-line arm that runs in this same machine state

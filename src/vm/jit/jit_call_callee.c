@@ -171,7 +171,8 @@ bool emitGlobalCall(Emit *e, ObjFunction *caller, unsigned argc,
         return subWhy(e, "a callee returning %s", slotKindName(rk));
     }
 
-    if (!emitDescriptor(e, cv, e->depth - argc, argc, (void *)&jitCallOut)) {
+    if (!emitDescriptorAt(e, cv, e->depth - argc, argc, (void *)&jitCallOut,
+                          callOff, e->osr && e->inProtected)) {
         return false;
     }
     for (unsigned i = 0; i < argc; i++) {
