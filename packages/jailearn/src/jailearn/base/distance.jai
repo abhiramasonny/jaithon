@@ -6,7 +6,18 @@ from std.gpu import Buffer
 
 from .kernels import base_kernel
 from .params import check_matrix
-from .reduce import row_topk, row_topk_into, topk_one_pass
+from std.os import env_or
+
+from .reduce import DIRECT_WIDTH, row_topk, row_topk_into, topk_one_pass
+
+#: `JAILEARN_NEAREST_EXACT=0` returns `nearest_rows` to the expanded form
+#: alone: no term-by-term search for narrow rows, and no exact distances for
+#: the rows a wide search picks.
+let _NEAREST_EXACT = env_or("JAILEARN_NEAREST_EXACT", "1") != "0"
+
+#: Whether the exact search is on (`JAILEARN_NEAREST_EXACT`); a neighbour
+#: index that centres and refines its own search asks this first.
+pub fn exact_search() -> bool { return _NEAREST_EXACT }
 
 #: The squared length of every row. jaitensor's row reduction rather than a
 #: kernel here: it puts a threadgroup on each row, which matters as soon as the
@@ -62,19 +73,33 @@ pub const NEAREST_BAND_FLOATS: int = 67108864
 
 #: The `k` rows of `b` nearest each row of `a`: `(squared distances,
 #: indices)`, both `[n_a, k]`, nearest first, equal distances by the smaller
-#: index -- what `row_topk(pairwise_sqdist(a, b), k, largest: false)` returns.
+#: index.
 #:
-#: It is cheaper than that composition in two ways. The top-k reads the raw
-#: product `a.bT` and adds the norms as it ranks, so the distance matrix is
-#: never finished by a separate pass over it; and `a` is taken in bands of
-#: rows sized by `NEAREST_BAND_FLOATS`, so `n_a x n_b` is never materialised
-#: at once. A `k` past `TOPK_ONE_PASS_MAX` takes the composition, band by
-#: band. `band_floats` overrides the band size.
+#: Rows of at most `DIRECT_WIDTH` features are searched term by term, one
+#: pass that ranks `sum((a_i - b_j)^2)` directly. Wider rows take one GEMM per
+#: band and the expanded form `|a|^2 + |b|^2 - 2 a.b`, ranked as the top-k
+#: reads the product, so the distance matrix is never finished by a separate
+#: pass and `a` is taken in bands of rows sized by `NEAREST_BAND_FLOATS`. The
+#: expanded form is only good to an ulp of the squared norms, so the distances
+#: of the rows it picks are then recomputed term by term and re-sorted
+#: (`refine_nearest`): an exact duplicate comes back at zero. What the
+#: expanded form can still get wrong is WHICH rows: two rows closer together
+#: than its rounding may be picked out of order. Data far from the origin
+#: makes that rounding large; `KNeighborsClassifier` centres both sides first,
+#: which is what removes it.
+#:
+#: `exact: false` (or `JAILEARN_NEAREST_EXACT=0`) is the expanded form alone,
+#: which is `row_topk(pairwise_sqdist(a, b), k, largest: false)` exactly. A
+#: `k` past `TOPK_ONE_PASS_MAX` takes that composition, band by band.
+#: `band_floats` overrides the band size. A query holding a NaN or an
+#: infinity has no neighbours under the exact search: its row is padded with
+#: index `n_b` and distance infinity.
 pub fn nearest_rows(
     a: Tensor,
     b: Tensor,
     k: int,
-    band_floats: int = NEAREST_BAND_FLOATS
+    band_floats: int = NEAREST_BAND_FLOATS,
+    exact: bool = true
 ) -> tuple[Tensor, Tensor] {
     check_matrix(a, "a")
     check_matrix(b, "b")
@@ -86,8 +111,23 @@ pub fn nearest_rows(
     if k <= 0 or k > points { throw ValueError(f"cannot take {k} of {points} rows") }
     let values = Tensor([queries, k])
     let index = Tensor([queries, k])
-    let band = max(1, min(queries, band_floats // max(points, 1)))
     let one_pass = topk_one_pass(k)
+    let refine = exact and _NEAREST_EXACT
+    if refine and one_pass and a.shape[1] <= DIRECT_WIDTH {
+        row_topk_into(
+            b.buffer(),
+            queries,
+            points,
+            k,
+            false,
+            values,
+            index,
+            left: a.buffer(),
+            direct_width: a.shape[1]
+        )
+        return (values, index)
+    }
+    let band = max(1, min(queries, band_floats // max(points, 1)))
     let left = row_sqnorm(a)
     let right = row_sqnorm(b)
     let product = Tensor([band, points])
@@ -129,7 +169,21 @@ pub fn nearest_rows(
     product.free()
     left.free()
     right.free()
+    if refine { refine_nearest(a, b, values, index) }
     return (values, index)
+}
+
+#: Recompute, term by term, the squared distances of the neighbours a search
+#: of `b` for each row of `a` picked, and re-sort each row of `(values,
+#: index)` by them, equal distances by the smaller index. Both are
+#: `[n_a, k]` and are rewritten in place.
+pub fn refine_nearest(a: Tensor, b: Tensor, values: Tensor, index: Tensor) -> void {
+    let k = values.shape[1]
+    base_kernel("base_nearest_refine").dispatch_async(
+        [a.buffer(), b.buffer(), values.buffer(), index.buffer()],
+        a.shape[0],
+        [a.shape[0], a.shape[1], k, b.shape[0]]
+    )
 }
 
 fn copy_rows(part: Tensor, whole: Tensor, offset: int) -> void {

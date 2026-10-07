@@ -230,6 +230,10 @@ fn topk_threads(columns: int) -> int {
     return threads
 }
 
+#: The widest rows `row_topk_into` searches term by term; must match the
+#: kernel's `DIRECT_WIDTH`.
+pub const DIRECT_WIDTH: int = 8
+
 #: Whether `row_topk_into` takes a `k` this large in one pass.
 pub fn topk_one_pass(k: int) -> bool { return _ROW_TOPK and k <= TOPK_ONE_PASS_MAX }
 
@@ -240,6 +244,11 @@ pub fn topk_one_pass(k: int) -> bool { return _ROW_TOPK and k <= TOPK_ONE_PASS_M
 #: the squared distance `left[first + row] + right[column] - 2 m`, clamped at
 #: zero; that is how `distance.nearest_rows` searches without a finishing
 #: pass over the matrix.
+#:
+#: With `direct_width` instead, `m` is the `[columns, direct_width]` training
+#: matrix and `left` the `[rows, direct_width]` queries, and the ranked value
+#: is the squared distance taken term by term (`direct_width` at most
+#: `DIRECT_WIDTH`).
 pub fn row_topk_into(
     m: Buffer,
     rows: int,
@@ -250,20 +259,30 @@ pub fn row_topk_into(
     index: Tensor,
     first: int = 0,
     left: Buffer? = null,
-    right: Buffer? = null
+    right: Buffer? = null,
+    direct_width: int = 0
 ) -> void {
     if not topk_one_pass(k) { throw ValueError(f"k {k} is past the one-pass top-k") }
-    let fused = left is not null and right is not null
+    if direct_width > DIRECT_WIDTH {
+        throw ValueError(
+            f"a direct search takes at most {DIRECT_WIDTH} features, got {direct_width}"
+        )
+    }
+    let mode = if direct_width > 0 and left is not null {
+        2
+    } elif left is not null and right is not null {
+        1
+    } else {
+        0
+    }
+    let wanted = if largest { 1 } else { 0 }
     let threads = topk_threads(columns)
-    base_kernel(f"base_row_topk{topk_capacity(k)}").dispatch_async([m, values.buffer(), index.buffer(), left ?? m, right ?? m], rows * threads, [rows, columns, k, if largest {
-        1
-    } else {
-        0
-    }, if fused {
-        1
-    } else {
-        0
-    }, first], group_size: threads)
+    base_kernel(f"base_row_topk{topk_capacity(k)}").dispatch_async(
+        [m, values.buffer(), index.buffer(), left ?? m, right ?? m],
+        rows * threads,
+        [rows, columns, k, wanted, mode, first, direct_width],
+        group_size: threads
+    )
 }
 
 #: The `k` best entries of every row: `(values, indices)`, both `[n_rows, k]`.

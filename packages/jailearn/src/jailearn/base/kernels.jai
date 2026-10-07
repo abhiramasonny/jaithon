@@ -523,7 +523,21 @@ static inline bool topk_before(float s, uint i, float t, uint j) {
  * have written, so a neighbour search never makes that pass over the whole
  * matrix. Rows are written at `first + row`, which is how a search over bands
  * of queries fills one answer. A row with fewer than `k` ranked entries pads
- * with column `columns`, as `base_row_topk` does. */
+ * with column `columns`, as `base_row_topk` does.
+ *
+ * `fused` 2 is the direct search for narrow rows: `m` is the training matrix
+ * `b`, `left` the queries `a`, both `width <= DIRECT_WIDTH` wide, and the
+ * ranked value is `sum((a_row - b_j)^2)` taken term by term. The expanded
+ * form cancels catastrophically when the squared norms dwarf the distance --
+ * one feature, or a few far from the origin -- and at this width the
+ * difference costs no more than the product would. A query holding a NaN or
+ * an infinity ranks nothing, so its row is all padding. */
+constexpr constant uint DIRECT_WIDTH = 8u;
+
+static inline bool not_finite(float v) {
+    return (as_type<uint>(v) & 0x7F800000u) == 0x7F800000u;
+}
+
 template <uint K>
 kernel void base_row_topk_group(device const float* m [[buffer(0)]],
                                 device float* values [[buffer(1)]],
@@ -536,6 +550,7 @@ kernel void base_row_topk_group(device const float* m [[buffer(0)]],
                                 constant uint& largest [[buffer(8)]],
                                 constant uint& fused [[buffer(9)]],
                                 constant uint& first [[buffer(10)]],
+                                constant uint& width [[buffer(11)]],
                                 uint row [[threadgroup_position_in_grid]],
                                 uint lid [[thread_index_in_threadgroup]],
                                 uint threads [[threads_per_threadgroup]],
@@ -551,10 +566,34 @@ kernel void base_row_topk_group(device const float* m [[buffer(0)]],
     #pragma unroll
     for (uint p = 0u; p < K; ++p) { best[p] = -INFINITY; at[p] = none; }
     device const float* line = m + ulong(row) * ulong(columns);
-    float offset = fused != 0u ? left[first + row] : 0.0f;
-    for (uint j = lid; j < columns; j += threads) {
-        float value = line[j];
-        if (fused != 0u) value = max(offset + right[j] - 2.0f * value, 0.0f);
+    float offset = fused == 1u ? left[first + row] : 0.0f;
+    float q[DIRECT_WIDTH];
+    uint reach = columns;
+    if (fused == 2u) {
+        bool bad = false;
+        #pragma unroll
+        for (uint c = 0u; c < DIRECT_WIDTH; ++c) {
+            q[c] = c < width ? left[ulong(first + row) * ulong(width) + c] : 0.0f;
+            bad = bad || not_finite(q[c]);
+        }
+        if (bad) reach = 0u;
+    }
+    for (uint j = lid; j < reach; j += threads) {
+        float value;
+        if (fused == 2u) {
+            device const float* p = m + ulong(j) * ulong(width);
+            value = 0.0f;
+            #pragma unroll
+            for (uint c = 0u; c < DIRECT_WIDTH; ++c) {
+                if (c < width) {
+                    float gap = q[c] - p[c];
+                    value += gap * gap;
+                }
+            }
+        } else {
+            value = line[j];
+            if (fused == 1u) value = max(offset + right[j] - 2.0f * value, 0.0f);
+        }
         float s = sign * value;
         if (!topk_before(s, j, best[K - 1u], at[K - 1u])) continue;
         best[K - 1u] = s;
@@ -595,6 +634,60 @@ kernel void base_row_topk_group(device const float* m [[buffer(0)]],
             best[K - 1u] = -INFINITY;
             at[K - 1u] = none;
         }
+    }
+}
+
+/* Each query's `k` neighbours, found by the expanded form, given their exact
+ * squared distances and put back in order, a thread a query.
+ *
+ * `|a|^2 + |b|^2 - 2 a.b` in float32 is wrong by about an ulp of the squared
+ * norms, which is more than the distance between near neighbours once the
+ * norms are large: an exact duplicate came back at a distance of five. The
+ * search already holds the right rows; this recomputes `sum((a - b)^2)` for
+ * just those `k` and sorts them by `(distance, index)`, the order every top-k
+ * here uses. A query holding a NaN or an infinity has no neighbours: every
+ * slot is padded with index `points` and distance infinity. */
+kernel void base_nearest_refine(device const float* a [[buffer(0)]],
+                                device const float* b [[buffer(1)]],
+                                device float* values [[buffer(2)]],
+                                device float* index [[buffer(3)]],
+                                constant uint& queries [[buffer(4)]],
+                                constant uint& width [[buffer(5)]],
+                                constant uint& k [[buffer(6)]],
+                                constant uint& points [[buffer(7)]],
+                                uint id [[thread_position_in_grid]]) {
+    if (id >= queries) return;
+    device const float* query = a + ulong(id) * ulong(width);
+    device float* near = values + ulong(id) * ulong(k);
+    device float* at = index + ulong(id) * ulong(k);
+    bool bad = false;
+    for (uint c = 0u; c < width; ++c) bad = bad || not_finite(query[c]);
+    for (uint j = 0u; j < k; ++j) {
+        uint i = uint(at[j]);
+        if (bad || i >= points) {
+            near[j] = INFINITY;
+            at[j] = float(points);
+            continue;
+        }
+        device const float* row = b + ulong(i) * ulong(width);
+        float total = 0.0f;
+        for (uint c = 0u; c < width; ++c) {
+            float gap = query[c] - row[c];
+            total += gap * gap;
+        }
+        near[j] = total;
+    }
+    for (uint j = 1u; j < k; ++j) {
+        float v = near[j];
+        float i = at[j];
+        uint p = j;
+        while (p > 0u && (near[p - 1u] > v || (near[p - 1u] == v && at[p - 1u] > i))) {
+            near[p] = near[p - 1u];
+            at[p] = at[p - 1u];
+            --p;
+        }
+        near[p] = v;
+        at[p] = i;
     }
 }
 

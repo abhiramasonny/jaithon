@@ -312,3 +312,165 @@ fn test_nearest_rows_matches_a_host_brute_force() -> void {
         assert_true(agree * 100 >= count * k * 95, f"k {k}: {agree} of {count * k} agree")
     }
 }
+
+fn uniform_cell(index: int) -> float {
+    let s = math.sin(float(index) * 12.9898 + 78.233) * 43758.5453
+    return s - math.floor(s)
+}
+
+#: How many of each query's `k` neighbours the estimator found, against a
+#: double-precision brute force over the same float32 values. A miss must be
+#: a near-tie (closer to the right distance than float32 resolves); returns
+#: the share of exact matches.
+fn neighbour_agreement(
+    points: int,
+    width: int,
+    count: int,
+    k: int,
+    offset: float,
+    spread: float
+) -> float {
+    var train: list[float] = []
+    for index in 0..points * width { train.push(offset + spread * uniform_cell(index)) }
+    var query: list[float] = []
+    for index in 0..count * width { query.push(offset + spread * uniform_cell(index + 7777777)) }
+    let b = Tensor([points, width], train)
+    defer { b.free() }
+    let a = Tensor([count, width], query)
+    defer { a.free() }
+    let rows = jl.to_values(b)
+    let asked = jl.to_values(a)
+    let y = jl.vector([float(i % 3) for i in 0..points])
+    defer { y.free() }
+    let model = KNeighborsClassifier(k)
+    defer { model.free() }
+    model.fit(b, y)
+    let (distance, index) = model.kneighbors(a)
+    let got = jl.to_values(index)
+    let got_distance = jl.to_values(distance)
+    distance.free()
+    index.free()
+    var agree = 0
+    for row in 0..count {
+        var exact: list[float] = []
+        for column in 0..points {
+            var total = 0.0
+            for f in 0..width {
+                let gap = asked[row * width + f] - rows[column * width + f]
+                total += gap * gap
+            }
+            exact.push(total)
+        }
+        var order = [column for column in 0..points]
+        order.sort(key: |c| exact[c])
+        for slot in 0..k {
+            let picked = int(got[row * k + slot])
+            if picked == order[slot] { agree += 1 }
+            let want = math.sqrt(exact[order[slot]])
+            let scale = spread * spread * float(width)
+            assert_near(exact[picked], exact[order[slot]], 1e-5 * scale, f"row {row} slot {slot}")
+            assert_near(
+                got_distance[row * k + slot],
+                want,
+                1e-4 * spread * math.sqrt(float(width)),
+                f"distance {row} {slot}"
+            )
+        }
+    }
+    return float(agree) / float(count * k)
+}
+
+#: Far from the origin, or in one or two dimensions, the expanded distance
+#: `|a|^2 + |b|^2 - 2 a.b` rounds at the scale of the squared norms rather
+#: than of the distances: at fifty features a thousand from the origin it
+#: found the right nearest row 17% of the time, and two features a hundred
+#: out it found 2%. The search centres both sides on the training means and
+#: compares narrow rows term by term.
+fn test_neighbours_survive_an_offset_and_a_narrow_row() -> void {
+    if not jl.is_available() { return }
+    let far = neighbour_agreement(2000, 50, 40, 5, 1000.0, 1.0)
+    assert_true(far >= 0.99, f"fifty features, offset 1000: {far} of neighbours right")
+    let narrow = neighbour_agreement(20000, 2, 40, 5, 100.0, 1.0)
+    assert_true(narrow >= 0.99, f"two features, offset 100: {narrow} of neighbours right")
+    let line = neighbour_agreement(5000, 1, 60, 1, 0.0, 6.0)
+    assert_true(line >= 0.99, f"one zero-mean feature: {line} of nearest rows right")
+}
+
+#: An exact duplicate is at distance zero, so distance weighting takes only
+#: it -- which the expanded form missed by up to five on integer features in
+#: the hundreds, so the rule never fired.
+fn test_a_duplicate_row_is_at_distance_zero() -> void {
+    if not jl.is_available() { return }
+    let points = 500
+    let width = 50
+    var train: list[float] = []
+    for index in 0..points * width { train.push(math.floor(uniform_cell(index) * 1000.0)) }
+    let x = Tensor([points, width], train)
+    defer { x.free() }
+    let y = jl.vector([float(i) * 0.25 for i in 0..points])
+    defer { y.free() }
+    let q = Tensor([3, width], train[17 * width:20 * width])
+    defer { q.free() }
+    let model = KNeighborsRegressor(4, "distance")
+    defer { model.free() }
+    model.fit(x, y)
+    let (distance, index) = model.kneighbors(q)
+    let near = jl.to_values(distance)
+    let at = jl.to_values(index)
+    distance.free()
+    index.free()
+    for row in 0..3 {
+        assert_eq(near[row * 4], 0.0, f"query {row} sits on a training row")
+        assert_eq(at[row * 4], float(17 + row), f"query {row} found its own row")
+    }
+    let predicted = model.predict(q)
+    defer { predicted.free() }
+    assert_values(jl.to_values(predicted), [4.25, 4.5, 4.75], "the duplicate takes all the weight")
+}
+
+#: A query holding a NaN or an infinity has no neighbours: padded indices, a
+#: NaN share, a NaN label and a NaN mean, and never a training row read
+#: through a padded index.
+fn test_a_query_that_is_not_finite_has_no_neighbours() -> void {
+    if not jl.is_available() { return }
+    for width in [2, 12] {
+        var train: list[float] = []
+        for index in 0..40 * width { train.push(uniform_cell(index)) }
+        let x = Tensor([40, width], train)
+        defer { x.free() }
+        let y = jl.vector([float(i % 2) + 3.0 for i in 0..40])
+        defer { y.free() }
+        var asked = [0.5 for _slot in 0..3 * width]
+        asked[width] = math.NAN
+        asked[2 * width + 1] = math.INF
+        let q = Tensor([3, width], asked)
+        defer { q.free() }
+        let classifier = KNeighborsClassifier(3)
+        defer { classifier.free() }
+        classifier.fit(x, y)
+        let (distance, index) = classifier.kneighbors(q)
+        let at = jl.to_values(index)
+        distance.free()
+        index.free()
+        assert_true(at[0] < 40.0, f"width {width}: a finite query has neighbours")
+        for slot in 3..9 { assert_eq(at[slot], 40.0, f"width {width}: slot {slot} is padded") }
+        let proba = classifier.predict_proba(q)
+        let shares = jl.to_values(proba)
+        proba.free()
+        assert_near(shares[0] + shares[1], 1.0, 1e-6, f"width {width}: finite shares")
+        for slot in 2..6 { assert_true(math.is_nan(shares[slot]), f"width {width}: share {slot}") }
+        let labels = classifier.predict(q)
+        let named = jl.to_values(labels)
+        labels.free()
+        assert_true(named[0] == 3.0 or named[0] == 4.0, f"width {width}: a finite label")
+        assert_true(math.is_nan(named[1]) and math.is_nan(named[2]), f"width {width}: NaN labels")
+        let regressor = KNeighborsRegressor(3)
+        defer { regressor.free() }
+        regressor.fit(x, y)
+        let mean = regressor.predict(q)
+        let means = jl.to_values(mean)
+        mean.free()
+        assert_true(not math.is_nan(means[0]), f"width {width}: a finite mean")
+        assert_true(math.is_nan(means[1]) and math.is_nan(means[2]), f"width {width}: NaN means")
+    }
+}
