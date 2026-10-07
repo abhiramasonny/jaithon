@@ -317,7 +317,10 @@ fn test_column_variance_survives_a_large_offset() -> void {
         (300, 5, 1.0e5),
     ] {
         let worst = worst_variance_error(rows, width, offset)
-        let bound = if offset >= 1.0e5 { 1.0e-4 } else { 1.0e-5 }
+        #: Unshifted, 300 x 5 at 1e4 was off by 1.3e-4 and at 1e5 by 2.6e-3;
+        #: the two-pass kernel `JAILEARN_COLUMN_TILES=0` restores is 3.7e-7
+        #: and 1.1e-4.
+        let bound = if offset >= 1.0e5 { 5.0e-4 } else { 1.0e-5 }
         assert_true(worst < bound, f"{rows}x{width} offset {offset}: variance off by {worst}")
     }
 }

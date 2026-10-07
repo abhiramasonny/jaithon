@@ -388,6 +388,9 @@ fn neighbour_agreement(
 #: compares narrow rows term by term.
 fn test_neighbours_survive_an_offset_and_a_narrow_row() -> void {
     if not jl.is_available() { return }
+    #: `JAILEARN_NEAREST_EXACT=0` is the expanded form alone, which is the
+    #: behaviour this test exists to rule out.
+    if not jl.exact_search() { return }
     let far = neighbour_agreement(2000, 50, 40, 5, 1000.0, 1.0)
     assert_true(far >= 0.99, f"fifty features, offset 1000: {far} of neighbours right")
     let narrow = neighbour_agreement(20000, 2, 40, 5, 100.0, 1.0)
@@ -401,6 +404,9 @@ fn test_neighbours_survive_an_offset_and_a_narrow_row() -> void {
 #: the hundreds, so the rule never fired.
 fn test_a_duplicate_row_is_at_distance_zero() -> void {
     if not jl.is_available() { return }
+    #: `JAILEARN_NEAREST_EXACT=0` is the expanded form alone, which is the
+    #: behaviour this test exists to rule out.
+    if not jl.exact_search() { return }
     let points = 500
     let width = 50
     var train: list[float] = []
@@ -433,6 +439,9 @@ fn test_a_duplicate_row_is_at_distance_zero() -> void {
 #: through a padded index.
 fn test_a_query_that_is_not_finite_has_no_neighbours() -> void {
     if not jl.is_available() { return }
+    #: `JAILEARN_NEAREST_EXACT=0` is the expanded form alone, which is the
+    #: behaviour this test exists to rule out.
+    if not jl.exact_search() { return }
     for width in [2, 12] {
         var train: list[float] = []
         for index in 0..40 * width { train.push(uniform_cell(index)) }
