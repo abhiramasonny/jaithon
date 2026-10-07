@@ -829,29 +829,62 @@ fn test_evaluate_between_fits_keeps_the_optimiser_state() -> void {
     }
 }
 
-#: A flat dataset takes the compiled step only when the batch that does not
-#: fill is a sliver of the epoch. The step is built for one batch size and
-#: leaves that batch untrained, which the static path does not -- so a hundred
-#: rows at a batch of thirty-two, where four would never be seen, stay static.
-fn test_a_flat_dataset_with_a_large_tail_stays_static() -> void {
+#: A short last batch is trained, not dropped. The step is built for one
+#: batch size, so that batch goes through the ordinary path -- a hundred rows
+#: at a batch of thirty-two used to leave the same four untrained every epoch,
+#: and flat data stayed off the compiled step whenever its tail was large to
+#: avoid that. Pictures and flat rows, plain descent, momentum and Adam: the
+#: two paths have to agree batch for batch, tail included.
+fn test_a_short_last_batch_is_trained_on_the_compiled_path() -> void {
     if not gpu.is_available() { return }
     let was = compiled_step_allowed()
     defer { set_compiled_step(was) }
-    set_compiled_step(true)
-    for (samples, want) in [(100, "static"), (128, "compiled"), (2050, "compiled")] {
-        let data = learnable_rows(samples, 20, 4, 5)
-        let model = jt.Sequential(
-            [
-                Dense(16, activation: Activation.Relu),
-                Dense(16, activation: Activation.Relu),
-                Dense(4, activation: Activation.Softmax),
-            ]
-        )
-        model.compile(optimizer: SGD(learning_rate: 0.1), loss: SparseCategoricalCrossentropy())
-        model.fit(data, epochs: 1, batch_size: 32, verbose: false, plot_path: null)
-        assert_eq(model.training_route(), want, f"{samples} rows")
-        model.free()
-        data.free()
+    let policy = set_flat_policy(2)
+    defer { set_flat_policy(policy) }
+    for name in ["sgd", "momentum", "adam"] {
+        for image in [false, true] {
+            var seen: list[list[float]] = []
+            for compiled in [true, false] {
+                set_compiled_step(compiled)
+                let rows = learnable_rows(100, 20, 4, 5)
+                let data = if image {
+                    Dataset(rows.features.view(0, [100, 5, 4, 1]), rows.labels.view(0, [100]))
+                } else {
+                    rows
+                }
+                var layers: list[Layer] = []
+                if image { layers.push(Flatten()) }
+                layers.push(Dense(16, activation: Activation.Relu))
+                layers.push(Dense(16, activation: Activation.Relu))
+                layers.push(Dense(4, activation: Activation.Softmax))
+                let model = Sequential(layers)
+                model.compile(
+                    optimizer: optimizer_named(name),
+                    loss: SparseCategoricalCrossentropy()
+                )
+                let history = model.fit(
+                    data,
+                    epochs: 3,
+                    batch_size: 32,
+                    verbose: false,
+                    plot_path: null
+                )
+                assert_eq(model.training_route() == "compiled", compiled, f"{name} image {image}")
+                var trace = history.loss
+                trace.extend(history.accuracy)
+                seen.push(trace)
+                model.free()
+                rows.free()
+            }
+            for (index, value) in seen[0].enumerate() {
+                assert_near(
+                    value,
+                    seen[1][index],
+                    1e-3,
+                    f"{name} image {image} {index}: {seen[0]} against {seen[1]}"
+                )
+            }
+        }
     }
 }
 
@@ -1014,8 +1047,8 @@ fn fitted_in_three_sizes(
 #: A compiled step is built for one batch size and carried its velocity or
 #: moments itself, starting from rest: a fit at another size built a new step
 #: and started the optimiser over, and a fit the rules sent to the static path
-#: (a batch that leaves a large tail) began from whatever the static path had
-#: last seen. The static path alone keeps one state throughout, so that is
+#: (here a batch larger than the dataset) began from whatever the static path
+#: had last seen. The static path alone keeps one state throughout, so that is
 #: what both have to agree with.
 fn test_the_optimiser_state_survives_a_change_of_batch_size_and_path() -> void {
     if not gpu.is_available() { return }
@@ -1024,7 +1057,7 @@ fn test_the_optimiser_state_survives_a_change_of_batch_size_and_path() -> void {
     for (name, policy, sizes, want) in [
         ("momentum", 2, [32, 64, 32], ["compiled", "compiled", "compiled"]),
         ("adam", 2, [32, 64, 32], ["compiled", "compiled", "compiled"]),
-        ("momentum", 1, [32, 48, 32], ["compiled", "static", "compiled"]),
+        ("momentum", 1, [32, 256, 32], ["compiled", "static", "compiled"]),
     ] {
         let before = set_flat_policy(policy)
         let (compiled, routes) = fitted_in_three_sizes(name, true, sizes)

@@ -705,21 +705,18 @@ fn flat_policy() -> int {
 #: only sometimes wins is not taken: below `ADAM_FLAT_MIN_WORK` an Adam model
 #: stays on the static path it had before flat data compiled.
 #:
-#: Also gated is the batch that does not fill: a compiled step is built for
-#: one batch size and leaves a short last batch untrained, which the static
-#: path does not. Flat data compiles only when that tail is at most a
-#: sixty-fourth of the epoch -- 96 of fashion's 60000 rows at b512 -- so a
-#: small table with a large batch keeps every row it has.
+#: A short last batch is no reason to stay off it: the epoch trains that
+#: batch through the ordinary path, which shares the step's parameters and
+#: optimiser state.
 #:
 #: `JAITENSOR_COMPILED_FLAT`: 0 never compiles for a flat dataset (the old
-#: rule), 2 compiles whatever the tail and the work, and anything else is the
-#: default above. Read once; `set_flat_policy` overrides it in-process.
+#: rule), 2 compiles whatever the work, and anything else is the default
+#: above. Read once; `set_flat_policy` overrides it in-process.
 pub fn flat_step_wanted(samples: int, batch_size: int, adam: bool = false, work: int = 0) -> bool {
     let policy = flat_policy()
     if policy == 0 { return false }
-    if policy == 2 { return true }
     if batch_size <= 0 or samples < batch_size { return false }
-    if samples % batch_size * 64 > samples { return false }
+    if policy == 2 { return true }
     return not adam or work >= ADAM_FLAT_MIN_WORK
 }
 

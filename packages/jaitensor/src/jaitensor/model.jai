@@ -180,16 +180,14 @@ pub class Sequential {
 
     #: Train for `epochs`, returning loss and accuracy histories.
     #:
-    #: A trailing batch shorter than `batch_size` is dropped on the fused and
-    #: compiled paths, which need every batch the same size: with a hundred
-    #: samples and a batch of thirty-two, four of them are never trained on
-    #: and never counted, each epoch, and the reported loss and accuracy are
-    #: over the ninety-six that were. Shuffling is off by default, so without
+    #: A trailing batch shorter than `batch_size` is dropped on the fused
+    #: paths, which need every batch the same size: with a hundred samples and
+    #: a batch of thirty-two, four of them are never trained on and never
+    #: counted, each epoch, and the reported loss and accuracy are over the
+    #: ninety-six that were. Shuffling is off by default, so without
     #: `shuffle: true` it is the same four every time. A batch size that
-    #: divides the sample count avoids it altogether. A flat (rank-2) dataset
-    #: takes the compiled path only when that tail is at most a sixty-fourth
-    #: of it, so the hundred samples here would stay on the static path and
-    #: keep all four.
+    #: divides the sample count avoids it altogether. The compiled path trains
+    #: that batch through the ordinary one, so it keeps all four.
     pub fn fit(
         self,
         dataset: Dataset,
@@ -1252,11 +1250,40 @@ pub class Sequential {
         return activations
     }
 
+    #: One batch through the static path where the model has one, otherwise
+    #: through autograd, adding its loss and correct count to the totals.
+    fn _train_batch_eagerly(
+        self,
+        features: Tensor,
+        labels: Tensor,
+        count: int,
+        total_loss: Tensor,
+        total_correct: Tensor
+    ) -> void {
+        if self._static_step_active(count) {
+            let activations = self._static_train_batch(features, labels, total_loss, count)
+            add_correct_into(activations[activations.len() - 1], labels, total_correct)
+            for activation in activations { activation.free() }
+            return
+        }
+        let loss_fn = self.loss_value
+        let optimizer = self.optimizer_value
+        if loss_fn is null or optimizer is null { throw RuntimeError("model is not compiled") }
+        let prediction = self._forward(features, training: true)
+        let loss = loss_fn.forward(prediction, labels, total_loss, count)
+        self._zero_grad()
+        let graph = loss.backward()
+        optimizer.step(self._parameters())
+        add_correct_into(prediction, labels, total_correct)
+        loss.free()
+        for tensor in graph { tensor.free() }
+    }
+
     #: One epoch through the compiled step.
     #:
-    #: The plan is built for one batch size, so a short last batch is skipped,
-    #: neither trained on nor counted, rather than run against a graph that
-    #: does not fit it.
+    #: The plan is built for one batch size, so a short last batch is trained
+    #: by the ordinary path rather than run against a graph that does not fit
+    #: it. Skipping it, as this did, left the same rows untrained every epoch.
     fn _run_compiled_epoch(self, step: CompiledStep, dataset: Dataset, batch_size: int) -> Metrics {
         let total_correct = Tensor.zeros([1])
         defer { total_correct.free() }
@@ -1294,6 +1321,19 @@ pub class Sequential {
                 batch_labels = self._slice_labels(dataset, start, count)
             }
             if count != batch_size {
+                #: Settled, the parameters and the optimiser's state are where
+                #: the ordinary path keeps them, so it can take this batch and
+                #: the step go on from what it did.
+                step.settle()
+                self._train_batch_eagerly(
+                    batch_features,
+                    batch_labels,
+                    count,
+                    total_loss,
+                    total_correct
+                )
+                step.resume()
+                seen += count
                 batch_features.free()
                 batch_labels.free()
                 start += count
