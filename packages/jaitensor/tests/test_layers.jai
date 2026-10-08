@@ -1,5 +1,6 @@
 #: The layer objects: what shape each one builds itself for and hands on.
 import jaitensor as jt
+import std.gpu as gpu
 import std.math
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_throws, assert_true
@@ -254,6 +255,53 @@ fn test_frozen_positions_are_a_view_of_the_table() -> void {
     assert_true(viewed.creator is null)
     viewed.free()
     assert_eq(table.download()[9:15], want)
+}
+
+#: Several recorded forwards at different lengths and offsets, then one
+#: backward. Each gather reads its index again in the backward, so asking for
+#: another length must not free the index an earlier forward still needs: it
+#: threw "this Tensor has already been freed". Both layouts and the rank-two
+#: case, and the graph frees what it took, so nothing is left over.
+fn test_positions_at_several_lengths_share_one_backward() -> void {
+    if not jt.is_available() { return }
+    let width = 4
+    let max_seq = 10
+    let batch = 2
+    for batch_first in [true, false] {
+        let positions = jt.PositionalEmbedding(max_seq, width, batch_first: batch_first)
+        defer { positions.free() }
+        positions.build(width, Random.with_seed(3))
+        let table = positions.parameters()[0]
+        let short = if batch_first { [batch, 3, width] } else { [3, batch, width] }
+        let long = if batch_first { [batch, 6, width] } else { [6, batch, width] }
+        var live = -1
+        for round in 0..3 {
+            let xa = jt.Tensor.zeros(short)
+            let xb = jt.Tensor.zeros(long)
+            let xc = jt.Tensor.zeros([5, width])
+            let a = positions.forward_at(xa, 0)
+            let b = positions.forward_at(xb, 4)
+            let c = positions.forward(xc)
+            let total = jt.add(jt.add(jt.sum(a), jt.sum(b)), jt.sum(c))
+            for held in total.backward() { held.free() }
+            for t in [total, xa, xb, xc] { t.free() }
+            let grad = table.grad
+            assert_true(grad is not null)
+            if grad is not null {
+                let g = grad.download()
+                for row in 0..max_seq {
+                    var want = 0.0
+                    if row < 3 { want += float(batch) }
+                    if row >= 4 { want += float(batch) }
+                    if row < 5 { want += 1.0 }
+                    for column in 0..width { assert_near(g[row * width + column], want, 1e-6) }
+                }
+            }
+            jt.zero_grad(positions.parameters())
+            if round == 1 { live = gpu.live_buffers() }
+            if round == 2 { assert_eq(gpu.live_buffers(), live) }
+        }
+    }
 }
 
 fn test_conv2d_layer_builds_from_image_shape() -> void {

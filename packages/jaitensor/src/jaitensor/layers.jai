@@ -1416,7 +1416,7 @@ pub class PositionalEmbedding: Layer {
         if not table.requires_grad and position_view_on() {
             return table.view(start * self.dim, [seq, self.dim])
         }
-        return gather_rows(table, self.indices(seq, start, 1))
+        return self.gather_positions(table, seq, start, 1, null)
     }
 
     #: `x` plus positions `0..seq`.
@@ -1439,7 +1439,7 @@ pub class PositionalEmbedding: Layer {
                     f"positions {start}..{start + seq} run past the {self.max_seq} this table holds"
                 )
             }
-            let rows = gather_rows(table, self.indices(seq, start, x.shape[1]), x.shape)
+            let rows = self.gather_positions(table, seq, start, x.shape[1], x.shape)
             let output = add(x, rows)
             hand_to_graph(output, [rows])
             return output
@@ -1450,10 +1450,40 @@ pub class PositionalEmbedding: Layer {
         return output
     }
 
+    #: The table's rows at positions `start..start + seq`, each `repeat`
+    #: times over, shaped `shape`.
+    #:
+    #: A gather that records reads its index again in the backward, which may
+    #: come after several more forwards. Those can ask for another length or
+    #: offset and replace the cached index, so a recorded gather reads a
+    #: device copy of it instead, which the graph owns and frees with its other
+    #: intermediates. Freeing the cached index for another then leaves every
+    #: graph its own: two forwards of different lengths before one backward
+    #: used to throw that the index had already been freed. A gather that does
+    #: not record -- generation -- reads the cached index directly.
+    fn gather_positions(
+        self,
+        table: Tensor,
+        seq: int,
+        start: int,
+        repeat: int,
+        shape: list[int]?
+    ) -> Tensor {
+        let cached = self.indices(seq, start, repeat)
+        if not table.requires_grad { return gather_rows(table, cached, shape) }
+        let owned = Tensor([cached.size])
+        copy_into(cached, owned)
+        let rows = gather_rows(table, owned, shape)
+        let node = rows.creator
+        if node is not null { node.extras.push(owned) } else { owned.free() }
+        return rows
+    }
+
     #: The index tensor for positions `start..start + seq`, each `repeat`
     #: times over, kept between calls: training asks for the same one every
-    #: step. The gather that read the last one may still be queued, so a
-    #: different one is a new tensor, not an upload over the old.
+    #: step. Only work already queued reads it -- a gather that did not record,
+    #: or the copy a recorded one took -- so a different one is a new tensor,
+    #: not an upload over the old, and the old one can go.
     fn indices(self, seq: int, start: int, repeat: int) -> Tensor {
         let held = self.index
         if held is not null and held.size == seq * repeat and self.index_start == start {
