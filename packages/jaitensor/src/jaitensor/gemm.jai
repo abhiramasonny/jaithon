@@ -768,17 +768,21 @@ fn instantiate(config: Config, element: str) -> str {
     return text
 }
 
-#: The epilogues' tanh, with its argument held where it has an answer.
+#: The epilogues' tanh: the precise one.
 #:
 #: Kernels compile in fast-math mode, and there `tanh` is worked out through
 #: an exponential that overflows: it returned 0 at 44 and NaN from 45 up, so
 #: a tanh layer whose pre-activation reached 45 gave NaN, and GELU -- whose
-#: argument carries a cube -- gave NaN from an input of 20. Past 15 the true
-#: value is 1 to the last bit of a float, so clamping there costs nothing.
+#: argument carries a cube -- gave NaN from an input of 20. Clamping the
+#: argument to 15 fixed that but laundered a NaN into -1, since `clamp` is a
+#: max and a min and each drops a NaN: a diverged tanh layer read as finite
+#: outputs with a zero gradient instead of a NaN loss. `precise::tanh` is 1 at
+#: 45 and at infinity and NaN at NaN, and it runs once per output, after the
+#: product.
 let GEMM_PRELUDE = """#include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
-static inline float gemm_tanh(float x) { return tanh(clamp(x, -15.0f, 15.0f)); }
+static inline float gemm_tanh(float x) { return precise::tanh(x); }
 """
 
 fn build_source(element: str) -> str {

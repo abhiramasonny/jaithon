@@ -752,6 +752,74 @@ fn test_tanh_and_gelu_epilogues_stay_finite_on_large_pre_activations() -> void {
     )
 }
 
+#: A NaN pre-activation is NaN after the tanh epilogue, on every route.
+#:
+#: Clamping tanh's argument kept the fast-math tanh from overflowing but
+#: turned a NaN into -1 -- `clamp` is a max and a min, and each drops a NaN
+#: -- so a tanh layer that had diverged read as finite outputs with a zero
+#: gradient. A NaN in row 0 of `a` has to reach every output of row 0 and no
+#: other.
+fn assert_nan_row_survives(plan: Plan, rows: int, inner: int, columns: int, epilogue: int) -> void {
+    let a = device_tensor([rows, inner], 61)
+    let b = device_tensor([inner, columns], 62)
+    let bias = device_tensor([columns], 63)
+    let out = jt.Tensor([rows, columns])
+    defer { a.free() }
+    defer { b.free() }
+    defer { bias.free() }
+    defer { out.free() }
+    var values = a.download()
+    values[inner // 2] = math.NAN
+    a.upload(values)
+    dispatch_plan(
+        plan,
+        a.buffer(),
+        b.buffer(),
+        out.buffer(),
+        bias.buffer(),
+        rows,
+        inner,
+        columns,
+        epilogue: epilogue
+    )
+    let got = out.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            let have = got[row * columns + column]
+            if row == 0 {
+                assert_true(
+                    math.is_nan(have),
+                    f"{plan.to_str()} epilogue {epilogue} gave {have} for NaN"
+                )
+            } else {
+                assert_true(
+                    math.is_finite(have),
+                    f"{plan.to_str()} epilogue {epilogue} gave {have}"
+                )
+            }
+        }
+    }
+}
+
+fn test_a_nan_pre_activation_stays_nan_through_the_tanh_epilogue() -> void {
+    if not jt.is_available() { return }
+    for text in [
+        "thin_n",
+        "thin_m",
+        "thin_n:2",
+        "gemm32x32",
+        "gemm32x32:2",
+        "gemm64x32",
+        "direct32x32",
+        "direct32x32:2",
+        "mpsgraph",
+    ] {
+        for epilogue in [4, 5] { assert_nan_row_survives(plan_named(text), 32, 128, 32, epilogue) }
+    }
+    #: Through the padded graph route's unpad kernel too.
+    for epilogue in [4, 5] { assert_nan_row_survives(plan_named("mpsgraph"), 9, 50, 7, epilogue) }
+}
+
 fn test_a_batched_thin_product_matches_host() -> void {
     if not jt.is_available() { return }
     let batch = 3
