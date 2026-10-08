@@ -247,7 +247,9 @@ fn residual_block_for(shape: list[int], channels: int, stride: int) -> ResBlock 
     let inputs = shape[2]
     let parameters = block.parameters()
     parameters[0].upload(formula(9 * inputs * channels, |i| 0.2 * math.cos(0.53 * float(i))))
-    parameters[3].upload(formula(9 * channels * channels, |i| 0.2 * math.sin(0.29 * float(i) + 0.4)))
+    parameters[3].upload(
+        formula(9 * channels * channels, |i| 0.2 * math.sin(0.29 * float(i) + 0.4))
+    )
     var norm_slots = [1, 4]
     if parameters.len() > 6 {
         parameters[6].upload(formula(inputs * channels, |i| 0.3 * math.cos(0.71 * float(i) + 0.2)))
@@ -263,7 +265,12 @@ fn residual_block_for(shape: list[int], channels: int, stride: int) -> ResBlock 
 #: Forward the block, or the same thing written out op by op, and take
 #: sum(out * r) back through it. Returns the output, then every gradient:
 #: input first, then the parameters in `parameters()` order.
-fn residual_gradients(block: ResBlock, shape: list[int], batch: int, composed: bool) -> list[list[float]] {
+fn residual_gradients(
+    block: ResBlock,
+    shape: list[int],
+    batch: int,
+    composed: bool
+) -> list[list[float]] {
     let full = [batch, shape[0], shape[1], shape[2]]
     var size = batch
     for d in shape { size *= d }
@@ -273,7 +280,11 @@ fn residual_gradients(block: ResBlock, shape: list[int], batch: int, composed: b
     let out = if composed {
         let inner = jt.relu(jt.batch_norm(jt.conv2d(x, p[0], stride: block.stride, padding: 1), p[1], p[2]))
         let main = jt.batch_norm(jt.conv2d(inner, p[3], padding: 1), p[4], p[5])
-        let skip = if block.projects { jt.batch_norm(jt.conv2d(x, p[6], stride: block.stride), p[7], p[8]) } else { x }
+        let skip = if block.projects {
+            jt.batch_norm(jt.conv2d(x, p[6], stride: block.stride), p[7], p[8])
+        } else {
+            x
+        }
         jt.relu(jt.add(main, skip))
     } else {
         block.forward(x)
@@ -374,16 +385,18 @@ fn test_resblock_matches_torch() -> void {
 #: where the shape changes, and the parameters are counted.
 fn test_resblock_builds_inside_sequential() -> void {
     if not jt.is_available() { return }
-    let model = jt.Sequential([
-        jt.Conv2d(8, 3, padding: 1),
-        jt.BatchNorm2d(),
-        jt.Activate(jt.Activation.Relu),
-        jt.ResBlock(8),
-        jt.ResBlock(16, stride: 2),
-        jt.AvgPool2d(4),
-        jt.Flatten(),
-        jt.Dense(3, activation: jt.Activation.Softmax),
-    ])
+    let model = jt.Sequential(
+        [
+            jt.Conv2d(8, 3, padding: 1),
+            jt.BatchNorm2d(),
+            jt.Activate(jt.Activation.Relu),
+            jt.ResBlock(8),
+            jt.ResBlock(16, stride: 2),
+            jt.AvgPool2d(4),
+            jt.Flatten(),
+            jt.Dense(3, activation: jt.Activation.Softmax),
+        ]
+    )
     let images = jt.Tensor([4, 8, 8, 2], formula(4 * 8 * 8 * 2, |i| math.sin(float(i))))
     let labels = jt.Tensor([4], [0.0, 1.0, 2.0, 1.0])
     let data = jt.Dataset(images, labels)

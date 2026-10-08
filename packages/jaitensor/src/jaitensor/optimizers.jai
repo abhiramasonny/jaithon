@@ -329,7 +329,7 @@ fn round_half_even(value: float) -> int {
     let below = math.floor(value)
     let rest = value - below
     var whole = int(below)
-    if rest > 0.5 or (rest == 0.5 and whole % 2 == 1) { whole += 1 }
+    if rest > 0.5 or rest == 0.5 and whole % 2 == 1 { whole += 1 }
     return whole
 }
 
@@ -381,7 +381,11 @@ fn step_all(parameters: list[Tensor], settings: list[float], kind: int) -> void 
     #: Converted once a step, not once a parameter: they are the same numbers
     #: for every one of them.
     let bits = if kind == 0 or kind == 2 {
-        setting_bits([settings[0], settings[1], settings[2], 0.0, if settings.len() > 3 { settings[3] } else { 0.0 }])
+        setting_bits([settings[0], settings[1], settings[2], 0.0, if settings.len() > 3 {
+            settings[3]
+        } else {
+            0.0
+        }])
     } else {
         setting_bits(settings)
     }
@@ -621,7 +625,7 @@ fn norm_kernels() -> list[Kernel] {
 #: caller frees. It is computed and applied on the device, so nothing waits for
 #: it: download it only on the steps where it is wanted.
 pub fn clip_grad_norm(parameters: list[Tensor], max_norm: float) -> Tensor {
-    if not (max_norm > 0.0) { throw ValueError(f"max_norm must be positive, got {max_norm}") }
+    if not max_norm > 0.0 { throw ValueError(f"max_norm must be positive, got {max_norm}") }
     var gradients: list[Tensor] = []
     var groups: list[int] = []
     var slots = 0
@@ -654,7 +658,11 @@ pub fn clip_grad_norm(parameters: list[Tensor], max_norm: float) -> Tensor {
         [slots, float32_bits(max_norm)]
     )
     for gradient in gradients {
-        kernels[2].dispatch_async([gradient.buffer(), coefficient.buffer()], gradient.size, [gradient.size])
+        kernels[2].dispatch_async(
+            [gradient.buffer(), coefficient.buffer()],
+            gradient.size,
+            [gradient.size]
+        )
     }
     partials.free()
     coefficient.free()

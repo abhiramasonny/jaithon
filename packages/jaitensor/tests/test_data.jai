@@ -138,7 +138,15 @@ fn test_dataloader_shuffle_keeps_images_shaped() -> void {
 #: The shift (dx, dy) and flip that turn `source` image `n` into `output`
 #: image `n`, as `[dx, dy, flip]`, or an empty list when none does. Pixels
 #: brought in from outside the image are zero; the source holds no zeros.
-fn crop_that_made(source: list[float], output: list[float], n: int, height: int, width: int, channels: int, padding: int) -> list[int] {
+fn crop_that_made(
+    source: list[float],
+    output: list[float],
+    n: int,
+    height: int,
+    width: int,
+    channels: int,
+    padding: int
+) -> list[int] {
     let per = height * width * channels
     for flip in [0, 1] {
         for dy in -padding..=padding {
@@ -154,7 +162,9 @@ fn crop_that_made(source: list[float], output: list[float], n: int, height: int,
                             } else {
                                 0.0
                             }
-                            if output[n * per + (y * width + x) * channels + c] != want { same = false }
+                            if output[n * per + (y * width + x) * channels + c] != want {
+                                same = false
+                            }
                         }
                     }
                 }
@@ -177,7 +187,10 @@ fn test_random_crop_flip_is_a_seeded_padded_crop() -> void {
     let channels = 2
     let padding = 2
     let size = images * height * width * channels
-    let source = jt.Tensor([images, height, width, channels], [float(index + 1) for index in 0..size])
+    let source = jt.Tensor(
+        [images, height, width, channels],
+        [float(index + 1) for index in 0..size]
+    )
     let values = source.download()
     let first = jt.random_crop_flip(source, padding: padding, seed: 11)
     let again = jt.random_crop_flip(source, padding: padding, seed: 11)

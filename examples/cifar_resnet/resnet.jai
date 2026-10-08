@@ -215,18 +215,33 @@ pub fn train_resnet(recipe: Recipe, train: Dataset, test: Dataset) -> Outcome {
     let run_started = Instant.now()
     for epoch in 0..recipe.epochs {
         let started = Instant.now()
-        random_crop_flip_into(train.features, augmented, padding: recipe.padding, seed: recipe.seed * 1000003 + epoch)
+        random_crop_flip_into(
+            train.features,
+            augmented,
+            padding: recipe.padding,
+            seed: recipe.seed * 1000003 + epoch
+        )
         if recipe.verbose {
             gpu.synchronize()
             outcome.augment_ms.push(started.elapsed().to_seconds() * 1000.0)
         }
         total_loss.zero_()
         total_correct.zero_()
-        let loader = DataLoader(epoch_data, recipe.batch, shuffle: true, seed: recipe.seed * 7919 + epoch + 1)
+        let loader = DataLoader(
+            epoch_data,
+            recipe.batch,
+            shuffle: true,
+            seed: recipe.seed * 7919 + epoch + 1
+        )
         while loader.has_next() {
             let (features, labels) = loader.next_batch()
             let count = features.shape[0]
-            optimizer.learning_rate = one_cycle_lr(step, total_steps, recipe.max_lr, pct_start: recipe.pct_start)
+            optimizer.learning_rate = one_cycle_lr(
+                step,
+                total_steps,
+                recipe.max_lr,
+                pct_start: recipe.pct_start
+            )
             var current = features
             for layer in layers { current = layer.forward(current) }
             let loss = loss_fn.forward(current, labels, total_loss, count)
@@ -250,7 +265,9 @@ pub fn train_resnet(recipe: Recipe, train: Dataset, test: Dataset) -> Outcome {
         outcome.epoch_accuracy.push(100.0 * correct / float(train.samples))
         if recipe.verbose {
             let aug = outcome.augment_ms[outcome.augment_ms.len() - 1]
-            print(f"epoch {epoch + 1}/{recipe.epochs}  {seconds:.3f}s  aug {aug:.1f}ms  loss {summed / float(train.samples):.4f}  train {100.0 * correct / float(train.samples):.2f}%  lr {optimizer.learning_rate:.5f}")
+            print(
+                f"epoch {epoch + 1}/{recipe.epochs}  {seconds:.3f}s  aug {aug:.1f}ms  loss {summed / float(train.samples):.4f}  train {100.0 * correct / float(train.samples):.2f}%  lr {optimizer.learning_rate:.5f}"
+            )
         }
     }
     outcome.train_seconds = run_started.elapsed().to_seconds()

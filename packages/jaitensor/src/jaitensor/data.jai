@@ -73,7 +73,12 @@ fn augment_kernel() -> Kernel {
 #:
 #: Returns a new tensor the caller frees. `random_crop_flip_into` writes into
 #: one it already has.
-pub fn random_crop_flip(images: Tensor, padding: int = 4, seed: int = 0, flip: bool = true) -> Tensor {
+pub fn random_crop_flip(
+    images: Tensor,
+    padding: int = 4,
+    seed: int = 0,
+    flip: bool = true
+) -> Tensor {
     let output = Tensor(images.shape)
     random_crop_flip_into(images, output, padding: padding, seed: seed, flip: flip)
     return output
@@ -88,26 +93,22 @@ pub fn random_crop_flip_into(
     seed: int = 0,
     flip: bool = true
 ) -> void {
-    if images.rank() != 4 { throw ValueError(f"random_crop_flip needs NHWC images, got {images.shape}") }
+    if images.rank() != 4 {
+        throw ValueError(f"random_crop_flip needs NHWC images, got {images.shape}")
+    }
     if output.shape != images.shape {
         throw ValueError(f"output shape {output.shape} does not match images {images.shape}")
     }
-    if output.id == images.id { throw ValueError("random_crop_flip cannot write over its own input") }
+    if output.id == images.id {
+        throw ValueError("random_crop_flip cannot write over its own input")
+    }
     if padding < 0 { throw ValueError(f"padding must be non-negative, got {padding}") }
     if images.size == 0 { return }
-    augment_kernel().dispatch_async(
-        [images.buffer(), output.buffer()],
-        images.size,
-        [
-            images.shape[0],
-            images.shape[1],
-            images.shape[2],
-            images.shape[3],
-            padding,
-            seed & 0xFFFFFFFF,
-            if flip { 1 } else { 0 },
-        ]
-    )
+    augment_kernel().dispatch_async([images.buffer(), output.buffer()], images.size, [images.shape[0], images.shape[1], images.shape[2], images.shape[3], padding, seed & 0xFFFFFFFF, if flip {
+        1
+    } else {
+        0
+    }])
 }
 
 #: A feature matrix and sparse integer labels on the GPU.

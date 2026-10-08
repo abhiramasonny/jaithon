@@ -59,7 +59,9 @@ fn main() -> int {
         parsed = parse(argv())
     } catch failure {
         print(failure.message)
-        print("usage: jaithon run examples/cifar_resnet/train.jai [--epochs N] [--seed N] [--depth 6n+2] [--width N] [--batch N] [--lr F] [--pct F] [--wd F] [--normalize 0|1] [--train N]")
+        print(
+            "usage: jaithon run examples/cifar_resnet/train.jai [--epochs N] [--seed N] [--depth 6n+2] [--width N] [--batch N] [--lr F] [--pct F] [--wd F] [--normalize 0|1] [--train N]"
+        )
         return 2
     }
     let (recipe, samples) = parsed
@@ -68,8 +70,12 @@ fn main() -> int {
     let test = load_cifar("test", normalize: recipe.normalize)
     let outcome = train_resnet(recipe, train, test)
     print(f"parameters {outcome.parameters}")
-    print(f"train {outcome.train_seconds:.2f}s  steady epoch {outcome.steady_epoch():.3f}s  first epoch {outcome.epoch_seconds[0]:.3f}s")
-    print(f"test accuracy {outcome.test_accuracy:.2f}%  loss {outcome.test_loss:.4f}  (batch statistics, batch 1000)")
+    print(
+        f"train {outcome.train_seconds:.2f}s  steady epoch {outcome.steady_epoch():.3f}s  first epoch {outcome.epoch_seconds[0]:.3f}s"
+    )
+    print(
+        f"test accuracy {outcome.test_accuracy:.2f}%  loss {outcome.test_loss:.4f}  (batch statistics, batch 1000)"
+    )
     train.free()
     test.free()
     return 0

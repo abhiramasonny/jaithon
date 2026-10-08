@@ -24,7 +24,9 @@ fn main() -> int {
     train.free()
     test.free()
     let seconds = started.elapsed().to_seconds()
-    print(f"test accuracy {outcome.test_accuracy:.2f}% after {recipe.epochs} epochs; {seconds:.1f}s in all")
+    print(
+        f"test accuracy {outcome.test_accuracy:.2f}% after {recipe.epochs} epochs; {seconds:.1f}s in all"
+    )
     var failed = false
     if outcome.test_accuracy < 60.0 {
         print(f"check FAILED: test accuracy {outcome.test_accuracy:.2f}% is under 60%")

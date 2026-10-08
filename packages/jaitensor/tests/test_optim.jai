@@ -310,9 +310,24 @@ fn assert_close(got: list[float], want: list[float], tolerance: float, what: str
 #: the gradient before the momentum, in plain, momentum and Nesterov descent.
 fn test_sgd_weight_decay_matches_torch() -> void {
     if not jt.is_available() { return }
-    assert_close(three_steps(jt.SGD(learning_rate: 0.1, weight_decay: 0.05)), [0.9606986249999999, -1.9557722499999999, 0.4137824375], 1e-6, "sgd")
-    assert_close(three_steps(jt.SGD(learning_rate: 0.1, momentum: 0.9, weight_decay: 0.05)), [0.840143625, -1.82716225, 0.2020799375], 1e-6, "momentum")
-    assert_close(three_steps(jt.SGD(learning_rate: 0.1, momentum: 0.9, nesterov: true, weight_decay: 5e-4)), [0.8549278414117676, -1.8775831203235354, 0.16157469395507135], 1e-6, "nesterov")
+    assert_close(
+        three_steps(jt.SGD(learning_rate: 0.1, weight_decay: 0.05)),
+        [0.9606986249999999, -1.9557722499999999, 0.4137824375],
+        1e-6,
+        "sgd"
+    )
+    assert_close(
+        three_steps(jt.SGD(learning_rate: 0.1, momentum: 0.9, weight_decay: 0.05)),
+        [0.840143625, -1.82716225, 0.2020799375],
+        1e-6,
+        "momentum"
+    )
+    assert_close(
+        three_steps(jt.SGD(learning_rate: 0.1, momentum: 0.9, nesterov: true, weight_decay: 5e-4)),
+        [0.8549278414117676, -1.8775831203235354, 0.16157469395507135],
+        1e-6,
+        "nesterov"
+    )
 }
 
 #: `Adam(weight_decay=...)` is PyTorch's coupled L2 form; `AdamW` decays the
@@ -320,9 +335,19 @@ fn test_sgd_weight_decay_matches_torch() -> void {
 fn test_adam_weight_decay_and_adamw_match_torch() -> void {
     if not jt.is_available() { return }
     let coupled = three_steps(jt.Adam(learning_rate: 0.01, epsilon: 1e-8, weight_decay: 0.1))
-    assert_close(coupled, [0.9772928152861048, -1.9842420340514224, 0.48705850466617945], 2e-6, "adam")
+    assert_close(
+        coupled,
+        [0.9772928152861048, -1.9842420340514224, 0.48705850466617945],
+        2e-6,
+        "adam"
+    )
     let decoupled = three_steps(jt.AdamW(learning_rate: 0.01, epsilon: 1e-8, weight_decay: 0.1))
-    assert_close(decoupled, [0.9766026841558618, -1.9829551877290008, 0.4861818426362763], 2e-6, "adamw")
+    assert_close(
+        decoupled,
+        [0.9766026841558618, -1.9829551877290008, 0.4861818426362763],
+        2e-6,
+        "adamw"
+    )
     assert math.fabs(coupled[0] - decoupled[0]) > 1e-4
 }
 
@@ -379,7 +404,12 @@ fn test_clip_grad_norm_matches_torch() -> void {
     let norm = jt.clip_grad_norm([a, unused, b], 1.5)
     assert math.fabs(norm.download()[0] - 5.5) < 1e-5
     norm.free()
-    assert_close(grad_a.download(), [0.8181816694215147, -1.0909088925620196, 0.2727272231405049], 1e-6, "a")
+    assert_close(
+        grad_a.download(),
+        [0.8181816694215147, -1.0909088925620196, 0.2727272231405049],
+        1e-6,
+        "a"
+    )
     assert_close(grad_b.download(), [0.5454544462810098, 0.13636361157025245], 1e-6, "b")
     grad_a.upload([0.3, -0.4, 0.1])
     grad_b.upload([0.2, 0.05])
@@ -420,13 +450,44 @@ fn test_clip_grad_norm_sums_large_gradients() -> void {
 #: `one_cycle_lr` against `torch.optim.lr_scheduler.OneCycleLR` (cosine, two
 #: phases, its default divisors), read before each step.
 fn test_one_cycle_lr_matches_torch() -> void {
-    let torch_lrs = [0.008000000000000007, 0.026334368540005065, 0.07433436854000505, 0.13366563145999494, 0.18166563145999495, 0.2, 0.19749280124701749, 0.19009692640269477, 0.17818323551421, 0.1623491307899526, 0.14338860035826018, 0.12225240438725786, 0.1000004, 0.07774839561274215, 0.056612199641739844, 0.0376516692100474, 0.021817564485790017, 0.009903873597305258, 0.002507998752982511, 8e-07]
+    let torch_lrs = [
+        0.008000000000000007,
+        0.026334368540005065,
+        0.07433436854000505,
+        0.13366563145999494,
+        0.18166563145999495,
+        0.2,
+        0.19749280124701749,
+        0.19009692640269477,
+        0.17818323551421,
+        0.1623491307899526,
+        0.14338860035826018,
+        0.12225240438725786,
+        0.1000004,
+        0.07774839561274215,
+        0.056612199641739844,
+        0.0376516692100474,
+        0.021817564485790017,
+        0.009903873597305258,
+        0.002507998752982511,
+        8e-07,
+    ]
     for (step, want) in torch_lrs.enumerate() {
         let got = jt.one_cycle_lr(step, 20, 0.2)
         assert math.fabs(got - want) < 1e-12, f"step {step}: {got} against torch {want}"
     }
     let steps = [0, 1, 1000, 2931, 2932, 2933, 5000, 11728, 11729]
-    let long = [0.016000000000000014, 0.016000110253183875, 0.11609708476489422, 0.3999999724367021, 0.39999999681199155, 0.39999997130792453, 0.34787414387959736, 1.6127520337131734e-06, 1.6e-06]
+    let long = [
+        0.016000000000000014,
+        0.016000110253183875,
+        0.11609708476489422,
+        0.3999999724367021,
+        0.39999999681199155,
+        0.39999997130792453,
+        0.34787414387959736,
+        1.6127520337131734e-06,
+        1.6e-06,
+    ]
     for (index, step) in steps.enumerate() {
         let got = jt.one_cycle_lr(step, 11730, 0.4, pct_start: 0.25)
         assert math.fabs(got - long[index]) < 1e-12, f"step {step}: {got} against torch {long[index]}"
@@ -437,8 +498,30 @@ fn test_one_cycle_lr_matches_torch() -> void {
 #: The float arguments go to the device as bits, and a number just under a
 #: power of two must round up to it rather than come out as half of it.
 fn test_float32_bits_rounds_like_a_float_buffer() -> void {
-    let values = [1.0, 0.99999999, 1.9999999999, 0.24999999999, 0.1, -0.1, 5e-4, 3.4028234663852886e38, 1e-40, 0.0]
-    let wanted = [1065353216, 1065353216, 1073741824, 1048576000, 1036831949, 3184315597, 973279855, 2139095039, 71362, 0]
+    let values = [
+        1.0,
+        0.99999999,
+        1.9999999999,
+        0.24999999999,
+        0.1,
+        -0.1,
+        5e-4,
+        3.4028234663852886e38,
+        1e-40,
+        0.0,
+    ]
+    let wanted = [
+        1065353216,
+        1065353216,
+        1073741824,
+        1048576000,
+        1036831949,
+        3184315597,
+        973279855,
+        2139095039,
+        71362,
+        0,
+    ]
     for (index, value) in values.enumerate() {
         let got = float32_bits(value)
         assert got == wanted[index], f"{value}: {got} against {wanted[index]}"
@@ -459,8 +542,16 @@ fn test_a_decaying_optimizer_takes_a_path_that_applies_it() -> void {
         #: compiling off; the decayed one may compile, and must not.
         set_compiled_step(decay != 0.0)
         let data = rows_that_carry_their_class(64, 16, 4)
-        let model = jt.Sequential([jt.Dense(256, activation: jt.Activation.Relu), jt.Dense(4, activation: jt.Activation.Softmax)])
-        model.compile(optimizer: jt.SGD(learning_rate: 0.05, momentum: 0.9, weight_decay: decay), loss: jt.SparseCategoricalCrossentropy())
+        let model = jt.Sequential(
+            [
+                jt.Dense(256, activation: jt.Activation.Relu),
+                jt.Dense(4, activation: jt.Activation.Softmax),
+            ]
+        )
+        model.compile(
+            optimizer: jt.SGD(learning_rate: 0.05, momentum: 0.9, weight_decay: decay),
+            loss: jt.SparseCategoricalCrossentropy()
+        )
         let _history = model.fit(data, epochs: 3, batch_size: 16, verbose: false, plot_path: null)
         let route = model.training_route()
         if decay == 0.0 {
