@@ -203,8 +203,10 @@ The JPEG and PNG decoders are Jaithon, and each has a fast path in front of a
 reference decoder. The fast path gives the same bytes as the reference, not a
 picture within a unit of it: same float operations, same order. Anything it
 cannot reproduce exactly goes to the reference -- a JPEG that reads past a
-restart marker or the end of its scan, an odd sampling layout, a damaged
-Huffman table; a palette, sub-byte, sixteen-bit or interlaced PNG.
+restart marker or the end of its scan, or whose scan header points past the
+end of the file, an odd sampling layout, a damaged Huffman table; a palette,
+sub-byte, sixteen-bit or interlaced PNG, or one whose size does not fit in an
+int.
 
 | Switch | What it does when on |
 |---|---|
@@ -238,18 +240,22 @@ the device buffer the `Mat` lives in, and `IMREAD_GRAYSCALE` adds a
 from 50 s.
 
 The JPEG is not: 3.6x faster than the reference, still ten times OpenCV. A
-decode is now about 40,000 interpreted instructions and a hundred allocations
-(the reference: 1.1 million and 4,000), so the JIT runs nearly all of it,
-and the time is what the compiled code costs. On a COCO image about 4 ms of
-the 16 is the Huffman decode, 7.5 the IDCT, 2 the colour conversion, 1.2
-packing the list into bytes, and the rest unstuffing and setup. The working
-lists are kept from one decode to the next (about forty megabytes for a 720p
-frame; none over 8.4 million elements), which saves the allocator three
-milliseconds a video frame. Each step is held to the reference's arithmetic, so there is no
-cheaper transform to switch to -- the IDCT has to add the same terms in the
-same order -- and what is left is the compiled code's cost per list access
-and per float operation: about 0.8 ns a multiply-add in the best case. The
-limits it was written around, all in the JIT:
+decode is about 25,000 interpreted instructions (`--stats`, the difference
+between 11 and 41 decodes in one process), so the JIT runs nearly all of it,
+and the time is what the compiled code costs. The reference's count swings
+with when the JIT's timer fires, from a few hundred thousand to over a million
+a decode; allocations are not where the two differ, about a hundred a decode
+on either path. On a COCO image about 4 ms of the 16 is the Huffman decode,
+7.5 the IDCT, 2 the colour conversion, 1.2 packing the list into bytes, and
+the rest unstuffing and setup. The working lists are kept from one decode to
+the next (about forty megabytes for a 720p frame; none over 8.4 million
+elements), which saves the allocator three milliseconds a video frame;
+`jpeg.release_buffers()` lets them go, and closing an `AviReader` calls it.
+Each step is held to the reference's arithmetic, so there is no cheaper
+transform to switch to -- the IDCT has to add the same terms in the same order
+-- and what is left is the compiled code's cost per list access and per float
+operation: about 0.8 ns a multiply-add in the best case. The limits it was
+written around, all in the JIT:
 
 - a function of more than eight arguments never reaches the function tier, so
   the per-block work is methods on `FastScan` reading fields;

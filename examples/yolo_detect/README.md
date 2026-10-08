@@ -97,7 +97,11 @@ A `Detection` carries the box as the network gave it, in floating point --
 `x`, `y`, `w`, `h`, in original-image pixels, clipped to the image -- and
 `box`, the same box with each edge rounded to the nearest pixel, for drawing.
 Non-maximum suppression works on whole-pixel `Rect`s and is handed the box
-with both edges truncated, as it always was.
+with both edges truncated, as it always was. A box with no whole pixel left
+in that form overlaps nothing, so it could neither suppress a duplicate nor
+be suppressed; it is dropped before the suppression, as it always was too.
+Anything scoring detections should read `x`, `y`, `w`, `h`: `box` is for
+drawing, and scored on its own it gives 0.4050 on the run below.
 
 Until it was measured, the reported box was that truncated one too. On the
 first 300 COCO val2017 images at a score threshold of 0.001 (COCO's
@@ -115,8 +119,8 @@ well and comes out lower, 0.4059, so it was left as it was. The rest of the
 gap to onnxruntime is the suppression itself working in whole pixels; there is
 no `Rect2d` in jaicv yet.
 
-The 300 images take 7.4 s end to end in Jaithon, decode included (16.8 ms an
-`imread` and 7.3 ms of `detect_frame` each), against 20.3 s with the reference
+The 300 images take 7.6 s end to end in Jaithon, decode included (16.7 ms an
+`imread` and 7.8 ms of `detect_frame` each), against 20.3 s with the reference
 JPEG decoder; the detections are the same either way.
 
 ## Verified
