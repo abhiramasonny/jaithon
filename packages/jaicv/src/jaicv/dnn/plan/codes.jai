@@ -87,4 +87,16 @@ pub let FOLDABLE = {
     "GatherElements": true,
     "GatherND": true,
     "ScatterND": true,
+    #: The rest of the arithmetic a TorchScript export does on shapes -- the
+    #: padding Swin works out for its windows goes through a `Transpose`.
+    "Transpose": true,
+    "Neg": true,
+    "Abs": true,
+    "Min": true,
+    "Max": true,
+    "Less": true,
+    "Greater": true,
+    "Not": true,
+    "And": true,
+    "Or": true,
 }
