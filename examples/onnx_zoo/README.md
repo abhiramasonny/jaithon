@@ -163,8 +163,8 @@ Found in review, each with a test that failed before and passes after:
 - **A `Tensor.view` of a batch** whose last axis is not a multiple of four
   floats is refused by MPSGraph, which the new one-operator convolution and
   matrix product routes go through; jaitensor took it before. Such a feed is
-  now run again as a contiguous copy. (The compiled plan refused one before
-  this change too, and still does.)
+  now run again as a contiguous copy. A compiled `Plan` fed such a view still
+  throws when it runs, as it did before this change.
 - **`compile_plan` read back folded values too large to fold**, such as a
   transposed tied embedding, now that `Transpose` folds; it leaves anything
   over `FOLD_LIMIT` on the device.
