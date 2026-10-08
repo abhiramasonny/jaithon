@@ -9,6 +9,7 @@
 import std.math
 from std.random import Random
 from .model import GPT
+from .tokenizer import BOT, EOT, USER
 
 pub class Sampling {
     pub var temperature: float
@@ -42,21 +43,32 @@ fn argmax(row: list[float]) -> int {
     return best
 }
 
+#: `row` with the repetition penalty applied, as in CTRL: every distinct id
+#: among the last `window` of `recent` has its logit divided by the penalty
+#: (multiplied, if negative) once, however often it occurs. The role and end
+#: tokens are left alone: they are in every chat prompt, and `<|user|>` is the
+#: token the bot has to say to hand the turn back.
+pub fn penalised(row: list[float], s: Sampling, recent: list[int]) -> list[float] {
+    if s.repetition_penalty == 1.0 or recent.len() == 0 { return row }
+    var logits = row.copy()
+    let seen: set[int] = set()
+    let first = max(0, recent.len() - s.window)
+    for t in recent[first:] {
+        if t == EOT or t == USER or t == BOT or seen.contains(t) { continue }
+        seen.add(t)
+        let v = logits[t]
+        logits[t] = if v > 0.0 { v / s.repetition_penalty } else { v * s.repetition_penalty }
+    }
+    return logits
+}
+
 #: Pick the next token from one row of logits. Temperature 0 is greedy, and
 #: then the penalty is the only thing applied.
 pub fn pick(row: list[float], s: Sampling, recent: list[int], rng: Random) -> int {
     for value in row {
         if value != value { throw RuntimeError("the model produced NaN logits") }
     }
-    var logits = row
-    if s.repetition_penalty != 1.0 and recent.len() > 0 {
-        logits = row.copy()
-        let first = max(0, recent.len() - s.window)
-        for t in recent[first:] {
-            let v = logits[t]
-            logits[t] = if v > 0.0 { v / s.repetition_penalty } else { v * s.repetition_penalty }
-        }
-    }
+    let logits = penalised(row, s, recent)
     if s.temperature <= 0.0 { return argmax(logits) }
     let k = if s.top_k > 0 and s.top_k < logits.len() { s.top_k } else { logits.len() }
     let ordered = logits.sorted()
