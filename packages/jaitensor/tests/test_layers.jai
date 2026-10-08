@@ -1,7 +1,8 @@
 #: The layer objects: what shape each one builds itself for and hands on.
 import jaitensor as jt
 import std.math
-from std.test import assert_eq, assert_near, assert_true
+from std.random import Random
+from std.test import assert_eq, assert_near, assert_throws, assert_true
 
 fn test_conv2d_matches_spatial_output_and_channel_count() -> void {
     if not jt.is_available() { return }
@@ -99,6 +100,99 @@ fn test_an_embedding_takes_a_batch_of_index_rows() -> void {
     assert_eq(history.loss.len(), 4)
     for value in history.loss { assert math.is_finite(value) }
     assert history.loss[3] < history.loss[0]
+}
+
+#: `lookup` keeps the indices' shape, `[batch, seq]` to `[batch, seq, dim]`,
+#: which is what a transformer needs; `forward` keeps the `[batch, seq * dim]`
+#: block a `Sequential` sizes its next layer for. Both read the same rows and
+#: send the gradient to the same table.
+fn test_an_embedding_looks_up_rows_in_the_shape_of_its_indices() -> void {
+    if not jt.is_available() { return }
+    let vocab = 7
+    let width = 3
+    let embedding = jt.Embedding(vocab, width)
+    defer { embedding.free() }
+    embedding.build(2, Random.with_seed(3))
+    let table = embedding.parameters()[0].download()
+    let ids = [4.0, 0.0, 6.0, 4.0, 2.0, 1.0]
+    let indices = jt.Tensor([2, 3], ids)
+    defer { indices.free() }
+    let rows = embedding.lookup(indices)
+    assert_eq(rows.shape, [2, 3, width])
+    let flat = embedding.forward(indices)
+    assert_eq(flat.shape, [2, 3 * width])
+    let got = rows.download()
+    assert_eq(got, flat.download())
+    for (slot, id) in ids.enumerate() {
+        for c in 0..width { assert_eq(got[slot * width + c], table[int(id) * width + c]) }
+    }
+    let total = jt.sum(rows)
+    for held in total.backward() { held.free() }
+    total.free()
+    let grad = embedding.parameters()[0].grad
+    assert_true(grad is not null)
+    if grad is not null {
+        let g = grad.download()
+        #: Row 4 is looked up twice, rows 3 and 5 never.
+        assert_near(g[4 * width], 2.0, 1e-6)
+        assert_near(g[3 * width], 0.0, 1e-6)
+        assert_near(g[0], 1.0, 1e-6)
+    }
+    for t in [rows, flat] { t.free() }
+    let single = jt.Tensor([3], [1.0, 2.0, 3.0])
+    let one = embedding.lookup(single)
+    assert_eq(one.shape, [3, width])
+    for t in [single, one] { t.free() }
+}
+
+#: Positions `start..start + seq` of the table are added to every sequence of
+#: a batch, and the table's gradient is the sum over the batch.
+fn test_positional_embedding_adds_each_position_to_every_sequence() -> void {
+    if not jt.is_available() { return }
+    let max_seq = 10
+    let width = 4
+    let positions = jt.PositionalEmbedding(max_seq, width)
+    defer { positions.free() }
+    positions.build(width, Random.with_seed(5))
+    let table = positions.parameters()[0].download()
+    let batch = 3
+    let seq = 6
+    let xs = [float(i) * 0.25 for i in 0..batch * seq * width]
+    let x = jt.Tensor([batch, seq, width], xs)
+    defer { x.free() }
+    for start in [0, 2, 4] {
+        let y = positions.forward_at(x, start)
+        assert_eq(y.shape, [batch, seq, width])
+        let got = y.download()
+        for b in 0..batch {
+            for t in 0..seq {
+                for c in 0..width {
+                    let at = (b * seq + t) * width + c
+                    assert_near(got[at], xs[at] + table[(start + t) * width + c], 1e-6)
+                }
+            }
+        }
+        let total = jt.sum(y)
+        for held in total.backward() { held.free() }
+        total.free()
+        y.free()
+        let grad = positions.parameters()[0].grad
+        assert_true(grad is not null)
+        if grad is not null {
+            let g = grad.download()
+            for row in 0..max_seq {
+                let want = if row >= start and row < start + seq { float(batch) } else { 0.0 }
+                assert_near(g[row * width], want, 1e-6)
+            }
+        }
+        jt.zero_grad(positions.parameters())
+    }
+    #: One sequence, `[seq, dim]`, is the rank-two case.
+    let one = jt.Tensor([seq, width], xs[0:seq * width])
+    let y = positions.forward(one)
+    assert_near(y.download()[width], xs[width] + table[width], 1e-6)
+    for t in [one, y] { t.free() }
+    assert_throws(ValueError, || positions.forward_at(x, 5))
 }
 
 fn test_conv2d_layer_builds_from_image_shape() -> void {

@@ -669,7 +669,8 @@ pub class GroupNorm2d: Layer {
     }
 }
 
-#: Layer normalization over the last axis of a rank-two tensor.
+#: Layer normalization over the last axis of a tensor of rank two or more;
+#: leading axes fold into rows, so `[batch, seq, dim]` works as it is.
 pub class LayerNorm: Layer {
     var width: int
     var gamma_value: Tensor?
@@ -1147,6 +1148,21 @@ pub class Embedding: Layer {
         return gather_rows(table, x, [x.shape[0], x.shape[1] * self.dim])
     }
 
+    #: One row of the table per index, keeping the indices' shape:
+    #: `[batch, seq]` gives `[batch, seq, dim]`, `[n]` gives `[n, dim]`.
+    #:
+    #: `forward` is what a `Sequential` wants, a `[batch, seq * dim]` block
+    #: the next layer was sized for; a transformer wants the rows kept apart,
+    #: which is this. Both are the same gather, read under a different shape,
+    #: and the gradient reaches the table either way.
+    pub fn lookup(self, indices: Tensor) -> Tensor {
+        let table = self.table
+        if table is null { throw RuntimeError("Embedding has not been built") }
+        var shape = [dimension for dimension in indices.shape]
+        shape.push(self.dim)
+        return gather_rows(table, indices, shape)
+    }
+
     pub fn parameters(self) -> list[Tensor] {
         let table = self.table
         if table is null { throw RuntimeError("Embedding has not been built") }
@@ -1162,6 +1178,109 @@ pub class Embedding: Layer {
     }
 
     fn __str__(self) -> str { return f"Embedding({self.vocab}, {self.dim})" }
+}
+
+#: Learned positional embeddings: row `p` of a `[max_seq, dim]` table is added
+#: to every sequence's position `p`.
+#:
+#: `forward` takes `[seq, dim]` or `[batch, seq, dim]` activations and adds
+#: positions `0..seq`; `forward_at(x, start)` adds `start..start + seq`, which
+#: is what a cached decoder feeding one token at a time needs. Only the `seq`
+#: rows in use are gathered and they broadcast over the batch, so the
+#: gradient reaches the table as one sum over the batch rather than `batch`
+#: colliding atomic adds per row.
+pub class PositionalEmbedding: Layer {
+    pub let max_seq: int
+    pub let dim: int
+    #: Half-width of the uniform initialisation `build` draws from.
+    pub let init_limit: float
+    var table: Tensor?
+    var index: Tensor?
+    var index_start: int
+
+    pub fn init(self, max_seq: int, dim: int, init_limit: float = 0.05) {
+        if max_seq <= 0 or dim <= 0 {
+            throw ValueError("PositionalEmbedding max_seq and dim must be positive")
+        }
+        self.max_seq = max_seq
+        self.dim = dim
+        self.init_limit = init_limit
+        self.table = null
+        self.index = null
+        self.index_start = -1
+    }
+
+    pub fn build(self, input_units: int, rng: Random) -> void {
+        let _ = input_units
+        if self.table is not null { return }
+        let table = Tensor([self.max_seq, self.dim], requires_grad: true)
+        table.buffer().fill_uniform(-self.init_limit, self.init_limit, rng.next_int())
+        self.table = table
+    }
+
+    #: The table's rows `start..start + seq` as `[seq, dim]`, recorded for the
+    #: gradient when the table trains.
+    pub fn positions(self, seq: int, start: int = 0) -> Tensor {
+        let table = self.table
+        if table is null { throw RuntimeError("PositionalEmbedding has not been built") }
+        if seq <= 0 or start < 0 or start + seq > self.max_seq {
+            throw ValueError(
+                f"positions {start}..{start + seq} run past the {self.max_seq} this table holds"
+            )
+        }
+        return gather_rows(table, self.indices(seq, start))
+    }
+
+    #: `x` plus positions `0..seq`.
+    pub fn forward(self, x: Tensor) -> Tensor { return self.forward_at(x, 0) }
+
+    #: `x` plus positions `start..start + seq`, for `[seq, dim]` or
+    #: `[batch, seq, dim]`.
+    pub fn forward_at(self, x: Tensor, start: int) -> Tensor {
+        if x.rank() < 2 or x.rank() > 3 or x.shape[x.rank() - 1] != self.dim {
+            throw ValueError(
+                f"PositionalEmbedding needs [seq, {self.dim}] or [batch, seq, {self.dim}], got {x.shape}"
+            )
+        }
+        let rows = self.positions(x.shape[x.rank() - 2], start)
+        let output = add(x, rows)
+        hand_to_graph(output, [rows])
+        return output
+    }
+
+    #: The `[seq]` index tensor for `start..start + seq`, kept between calls:
+    #: training asks for the same one every step. The gather that read the
+    #: last one may still be queued, so a different one is a new tensor, not
+    #: an upload over the old.
+    fn indices(self, seq: int, start: int) -> Tensor {
+        let held = self.index
+        if held is not null and held.size == seq and self.index_start == start { return held }
+        if held is not null { held.free() }
+        let made = Tensor([seq], [float(start + offset) for offset in 0..seq])
+        self.index = made
+        self.index_start = start
+        return made
+    }
+
+    pub fn parameters(self) -> list[Tensor] {
+        let table = self.table
+        if table is null { throw RuntimeError("PositionalEmbedding has not been built") }
+        return [table]
+    }
+
+    pub fn output_width(self) -> int { return self.dim }
+
+    pub fn free(self) -> void {
+        let table = self.table
+        if table is not null { table.free() }
+        let held = self.index
+        if held is not null { held.free() }
+        self.table = null
+        self.index = null
+        self.index_start = -1
+    }
+
+    fn __str__(self) -> str { return f"PositionalEmbedding({self.max_seq}, {self.dim})" }
 }
 
 #: NHWC max pooling window.

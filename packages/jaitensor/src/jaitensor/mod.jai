@@ -39,6 +39,8 @@ export { clamp, maximum, minimum, sum, mean, max_pool2d, avg_pool2d, dropout, ms
 export { batch_norm, layer_norm, group_norm, scaled_dot_product_attention, gather_rows }
 export { eye, flip, upsample_nearest2d, split_heads, merge_heads, multi_head_attention, tril }
 export { add_correct_into, add_scaled_into }
+from .layers import PositionalEmbedding
+export { PositionalEmbedding }
 
 #: Whether the machine has a GPU backend that jaitensor can use.
 pub fn is_available() -> bool { return gpu.is_available() }
