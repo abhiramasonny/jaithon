@@ -117,7 +117,11 @@ kernel void grad_norm_join(device const float* partials [[buffer(0)]],
     for (uint i = 0u; i < slots; ++i) total += partials[i];
     float length = sqrt(total);
     norm[0] = length;
-    coefficient[0] = min(1.0f, max_norm / (length + 1e-6f));
+    // min() would make a NaN norm a coefficient of 1 and leave the finite
+    // gradients alone; PyTorch makes them all NaN. Tested on the bits, which
+    // fast math cannot assume away.
+    bool unknown = (as_type<uint>(length) & 0x7FFFFFFFu) > 0x7F800000u;
+    coefficient[0] = unknown ? length : min(1.0f, max_norm / (length + 1e-6f));
 }
 
 kernel void grad_scale(device float* gradient [[buffer(0)]],
@@ -308,6 +312,7 @@ pub fn float32_bits(value: float) -> int {
         magnitude = -magnitude
     }
     if magnitude == 0.0 { return sign << 31 }
+    if magnitude == math.INF { return sign << 31 | 0x7F800000 }
     let split = __prim__.f64_frexp(magnitude)
     var biased = split[1] + 126
     if biased <= 0 {
@@ -407,8 +412,9 @@ pub trait Optimizer {
     fn step(self, parameters: list[Tensor]) -> void
 }
 
+#: NaN first: an ordered comparison with NaN throws a TypeError.
 fn check_decay(weight_decay: float) -> void {
-    if weight_decay < 0.0 or weight_decay != weight_decay {
+    if weight_decay != weight_decay or weight_decay < 0.0 {
         throw ValueError(f"weight_decay must be non-negative, got {weight_decay}")
     }
 }
@@ -619,13 +625,19 @@ fn norm_kernels() -> list[Kernel] {
 #: The norm is over all the gradients as one vector. When it exceeds
 #: `max_norm`, every gradient is multiplied by `max_norm / (norm + 1e-6)`;
 #: otherwise they are left as they are. Parameters without a gradient are
-#: skipped.
+#: skipped. `max_norm` may be `math.INF`, PyTorch's way of measuring the norm
+#: without clipping. A NaN norm makes every gradient NaN, as PyTorch's does.
 #:
 #: Returns a one-element tensor holding the norm before clipping, which the
 #: caller frees. It is computed and applied on the device, so nothing waits for
 #: it: download it only on the steps where it is wanted.
 pub fn clip_grad_norm(parameters: list[Tensor], max_norm: float) -> Tensor {
-    if not max_norm > 0.0 { throw ValueError(f"max_norm must be positive, got {max_norm}") }
+    if max_norm != max_norm or max_norm <= 0.0 {
+        throw ValueError(f"max_norm must be positive, got {max_norm}")
+    }
+    #: Converted before anything is allocated, so nothing is left behind if
+    #: it throws.
+    let bound = float32_bits(max_norm)
     var gradients: list[Tensor] = []
     var groups: list[int] = []
     var slots = 0
@@ -655,7 +667,7 @@ pub fn clip_grad_norm(parameters: list[Tensor], max_norm: float) -> Tensor {
     kernels[1].dispatch_async(
         [partials.buffer(), norm.buffer(), coefficient.buffer()],
         1,
-        [slots, float32_bits(max_norm)]
+        [slots, bound]
     )
     for gradient in gradients {
         kernels[2].dispatch_async(

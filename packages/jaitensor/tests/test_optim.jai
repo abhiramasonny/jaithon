@@ -1,7 +1,8 @@
 #: The optimizers, one parameter at a time: momentum, moments, and the settings buffer.
 import jaitensor as jt
+import std.gpu as gpu
 import std.math
-from std.test import assert_throws
+from std.test import assert_eq, assert_throws
 from jaitensor import Dataset, Layer, Optimizer, Tensor
 from jaitensor.compiled import compiled_step_allowed, set_compiled_step
 from jaitensor.optimizers import float32_bits
@@ -193,6 +194,10 @@ fn test_optimizer_configuration_rejects_invalid_values() -> void {
     let _nesterov = assert_throws(ValueError, || jt.SGD(nesterov: true))
     let _beta = assert_throws(ValueError, || jt.Adam(beta1: 1.0))
     let _epsilon = assert_throws(ValueError, || jt.Adam(epsilon: 0.0))
+    #: An ordered comparison with NaN throws a TypeError, so these are
+    #: tested for NaN first.
+    let _nan_decay = assert_throws(ValueError, || jt.SGD(weight_decay: math.NAN))
+    let _nan_adam_decay = assert_throws(ValueError, || jt.Adam(weight_decay: math.NAN))
 }
 
 fn rows_that_carry_their_class(samples: int, width: int, classes: int) -> Dataset {
@@ -419,9 +424,49 @@ fn test_clip_grad_norm_matches_torch() -> void {
     assert_close(grad_a.download(), [0.3, -0.4, 0.1], 1e-7, "a inside")
     assert_close(grad_b.download(), [0.2, 0.05], 1e-7, "b inside")
     let _bound = assert_throws(ValueError, || jt.clip_grad_norm([a], 0.0))
+    let _nan_bound = assert_throws(ValueError, || jt.clip_grad_norm([a], math.NAN))
     a.free()
     b.free()
     unused.free()
+}
+
+#: An infinite `max_norm` is PyTorch's way of asking for the norm without
+#: clipping (`clip_grad_norm_(params, float("inf"))` returns 5.0 here and
+#: leaves the gradients alone). It used to throw converting the bound, after
+#: three scratch buffers had been allocated, and leave them behind.
+fn test_clip_grad_norm_with_an_infinite_bound_only_measures() -> void {
+    if not jt.is_available() { return }
+    let p = jt.Tensor([5], [0.0, 0.0, 0.0, 0.0, 0.0], requires_grad: true)
+    let grad = jt.Tensor([5], [3.0, 4.0, 0.0, 0.0, 0.0])
+    p.grad = grad
+    let live = gpu.live_buffers()
+    let norm = jt.clip_grad_norm([p], math.INF)
+    assert math.fabs(norm.download()[0] - 5.0) < 1e-6
+    norm.free()
+    assert_eq(gpu.live_buffers(), live)
+    assert_close(grad.download(), [3.0, 4.0, 0.0, 0.0, 0.0], 0.0, "unclipped")
+    p.free()
+}
+
+#: A NaN anywhere makes the norm NaN, and PyTorch's clipping coefficient
+#: `min(max_norm / (nan + 1e-6), 1)` is NaN too, so every gradient becomes
+#: NaN. Metal's `min` returns the number for a NaN, which used to leave the
+#: finite gradients as they were.
+fn test_clip_grad_norm_with_a_nan_norm_poisons_every_gradient() -> void {
+    if not jt.is_available() { return }
+    let a = jt.Tensor([2], [0.0, 0.0], requires_grad: true)
+    let b = jt.Tensor([3], [0.0, 0.0, 0.0], requires_grad: true)
+    let grad_a = jt.Tensor([2], [math.NAN, 1.0])
+    let grad_b = jt.Tensor([3], [2.0, -2.0, 0.5])
+    a.grad = grad_a
+    b.grad = grad_b
+    let norm = jt.clip_grad_norm([a, b], 1.0)
+    assert math.is_nan(norm.download()[0])
+    norm.free()
+    for value in grad_a.download() { assert math.is_nan(value), f"a: {value}" }
+    for value in grad_b.download() { assert math.is_nan(value), f"b: {value}" }
+    a.free()
+    b.free()
 }
 
 #: Many threadgroups per gradient, and many gradients: the partial sums have
@@ -509,6 +554,8 @@ fn test_float32_bits_rounds_like_a_float_buffer() -> void {
         3.4028234663852886e38,
         1e-40,
         0.0,
+        math.INF,
+        -math.INF,
     ]
     let wanted = [
         1065353216,
@@ -521,6 +568,8 @@ fn test_float32_bits_rounds_like_a_float_buffer() -> void {
         2139095039,
         71362,
         0,
+        2139095040,
+        4286578688,
     ]
     for (index, value) in values.enumerate() {
         let got = float32_bits(value)
