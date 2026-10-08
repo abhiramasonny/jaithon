@@ -37,6 +37,8 @@ kernel void normalize_channels(device float* x [[buffer(0)]],
 }
 """
 
+var _normalize: list[Kernel] = []
+
 #: Standardise NHWC images in place, channel by channel, with the training
 #: set's statistics -- so the zeros a padded crop brings in are the average
 #: colour, not black.
@@ -44,11 +46,10 @@ pub fn normalize_images(images: Tensor) -> void {
     var numbers = [m for m in CHANNEL_MEAN]
     for s in CHANNEL_STD { numbers.push(1.0 / s) }
     let constants = Tensor([6], numbers)
-    Kernel.compile(NORMALIZE_SOURCE, "normalize_channels").dispatch_async(
-        [images.buffer(), constants.buffer()],
-        images.size,
-        [images.size]
-    )
+    if _normalize.len() == 0 {
+        _normalize = [Kernel.compile(NORMALIZE_SOURCE, "normalize_channels")]
+    }
+    _normalize[0].dispatch_async([images.buffer(), constants.buffer()], images.size, [images.size])
     constants.free()
 }
 
