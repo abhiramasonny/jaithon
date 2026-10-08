@@ -23,8 +23,8 @@ Two verdicts, because they want different fixes:
     dead         nothing calls it anywhere, including itself -- delete it
 
 `dead` under-counts, because it is one round of a fixpoint and this runs one
-round. jaiArenaAlloc's only callers are the five dead jaiArena* functions, and
-the five chunk writers are reached only from each other; deleting a dead group
+round. jaiArenaAlloc's only callers were the five dead jaiArena* functions, and
+the five chunk writers were reached only from each other; deleting a dead group
 is what makes its private helpers dead in turn.
 
 The tests/ harnesses link against these objects too (tests/vm/verify_chunk.c
