@@ -27,6 +27,14 @@ from .model import GPT, default_checkpoint, env_float, env_int, load_model
 #: Pick a byte from one row of logits: greedy at temperature 0, otherwise a
 #: draw from the softmax of the `top_k` largest at that temperature.
 fn pick(row: list[float], temperature: float, top_k: int, rng: Random) -> int {
+    for value in row {
+        if math.is_nan(value) {
+            #: Comparing NaN throws here. The fused GELU product epilogue gave
+            #: NaN from a pre-activation of about 20 until gemm_tanh clamped
+            #: its argument (thin-gemms-fused-batchnorm); say so plainly.
+            throw RuntimeError("the model produced NaN logits; this needs the GEMM epilogue tanh clamp")
+        }
+    }
     var best = 0
     for i in 1..row.len() {
         if row[i] > row[best] { best = i }
