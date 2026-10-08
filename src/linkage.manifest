@@ -12,13 +12,6 @@ file-local jaiMethodTablesInit         src/runtime/builtins/builtins.c
 file-local jaiFormatValue              src/runtime/builtins/text/builtins_format.c
 file-local jaiFrontEndCall0            src/runtime/modules/frontend.c
 file-local jaiFrontEndField            src/runtime/modules/frontend.c
-dead       jaiChunkAddConstant         src/vm/bytecode/chunk.c
-file-local jaiChunkWrite               src/vm/bytecode/chunk.c
-dead       jaiChunkWriteI16            src/vm/bytecode/chunk.c
-file-local jaiChunkWriteU16            src/vm/bytecode/chunk.c
-dead       jaiChunkWriteU24            src/vm/bytecode/chunk.c
-dead       jaiCacheClear               src/vm/bytecode/serialize.c
-dead       jaiCacheLoad                src/vm/bytecode/serialize.c
 file-local jaiGCMarkArray              src/vm/gc.c
 file-local emitDescriptorFull          src/vm/jit/jit_call_desc.c
 file-local emitGlobalsGuard            src/vm/jit/jit_global.c
@@ -27,7 +20,6 @@ file-local globalIsSelf                src/vm/jit/jit_global.c
 file-local globalNamespace             src/vm/jit/jit_global.c
 file-local globalSlot                  src/vm/jit/jit_global.c
 file-local jaiStringChar               src/vm/object/object_string.c
-dead       jaiTraceOpCount             src/vm/trace/trace.c
 file-local enumMember                  src/vm/vm_class.c
 file-local jaiVMPrintStack             src/vm/vm_lifecycle.c
 file-local jaiVMResetStack             src/vm/vm_lifecycle.c

@@ -107,10 +107,6 @@ ObjFunction *jaiDeserializeCached(const uint8_t *data, size_t size,
                                   ObjModule *module, uint64_t sourceHash,
                                   const char *sourcePath);
 
-ObjFunction *jaiCacheLoad(const char *sourcePath, ObjModule *module,
-                          uint64_t sourceHash);
-void  jaiCacheClear(const char *rootDir);
-
 uint64_t jaiSourceHash(const char *source, size_t length);
 
 /* The `buildId` field of §7: a fingerprint of the C sources this binary was

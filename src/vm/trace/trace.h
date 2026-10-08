@@ -30,7 +30,6 @@ void     jaiTraceLeave(struct ObjFunction *fn);
 bool     jaiTraceIsActive(void);
 uint32_t jaiTraceRunId(void);
 bool     jaiTraceRecordOp(const char *name, const int *shape, int shape_len);
-int      jaiTraceOpCount(void);
 bool     jaiTraceReplay(void);
 
 #endif
