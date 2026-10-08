@@ -530,11 +530,13 @@ kernel void channel_params_backward(device const float* input [[buffer(0)]],
  * writes y, the add reads y and the skip and writes their sum, the ReLU reads
  * the sum and writes it again. Here the input and the skip are read once and
  * the result written once. `flags` bit 0 adds `residual`, bit 1 applies the
- * ReLU; the arithmetic is the unfused kernels' own, in their order, so the
- * two agree to the bit.
+ * ReLU; the arithmetic is the unfused kernels' own, in their order, so this
+ * one-float kernel agrees with them to the bit.
  *
  * Four channels to a thread wherever the channel count allows it, so a
- * thread's loads are one 16-byte access each. */
+ * thread's loads are one 16-byte access each. That one does not agree to the
+ * bit: the compiler contracts the vector arithmetic differently, and the two
+ * differ by about 1e-7 relative. */
 kernel void batch_norm_apply(device const float* input [[buffer(0)]],
                              device const float* mean [[buffer(1)]],
                              device const float* variance [[buffer(2)]],
