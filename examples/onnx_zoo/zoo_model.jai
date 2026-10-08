@@ -104,8 +104,12 @@ pub class Exported {
 }
 
 #: The largest absolute difference over the largest absolute reference value.
-#: A size mismatch or a NaN is infinitely wrong.
-pub fn relative_difference(got: Tensor, want: list[float]) -> float {
+#: A shape mismatch or a NaN is infinitely wrong. The shape, not just the
+#: count: a spurious width-one axis has the right number of values.
+pub fn relative_difference(got: Tensor, want: list[float], shape: list[int]) -> float {
+    #: A rank-zero answer is carried as `[1]`, as every scalar is here.
+    let expected = if shape.len() == 0 { [1] } else { shape }
+    if got.shape != expected { return 1.0e30 }
     let have = got.download()
     if have.len() != want.len() { return 1.0e30 }
     var worst = 0.0
@@ -243,7 +247,7 @@ pub fn measure(found: Exported, warm_s: float, samples: int) -> Row {
         let outs = run_graph(held, feeds)
         gpu.synchronize()
         row.interp_cold_ms = ms_since(clock)
-        row.interp_rel = relative_difference(outs[out_name], want)
+        row.interp_rel = relative_difference(outs[out_name], want, found.outputs[0].shape)
         free_all(outs)
     } catch failure: Error {
         row.refusal = f"interpreter: {failure.message}"
@@ -268,7 +272,7 @@ pub fn measure(found: Exported, warm_s: float, samples: int) -> Row {
     } else {
         let outs = plan.run(feeds)
         gpu.synchronize()
-        row.plan_rel = relative_difference(outs[out_name], want)
+        row.plan_rel = relative_difference(outs[out_name], want, found.outputs[0].shape)
         free_all(outs)
         if samples > 0 { row.plan = time_calls(|| plan.run(feeds), warm_s, samples) }
         plan.free()
