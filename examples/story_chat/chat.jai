@@ -60,7 +60,10 @@ fn main() -> int {
         if one == "" {
             say("you> ")
             let got = read_line()
-            if got is null { break }
+            if got is null {
+                say("\n")
+                break
+            }
             line = got.strip()
             if echo { say(line + "\n") }
         }

@@ -541,8 +541,17 @@ pub fn load_model(path: str, batch: int = 1) -> (GPT, dict[str, any]) {
     return (model, meta)
 }
 
-pub fn pretrain_checkpoint() -> str {
-    return os.env_or("PRETRAIN_CKPT", cache_dir() + "/pretrain.ckpt")
+#: Where a run keeps its checkpoints and logs: `RUN_DIR`, by default the
+#: cache itself. `run_full.sh` gives each run a folder of its own and links
+#: its checkpoints into the cache when it finishes.
+pub fn run_dir() -> str {
+    let dir = os.env_or("RUN_DIR", cache_dir())
+    Path(dir).mkdir(true, true)
+    return dir
 }
 
-pub fn chat_checkpoint() -> str { return os.env_or("CHAT_CKPT", cache_dir() + "/chat.ckpt") }
+pub fn pretrain_checkpoint() -> str {
+    return os.env_or("PRETRAIN_CKPT", run_dir() + "/pretrain.ckpt")
+}
+
+pub fn chat_checkpoint() -> str { return os.env_or("CHAT_CKPT", run_dir() + "/chat.ckpt") }

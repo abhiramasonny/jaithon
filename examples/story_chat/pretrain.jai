@@ -1,17 +1,21 @@
 #: Pretrain the GPT on TinyStories.
 #:
-#:     jaithon run examples/story_chat/pretrain.jai -- --steps 20000 --minutes 5 --resume
+#:     jaithon run examples/story_chat/pretrain.jai -- --budget 120 --minutes 5 --resume
 #:
 #: Reads the token files `prepare.jai` wrote. Random windows of the train
 #: split, AdamW (decay on the matrices only), a linear warm-up of `WARMUP`
 #: (200) steps to `LR` (6e-4) and a cosine decay to a tenth of it at the last
 #: step, the gradient clipped to a norm of `CLIP` (1.0).
 #:
-#: `--steps N` is the length of the whole schedule; `--minutes M` stops this
-#: run after M minutes of training and saves where it got to, and `--resume`
-#: carries on from that checkpoint -- weights, optimiser moments, step and
-#: tokens seen -- so a long run can be split into chunks that each hold the
-#: GPU only for a few minutes. Every `EVAL_EVERY` (250) steps it reports the
+#: `--budget M` makes the schedule M minutes of training long (evaluation
+#: and checkpoints not counted), so the cosine reaches its floor when the
+#: time is up whatever the step time; without it `--steps N` (20000) is the
+#: length. `--minutes M` stops this run after M minutes and saves where it
+#: got to, and `--resume` carries on from that checkpoint -- weights,
+#: optimiser moments, step, tokens seen, time trained and the schedule -- so
+#: a long run can be split into chunks that each hold the GPU only for a few
+#: minutes. The exit status is 0 when the schedule is finished and 10 when a
+#: chunk stopped short of it. Every `EVAL_EVERY` (250) steps it reports the
 #: held-out loss and bits per byte on `EVAL_WINDOWS` (256) fixed windows of
 #: the valid split, prints a story from a fixed prompt, and appends a line to
 #: `pretrain_log.tsv` in the cache. It checkpoints every `CKPT_EVERY` (1000)
@@ -31,7 +35,7 @@ from std.random import Random
 from std.time import Instant
 from .model import FLUSH, Config, GPT, Optimisers, Sampler, TokenFile, checkpoint_meta, config_from_env
 from .model import config_of, drop_grads, env_float, env_int, free_all, held_out_loss, held_out_starts
-from .model import pretrain_checkpoint, read_token_file, target_bytes, token_path, tokenizer_path
+from .model import pretrain_checkpoint, read_token_file, run_dir, target_bytes, token_path, tokenizer_path
 from .sample import Decoder, Sampling, generate
 from .tokenizer import EOT, Tokenizer, cache_dir, load_tokenizer, text_of
 
@@ -146,6 +150,21 @@ fn median(xs: list[float]) -> float {
     return s[s.len() // 2]
 }
 
+#: The fraction of the schedule done: of the training-time budget when there
+#: is one, otherwise of the steps.
+fn progress(step: int, total: int, trained: float, budget_minutes: float) -> float {
+    if budget_minutes > 0.0 { return trained / (budget_minutes * 60.0) }
+    return float(step) / float(total)
+}
+
+#: Warm-up over `warmup` steps, then a cosine over the schedule's progress to
+#: `floor * peak`.
+pub fn scheduled_rate(step: int, done: float, peak: float, warmup: int, floor: float) -> float {
+    if step < warmup { return peak * float(step + 1) / float(warmup) }
+    let p = min(1.0, done)
+    return peak * (floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.PI * p)))
+}
+
 fn main() -> int {
     let cfg = config_from_env()
     let tok = load_tokenizer(tokenizer_path(cfg.vocab))
@@ -159,7 +178,8 @@ fn main() -> int {
         f"tokens: train {train_file.count}, valid {valid_file.count}; read in {t_read.elapsed().to_seconds():.1f} s"
     )
     let peak = env_float("LR", 6.0e-4)
-    let total = int(flag("--steps", os.env_or("STEPS", "20000")))
+    var total = int(flag("--steps", os.env_or("STEPS", "20000")))
+    var budget = float(flag("--budget", os.env_or("BUDGET_MINUTES", "0")))
     let minutes = float(flag("--minutes", os.env_or("MINUTES", "0")))
     let warmup = env_int("WARMUP", 200)
     let floor = env_float("MIN_LR_FRAC", 0.1)
@@ -178,12 +198,32 @@ fn main() -> int {
         step = at
         tokens_seen = seen
         train_seconds = secs
-        print(f"resumed {path} at step {step}, {tokens_seen} tokens seen")
+        #: The schedule is the one the run started with.
+        let was_total: int = meta["total_steps"]
+        let was_budget: float = meta["budget_minutes"]
+        total = was_total
+        budget = was_budget
+        print(
+            f"resumed {path} at step {step}, {tokens_seen} tokens seen, {secs / 60.0:.1f} minutes trained"
+        )
     }
-    print(f"model: {cfg}, {model.parameter_count()} parameters; schedule {total} steps")
+    let plan = if budget > 0.0 { f"{budget:.1f} minutes of training" } else { f"{total} steps" }
+    print(f"model: {cfg}, {model.parameter_count()} parameters; schedule {plan}")
     let sampler = Sampler(train_file, seed * 1000003 + step)
     if os.env_or("MODE", "train") == "bench" {
         run_bench(trainer, sampler, cfg)
+        model.free()
+        return 0
+    }
+    if os.env_or("MODE", "train") == "eval" {
+        let windows = held_out_starts(valid_file, cfg.seq, env_int("EVAL_WINDOWS", 2048))
+        let te = Instant.now()
+        let val = held_out_loss(model, valid_file, windows)
+        let nbytes = target_bytes(valid_file, tok, windows, cfg.seq)
+        let bpb = val * float(windows.len() * cfg.seq) / float(nbytes) / math.log(2.0)
+        print(
+            f"held-out over {windows.len()} windows ({windows.len() * cfg.seq} tokens, {nbytes} bytes): loss {val:.4f}, {bpb:.4f} bits/byte, perplexity {math.exp(val):.2f} ({te.elapsed().to_seconds():.1f} s)"
+        )
         model.free()
         return 0
     }
@@ -192,9 +232,8 @@ fn main() -> int {
     let log_every = env_int("LOG_EVERY", 50)
     let held = held_out_starts(valid_file, cfg.seq, env_int("EVAL_WINDOWS", 256))
     let held_bytes = target_bytes(valid_file, tok, held, cfg.seq)
-    let held_tokens = held.len() // cfg.batch * cfg.batch * cfg.seq
     let bytes_per_token = float(held_bytes) / float(held.len() * cfg.seq)
-    let log_path = cache_dir() + "/pretrain_log.tsv"
+    let log_path = run_dir() + "/pretrain_log.tsv"
     if step == 0 {
         append_file(log_path, "step\ttokens\ttrain_loss\tval_loss\tval_bpb\ttrain_seconds\n")
     }
@@ -207,10 +246,14 @@ fn main() -> int {
     let t0 = Instant.now()
     let start_seconds = train_seconds
     let started_at = step
+    #: Evaluation, samples and checkpoints in this run: not training time.
+    var aside = 0.0
     var pending: Tensor? = null
-    while step < total {
+    var finished = progress(step, total, train_seconds, budget) >= 1.0
+    while not finished {
         if minutes > 0.0 and t0.elapsed().to_seconds() >= minutes * 60.0 { break }
-        let lr = learning_rate(step, total, peak, warmup, floor)
+        let done = progress(step, total, start_seconds + t0.elapsed().to_seconds() - aside, budget)
+        let lr = scheduled_rate(step, done, peak, warmup, floor)
         let (x, y) = sampler.next(cfg.batch, cfg.seq)
         let loss = trainer.step(x, y, lr)
         #: Download the previous step's loss, not this one's: the device is
@@ -224,52 +267,45 @@ fn main() -> int {
         pending = loss
         step += 1
         tokens_seen += per_step
+        train_seconds = start_seconds + t0.elapsed().to_seconds() - aside
+        finished = progress(step, total, train_seconds, budget) >= 1.0
         if step == started_at + 10 {
             gpu.synchronize()
             live = gpu.live_buffers() - 1
         }
         if step % log_every == 0 and recent_n > 0 {
-            let s = start_seconds + t0.elapsed().to_seconds()
             last_train = recent / float(recent_n)
-            let rate = float((step - started_at) * per_step) / t0.elapsed().to_seconds()
-            print(f"step {step} loss {last_train:.4f} lr {lr:.2e} ({s:.0f} s, {rate:.0f} tokens/s)")
+            let rate = float((step - started_at) * per_step) / (t0.elapsed().to_seconds() - aside)
+            print(
+                f"step {step} loss {last_train:.4f} lr {lr:.2e} ({train_seconds:.0f} s, {rate:.0f} tokens/s)"
+            )
             recent = 0.0
             recent_n = 0
         }
-        let at_end = step == total
-        if step % every == 0 or at_end {
+        if step % every == 0 or finished {
+            let te = Instant.now()
             let p = pending
             if p is not null {
                 p.free()
                 pending = null
             }
-            let te = Instant.now()
             let val = held_out_loss(model, valid_file, held)
             let bpb = val * float(held.len() * cfg.seq) / float(held_bytes) / math.log(2.0)
-            let s = start_seconds + t0.elapsed().to_seconds()
             print(
-                f"step {step} held-out loss {val:.4f} ({bpb:.4f} bits/byte, {bytes_per_token:.2f} bytes/token) in {te.elapsed().to_seconds():.1f} s"
+                f"step {step} held-out loss {val:.4f} ({bpb:.4f} bits/byte, {bytes_per_token:.2f} bytes/token)"
             )
             append_file(
                 log_path,
-                f"{step}\t{tokens_seen}\t{last_train:.4f}\t{val:.4f}\t{bpb:.4f}\t{s:.0f}\n"
+                f"{step}\t{tokens_seen}\t{last_train:.4f}\t{val:.4f}\t{bpb:.4f}\t{train_seconds:.0f}\n"
             )
             let story = sample_story(model, tok, prompt, 80, 1)
             print(f"  sample: {story.replace("\n", " / ")}")
+            aside += te.elapsed().to_seconds()
         }
-        if step % ckpt_every == 0 and not at_end {
-            trainer.save(
-                path,
-                checkpoint_meta(
-                    cfg,
-                    step,
-                    {
-                        "tokens": tokens_seen,
-                        "total_steps": total,
-                        "train_seconds": start_seconds + t0.elapsed().to_seconds(),
-                    }
-                )
-            )
+        if step % ckpt_every == 0 and not finished {
+            let tc = Instant.now()
+            trainer.save(path, run_meta(cfg, step, tokens_seen, total, budget, train_seconds))
+            aside += tc.elapsed().to_seconds()
         }
     }
     let p = pending
@@ -278,23 +314,42 @@ fn main() -> int {
     let wall = t0.elapsed().to_seconds()
     #: Both counts leave out the one loss still waiting to be read.
     if live >= 0 { print(f"live_buffers_drift={gpu.live_buffers() - live}") }
-    let rate = float((step - started_at) * per_step) / max(wall, 1.0e-9)
+    let rate = float((step - started_at) * per_step) / max(wall - aside, 1.0e-9)
     print(
-        f"ran steps {started_at}..{step} in {wall:.1f} s ({rate:.0f} tokens/s with evaluation); {tokens_seen} tokens seen in all"
+        f"ran steps {started_at}..{step}: {wall - aside:.1f} s training ({rate:.0f} tokens/s), {aside:.1f} s evaluating; {tokens_seen} tokens seen in all"
     )
     let ts = Instant.now()
-    trainer.save(
-        path,
-        checkpoint_meta(
-            cfg,
-            step,
-            {"tokens": tokens_seen, "total_steps": total, "train_seconds": start_seconds + wall}
-        )
-    )
+    trainer.save(path, run_meta(cfg, step, tokens_seen, total, budget, train_seconds))
     print(f"checkpoint {path} at step {step} ({ts.elapsed().to_seconds():.1f} s)")
     model.free()
     gpu.synchronize()
-    return 0
+    if finished {
+        print("schedule finished")
+        return 0
+    }
+    let done = progress(step, total, train_seconds, budget)
+    print(f"{done * 100.0:.0f}% of the schedule done; run again with --resume to go on")
+    return 10
+}
+
+fn run_meta(
+    cfg: Config,
+    step: int,
+    tokens: int,
+    total: int,
+    budget: float,
+    seconds: float
+) -> dict[str, any] {
+    return checkpoint_meta(
+        cfg,
+        step,
+        {
+            "tokens": tokens,
+            "total_steps": total,
+            "budget_minutes": budget,
+            "train_seconds": seconds,
+        }
+    )
 }
 
 fn run_bench(trainer: Trainer, sampler: Sampler, cfg: Config) -> void {
