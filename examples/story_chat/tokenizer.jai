@@ -385,6 +385,9 @@ pub fn normalise_turn(text: str) -> str {
     t = t.replace("( ", "(")
     t = t.replace(" ' s ", "'s ").replace(" n't", "n't").replace(" 's ", "'s ").replace(" ’ ", "'")
     t = t.replace("’", "'")
+    #: 540 lines of the train split write `I ’ Ve`; the chat model learned
+    #: to say `I'Ve` from them.
+    t = t.replace("'Ve ", "'ve ")
     return t
 }
 
