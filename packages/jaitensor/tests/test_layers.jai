@@ -1,9 +1,10 @@
 #: The layer objects: what shape each one builds itself for and hands on.
 import jaitensor as jt
 import std.math
+from std.gpu import Buffer
 from std.random import Random
 from std.test import assert_eq, assert_near, assert_true
-from jaitensor import ResBlock
+from jaitensor import Layer, ResBlock, Tensor
 
 fn test_conv2d_matches_spatial_output_and_channel_count() -> void {
     if not jt.is_available() { return }
@@ -418,4 +419,67 @@ fn test_resblock_builds_inside_sequential() -> void {
     assert_eq(counted, 1152 + 2304 + 128 + 6 * 16)
     model.free()
     data.free()
+}
+
+#: The highest handle among the next 256 buffers. Handles are handed out
+#: lowest free slot first, so this stays put while everything made in between
+#: is freed, and climbs by one for every handle something kept below it. (One
+#: probe is not enough: a kept handle can sit above a slot a later free opens.)
+fn handle_frontier() -> int {
+    var probes: list[Buffer] = []
+    var top = 0
+    for _index in 0..256 {
+        let probe = Buffer(1)
+        top = max(top, probe.handle_of())
+        probes.push(probe)
+    }
+    for probe in probes { probe.free() }
+    return top
+}
+
+#: A training step through residual blocks frees every handle it made.
+#:
+#: A convolution's backward took a flat view of its upstream gradient and
+#: never freed it: one handle kept per convolution per step. Handles are found
+#: by a scan from the bottom of the table, so the step grew slower the longer
+#: a run went on -- ResNet-20's thirtieth epoch took three times its first,
+#: all of it in that scan. `handle_frontier` climbs by one for each kept handle.
+fn test_a_residual_training_step_keeps_no_handles() -> void {
+    if not jt.is_available() { return }
+    let layers: list[Layer] = [
+        jt.Conv2d(4, 3, padding: 1, in_channels: 2),
+        jt.ResBlock(4),
+        jt.ResBlock(8, stride: 2),
+        jt.AvgPool2d(2),
+        jt.Flatten(),
+        jt.Dense(3, activation: jt.Activation.Softmax),
+    ]
+    var shape = [4, 4, 2]
+    let rng = Random.with_seed(2)
+    for layer in layers {
+        layer.build_from_shape(shape, rng)
+        shape = layer.output_shape()
+    }
+    var parameters: list[Tensor] = []
+    for layer in layers { parameters.extend(layer.parameters()) }
+    let optimizer = jt.SGD(learning_rate: 0.01, momentum: 0.9, weight_decay: 1e-4)
+    let loss_fn = jt.SparseCategoricalCrossentropy()
+    let x = jt.Tensor([4, 4, 4, 2], formula(128, |i| math.sin(float(i))))
+    let y = jt.Tensor([4], [0.0, 1.0, 2.0, 0.0])
+    var before = 0
+    for step in 0..6 {
+        if step == 3 { before = handle_frontier() }
+        var current = x
+        for layer in layers { current = layer.forward(current) }
+        let loss = loss_fn.forward(current, y)
+        jt.zero_grad(parameters)
+        let graph = loss.backward()
+        optimizer.step(parameters)
+        loss.free()
+        for held in graph { held.free() }
+    }
+    assert_eq(handle_frontier(), before)
+    for layer in layers { layer.free() }
+    x.free()
+    y.free()
 }

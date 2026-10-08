@@ -345,6 +345,10 @@ pub class DataLoader {
         let column = self.dataset.labels.view(0, [self.dataset.samples, 1])
         let picked = gather_rows(column, indices, [count])
         column.free()
+        #: A view holds no memory but does hold a handle, and handles are found
+        #: by a scan from the bottom of the table; one kept per batch made every
+        #: later allocation in a long run slower than the one before.
+        indices.free()
         return (gathered, picked)
     }
 }

@@ -1,5 +1,6 @@
 #: `Dataset` and the loader: how a batch is built and what shuffling has to keep.
 import jaitensor as jt
+from std.gpu import Buffer
 from std.test import assert_eq, assert_near, assert_throws
 
 fn test_dataset_constructors_are_format_agnostic() -> void {
@@ -223,4 +224,54 @@ fn test_random_crop_flip_is_a_seeded_padded_crop() -> void {
     let _self = assert_throws(ValueError, || jt.random_crop_flip_into(source, source))
     let _flat = assert_throws(ValueError, || jt.random_crop_flip(jt.Tensor([4, 3])))
     for tensor in [source, first, again, other, held] { tensor.free() }
+}
+
+#: The highest handle among the next 256 buffers. Handles are handed out
+#: lowest free slot first, so this stays put while everything made in between
+#: is freed, and climbs by one for every handle something kept below it. (One
+#: probe is not enough: a kept handle can sit above a slot a later free opens.)
+fn handle_frontier() -> int {
+    var probes: list[Buffer] = []
+    var top = 0
+    for _index in 0..256 {
+        let probe = Buffer(1)
+        top = max(top, probe.handle_of())
+        probes.push(probe)
+    }
+    for probe in probes { probe.free() }
+    return top
+}
+
+#: A shuffled epoch frees everything it made.
+#:
+#: `next_batch` took a view of the order for each batch's indices and never
+#: freed it. A view holds no device memory, so nothing counting buffers saw
+#: it, but it holds a handle, and handles are found by a scan from the bottom
+#: of the table: a training run kept one per batch, and every allocation
+#: after that walked past all of them. ResNet-20 on CIFAR-10 spent its last
+#: epochs three times as long as its first doing it.
+fn test_a_shuffled_epoch_keeps_no_handles() -> void {
+    if not jt.is_available() { return }
+    let data = jt.Dataset(jt.Tensor([40, 2, 2, 1]), jt.Tensor([40], [float(i % 4) for i in 0..40]))
+    for _warm in 0..2 {
+        let loader = jt.DataLoader(data, 8, shuffle: true, seed: 3)
+        while loader.has_next() {
+            let (features, labels) = loader.next_batch()
+            features.free()
+            labels.free()
+        }
+        loader.free()
+    }
+    let before = handle_frontier()
+    for epoch in 0..3 {
+        let loader = jt.DataLoader(data, 8, shuffle: true, seed: epoch)
+        while loader.has_next() {
+            let (features, labels) = loader.next_batch()
+            features.free()
+            labels.free()
+        }
+        loader.free()
+    }
+    assert_eq(handle_frontier(), before)
+    data.free()
 }
