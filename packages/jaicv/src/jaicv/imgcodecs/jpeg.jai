@@ -1828,10 +1828,13 @@ fn crop_plane(plane: list[int], stride: int, width: int, height: int, out: list[
 #: element of a widened plane and of the picture by the loop that fills it,
 #: before anything reads it. So the last decode's are kept and handed to the next.
 #: That holds on to them between decodes; the pictures of a video, or of a
-#: dataset, are mostly one size, which is the case this is for.
+#: dataset, are mostly one size, which is the case this is for. A list over
+#: `SPARE_LIMIT` elements -- a 1080p picture's is 6.2 million -- is not kept,
+#: so one large photograph does not leave hundreds of megabytes behind it.
 var _SPARE: list[list[int]] = [[], [], [], [], [], [], [], [], [], []]
 
 const SPARE_OUT = 9
+const SPARE_LIMIT = 8388608
 
 #: A list of at least `count` elements for `role`, its contents whatever the
 #: last decode left: the one kept for that role when it is big enough and not
@@ -1841,7 +1844,7 @@ fn spare(role: int, count: int) -> list[int] {
     let kept = _SPARE[role]
     if kept.len() >= count and kept.len() <= count + count // 4 { return kept }
     var fresh: list[int] = __prim__.list_filled(count, 0)
-    _SPARE[role] = fresh
+    if count <= SPARE_LIMIT { _SPARE[role] = fresh }
     return fresh
 }
 

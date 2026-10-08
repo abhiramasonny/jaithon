@@ -244,7 +244,8 @@ and the time is what the compiled code costs. On a COCO image about 4 ms of
 the 16 is the Huffman decode, 7.5 the IDCT, 2 the colour conversion, 1.2
 packing the list into bytes, and the rest unstuffing and setup. The working
 lists are kept from one decode to the next (about forty megabytes for a 720p
-frame), which saves the allocator three milliseconds a video frame. Each step is held to the reference's arithmetic, so there is no
+frame; none over 8.4 million elements), which saves the allocator three
+milliseconds a video frame. Each step is held to the reference's arithmetic, so there is no
 cheaper transform to switch to -- the IDCT has to add the same terms in the
 same order -- and what is left is the compiled code's cost per list access
 and per float operation: about 0.8 ns a multiply-add in the best case. The
