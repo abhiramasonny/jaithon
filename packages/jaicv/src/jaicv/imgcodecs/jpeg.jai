@@ -1818,6 +1818,34 @@ fn crop_plane(plane: list[int], stride: int, width: int, height: int, out: list[
     }
 }
 
+#: The working lists of the last fast decode, one a role: three planes, three
+#: widened across, three widened down, and the packed picture.
+#:
+#: A 720p frame's lists come to about forty megabytes, and allocating them
+#: fresh -- the allocator handing over pages and zeroing every one -- was
+#: three of the thirty-one milliseconds a frame took (half of one of a COCO
+#: photograph's seventeen, whose sizes vary more). Nothing needs them
+#: zeroed: every element of a plane is written by exactly one block, every
+#: element of a widened plane and of the picture by the loop that fills it,
+#: before anything reads it. So the last decode's are kept and handed to the next.
+#: That holds on to them between decodes; the pictures of a video, or of a
+#: dataset, are mostly one size, which is the case this is for.
+var _SPARE: list[list[int]] = [[], [], [], [], [], [], [], [], [], []]
+
+const SPARE_OUT = 9
+
+#: A list of at least `count` elements for `role`, its contents whatever the
+#: last decode left: the one kept for that role when it is big enough and not
+#: much bigger, a new one (kept in its place) when not. The packed picture is
+#: converted to bytes whole, so its slack is bounded to a quarter.
+fn spare(role: int, count: int) -> list[int] {
+    let kept = _SPARE[role]
+    if kept.len() >= count and kept.len() <= count + count // 4 { return kept }
+    var fresh: list[int] = __prim__.list_filled(count, 0)
+    _SPARE[role] = fresh
+    return fresh
+}
+
 #: The scan, the fast way, or null to send it through the reference loop.
 fn scan_fast(
     data: bytes,
@@ -1857,7 +1885,7 @@ fn scan_fast(
     if not usable { return null }
     for slot in 0..count {
         let component = components[slot]
-        planes.push(__prim__.list_filled(component.width * component.height, 0))
+        planes.push(spare(slot, component.width * component.height))
         widths.push(component.width)
         heights.push(component.height)
         hs.push(component.h)
@@ -1891,21 +1919,22 @@ fn scan_fast(
     for slot in 0..count {
         if hs[slot] < max_h {
             let factor = max_h // hs[slot]
-            var wider: list[int] = __prim__.list_filled(widths[slot] * factor * heights[slot], 0)
+            let wider = spare(3 + slot, widths[slot] * factor * heights[slot])
             widen_rows(planes[slot], widths[slot], heights[slot], factor, wider)
             planes[slot] = wider
             widths[slot] = widths[slot] * factor
         }
         if vs[slot] < max_v and not tall {
             let factor = max_v // vs[slot]
-            var taller: list[int] = __prim__.list_filled(widths[slot] * heights[slot] * factor, 0)
+            let taller = spare(6 + slot, widths[slot] * heights[slot] * factor)
             widen_columns(planes[slot], widths[slot], heights[slot], factor, taller)
             planes[slot] = taller
             heights[slot] = heights[slot] * factor
         }
     }
 
-    var out: list[int] = __prim__.list_filled(frame_width * frame_height * count, 0)
+    let picture = frame_width * frame_height * count
+    let out = spare(SPARE_OUT, picture)
     if count == 1 {
         crop_plane(planes[0], widths[0], frame_width, frame_height, out)
     } else {
