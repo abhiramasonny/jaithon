@@ -388,12 +388,18 @@ fn test_weights_in_a_sidecar_are_read() -> void {
 }
 
 fn test_a_sidecar_that_is_not_there_is_refused() -> void {
-    let error = assert_throws(ValueError, || read_net_from_onnx(MODELS + "onnx_external_missing.onnx"))
+    let error = assert_throws(
+        ValueError,
+        || read_net_from_onnx(MODELS + "onnx_external_missing.onnx")
+    )
     assert_contains(error.message, "weight.bin")
 }
 
 fn test_a_sidecar_too_short_for_its_tensor_is_refused() -> void {
-    let error = assert_throws(ValueError, || read_net_from_onnx(MODELS + "onnx_external_short.onnx"))
+    let error = assert_throws(
+        ValueError,
+        || read_net_from_onnx(MODELS + "onnx_external_short.onnx")
+    )
     assert_contains(error.message, "from byte 24")
 }
 

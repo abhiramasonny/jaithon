@@ -270,7 +270,9 @@ pub fn op_expand(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
             throw ValueError(f"{node.label()} expands to {target}, which has a negative width")
         }
         if dimension == 0 {
-            throw ValueError(f"{node.label()} expands to {target}, and an empty tensor has no place here")
+            throw ValueError(
+                f"{node.label()} expands to {target}, and an empty tensor has no place here"
+            )
         }
     }
     let shape = broadcast_shape(data.shape, target, node.label())

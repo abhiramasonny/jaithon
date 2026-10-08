@@ -216,27 +216,12 @@ pub fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     #: Everything jaitensor's own convolution does not take goes to the graph
     #: convolution in one dispatch: groups, dilations, a stride that differs
     #: between the axes, and one-dimensional input.
-    let plain = axes == 2 and
-        groups == 1 and
-        dilations == [1, 1] and
-        strides[0] == strides[1]
+    let plain = axes == 2 and groups == 1 and dilations == [1, 1] and strides[0] == strides[1]
     if not plain and (GRAPH_CONV or axes == 1) {
         let params = if axes == 1 {
             [1, strides[0], 0, 0, pads[0], pads[1], 1, dilations[0], groups, 0, 0]
         } else {
-            [
-                strides[0],
-                strides[1],
-                pads[0],
-                pads[2],
-                pads[1],
-                pads[3],
-                dilations[0],
-                dilations[1],
-                groups,
-                0,
-                0,
-            ]
+            [strides[0], strides[1], pads[0], pads[2], pads[1], pads[3], dilations[0], dilations[1], groups, 0, 0]
         }
         return [graph_conv_of(x, w, bias, params, out_shape, node.label())]
     }
@@ -352,29 +337,11 @@ pub fn op_conv_transpose(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let in_per_group = in_channels // groups
     let output = Tensor([x.shape[0], out_channels, spatial[0], spatial[1]])
     let bias_buffer = if bias is null { output.buffer() } else { bias.buffer() }
-    kernel_for("conv_transpose_nchw").dispatch_async(
-        [x.buffer(), w.buffer(), bias_buffer, output.buffer()],
-        output.size,
-        [
-            output.size,
-            in_per_group,
-            x.shape[2],
-            x.shape[3],
-            out_per_group,
-            spatial[0],
-            spatial[1],
-            window[0],
-            window[1],
-            strides[0],
-            strides[1],
-            pads[0],
-            pads[1],
-            dilations[0],
-            dilations[1],
-            if bias is null { 0 } else { 1 },
-            groups,
-        ]
-    )
+    kernel_for("conv_transpose_nchw").dispatch_async([x.buffer(), w.buffer(), bias_buffer, output.buffer()], output.size, [output.size, in_per_group, x.shape[2], x.shape[3], out_per_group, spatial[0], spatial[1], window[0], window[1], strides[0], strides[1], pads[0], pads[1], dilations[0], dilations[1], if bias is null {
+        0
+    } else {
+        1
+    }, groups])
     return [output]
 }
 

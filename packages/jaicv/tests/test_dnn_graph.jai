@@ -58,7 +58,13 @@ class Case {
 
     #: This case's one node, under the names a test graph gives its inputs.
     pub fn node(self, names: list[str], outs: list[str]) -> GraphNode {
-        let built = GraphNode(self.op, name: self.name, inputs: names, outputs: outs, attrs: self.attrs)
+        let built = GraphNode(
+            self.op,
+            name: self.name,
+            inputs: names,
+            outputs: outs,
+            attrs: self.attrs
+        )
         var scalar_names: dict[str, bool] = {}
         for slot in self.scalars { scalar_names[names[slot]] = true }
         mark_rank_zero([built], scalar_names)
@@ -179,11 +185,7 @@ fn worst_difference(item: Case) -> float {
     }
     var outs: list[str] = []
     for slot in 0..item.wants.len() { outs.push(f"out{slot}") }
-    let graph = Graph(
-        nodes: [item.node(names, outs)],
-        inputs: declared,
-        outputs: outs
-    )
+    let graph = Graph(nodes: [item.node(names, outs)], inputs: declared, outputs: outs)
     let produced = run_graph(graph, feeds)
     var worst = 0.0
     for (slot, want) in item.wants.enumerate() {
@@ -860,8 +862,18 @@ fn test_batch_norm_statistics_through_identity_compile() -> void {
     if not gpu.is_available() { return }
     let graph = Graph(
         nodes: [
-            GraphNode("Identity", name: "mean_copy", inputs: ["mean"], outputs: ["mean_seen"]),
-            GraphNode("Identity", name: "var_copy", inputs: ["var"], outputs: ["var_seen"]),
+            GraphNode(
+                "Identity",
+                name: "mean_copy",
+                inputs: ["mean"],
+                outputs: ["mean_seen"]
+            ),
+            GraphNode(
+                "Identity",
+                name: "var_copy",
+                inputs: ["var"],
+                outputs: ["var_seen"]
+            ),
             GraphNode(
                 "BatchNormalization",
                 name: "bn",

@@ -53,14 +53,34 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
             } else {
                 -1
             }
-            let source = __prim__.graph_reshape(b, state.id_of(node.inputs[0]), [x[0], x[1], 1, x[2]])
-            let filters = __prim__.graph_reshape(b, state.id_of(node.inputs[1]), [w[0], w[1], 1, w[2]])
+            let source = __prim__.graph_reshape(
+                b,
+                state.id_of(node.inputs[0]),
+                [x[0], x[1], 1, x[2]]
+            )
+            let filters = __prim__.graph_reshape(
+                b,
+                state.id_of(node.inputs[1]),
+                [w[0], w[1], 1, w[2]]
+            )
             let convolved = __prim__.graph_conv(
                 b,
                 source,
                 filters,
                 bias,
-                [1, strides[0], 0, 0, pads[0], pads[1], 1, dilations[0], attr_int(node, "group", 1), 0, 0]
+                [
+                    1,
+                    strides[0],
+                    0,
+                    0,
+                    pads[0],
+                    pads[1],
+                    1,
+                    dilations[0],
+                    attr_int(node, "group", 1),
+                    0,
+                    0,
+                ]
             )
             state.ids[out] = __prim__.graph_reshape(b, convolved, dims_of(want))
             return true
@@ -751,7 +771,11 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
             }
             let shape = state.shape_of(node.inputs[1])
             if negative and shape is not null {
-                let moved = [if value < 0.0 { value + float(width) } else { value } for value in folded]
+                let moved = [if value < 0.0 {
+                    value + float(width)
+                } else {
+                    value
+                } for value in folded]
                 indices = __prim__.graph_constant(b, moved, dims_of(shape))
             }
         } else {

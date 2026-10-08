@@ -66,11 +66,15 @@ pub fn op_gather_nd(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let batch = attr_int(node, "batch_dims", 0)
     let depth = indices.shape[indices.rank() - 1]
     if batch < 0 or batch + depth > data.rank() or batch >= indices.rank() {
-        throw ValueError(f"{node.label()} indexes a {data.shape} with {indices.shape} past {batch} batch axes")
+        throw ValueError(
+            f"{node.label()} indexes a {data.shape} with {indices.shape} past {batch} batch axes"
+        )
     }
     for axis in 0..batch {
         if indices.shape[axis] != data.shape[axis] {
-            throw ValueError(f"{node.label()} has batch axes that differ: {data.shape} and {indices.shape}")
+            throw ValueError(
+                f"{node.label()} has batch axes that differ: {data.shape} and {indices.shape}"
+            )
         }
     }
     var out_shape: list[int] = []
@@ -117,7 +121,9 @@ pub fn op_scatter_nd(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     }
     let reduction = attr_str(node, "reduction", "none")
     if not reduction in ["none", "add", "mul", "max", "min"] {
-        throw ValueError(f"{node.label()} asks for the {reduction} reduction, which is not implemented")
+        throw ValueError(
+            f"{node.label()} asks for the {reduction} reduction, which is not implemented"
+        )
     }
     var slab = 1
     for axis in depth..data.rank() { slab *= data.shape[axis] }
@@ -158,7 +164,9 @@ pub fn op_range(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     if delta == 0.0 { throw ValueError(f"{node.label()} steps by zero") }
     let count = int(math.ceil((limit - start) / delta))
     if count <= 0 {
-        throw ValueError(f"{node.label()} is the empty range {start} to {limit}, and an empty tensor has no place here")
+        throw ValueError(
+            f"{node.label()} is the empty range {start} to {limit}, and an empty tensor has no place here"
+        )
     }
     return [Tensor([count], [start + float(index) * delta for index in 0..count])]
 }

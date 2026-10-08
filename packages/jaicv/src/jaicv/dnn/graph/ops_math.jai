@@ -78,7 +78,9 @@ pub fn op_hard_swish(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
 pub fn op_gelu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let approximate = attr_str(node, "approximate", "none")
     if approximate != "none" and approximate != "tanh" {
-        throw ValueError(f"{node.label()} asks for the {approximate} approximation, which Gelu does not have")
+        throw ValueError(
+            f"{node.label()} asks for the {approximate} approximation, which Gelu does not have"
+        )
     }
     return [unary_ex_of(need(ins, 0, node), if approximate == "tanh" { 10 } else { 9 })]
 }

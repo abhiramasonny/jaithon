@@ -374,7 +374,9 @@ fn entry_count(text: str, key: str, where: str) -> int {
     for index in 0..text.len() {
         let digit = text[index]
         if digit < "0" or digit > "9" {
-            throw ValueError(f"{where} gives the {key} {text} for its external data, which is not a count")
+            throw ValueError(
+                f"{where} gives the {key} {text} for its external data, which is not a count"
+            )
         }
         if value > MAX_EXTERNAL_BYTES {
             throw ValueError(f"{where} gives the {key} {text}, which no file this reader opens is")
@@ -409,7 +411,11 @@ fn external_raw(fields: list[Field], where: str, files: ExternalFiles?) -> Field
         )
     }
     let data = files.read(location, where)
-    let offset = if "offset" in entries { entry_count(entries["offset"], "offset", where) } else { 0 }
+    let offset = if "offset" in entries {
+        entry_count(entries["offset"], "offset", where)
+    } else {
+        0
+    }
     if offset > data.len() {
         throw ValueError(f"{where} starts at byte {offset} of {location}, which has {data.len()}")
     }
@@ -989,7 +995,9 @@ fn place_node(reading: Reading, node: GraphNode, label: str, scalar: bool) -> li
     }
     #: `ConstantOfShape` of an empty shape is a scalar, which is how the
     #: TorchScript exporter writes one: the value attribute, held as `[1]`.
-    if op == "ConstantOfShape" and node.inputs.len() == 1 and reading.empty.get(node.inputs[0], false) {
+    if op == "ConstantOfShape" and
+        node.inputs.len() == 1 and
+        reading.empty.get(node.inputs[0], false) {
         let held = node.attrs.get("value", null)
         var value = 0.0
         if held is not null and held.tensor is not null { value = held.tensor.download()[0] }
