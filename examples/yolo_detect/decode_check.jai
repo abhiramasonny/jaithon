@@ -67,6 +67,19 @@ fn test_a_box_is_clipped_to_the_image_in_floating_point() -> void {
     assert_true(math.fabs(hit.h - 9.5) < 0.001)
 }
 
+#: A box with no whole pixel in it cannot take part in the suppression, so
+#: it is dropped rather than reported: a run of such slivers on one object
+#: would otherwise all survive.
+fn test_a_box_with_no_whole_pixel_is_dropped() -> void {
+    if not gpu.is_available() { return }
+    for edges in [[10.2, 30.0, 10.8, 60.0], [100.0, 7.1, 140.0, 7.9], [639.5, 0.0, 639.9, 50.0]] {
+        let output = one_box(8, edges[0], edges[1], edges[2], edges[3], 2, 0.9)
+        let found = decode(output, 1.0, 0, 0, 640, 480)
+        output.free()
+        assert_eq(found.len(), 0)
+    }
+}
+
 fn test_pixel_boxes_round_each_edge() -> void {
     let box = pixel_box(0.49, 0.5, 9.0, 2.2)
     assert_eq(box.x, 0)
@@ -78,7 +91,8 @@ fn test_pixel_boxes_round_each_edge() -> void {
 fn main() -> int {
     test_a_box_keeps_its_fractional_edges()
     test_a_box_is_clipped_to_the_image_in_floating_point()
+    test_a_box_with_no_whole_pixel_is_dropped()
     test_pixel_boxes_round_each_edge()
-    print("decode_check: 3 passed")
+    print("decode_check: 4 passed")
     return 0
 }

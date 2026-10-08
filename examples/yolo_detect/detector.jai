@@ -199,7 +199,6 @@ pub fn decode(
         let top = max(0.0, y0)
         let right = min(float(width), x0 + bw)
         let bottom = min(float(height), y0 + bh)
-        if right <= left or bottom <= top { continue }
 
         #: The suppression works on whole-pixel `Rect`s, and gets the box with
         #: both edges truncated, as it always has. Rounding them instead was
@@ -208,14 +207,14 @@ pub fn decode(
         #: because a tiny box shrinks under truncation and overlaps less.
         let pixel_left = max(0, int(x0))
         let pixel_top = max(0, int(y0))
-        boxes.push(
-            Rect(
-                pixel_left,
-                pixel_top,
-                min(width, int(x0 + bw)) - pixel_left,
-                min(height, int(y0 + bh)) - pixel_top
-            )
-        )
+        let pixel_width = min(width, int(x0 + bw)) - pixel_left
+        let pixel_height = min(height, int(y0 + bh)) - pixel_top
+        #: A box with no whole pixel in it overlaps nothing, so it could
+        #: neither suppress a duplicate nor be suppressed by one; it is
+        #: dropped here, as it always was. That also drops every box empty in
+        #: floating point, since a truncated edge never passes the true one.
+        if pixel_width <= 0 or pixel_height <= 0 { continue }
+        boxes.push(Rect(pixel_left, pixel_top, pixel_width, pixel_height))
         exact.push(left)
         exact.push(top)
         exact.push(right - left)
