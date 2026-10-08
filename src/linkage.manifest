@@ -7,10 +7,7 @@
 
 file-local jaiCliDispatch              src/cli/main.c
 file-local jaiDiagCodeIsWarning        src/common/diag.c
-dead       jaiNameDistance             src/common/diag.c
-dead       jaiNameIsCloser             src/common/diag.c
 file-local jaiSourceLineText           src/common/diag.c
-dead       jaiSpanJoin                 src/common/diag.c
 file-local jaiArenaAlloc               src/common/memory.c
 dead       jaiArenaAllocZeroed         src/common/memory.c
 dead       jaiArenaFree                src/common/memory.c
