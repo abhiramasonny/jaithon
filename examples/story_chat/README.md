@@ -451,7 +451,10 @@ save cut off mid-copy used to leave a truncated `pretrain.ckpt` that
 `--resume` refused, and one cut off between deleting the old file and copying
 the new left none, so `--resume` started the schedule again from step 0.
 Saves are now marked and settled (above), and training stops on a NaN or
-infinite loss before it can overwrite the last good checkpoint. And the disk:
+infinite loss before it can overwrite the last good checkpoint. Decoding
+bytes that were not UTF-8 -- a reply cut off inside a character, which
+`chat.jai` keeps as the bot's turn -- used to turn every non-ASCII byte into
+U+FFFD; now only the bad bytes are replaced. And the disk:
 a run directory holds about a gigabyte at its peak (the 329 MB pretraining
 checkpoint is written beside the old one before it replaces it), and the disk
 this ran on filled up during the vocabulary comparison (346 MB free of 787 GB,
