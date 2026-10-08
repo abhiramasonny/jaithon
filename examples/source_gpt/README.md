@@ -72,19 +72,22 @@ does that.
 | | jai, this branch | jai, trial merge | torch MPS | target |
 |---|---|---|---|---|
 | step, 2 s warm then 7 x 5 steps, 3 rounds | 46.7 / 46.0 / 48.6 ms | 42.1 / 44.9 / 47.3 ms | 56.4 / 56.7 / 59.9 ms (54.4 / 54.3 / 70.0 beside the merge) | 1.3x |
-| step, averaged over the 2,000-step run | **43.1 ms (1.35x)** | | 58.2 ms | 1.3x |
-| 2,000 steps, wall | **87.2 s** | | 117.2 s | 100 s |
-| held-out bits per byte at step 2,000 | **1.463** | | 1.488 | within 0.05 |
+| step, averaged over the 2,000-step run | **43.1 ms (1.35x)** | 47.1, then **45.5 ms (1.35x)** | 58.2 ms (61.2 beside the merge) | 1.3x |
+| 2,000 steps, wall | **87.2 s** | 95.3, then **92.1 s** | 117.2 s (123.3 beside the merge) | 100 s |
+| held-out bits per byte at step 2,000 | **1.463** | 1.467, then **1.465** | 1.488 (1.463 beside the merge) | within 0.05 |
 | cached batch-1 decode | 1.86 / 1.89 / 1.82 ms a byte, **536 bytes/s** | 1.26 / 2.54 / 1.28 ms, **781 bytes/s** | 1.34 / 1.35 / 1.37 ms, 741 bytes/s (5.70 / 1.74 / 1.62 beside the merge) | 600 bytes/s |
-| checkpoint save + load, 3,252,736 parameters | **20 + 11 ms** | | | 0.3 s |
+| checkpoint save + load, 3,252,736 parameters | **20 + 11 ms** | 10 + 9, 22 + 13 ms | | 0.3 s |
 | first step, fresh process | 69 / 152 / 71 ms | 61 / 62 / 64 ms | 309 / 276 / 1176 ms | report |
 | sampled top-level functions `jaithon check` accepts | 0 of 50 (9 closed their body in 600 bytes) | | | report |
 
 Read it this way:
 
-- **Training is 1.35x torch over the real run and 1.21-1.29x in the short
-  bench.** The 2,000-step averages are the steadier number: 2,000 steps on each
-  side, the same protocol, back to back under the lock. The short bench takes
+- **Training is 1.35x torch over the real run, on both trees, and 1.21-1.29x
+  in the short bench.** The 2,000-step averages are the steadier number: 2,000
+  steps on each side, the same protocol, back to back under the lock (the
+  merged pair inside one acquisition). Two jai runs of the merged tree a few
+  minutes apart read 95.3 and 92.1 s, which is the size of the run-to-run
+  noise here. The short bench takes
   35 steps after 2 s of warm-up and jai's spread inside a round is wide
   (37-54 ms a step under the CPU load other agents put on the machine), while
   torch's is not. The step is GPU-bound: the GEMMs are about two thirds of it
@@ -93,7 +96,8 @@ Read it this way:
 - **The two models learn the same thing.** Held-out bits per byte track each
   other all the way: 2.60 / 2.62 at step 250, 1.98 / 1.99 at 500, 1.70 / 1.69
   at 1,000, 1.46 / 1.49 at 2,000 (jai first; 8 batches until the last, which
-  is all 1,920 windows).
+  is all 1,920 windows). Torch's own two runs ended 0.025 apart, 1.488 and
+  1.463, so the gap between the sides is inside the gap between seeds.
 - **Decoding reaches the target on the merged tree, not on this branch.** A
   decoded byte is about 40 dispatches of one row each, and the device -- not
   the host, whose encode is 0.3 ms of it -- spends its time in the one-row
