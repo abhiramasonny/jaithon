@@ -711,13 +711,16 @@ fn test_distinct_values_spreads_integer_labels() -> void {
     for index in 0..4000 { assert_near(found[index], float(index), 0.0, f"class {index}") }
     best_label_time(many)
     best_label_time(few)
-    var worst = 0.0
-    for _round in 0..2 {
+    #: The best of three rounds: another process on the device can only make
+    #: a round slower, and the chain walk made every round about five times
+    #: slower, so the best round still tells the two apart.
+    var ratio = 1.0e9
+    for _round in 0..3 {
         let wide = best_label_time(many)
         let narrow = best_label_time(few)
-        worst = max(worst, wide / max(narrow, 0.05))
+        ratio = min(ratio, wide / max(narrow, 0.05))
     }
-    assert_true(worst < 3.0, f"4000 classes took {worst}x as long as 3")
+    assert_true(ratio < 3.0, f"4000 classes took {ratio}x as long as 3")
 }
 
 fn test_cholesky_solves_the_normal_equations() -> void {
