@@ -181,8 +181,9 @@ pub fn refine_nearest(a: Tensor, b: Tensor, values: Tensor, index: Tensor) -> vo
     let k = values.shape[1]
     base_kernel("base_nearest_refine").dispatch_async(
         [a.buffer(), b.buffer(), values.buffer(), index.buffer()],
-        a.shape[0],
-        [a.shape[0], a.shape[1], k, b.shape[0]]
+        a.shape[0] * 32,
+        [a.shape[0], a.shape[1], k, b.shape[0]],
+        group_size: 32
     )
 }
 

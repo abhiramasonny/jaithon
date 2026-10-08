@@ -638,7 +638,7 @@ kernel void base_row_topk_group(device const float* m [[buffer(0)]],
 }
 
 /* Each query's `k` neighbours, found by the expanded form, given their exact
- * squared distances and put back in order, a thread a query.
+ * squared distances and put back in order, a simdgroup a query.
  *
  * `|a|^2 + |b|^2 - 2 a.b` in float32 is wrong by about an ulp of the squared
  * norms, which is more than the distance between near neighbours once the
@@ -646,7 +646,13 @@ kernel void base_row_topk_group(device const float* m [[buffer(0)]],
  * search already holds the right rows; this recomputes `sum((a - b)^2)` for
  * just those `k` and sorts them by `(distance, index)`, the order every top-k
  * here uses. A query holding a NaN or an infinity has no neighbours: every
- * slot is padded with index `points` and distance infinity. */
+ * slot is padded with index `points` and distance infinity.
+ *
+ * The lanes split the features, so each neighbour's row is read as whole
+ * consecutive words and summed with `simd_sum`. A thread a query read the
+ * rows one feature at a time and left most of the device idle: at a
+ * thousand queries of fifty features it took 0.77 ms, a third of the whole
+ * search. Lane 0 then sorts the `k`. */
 kernel void base_nearest_refine(device const float* a [[buffer(0)]],
                                 device const float* b [[buffer(1)]],
                                 device float* values [[buffer(2)]],
@@ -655,28 +661,36 @@ kernel void base_nearest_refine(device const float* a [[buffer(0)]],
                                 constant uint& width [[buffer(5)]],
                                 constant uint& k [[buffer(6)]],
                                 constant uint& points [[buffer(7)]],
-                                uint id [[thread_position_in_grid]]) {
+                                uint id [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
     if (id >= queries) return;
     device const float* query = a + ulong(id) * ulong(width);
     device float* near = values + ulong(id) * ulong(k);
     device float* at = index + ulong(id) * ulong(k);
     bool bad = false;
-    for (uint c = 0u; c < width; ++c) bad = bad || not_finite(query[c]);
+    for (uint c = lane; c < width; c += 32u) bad = bad || not_finite(query[c]);
+    bad = simd_any(bad);
     for (uint j = 0u; j < k; ++j) {
         uint i = uint(at[j]);
+        /* Uniform across the simdgroup: every lane holds the same `bad` and
+         * reads the same `i`, so all of them reach the `simd_sum`. */
         if (bad || i >= points) {
-            near[j] = INFINITY;
-            at[j] = float(points);
+            if (lane == 0u) {
+                near[j] = INFINITY;
+                at[j] = float(points);
+            }
             continue;
         }
         device const float* row = b + ulong(i) * ulong(width);
-        float total = 0.0f;
-        for (uint c = 0u; c < width; ++c) {
+        float part = 0.0f;
+        for (uint c = lane; c < width; c += 32u) {
             float gap = query[c] - row[c];
-            total += gap * gap;
+            part += gap * gap;
         }
-        near[j] = total;
+        float total = simd_sum(part);
+        if (lane == 0u) near[j] = total;
     }
+    if (lane != 0u) return;
     for (uint j = 1u; j < k; ++j) {
         float v = near[j];
         float i = at[j];
