@@ -7,8 +7,9 @@ fill about 150 ms, median/min/max in ms -- the protocol zoo.jai uses.
         --no-project --with onnx --with onnxruntime --with onnxscript --with torchvision \\
         python examples/onnx_zoo/peer_time.py resnet18 vit_tiny_dyn1
 
-Results accumulate in $ONNX_ZOO_DIR/peer.json. `--table zoo.tsv` prints the
-README's markdown table from zoo.jai's rows and those results.
+Results accumulate in $ONNX_ZOO_DIR/peer.json. `--table zoo.tsv [tag,tag,...]`
+prints the README's markdown table from zoo.jai's rows and those results, in
+the order given (every row, sorted, when no list is).
 """
 import json
 import os
@@ -90,16 +91,21 @@ def fmt(v):
     return "-" if v in ("-", None) else f"{float(v):.2f}"
 
 
-def table(tsv):
+def table(tsv, only=None):
     zoo = os.path.expanduser(os.environ.get("ONNX_ZOO_DIR", "~/.cache/jaithon/onnx_zoo"))
     peer_path = os.path.join(zoo, "peer.json")
     peers = json.load(open(peer_path)) if os.path.exists(peer_path) else {}
     print("| model | status | import ms | interp ms | compile ms | plan ms | torch MPS ms | ORT CPU ms | plan vs MPS | plan vs ORT | rel (interp / plan) |")
     print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    rows = {}
     for line in open(tsv):
         f = line.rstrip("\n").split("\t")
-        if len(f) < 13:
+        if len(f) >= 13:
+            rows[f[0]] = f
+    for tag in (only or sorted(rows)):
+        if tag not in rows:
             continue
+        f = rows[tag]
         tag, status, imp, _cold, imed, _ilo, _ihi, comp, pmed, plo, phi, irel, prel = f[:13]
         p = peers.get(tag, {})
         mps = p.get("torch_mps", {})
@@ -115,6 +121,6 @@ def table(tsv):
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--table"]:
-        table(sys.argv[2])
+        table(sys.argv[2], sys.argv[3].split(",") if len(sys.argv) > 3 else None)
     else:
         time_peers(sys.argv[1:])

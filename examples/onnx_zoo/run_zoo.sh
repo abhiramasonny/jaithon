@@ -18,8 +18,7 @@ BATCH=${BATCH:-12}
 
 run_batch() {
   echo "=== $* $(date +%H:%M:%S) load $(uptime | sed 's/.*averages: //')"
-  ./scripts/bench/gpu_lock.sh ./jaithon run examples/onnx_zoo/zoo.jai -- --tsv "$Z/zoo.tsv" "$@" 2>&1 \
-    | grep -v "Incompatible element type"
+  ./scripts/bench/gpu_lock.sh sh examples/onnx_zoo/zoo_batch.sh "$@"
   peers=""
   for m in "$@"; do
     if [ "${PEERS:-1}" = "0" ]; then continue; fi

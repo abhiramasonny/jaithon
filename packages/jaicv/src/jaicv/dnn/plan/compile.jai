@@ -23,11 +23,32 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
     let order = graph.schedule()
     let known = static_values(graph, order)
 
-    #: Ask the survey for every static value, which is what the folding needs.
+    #: An `Identity` of a constant is the constant under a second name -- torch
+    #: writes one for every weight it found a duplicate of, so a randomly
+    #: initialised ResNet-50 has forty-seven of them, one per zero bias. Their
+    #: values are copied across after the survey rather than asked of it,
+    #: because asking means reading each one back, and every read waits on the
+    #: GPU; forty-seven waits were a third of the survey.
+    var aliases: list[list[str]] = []
+    var aliased: dict[str, bool] = {}
+    for node in order {
+        if node.op != "Identity" and node.op != "Dropout" { continue }
+        if node.inputs.len() == 0 or node.outputs.len() == 0 or node.outputs[0].len() == 0 {
+            continue
+        }
+        if not known.get(node.inputs[0], false) { continue }
+        aliases.push([node.outputs[0], node.inputs[0]])
+        aliased[node.outputs[0]] = true
+    }
+
+    #: Ask the survey for every other static value, which is what the folding
+    #: needs.
     var wanted: dict[str, list[float]] = {}
     for node in order {
         for name in node.outputs {
-            if name.len() > 0 and known.get(name, false) { wanted[name] = [] }
+            if name.len() > 0 and known.get(name, false) and not aliased.get(name, false) {
+                wanted[name] = []
+            }
         }
     }
     var shapes: dict[str, list[int]] = {}
@@ -43,6 +64,11 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
     #: nothing produced them.
     for (name, weight) in graph.initializers.items() {
         if weight.size <= FOLD_LIMIT { wanted[name] = weight.download() }
+    }
+    #: In schedule order, so a chain of them resolves front to back.
+    for pair in aliases {
+        let values = wanted.get(pair[1], null)
+        if values is not null { wanted[pair[0]] = values }
     }
 
     var oversized: list[str] = []
