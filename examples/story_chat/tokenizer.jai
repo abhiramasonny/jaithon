@@ -239,18 +239,55 @@ pub fn load_tokenizer(path: str) -> Tokenizer {
     return Tokenizer(lefts, rights)
 }
 
-#: Bytes as text, with anything that is not UTF-8 replaced byte by byte.
+#: How many bytes the UTF-8 character at `i` takes, or 0 if the bytes there
+#: are not one (a stray continuation, a cut-off sequence, an overlong form,
+#: a surrogate, or past U+10FFFF).
+fn utf8_length(data: bytes, i: int) -> int {
+    let b = data[i]
+    if b < 128 { return 1 }
+    var n = 0
+    var lo = 128
+    var hi = 191
+    if b >= 194 and b <= 223 {
+        n = 2
+    } elif b >= 224 and b <= 239 {
+        n = 3
+        if b == 224 { lo = 160 }
+        if b == 237 { hi = 159 }
+    } elif b >= 240 and b <= 244 {
+        n = 4
+        if b == 240 { lo = 144 }
+        if b == 244 { hi = 143 }
+    } else {
+        return 0
+    }
+    if i + n > data.len() { return 0 }
+    let second = data[i + 1]
+    if second < lo or second > hi { return 0 }
+    for k in 2..n {
+        let c = data[i + k]
+        if c < 128 or c > 191 { return 0 }
+    }
+    return n
+}
+
+#: Bytes as text. Bytes that are not part of a UTF-8 character -- a reply
+#: cut off inside one, say -- each become U+FFFD; the characters around
+#: them are kept.
 pub fn text_of(data: bytes) -> str {
     try {
         return data.decode()
     } catch _e: Error {
         var kept: list[int] = []
-        for i in 0..data.len() {
-            let b = data[i]
-            if b < 128 {
-                kept.push(b)
-            } else {
+        var i = 0
+        while i < data.len() {
+            let n = utf8_length(data, i)
+            if n == 0 {
                 for x in [239, 191, 189] { kept.push(x) }
+                i += 1
+            } else {
+                for k in 0..n { kept.push(data[i + k]) }
+                i += n
             }
         }
         return bytes(kept).decode()
