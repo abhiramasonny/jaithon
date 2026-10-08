@@ -6,8 +6,10 @@
 #: `<|user|>` / `<|bot|>` turns (each speaker taking a turn as the bot), and
 #: trains on the bot's tokens only: the hidden states at those positions are
 #: gathered with `gather_rows` before the output head, so the loss is the
-#: ordinary cross-entropy over just them. AdamW at a low rate, `LR` (1e-4)
-#: after `WARMUP` (50) steps, cosine to a tenth over all `--epochs` (3).
+#: ordinary cross-entropy over just them. AdamW at half the pretraining
+#: rate, `LR` (3e-4; 1e-4 reached 3.235 after two epochs where 3e-4 reached
+#: 2.979), after `WARMUP` (50) steps, cosine to a tenth over all `--epochs`
+#: (3).
 #: Reports the masked loss on `dialogues_validation` every epoch and saves the
 #: best to `CHAT_CKPT` (default `~/.cache/jaithon/story_chat/chat.ckpt`), and
 #: the latest, optimiser and all, beside it as `chat.ckpt.state`.
@@ -115,7 +117,7 @@ fn main() -> int {
     let one_epoch = has_flag("--one-epoch")
     let seed = env_int("SEED", 11)
     let per_epoch = epoch_batches(train_rows, batch, cfg.seq, quantum, null).len()
-    let peak = env_float("LR", 1.0e-4)
+    let peak = env_float("LR", 3.0e-4)
     let warmup = env_int("WARMUP", 50)
     let trainer = Trainer(model, peak, env_float("WD", 0.1), env_float("CLIP", 1.0))
     let path = chat_checkpoint()
