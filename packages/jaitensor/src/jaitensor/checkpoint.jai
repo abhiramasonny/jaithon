@@ -34,6 +34,11 @@ let MAGIC = "JAITENSOR-CHECKPOINT 1\n"
 #: aligned however long the names are.
 let ALIGN = 64
 
+#: The most values one checkpoint holds: the byte kernels index a value's
+#: four bytes with a 32-bit `(offset + id) * 4`, which would wrap past this
+#: and corrupt the file silently.
+let MAX_VALUES = 1073741824
+
 let _BYTES_SOURCE = """#include <metal_stdlib>
 using namespace metal;
 
@@ -115,6 +120,9 @@ pub fn save_checkpoint(
         entries.push({"name": name, "shape": tensor.shape, "offset": total})
         total += tensor.size
     }
+    if total > MAX_VALUES {
+        throw ValueError(f"a checkpoint holds at most {MAX_VALUES} values, got {total}")
+    }
     var data = bytes([])
     if total > 0 {
         let staging = Buffer(4 * total)
@@ -191,6 +199,9 @@ class Layout {
             shapes.push(shape)
             offsets.push(offset)
             total += size
+        }
+        if total > MAX_VALUES {
+            throw ValueError(f"{path}: a checkpoint holds at most {MAX_VALUES} values, got {total}")
         }
         if self.data_start + 4 * total > raw.len() {
             throw ValueError(f"{path}: checkpoint holds fewer values than its header lists")
