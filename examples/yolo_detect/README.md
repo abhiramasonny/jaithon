@@ -115,9 +115,9 @@ well and comes out lower, 0.4059, so it was left as it was. The rest of the
 gap to onnxruntime is the suppression itself working in whole pixels; there is
 no `Rect2d` in jaicv yet.
 
-The 300 images take 8.1 s end to end in Jaithon, decode included (about 17
-ms a JPEG and 8 ms of `detect_frame` each), against 21 s with the reference
-JPEG decoder.
+The 300 images take 7.4 s end to end in Jaithon, decode included (16.8 ms an
+`imread` and 7.3 ms of `detect_frame` each), against 20.3 s with the reference
+JPEG decoder; the detections are the same either way.
 
 ## Verified
 
@@ -162,9 +162,10 @@ jaithon run examples/yolo_detect/live.jai -- --video clip720.avi --headless
 | decoder | steady fps (five runs) | whole run |
 | --- | --- | --- |
 | reference (`JAICV_FAST_JPEG=0`) | 19.1 | 23.7 s |
-| fast | 32.6, 37.5, 40.1, 42.7, 45.4 | 4.7 s |
+| fast | 38.2, 43.4, 46.5, 49.3, 50.1 | 4.1-4.6 s |
 
 The fps is `live.jai`'s own, the mean of the last fifteen frames, which is why
 it scatters; the whole-run time includes loading the model. A 720p frame takes
-about 30 ms to decode against roughly 4 ms of network, so from a file the loop
-is still decode-bound, short of the 50 fps the detector could keep up with.
+27 ms to decode (118 ms with the reference decoder) against roughly 4 ms of
+network, so from a file the loop is still decode-bound, just short of the
+50 fps the detector could keep up with.

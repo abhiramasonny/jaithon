@@ -226,7 +226,9 @@ memory, median of five rounds after a second of warm-up, against OpenCV 4 with
 
 | | fast | reference | cv2 |
 |---|---|---|---|
-| COCO JPEG, 640x426 average, 20 images | 17.0 ms | 57.9 ms | 1.61 ms |
+| COCO JPEG, 4:4:4, first 20 val2017 images | 15.7 ms | 55.8 ms | 1.51 ms |
+| COCO JPEG, first 100 | 15.8 ms | | 1.53 ms |
+| 720p 4:2:0 MJPEG frame, from the AVI, 120 frames | 27.0 ms | 118.0 ms | |
 | HASY 32x32 RGB PNG, 500 images | 23.3 us | 265.6 us | 10.1 us |
 | HASY `imread(path, IMREAD_GRAYSCALE)` | 53.0 us | 300.6 us | 36.2 us |
 
@@ -235,12 +237,14 @@ the device buffer the `Mat` lives in, and `IMREAD_GRAYSCALE` adds a
 `cvt_color` dispatch. The whole HASY set (168,233 files) loads in about 9 s,
 from 50 s.
 
-The JPEG is not. A decode is now about 40,000 interpreted instructions and a
-hundred allocations (the reference: 1.1 million and 4,000), so the JIT runs
-nearly all of it, and the time is what the compiled code costs. On a COCO
-image about 4 ms of the 17 is the Huffman decode, 7.5 the IDCT, 2 the colour
-conversion, 1.2 packing the list into bytes, and the rest unstuffing and
-allocation. Each step is held to the reference's arithmetic, so there is no
+The JPEG is not: 3.6x faster than the reference, still ten times OpenCV. A
+decode is now about 40,000 interpreted instructions and a hundred allocations
+(the reference: 1.1 million and 4,000), so the JIT runs nearly all of it,
+and the time is what the compiled code costs. On a COCO image about 4 ms of
+the 16 is the Huffman decode, 7.5 the IDCT, 2 the colour conversion, 1.2
+packing the list into bytes, and the rest unstuffing and setup. The working
+lists are kept from one decode to the next (about forty megabytes for a 720p
+frame), which saves the allocator three milliseconds a video frame. Each step is held to the reference's arithmetic, so there is no
 cheaper transform to switch to -- the IDCT has to add the same terms in the
 same order -- and what is left is the compiled code's cost per list access
 and per float operation: about 0.8 ns a multiply-add in the best case. The
