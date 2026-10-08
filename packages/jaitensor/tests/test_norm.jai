@@ -148,7 +148,7 @@ fn check_fused_against_composed(shape: list[int], with_skip: bool, with_relu: bo
 
 fn test_fused_batch_norm_matches_the_composed_operations() -> void {
     if not jt.is_available() { return }
-    for shape in [[8, 8, 8, 32], [4, 8, 8, 64], [2, 2, 2, 4], [3, 4, 5, 6], [2, 8, 8, 3], [16, 4, 4, 128]] {
+    for shape in [[8, 8, 8, 32], [4, 8, 8, 64], [2, 2, 2, 4], [3, 4, 5, 6], [2, 8, 8, 3], [16, 4, 4, 128], [8, 8, 8, 2]] {
         check_fused_against_composed(shape, true, true)
         check_fused_against_composed(shape, false, true)
         check_fused_against_composed(shape, true, false)
