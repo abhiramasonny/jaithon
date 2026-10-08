@@ -6,6 +6,7 @@ from .ops import conv2d, conv2d_out_dim, dense_affine, dense_static_backward, de
 from .ops import dropout, gather_rows, gelu, layer_norm, leaky_relu, max_pool2d, avg_pool2d
 from .ops import relu, reshape, sigmoid, softmax, tanh
 from .ops import batch_norm, group_norm, multi_head_attention, silu, matmul
+from .ops import add, copy_into, merge_heads, split_heads
 from .ops.attention import hand_to_graph
 from .ops.matmul import raw_matmul
 from .tensor import Tensor
@@ -719,10 +720,17 @@ pub class LayerNorm: Layer {
     fn __str__(self) -> str { return f"LayerNorm({self.width})" }
 }
 
-#: Multi-head self-attention over rank-two `[seq, dim]` inputs.
+#: Multi-head self-attention over `[seq, dim]` or batched `[batch, seq, dim]`
+#: inputs.
 #:
 #: `causal` lets each position attend only to itself and the positions before
 #: it, which is what an autoregressive model trains with.
+#:
+#: A rank-three input is a batch of independent sequences. The projections
+#: run as one product over all `batch * seq` rows and attention folds the
+#: batch into the head axis, so a batch costs the same number of dispatches
+#: as one sequence; nothing attends across sequences. Rank two is one
+#: sequence, exactly as before, which is what `Sequential` hands the layer.
 #:
 #: For generation, `start_cache(max_seq)` keeps every key and value the layer
 #: has projected in device buffers of `max_seq` rows. Each `forward` then
@@ -731,7 +739,9 @@ pub class LayerNorm: Layer {
 #: everything cached so far, so a token costs the same at position 500 as at
 #: position 5 instead of recomputing the whole prefix. The cached forward
 #: records no gradient. `reset_cache` starts a new sequence in the same
-#: buffers; `free_cache` (or `free`) releases them.
+#: buffers; `free_cache` (or `free`) releases them. `start_cache(max_seq,
+#: batch: n)` keeps `n` sequences that advance together, fed as
+#: `[n, rows, dim]`.
 pub class MultiHeadAttention: Layer {
     pub let heads: int
     pub let dim: int
@@ -743,6 +753,7 @@ pub class MultiHeadAttention: Layer {
     var cache_k: Tensor?
     var cache_v: Tensor?
     var cached: int
+    var cache_batch: int
 
     pub fn init(self, dim: int, heads: int = 1, causal: bool = false) {
         if dim <= 0 or heads <= 0 {
@@ -759,17 +770,31 @@ pub class MultiHeadAttention: Layer {
         self.cache_k = null
         self.cache_v = null
         self.cached = 0
+        self.cache_batch = 1
     }
 
-    #: Keep keys and values across `forward` calls, for up to `max_seq` rows.
-    #: Replaces any cache already held, and starts empty.
-    pub fn start_cache(self, max_seq: int) -> void {
+    #: Keep keys and values across `forward` calls, for up to `max_seq` rows
+    #: of each of `batch` sequences. Replaces any cache already held, and
+    #: starts empty.
+    #:
+    #: The cache is position-major, `[max_seq, batch * dim]`: row `s` holds
+    #: every sequence's key at position `s`, side by side. That is the layout
+    #: batched attention folds a batch into anyway, so a decode step attends
+    #: the cache where it lies, and one new row a sequence -- `[batch, dim]`
+    #: -- is already exactly one row of it. For one sequence it is the plain
+    #: `[max_seq, dim]`.
+    pub fn start_cache(self, max_seq: int, batch: int = 1) -> void {
         if max_seq <= 0 { throw ValueError(f"start_cache needs a positive length, got {max_seq}") }
+        if batch <= 0 { throw ValueError(f"start_cache needs a positive batch, got {batch}") }
         self.free_cache()
-        self.cache_k = Tensor([max_seq, self.dim])
-        self.cache_v = Tensor([max_seq, self.dim])
+        self.cache_k = Tensor([max_seq, batch * self.dim])
+        self.cache_v = Tensor([max_seq, batch * self.dim])
+        self.cache_batch = batch
         self.cached = 0
     }
+
+    #: How many sequences the cache holds side by side.
+    pub fn cache_batch_size(self) -> int { return self.cache_batch }
 
     #: Forget the cached rows but keep the buffers, for the next sequence.
     #: Nothing is written: the rows are simply overwritten as they refill.
@@ -787,6 +812,7 @@ pub class MultiHeadAttention: Layer {
         self.cache_k = null
         self.cache_v = null
         self.cached = 0
+        self.cache_batch = 1
     }
 
     #: `forward` with the cache on: `x` holds only the rows not seen yet.
@@ -831,6 +857,127 @@ pub class MultiHeadAttention: Layer {
         return output
     }
 
+    #: The cached forward for `[batch, rows, dim]`, one batch of sequences
+    #: advancing together. Records no gradient, like the rank-two one.
+    fn forward_cached_batched(
+        self,
+        x: Tensor,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor,
+        keys: Tensor,
+        values: Tensor
+    ) -> Tensor {
+        let batch = x.shape[0]
+        let rows = x.shape[1]
+        if batch != self.cache_batch {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {self.cache_batch} sequences, got a batch of {batch}"
+            )
+        }
+        if batch == 1 {
+            #: One sequence is the rank-two cache exactly; the folds below
+            #: would only copy it.
+            let single = x.view(0, [rows, self.dim])
+            let out = self.forward_cached(single, wq, wk, wv, wo, keys, values)
+            single.free()
+            return Tensor([1, rows, self.dim], storage: out.buffer())
+        }
+        let capacity = keys.shape[0]
+        if self.cached + rows > capacity {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {capacity} rows; {self.cached} are used and {rows} more were given"
+            )
+        }
+        let width = batch * self.dim
+        let start = self.cached * width
+        let seen = self.cached + rows
+        let flat = x.view(0, [batch * rows, self.dim])
+        var query = flat
+        if rows == 1 {
+            #: `[batch, dim]` is already the next cache row, `[1, batch * dim]`,
+            #: so the projections write it in place, as the rank-two path does.
+            let k_rows = keys.view(start, [batch, self.dim])
+            let v_rows = values.view(start, [batch, self.dim])
+            raw_matmul(flat, wk, out: k_rows)
+            raw_matmul(flat, wv, out: v_rows)
+            k_rows.free()
+            v_rows.free()
+            let q = raw_matmul(flat, wq)
+            query = Tensor([1, width], storage: q.buffer())
+        } else {
+            #: A prompt: `[batch * rows, dim]` is sequence-major, the cache is
+            #: position-major, and `merge_heads` with one "head" a sequence is
+            #: precisely that transpose.
+            for (weight, cache) in [(wk, keys), (wv, values)] {
+                let projected = raw_matmul(flat, weight)
+                let folded = merge_heads(projected, batch, rows)
+                projected.free()
+                let target = cache.view(start, [rows, width])
+                copy_into(folded, target)
+                target.free()
+                folded.free()
+            }
+            let q = raw_matmul(flat, wq)
+            query = merge_heads(q, batch, rows)
+            q.free()
+        }
+        flat.free()
+        let k_seen = keys.view(0, [seen, width])
+        let v_seen = values.view(0, [seen, width])
+        let context = multi_head_attention(
+            query,
+            k_seen,
+            v_seen,
+            self.heads * batch,
+            causal: self.causal
+        )
+        k_seen.free()
+        v_seen.free()
+        query.free()
+        let per_row = if rows == 1 {
+            Tensor([batch, self.dim], storage: context.buffer())
+        } else {
+            split_heads(context, batch)
+        }
+        if rows != 1 { context.free() }
+        let output = raw_matmul(per_row, wo)
+        per_row.free()
+        self.cached = seen
+        return Tensor([batch, rows, self.dim], storage: output.buffer())
+    }
+
+    #: The whole-sequence forward for `[batch, seq, dim]`.
+    #:
+    #: Ownership follows the rank-two path: whatever a recorded graph reads
+    #: rides on it, through `hand_to_graph`, and what nothing recorded is
+    #: freed here. `flat` is read by the projections' backward and `per_row`
+    #: by the output product's, so they go to the graph with `context`; the
+    #: unrecorded result adopts the product's buffer rather than viewing it.
+    fn forward_batched(self, x: Tensor, wq: Tensor, wk: Tensor, wv: Tensor, wo: Tensor) -> Tensor {
+        let batch = x.shape[0]
+        let seq = x.shape[1]
+        let flat = reshape(x, [batch * seq, self.dim])
+        let q = matmul(flat, wq)
+        let k = matmul(flat, wk)
+        let v = matmul(flat, wv)
+        let q3 = reshape(q, [batch, seq, self.dim])
+        let k3 = reshape(k, [batch, seq, self.dim])
+        let v3 = reshape(v, [batch, seq, self.dim])
+        let context = multi_head_attention(q3, k3, v3, self.heads, causal: self.causal)
+        hand_to_graph(context, [q3, k3, v3, q, k, v])
+        let per_row = reshape(context, [batch * seq, self.dim])
+        let product = matmul(per_row, wo)
+        if product.creator is null {
+            for held in [flat, per_row, context] { held.free() }
+            return Tensor([batch, seq, self.dim], storage: product.buffer())
+        }
+        let output = reshape(product, [batch, seq, self.dim])
+        hand_to_graph(output, [flat, per_row, context])
+        return output
+    }
+
     pub fn build(self, input_units: int, rng: Random) -> void {
         if input_units != self.dim {
             throw ValueError(f"MultiHeadAttention expected width {self.dim}, got {input_units}")
@@ -855,12 +1002,25 @@ pub class MultiHeadAttention: Layer {
         if wq is null or wk is null or wv is null or wo is null {
             throw RuntimeError("MultiHeadAttention has not been built")
         }
-        if x.rank() != 2 or x.shape[1] != self.dim {
-            throw ValueError(f"MultiHeadAttention needs [seq, {self.dim}], got {x.shape}")
-        }
         let keys = self.cache_k
         let values = self.cache_v
+        if x.rank() == 3 and x.shape[2] == self.dim {
+            if keys is not null and values is not null {
+                return self.forward_cached_batched(x, wq, wk, wv, wo, keys, values)
+            }
+            return self.forward_batched(x, wq, wk, wv, wo)
+        }
+        if x.rank() != 2 or x.shape[1] != self.dim {
+            throw ValueError(
+                f"MultiHeadAttention needs [seq, {self.dim}] or [batch, seq, {self.dim}], got {x.shape}"
+            )
+        }
         if keys is not null and values is not null {
+            if self.cache_batch != 1 {
+                throw ValueError(
+                    f"MultiHeadAttention cache holds {self.cache_batch} sequences; feed it [{self.cache_batch}, rows, {self.dim}]"
+                )
+            }
             return self.forward_cached(x, wq, wk, wv, wo, keys, values)
         }
         let q = matmul(x, wq)
