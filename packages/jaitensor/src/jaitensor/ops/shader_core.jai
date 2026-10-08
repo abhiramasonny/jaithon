@@ -92,7 +92,7 @@ kernel void unary_op(device const float* input [[buffer(0)]],
     if (operation == 0) output[id] = value;
     else if (operation == 1) output[id] = max(value, 0.0f);
     else if (operation == 2) output[id] = 1.0f / (1.0f + exp(-value));
-    else if (operation == 3) output[id] = tanh(clamp(value, -15.0f, 15.0f));
+    else if (operation == 3) output[id] = value > 15.0f ? 1.0f : (value < -15.0f ? -1.0f : tanh(value));
     else if (operation == 4) output[id] = exp(value);
     else if (operation == 5) output[id] = log(value);
     else if (operation == 6) output[id] = fabs(value);

@@ -23,18 +23,24 @@ let BASE_SOURCE = CORE_SOURCE + POOL_SOURCE + NORM_SOURCE + CONV_SOURCE + LAYOUT
 #: Compiling more entry points is close to free: the Metal library is cached by
 #: source text, so each of these costs a pipeline object and no recompilation.
 #:
-#: `tanh` is clamped to +-15 in both tanh and GELU. The kernels build with
+#: `tanh` saturates past +-15 in both tanh and GELU. The kernels build with
 #: fast math, which works tanh out through an exponential that overflows: it
 #: gave NaN from 45 up, and GELU, whose argument carries a cube, gave NaN from
 #: an input of 12 -- a GPT's MLP reaches that within a few hundred steps of
 #: Adam at 1e-3, and every loss after it is NaN. Past 15 the true value is 1
-#: to the last bit of a float, so the clamp changes nothing else. The GEMM
-#: epilogues do the same (`gemm_tanh`).
+#: to the last bit of a float, so this changes nothing else. tanh tests the
+#: range rather than clamping its argument, because a clamp turns NaN into
+#: -15 and so into a finite -1 with a zero gradient, hiding a divergence;
+#: GELU can clamp, since it multiplies by the input, which is NaN whenever
+#: its tanh argument is.
 pub let UNARY_FORMS = [
     ("copy", "value"),
     ("relu", "max(value, 0.0f)"),
     ("sigmoid", "1.0f / (1.0f + exp(-value))"),
-    ("tanh", "tanh(clamp(value, -15.0f, 15.0f))"),
+    (
+        "tanh",
+        "(value > 15.0f ? 1.0f : (value < -15.0f ? -1.0f : tanh(value)))"
+    ),
     ("exp", "exp(value)"),
     ("log", "log(value)"),
     ("abs", "fabs(value)"),
