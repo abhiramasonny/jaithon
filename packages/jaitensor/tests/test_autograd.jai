@@ -3,6 +3,7 @@ import jaitensor as jt
 import std.gpu as gpu
 import std.math
 import std.os
+from std.random import Random
 from jaitensor.losses import sparse_ce_with_delta
 from jaitensor.tensor import GradNode, Tensor
 from std.test import assert_eq, assert_near, assert_true
@@ -649,7 +650,9 @@ fn test_backward_gives_no_gradient_to_a_constant_on_either_side_of_a_binary_op()
                     throw AssertionError(f"{name} (swap {swap}) gave the constant a gradient")
                 }
                 let gradient = x.grad
-                if gradient is null { throw AssertionError(f"{name} (swap {swap}) gave x no gradient") }
+                if gradient is null {
+                    throw AssertionError(f"{name} (swap {swap}) gave x no gradient")
+                }
                 var want: list[float] = []
                 for index in 0..4 {
                     want.push(binary_grad_by_hand(name, c_values[index], x_values[index], swap))
@@ -932,7 +935,7 @@ fn test_sparse_cross_entropy_matches_a_hand_computation_at_every_width() -> void
         for rows in [1, 3] {
             var values: list[float] = []
             for index in 0..rows * classes {
-                values.push(float((index * 37) % 1009) / 256.0 - 2.0)
+                values.push(float(index * 37 % 1009) / 256.0 - 2.0)
             }
             var labels: list[float] = []
             for row in 0..rows { labels.push(float(if row % 2 == 0 { classes - 1 } else { 0 })) }
@@ -944,7 +947,11 @@ fn test_sparse_cross_entropy_matches_a_hand_computation_at_every_width() -> void
             var want_grad: list[float] = []
             for row in 0..rows {
                 let slice = [values[row * classes + column] for column in 0..classes]
-                let (row_loss, row_grad) = ce_row_by_hand(slice, int(labels[row]), 1.0 / float(rows))
+                let (row_loss, row_grad) = ce_row_by_hand(
+                    slice,
+                    int(labels[row]),
+                    1.0 / float(rows)
+                )
                 want_loss += row_loss / float(rows)
                 for value in row_grad { want_grad.push(value) }
             }
@@ -984,4 +991,302 @@ fn test_sparse_cross_entropy_gradient_carries_the_upstream() -> void {
     let thrice = logits.grad
     if thrice is null { throw AssertionError("expected logits.grad") }
     assert_values_near(thrice.download(), [value * 3.0 for value in single], 1e-6)
+}
+
+fn filled(shape: list[int], seed: int, requires_grad: bool = false) -> Tensor {
+    let tensor = jt.Tensor(shape, requires_grad: requires_grad)
+    tensor.buffer().fill_uniform(0.1, 0.9, seed)
+    return tensor
+}
+
+#: Buffers left behind by three calls of `body` inside `no_grad`, each freeing
+#: what it returns, after one call to fill any per-shape cache.
+fn no_grad_drift(body: fn() -> Tensor) -> int {
+    jt.no_grad(fn() -> void { body().free() })
+    gpu.synchronize()
+    let before = gpu.live_buffers()
+    for _i in 0..3 { jt.no_grad(fn() -> void { body().free() }) }
+    gpu.synchronize()
+    return gpu.live_buffers() - before
+}
+
+fn assert_no_grad_drift(name: str, body: fn() -> Tensor) -> void {
+    let drift = no_grad_drift(body)
+    if drift != 0 { throw AssertionError(f"{name} left {drift} buffers behind under no_grad") }
+}
+
+#: A parameter straight into an op that composes others. Each used to keep
+#: its temporaries for a graph because the parameter requires a gradient,
+#: and inside `no_grad` no graph ever came to free them.
+fn test_no_grad_frees_the_temporaries_of_composed_ops() -> void {
+    if not jt.is_available() { return }
+    let w = filled([4, 8], 3, requires_grad: true)
+    defer { w.free() }
+    let t = filled([4, 8], 5)
+    defer { t.free() }
+    let seq = filled([16, 32], 7, requires_grad: true)
+    defer { seq.free() }
+    let kv = filled([24, 32], 9, requires_grad: true)
+    defer { kv.free() }
+    assert_no_grad_drift("mean", || jt.mean(w))
+    assert_no_grad_drift("mean over rows", || jt.mean(w, axis: -1))
+    assert_no_grad_drift("mse", || jt.mse(w, t))
+    assert_no_grad_drift("mse of a target", || jt.mse(t, w))
+    assert_no_grad_drift("binary_cross_entropy", || jt.binary_cross_entropy(w, t))
+    assert_no_grad_drift("bce with logits", || jt.binary_cross_entropy_with_logits(w, t))
+    assert_no_grad_drift("MeanSquaredError", || jt.MeanSquaredError().forward(w, t))
+    assert_no_grad_drift("BinaryCrossentropy", || jt.BinaryCrossentropy().forward(w, t))
+    assert_no_grad_drift(
+        "scaled_dot_product_attention",
+        || jt.scaled_dot_product_attention(w, w, w)
+    )
+    assert_no_grad_drift("multi_head_attention", || jt.multi_head_attention(seq, seq, seq, 4))
+    assert_no_grad_drift(
+        "multi_head_attention over a longer key",
+        || jt.multi_head_attention(seq, kv, kv, 4, causal: true)
+    )
+    assert_true(w.grad is null)
+}
+
+#: The same answer with the graph off as on, since attention takes its
+#: inference kernels there.
+fn test_no_grad_attention_matches_the_recorded_forward() -> void {
+    if not jt.is_available() { return }
+    let q = filled([16, 32], 11, requires_grad: true)
+    defer { q.free() }
+    let recorded = jt.multi_head_attention(q, q, q, 4, causal: true)
+    let expected = recorded.download()
+    free_graph(recorded.discard_graph())
+    recorded.free()
+    var got: list[float] = []
+    jt.no_grad(fn() -> void {
+        let plain = jt.multi_head_attention(q, q, q, 4, causal: true)
+        got = plain.download()
+        plain.free()
+    })
+    assert_values_near(got, expected, 1e-4)
+}
+
+#: A layer whose activation runs as its own op used to leave the
+#: pre-activation map behind when no graph was recorded.
+fn test_no_grad_layers_free_their_pre_activation() -> void {
+    if not jt.is_available() { return }
+    let rng = std_random()
+    let x = filled([4, 8], 13)
+    defer { x.free() }
+    let images = filled([2, 6, 6, 4], 15)
+    defer { images.free() }
+    let flat_images = filled([2, 144], 17)
+    defer { flat_images.free() }
+    for activation in [
+        jt.Activation.Linear,
+        jt.Activation.Relu,
+        jt.Activation.Sigmoid,
+        jt.Activation.Tanh,
+        jt.Activation.Gelu,
+        jt.Activation.Silu,
+        jt.Activation.LeakyRelu,
+    ] {
+        let dense = jt.Dense(8, activation: activation)
+        dense.build(8, rng)
+        assert_no_grad_drift(f"Dense {activation}", || dense.forward(x))
+        dense.free()
+        let conv = jt.Conv2d(8, 3, padding: 1, activation: activation)
+        conv.build_from_shape([6, 6, 4], rng)
+        assert_no_grad_drift(f"Conv2d {activation}", || conv.forward(images))
+        assert_no_grad_drift(f"Conv2d {activation} on flat rows", || conv.forward(flat_images))
+        conv.free()
+    }
+}
+
+fn std_random() -> Random { return Random.with_seed(1) }
+
+#: `predict` and `evaluate` freed the hidden activations only through
+#: `discard_graph()`, which has nothing to return when no graph was
+#: recorded. They now free each one once the next layer has read it, and a
+#: `Flatten` view keeps the map it reshapes alive instead.
+fn test_no_grad_predict_and_evaluate_leave_nothing_behind() -> void {
+    if not jt.is_available() { return }
+    let mlp = jt.Sequential(
+        [
+            jt.Dense(16, activation: jt.Activation.Relu),
+            jt.Dense(16, activation: jt.Activation.Gelu),
+            jt.Dense(16, activation: jt.Activation.Tanh),
+            jt.Dense(4, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { mlp.free() }
+    mlp.compile(jt.Adam())
+    let features = filled([32, 8], 19)
+    defer { features.free() }
+    let recorded = mlp.predict(features)
+    let expected = recorded.download()
+    recorded.free()
+    assert_no_grad_drift("Sequential.predict", || mlp.predict(features))
+    var got: list[float] = []
+    jt.no_grad(fn() -> void {
+        let plain = mlp.predict(features)
+        got = plain.download()
+        plain.free()
+    })
+    assert_values_near(got, expected, 1e-6)
+    let rows = [[float((r * 7 + c) % 5) / 5.0 for c in 0..8] for r in 0..64]
+    let data = jt.Dataset.from_rows(rows, [r % 4 for r in 0..64])
+    defer { data.free() }
+    let outside = mlp.evaluate(data, batch_size: 16)
+    var inside = outside
+    assert_no_grad_drift("Sequential.evaluate", fn() -> Tensor {
+        inside = mlp.evaluate(data, batch_size: 16)
+        return jt.zeros([1])
+    })
+    assert_near(inside.loss, outside.loss, 1e-6)
+
+    let cnn = jt.Sequential(
+        [
+            jt.Conv2d(4, 3, padding: 1, in_channels: 4, activation: jt.Activation.Gelu),
+            jt.MaxPool2d(2),
+            jt.Flatten(),
+            jt.Dropout(0.25),
+            jt.Dense(4, activation: jt.Activation.Softmax),
+        ]
+    )
+    defer { cnn.free() }
+    cnn.compile(jt.Adam())
+    let images = filled([8, 6, 6, 4], 21)
+    let image_data = jt.Dataset(images, jt.Tensor([8], [float(r % 4) for r in 0..8]))
+    defer { image_data.free() }
+    let cnn_outside = cnn.evaluate(image_data, batch_size: 4)
+    var cnn_inside = cnn_outside
+    assert_no_grad_drift("conv Sequential.evaluate", fn() -> Tensor {
+        cnn_inside = cnn.evaluate(image_data, batch_size: 4)
+        return jt.zeros([1])
+    })
+    assert_near(cnn_inside.loss, cnn_outside.loss, 1e-5)
+    let flat = filled([2, 144], 23)
+    defer { flat.free() }
+    let cnn_recorded = cnn.predict(flat)
+    let cnn_expected = cnn_recorded.download()
+    cnn_recorded.free()
+    assert_no_grad_drift("conv Sequential.predict", || cnn.predict(flat))
+    var cnn_got: list[float] = []
+    jt.no_grad(fn() -> void {
+        let plain = cnn.predict(flat)
+        #: Take any freed memory back out of the pool and scribble on it.
+        var scribbles: list[Tensor] = []
+        for _i in 0..8 { scribbles.push(jt.fill([2, 4, 3, 3, 4], 7.0)) }
+        cnn_got = plain.download()
+        plain.free()
+        for scribble in scribbles { scribble.free() }
+    })
+    assert_values_near(cnn_got, cnn_expected, 1e-5)
+}
+
+#: A parameter first reached through `reshape` keeps a view as its `.grad`.
+#: `dense_affine` then accumulates into that view in place, which
+#: `backward()` took for a view of the step's upstream and chained the
+#: upstream behind it: one buffer leaked every step, in both early-free modes.
+fn test_an_in_place_view_gradient_does_not_hold_the_upstream() -> void {
+    if not jt.is_available() { return }
+    let x = filled([4, 6], 25)
+    defer { x.free() }
+    let dense = jt.Dense(3)
+    dense.build(6, std_random())
+    defer { dense.free() }
+    let w = dense.parameters()[0]
+    let first = jt.sum(jt.matmul(x, jt.reshape(w, [6, 3])))
+    free_graph(first.backward())
+    first.free()
+    let view_grad = w.grad
+    if view_grad is null { throw AssertionError("expected w.grad") }
+    assert_true(view_grad.borrowed)
+    var drifts: list[int] = []
+    for _step in 0..5 {
+        gpu.synchronize()
+        let before = gpu.live_buffers()
+        jt.zero_grad(dense.parameters())
+        let loss = jt.sum(dense.forward(x))
+        free_graph(loss.backward())
+        loss.free()
+        gpu.synchronize()
+        drifts.push(gpu.live_buffers() - before)
+    }
+    #: The first step may fill a per-shape cache; none after it may grow.
+    for (step, drift) in drifts.enumerate() {
+        if step > 0 and drift != 0 {
+            throw AssertionError(f"step {step} leaked {drift} buffers: {drifts}")
+        }
+    }
+    var column_sums = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let rows = x.download()
+    for (index, value) in rows.enumerate() { column_sums[index % 6] += value }
+    let gradient = w.grad
+    if gradient is null { throw AssertionError("expected w.grad") }
+    let got = gradient.download()
+    for row in 0..6 {
+        for column in 0..3 { assert_near(got[row * 3 + column], column_sums[row], 1e-4) }
+    }
+}
+
+#: An intermediate whose handed-on gradient was merged into an input that
+#: already had one must not keep a reference to the freed tensor, with
+#: early frees on or off (`JAITENSOR_BACKWARD_FREE=0`).
+fn test_no_intermediate_keeps_a_freed_gradient() -> void {
+    if not jt.is_available() { return }
+    let x = filled([3, 4], 27)
+    defer { x.free() }
+    let w = filled([4, 4], 29, requires_grad: true)
+    defer { w.free() }
+    let h = jt.matmul(x, w)
+    let k = jt.square(h)
+    let z = jt.add(h, k)
+    let loss = jt.sum(jt.add(z, h))
+    let held = loss.backward()
+    for tensor in held {
+        let gradient = tensor.grad
+        if gradient is not null { assert_true(not gradient.is_freed()) }
+    }
+    free_graph(held)
+    loss.free()
+}
+
+#: Two losses over one trunk whose ops saved tensors (attention keeps its
+#: probabilities): `retain_graph` on the first call keeps them for the second,
+#: and the parameters get the sum of both gradients.
+fn test_retain_graph_allows_a_second_backward_through_saved_tensors() -> void {
+    if not jt.is_available() { return }
+    let q = filled([8, 8], 31, requires_grad: true)
+    defer { q.free() }
+    let one = jt.multi_head_attention(q, q, q, 2)
+    let l1 = jt.sum(one)
+    free_graph(l1.backward())
+    l1.free()
+    let alone_first = q.grad
+    if alone_first is null { throw AssertionError("expected q.grad") }
+    let first = alone_first.download()
+    clear_grad(q)
+    let two = jt.multi_head_attention(q, q, q, 2)
+    let l2 = jt.sum(jt.multiply(two, two))
+    free_graph(l2.backward())
+    l2.free()
+    let alone_second = q.grad
+    if alone_second is null { throw AssertionError("expected q.grad") }
+    let second = alone_second.download()
+    clear_grad(q)
+
+    let ctx = jt.multi_head_attention(q, q, q, 2)
+    let a = jt.sum(ctx)
+    let b = jt.sum(jt.multiply(ctx, ctx))
+    let _kept = a.backward(retain_graph: true)
+    let held = b.backward()
+    let both = q.grad
+    if both is null { throw AssertionError("expected q.grad") }
+    assert_values_near(
+        both.download(),
+        [value + second[index] for (index, value) in first.enumerate()],
+        1e-4
+    )
+    free_graph(held)
+    a.free()
+    b.free()
+    clear_grad(q)
 }
