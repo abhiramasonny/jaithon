@@ -433,10 +433,10 @@ tracks own them this wave:
 
 `check.jai` also proves the resume path the chunked run depends on: a trainer
 restored from a checkpoint -- weights, both AdamW moments, the step count --
-takes the same next two steps as the original, within 1e-4 in loss. In a
-default run the gap is 0; with `JAITHON_GPU_POISON=1` a review measured
-4.8e-7, from the order of accumulation, not from uninitialised memory (no
-NaN appeared).
+takes the same next two steps as the original, within 1e-4 in loss. The gap
+is 0 in some runs and 4.8e-7 in others, default settings and
+`JAITHON_GPU_POISON=1` alike: the order of accumulation, not uninitialised
+memory (no NaN appeared under poisoning).
 
 Things it ran into in its own tooling. `gpu_lock.sh` gives up after an
 hour by default, which with the machine this busy cancelled a queued
