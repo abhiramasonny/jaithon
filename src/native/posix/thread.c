@@ -1,6 +1,6 @@
-/* thread.c — OS threads, mutexes, condition variables, atomics, and the
- * parallel-for pool behind std.thread. The VM is single-threaded: workers must
- * not touch VM state, allocate GC objects, or raise — tasks see only raw buffers, so failures are a status code, not a diagnostic. */
+/* thread.c — OS threads, mutexes, condition variables, and atomics behind
+ * std.thread. The VM is single-threaded: workers must not touch VM state,
+ * allocate GC objects, or raise — they see only raw buffers, so failures are a status code, not a diagnostic. */
 
 /* Feature macros must precede every include: sysconf's _SC_NPROCESSORS_ONLN is
  * not in the C11 headers on its own. */
@@ -208,103 +208,4 @@ bool jaiAtomicCasI64(volatile int64_t *p, int64_t expect, int64_t desired) {
     pthread_mutex_unlock(&gAtomicLock);
     return swapped;
 #endif
-}
-
-/* Below this many iterations the spawn and join cost more than the body. */
-#define JAI_PARALLEL_MIN_ITERS   1024
-#define JAI_PARALLEL_MAX_THREADS 64
-/* Chunks per thread: more than one lets a fast worker take over for a slow
- * one when the body's cost varies with the index; too many and the shared cursor becomes the bottleneck. */
-#define JAI_PARALLEL_OVERSUBSCRIBE 4
-
-typedef struct {
-    volatile int64_t cursor;   /* first unclaimed offset; the only shared write */
-    int64_t          total;
-    int64_t          chunk;
-    int              start;
-    JaiTaskFn        fn;
-    void            *arg;
-} ParallelJob;
-
-/* Offsets are tracked as int64 because end - start can exceed INT_MAX even
- * though every individual index fits in an int. */
-static void parallelSerial(int start, int64_t total, JaiTaskFn fn, void *arg) {
-    for (int64_t i = 0; i < total; i++) fn(arg, (int)((int64_t)start + i));
-}
-
-/* Each worker repeatedly claims a chunk with one fetch-add; whoever finishes
- * first simply claims more, which is what balances an uneven body. */
-static void parallelRun(ParallelJob *job) {
-    for (;;) {
-        int64_t from = jaiAtomicAddI64(&job->cursor, job->chunk);
-        if (from >= job->total) return;
-
-        int64_t to = from + job->chunk;
-        if (to > job->total) to = job->total;
-        for (int64_t i = from; i < to; i++) {
-            job->fn(job->arg, (int)((int64_t)job->start + i));
-        }
-    }
-}
-
-static void *parallelWorker(void *arg) {
-    parallelRun((ParallelJob *)arg);
-    return NULL;
-}
-
-bool jaiParallelFor(int start, int end, JaiTaskFn fn, void *arg, int maxThreads) {
-    if (fn == NULL) return false;
-    if (end <= start) return true;   /* an empty range is vacuously done */
-
-    int64_t total = (int64_t)end - (int64_t)start;
-
-    if (maxThreads <= 1 || total < JAI_PARALLEL_MIN_ITERS) {
-        parallelSerial(start, total, fn, arg);
-        return true;
-    }
-
-    int threads = maxThreads;
-    int hw      = jaiCpuCount();
-    if (threads > hw) threads = hw;
-    if (threads > JAI_PARALLEL_MAX_THREADS) threads = JAI_PARALLEL_MAX_THREADS;
-
-    int64_t chunk = total / ((int64_t)threads * JAI_PARALLEL_OVERSUBSCRIBE);
-    if (chunk < 1) chunk = 1;
-
-    /* Threads beyond the chunk count would only spawn and exit. */
-    int64_t chunks = (total + chunk - 1) / chunk;
-    if ((int64_t)threads > chunks) threads = (int)chunks;
-    if (threads <= 1) {
-        parallelSerial(start, total, fn, arg);
-        return true;
-    }
-
-    ParallelJob job;
-    job.cursor = 0;
-    job.total  = total;
-    job.chunk  = chunk;
-    job.start  = start;
-    job.fn     = fn;
-    job.arg    = arg;
-
-    /* `job` lives on this frame and every worker points at it, so this function
-     * must not return until all of them are joined. */
-    JaiThread **workers = JAI_ALLOC(JaiThread *, threads - 1);
-    int spawned = 0;
-    for (int i = 0; i < threads - 1; i++) {
-        JaiThread *t = jaiThreadSpawn(parallelWorker, &job);
-        /* A refused spawn costs throughput, not correctness: the remaining
-         * workers pull the chunks it would have taken. */
-        if (t == NULL) break;
-        workers[spawned++] = t;
-    }
-
-    parallelRun(&job);   /* the caller is a worker, not a supervisor */
-
-    bool ok = true;
-    for (int i = 0; i < spawned; i++) {
-        if (!jaiThreadJoin(workers[i], NULL)) ok = false;
-    }
-    JAI_FREE_ARRAY(JaiThread *, workers, threads - 1);
-    return ok;
 }

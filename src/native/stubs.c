@@ -196,14 +196,6 @@ bool jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
     return false;
 }
 
-bool jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
-    (void)b;
-    (void)dst;
-    (void)bytes;
-    (void)offset;
-    return false;
-}
-
 JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
                             char *errBuf, size_t errBufSize) {
     (void)source;

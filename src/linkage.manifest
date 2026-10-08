@@ -8,10 +8,6 @@
 file-local jaiCliDispatch              src/cli/main.c
 file-local jaiDiagCodeIsWarning        src/common/diag.c
 file-local jaiSourceLineText           src/common/diag.c
-dead       jaiGpuDownload              src/native/apple/gpu_buffer.m
-dead       jaiProcessRun               src/native/posix/process.c
-dead       jaiStatPath                 src/native/posix/process.c
-dead       jaiParallelFor              src/native/posix/thread.c
 file-local jaiMethodTablesInit         src/runtime/builtins/builtins.c
 file-local jaiFormatValue              src/runtime/builtins/text/builtins_format.c
 file-local jaiFrontEndCall0            src/runtime/modules/frontend.c

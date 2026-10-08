@@ -107,8 +107,6 @@ bool          jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
 bool          jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
                                 float low, float high, uint64_t seed);
 bool          jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count);
-bool          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
-                             size_t offset);
 /* The buffer's own memory to read from, after everything queued has run, or
  * NULL when the range does not fit or the wait failed. Storage is shared, so a
  * caller that is going to walk the values anyway can skip the staging copy
@@ -504,12 +502,6 @@ void        jaiCondBroadcast(JaiCond *c);
 int64_t     jaiAtomicAddI64(volatile int64_t *p, int64_t delta);
 bool        jaiAtomicCasI64(volatile int64_t *p, int64_t expect, int64_t desired);
 
-/* Tasks must not touch VM state — they operate only on raw buffers. */
-typedef void (*JaiTaskFn)(void *arg, int index);
-bool jaiParallelFor(int start, int end, JaiTaskFn fn, void *arg, int maxThreads);
-
-int   jaiProcessRun(const char *command, char **outStdout, size_t *outLen);
-
 /* Fields split by mode: waiting form only fills exitCode + the two buffers;
  * streaming form only fills pid and the three descriptors. */
 typedef struct {
@@ -565,7 +557,6 @@ int jaiProcessSpawnTo(const char *const *argv, const char *outPath,
 
 bool jaiProcessSignal(int pid, int sig);
 char **jaiListDir(const char *path, int *outCount);   /* caller frees */
-bool  jaiStatPath(const char *path, int64_t *size, int64_t *mtime, bool *isDir);
 const char *jaiExecutablePath(void);
 
 #ifdef __cplusplus

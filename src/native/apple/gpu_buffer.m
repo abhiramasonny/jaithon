@@ -512,17 +512,6 @@ bool jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
     return true;
 }
 
-bool jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
-    if (b == NULL || b->buffer == NULL || dst == NULL) return false;
-    if (bytes == 0) return true;
-    if (offset > b->bytes || bytes > b->bytes - offset) return false;
-    if (!jaiGpuWaitFor(b)) return false;
-
-    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
-    memcpy(dst, (const uint8_t *)[buffer contents] + offset, bytes);
-    return true;
-}
-
 typedef struct {
     const float *source;
     uint8_t     *dst;

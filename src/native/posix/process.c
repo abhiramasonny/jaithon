@@ -1,8 +1,8 @@
-/* process.c — subprocesses, directory listing, stat, and the running binary's
- * path; backs __prim__.os_spawn, __prim__.io_listdir, __prim__.io_stat.
+/* process.c — subprocesses, directory listing, and the running binary's
+ * path; backs __prim__.os_spawn and __prim__.io_listdir.
  * Failures are a status code or false — turning that into IOError is the wrapper's job, not this layer's. */
 
-/* Feature macros must precede every include: popen, readdir and readlink are
+/* Feature macros must precede every include: readdir and readlink are
  * POSIX, and getprogname needs the full Darwin surface. */
 #if !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
@@ -32,49 +32,6 @@
 #endif
 
 #define JAI_PROC_READ_BLOCK 4096u
-
-/* Runs `command` through the shell; returns the exit code, 128 + signal for a
- * killed child, or -1 (no output handed back) on failure. *outStdout is a
- * NUL-terminated heap string that may hold embedded NULs — free with
- * JAI_FREE_ARRAY(char, s, len + 1). stderr stays attached to the parent's. */
-int jaiProcessRun(const char *command, char **outStdout, size_t *outLen) {
-    if (outStdout != NULL) *outStdout = NULL;
-    if (outLen != NULL) *outLen = 0;
-    if (command == NULL) return -1;
-
-    FILE *proc = popen(command, "r");
-    if (proc == NULL) return -1;
-
-    JaiBuf out;
-    jaiBufInit(&out);
-
-    char block[JAI_PROC_READ_BLOCK];
-    for (;;) {
-        size_t got = fread(block, 1, sizeof block, proc);
-        if (got > 0) jaiBufAppend(&out, block, got);
-        if (got < sizeof block) break;   /* EOF or error; ferror tells which */
-    }
-    bool readFailed = ferror(proc) != 0;
-
-    /* pclose waits for the child, so the status is only valid after this. */
-    int status = pclose(proc);
-    if (readFailed || status == -1) {
-        jaiBufFree(&out);
-        return -1;
-    }
-
-    if (outStdout != NULL) {
-        size_t len = 0;
-        *outStdout = jaiBufTakeCString(&out, &len);
-        if (outLen != NULL) *outLen = len;
-    } else {
-        jaiBufFree(&out);
-    }
-
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
-    return status;   /* stopped or unknown: hand the raw wait status back */
-}
 
 extern char **environ;
 
@@ -559,24 +516,6 @@ char **jaiListDir(const char *path, int *outCount) {
 
     if (outCount != NULL) *outCount = count;
     return names;
-}
-
-/* Follows symlinks. mtime is whole seconds (std.time's timestamps are
- * second-grained); every out param is optional and cleared up front, so a
- * false return leaves no stale values. */
-bool jaiStatPath(const char *path, int64_t *size, int64_t *mtime, bool *isDir) {
-    if (size != NULL) *size = 0;
-    if (mtime != NULL) *mtime = 0;
-    if (isDir != NULL) *isDir = false;
-    if (path == NULL) return false;
-
-    struct stat st;
-    if (stat(path, &st) != 0) return false;
-
-    if (size != NULL) *size = (int64_t)st.st_size;
-    if (mtime != NULL) *mtime = (int64_t)st.st_mtime;
-    if (isDir != NULL) *isDir = S_ISDIR(st.st_mode) != 0;
-    return true;
 }
 
 static char            gExecPath[JAI_MAX_PATH];
