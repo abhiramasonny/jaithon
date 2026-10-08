@@ -7,10 +7,11 @@
 #: says how), and images do not go in the repo.
 import std.gpu as gpu
 import jaicv.imgcodecs.jpeg as jpeg
+import jaicv.imgcodecs.png as png
 
 from std.test import assert_eq, assert_true
 from jaicv.core.mat import Mat
-from jaicv.core.types import CV_8UC1, CV_8UC3, CV_8UC4
+from jaicv.core.types import CV_8UC1, CV_8UC3, CV_8UC4, CV_16UC3
 
 fn have_gpu() -> bool { return gpu.is_available() }
 
@@ -98,4 +99,121 @@ fn test_a_damaged_jpeg_goes_the_way_the_reference_goes() -> void {
         flipped[at] = flipped[at] ^ 0x5A
         same_outcome(bytes(flipped))
     }
+    #: A stretch cut out of the middle with the end-of-image marker kept: the
+    #: scan runs into the marker, which the reference reads as data and the
+    #: fast path must not guess at.
+    for gap in [40, 200] {
+        let start = whole.len() // 2
+        var holed = whole.slice(0, start)
+        for index in start + gap..whole.len() { holed.push(whole[index]) }
+        same_outcome(bytes(holed))
+    }
+}
+
+fn be(value: int) -> list[int] {
+    return [value >> 24 & 255, value >> 16 & 255, value >> 8 & 255, value & 255]
+}
+
+fn png_chunk(out: list[int], name: str, payload: list[int]) -> void {
+    var tagged: list[int] = []
+    for character in name.chars() { tagged.push(ord(character)) }
+    for byte in payload { tagged.push(byte) }
+    for byte in be(payload.len()) { out.push(byte) }
+    for byte in tagged { out.push(byte) }
+    for byte in be(__prim__.crc32(bytes(tagged))) { out.push(byte) }
+}
+
+#: A PNG put together by hand, so every filter type turns up: row y uses
+#: filter `filters[y % filters.len()]` over arbitrary bytes, which any filter
+#: turns into some picture. The data goes in `pieces` IDAT chunks.
+fn handmade_png(
+    width: int,
+    height: int,
+    colour: int,
+    filters: list[int],
+    pieces: int,
+    seed: int
+) -> bytes {
+    let channels = if colour == 0 { 1 } elif colour == 2 { 3 } elif colour == 4 { 2 } else { 4 }
+    var raw: list[int] = []
+    var state = seed
+    for y in 0..height {
+        raw.push(filters[y % filters.len()])
+        for _index in 0..width * channels {
+            state = (state * 1103515245 + 12345) % 2147483648
+            raw.push(state >> 16 & 255)
+        }
+    }
+    let packed = __prim__.deflate(bytes(raw), 6).to_list()
+    var out: list[int] = [137, 80, 78, 71, 13, 10, 26, 10]
+    var header = be(width)
+    for byte in be(height) { header.push(byte) }
+    for byte in [8, colour, 0, 0, 0] { header.push(byte) }
+    png_chunk(out, "IHDR", header)
+    let step = (packed.len() + pieces - 1) // pieces
+    var at = 0
+    while at < packed.len() {
+        let end = min(at + step, packed.len())
+        png_chunk(out, "IDAT", packed.slice(at, end))
+        at = end
+    }
+    png_chunk(out, "IEND", [])
+    return bytes(out)
+}
+
+fn same_png(data: bytes) -> void {
+    var reference_error = ""
+    var fast_error = ""
+    var reference: Mat? = null
+    var fast: Mat? = null
+    try {
+        reference = png.decode_with(data, false)
+    } catch error {
+        reference_error = f"{error}"
+    }
+    try {
+        fast = png.decode_with(data, true)
+    } catch error {
+        fast_error = f"{error}"
+    }
+    assert_eq(fast_error, reference_error)
+    if reference is not null and fast is not null {
+        assert_eq(fast.rows, reference.rows)
+        assert_eq(fast.cols, reference.cols)
+        assert_eq(fast.channels(), reference.channels())
+        assert_eq(fast.depth(), reference.depth())
+        assert_true(fast.to_bytes() == reference.to_bytes())
+    }
+}
+
+fn test_the_fast_png_path_matches_the_reference_for_every_filter() -> void {
+    if not have_gpu() { return }
+    for colour in [0, 2, 4, 6] {
+        for size in [[1, 1], [3, 5], [32, 32], [17, 9]] {
+            for filters in [[0], [1], [2], [3], [4], [4, 3, 2, 1, 0]] {
+                for pieces in [1, 3] {
+                    same_png(
+                        handmade_png(size[0], size[1], colour, filters, pieces, size[0] + colour)
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn test_png_files_the_fast_path_does_not_cover_still_decode() -> void {
+    if not have_gpu() { return }
+    #: Sixteen bits goes to the reference whichever path is asked for.
+    let deep = texture(6, 7, CV_8UC3, 5).convert_to(CV_16UC3, 257.0, 0.0)
+    same_png(png.encode(deep))
+    #: An undefined filter type, a header promising more rows than the data
+    #: holds, and a chunk running off the end: refused the same way.
+    same_png(handmade_png(4, 4, 2, [0, 5], 1, 9))
+    let whole = handmade_png(8, 8, 6, [4], 2, 11).to_list()
+    var short: list[int] = []
+    for index in 0..whole.len() - 30 { short.push(whole[index]) }
+    same_png(bytes(short))
+    var taller = whole.slice(0, whole.len())
+    taller[23] = 40
+    same_png(bytes(taller))
 }

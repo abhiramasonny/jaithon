@@ -7,8 +7,15 @@
 #: The deflate stream itself is zlib's, through `__prim__.inflate`; everything
 #: above it — chunk walk, filter reversal, bit unpacking — is here.
 import std.math
+from std.os import env_or
 from ..core.mat import Mat
 from ..core.types import CV_8U, CV_16U, CV_MAKETYPE
+
+#: Read once. On, an eight-bit grey, grey-alpha, RGB or RGBA PNG goes through
+#: `decode_fast`, which gives the same bytes as the reference decoder; off,
+#: and for palette, sub-byte, sixteen-bit and interlaced files either way, it
+#: goes through the reference.
+let _FAST_PNG = env_or("JAICV_FAST_PNG", "1") != "0"
 
 #: The eight bytes every PNG starts with.
 pub let SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10]
@@ -146,7 +153,169 @@ fn gather_chunks(data: bytes) -> tuple[Header, list[int], list[int], list[int]] 
 #: The result is `CV_8U` or `CV_16U` to match the file, with channels in BGR or
 #: BGRA order — the order the rest of jaicv works in, as OpenCV's `imread`
 #: also produces.
-pub fn decode(data: bytes) -> Mat {
+pub fn decode(data: bytes) -> Mat { return decode_with(data, _FAST_PNG) }
+
+#: The eight-bit, non-palette, non-interlaced PNG -- nearly every PNG a
+#: dataset holds -- decoded straight into bytes, or null for anything else.
+#:
+#: The reference below copies each row into a list, builds a list of floats a
+#: pixel at a time (with a fresh list per pixel for the channels), and hands
+#: the floats to `Mat.from_list`. Here the rows are unfiltered in one int list
+#: in place, the channels swapped to BGR in it, and the list packed into bytes
+#: for `Mat.from_bytes`. Eight-bit samples pass through the reference's
+#: `float(sample) * 257.0 / 257.0` unchanged, so the result is the same bytes.
+#: Whatever the reference would refuse -- a short chunk, a missing IDAT, an
+#: unknown filter -- comes back null, and the reference refuses it.
+fn decode_fast(data: bytes) -> Mat? {
+    let header = read_header(data)
+    if header.interlaced or header.bit_depth != 8 { return null }
+    let colour = header.colour_type
+    if colour != COLOR_GRAY and
+        colour != COLOR_RGB and
+        colour != COLOR_GRAY_ALPHA and
+        colour != COLOR_RGBA {
+        return null
+    }
+    let channels = channels_for(colour)
+    let width = header.width
+    let height = header.height
+    let row_bytes = width * channels
+    let expected = (row_bytes + 1) * height
+
+    #: `gather_chunks`' walk, keeping the IDAT bodies as slices.
+    var compressed = bytes([])
+    var any = false
+    var short = false
+    var at = 8
+    var going = true
+    while going and at + 8 <= data.len() {
+        let length = be32(data, at)
+        let kind = data[at + 4] << 24 | data[at + 5] << 16 | data[at + 6] << 8 | data[at + 7]
+        let body = at + 8
+        if kind == 0x49444154 {
+            if body + length > data.len() {
+                short = true
+                going = false
+            } else {
+                compressed = if any {
+                    __prim__.bytes_concat(compressed, data.slice(body, body + length))
+                } else {
+                    data.slice(body, body + length)
+                }
+                any = any or length > 0
+            }
+        } elif kind == 0x49454E44 {
+            going = false
+        } elif kind == 0x504C5445 or kind == 0x74524E53 {
+            #: Read, and so range-checked, by the reference; not needed here.
+            if body + length > data.len() {
+                short = true
+                going = false
+            }
+        }
+        at += 12 + length
+    }
+    if short or not any { return null }
+    let raw = __prim__.inflate(compressed, expected)
+    if raw.len() < expected { return null }
+
+    var out: list[int] = __prim__.list_filled(row_bytes * height, 0)
+    if not unfilter_into(raw, out, height, row_bytes, channels) { return null }
+    if channels >= 3 { swap_red_blue(out, width * height, channels) }
+    return Mat.from_bytes(height, width, CV_MAKETYPE(CV_8U, channels), __prim__.bytes_new(out))
+}
+
+#: `unfilter_row` over the whole image, from `raw` (each row behind its
+#: filter byte) into `out` (the rows end to end, the row above read back out
+#: of `out`). False on a filter type the format does not define.
+fn unfilter_into(raw: bytes, out: list[int], height: int, row_bytes: int, stride: int) -> bool {
+    var ok = true
+    var y = 0
+    var source = 0
+    var row = 0
+    var above = 0
+    var index = 0
+    var filter = 0
+    var left = 0
+    var up = 0
+    var corner = 0
+    var estimate = 0
+    var dl = 0
+    var du = 0
+    var dc = 0
+    while ok and y < height {
+        filter = raw[source]
+        source += 1
+        row = y * row_bytes
+        above = row - row_bytes
+        index = 0
+        if filter == 0 {
+            while index < row_bytes {
+                out[row + index] = raw[source + index]
+                index += 1
+            }
+        } elif filter == 1 {
+            while index < row_bytes {
+                left = if index >= stride { out[row + index - stride] } else { 0 }
+                out[row + index] = raw[source + index] + left & 255
+                index += 1
+            }
+        } elif filter == 2 {
+            while index < row_bytes {
+                up = if y > 0 { out[above + index] } else { 0 }
+                out[row + index] = raw[source + index] + up & 255
+                index += 1
+            }
+        } elif filter == 3 {
+            while index < row_bytes {
+                left = if index >= stride { out[row + index - stride] } else { 0 }
+                up = if y > 0 { out[above + index] } else { 0 }
+                out[row + index] = raw[source + index] + (left + up) // 2 & 255
+                index += 1
+            }
+        } elif filter == 4 {
+            while index < row_bytes {
+                left = if index >= stride { out[row + index - stride] } else { 0 }
+                up = if y > 0 { out[above + index] } else { 0 }
+                corner = if index >= stride and y > 0 { out[above + index - stride] } else { 0 }
+                estimate = left + up - corner
+                dl = abs(estimate - left)
+                du = abs(estimate - up)
+                dc = abs(estimate - corner)
+                corner = if dl <= du and dl <= dc { left } elif du <= dc { up } else { corner }
+                out[row + index] = raw[source + index] + corner & 255
+                index += 1
+            }
+        } else {
+            ok = false
+        }
+        source += row_bytes
+        y += 1
+    }
+    return ok
+}
+
+#: RGB(A) to BGR(A), in place: the order the reference emits.
+fn swap_red_blue(out: list[int], pixels: int, channels: int) -> void {
+    var at = 0
+    var red = 0
+    let end = pixels * channels
+    while at < end {
+        red = out[at]
+        out[at] = out[at + 2]
+        out[at + 2] = red
+        at += channels
+    }
+}
+
+#: `decode`, choosing the path: `fast` takes `decode_fast` for the files it
+#: covers, and false always takes the reference. The two give the same bytes;
+#: this is how a test holds them to it.
+pub fn decode_with(data: bytes, fast: bool) -> Mat {
+    if fast {
+        let quick = decode_fast(data)
+        if quick is not null { return quick }
+    }
     let (header, compressed, palette, transparency) = gather_chunks(data)
     if header.interlaced { throw ValueError("interlaced PNG is not supported") }
     if compressed.len() == 0 { throw ValueError("this PNG carries no image data") }
