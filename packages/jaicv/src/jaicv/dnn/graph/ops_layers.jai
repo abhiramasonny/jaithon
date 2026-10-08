@@ -7,7 +7,8 @@ from std.os import env
 
 from .kernels import LOWEST_FLOAT, f32_bits, kernel_for
 from .nodes import GraphNode, attr_float, attr_floats, attr_int, attr_ints, attr_str, maybe, need
-from .tensors import compile_encoded, concat_along, host_ints, pad_nd_of, row_reduce_of, slice_axis
+from .tensors import compile_encoded, concat_along, copy_of, host_ints, pad_nd_of, row_reduce_of
+from .tensors import slice_axis
 
 #: The explicit padding a window operator wants, as ONNX's
 #: `[begin..., end...]`, working out what `auto_pad` meant when that is how
@@ -524,11 +525,24 @@ pub fn op_layer_norm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     )
     if shift is null { bias.free() }
     #: `Mean` and `InvStdDev` are optional outputs, shaped like the input with
-    #: the normalised axes collapsed to one. The ones a graph does not name are
-    #: dropped by the caller.
+    #: the normalised axes collapsed to one. Only the ones a graph names are
+    #: handed back, as tensors of their own: a reshape shares its storage, so
+    #: freeing it left the row statistics behind -- two buffers a node a call,
+    #: fifty a frame on a ViT, and every allocation after slower for them.
     var moment_shape: list[int] = []
     for other in 0..rank { moment_shape.push(if other < axis { x.shape[other] } else { 1 }) }
-    return [output, jt.reshape(mean, moment_shape), jt.reshape(inv_std, moment_shape)]
+    #: Positions identify outputs, so everything up to the last named one goes
+    #: back, and the caller frees whichever of those has no name.
+    var last = 0
+    for slot in 1..min(node.outputs.len(), 3) {
+        if node.outputs[slot].len() > 0 { last = slot }
+    }
+    var produced = [output]
+    for (slot, moment) in [mean, inv_std].enumerate() {
+        if slot + 1 <= last { produced.push(copy_of(moment, moment_shape)) }
+        moment.free()
+    }
+    return produced
 }
 
 pub fn op_instance_norm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {

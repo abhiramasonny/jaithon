@@ -937,3 +937,47 @@ fn test_a_depthwise_conv_keeps_no_slices_on_its_node() -> void {
     x.free()
     w.free()
 }
+
+#: A LayerNormalization run with and without its optional statistics leaves
+#: no buffer behind. Its row mean and deviation came back as reshapes, which
+#: share storage, so freeing them freed nothing: two buffers a node a call.
+fn test_layer_norm_leaves_no_buffers_behind() -> void {
+    if not gpu.is_available() { return }
+    let x = Tensor([2, 3, 4], [float(index % 5) - 2.0 for index in 0..24])
+    let scale = Tensor([4], [1.0, 0.5, 2.0, 1.5])
+    for outputs in [["y"], ["y", "", "deviation"], ["y", "mean", "deviation"]] {
+        let graph = Graph(
+            nodes: [
+                GraphNode(
+                    "LayerNormalization",
+                    name: "ln",
+                    inputs: ["x", "scale"],
+                    outputs: outputs,
+                    attrs: {"axis": Attr.of_int(-1)}
+                ),
+            ],
+            inputs: ["x"],
+            outputs: [name for name in outputs if name.len() > 0],
+            initializers: {"scale": scale}
+        )
+        let before = gpu.live_buffers()
+        for _call in 0..3 {
+            let produced = run_graph(graph, {"x": x})
+            if outputs.len() == 3 {
+                assert_eq(
+                    produced["deviation"].shape,
+                    [2, 3, 1],
+                    "the deviation keeps the outer axes"
+                )
+            }
+            for (_name, tensor) in produced.items() { tensor.free() }
+        }
+        assert_eq(
+            gpu.live_buffers() - before,
+            0,
+            f"LayerNormalization with outputs {outputs} leaked"
+        )
+    }
+    x.free()
+    scale.free()
+}
