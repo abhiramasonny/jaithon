@@ -1,7 +1,114 @@
 #: Generic datasets kept resident on the GPU.
+from std.gpu import Kernel
 from std.random import Random
 from .ops import gather_rows
 from .tensor import Tensor
+
+let AUGMENT_SOURCE = """#include <metal_stdlib>
+using namespace metal;
+
+static inline uint mix32(uint h) {
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+/* One thread per output value. Every image draws its own shift and flip from
+ * a hash of its index and the seed, so the result depends on nothing but the
+ * two -- not on the dispatch, the batch it is in, or what ran before it. */
+kernel void random_crop_flip(device const float* source [[buffer(0)]],
+                             device float* destination [[buffer(1)]],
+                             constant uint& images [[buffer(2)]],
+                             constant uint& height [[buffer(3)]],
+                             constant uint& width [[buffer(4)]],
+                             constant uint& channels [[buffer(5)]],
+                             constant uint& padding [[buffer(6)]],
+                             constant uint& seed [[buffer(7)]],
+                             constant uint& flips [[buffer(8)]],
+                             uint id [[thread_position_in_grid]]) {
+    uint per_image = height * width * channels;
+    if (id >= images * per_image) return;
+    uint c = id % channels;
+    uint x = (id / channels) % width;
+    uint y = (id / (channels * width)) % height;
+    uint n = id / per_image;
+    uint span = 2u * padding + 1u;
+    uint h = mix32(n * 2654435761u ^ mix32(seed));
+    int dx = int(h % span) - int(padding);
+    int dy = int((h / span) % span) - int(padding);
+    bool flip = flips != 0u && ((h / (span * span)) & 1u) != 0u;
+    int sx = int(flip ? width - 1u - x : x) + dx;
+    int sy = int(y) + dy;
+    float v = 0.0f;
+    if (sx >= 0 && sx < int(width) && sy >= 0 && sy < int(height)) {
+        v = source[((n * height + uint(sy)) * width + uint(sx)) * channels + c];
+    }
+    destination[id] = v;
+}
+"""
+
+var _augment_kernel: Kernel? = null
+
+fn augment_kernel() -> Kernel {
+    let existing = _augment_kernel
+    if existing is not null { return existing }
+    let kernel = Kernel.compile(AUGMENT_SOURCE, "random_crop_flip")
+    _augment_kernel = kernel
+    return kernel
+}
+
+#: A random crop and horizontal flip of every image in an NHWC batch, made on
+#: the GPU: the standard CIFAR augmentation.
+#:
+#: Each image is shifted by a whole number of pixels in each direction, from
+#: `-padding` to `padding`, with zeros brought in at the edges -- the same as
+#: padding by `padding` and cropping back to the original size -- and, when
+#: `flip` is set, mirrored left to right half the time. Which shift and which
+#: flip an image gets is a hash of its index and `seed`, so a seed gives the
+#: same batch every time and a new seed a new one. Pass a different seed each
+#: epoch.
+#:
+#: Returns a new tensor the caller frees. `random_crop_flip_into` writes into
+#: one it already has.
+pub fn random_crop_flip(images: Tensor, padding: int = 4, seed: int = 0, flip: bool = true) -> Tensor {
+    let output = Tensor(images.shape)
+    random_crop_flip_into(images, output, padding: padding, seed: seed, flip: flip)
+    return output
+}
+
+#: `random_crop_flip`, written into `output`, which must have the shape of
+#: `images` and must not be it.
+pub fn random_crop_flip_into(
+    images: Tensor,
+    output: Tensor,
+    padding: int = 4,
+    seed: int = 0,
+    flip: bool = true
+) -> void {
+    if images.rank() != 4 { throw ValueError(f"random_crop_flip needs NHWC images, got {images.shape}") }
+    if output.shape != images.shape {
+        throw ValueError(f"output shape {output.shape} does not match images {images.shape}")
+    }
+    if output.id == images.id { throw ValueError("random_crop_flip cannot write over its own input") }
+    if padding < 0 { throw ValueError(f"padding must be non-negative, got {padding}") }
+    if images.size == 0 { return }
+    augment_kernel().dispatch_async(
+        [images.buffer(), output.buffer()],
+        images.size,
+        [
+            images.shape[0],
+            images.shape[1],
+            images.shape[2],
+            images.shape[3],
+            padding,
+            seed & 0xFFFFFFFF,
+            if flip { 1 } else { 0 },
+        ]
+    )
+}
 
 #: A feature matrix and sparse integer labels on the GPU.
 #:
