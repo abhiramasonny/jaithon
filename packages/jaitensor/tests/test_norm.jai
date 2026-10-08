@@ -64,6 +64,51 @@ fn check_parameter_gradients(rows: int, width: int) -> void {
     w.free()
 }
 
+#: `[batch, seq, dim]` is normalized as the `[batch * seq, dim]` it is laid out
+#: as, and so is any deeper rank. `layer_norm` took rank two only, so every
+#: transformer reshaped its activations around each norm by hand. The value
+#: and all three gradients must equal the rank-two answer bit for bit: it is
+#: the same kernel over the same rows.
+fn test_layer_norm_folds_leading_axes_into_rows() -> void {
+    if not jt.is_available() { return }
+    let batch = 3
+    let seq = 70
+    let width = 100
+    let count = batch * seq * width
+    let xs = wave(count, 0.3, 2.0, 0.5)
+    let ws = wave(count, 1.9, 1.0, 0.0)
+    let gs = wave(width, 0.7, 0.5, 1.0)
+    let bs = wave(width, 2.2, 0.3, 0.0)
+    var answers: list[list[list[float]]] = []
+    for shape in [[batch * seq, width], [batch, seq, width], [batch, seq, 1, width]] {
+        let x = Tensor(shape, xs, requires_grad: true)
+        let gamma = Tensor([width], gs, requires_grad: true)
+        let beta = Tensor([width], bs, requires_grad: true)
+        let w = Tensor(shape, ws)
+        let y = jt.layer_norm(x, gamma, beta)
+        assert_eq(y.shape, shape)
+        var got = [y.download()]
+        let total = jt.sum(jt.multiply(y, w))
+        let held = total.backward()
+        for tensor in [x, gamma, beta] {
+            let g = tensor.grad
+            assert_true(g is not null)
+            if g is not null {
+                assert_eq(g.shape, tensor.shape)
+                got.push(g.download())
+            }
+        }
+        answers.push(got)
+        for tensor in held { tensor.free() }
+        total.free()
+        for tensor in [x, gamma, beta, w] { tensor.free() }
+    }
+    for answer in answers[1:] {
+        assert_eq(answer.len(), 4)
+        for (index, values) in answer.enumerate() { assert_eq(values, answers[0][index]) }
+    }
+}
+
 fn test_layer_norm_parameter_gradients_at_transformer_sizes() -> void {
     if not jt.is_available() { return }
     check_parameter_gradients(3, 8)
