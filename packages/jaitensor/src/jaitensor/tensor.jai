@@ -1,6 +1,17 @@
 #: GPU-resident tensors.
 import std.gpu as gpu
 from std.gpu import Buffer, Kernel
+from std.os import env_or
+
+#: Whether `backward()` releases each intermediate's gradient, and any tensor
+#: only one op's backward read, as soon as the walk is past them. On by
+#: default; `JAITENSOR_BACKWARD_FREE=0` keeps everything until the caller
+#: frees what `backward()` returns, which is how it behaved before, for an
+#: A/B in one binary. Read once.
+let _EARLY_FREE = env_or("JAITENSOR_BACKWARD_FREE", "1") != "0"
+
+#: Whether ops record autograd graphs. `no_grad` clears it for a block.
+var _grad_enabled = true
 
 #: How many elements a shape holds.
 #:
@@ -40,6 +51,19 @@ pub class Tensor {
     pub var grad: Tensor?
     #: The op that produced this tensor, or `null` for a leaf.
     pub var creator: GradNode?
+    #: Keep `.grad` after `backward()` on a tensor an op produced. Off by
+    #: default, as in torch: an intermediate's gradient is released as soon
+    #: as the walk has passed it. Leaves always keep theirs. Set it with
+    #: `retain_grad()`.
+    pub var retains_grad: bool
+    #: Whether the storage was handed in rather than allocated here, so it
+    #: may belong to, or share memory with, another tensor (`view`, `reshape`).
+    pub let borrowed: bool
+    #: A gradient this tensor's memory may be a window into, kept alive for
+    #: exactly as long as this tensor is. `backward()` sets it when an op
+    #: hands back a view of its upstream gradient (`reshape` does), so the
+    #: upstream can be released with the view instead of outliving the walk.
+    pub var backing: Tensor?
     #: Whether `backward()`'s topological walk has already visited this tensor.
     #: `pub` only so the free function `visit_for_backward` can reach it.
     pub var topo_mark: bool
@@ -67,8 +91,11 @@ pub class Tensor {
         self.requires_grad = requires_grad
         self.grad = null
         self.creator = null
+        self.retains_grad = false
+        self.backing = null
         self.topo_mark = false
         self.id = next_tensor_id()
+        self.borrowed = storage is not null
         if storage is not null {
             if values is not null {
                 throw ValueError("a storage-backed tensor cannot also take host values")
@@ -195,6 +222,18 @@ pub class Tensor {
             gradient.free()
             self.grad = null
         }
+        let backing = self.backing
+        if backing is not null {
+            self.backing = null
+            backing.free()
+        }
+    }
+
+    #: Keep this tensor's `.grad` through `backward()` even though an op
+    #: produced it. Returns this tensor.
+    pub fn retain_grad(self) -> Tensor {
+        self.retains_grad = true
+        return self
     }
 
     #: Return this tensor, no longer part of any autograd graph.
@@ -213,7 +252,17 @@ pub class Tensor {
     #: sets `requires_grad` too, so the *next* op downstream sees this
     #: tensor as differentiable and keeps recording instead of the chain
     #: silently stopping one op after the first.
+    #:
+    #: Inside `no_grad` it records nothing: the tensor stays a plain value
+    #: that its caller frees, and the tensors the node saved for its backward
+    #: are released here, since no backward will ever read them.
     pub fn attach_creator(self, node: GradNode) -> void {
+        if not _grad_enabled {
+            for extra in node.extras {
+                if extra is not self and extra.creator is null { extra.free() }
+            }
+            return
+        }
         self.creator = node
         self.requires_grad = true
     }
@@ -223,11 +272,23 @@ pub class Tensor {
     #: Seeds `self.grad` to `ones(self.shape)` first if it isn't already
     #: set, so a plain `loss.backward()` works without the caller manually
     #: pre-seeding the root gradient. Then accumulates into each
-    #: dependency's `.grad`. Returns every non-leaf, non-root tensor the
-    #: graph built — still valid, not yet freed — so the caller can free
-    #: them after encoding the rest of the step. `Tensor.free` no longer
-    #: fences; `gpu.flush()` or `gpu.synchronize()` commits the work.
-    pub fn backward(self) -> list[Tensor] {
+    #: dependency's `.grad`, skipping any that never asked for one. Returns
+    #: every non-leaf, non-root tensor the graph built — still valid, not yet
+    #: freed — so the caller can free them after encoding the rest of the
+    #: step. `Tensor.free` no longer fences; `gpu.flush()` or
+    #: `gpu.synchronize()` commits the work.
+    #:
+    #: An intermediate's own `.grad` is released as soon as its op's backward
+    #: has read it (unless `retain_grad()` asked to keep it), and so is a
+    #: tensor only one op saved for its backward; freeing those again with
+    #: the rest of the returned list is harmless. Leaves keep their `.grad`.
+    #:
+    #: A second `backward()` through the same graph -- two losses over one
+    #: trunk -- needs those saved tensors again, and throws that one "has
+    #: already been freed" if the first released them. Pass `retain_graph`
+    #: to every call but the last to keep them, as in torch, and free the
+    #: graph once, after the last call.
+    pub fn backward(self, retain_graph: bool = false) -> list[Tensor] {
         if self.size != 1 {
             throw ValueError(f"backward needs a scalar tensor, got shape {self.shape}")
         }
@@ -248,6 +309,11 @@ pub class Tensor {
             unit_scalar()
         }
         let order = self._topo_order()
+        let release = _EARLY_FREE and not retain_graph
+        #: A gradient left on an intermediate would be added to again by the
+        #: next call through the graph, and passed down a second time.
+        let free_grads = _EARLY_FREE or retain_graph
+        let last_reader = if release { last_readers(order) } else { {} }
         var index = order.len() - 1
         while index >= 0 {
             let tensor = order[index]
@@ -255,9 +321,17 @@ pub class Tensor {
             let upstream = if tensor is self { root_upstream } else { tensor.grad }
             if node is not null and upstream is not null {
                 let grads = node.apply(upstream)
-                for (position, input) in node.inputs.enumerate() {
-                    accumulate_grad(input, grads[position])
+                #: The root's upstream is shared or the caller's, and a
+                #: retained gradient must not change under the input that
+                #: would otherwise alias it, so those are copied out.
+                let keeps = tensor is self or tensor.retains_grad
+                if keeps { own_grads(node, grads, upstream) }
+                let in_place = if keeps { 0 } else { in_place_positions(node, grads) }
+                settle_grads(node, grads, upstream)
+                if not keeps {
+                    release_upstream(tensor, upstream, node, grads, in_place, free_grads)
                 }
+                if release { release_saved(node, index, last_reader) }
             }
             index -= 1
         }
@@ -308,11 +382,19 @@ pub class Tensor {
 #: One recorded op in the autograd graph.
 #:
 #: `inputs` are the tensors an op consumed; `backward_fn` maps an upstream
-#: gradient to one gradient per input, same order as `inputs`. Never
-#: returns one of its own `inputs` by reference — always a fresh tensor.
+#: gradient to one gradient per input, same order as `inputs`. For an input
+#: that wants a gradient it returns a fresh tensor, never one of `inputs` by
+#: reference. For one that does not (`needs` is false there) it may skip the
+#: work and return that input itself as a placeholder, which `backward()`
+#: ignores; anything else returned there is freed unused.
 pub class GradNode {
     pub let inputs: list[Tensor]
     pub let extras: list[Tensor]
+    #: Whether each input wanted a gradient when the op ran, same order as
+    #: `inputs`. Only these receive one: data, targets and constants that
+    #: never asked for a gradient stay without one. An input some op
+    #: produced counts as wanting one, since the walk runs through it.
+    pub let needs: list[bool]
     let backward_fn: fn(Tensor) -> list[Tensor]
 
     pub fn init(
@@ -324,6 +406,7 @@ pub class GradNode {
         self.inputs = inputs
         self.backward_fn = backward_fn
         self.extras = extras
+        self.needs = [wants_grad(input) for input in inputs]
     }
 
     pub fn apply(self, upstream: Tensor) -> list[Tensor] { return self.backward_fn(upstream) }
@@ -347,6 +430,13 @@ kernel void grad_add_into(device const float* source [[buffer(0)]],
     if (id < count) dest[id] += source[id];
 }
 
+kernel void grad_copy(device const float* source [[buffer(0)]],
+                      device float* dest [[buffer(1)]],
+                      constant uint& count [[buffer(2)]],
+                      uint id [[thread_position_in_grid]]) {
+    if (id < count) dest[id] = source[id];
+}
+
 kernel void fill_zero(device float* output [[buffer(0)]],
                       constant uint& count [[buffer(1)]],
                       uint id [[thread_position_in_grid]]) {
@@ -357,6 +447,19 @@ kernel void fill_zero(device float* output [[buffer(0)]],
 var _grad_add_kernel: Kernel? = null
 var _grad_add_into_kernel: Kernel? = null
 var _fill_zero_kernel: Kernel? = null
+var _grad_copy_kernel: Kernel? = null
+
+fn raw_copy_into(dest: Tensor, source: Tensor) -> void {
+    let existing = _grad_copy_kernel
+    let kernel = if existing is not null {
+        existing
+    } else {
+        let compiled = Kernel.compile(_GRAD_ADD_SOURCE, "grad_copy")
+        _grad_copy_kernel = compiled
+        compiled
+    }
+    kernel.dispatch_async([source.buffer(), dest.buffer()], dest.size, [dest.size])
+}
 
 fn raw_grad_add(a: Tensor, b: Tensor) -> Tensor {
     let output = Tensor(a.shape)
@@ -435,7 +538,198 @@ fn accumulate_grad(target: Tensor, contribution: Tensor) -> void {
     }
 }
 
-export { element_count, GradNode }
+#: Whether a backward should compute `tensor`'s gradient: it asked for one,
+#: or an op produced it, so the walk runs through it. Ops building a
+#: `GradNode` use this to skip the side of a backward nobody reads.
+pub fn wants_grad(tensor: Tensor) -> bool {
+    return tensor.requires_grad or tensor.creator is not null
+}
+
+#: Whether `grads` holds `candidate` at a position whose input wants it.
+fn handed_on(node: GradNode, grads: list[Tensor], candidate: Tensor) -> bool {
+    for (position, grad) in grads.enumerate() {
+        if grad is candidate and node.needs[position] { return true }
+    }
+    return false
+}
+
+#: Give each input that wants a gradient its share, and drop the rest.
+#:
+#: A position whose input never asked for a gradient gets nothing: what the
+#: op returned there is freed, unless it is the placeholder (the input
+#: itself), the upstream, or a tensor also handed to an input that does want
+#: it.
+fn settle_grads(node: GradNode, grads: list[Tensor], upstream: Tensor) -> void {
+    for (position, input) in node.inputs.enumerate() {
+        let grad = grads[position]
+        if node.needs[position] {
+            if grad is not input { accumulate_grad(input, grad) }
+        } elif grad is not input and grad is not upstream and not handed_on(node, grads, grad) {
+            grad.free()
+        }
+    }
+}
+
+#: Copy out any gradient that is the upstream or a view of it.
+#:
+#: For the root, whose upstream is shared (the unit scalar every scalar loss
+#: starts from) or the caller's seed, and for a tensor keeping its gradient:
+#: an op that passed either straight through, or a view of it, would hand an
+#: input a gradient that something else owns.
+fn own_grads(node: GradNode, grads: list[Tensor], upstream: Tensor) -> void {
+    for (position, grad) in grads.enumerate() {
+        if not node.needs[position] { continue }
+        let input = node.inputs[position]
+        if grad is input or grad is input.grad { continue }
+        if grad is upstream or grad.borrowed {
+            let copy = Tensor(grad.shape)
+            raw_copy_into(copy, grad)
+            if grad is not upstream { grad.free() }
+            grads[position] = copy
+        }
+    }
+}
+
+#: Which positions of `grads` are their input's existing `.grad`, written in
+#: place, as a bit mask. Read before `settle_grads`, which makes every
+#: gradient it hands out an input's `.grad` and so hides the difference.
+fn in_place_positions(node: GradNode, grads: list[Tensor]) -> int {
+    var mask = 0
+    for (position, input) in node.inputs.enumerate() {
+        if position >= 62 { break }
+        let existing = input.grad
+        if existing is not null and grads[position] is existing { mask = mask | 1 << position }
+    }
+    return mask
+}
+
+#: Settle who owns an intermediate's gradient once its op's backward has
+#: read it, and with `free_now` release it.
+#:
+#: Every consumer has already contributed by now -- they all come later in
+#: the forward order, so earlier in this walk -- and nothing but this op's
+#: backward reads it. Two things can still hold its memory: an op that
+#: passed it straight through as an input's gradient (which then owns it),
+#: or one that handed back a view of it (`reshape`), which then keeps it
+#: alive as its `backing` -- so a parameter whose gradient is that view does
+#: not lose it when the graph is freed. Both happen whether or not anything
+#: is released early. With more than one such holder it is left for the
+#: caller to free with the tensor, as before.
+fn release_upstream(
+    tensor: Tensor,
+    upstream: Tensor,
+    node: GradNode,
+    grads: list[Tensor],
+    in_place: int,
+    free_now: bool
+) -> void {
+    var holders = 0
+    var holder: Tensor? = null
+    for (position, grad) in grads.enumerate() {
+        if not node.needs[position] or grad.is_freed() { continue }
+        #: The input's own gradient, accumulated in place (`dense_affine`
+        #: writes `out: weights.grad`), holds nothing of the upstream even
+        #: when it is itself a view -- which it is for a parameter first
+        #: reached through `reshape`. Counting it chained this step's
+        #: upstream behind it, one buffer leaked per step.
+        if position < 62 and in_place >> position & 1 == 1 { continue }
+        if grad is upstream or grad.borrowed {
+            holders += 1
+            holder = grad
+        }
+    }
+    if holders > 1 { return }
+    let kept = holder
+    if kept is null {
+        #: An upstream already freed was handed on and then merged into an
+        #: input's existing gradient; the reference must not outlive it.
+        if free_now or upstream.is_freed() {
+            tensor.grad = null
+            upstream.free()
+        }
+        return
+    }
+    tensor.grad = null
+    if kept is not upstream {
+        let earlier = kept.backing
+        if earlier is null {
+            kept.backing = upstream
+        } else {
+            #: Already backed; keep this one alive behind it.
+            upstream.backing = earlier
+            kept.backing = upstream
+        }
+    }
+}
+
+#: The walk position of the last op to read each saved tensor, by id.
+#:
+#: The walk runs from the end of `order` down, so the last reader is the one
+#: with the smallest index. A saved tensor any op also takes as an input is
+#: never released early: that op reads it too, and it may be the caller's.
+fn last_readers(order: list[Tensor]) -> dict[int, int] {
+    var last: dict[int, int] = {}
+    for (index, tensor) in order.enumerate() {
+        let node = tensor.creator
+        if node is null { continue }
+        for extra in node.extras {
+            let known = last.get(extra.id, -1)
+            if known < 0 or index < known { last[extra.id] = index }
+        }
+    }
+    if last.len() == 0 { return last }
+    for tensor in order {
+        let node = tensor.creator
+        if node is null { continue }
+        for input in node.inputs {
+            if last.contains(input.id) { last[input.id] = -1 }
+        }
+    }
+    return last
+}
+
+#: Free the tensors `node` saved for its backward once no later op reads them.
+fn release_saved(node: GradNode, index: int, last_reader: dict[int, int]) -> void {
+    for extra in node.extras {
+        if extra.creator is not null { continue }
+        if last_reader.get(extra.id, -1) == index { extra.free() }
+    }
+}
+
+#: Run `body` without recording any autograd graph.
+#:
+#: Ops inside record nothing: what they return is a plain tensor with no
+#: `.creator`, which the caller frees like any other, and nothing needs
+#: `discard_graph()`. That includes what a caller's own composition of ops
+#: produces on the way: no graph will hand those back, so free them too.
+#: Parameters keep their `requires_grad`; the block does not touch them.
+#: Nests, and restores the previous state even when `body` throws.
+#:
+#: An op or layer that composes others, and decides who frees a temporary,
+#: must not ask `requires_grad` -- that is still true in here. Ask whether
+#: the result has a `.creator` (the graph took the temporary) or
+#: `is_grad_enabled()`; `mean`, `mse`, the binary cross-entropies,
+#: `scaled_dot_product_attention`, `Dense`, `Conv2d` and `Sequential.predict`
+#: and `evaluate` each leaked a buffer a call here until they did.
+pub fn no_grad(body: fn() -> void) -> void {
+    let previous = _grad_enabled
+    _grad_enabled = false
+    defer { _grad_enabled = previous }
+    body()
+}
+
+#: Whether ops are recording autograd graphs (false inside `no_grad`).
+pub fn is_grad_enabled() -> bool { return _grad_enabled }
+
+#: Turn graph recording on or off until changed again; returns the previous
+#: setting so a caller can restore it. `no_grad` is the scoped form.
+pub fn set_grad_enabled(enabled: bool) -> bool {
+    let previous = _grad_enabled
+    _grad_enabled = enabled
+    return previous
+}
+
+export { element_count, GradNode, no_grad, is_grad_enabled, set_grad_enabled, wants_grad }
 
 #: Construct a constant GPU tensor from flat row-major values.
 pub fn constant(values: list[float], shape: list[int]) -> Tensor { return Tensor(shape, values) }

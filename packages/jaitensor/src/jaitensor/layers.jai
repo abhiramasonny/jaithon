@@ -135,10 +135,17 @@ pub class Dense: Layer {
         let bias = self.bias_value
         if weights is null or bias is null { throw RuntimeError("Dense layer has not been built") }
         let affine = dense_affine(x, weights, bias, self.activation_code())
-        if self.activation == Activation.Gelu { return gelu(affine) }
-        if self.activation == Activation.Silu { return silu(affine) }
-        if self.activation == Activation.LeakyRelu { return leaky_relu(affine) }
-        return affine
+        let activated = match self.activation {
+            Activation.Gelu => gelu(affine),
+            Activation.Silu => silu(affine),
+            Activation.LeakyRelu => leaky_relu(affine),
+            _ => affine,
+        }
+        if activated is affine { return affine }
+        #: The graph frees `affine` when it recorded one; when it did not
+        #: (`no_grad`, or frozen parameters) nothing else ever would.
+        if activated.creator is null { affine.free() }
+        return activated
     }
 
     #: This layer's trainable tensors, in the order `get_weights` reports them.
@@ -461,7 +468,11 @@ pub class Conv2d: Layer {
             )
         }
         let output = conv2d(input, weights, bias: bias, stride: self.stride, padding: self.padding)
-        return activate(output, self.activation)
+        let activated = activate(output, self.activation)
+        #: As in `Dense.forward`: without a recorded graph the pre-activation
+        #: map is nobody's to free but this method's.
+        if activated is not output and activated.creator is null { output.free() }
+        return activated
     }
 
     pub fn parameters(self) -> list[Tensor] {

@@ -81,7 +81,9 @@ pub fn mean(input: Tensor, axis: int? = null) -> Tensor {
     let reduced = sum(input, axis: axis)
     let count = if axis is null { float(input.size) } else { float(input.dim(-1)) }
     let scaled = scale(reduced, 1.0 / count)
-    if not input.requires_grad { reduced.free() }
+    #: Kept only when the graph took it. Asking `input.requires_grad` instead
+    #: leaked it under `no_grad`, where nothing records a graph to free it.
+    if scaled.creator is null { reduced.free() }
     return scaled
 }
 
@@ -93,7 +95,7 @@ pub fn mse(prediction: Tensor, target: Tensor) -> Tensor {
     let diff = subtract(prediction, target)
     let sq = square(diff)
     let loss = mean(sq)
-    if prediction.requires_grad or target.requires_grad { return loss }
+    if loss.creator is not null { return loss }
     diff.free()
     sq.free()
     return loss
@@ -120,7 +122,7 @@ pub fn binary_cross_entropy(prediction: Tensor, target: Tensor) -> Tensor {
         }))
     }
     let loss = mean(per)
-    if not prediction.requires_grad { per.free() }
+    if loss.creator is null { per.free() }
     return loss
 }
 
@@ -145,7 +147,7 @@ pub fn binary_cross_entropy_with_logits(logits: Tensor, target: Tensor) -> Tenso
         }))
     }
     let loss = mean(per)
-    if not logits.requires_grad { per.free() }
+    if loss.creator is null { per.free() }
     return loss
 }
 

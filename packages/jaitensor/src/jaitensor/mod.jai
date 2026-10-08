@@ -27,6 +27,7 @@ from .ops import relu, reshape, rsqrt, scale, scaled_dot_product_attention, sigm
 from .optimizers import Adam, Optimizer, SGD, zero_grad
 from .plots import save_history_plot
 from .tensor import Tensor, constant, fill, ones, zeros
+from .tensor import no_grad, is_grad_enabled, set_grad_enabled
 
 export { Tensor, constant, zeros, ones, fill, Dataset, DataLoader }
 export { Activate, Activation, AvgPool2d, BatchNorm2d, Conv2d, Dense, Dropout, Embedding, Flatten, GroupNorm2d, Layer, LayerNorm, MaxPool2d, MultiHeadAttention }
@@ -39,6 +40,7 @@ export { clamp, maximum, minimum, sum, mean, max_pool2d, avg_pool2d, dropout, ms
 export { batch_norm, layer_norm, group_norm, scaled_dot_product_attention, gather_rows }
 export { eye, flip, upsample_nearest2d, split_heads, merge_heads, multi_head_attention, tril }
 export { add_correct_into, add_scaled_into }
+export { no_grad, is_grad_enabled, set_grad_enabled }
 
 #: Whether the machine has a GPU backend that jaitensor can use.
 pub fn is_available() -> bool { return gpu.is_available() }

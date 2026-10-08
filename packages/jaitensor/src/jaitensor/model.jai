@@ -282,7 +282,7 @@ pub class Sequential {
             )
         }
         self._build(features.shape[1])
-        let raw = self._forward(features, training: false)
+        let raw = self._infer(features)
         let intermediates = raw.discard_graph()
         #: Freeing parks the buffer for reuse and carries what is queued
         #: against it along, so the next owner waits rather than this one.
@@ -615,6 +615,23 @@ pub class Sequential {
         return current
     }
 
+    #: `_forward` for a pass nothing will differentiate. A hidden activation
+    #: no graph recorded -- every one inside `no_grad`, or behind frozen
+    #: parameters -- is freed as soon as the next layer has consumed it, since
+    #: `discard_graph()` can only return what a graph holds. Recorded ones
+    #: are left to it. Never for training: a backward reads those inputs.
+    fn _infer(self, x: Tensor) -> Tensor {
+        var current = x
+        for layer in self.layers {
+            let next = layer.eval_forward(current)
+            if current is not x and next is not current and current.creator is null {
+                release_consumed(current, next)
+            }
+            current = next
+        }
+        return current
+    }
+
     #: A loader for one epoch, ordered differently from the epoch before it.
     #:
     #: Each of the three epoch bodies used to build its own with the default
@@ -681,7 +698,15 @@ pub class Sequential {
                 batch_labels = self._slice_labels(dataset, start, count)
             }
 
-            let prediction = self._forward(batch_features, training: training)
+            let prediction = if training {
+                self._forward(batch_features, training: true)
+            } else {
+                self._infer(batch_features)
+            }
+            #: What no graph holds, `discard_graph()` cannot return.
+            let unrecorded = not training and
+                prediction.creator is null and
+                prediction is not batch_features
             let loss = loss_fn.forward(prediction, batch_labels, total_loss, count)
             let intermediates = if training {
                 self._zero_grad()
@@ -694,6 +719,7 @@ pub class Sequential {
             add_correct_into(prediction, batch_labels, total_correct)
 
             loss.free()
+            if unrecorded { prediction.free() }
             batch_features.free()
             batch_labels.free()
             for tensor in intermediates { tensor.free() }
@@ -1432,4 +1458,15 @@ pub class Sequential {
     fn _check_live(self) -> void {
         if self.freed { throw RuntimeError("this Sequential model has already been freed") }
     }
+}
+
+#: Free `consumed`, a layer's input no graph recorded, now that the layer has
+#: produced `produced` from it. A view (`Flatten` reshapes) may share its
+#: memory, so then it is tied to the view's lifetime instead.
+fn release_consumed(consumed: Tensor, produced: Tensor) -> void {
+    if not produced.borrowed {
+        consumed.free()
+        return
+    }
+    if produced.backing is null { produced.backing = consumed }
 }
