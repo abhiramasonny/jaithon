@@ -27,7 +27,11 @@ repository: token files, tokenizers, checkpoints and logs go to
 **The numbers and samples below come from a 15-minute pretraining run, an
 eighth of the real budget.** The two-hour run is `run_full.sh` with its
 defaults; one was started from this branch at 13:38 on 2026-10-08, and none
-of its results are in this README.
+of its results are in this README. It runs the code from before a review
+round fixed it: its chat transcript in `final_eval.txt` comes from the old
+repetition penalty, and it takes the lock back between chunks without
+waiting. Its checkpoints are unaffected; `chat.jai` as it is now samples
+from them with the fixed penalty.
 
 ## Data
 
