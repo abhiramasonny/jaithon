@@ -282,7 +282,13 @@ pub class Tensor {
     #: has read it (unless `retain_grad()` asked to keep it), and so is a
     #: tensor only one op saved for its backward; freeing those again with
     #: the rest of the returned list is harmless. Leaves keep their `.grad`.
-    pub fn backward(self) -> list[Tensor] {
+    #:
+    #: A second `backward()` through the same graph -- two losses over one
+    #: trunk -- needs those saved tensors again, and throws that one "has
+    #: already been freed" if the first released them. Pass `retain_graph`
+    #: to every call but the last to keep them, as in torch, and free the
+    #: graph once, after the last call.
+    pub fn backward(self, retain_graph: bool = false) -> list[Tensor] {
         if self.size != 1 {
             throw ValueError(f"backward needs a scalar tensor, got shape {self.shape}")
         }
@@ -303,7 +309,11 @@ pub class Tensor {
             unit_scalar()
         }
         let order = self._topo_order()
-        let last_reader = if _EARLY_FREE { last_readers(order) } else { {} }
+        let release = _EARLY_FREE and not retain_graph
+        #: A gradient left on an intermediate would be added to again by the
+        #: next call through the graph, and passed down a second time.
+        let free_grads = _EARLY_FREE or retain_graph
+        let last_reader = if release { last_readers(order) } else { {} }
         var index = order.len() - 1
         while index >= 0 {
             let tensor = order[index]
@@ -316,9 +326,12 @@ pub class Tensor {
                 #: would otherwise alias it, so those are copied out.
                 let keeps = tensor is self or tensor.retains_grad
                 if keeps { own_grads(node, grads, upstream) }
+                let in_place = if keeps { 0 } else { in_place_positions(node, grads) }
                 settle_grads(node, grads, upstream)
-                if not keeps { release_upstream(tensor, upstream, node, grads, _EARLY_FREE) }
-                if _EARLY_FREE { release_saved(node, index, last_reader) }
+                if not keeps {
+                    release_upstream(tensor, upstream, node, grads, in_place, free_grads)
+                }
+                if release { release_saved(node, index, last_reader) }
             }
             index -= 1
         }
@@ -528,7 +541,9 @@ fn accumulate_grad(target: Tensor, contribution: Tensor) -> void {
 #: Whether a backward should compute `tensor`'s gradient: it asked for one,
 #: or an op produced it, so the walk runs through it. Ops building a
 #: `GradNode` use this to skip the side of a backward nobody reads.
-pub fn wants_grad(tensor: Tensor) -> bool { return tensor.requires_grad or tensor.creator is not null }
+pub fn wants_grad(tensor: Tensor) -> bool {
+    return tensor.requires_grad or tensor.creator is not null
+}
 
 #: Whether `grads` holds `candidate` at a position whose input wants it.
 fn handed_on(node: GradNode, grads: list[Tensor], candidate: Tensor) -> bool {
@@ -575,6 +590,19 @@ fn own_grads(node: GradNode, grads: list[Tensor], upstream: Tensor) -> void {
     }
 }
 
+#: Which positions of `grads` are their input's existing `.grad`, written in
+#: place, as a bit mask. Read before `settle_grads`, which makes every
+#: gradient it hands out an input's `.grad` and so hides the difference.
+fn in_place_positions(node: GradNode, grads: list[Tensor]) -> int {
+    var mask = 0
+    for (position, input) in node.inputs.enumerate() {
+        if position >= 62 { break }
+        let existing = input.grad
+        if existing is not null and grads[position] is existing { mask = mask | 1 << position }
+    }
+    return mask
+}
+
 #: Settle who owns an intermediate's gradient once its op's backward has
 #: read it, and with `free_now` release it.
 #:
@@ -592,12 +620,19 @@ fn release_upstream(
     upstream: Tensor,
     node: GradNode,
     grads: list[Tensor],
+    in_place: int,
     free_now: bool
 ) -> void {
     var holders = 0
     var holder: Tensor? = null
     for (position, grad) in grads.enumerate() {
         if not node.needs[position] or grad.is_freed() { continue }
+        #: The input's own gradient, accumulated in place (`dense_affine`
+        #: writes `out: weights.grad`), holds nothing of the upstream even
+        #: when it is itself a view -- which it is for a parameter first
+        #: reached through `reshape`. Counting it chained this step's
+        #: upstream behind it, one buffer leaked per step.
+        if position < 62 and in_place >> position & 1 == 1 { continue }
         if grad is upstream or grad.borrowed {
             holders += 1
             holder = grad
@@ -606,7 +641,9 @@ fn release_upstream(
     if holders > 1 { return }
     let kept = holder
     if kept is null {
-        if free_now {
+        #: An upstream already freed was handed on and then merged into an
+        #: input's existing gradient; the reference must not outlive it.
+        if free_now or upstream.is_freed() {
             tensor.grad = null
             upstream.free()
         }
@@ -663,9 +700,17 @@ fn release_saved(node: GradNode, index: int, last_reader: dict[int, int]) -> voi
 #:
 #: Ops inside record nothing: what they return is a plain tensor with no
 #: `.creator`, which the caller frees like any other, and nothing needs
-#: `discard_graph()`. Parameters keep their `requires_grad`; the block does
-#: not touch them. Nests, and restores the previous state even when `body`
-#: throws.
+#: `discard_graph()`. That includes what a caller's own composition of ops
+#: produces on the way: no graph will hand those back, so free them too.
+#: Parameters keep their `requires_grad`; the block does not touch them.
+#: Nests, and restores the previous state even when `body` throws.
+#:
+#: An op or layer that composes others, and decides who frees a temporary,
+#: must not ask `requires_grad` -- that is still true in here. Ask whether
+#: the result has a `.creator` (the graph took the temporary) or
+#: `is_grad_enabled()`; `mean`, `mse`, the binary cross-entropies,
+#: `scaled_dot_product_attention`, `Dense`, `Conv2d` and `Sequential.predict`
+#: and `evaluate` each leaked a buffer a call here until they did.
 pub fn no_grad(body: fn() -> void) -> void {
     let previous = _grad_enabled
     _grad_enabled = false

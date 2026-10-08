@@ -160,16 +160,29 @@ only one op saved for its backward (attention probabilities, norm statistics,
 the cross-entropy row statistics) is released after that op, as in torch with
 `retain_grad=False`. `t.retain_grad()` keeps one. Leaves keep theirs. The
 caller still frees what `backward()` returns; the early-freed ones are already
-gone and freeing them again is harmless. `jt.no_grad(fn() { ... })` runs a
-block that records no graph: its results have no `.creator` and are freed like
-any tensor. `set_grad_enabled` and `is_grad_enabled` are the unscoped forms.
+gone and freeing them again is harmless. A second `backward()` through the
+same graph (two losses over one trunk) needs the saved tensors again: pass
+`backward(retain_graph: true)` to every call but the last, then free the graph
+once; without it the second call throws that a tensor "has already been
+freed". `jt.no_grad(fn() { ... })` runs a block that records no graph: its
+results have no `.creator` and are freed like any tensor, and so is anything a
+caller's own composition of ops made on the way, since no graph will return
+it. An op or layer that composes others must decide who frees a temporary by
+whether the result has a `.creator` (or `is_grad_enabled()`), never by
+`requires_grad`, which parameters keep inside the block. Under `no_grad`
+attention takes its inference kernels, and `Sequential.predict` and
+`evaluate` free each hidden activation once the next layer has read it.
+`set_grad_enabled` and `is_grad_enabled` are the unscoped forms.
 Sparse cross-entropy runs a row across a simdgroup (up to 1024 classes) or a
 threadgroup of 256, with an online max and sum in one coalesced pass; the
 autograd backward recomputes the gradient from three numbers a row instead of
 holding a logits-sized delta between forward and backward. A/B switches, each
-read once: `JAITENSOR_BACKWARD_FREE=0` keeps every intermediate gradient and
-saved tensor until the caller frees the graph. `JAITENSOR_CE_ROWS=0` takes
-the old one-thread-per-row cross-entropy kernel.
+read once: `JAITENSOR_BACKWARD_FREE=0` keeps intermediate gradients and saved
+tensors until the caller frees the graph (an intermediate whose gradient was
+handed down and merged into another is left with none, and `retain_graph`
+still releases intermediate gradients so a second call does not count the
+first twice). `JAITENSOR_CE_ROWS=0` takes the old one-thread-per-row
+cross-entropy kernel.
 
 ## What this is aimed at
 
