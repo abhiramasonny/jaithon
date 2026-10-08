@@ -8,7 +8,6 @@ from .ops import relu, reshape, sigmoid, softmax, tanh
 from .ops import batch_norm, group_norm, multi_head_attention, silu, matmul
 from .ops.attention import hand_to_graph
 from .ops.matmul import raw_matmul
-from .ops import add
 from .tensor import Tensor
 
 #: Something `Sequential` can stack: turns an input tensor into an output
@@ -1170,8 +1169,8 @@ pub class ResBlock: Layer {
         self.stride = stride
         self.projects = projection
         self.projection_asked = projection
-        self.norm1 = BatchNorm2d()
-        self.norm2 = BatchNorm2d()
+        self.norm1 = BatchNorm2d(relu: true)
+        self.norm2 = BatchNorm2d(relu: true)
         self.norm_shortcut = BatchNorm2d()
         self.conv1 = null
         self.conv2 = null
@@ -1217,10 +1216,12 @@ pub class ResBlock: Layer {
         let conv2 = self.conv2
         if conv1 is null or conv2 is null { throw RuntimeError("ResBlock has not been built") }
         if x.rank() != 4 { throw ValueError(f"ResBlock needs NHWC input, got {x.shape}") }
-        let inner = relu(self.norm1.forward(conv2d(x, conv1, stride: self.stride, padding: 1)))
-        let main = self.norm2.forward(conv2d(inner, conv2, padding: 1))
+        #: Both norms carry their ReLU, and the second the skip as well: the
+        #: add and the two ReLUs run inside the norms' own passes, forward and
+        #: backward (`JAITENSOR_BN_FUSED=0` composes them from separate ops).
+        let inner = self.norm1.forward(conv2d(x, conv1, stride: self.stride, padding: 1))
         let skip = self.shortcut_of(x)
-        return relu(add(main, skip))
+        return self.norm2.forward_residual(conv2d(inner, conv2, padding: 1), skip)
     }
 
     fn shortcut_of(self, x: Tensor) -> Tensor {
