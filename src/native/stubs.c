@@ -146,36 +146,39 @@ void jaiGpuFree(JaiGpuBuffer *b) {
     (void)b;
 }
 
-void jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes, size_t offset) {
+bool jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes, size_t offset) {
     (void)b;
     (void)src;
     (void)bytes;
     (void)offset;
+    return false;
 }
 
-void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
+bool jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
                     size_t offset, float scale) {
     (void)b;
     (void)src;
     (void)count;
     (void)offset;
     (void)scale;
+    return false;
 }
 
 const float *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
     (void)b; (void)elementOffset; (void)count; return NULL;
 }
 
-void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
+bool jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
                       size_t offset, float scale) {
     (void)b;
     (void)dst;
     (void)count;
     (void)offset;
     (void)scale;
+    return false;
 }
 
-void jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
+bool jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
                        float low, float high, uint64_t seed) {
     (void)b;
     (void)elementOffset;
@@ -183,19 +186,22 @@ void jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
     (void)low;
     (void)high;
     (void)seed;
+    return false;
 }
 
-void jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
+bool jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
     (void)b;
     (void)elementOffset;
     (void)count;
+    return false;
 }
 
-void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
+bool jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
     (void)b;
     (void)dst;
     (void)bytes;
     (void)offset;
+    return false;
 }
 
 JaiGpuKernel *jaiGpuCompile(const char *source, const char *entryPoint,
@@ -246,7 +252,7 @@ bool jaiGpuSynchronize(void) {
     return false;
 }
 
-const char *jaiGpuLastError(void) {
+const char *jaiGpuTakeError(void) {
     return "";
 }
 

@@ -57,6 +57,10 @@ struct JaiGpuBuffer;
  * so the graph primitives can feed device memory through a compiled plan. */
 bool jaiGpuBufferOf(Value v, int index, const char *fnName,
                     struct JaiGpuBuffer **buffer, int64_t *origin);
+/* Raise the RuntimeError for queued GPU work that failed or timed out under a
+ * wait, a read or a waiting host write, carrying the Metal error or the
+ * timeout, and mark that failure reported. Always returns false. */
+bool jaiThrowGpuFailure(const char *fnName);
 void jaiRegisterAllBuiltins(void);
 
 bool jaiBuiltinMethod(Value receiver, ObjString *name, Value *out);

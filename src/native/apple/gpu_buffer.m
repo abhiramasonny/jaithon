@@ -333,19 +333,28 @@ static bool swapForFresh(JaiGpuBuffer *b) {
     return true;
 }
 
-static void hostWriteBarrier(JaiGpuBuffer *b) {
-    if (b == NULL) return;
-    if (!b->recycled && b->lastBatch == 0) return;
+/* False when the wait failed -- the work is still queued or broke -- and the
+ * caller must then not write: a write that went ahead would land under the
+ * queued work it was meant to follow. The failure is pending, for the caller
+ * to raise. */
+static bool hostWriteBarrier(JaiGpuBuffer *b) {
+    if (b == NULL) return true;
+    if (!b->recycled && b->lastBatch == 0) return true;
     const bool tradable = b->recycled && b->untouched;
-    b->recycled = false;
-    b->untouched = false;
     if (tradable && b->bytes < JAI_POOL_WAIT_RATHER_THAN_ALLOCATE && poolSwaps() &&
         b->lastBatch > doneBatch()) {
         @autoreleasepool {
-            if (swapForFresh(b)) return;
+            if (swapForFresh(b)) {
+                b->recycled = false;
+                b->untouched = false;
+                return true;
+            }
         }
     }
-    jaiGpuWaitFor(b);
+    if (!jaiGpuWaitFor(b)) return false;
+    b->recycled = false;
+    b->untouched = false;
+    return true;
 }
 
 void jaiGpuFree(JaiGpuBuffer *b) {
@@ -366,32 +375,35 @@ void jaiGpuFree(JaiGpuBuffer *b) {
 
 /* Shared storage means the pointer is host-visible and coherent; there is no
  * separate staging copy and nothing to synchronise after a write. */
-void jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes, size_t offset) {
-    if (b == NULL || b->buffer == NULL || src == NULL || bytes == 0) return;
+bool jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes, size_t offset) {
+    if (b == NULL || b->buffer == NULL || src == NULL) return false;
+    if (bytes == 0) return true;
     /* A partial copy would look like success and leave the tail stale, so an
      * oversized request copies nothing. Callers bound-check first. */
-    if (offset > b->bytes || bytes > b->bytes - offset) return;
-    hostWriteBarrier(b);
+    if (offset > b->bytes || bytes > b->bytes - offset) return false;
+    if (!hostWriteBarrier(b)) return false;
 
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     memcpy((uint8_t *)[buffer contents] + offset, src, bytes);
+    return true;
 }
 
-void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
+bool jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
                     size_t offset, float scale) {
-    if (b == NULL || b->buffer == NULL || src == NULL || count == 0) return;
+    if (b == NULL || b->buffer == NULL || src == NULL) return false;
+    if (count == 0) return true;
     const size_t start = offset * sizeof(float);
     const size_t bytes = count * sizeof(float);
-    if (start > b->bytes || bytes > b->bytes - start) return;
+    if (start > b->bytes || bytes > b->bytes - start) return false;
     /* Both routes below can write from the host, so the barrier covers the
      * whole function rather than the fallback alone. */
-    hostWriteBarrier(b);
+    if (!hostWriteBarrier(b)) return false;
     if (count < JAI_GPU_MIN_WORK || count > UINT32_MAX || !ensureDevice() ||
         !ensureBuiltins() || gExpandU8 == nil) {
         float *destination =
             (float *)((__bridge id<MTLBuffer>)b->buffer).contents + offset;
         for (size_t i = 0; i < count; i++) destination[i] = (float)src[i] * scale;
-        return;
+        return true;
     }
 
     @autoreleasepool {
@@ -402,7 +414,7 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
         if (staging == nil) {
             float *destination = (float *)[dest contents] + offset;
             for (size_t i = 0; i < count; i++) destination[i] = (float)src[i] * scale;
-            return;
+            return true;
         }
         uint32_t n = (uint32_t)count;
         float scaleValue = scale;
@@ -415,7 +427,7 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
                     for (size_t i = 0; i < count; i++) {
                         destination[i] = (float)src[i] * scale;
                     }
-                    return;
+                    return true;
                 }
             }
             if (gAsyncEncoder == nil) {
@@ -425,7 +437,7 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
                     for (size_t i = 0; i < count; i++) {
                         destination[i] = (float)src[i] * scale;
                     }
-                    return;
+                    return true;
                 }
             }
             markLocked(b);
@@ -437,15 +449,17 @@ void jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
             encodeDispatch(gAsyncEncoder, gExpandU8, (NSUInteger)count, 256);
         }
     }
+    return true;
 }
 
-void jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
+bool jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
                        float low, float high, uint64_t seed) {
-    if (b == NULL || b->buffer == NULL || count == 0) return;
+    if (b == NULL || b->buffer == NULL) return false;
+    if (count == 0) return true;
     const size_t start = elementOffset * sizeof(float);
     const size_t bytes = count * sizeof(float);
-    if (start > b->bytes || bytes > b->bytes - start) return;
-    hostWriteBarrier(b);
+    if (start > b->bytes || bytes > b->bytes - start) return false;
+    if (!hostWriteBarrier(b)) return false;
     float *destination =
         (float *)((__bridge id<MTLBuffer>)b->buffer).contents + elementOffset;
     uint64_t state = seed != 0 ? seed : 0x9E3779B97F4A7C15ull;
@@ -456,24 +470,29 @@ void jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
         state ^= state << 17;
         destination[i] = low + scale * (float)((uint32_t)(state >> 40));
     }
+    return true;
 }
 
-void jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
-    if (b == NULL || b->buffer == NULL || count == 0) return;
+bool jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
+    if (b == NULL || b->buffer == NULL) return false;
+    if (count == 0) return true;
     const size_t start = elementOffset * sizeof(float);
     const size_t bytes = count * sizeof(float);
-    if (start > b->bytes || bytes > b->bytes - start) return;
-    hostWriteBarrier(b);
+    if (start > b->bytes || bytes > b->bytes - start) return false;
+    if (!hostWriteBarrier(b)) return false;
     memset((uint8_t *)((__bridge id<MTLBuffer>)b->buffer).contents + start, 0, bytes);
+    return true;
 }
 
-void jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
-    if (b == NULL || b->buffer == NULL || dst == NULL || bytes == 0) return;
-    if (offset > b->bytes || bytes > b->bytes - offset) return;
-    jaiGpuWaitFor(b);
+bool jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes, size_t offset) {
+    if (b == NULL || b->buffer == NULL || dst == NULL) return false;
+    if (bytes == 0) return true;
+    if (offset > b->bytes || bytes > b->bytes - offset) return false;
+    if (!jaiGpuWaitFor(b)) return false;
 
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     memcpy(dst, (const uint8_t *)[buffer contents] + offset, bytes);
+    return true;
 }
 
 typedef struct {
@@ -501,13 +520,14 @@ static void jaiParallelNarrow(const float *source, uint8_t *dst, size_t count,
     jaiParallelChunks(count, 32768, narrowRange, &work);
 }
 
-void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
+bool jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
                       size_t offset, float scale) {
-    if (b == NULL || b->buffer == NULL || dst == NULL || count == 0) return;
+    if (b == NULL || b->buffer == NULL || dst == NULL) return false;
+    if (count == 0) return true;
     const size_t start = offset * sizeof(float);
     const size_t bytes = count * sizeof(float);
-    if (start > b->bytes || bytes > b->bytes - start) return;
-    jaiGpuWaitFor(b);
+    if (start > b->bytes || bytes > b->bytes - start) return false;
+    if (!jaiGpuWaitFor(b)) return false;
 
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     /* Indexed as floats rather than stepped as bytes and cast: `start` is a
@@ -520,6 +540,7 @@ void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
     const float factor = scale != 0.0f ? 1.0f / scale : 1.0f;
     /* One frame is millions of these and nothing is shared between them. */
     jaiParallelNarrow(source, dst, count, factor);
+    return true;
 }
 
 /* The buffer's own memory, ready to read, after everything queued has run.
@@ -529,13 +550,15 @@ void jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
  * -- turning them into list elements, say -- can read them where they are and
  * skip a staging array and a copy of the whole thing.
  *
- * The pointer is good until the next GPU work touches the buffer. */
+ * The pointer is good until the next GPU work touches the buffer. NULL when
+ * the wait failed, as well as out of range: bytes the queued work has not
+ * finished writing are not a result. */
 const float *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
     if (b == NULL || b->buffer == NULL) return NULL;
     const size_t start = elementOffset * sizeof(float);
     const size_t bytes = count * sizeof(float);
     if (start > b->bytes || bytes > b->bytes - start) return NULL;
-    jaiGpuWaitFor(b);
+    if (!jaiGpuWaitFor(b)) return NULL;
     b->untouched = false;   /* the caller holds a pointer into these bytes */
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     return (const float *)[buffer contents] + elementOffset;
@@ -546,7 +569,7 @@ float *jaiGpuMapWrite(JaiGpuBuffer *b, size_t elementOffset, size_t count) {
     const size_t start = elementOffset * sizeof(float);
     const size_t bytes = count * sizeof(float);
     if (start > b->bytes || bytes > b->bytes - start) return NULL;
-    hostWriteBarrier(b);
+    if (!hostWriteBarrier(b)) return NULL;
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)b->buffer;
     return (float *)[buffer contents] + elementOffset;
 }

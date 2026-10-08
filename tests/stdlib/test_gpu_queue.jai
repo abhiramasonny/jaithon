@@ -102,7 +102,9 @@ fn run_child(source: str, settings: str, tag: str) -> Completed {
 fn child_program(body: list[str]) -> str {
     var src = "import std.gpu\n"
     src += "let SOURCE = \"#include <metal_stdlib>\\nusing namespace metal;\\n"
-    src += "kernel void add_one(device float* v [[buffer(0)]], uint i [[thread_position_in_grid]]) { v[i] += 1.0f; }\\n\"\n"
+    src += "kernel void add_one(device float* v [[buffer(0)]], uint i [[thread_position_in_grid]]) { v[i] += 1.0f; }\\n"
+    src += "kernel void set_seven(device float* v [[buffer(0)]], uint i [[thread_position_in_grid]]) { v[i] = 7.0f; }\\n"
+    src += "kernel void burn(device float* v [[buffer(0)]], uint i [[thread_position_in_grid]]) { float x = v[i]; for (uint k = 0; k < 10000; k++) { x = fma(x, 0.999f, 0.001f); } v[i] = x; }\\n\"\n"
     src += "fn main() -> int {\n"
     src += "    let kernel = gpu.Kernel.compile(SOURCE, \"add_one\")\n"
     for line in body { src += f"    {line}\n" }
@@ -117,16 +119,192 @@ fn child_program(body: list[str]) -> str {
 #: for five minutes.
 fn test_a_stalled_queue_raises_after_the_timeout_instead_of_hanging() -> void {
     if not gpu.is_available() { return }
-    let src = child_program([
-        "let values = gpu.Buffer.of([1.0, 2.0])",
-        "kernel.dispatch_async([values], 2)",
-        "try { gpu.synchronize() } catch e: RuntimeError { print(f\"caught: {e.message}\") }",
-    ])
+    let src = child_program(
+        [
+            "let values = gpu.Buffer.of([1.0, 2.0])",
+            "kernel.dispatch_async([values], 2)",
+            "try { gpu.synchronize() } catch e: RuntimeError { print(f\"caught: {e.message}\") }",
+        ]
+    )
     let ran = run_child(src, "JAITHON_GPU_DEBUG_STALL=1 JAITHON_GPU_WAIT_TIMEOUT=0.3", "stall")
     assert_eq(ran.exit_code, 0, ran.stderr)
-    assert_true(ran.stdout.contains("caught: gpu_synchronize(): queued GPU work did not complete"),
-                ran.stdout)
+    assert_true(
+        ran.stdout.contains("caught: gpu_synchronize(): queued GPU work did not complete"),
+        ran.stdout
+    )
     assert_true(ran.stdout.contains("did not finish within 0.3 s"), ran.stdout)
+}
+
+#: A host write that has to wait for queued work, and whose wait times out,
+#: raises and writes nothing. Written anyway, as it once was, the bytes landed
+#: under the kernel still queued against them, that kernel then ran on top of
+#: them, and nobody was told: the next synchronize said the queue was fine.
+fn test_a_host_write_whose_wait_times_out_raises_and_writes_nothing() -> void {
+    if not gpu.is_available() { return }
+    let src = child_program(
+        [
+            "let values = gpu.Buffer.of([1.0, 2.0])",
+            "kernel.dispatch_async([values], 2)",
+            "try {",
+            "    values.upload([5.0, 5.0])",
+            "    print(\"upload went through\")",
+            "} catch e: RuntimeError { print(f\"upload raised: {e.message}\") }",
+            "gpu.synchronize()",
+            "print(f\"after: {values.download()}\")",
+        ]
+    )
+    let ran = run_child(
+        src,
+        "JAITHON_GPU_DEBUG_STALL=1 JAITHON_GPU_WAIT_TIMEOUT=0.3",
+        "stall_write"
+    )
+    assert_eq(ran.exit_code, 0, ran.stderr)
+    assert_true(
+        ran.stdout.contains("upload raised: gpu_buffer_upload(): queued GPU work did not complete"),
+        ran.stdout
+    )
+    assert_true(ran.stdout.contains("did not finish within 0.3 s"), ran.stdout)
+    assert_true(ran.stdout.contains("after: [2.0, 3.0]"), ran.stdout)
+}
+
+#: A read whose wait times out raises rather than hand back the bytes from
+#: before the queued kernel. The batch it gave up on is still queued, so it
+#: goes back on the books: the synchronize after waits for it, finds nothing
+#: new to report (the read already raised it), and the read after that sees
+#: the kernel's result.
+fn test_a_read_whose_wait_times_out_raises_instead_of_returning_stale_values() -> void {
+    if not gpu.is_available() { return }
+    let src = child_program(
+        [
+            "let values = gpu.Buffer.of([1.0, 2.0])",
+            "kernel.dispatch_async([values], 2)",
+            "try { print(f\"read: {values.download()}\") } catch e: RuntimeError { print(f\"read raised: {e.message}\") }",
+            "gpu.synchronize()",
+            "print(f\"after: {values.download()}\")",
+        ]
+    )
+    let ran = run_child(src, "JAITHON_GPU_DEBUG_STALL=1 JAITHON_GPU_WAIT_TIMEOUT=0.3", "stall_read")
+    assert_eq(ran.exit_code, 0, ran.stderr)
+    assert_true(
+        ran.stdout.contains("read raised: gpu_buffer_download(): queued GPU work did not complete"),
+        ran.stdout
+    )
+    assert_true(ran.stdout.contains("did not finish within 0.3 s"), ran.stdout)
+    assert_true(ran.stdout.contains("after: [2.0, 3.0]"), ran.stdout)
+}
+
+#: The batch a wait gives up on need not be the buffer's own. Here the stalled
+#: one is an earlier batch, and the buffer's own -- a long kernel, then the
+#: write of seven -- is queued behind it. The upload raises and writes
+#: nothing, and the batches the wait took off the books go back on them, so
+#: the read after it waits for the seven instead of reading the bytes from
+#: before it. Once the books dropped them: the upload landed, the read came
+#: back [1.0, 2.0] while the kernel was still running, nothing raised, and the
+#: seven landed on top of it all afterwards.
+fn test_a_write_behind_a_stalled_earlier_batch_raises_and_the_batches_stay_queued() -> void {
+    if not gpu.is_available() { return }
+    let src = child_program(
+        [
+            "let burn = gpu.Kernel.compile(SOURCE, \"burn\")",
+            "let set_seven = gpu.Kernel.compile(SOURCE, \"set_seven\")",
+            "let small = gpu.Buffer.of([0.0])",
+            "kernel.dispatch_async([small], 1)",
+            "gpu.flush()",
+            "let big = gpu.Buffer(1048576)",
+            "big.fill_zero()",
+            "burn.dispatch_async([big], 1048576)",
+            "let values = gpu.Buffer(2)",
+            "set_seven.dispatch_async([values], 2)",
+            "try {",
+            "    values.upload([1.0, 2.0])",
+            "    print(\"upload went through\")",
+            "} catch e: RuntimeError { print(f\"upload raised: {e.message}\") }",
+            "print(f\"read: {values.download()}\")",
+            "gpu.synchronize()",
+            "print(\"synchronize ok\")",
+        ]
+    )
+    let ran = run_child(
+        src,
+        "JAITHON_GPU_DEBUG_STALL=1 JAITHON_GPU_WAIT_TIMEOUT=0.3",
+        "stall_earlier_write"
+    )
+    assert_eq(ran.exit_code, 0, ran.stderr)
+    assert_true(
+        ran.stdout.contains(
+            "upload raised: gpu_buffer_upload(): queued GPU work did not complete: GPU work queued in batch 1 did not finish within 0.3 s"
+        ),
+        ran.stdout
+    )
+    assert_true(ran.stdout.contains("read: [7.0, 7.0]"), ran.stdout)
+    assert_true(ran.stdout.contains("synchronize ok"), ran.stdout)
+}
+
+#: The read side of the same shape: a read whose wait gives up on an earlier
+#: batch raises, and the read after it still waits for the kernel queued
+#: behind -- it does not read past batches that were only ever taken off the
+#: books to be waited for.
+fn test_a_read_behind_a_stalled_earlier_batch_raises_and_the_next_read_waits() -> void {
+    if not gpu.is_available() { return }
+    let src = child_program(
+        [
+            "let burn = gpu.Kernel.compile(SOURCE, \"burn\")",
+            "let small = gpu.Buffer.of([0.0])",
+            "kernel.dispatch_async([small], 1)",
+            "gpu.flush()",
+            "let big = gpu.Buffer(1048576)",
+            "big.fill_zero()",
+            "burn.dispatch_async([big], 1048576)",
+            "let values = gpu.Buffer.of([1.0, 2.0])",
+            "kernel.dispatch_async([values], 2)",
+            "try { print(f\"first read: {values.download()}\") } catch e: RuntimeError { print(f\"first read raised: {e.message}\") }",
+            "print(f\"second read: {values.download()}\")",
+            "gpu.synchronize()",
+            "print(\"synchronize ok\")",
+        ]
+    )
+    let ran = run_child(
+        src,
+        "JAITHON_GPU_DEBUG_STALL=1 JAITHON_GPU_WAIT_TIMEOUT=0.3",
+        "stall_earlier_read"
+    )
+    assert_eq(ran.exit_code, 0, ran.stderr)
+    assert_true(
+        ran.stdout.contains(
+            "first read raised: gpu_buffer_download(): queued GPU work did not complete: GPU work queued in batch 1 did not finish within 0.3 s"
+        ),
+        ran.stdout
+    )
+    assert_true(ran.stdout.contains("second read: [2.0, 3.0]"), ran.stdout)
+    assert_true(ran.stdout.contains("synchronize ok"), ran.stdout)
+}
+
+#: The backpressure wait inside a dispatch that never reads is a wait like any
+#: other: when it times out, the dispatch raises with the reason, not a bare
+#: "did not accept or complete the kernel".
+fn test_a_dispatch_whose_backpressure_wait_times_out_says_why() -> void {
+    if not gpu.is_available() { return }
+    let src = child_program(
+        [
+            "let values = gpu.Buffer.of([0.0, 0.0])",
+            "var said = \"\"",
+            "for _i in 0..40 { try { kernel.dispatch_async([values], 2) } catch e: RuntimeError { if said == \"\" { said = e.message } } }",
+            "gpu.synchronize()",
+            "print(f\"said: {said}\")",
+        ]
+    )
+    let ran = run_child(
+        src,
+        "JAITHON_GPU_DEBUG_STALL=1 JAITHON_GPU_WAIT_TIMEOUT=0.3 JAITHON_GPU_KERNEL_COMMIT=1",
+        "stall_dispatch"
+    )
+    assert_eq(ran.exit_code, 0, ran.stderr)
+    assert_true(
+        ran.stdout.contains(
+            "queued GPU work did not complete: GPU work queued in batch 1 did not finish within 0.3 s"
+        ),
+        ran.stdout
+    )
 }
 
 #: A loop that never reads still has its work committed in bounded pieces.
@@ -135,14 +313,19 @@ fn test_a_stalled_queue_raises_after_the_timeout_instead_of_hanging() -> void {
 #: across every boundary.
 fn test_the_batch_cap_commits_a_loop_that_never_waits() -> void {
     if not gpu.is_available() { return }
-    let src = child_program([
-        "let values = gpu.Buffer.of([0.0, 5.0])",
-        "for _i in 0..1000 { kernel.dispatch_async([values], 2) }",
-        "gpu.synchronize()",
-        "print(values.download())",
-    ])
-    let ran = run_child(src, "JAITHON_GPU_METER=1 JAITHON_GPU_KERNEL_COMMIT=0 JAITHON_GPU_BATCH_CAP=100",
-                        "cap")
+    let src = child_program(
+        [
+            "let values = gpu.Buffer.of([0.0, 5.0])",
+            "for _i in 0..1000 { kernel.dispatch_async([values], 2) }",
+            "gpu.synchronize()",
+            "print(values.download())",
+        ]
+    )
+    let ran = run_child(
+        src,
+        "JAITHON_GPU_METER=1 JAITHON_GPU_KERNEL_COMMIT=0 JAITHON_GPU_BATCH_CAP=100",
+        "cap"
+    )
     assert_eq(ran.exit_code, 0, ran.stderr)
     assert_true(ran.stdout.contains("[1000.0, 1005.0]"), ran.stdout)
     assert_true(ran.stderr.contains("buffers 10 "), ran.stderr)
@@ -152,14 +335,19 @@ fn test_the_batch_cap_commits_a_loop_that_never_waits() -> void {
 #: is measured against -- and what the old default did to every unread loop.
 fn test_without_the_cap_an_unread_loop_is_one_buffer() -> void {
     if not gpu.is_available() { return }
-    let src = child_program([
-        "let values = gpu.Buffer.of([0.0, 5.0])",
-        "for _i in 0..1000 { kernel.dispatch_async([values], 2) }",
-        "gpu.synchronize()",
-        "print(values.download())",
-    ])
-    let ran = run_child(src, "JAITHON_GPU_METER=1 JAITHON_GPU_KERNEL_COMMIT=0 JAITHON_GPU_BATCH_CAP=0",
-                        "nocap")
+    let src = child_program(
+        [
+            "let values = gpu.Buffer.of([0.0, 5.0])",
+            "for _i in 0..1000 { kernel.dispatch_async([values], 2) }",
+            "gpu.synchronize()",
+            "print(values.download())",
+        ]
+    )
+    let ran = run_child(
+        src,
+        "JAITHON_GPU_METER=1 JAITHON_GPU_KERNEL_COMMIT=0 JAITHON_GPU_BATCH_CAP=0",
+        "nocap"
+    )
     assert_eq(ran.exit_code, 0, ran.stderr)
     assert_true(ran.stdout.contains("[1000.0, 1005.0]"), ran.stdout)
     assert_true(ran.stderr.contains("buffers 1 "), ran.stderr)
@@ -169,12 +357,14 @@ fn test_without_the_cap_an_unread_loop_is_one_buffer() -> void {
 #: and the device overlap and freed buffers settle for the pool.
 fn test_a_kernel_only_loop_commits_every_sixty_four_dispatches() -> void {
     if not gpu.is_available() { return }
-    let src = child_program([
-        "let values = gpu.Buffer.of([0.0, 5.0])",
-        "for _i in 0..640 { kernel.dispatch_async([values], 2) }",
-        "gpu.synchronize()",
-        "print(values.download())",
-    ])
+    let src = child_program(
+        [
+            "let values = gpu.Buffer.of([0.0, 5.0])",
+            "for _i in 0..640 { kernel.dispatch_async([values], 2) }",
+            "gpu.synchronize()",
+            "print(values.download())",
+        ]
+    )
     let ran = run_child(src, "JAITHON_GPU_METER=1", "kernel")
     assert_eq(ran.exit_code, 0, ran.stderr)
     assert_true(ran.stdout.contains("[640.0, 645.0]"), ran.stdout)

@@ -186,9 +186,7 @@ static bool readSurface(Value *args, int first, const char *fnName, JaiSurface *
     int64_t wanted = origin + cols * channels;
     if (rows > 0) wanted = origin + (rows - 1) * stride + cols * channels;
     float *raw = jaiGpuMapWrite(buffer, (size_t)base, (size_t)(wanted > 0 ? wanted : 0));
-    if (raw == NULL) {
-        return jaiThrow(vm.cRuntimeError, "%s(): the buffer would not map to write", fnName);
-    }
+    if (raw == NULL) return jaiThrowGpuFailure(fnName);
     s->raw = raw;
     s->capacity = wanted;
     return true;

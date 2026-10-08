@@ -55,13 +55,21 @@ static int gEncoderStatus = -1;
  * finished batches. Written by Metal's completion thread, read by the
  * encoder, so it is an atomic; 0 until the first batch finishes. */
 static _Atomic double gUnitSeconds;
-/* When the open batch began, and when the last finished batch ended, on the
- * clock Metal's GPUEndTime uses (CLOCK_UPTIME_RAW). A batch's GPU time is
- * taken as its end less the later of those two, not as GPUEndTime less
- * GPUStartTime: MPSGraph commits a batch part way through (commitAndContinue)
- * and the buffer that finally carries the handler starts only at the last
- * part, which read a 1.5 ms dispatch as a fifth of that. */
-static double gOpenedAt;
+/* When the GPU could first have started the open batch, and when the last
+ * finished batch ended, on the clock Metal's GPUEndTime uses
+ * (CLOCK_UPTIME_RAW). A batch's GPU time is taken as its end less the later of
+ * those two, not as GPUEndTime less GPUStartTime: MPSGraph commits a batch
+ * part way through (commitAndContinue) and the buffer that finally carries the
+ * handler starts only at the last part, which read a 1.5 ms dispatch as a
+ * fifth of that.
+ *
+ * The earliest start is the commit for a batch of kernels alone, and the
+ * first graph encode for one with a graph in it -- the only place a part can
+ * be committed early. Not the moment the batch opened: the host time spent
+ * encoding into it, with the GPU idle, would count as GPU time, and after a
+ * long host phase every batch would be cut at a fraction of the work the cap
+ * means to allow. */
+static double gFirstGraphAt;
 static _Atomic double gLastEnd;
 
 static double uptimeNow(void) {
@@ -101,35 +109,57 @@ static bool fineSyncEnabled(void) {
 
 static void commitOpenLocked(void);
 static uint64_t takeFrontLocked(void);
+static void ensureInFlight(void);
 
-/* Why the last wait failed, for the RuntimeError that reports it.
+/* A failure no RuntimeError has carried yet, and why it happened.
  *
  * A wait used to come back false on any status but Completed and drop
  * `commands.error` on the floor, so five failures in one session said only
- * "did not complete" and nothing could be learned from any of them. The text
- * is written from Metal's completion thread as well as from waiters, so it has
- * a lock of its own -- never the queue's, which a waiter may be holding. */
+ * "did not complete" and nothing could be learned from any of them.
+ *
+ * The flag, not any one return value, is what decides whether an operation
+ * raises: a batch that failed or timed out sets it, and every wait -- a
+ * synchronize, a read, a host write that had to wait -- reports false while
+ * it is set, so whichever of them comes first raises it. Raising takes it
+ * (jaiGpuTakeError), so the same failure is not raised twice. A failure in a
+ * batch nobody waits on individually, one retired by backpressure inside an
+ * encode say, therefore still reaches the next wait.
+ *
+ * The first failure since the last take keeps the text: a later one is
+ * usually its consequence. The text is written from Metal's completion thread
+ * as well as from waiters, so it has a lock of its own -- never the queue's,
+ * which a waiter may be holding. */
 static pthread_mutex_t gErrorLock = PTHREAD_MUTEX_INITIALIZER;
 static char gLastError[1024];
 static char gLastErrorCopy[1024];
-/* A batch failed and no caller has been told yet. Set by the completion
- * handler, so a failure in a batch nobody waits on individually (one retired
- * by backpressure inside an encode, say) still reaches the next synchronize. */
 static atomic_bool gErrorPending;
 
 static void recordGpuError(const char *fmt, ...) JAI_PRINTF(1, 2);
 static void recordGpuError(const char *fmt, ...) {
     pthread_mutex_lock(&gErrorLock);
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(gLastError, sizeof gLastError, fmt, args);
-    va_end(args);
+    if (!atomic_load(&gErrorPending)) {
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(gLastError, sizeof gLastError, fmt, args);
+        va_end(args);
+        atomic_store(&gErrorPending, true);
+    }
     pthread_mutex_unlock(&gErrorLock);
 }
 
-const char *jaiGpuLastError(void) {
+static bool failurePending(void) {
+    return atomic_load(&gErrorPending);
+}
+
+const char *jaiGpuTakeError(void) {
     pthread_mutex_lock(&gErrorLock);
-    memcpy(gLastErrorCopy, gLastError, sizeof gLastErrorCopy);
+    if (atomic_load(&gErrorPending)) {
+        memcpy(gLastErrorCopy, gLastError, sizeof gLastErrorCopy);
+    } else {
+        gLastErrorCopy[0] = '\0';
+    }
+    gLastError[0] = '\0';
+    atomic_store(&gErrorPending, false);
     pthread_mutex_unlock(&gErrorLock);
     return gLastErrorCopy;
 }
@@ -199,8 +229,14 @@ static void recordCommandError(id<MTLCommandBuffer> done, uint64_t batch) {
                                        encoderStateName(info.errorState)];
             }
         }
-        recordGpuError("the Metal command buffer for batch %llu failed: %s code %ld (%s): %s%s%s",
-                       (unsigned long long)batch,
+        char which[48];
+        if (batch != 0) {
+            snprintf(which, sizeof which, "for batch %llu", (unsigned long long)batch);
+        } else {
+            snprintf(which, sizeof which, "of a synchronous dispatch");
+        }
+        recordGpuError("the Metal command buffer %s failed: %s code %ld (%s): %s%s%s",
+                       which,
                        error != nil ? utf8Or(error.domain, "?") : "no NSError",
                        error != nil ? (long)error.code : 0L,
                        error != nil ? commandErrorName(error.code) : "status error",
@@ -261,6 +297,17 @@ static void releaseStall(void) {
     if (gStallEvent != nil) gStallEvent.signaledValue = 1;
 }
 
+/* Wait for one committed batch, for at most waitTimeoutSeconds.
+ *
+ * True once the batch has finished, whether it worked or not -- a failed one
+ * has set the pending failure from its completion handler, and the caller
+ * reports that, not this. False when the wait gave up: the batch is still
+ * queued, so the caller must put it back on the books it took it from, or a
+ * later wait would not wait for it and a read would see the bytes from before
+ * it. A timeout sets the pending failure itself.
+ *
+ * The deadline is on the uptime clock, which a system sleep or a clock step
+ * does not move, so neither can end a wait on a GPU that is fine. */
 static bool waitBatch(id<MTLCommandBuffer> commands, uint64_t batch) {
     if (commands == nil) return true;
     if (doneBatch() < batch) {
@@ -270,20 +317,19 @@ static bool waitBatch(id<MTLCommandBuffer> commands, uint64_t batch) {
         if (limit <= 0.0) {
             while (doneBatch() < batch) pthread_cond_wait(&gDoneCond, &gDoneLock);
         } else {
-            struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
-            const double whole = floor(limit);
-            deadline.tv_sec += (time_t)whole;
-            deadline.tv_nsec += (long)((limit - whole) * 1e9);
-            if (deadline.tv_nsec >= 1000000000L) {
-                deadline.tv_sec += 1;
-                deadline.tv_nsec -= 1000000000L;
-            }
+            const double deadline = uptimeNow() + limit;
             while (doneBatch() < batch) {
-                if (pthread_cond_timedwait(&gDoneCond, &gDoneLock, &deadline) == ETIMEDOUT) {
-                    timedOut = doneBatch() < batch;
+                const double left = deadline - uptimeNow();
+                if (left <= 0.0) {
+                    timedOut = true;
                     break;
                 }
+                const double whole = floor(left);
+                struct timespec span = {
+                    .tv_sec = (time_t)whole,
+                    .tv_nsec = (long)((left - whole) * 1e9),
+                };
+                pthread_cond_timedwait_relative_np(&gDoneCond, &gDoneLock, &span);
             }
         }
         pthread_mutex_unlock(&gDoneLock);
@@ -299,18 +345,42 @@ static bool waitBatch(id<MTLCommandBuffer> commands, uint64_t batch) {
     }
     /* The batch is known finished, by its own handler or a later one's. A
      * later one's runs first only in principle, and then this returns at once;
-     * it is here so the status read below is final. */
+     * it is here so the batch really is final when the caller moves on. */
     [commands waitUntilCompleted];
-    if ([commands status] == MTLCommandBufferStatusCompleted) return true;
-    recordCommandError(commands, batch);
-    atomic_store(&gErrorPending, false);
-    return false;
+    return true;
 }
 
-/* A failure no wait has reported yet: one retired by backpressure inside an
- * encode, which has no caller to tell. */
-static bool takePendingError(void) {
-    return atomic_exchange(&gErrorPending, false);
+/* Put batches a wait took off the books, and did not see finish, back where
+ * they were: at the front, since everything committed since is newer. */
+static void requeueLocked(NSArray<id<MTLCommandBuffer>> *commands,
+                          NSArray<NSNumber *> *batches, NSUInteger from) {
+    if (from >= commands.count) return;
+    ensureInFlight();
+    const NSRange rest = NSMakeRange(from, commands.count - from);
+    NSIndexSet *front = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, rest.length)];
+    [gInFlight insertObjects:[commands subarrayWithRange:rest] atIndexes:front];
+    [gInFlightBatch insertObjects:[batches subarrayWithRange:rest] atIndexes:front];
+}
+
+static void requeueOneLocked(id<MTLCommandBuffer> commands, uint64_t batch) {
+    ensureInFlight();
+    [gInFlight insertObject:commands atIndex:0];
+    [gInFlightBatch insertObject:@(batch) atIndex:0];
+}
+
+/* The backpressure wait for the oldest batch, which a caller took off the
+ * books under the lock and waits for outside it. False when a failure is now
+ * pending, whether this batch's or an earlier one's. */
+static bool waitOldest(id<MTLCommandBuffer> oldest, uint64_t batch) {
+    if (oldest == nil) return !failurePending();
+    if (!waitBatch(oldest, batch)) {
+        @synchronized(gQueue) {
+            requeueOneLocked(oldest, batch);
+        }
+        return false;
+    }
+    noteDone(batch);
+    return !failurePending();
 }
 
 /* How many dispatches may pile into one command buffer before it is sent.
@@ -422,7 +492,6 @@ static void ensureInFlight(void) {
  * exists for the work about to be encoded into it. */
 void beginBatchLocked(void) {
     gOpenBatch = ++gBatchCounter;
-    gOpenedAt = uptimeNow();
 }
 
 /* Note that whatever is being encoded now may write `b`.
@@ -653,10 +722,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
              * backpressure that keeps the queue from growing without bound,
              * and holding the lock through it would stop every other thread
              * from encoding while this one sleeps. */
-            if (oldest != nil) {
-                if (!waitBatch(oldest, oldestBatch)) return false;
-                noteDone(oldestBatch);
-            }
+            if (oldest != nil) return waitOldest(oldest, oldestBatch);
             return true;
         }
 
@@ -686,10 +752,15 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                        (NSUInteger)groupSize);
         [encoder endEncoding];
         /* Off the batch books, so it is bounded by a semaphore of its own
-         * rather than by gDoneBatch. */
+         * rather than by gDoneBatch. The command buffer does not retain what
+         * it reads, so the handler does: after a timeout the caller may free
+         * these buffers while the kernel is still running on them. */
+        NSMutableArray<id<MTLBuffer>> *held = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+        for (int i = 0; i < count; i++) [held addObject:(__bridge id<MTLBuffer>)buffers[i]->buffer];
         dispatch_semaphore_t finished = dispatch_semaphore_create(0);
         [commands addCompletedHandler:^(id<MTLCommandBuffer> done) {
             (void)done;
+            (void)held;
             dispatch_semaphore_signal(finished);
         }];
         [commands commit];
@@ -736,20 +807,20 @@ static void commitOpenLocked(void) {
     const uint64_t mine = gOpenBatch;
     const uint32_t encoded = gOpenEncoded;
     const uint32_t units = gOpenEncoded + gOpenGraphs;
-    const double openedAt = gOpenedAt;
+    const double startedBy = gOpenHasGraph ? gFirstGraphAt : uptimeNow();
     [gAsyncCommands addCompletedHandler:^(id<MTLCommandBuffer> done) {
         meterNote(done, encoded);
         const double ended = done.GPUEndTime;
         const double previous = atomic_load_explicit(&gLastEnd, memory_order_relaxed);
         if (ended > previous) atomic_store_explicit(&gLastEnd, ended, memory_order_relaxed);
         if ([done status] == MTLCommandBufferStatusError) {
-            recordCommandError(done, mine);
-            atomic_store(&gErrorPending, true);
+            recordCommandError(done, mine);   /* sets the pending failure */
         } else if (units > 0 && ended > 0.0) {
-            /* From whichever came later, the batch opening or the one before
-             * it ending: anything else on the queue in between is counted
-             * too, which can only over-estimate and so only commit sooner. */
-            const double took = ended - (previous > openedAt ? previous : openedAt);
+            /* From whichever came later, the earliest the batch could start
+             * or the one before it ending: anything else on the queue in
+             * between is counted too, which can only over-estimate and so
+             * only commit sooner. */
+            const double took = ended - (previous > startedBy ? previous : startedBy);
             if (took > 0.0) {
                 const double perUnit = took / (double)units;
                 const double seen = atomic_load_explicit(&gUnitSeconds, memory_order_relaxed);
@@ -775,6 +846,7 @@ static void commitOpenLocked(void) {
 }
 
 void noteGraphEncodeLocked(void) {
+    if (!gOpenHasGraph) gFirstGraphAt = uptimeNow();
     gOpenHasGraph = true;
     gOpenGraphs++;
 }
@@ -782,7 +854,7 @@ void noteGraphEncodeLocked(void) {
 /* Inside the queue lock and after the graph is in the batch, so every buffer
  * the caller marked for it names the batch that is committed here. The wait
  * for the oldest is taken inside the lock: there is no caller to hand a
- * failure to, so it stays pending for the next synchronize. */
+ * failure to, so it stays pending for the next wait. */
 void afterGraphEncodeLocked(void) {
     if (!shouldCommitLocked(true)) return;
     commitOpenLocked();
@@ -792,7 +864,7 @@ void afterGraphEncodeLocked(void) {
         if (waitBatch(oldest, batch)) {
             noteDone(batch);
         } else {
-            atomic_store(&gErrorPending, true);
+            requeueOneLocked(oldest, batch);
         }
     }
 }
@@ -841,9 +913,7 @@ bool jaiGpuFlush(void) {
             }
         }
         if (oldest == nil) return true;
-        if (!waitBatch(oldest, oldestBatch)) return false;
-        noteDone(oldestBatch);
-        return true;
+        return waitOldest(oldest, oldestBatch);
     }
 }
 
@@ -872,11 +942,15 @@ bool jaiGpuSynchronize(void) {
         }
         for (NSUInteger i = 0; i < pending.count; i++) {
             const uint64_t batch = batches[i].unsignedLongLongValue;
-            if (!waitBatch(pending[i], batch)) return false;
+            if (!waitBatch(pending[i], batch)) {
+                @synchronized(gQueue) {
+                    requeueLocked(pending, batches, i);
+                }
+                return false;
+            }
             noteDone(batch);
         }
-        if (takePendingError()) return false;
-        return true;
+        return !failurePending();
     }
 }
 
@@ -913,7 +987,9 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
         if (waitFrom != 0.0) meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
         return ok;
     }
-    if (want == 0) return true;   /* nothing pending: not a wait */
+    /* Nothing pending on this buffer, so not a wait -- but a failure nobody
+     * has been told about still comes out here rather than be read past. */
+    if (want == 0) return !failurePending();
 
     @autoreleasepool {
         NSArray<id<MTLCommandBuffer>> *pending = nil;
@@ -936,6 +1012,12 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
         }
         for (NSUInteger i = 0; i < pending.count; i++) {
             if (!waitBatch(pending[i], batches[i].unsignedLongLongValue)) {
+                /* Still queued, and still writing the buffer: back on the
+                 * books, so the next read or synchronize waits for it again
+                 * rather than read past it. */
+                @synchronized(gQueue) {
+                    requeueLocked(pending, batches, i);
+                }
                 if (waitFrom != 0.0) {
                     meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
                 }
@@ -945,7 +1027,7 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
         if (reached != 0) noteDone(reached);
     }
     if (waitFrom != 0.0) meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
-    return true;
+    return !failurePending();
 }
 
 bool ensureAsyncCommandBuffer(void) {
