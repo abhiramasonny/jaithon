@@ -204,8 +204,11 @@ def calibrate(m, inputs):
                 bn.weight.uniform_(0.5, 1.5, generator=g)
                 bn.bias.normal_(0.0, 0.2, generator=g)
         m.train()
-        for _ in range(2):
-            m(*[torch.randn((2,) + tuple(t.shape[1:]), generator=g) for t in fed])
+        try:
+            for _ in range(2):
+                m(*[torch.randn((2,) + tuple(t.shape[1:]), generator=g) for t in fed])
+        except Exception:
+            pass  # a detector wants targets in training mode; its statistics stay at 0 and 1
     m.eval()
 
 
