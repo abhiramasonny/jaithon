@@ -21,6 +21,9 @@ set -e
 
 J="${JAITHON:-./jaithon}"
 LOCK="${GPU_LOCK:-./scripts/bench/gpu_lock.sh}"
+# gpu_lock.sh gives up after an hour by default; with many agents queued a
+# turn can take longer than that to come round.
+export GPU_LOCK_WAIT="${GPU_LOCK_WAIT:-86400}"
 CACHE="${STORY_CACHE:-$HOME/.cache/jaithon/story_chat}"
 PRETRAIN_MINUTES="${PRETRAIN_MINUTES:-120}"
 CHUNK_MINUTES="${CHUNK_MINUTES:-5}"
