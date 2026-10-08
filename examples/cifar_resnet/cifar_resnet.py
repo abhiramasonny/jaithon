@@ -19,6 +19,8 @@ Kept identical to the Jaithon side on purpose:
 - batches: a fresh permutation each epoch, batch 128, the short last batch kept;
 - evaluation: BatchNorm in batch-statistics mode at batch 1000 (what jaitensor
   does, as it keeps no running statistics), and running statistics alongside.
+  The batch-statistics pass puts the running buffers back afterwards, so the
+  running-statistics number never sees the test set (test_peer.py checks it).
 
 Never channels_last: on MPS it is 2.3-43x slower for these convolutions.
 """
@@ -32,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-dev = torch.device("mps")
+dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
 CHANNEL_MEAN = [0.49139968, 0.48215841, 0.44653091]
@@ -138,11 +140,21 @@ def augment(x, seed, pad):
 
 
 def evaluate(net, x, y, batch_stats):
+    """Test accuracy in batches of 1000. batch_stats puts BatchNorm in training
+    mode, which normalises by each batch, but training mode also folds every
+    batch into the running mean and variance, and no_grad does not stop that.
+    The buffers are saved and put back, so this leaves the network as it found
+    it and the running-statistics number does not depend on the order of the
+    two evaluations."""
+    saved = [b.clone() for b in net.buffers()] if batch_stats else None
     net.train(batch_stats)
     correct = 0
     with torch.no_grad():
         for i in range(0, x.shape[0], 1000):
             correct += int((net(x[i:i + 1000]).argmax(1) == y[i:i + 1000]).sum())
+        if saved is not None:
+            for b, s in zip(net.buffers(), saved):
+                b.copy_(s)
     return 100.0 * correct / x.shape[0]
 
 
@@ -210,4 +222,5 @@ def main():
     print(f"test accuracy {evaluate(net, xte, yte, False):.2f}%  (running statistics)")
 
 
-main()
+if __name__ == "__main__":
+    main()
