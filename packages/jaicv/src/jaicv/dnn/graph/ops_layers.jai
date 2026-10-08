@@ -8,7 +8,7 @@ from std.os import env
 from .kernels import LOWEST_FLOAT, f32_bits, kernel_for
 from .nodes import GraphNode, attr_float, attr_floats, attr_int, attr_ints, attr_str, maybe, need
 from .tensors import compile_encoded, concat_along, copy_of, host_ints, pad_nd_of, row_reduce_of
-from .tensors import slice_axis
+from .tensors import run_one_op_graph, slice_axis
 
 #: The explicit padding a window operator wants, as ONNX's
 #: `[begin..., end...]`, working out what `auto_pad` meant when that is how
@@ -149,9 +149,14 @@ fn graph_conv_of(
         plan = built
     }
     let output = Tensor(_conv_shapes[key])
-    var handles = [x.buffer().handle_of(), w.buffer().handle_of()]
-    if bias is not null { handles.push(bias.buffer().handle_of()) }
-    __prim__.graph_run(plan, handles, [output.buffer().handle_of()])
+    var fed = [x, w]
+    if bias is not null { fed.push(bias) }
+    try {
+        run_one_op_graph(plan, fed, output)
+    } catch failure: Error {
+        output.free()
+        throw failure
+    }
     return output
 }
 

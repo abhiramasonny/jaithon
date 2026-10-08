@@ -9,7 +9,7 @@ from .kernels import HIGHEST_FLOAT, LOWEST_FLOAT
 from .nodes import GraphNode, attr_float, attr_int, attr_str, ints_from, maybe, need
 from .tensors import binary_ex_of, broadcast_shape, copy_of, elementwise, expand_to
 from .tensors import normalize_axis, row_reduce_of, shaped, softmax_rows, transpose_to
-from .tensors import compile_encoded, unary_ex_of, volume
+from .tensors import compile_encoded, run_one_op_graph, unary_ex_of, volume
 
 pub fn op_relu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [jt.relu(need(ins, 0, node))]
@@ -350,11 +350,12 @@ fn graph_matmul_of(left: Tensor, right: Tensor, dims: list[int]) -> Tensor {
         plan = built
     }
     let output = Tensor(dims)
-    __prim__.graph_run(
-        plan,
-        [left.buffer().handle_of(), right.buffer().handle_of()],
-        [output.buffer().handle_of()]
-    )
+    try {
+        run_one_op_graph(plan, [left, right], output)
+    } catch failure: Error {
+        output.free()
+        throw failure
+    }
     return output
 }
 

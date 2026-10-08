@@ -1061,3 +1061,70 @@ fn test_layer_norm_takes_unnamed_trailing_outputs() -> void {
     x.free()
     scale.free()
 }
+
+#: A batch sliced with `Tensor.view` starts part way into its buffer, and
+#: MPSGraph will not read a window like that whose rows are not whole 16-byte
+#: lines. The convolutions and products that run as one-operator graphs took
+#: such a view on the base tree, through jaitensor, and have to keep doing so.
+fn test_graph_routes_take_a_view_of_a_batch() -> void {
+    if not gpu.is_available() { return }
+    let whole = Tensor([2, 16, 5, 5], [float(index % 13) * 0.25 - 1.0 for index in 0..800])
+    let w = Tensor([16, 1, 3, 3], [float(index % 7) * 0.125 - 0.3 for index in 0..144])
+    let depthwise = Graph(
+        nodes: [
+            GraphNode(
+                "Conv",
+                name: "depthwise",
+                inputs: ["x", "w"],
+                outputs: ["y"],
+                attrs: {"group": Attr.of_int(16), "pads": Attr.of_ints([1, 1, 1, 1])}
+            ),
+        ],
+        inputs: ["x"],
+        outputs: ["y"],
+        initializers: {"w": w}
+    )
+    let product = Graph(
+        nodes: [GraphNode("MatMul", name: "product", inputs: ["a", "b"], outputs: ["y"])],
+        inputs: ["a", "b"],
+        outputs: ["y"]
+    )
+    let left = Tensor([2, 3, 5, 5], [float(index % 9) * 0.5 - 2.0 for index in 0..150])
+    let right = Tensor([3, 5, 3], [float(index % 4) - 1.5 for index in 0..45])
+    let image = whole.view(400, [1, 16, 5, 5])
+    let page = left.view(75, [3, 5, 5])
+    for (graph, viewed) in [(depthwise, {"x": image}), (product, {"a": page, "b": right})] {
+        var copied: dict[str, Tensor] = {}
+        for (name, tensor) in viewed.items() {
+            copied[name] = Tensor(tensor.shape, tensor.download())
+        }
+        let before = gpu.live_buffers()
+        let got = run_graph(graph, viewed)
+        let want = run_graph(graph, copied)
+        let got_y = got["y"].download()
+        let want_y = want["y"].download()
+        assert_eq(got_y.len(), want_y.len())
+        for index in 0..want_y.len() {
+            assert_near(
+                got_y[index],
+                want_y[index],
+                1e-6,
+                f"{graph.nodes[0].name} on a view at {index}"
+            )
+        }
+        got["y"].free()
+        want["y"].free()
+        assert_eq(
+            gpu.live_buffers() - before,
+            0,
+            f"{graph.nodes[0].name} on a view leaked its copies"
+        )
+        for (_name, tensor) in copied.items() { tensor.free() }
+    }
+    image.free()
+    page.free()
+    whole.free()
+    w.free()
+    left.free()
+    right.free()
+}
