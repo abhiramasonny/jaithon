@@ -210,6 +210,81 @@ static uint32_t exitTargetFor(Emit *e, uint32_t target) {
     return FIXUP_EXIT - e->exitCount++;
 }
 
+/* A way out of an OSR region that leaves `keep` entries of the model on the
+ * operand stack (-1: a number the model cannot name), where the interpreter
+ * carries on at `target`.
+ *
+ * An exit stub hands back the locals and nothing else: it states an empty
+ * record, which is right only when the interpreter expects nothing above the
+ * head's own depth at `target`. A region cut short at its first `continue`
+ * (findLoopEnd's prefix) is where it does:
+ *
+ *     'other: for i in 0..3 {
+ *         for name in ["p", "q", "r"] {
+ *             if name == "q" { continue 'other }   <- the region ends here
+ *             acc.push(f"{i}{name}")               <- `name != "q"` jumps out
+ *
+ * The branch out to the push leaves with the inner loop's iterator in a
+ * register; the stub dropped it, the interpreter ran the rest of the body one
+ * entry short, and its next OP_FOR_ITER_BIND peeked whatever lay below (here
+ * an unused local: "for-loop expected an iterator, not 'null'"). Such a branch
+ * now leaves through a deopt record at `target`, which writes the entries out
+ * exactly as a guard's does.
+ *
+ * The bytecode decides how many entries the interpreter expects: the model's
+ * depth at an offset is chunkDepth[off] - chunkDepth[top]. None is the plain
+ * exit, whatever the model holds -- a model that drifted deeper than the
+ * bytecode (as _parse_pattern_list's does) loses nothing real by it. Some is
+ * the deopt record, and only when the model holds exactly that many: an exit
+ * the bytecode cannot vouch for declines rather than hand the interpreter a
+ * stack it does not have. */
+static uint32_t osrExitFor(Emit *e, uint32_t target, int keep) {
+    /* An inlined body's offsets are its own chunk's: nothing here describes
+     * them. Unchanged. */
+    if (e->inlining) return exitTargetFor(e, target);
+    /* The head's own exhausted exit: its stub drops the iterator that lives
+     * below the model (gDeopt.base), so the interpreter expects one fewer. */
+    bool dropsHead = e->hasIter && target == e->iterExit;
+    int want = -1;
+    if (e->chunkDepth != NULL && (int)target < e->chunkDepthCount &&
+        (int)e->osrTop < e->chunkDepthCount) {
+        int at = e->chunkDepth[target], head = e->chunkDepth[e->osrTop];
+        if (at >= 0 && head >= 0) want = at - head + (dropsHead ? 1 : 0);
+    }
+    if (want == 0 || (want < 0 && keep == 0)) return exitTargetFor(e, target);
+    if (keep < 0 || want != keep || dropsHead) {
+        e->whyNot = "a way out of the loop holding a stack the bytecode does "
+                    "not vouch for";
+        e->failed = true;
+        return FIXUP_EXIT;
+    }
+    unsigned k;
+    if (!deoptRecordAt(e, target, false, &k)) return FIXUP_EXIT;
+    /* The record took the whole model; a branch that drops its top entries
+     * (branchToDepth) hands back only what is below them. Positional, so the
+     * registers of the entries kept are unchanged. */
+    if ((unsigned)keep > e->deopt[k].depth) {
+        e->whyNot = "a way out of the loop deeper than its model";
+        e->failed = true;
+        return FIXUP_EXIT;
+    }
+    unsigned seen = 0;
+    for (unsigned i = 0; i < (unsigned)keep; i++) {
+        if (holdsRegister(e->stack[i])) seen++;
+    }
+    e->deopt[k].depth = (unsigned)keep;
+    e->deopt[k].valueDepth = seen;
+    return FIXUP_DEOPT - k;
+}
+
+/* The depth whose signature `sig` is, or -1. */
+static int depthOfSignature(const Emit *e, int64_t sig) {
+    for (int d = (int)e->depth; d >= 0; d--) {
+        if (stackSignatureAt(e, (unsigned)d) == sig) return d;
+    }
+    return -1;
+}
+
 void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
                      unsigned cond) {
     if (e->fixupCount >= JIT_MAX_FIXUPS) { e->failed = true; return; }
@@ -219,7 +294,8 @@ void branchTo(Emit *e, uint32_t targetOffset, bool conditional,
     settleAll(e);
     if (e->osr && targetOffset < UINT32_MAX - 64u &&
         (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
-        targetOffset = exitTargetFor(e, targetOffset);
+        targetOffset = osrExitFor(e, targetOffset, (int)e->depth);
+        if (e->failed) return;
     }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = targetOffset;
@@ -238,7 +314,11 @@ void branchToDepth(Emit *e, uint32_t targetOffset, unsigned cond,
     settleAll(e);   /* see branchTo: a join agrees about where every value is */
     if (e->osr && targetOffset < UINT32_MAX - 64u &&
         (targetOffset < e->osrTop || targetOffset >= e->osrEnd)) {
-        targetOffset = exitTargetFor(e, targetOffset);
+        /* -1 when no prefix of the model has that signature: then only an
+         * exit the bytecode says is empty can be taken. */
+        int keep = e->inlining ? 0 : depthOfSignature(e, depthOverride);
+        targetOffset = osrExitFor(e, targetOffset, keep);
+        if (e->failed) return;
     }
     e->fixups[e->fixupCount].instIndex    = (int)e->count;
     e->fixups[e->fixupCount].targetOffset = targetOffset;

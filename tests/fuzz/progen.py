@@ -143,6 +143,10 @@ DEOPT_CALL_RATE = 0.3
 # compiled walk never reaches (Gen.self_call).
 SELF_CALL_RATE = 0.3
 
+# Share of programs that get a labelled jump out of a nested `for x in <list>`
+# (Gen.labelled_iter).
+LABELLED_ITER_RATE = 0.3
+
 # Combined with `+% -% *%` only, so any of these is safe to reach.
 EDGE_INTS = [
     0, 1, -1, 2, 3, 7, 63, 64, 65, 255, 256, 1023, 65535, 65536,
@@ -2297,7 +2301,76 @@ class Gen:
             self.prog.helpers.extend(helpers)
             probes = self.prog.probes
             probes[sr.randrange(len(probes))].body.append(node)
+        # Last of all, on a stream of its own, for the same reason.
+        lr = random.Random(f"labelled-iter/{self.prog.seed}")
+        if lr.random() < LABELLED_ITER_RATE:
+            helper, node = self.labelled_iter(lr)
+            self.prog.helpers.append(helper)
+            probes = self.prog.probes
+            probes[lr.randrange(len(probes))].body.append(node)
         return self.prog
+
+    def labelled_iter(self, lr):
+        """A labelled `continue` or `break` out of a nested `for x in <list>`.
+
+        st_labelled nests a range in a range, and a range keeps nothing on the
+        operand stack. A `for x in <list>` keeps its iterator there, and an OSR
+        region that ends at a labelled `continue` (findLoopEnd's prefix) leaves
+        by branching out WITH it: the exit stub used to hand back the locals
+        only, the interpreter ran the rest of the body one entry short, and the
+        inner loop's next step raised "for-loop expected an iterator"
+        (tests/golden/jit_osr_exit_keeps_stack.jai). The nested range loop in
+        front is what gets the body its first compiled form early, so the
+        outer head's back edge reaches the safepoint that compiles it.
+
+        Returns the helper and the probe statement.
+        """
+        name = self.fresh("lit")
+        label = f"'LI{self.uid}"
+        elems = [lr.randint(-9, 9) for _ in range(lr.randint(2, 5))]
+        pick = lr.choice(elems)
+        hi = lr.randint(3, 40)
+        if lr.random() < 0.5:
+            src = "[" + ", ".join(str(v) for v in elems) + "]"
+            prelude = ""
+        else:
+            # A list built at run time, so its storage is the unboxed kind a
+            # push makes rather than a boxed literal.
+            src = self.fresh("lv")
+            prelude = (f"    var {src}: list[int] = []\n"
+                       f"    for v in [{', '.join(str(v) for v in elems)}] "
+                       f"{{ {src}.push(v +% (n % 3)) }}\n")
+            pick = f"({pick} +% (n % 3))"
+        if lr.random() < 0.5:
+            head = f"{label}: for i in 0..(n % {hi} +% 2) {{"
+        else:
+            # The outer loop over a list too: its iterator is below the model,
+            # the inner one on it.
+            head = (f"{label}: for i in "
+                    f"[{', '.join(str(lr.randint(0, 50)) for _ in range(lr.randint(2, 6)))}] {{")
+        warm = (f"        for k in 0..{lr.randint(1, 16)} {{ s = s +% k }}\n"
+                if lr.random() < 0.7 else "")
+        jump = lr.choice(["continue", "continue", "break"])
+        stop = (f"            if i == {lr.randint(0, 8)} {{ break {label} }}\n"
+                if lr.random() < 0.4 else "")
+        tail = (f"        total = total +% {lr.randint(1, 99)}\n"
+                if lr.random() < 0.5 else "")
+        helper = (f"fn {name}(n: int) -> int {{\n"
+                  f"    var total = 0\n"
+                  f"    var s = 0\n"
+                  f"{prelude}"
+                  f"    {head}\n"
+                  f"{warm}"
+                  f"        for x in {src} {{\n"
+                  f"            if x == {pick} {{ {jump} {label} }}\n"
+                  f"{stop}"
+                  f"            total = total *% 31 +% (i *% x +% s)\n"
+                  f"        }}\n"
+                  f"{tail}"
+                  f"    }}\n"
+                  f"    return total +% s\n"
+                  f"}}")
+        return helper, line(f"acc = acc +% {name}(n)")
 
     # -- allocation sinking (src/vm/jit/jit_sink.c) --------------------------
     #
