@@ -10,6 +10,13 @@ loss downloaded every step (`loss.item()`), as train.jai does.
 MODE=bench times the step (first step, WARM seconds of steps, then REPS x
 STEPS); MODE=train runs STEPS (2000) steps with the held-out evaluation;
 MODE=gen times cached batch-1 decoding (PROMPT, NEW, REPS, WARM).
+
+Two switches give the peer its strongest configuration, for an A/B in one
+interpreter. PEER_FUSED=1 uses torch's fused Adam. PEER_ITEM=forward reads
+the loss straight after the forward instead of after the optimiser step, so
+the next step's batch and forward are issued while the backward still runs:
+the overlap train.jai's default GPT_FLUSH=2 gets, where GPT_FLUSH=0 is the
+fully synchronous step this peer runs by default.
 """
 import glob
 import math
@@ -170,7 +177,11 @@ def main():
           f"{sum(p.numel() for p in model.parameters())} parameters")
     if mode == "gen":
         return generate(model, train_set)
-    opt = torch.optim.Adam(model.parameters(), lr=float(os.environ.get("LR", "1e-3")), eps=1e-7)
+    fused = env_int("PEER_FUSED", 0) == 1
+    item_after_forward = os.environ.get("PEER_ITEM", "step") == "forward"
+    print(f"peer: fused_adam={int(fused)} loss_item_after={'forward' if item_after_forward else 'step'}")
+    opt = torch.optim.Adam(model.parameters(), lr=float(os.environ.get("LR", "1e-3")), eps=1e-7,
+                           fused=fused)
     rng = np.random.default_rng(env_int("SEED", 7))
 
     def step():
@@ -178,10 +189,11 @@ def main():
         x, y = train_set.batch(picks, T)
         logits = model(x)
         loss = F.cross_entropy(logits.view(-1, VOCAB), y.view(-1))
+        value = loss.item() if item_after_forward else None
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
-        return loss.item()
+        return value if item_after_forward else loss.item()
 
     if mode == "bench":
         t0 = time.perf_counter()
