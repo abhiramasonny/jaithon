@@ -509,7 +509,7 @@ void jaiRegisterGpuPrimitives(void) {
     jaiDefineNative("__prim__.gpu_vector_mul", nGpuVectorMul, 2, 2);
     jaiDefineNative("__prim__.gpu_matmul",     nGpuMatMul,    5, 5);
     jaiDefineNative("__prim__.gpu_matmul_buffers", nGpuMatMulBuffers, 9, 9);
-    jaiDefineNative("__prim__.gpu_mha_buffers", nGpuMhaBuffers, 8, 8);
+    jaiDefineNative("__prim__.gpu_mha_buffers", nGpuMhaBuffers, 10, 10);
     jaiDefineNative("__prim__.gpu_conv2d_buffers", nGpuConv2dBuffers, 16, 17);
     jaiDefineNative("__prim__.gpu_conv2d_data_grad", nGpuConv2dDataGrad, 14, 14);
     jaiDefineNative("__prim__.gpu_conv2d_weights_grad", nGpuConv2dWeightsGrad, 14, 14);

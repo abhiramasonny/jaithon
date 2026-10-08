@@ -7,19 +7,16 @@
 
 static id<MTLBuffer> gMhaHalfScratch;
 static size_t gMhaHalfCap;
+static id<MTLBuffer> gMhaDecodeScratch;
+static size_t gMhaDecodeCap;
+
+/* Built beside the prefill kernels by ensureFlashAttn (gpu_device.m). */
+extern id<MTLComputePipelineState> gDecodePartial;
+extern id<MTLComputePipelineState> gDecodeReduce;
 
 static NSMutableDictionary<NSString *, NSArray *> *gMhaGraphs;
 
-static bool encodeFlashAttn(id<MTLBuffer> qBuf, size_t qOff,
-                            id<MTLBuffer> kBuf, size_t kOff,
-                            id<MTLBuffer> vBuf, size_t vOff,
-                            id<MTLBuffer> yBuf, size_t outOff,
-                            uint32_t seq, uint32_t heads, uint32_t hd, float scale) {
-    id<MTLComputePipelineState> pipe = hd == 32 ? gFlashAttn32 : hd == 64 ? gFlashAttn64 : nil;
-    if (pipe == nil || gFlashPack == nil) return false;
-    const size_t halfBytes = (size_t)seq * (size_t)heads * (size_t)hd * sizeof(uint16_t);
-    gMhaHalfScratch = growScratch(gMhaHalfScratch, &gMhaHalfCap, halfBytes * 3u);
-    if (gMhaHalfScratch == nil) return false;
+static bool ensureAsyncEncoder(void) {
     if (gAsyncCommands == nil) {
         gAsyncCommands = [gQueue commandBuffer];
         if (gAsyncCommands == nil) return false;
@@ -29,51 +26,167 @@ static bool encodeFlashAttn(id<MTLBuffer> qBuf, size_t qOff,
         gAsyncEncoder = [gAsyncCommands computeCommandEncoder];
         if (gAsyncEncoder == nil) return false;
     }
+    return true;
+}
+
+/* Below this many query rows the decode kernel runs instead of the prefill
+ * one, whose 64-row tiles would sit mostly idle. JAITHON_GPU_MHA_DECODE=0
+ * sends every shape to the prefill kernel, for an A/B in one binary. */
+static uint32_t decodeRowLimit(void) {
+    static int limit = -1;
+    if (limit < 0) {
+        const char *env = getenv("JAITHON_GPU_MHA_DECODE");
+        limit = (env != NULL && env[0] == '0' && env[1] == '\0') ? 0 : 8;
+    }
+    return (uint32_t)limit;
+}
+
+static bool encodeFlashAttn(id<MTLBuffer> qBuf, size_t qOff,
+                            id<MTLBuffer> kBuf, size_t kOff,
+                            id<MTLBuffer> vBuf, size_t vOff,
+                            id<MTLBuffer> yBuf, size_t outOff,
+                            uint32_t seq, uint32_t kseq, uint32_t heads, uint32_t hd,
+                            float scale, bool causal) {
+    id<MTLComputePipelineState> pipe = hd == 32 ? gFlashAttn32 : hd == 64 ? gFlashAttn64 : nil;
+    if (pipe == nil || gFlashPack == nil) return false;
+    const size_t qBytes = (size_t)seq * (size_t)heads * (size_t)hd * sizeof(uint16_t);
+    const size_t kvBytes = (size_t)kseq * (size_t)heads * (size_t)hd * sizeof(uint16_t);
+    gMhaHalfScratch = growScratch(gMhaHalfScratch, &gMhaHalfCap, qBytes + kvBytes * 2u);
+    if (gMhaHalfScratch == nil) return false;
+    if (!ensureAsyncEncoder()) return false;
+    const uint32_t causalFlag = causal ? 1u : 0u;
     [gAsyncEncoder setComputePipelineState:gFlashPack];
     [gAsyncEncoder setBuffer:qBuf offset:qOff atIndex:0];
     [gAsyncEncoder setBuffer:kBuf offset:kOff atIndex:1];
     [gAsyncEncoder setBuffer:vBuf offset:vOff atIndex:2];
     [gAsyncEncoder setBuffer:gMhaHalfScratch offset:0 atIndex:3];
-    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:halfBytes atIndex:4];
-    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:halfBytes * 2u atIndex:5];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:qBytes atIndex:4];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:qBytes + kvBytes atIndex:5];
     [gAsyncEncoder setBytes:&seq length:sizeof(seq) atIndex:6];
     [gAsyncEncoder setBytes:&heads length:sizeof(heads) atIndex:7];
     [gAsyncEncoder setBytes:&hd length:sizeof(hd) atIndex:8];
-    const NSUInteger packThreads = (NSUInteger)heads * seq * (hd / 4u);
+    [gAsyncEncoder setBytes:&kseq length:sizeof(kseq) atIndex:9];
+    const uint32_t rows = seq > kseq ? seq : kseq;
+    const NSUInteger packThreads = (NSUInteger)heads * rows * (hd / 4u);
     encodeDispatch(gAsyncEncoder, gFlashPack, packThreads, 256);
     [gAsyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
     [gAsyncEncoder setComputePipelineState:pipe];
     [gAsyncEncoder setBuffer:gMhaHalfScratch offset:0 atIndex:0];
-    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:halfBytes atIndex:1];
-    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:halfBytes * 2u atIndex:2];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:qBytes atIndex:1];
+    [gAsyncEncoder setBuffer:gMhaHalfScratch offset:qBytes + kvBytes atIndex:2];
     [gAsyncEncoder setBuffer:yBuf offset:outOff atIndex:3];
     [gAsyncEncoder setBytes:&seq length:sizeof(seq) atIndex:4];
     [gAsyncEncoder setBytes:&heads length:sizeof(heads) atIndex:5];
     [gAsyncEncoder setBytes:&scale length:sizeof(scale) atIndex:6];
+    [gAsyncEncoder setBytes:&kseq length:sizeof(kseq) atIndex:7];
+    [gAsyncEncoder setBytes:&causalFlag length:sizeof(causalFlag) atIndex:8];
     const uint32_t qTiles = (seq + 63u) / 64u;
-    [gAsyncEncoder dispatchThreadgroups:MTLSizeMake(qTiles, heads, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+    /* Causal grids are heads by tiles, longest tile first; see the kernel. */
+    const MTLSize grid = causal ? MTLSizeMake(heads, qTiles, 1) : MTLSizeMake(qTiles, heads, 1);
+    [gAsyncEncoder dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
     return true;
 }
 
-static NSArray *cachedPackedMhaGraph(uint32_t seq, uint32_t heads, uint32_t hd, float scale) {
-    if (seq == 0 || heads == 0 || hd == 0) return nil;
+/* A few query rows against `kseq` keys: split the keys across threadgroups,
+ * then merge. Reads fp32 Q/K/V in place. */
+static bool encodeFlashDecode(id<MTLBuffer> qBuf, size_t qOff,
+                              id<MTLBuffer> kBuf, size_t kOff,
+                              id<MTLBuffer> vBuf, size_t vOff,
+                              id<MTLBuffer> yBuf, size_t outOff,
+                              uint32_t seq, uint32_t kseq, uint32_t heads, uint32_t hd,
+                              float scale, bool causal) {
+    if (gDecodePartial == nil || gDecodeReduce == nil) return false;
+    if (hd == 0 || hd % 32u != 0 || hd > 128u) return false;
+    /* About 128 keys a threadgroup (32 for each of its four simdgroups), but
+     * never more than 32 splits: past that the merge costs more than the
+     * parallelism buys at these sizes. */
+    uint32_t splits = (kseq + 127u) / 128u;
+    if (splits > 32u) splits = 32u;
+    if (splits == 0u) splits = 1u;
+    uint32_t chunk = (kseq + splits - 1u) / splits;
+    const uint32_t causalFlag = causal ? 1u : 0u;
+    if (splits > 1u) {
+        const size_t partialBytes =
+            (size_t)seq * heads * splits * (size_t)(hd + 2u) * sizeof(float);
+        gMhaDecodeScratch = growScratch(gMhaDecodeScratch, &gMhaDecodeCap, partialBytes);
+        if (gMhaDecodeScratch == nil) return false;
+    }
+    if (!ensureAsyncEncoder()) return false;
+    [gAsyncEncoder setComputePipelineState:gDecodePartial];
+    [gAsyncEncoder setBuffer:qBuf offset:qOff atIndex:0];
+    [gAsyncEncoder setBuffer:kBuf offset:kOff atIndex:1];
+    [gAsyncEncoder setBuffer:vBuf offset:vOff atIndex:2];
+    if (splits > 1u) {
+        [gAsyncEncoder setBuffer:gMhaDecodeScratch offset:0 atIndex:3];
+    } else {
+        [gAsyncEncoder setBuffer:yBuf offset:outOff atIndex:3];
+    }
+    [gAsyncEncoder setBuffer:yBuf offset:outOff atIndex:4];
+    [gAsyncEncoder setBytes:&seq length:sizeof(seq) atIndex:5];
+    [gAsyncEncoder setBytes:&kseq length:sizeof(kseq) atIndex:6];
+    [gAsyncEncoder setBytes:&heads length:sizeof(heads) atIndex:7];
+    [gAsyncEncoder setBytes:&hd length:sizeof(hd) atIndex:8];
+    [gAsyncEncoder setBytes:&scale length:sizeof(scale) atIndex:9];
+    [gAsyncEncoder setBytes:&causalFlag length:sizeof(causalFlag) atIndex:10];
+    [gAsyncEncoder setBytes:&splits length:sizeof(splits) atIndex:11];
+    [gAsyncEncoder setBytes:&chunk length:sizeof(chunk) atIndex:12];
+    [gAsyncEncoder dispatchThreadgroups:MTLSizeMake(splits, heads, seq)
+                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if (splits > 1u) {
+        [gAsyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [gAsyncEncoder setComputePipelineState:gDecodeReduce];
+        [gAsyncEncoder setBuffer:gMhaDecodeScratch offset:0 atIndex:0];
+        [gAsyncEncoder setBuffer:yBuf offset:outOff atIndex:1];
+        [gAsyncEncoder setBytes:&heads length:sizeof(heads) atIndex:2];
+        [gAsyncEncoder setBytes:&hd length:sizeof(hd) atIndex:3];
+        [gAsyncEncoder setBytes:&splits length:sizeof(splits) atIndex:4];
+        [gAsyncEncoder dispatchThreadgroups:MTLSizeMake(heads, seq, 1)
+                      threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+    }
+    return true;
+}
+
+/* The additive mask SDPA takes for a causal shape: 0 where query row i may
+ * see key j (j <= i + kseq - seq), -inf elsewhere, broadcast over heads. */
+static MPSGraphTensor *causalMaskTensor(MPSGraph *graph, uint32_t seq, uint32_t kseq,
+                                        MPSDataType type) {
+    NSMutableData *data = [NSMutableData dataWithLength:(NSUInteger)seq * kseq * sizeof(float)];
+    float *mask = (float *)data.mutableBytes;
+    const uint32_t shift = kseq - seq;
+    for (uint32_t i = 0; i < seq; i++) {
+        for (uint32_t j = 0; j < kseq; j++) {
+            mask[(size_t)i * kseq + j] = (j <= i + shift) ? 0.0f : -INFINITY;
+        }
+    }
+    MPSGraphTensor *constant = [graph constantWithData:data
+                                                 shape:@[ @1, @1, @(seq), @(kseq) ]
+                                              dataType:MPSDataTypeFloat32];
+    if (type != MPSDataTypeFloat32) {
+        constant = [graph castTensor:constant toType:type name:@"mask16"];
+    }
+    return constant;
+}
+
+static NSArray *cachedPackedMhaGraph(uint32_t seq, uint32_t kseq, uint32_t heads, uint32_t hd,
+                                     float scale, bool causal) {
+    if (seq == 0 || kseq == 0 || heads == 0 || hd == 0) return nil;
     if (gMhaGraphs == nil) gMhaGraphs = [[NSMutableDictionary alloc] init];
-    NSString *key = [NSString stringWithFormat:@"mha-packed:%u:%u:%u:%.8f:%d",
-                     seq, heads, hd, scale, gMixedPrecision ? 1 : 0];
+    NSString *key = [NSString stringWithFormat:@"mha-packed:%u:%u:%u:%u:%.8f:%d:%d",
+                     seq, kseq, heads, hd, scale, gMixedPrecision ? 1 : 0, causal ? 1 : 0];
     NSArray *cached = gMhaGraphs[key];
     if (cached != nil) return cached;
     if (@available(macOS 15.0, *)) {
         MPSGraph *graph = [MPSGraph new];
         graph.options = MPSGraphOptionsNone;
-        NSArray *packed = @[ @1, @(seq), @(heads), @(hd) ];
-        MPSGraphTensor *q = [graph placeholderWithShape:packed
+        NSArray *packedQ = @[ @1, @(seq), @(heads), @(hd) ];
+        NSArray *packedKV = @[ @1, @(kseq), @(heads), @(hd) ];
+        MPSGraphTensor *q = [graph placeholderWithShape:packedQ
                                                dataType:MPSDataTypeFloat32
                                                    name:@"Q"];
-        MPSGraphTensor *k = [graph placeholderWithShape:packed
+        MPSGraphTensor *k = [graph placeholderWithShape:packedKV
                                                dataType:MPSDataTypeFloat32
                                                    name:@"K"];
-        MPSGraphTensor *v = [graph placeholderWithShape:packed
+        MPSGraphTensor *v = [graph placeholderWithShape:packedKV
                                                dataType:MPSDataTypeFloat32
                                                    name:@"V"];
         MPSGraphTensor *qt = [graph transposeTensor:q permutation:@[ @0, @2, @1, @3 ]
@@ -90,12 +203,23 @@ static NSArray *cachedPackedMhaGraph(uint32_t seq, uint32_t heads, uint32_t hd, 
             kIn = [graph castTensor:kt toType:MPSDataTypeFloat16 name:@"K16"];
             vIn = [graph castTensor:vt toType:MPSDataTypeFloat16 name:@"V16"];
         }
-        MPSGraphTensor *ctx =
-            [graph scaledDotProductAttentionWithQueryTensor:qIn
-                                                  keyTensor:kIn
-                                                valueTensor:vIn
-                                                      scale:scale
-                                                       name:@"sdpa"];
+        MPSGraphTensor *ctx = nil;
+        if (causal) {
+            MPSGraphTensor *mask = causalMaskTensor(
+                graph, seq, kseq, gMixedPrecision ? MPSDataTypeFloat16 : MPSDataTypeFloat32);
+            ctx = [graph scaledDotProductAttentionWithQueryTensor:qIn
+                                                        keyTensor:kIn
+                                                      valueTensor:vIn
+                                                       maskTensor:mask
+                                                            scale:scale
+                                                             name:@"sdpa"];
+        } else {
+            ctx = [graph scaledDotProductAttentionWithQueryTensor:qIn
+                                                        keyTensor:kIn
+                                                      valueTensor:vIn
+                                                            scale:scale
+                                                             name:@"sdpa"];
+        }
         if (gMixedPrecision) {
             ctx = [graph castTensor:ctx toType:MPSDataTypeFloat32 name:@"C32"];
         }
@@ -110,30 +234,33 @@ static NSArray *cachedPackedMhaGraph(uint32_t seq, uint32_t heads, uint32_t hd, 
 
 bool jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff, JaiGpuBuffer *k, size_t kOff,
                      JaiGpuBuffer *v, size_t vOff, JaiGpuBuffer *out, size_t outOff,
-                     uint32_t seq, uint32_t heads, uint32_t hd, float scale) {
+                     uint32_t seq, uint32_t kseq, uint32_t heads, uint32_t hd, float scale,
+                     bool causal) {
     if (q == NULL || k == NULL || v == NULL || out == NULL) return false;
     if (q->buffer == NULL || k->buffer == NULL || v->buffer == NULL ||
         out->buffer == NULL) {
         return false;
     }
-    if (seq == 0 || heads == 0 || hd == 0) return false;
+    if (seq == 0 || kseq == 0 || heads == 0 || hd == 0) return false;
+    if (causal && kseq < seq) return false;
     if (!isfinite(scale) || scale <= 0.0f) return false;
-    const size_t bytes = (size_t)seq * (size_t)heads * (size_t)hd * sizeof(float);
-    if (qOff + bytes > q->bytes || kOff + bytes > k->bytes ||
-        vOff + bytes > v->bytes || outOff + bytes > out->bytes) {
+    const size_t qBytes = (size_t)seq * (size_t)heads * (size_t)hd * sizeof(float);
+    const size_t kvBytes = (size_t)kseq * (size_t)heads * (size_t)hd * sizeof(float);
+    if (qOff + qBytes > q->bytes || kOff + kvBytes > k->bytes ||
+        vOff + kvBytes > v->bytes || outOff + qBytes > out->bytes) {
         return false;
     }
     if (!ensureDevice()) return false;
 
     @autoreleasepool {
         @synchronized(gQueue) {
-            if ((hd == 32 || hd == 64) && ensureFlashAttn()) {
-                id<MTLBuffer> qBuf = (__bridge id<MTLBuffer>)q->buffer;
-                id<MTLBuffer> kBuf = (__bridge id<MTLBuffer>)k->buffer;
-                id<MTLBuffer> vBuf = (__bridge id<MTLBuffer>)v->buffer;
-                id<MTLBuffer> yBuf = (__bridge id<MTLBuffer>)out->buffer;
-                if (encodeFlashAttn(qBuf, qOff, kBuf, kOff, vBuf, vOff, yBuf, outOff,
-                                    seq, heads, hd, scale)) {
+            id<MTLBuffer> qBuf = (__bridge id<MTLBuffer>)q->buffer;
+            id<MTLBuffer> kBuf = (__bridge id<MTLBuffer>)k->buffer;
+            id<MTLBuffer> vBuf = (__bridge id<MTLBuffer>)v->buffer;
+            id<MTLBuffer> yBuf = (__bridge id<MTLBuffer>)out->buffer;
+            if (seq < decodeRowLimit() && hd % 32u == 0 && hd <= 128u && ensureFlashAttn()) {
+                if (encodeFlashDecode(qBuf, qOff, kBuf, kOff, vBuf, vOff, yBuf, outOff,
+                                      seq, kseq, heads, hd, scale, causal)) {
                     markLocked(q);
                     markLocked(k);
                     markLocked(v);
@@ -141,13 +268,24 @@ bool jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff, JaiGpuBuffer *k, size_t kOff,
                     return true;
                 }
             }
-            NSArray *packed = cachedPackedMhaGraph(seq, heads, hd, scale);
+            if ((hd == 32 || hd == 64) && ensureFlashAttn()) {
+                if (encodeFlashAttn(qBuf, qOff, kBuf, kOff, vBuf, vOff, yBuf, outOff,
+                                    seq, kseq, heads, hd, scale, causal)) {
+                    markLocked(q);
+                    markLocked(k);
+                    markLocked(v);
+                    markLocked(out);
+                    return true;
+                }
+            }
+            NSArray *packed = cachedPackedMhaGraph(seq, kseq, heads, hd, scale, causal);
             if (packed != nil && packed.count == 5) {
-                NSArray *shape = @[ @1, @(seq), @(heads), @(hd) ];
-                MPSGraphTensorData *dq = graphData(q, qOff, shape);
-                MPSGraphTensorData *dk = graphData(k, kOff, shape);
-                MPSGraphTensorData *dv = graphData(v, vOff, shape);
-                MPSGraphTensorData *dy = graphData(out, outOff, shape);
+                NSArray *shapeQ = @[ @1, @(seq), @(heads), @(hd) ];
+                NSArray *shapeKV = @[ @1, @(kseq), @(heads), @(hd) ];
+                MPSGraphTensorData *dq = graphData(q, qOff, shapeQ);
+                MPSGraphTensorData *dk = graphData(k, kOff, shapeKV);
+                MPSGraphTensorData *dv = graphData(v, vOff, shapeKV);
+                MPSGraphTensorData *dy = graphData(out, outOff, shapeQ);
                 if (dq != nil && dk != nil && dv != nil && dy != nil) {
                     NSMutableDictionary<MPSGraphTensor *, MPSGraphTensorData *> *results =
                         [@{packed[4] : dy} mutableCopy];

@@ -341,27 +341,33 @@ bool nGpuMhaBuffers(int argc, Value *args, Value *out) {
     if (!requireBuffer(args[2], 3, "gpu_mha_buffers", &v)) return false;
     if (!requireBuffer(args[3], 4, "gpu_mha_buffers", &result)) return false;
 
-    int64_t seq, heads, hd;
+    int64_t seq, heads, hd, kvSeq;
     double scale;
     if (!jaiArgInt(args[4], 5, "gpu_mha_buffers", &seq)) return false;
     if (!jaiArgInt(args[5], 6, "gpu_mha_buffers", &heads)) return false;
     if (!jaiArgInt(args[6], 7, "gpu_mha_buffers", &hd)) return false;
     if (!jaiArgNumber(args[7], 8, "gpu_mha_buffers", &scale)) return false;
-    if (seq <= 0 || heads <= 0 || hd <= 0 ||
-        seq > UINT32_MAX || heads > UINT32_MAX || hd > UINT32_MAX)
+    bool causal;
+    if (!jaiArgBool(args[8], 9, "gpu_mha_buffers", &causal)) return false;
+    if (!jaiArgInt(args[9], 10, "gpu_mha_buffers", &kvSeq)) return false;
+    if (seq <= 0 || heads <= 0 || hd <= 0 || kvSeq <= 0 ||
+        seq > UINT32_MAX || heads > UINT32_MAX || hd > UINT32_MAX || kvSeq > UINT32_MAX)
         return jaiThrow(vm.cValueError,
                         "gpu_mha_buffers(): dimensions must be positive uint32, "
-                        "got %lldx%lldx%lld",
-                        (long long)seq, (long long)heads, (long long)hd);
+                        "got %lldx%lldx%lld against %lld keys",
+                        (long long)seq, (long long)heads, (long long)hd, (long long)kvSeq);
     if (!(scale > 0.0) || scale > 1e6)
         return jaiThrow(vm.cValueError, "gpu_mha_buffers(): scale is invalid");
+    if (causal && kvSeq < seq)
+        return jaiThrow(vm.cValueError,
+                        "gpu_mha_buffers(): causal needs at least as many keys as queries");
 
     bool ok = jaiGpuMhaPacked(
         q->buffer, (size_t)q->origin * sizeof(float),
         k->buffer, (size_t)k->origin * sizeof(float),
         v->buffer, (size_t)v->origin * sizeof(float),
         result->buffer, (size_t)result->origin * sizeof(float),
-        (uint32_t)seq, (uint32_t)heads, (uint32_t)hd, (float)scale);
+        (uint32_t)seq, (uint32_t)kvSeq, (uint32_t)heads, (uint32_t)hd, (float)scale, causal);
     *out = BOOL_VAL(ok);
     return true;
 }

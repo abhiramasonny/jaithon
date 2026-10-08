@@ -322,13 +322,15 @@ bool          jaiGpuMatMulBuffers(JaiGpuBuffer *a, size_t aOffset,
                                   JaiGpuBuffer *out, size_t outOffset,
                                   uint32_t m, uint32_t k, uint32_t n,
                                   bool transA, bool transB, bool useHalf);
-/* Packed multi-head attention: Q/K/V/out are `[seq, heads*hd]` row-major. */
+/* Packed multi-head attention: Q/out are `[seq, heads*hd]` row-major and K/V
+ * `[kvSeq, heads*hd]`. `causal` lets query row i see keys up to
+ * i + kvSeq - seq (kvSeq >= seq). */
 bool          jaiGpuMhaPacked(JaiGpuBuffer *q, size_t qOff,
                               JaiGpuBuffer *k, size_t kOff,
                               JaiGpuBuffer *v, size_t vOff,
                               JaiGpuBuffer *out, size_t outOff,
-                              uint32_t seq, uint32_t heads, uint32_t hd,
-                              float scale);
+                              uint32_t seq, uint32_t kvSeq, uint32_t heads,
+                              uint32_t hd, float scale, bool causal);
 /* Optional bias. `activation` fuses an elementwise epilogue into the same graph
  * dispatch: 0 none, 1 ReLU, 2 SiLU. `layout` picks how the caller has its data
  * arranged: 0 is NHWC activations with HWIO weights, 1 is NCHW with OIHW.

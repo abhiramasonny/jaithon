@@ -45,7 +45,13 @@ pub fn matmul_async(
     )
 }
 
-#: Packed multi-head attention. Q/K/V/out are `[seq, heads*hd]`.
+#: Packed multi-head attention. Q and out are `[seq, heads*hd]`; K and V are
+#: `[kv_seq, heads*hd]`, where `kv_seq` 0 means the same length as Q.
+#:
+#: `causal` lets query row `i` see key rows up to `i + kv_seq - seq`, so a
+#: block of new queries at the end of a cached key sequence sees its own
+#: prefix; it needs `kv_seq >= seq`. A single query row runs a decode kernel
+#: that splits the keys across threadgroups.
 #:
 #: Returns false when the device has no fused SDPA path so callers can
 #: fall back to a Metal kernel.
@@ -57,14 +63,24 @@ pub fn mha_async(
     seq: int,
     heads: int,
     hd: int,
-    scale: float
+    scale: float,
+    causal: bool = false,
+    kv_seq: int = 0
 ) -> bool {
     _require_device("mha_async")
-    if seq <= 0 or heads <= 0 or hd <= 0 {
-        throw ValueError(f"mha_async dimensions must be positive, got {seq}x{heads}x{hd}")
+    let keys = if kv_seq == 0 { seq } else { kv_seq }
+    if seq <= 0 or heads <= 0 or hd <= 0 or keys <= 0 {
+        throw ValueError(
+            f"mha_async dimensions must be positive, got {seq}x{heads}x{hd} against {keys} keys"
+        )
     }
     if not scale > 0.0 {
         throw ValueError("mha_async scale must be positive")
+    }
+    if causal and keys < seq {
+        throw ValueError(
+            f"mha_async causal needs at least as many keys as queries, got {keys} < {seq}"
+        )
     }
     return __prim__.gpu_mha_buffers(
         query.handle_of(),
@@ -74,7 +90,9 @@ pub fn mha_async(
         seq,
         heads,
         hd,
-        scale
+        scale,
+        causal,
+        keys
     )
 }
 

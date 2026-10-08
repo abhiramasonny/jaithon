@@ -6,6 +6,8 @@ from .ops import conv2d, conv2d_out_dim, dense_affine, dense_static_backward, de
 from .ops import dropout, gather_rows, gelu, layer_norm, leaky_relu, max_pool2d, avg_pool2d
 from .ops import relu, reshape, sigmoid, softmax, tanh
 from .ops import batch_norm, group_norm, multi_head_attention, silu, matmul
+from .ops.attention import hand_to_graph
+from .ops.matmul import raw_matmul
 from .tensor import Tensor
 
 #: Something `Sequential` can stack: turns an input tensor into an output
@@ -718,25 +720,115 @@ pub class LayerNorm: Layer {
 }
 
 #: Multi-head self-attention over rank-two `[seq, dim]` inputs.
+#:
+#: `causal` lets each position attend only to itself and the positions before
+#: it, which is what an autoregressive model trains with.
+#:
+#: For generation, `start_cache(max_seq)` keeps every key and value the layer
+#: has projected in device buffers of `max_seq` rows. Each `forward` then
+#: takes only the new rows -- a prompt, then one token at a time -- projects
+#: them straight into the next rows of the cache, and attends them against
+#: everything cached so far, so a token costs the same at position 500 as at
+#: position 5 instead of recomputing the whole prefix. The cached forward
+#: records no gradient. `reset_cache` starts a new sequence in the same
+#: buffers; `free_cache` (or `free`) releases them.
 pub class MultiHeadAttention: Layer {
     pub let heads: int
     pub let dim: int
+    pub let causal: bool
     var wq_value: Tensor?
     var wk_value: Tensor?
     var wv_value: Tensor?
     var wo_value: Tensor?
+    var cache_k: Tensor?
+    var cache_v: Tensor?
+    var cached: int
 
-    pub fn init(self, dim: int, heads: int = 1) {
+    pub fn init(self, dim: int, heads: int = 1, causal: bool = false) {
         if dim <= 0 or heads <= 0 {
             throw ValueError("MultiHeadAttention dim/heads must be positive")
         }
         if dim % heads != 0 { throw ValueError("MultiHeadAttention dim must divide heads") }
         self.dim = dim
         self.heads = heads
+        self.causal = causal
         self.wq_value = null
         self.wk_value = null
         self.wv_value = null
         self.wo_value = null
+        self.cache_k = null
+        self.cache_v = null
+        self.cached = 0
+    }
+
+    #: Keep keys and values across `forward` calls, for up to `max_seq` rows.
+    #: Replaces any cache already held, and starts empty.
+    pub fn start_cache(self, max_seq: int) -> void {
+        if max_seq <= 0 { throw ValueError(f"start_cache needs a positive length, got {max_seq}") }
+        self.free_cache()
+        self.cache_k = Tensor([max_seq, self.dim])
+        self.cache_v = Tensor([max_seq, self.dim])
+        self.cached = 0
+    }
+
+    #: Forget the cached rows but keep the buffers, for the next sequence.
+    #: Nothing is written: the rows are simply overwritten as they refill.
+    pub fn reset_cache(self) -> void { self.cached = 0 }
+
+    #: How many rows the cache holds.
+    pub fn cache_length(self) -> int { return self.cached }
+
+    #: Release the cache's buffers; `forward` goes back to whole sequences.
+    pub fn free_cache(self) -> void {
+        let k = self.cache_k
+        let v = self.cache_v
+        if k is not null { k.free() }
+        if v is not null { v.free() }
+        self.cache_k = null
+        self.cache_v = null
+        self.cached = 0
+    }
+
+    #: `forward` with the cache on: `x` holds only the rows not seen yet.
+    fn forward_cached(
+        self,
+        x: Tensor,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor,
+        keys: Tensor,
+        values: Tensor
+    ) -> Tensor {
+        let rows = x.shape[0]
+        let capacity = keys.shape[0]
+        if self.cached + rows > capacity {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {capacity} rows; {self.cached} are used and {rows} more were given"
+            )
+        }
+        let start = self.cached * self.dim
+        #: The new keys and values are written by the projection itself into
+        #: the next rows of the cache: device work only, no copy and no host
+        #: write, so nothing here needs a fence against the buffer pool.
+        let k_rows = keys.view(start, [rows, self.dim])
+        let v_rows = values.view(start, [rows, self.dim])
+        raw_matmul(x, wk, out: k_rows)
+        raw_matmul(x, wv, out: v_rows)
+        k_rows.free()
+        v_rows.free()
+        let q = raw_matmul(x, wq)
+        let seen = self.cached + rows
+        let k_seen = keys.view(0, [seen, self.dim])
+        let v_seen = values.view(0, [seen, self.dim])
+        let context = multi_head_attention(q, k_seen, v_seen, self.heads, causal: self.causal)
+        k_seen.free()
+        v_seen.free()
+        q.free()
+        let output = raw_matmul(context, wo)
+        context.free()
+        self.cached = seen
+        return output
     }
 
     pub fn build(self, input_units: int, rng: Random) -> void {
@@ -766,15 +858,26 @@ pub class MultiHeadAttention: Layer {
         if x.rank() != 2 or x.shape[1] != self.dim {
             throw ValueError(f"MultiHeadAttention needs [seq, {self.dim}], got {x.shape}")
         }
+        let keys = self.cache_k
+        let values = self.cache_v
+        if keys is not null and values is not null {
+            return self.forward_cached(x, wq, wk, wv, wo, keys, values)
+        }
         let q = matmul(x, wq)
         let k = matmul(x, wk)
         let v = matmul(x, wv)
-        let context = multi_head_attention(q, k, v, self.heads)
-        q.free()
-        k.free()
-        v.free()
+        let context = multi_head_attention(q, k, v, self.heads, causal: self.causal)
+        #: Attention's backward reads q, k and v, and the output product's
+        #: backward reads `context`, so freeing them here made the first
+        #: `backward()` of any model holding this layer throw. Whether one is
+        #: still read depends on its consumer, not on itself: a frozen
+        #: projection records nothing, yet attention's graph reads it as soon
+        #: as any other input trains. `hand_to_graph` gives each to the graph
+        #: that reads it, for `backward()` or `discard_graph()` to return, and
+        #: frees only what no graph reads.
+        hand_to_graph(context, [q, k, v])
         let output = matmul(context, wo)
-        context.free()
+        hand_to_graph(output, [context])
         return output
     }
 
@@ -804,9 +907,13 @@ pub class MultiHeadAttention: Layer {
         self.wk_value = null
         self.wv_value = null
         self.wo_value = null
+        self.free_cache()
     }
 
-    fn __str__(self) -> str { return f"MultiHeadAttention(dim={self.dim}, heads={self.heads})" }
+    fn __str__(self) -> str {
+        let mask = if self.causal { ", causal" } else { "" }
+        return f"MultiHeadAttention(dim={self.dim}, heads={self.heads}{mask})"
+    }
 }
 
 #: Inverted dropout. Inactive during `Sequential.predict` (`training` false).
