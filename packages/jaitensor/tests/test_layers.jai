@@ -235,6 +235,27 @@ fn test_positional_embedding_takes_a_sequence_first_batch() -> void {
     }
 }
 
+#: A table that does not train hands out its rows as a view: the same values
+#: as the gather, and freeing it leaves the table alone.
+fn test_frozen_positions_are_a_view_of_the_table() -> void {
+    if not jt.is_available() { return }
+    let positions = jt.PositionalEmbedding(6, 3)
+    defer { positions.free() }
+    positions.build(3, Random.with_seed(8))
+    let table = positions.parameters()[0]
+    let gathered = positions.positions(2, start: 3)
+    let want = gathered.download()
+    assert_true(gathered.creator is not null)
+    gathered.free()
+    table.requires_grad = false
+    let viewed = positions.positions(2, start: 3)
+    assert_eq(viewed.shape, [2, 3])
+    assert_eq(viewed.download(), want)
+    assert_true(viewed.creator is null)
+    viewed.free()
+    assert_eq(table.download()[9:15], want)
+}
+
 fn test_conv2d_layer_builds_from_image_shape() -> void {
     if not jt.is_available() { return }
     var pixels: list[float] = []

@@ -721,6 +721,10 @@ pub class LayerNorm: Layer {
     fn __str__(self) -> str { return f"LayerNorm({self.width})" }
 }
 
+#: The product epilogue that adds `residual`, or none without one: 6 is
+#: `linear_residual`'s.
+fn epilogue_for(residual: Tensor?) -> int { return if residual is null { 0 } else { 6 } }
+
 #: Multi-head self-attention over `[seq, dim]` or batched `[batch, seq, dim]`
 #: inputs.
 #:
@@ -830,6 +834,7 @@ pub class MultiHeadAttention: Layer {
     }
 
     #: `forward` with the cache on: `x` holds only the rows not seen yet.
+    #: A `residual` is added in the output product's epilogue.
     fn forward_cached(
         self,
         x: Tensor,
@@ -838,7 +843,8 @@ pub class MultiHeadAttention: Layer {
         wv: Tensor,
         wo: Tensor,
         keys: Tensor,
-        values: Tensor
+        values: Tensor,
+        residual: Tensor? = null
     ) -> Tensor {
         let rows = x.shape[0]
         let capacity = keys.shape[0]
@@ -865,7 +871,7 @@ pub class MultiHeadAttention: Layer {
         k_seen.free()
         v_seen.free()
         q.free()
-        let output = raw_matmul(context, wo)
+        let output = raw_matmul(context, wo, bias: residual, epilogue: epilogue_for(residual))
         context.free()
         self.cached = seen
         return output
@@ -974,7 +980,8 @@ pub class MultiHeadAttention: Layer {
         wv: Tensor,
         wo: Tensor,
         keys: Tensor,
-        values: Tensor
+        values: Tensor,
+        residual: Tensor? = null
     ) -> Tensor {
         let rows = x.shape[0]
         let batch = x.shape[1]
@@ -1015,7 +1022,7 @@ pub class MultiHeadAttention: Layer {
         v_seen.free()
         query.free()
         let per_row = Tensor([rows * batch, self.dim], storage: context.buffer())
-        let output = raw_matmul(per_row, wo)
+        let output = raw_matmul(per_row, wo, bias: residual, epilogue: epilogue_for(residual))
         per_row.free()
         self.cached = seen
         return Tensor([rows, batch, self.dim], storage: output.buffer())
@@ -1143,6 +1150,47 @@ pub class MultiHeadAttention: Layer {
         hand_to_graph(context, [q, k, v])
         let output = matmul(context, wo)
         hand_to_graph(output, [context])
+        return output
+    }
+
+    #: `residual + forward(x)`, the first half of a transformer block.
+    #:
+    #: With the cache on, the add rides on the output product's epilogue, the
+    #: way `linear_residual` does it, so a decoded token pays one dispatch a
+    #: layer less. Anywhere else it is `forward` and then `add`, recorded as
+    #: usual. `residual` is the output's shape.
+    pub fn forward_add(self, x: Tensor, residual: Tensor) -> Tensor {
+        if residual.size != x.size {
+            throw ValueError(f"forward_add residual {residual.shape} does not match input {x.shape}")
+        }
+        let wq = self.wq_value
+        let wk = self.wk_value
+        let wv = self.wv_value
+        let wo = self.wo_value
+        let keys = self.cache_k
+        let values = self.cache_v
+        if wq is not null and wk is not null and wv is not null and wo is not null {
+            if keys is not null and values is not null {
+                if x.rank() == 2 and x.shape[1] == self.dim and self.cache_batch == 1 {
+                    return self.forward_cached(x, wq, wk, wv, wo, keys, values, residual: residual)
+                }
+                if x.rank() == 3 and x.shape[2] == self.dim and not self.batch_first {
+                    return self.forward_cached_seq_first(
+                        x,
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        keys,
+                        values,
+                        residual: residual
+                    )
+                }
+            }
+        }
+        let y = self.forward(x)
+        let output = add(residual, y)
+        hand_to_graph(output, [y])
         return output
     }
 
@@ -1332,7 +1380,10 @@ pub class PositionalEmbedding: Layer {
     }
 
     #: The table's rows `start..start + seq` as `[seq, dim]`, recorded for the
-    #: gradient when the table trains.
+    #: gradient when the table trains. When it does not -- generation -- the
+    #: rows are contiguous, so this is a view of them: no index upload and no
+    #: gather for every decoded token. Free it either way; a view's free
+    #: leaves the table alone.
     pub fn positions(self, seq: int, start: int = 0) -> Tensor {
         let table = self.table
         if table is null { throw RuntimeError("PositionalEmbedding has not been built") }
@@ -1341,6 +1392,7 @@ pub class PositionalEmbedding: Layer {
                 f"positions {start}..{start + seq} run past the {self.max_seq} this table holds"
             )
         }
+        if not table.requires_grad { return table.view(start * self.dim, [seq, self.dim]) }
         return gather_rows(table, self.indices(seq, start, 1))
     }
 

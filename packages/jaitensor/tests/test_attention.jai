@@ -1246,3 +1246,44 @@ fn test_attention_layer_takes_a_sequence_first_batch() -> void {
     check_seq_first(2, 20, 64, 2, true)
     check_seq_first(2, 64, 128, 2, false)
 }
+
+#: `forward_add` is `residual + forward(x)`: through the cache, where the add
+#: rides on the output product, for one sequence and for a sequence-first
+#: batch, and recorded, where it is a plain add the gradient goes through.
+fn test_attention_layer_adds_its_residual() -> void {
+    if not jt.is_available() { return }
+    let dim = 128
+    for batch in [1, 3] {
+        let layer = jt.MultiHeadAttention(dim, heads: 2, causal: true, batch_first: false)
+        defer { layer.free() }
+        layer.build(dim, Random.with_seed(21))
+        for p in layer.parameters() { p.requires_grad = false }
+        let seq = 9
+        let shape = if batch == 1 { [seq, dim] } else { [seq, batch, dim] }
+        let x = Tensor(shape, wave(seq * batch * dim, 0.15))
+        let r = Tensor(shape, wave(seq * batch * dim, 1.15))
+        defer { x.free() }
+        defer { r.free() }
+        layer.start_cache(seq, batch: batch)
+        let plain = layer.forward(x)
+        layer.reset_cache()
+        let fused = layer.forward_add(x, r)
+        assert_eq(fused.shape, plain.shape)
+        let want = jt.add(r, plain)
+        assert_values_near(fused.download(), want.download(), 1e-5)
+        free_all([plain, fused, want])
+        layer.free_cache()
+    }
+    let layer = jt.MultiHeadAttention(64, heads: 1, causal: true)
+    defer { layer.free() }
+    layer.build(64, Random.with_seed(22))
+    let x = Tensor([64, 64], wave(64 * 64, 0.5))
+    let r = Tensor([64, 64], wave(64 * 64, 1.5), requires_grad: true)
+    let y = layer.forward_add(x, r)
+    let total = jt.sum(y)
+    free_all(total.backward())
+    let g = r.grad
+    assert_true(g is not null)
+    if g is not null { assert_values_near(g.download(), [1.0 for _ in 0..64 * 64], 1e-6) }
+    free_all([total, y, x, r])
+}
