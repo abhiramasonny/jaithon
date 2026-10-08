@@ -18,7 +18,7 @@ uint8 CIFAR-10 files that `tests/bench/jaitensor/prepare_data.py cifar10`
 writes (the repo's `data` is a symlink into `~/Developer/datasets`). `train.jai`
 also takes `--epochs`, `--depth` (6n+2), `--width`, `--batch`, `--lr` (the
 one-cycle peak), `--pct`, `--wd`, `--normalize 0|1` and `--train N` (the first
-N training images); the peer takes the same flags.
+N training images); the peer takes the same flags but `--train`.
 
 ## Results
 
