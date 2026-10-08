@@ -5,7 +5,7 @@ import jaitensor as jt
 from jaitensor import Tensor
 
 from .kernels import HIGHEST_FLOAT, LOWEST_FLOAT
-from .nodes import GraphNode, attr_float, attr_int, ints_from, maybe, need
+from .nodes import GraphNode, attr_float, attr_int, attr_str, ints_from, maybe, need
 from .tensors import binary_ex_of, broadcast_shape, copy_of, elementwise, expand_to
 from .tensors import normalize_axis, row_reduce_of, shaped, softmax_rows, transpose_to
 from .tensors import unary_ex_of, volume
@@ -69,6 +69,17 @@ pub fn op_hard_sigmoid(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
 #: in one pass rather than three.
 pub fn op_hard_swish(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [unary_ex_of(need(ins, 0, node), 8, first: 1.0 / 6.0, second: 0.5)]
+}
+
+#: Opset 20's `Gelu`, exact or with the tanh approximation, in one pass. It
+#: is what a dynamo export writes where the legacy exporter spelt out
+#: `Div`, `Erf`, `Add`, `Mul`, `Mul`.
+pub fn op_gelu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let approximate = attr_str(node, "approximate", "none")
+    if approximate != "none" and approximate != "tanh" {
+        throw ValueError(f"{node.label()} asks for the {approximate} approximation, which Gelu does not have")
+    }
+    return [unary_ex_of(need(ins, 0, node), if approximate == "tanh" { 10 } else { 9 })]
 }
 
 pub fn op_softplus(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {

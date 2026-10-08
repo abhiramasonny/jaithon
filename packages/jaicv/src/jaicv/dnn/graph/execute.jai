@@ -12,7 +12,7 @@ from .ops_layers import op_global_average_pool, op_global_max_pool, op_instance_
 from .ops_layers import op_layer_norm, op_lrn, op_max_pool, op_resize, op_upsample
 from .ops_math import op_abs, op_add, op_and, op_argmax, op_argmin, op_clip, op_div, op_dropout
 from .ops_math import op_elu, op_equal, op_erf, op_exp, op_gemm, op_greater, op_hard_sigmoid
-from .ops_math import op_greater_or_equal, op_hard_swish, op_less_or_equal
+from .ops_math import op_gelu, op_greater_or_equal, op_hard_swish, op_less_or_equal
 from .ops_math import op_identity, op_leaky_relu, op_less, op_log, op_log_softmax, op_matmul
 from .ops_math import op_max, op_mean, op_min, op_mod, op_mul, op_neg, op_not, op_or, op_pow
 from .ops_math import op_prelu, op_reduce_max, op_reduce_mean, op_reduce_min, op_reduce_sum
@@ -44,6 +44,7 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Silu"] = op_silu
     _handlers["HardSigmoid"] = op_hard_sigmoid
     _handlers["HardSwish"] = op_hard_swish
+    _handlers["Gelu"] = op_gelu
     _handlers["Tanh"] = op_tanh
     _handlers["Softplus"] = op_softplus
     _handlers["Erf"] = op_erf

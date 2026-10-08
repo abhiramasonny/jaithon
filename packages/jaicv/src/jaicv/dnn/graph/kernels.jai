@@ -237,6 +237,11 @@ kernel void unary_ex(device const float* input [[buffer(0)]],
     else if (op == 6) y = trunc(x);
     else if (op == 7) y = x != 0.0f ? 1.0f : 0.0f;
     else if (op == 8) y = x * clamp(a * x + b, 0.0f, 1.0f);
+    else if (op == 9) y = 0.5f * x * (1.0f + erf_approx(x * 0.70710678118654752f));
+    else if (op == 10) {
+        float inner = 0.79788456080286536f * (x + 0.044715f * x * x * x);
+        y = 0.5f * x * (1.0f + tanh(inner));
+    }
     output[id] = y;
 }
 

@@ -686,6 +686,8 @@ def build_cases():
     # interleaved, so every case above keeps its exact lines.
     wide = spread(2, 3, 4, low=-5.0, high=5.0, seed=70)
     case("elementwise", "hardswish_basic", "HardSwish", [wide], opset=14)
+    case("elementwise", "gelu_exact", "Gelu", [wide], opset=20)
+    case("elementwise", "gelu_tanh", "Gelu", [wide], {"approximate": "tanh"}, opset=20)
     ties = np.round(spread(2, 3, 4, seed=71))
     ties_right = np.round(spread(1, 3, 1, seed=72))
     case("broadcast", "greaterorequal_broadcast", "GreaterOrEqual", [ties, ties_right], opset=16)

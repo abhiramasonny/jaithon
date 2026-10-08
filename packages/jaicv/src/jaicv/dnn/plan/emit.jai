@@ -245,6 +245,31 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
         return true
     }
 
+    if node.op == "Gelu" {
+        #: `0.5 x (1 + erf(x / sqrt 2))`, or with `tanh` standing in for the
+        #: error function as the approximate form says.
+        let approximate = attr_str(node, "approximate", "none")
+        let x = state.id_of(node.inputs[0])
+        var curve = -1
+        if approximate == "none" {
+            let scaled = __prim__.graph_binary(b, x, scalar(state, 0.7071067811865476), 2)
+            curve = __prim__.graph_unary(b, scaled, 8)
+        } elif approximate == "tanh" {
+            let squared = __prim__.graph_binary(b, x, x, 2)
+            let cubed = __prim__.graph_binary(b, squared, x, 2)
+            let bent = __prim__.graph_binary(b, cubed, scalar(state, 0.044715), 2)
+            let summed = __prim__.graph_binary(b, x, bent, 0)
+            let scaled = __prim__.graph_binary(b, summed, scalar(state, 0.7978845608028654), 2)
+            curve = __prim__.graph_unary(b, scaled, 2)
+        } else {
+            return false
+        }
+        let lifted = __prim__.graph_binary(b, curve, scalar(state, 1.0), 0)
+        let halved = __prim__.graph_binary(b, x, scalar(state, 0.5), 2)
+        state.ids[out] = __prim__.graph_binary(b, halved, lifted, 2)
+        return true
+    }
+
     if node.op == "GreaterOrEqual" or node.op == "LessOrEqual" {
         #: The builder has no such comparison, and `Not` of the opposite one
         #: would call a NaN greater-or-equal to everything, so it is the
