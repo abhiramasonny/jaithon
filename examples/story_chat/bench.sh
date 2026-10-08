@@ -24,6 +24,25 @@ jai() { echo "== jai"; MODE=bench "$J" run examples/story_chat/pretrain.jai | gr
 mixed() { echo "== jai GPT_MIXED=1"; GPT_MIXED=1 MODE=bench "$J" run examples/story_chat/pretrain.jai | grep -v '^tokens:'; }
 torch() { echo "== torch"; MODE=bench "$PY" examples/story_chat/story_chat.py; }
 
+# ./examples/story_chat/bench.sh quality: both sides train STEPS (400) steps
+# from scratch on the same schedule (WARMUP 40, LR 6e-4, cosine over the
+# steps) and report the held-out loss on the same 256 windows every 100
+# steps -- a check that the two learn the same thing, not only at the same
+# speed. Each side takes the lock on its own.
+if [ "${1:-}" = quality ]; then
+    steps="${STEPS:-400}"
+    dir="${STORY_CACHE:-$HOME/.cache/jaithon/story_chat}/quality-$steps"
+    rm -rf "$dir"
+    echo "== jai, $steps steps"
+    RUN_DIR="$dir" WARMUP=40 EVAL_EVERY=100 EVAL_WINDOWS=256 LOG_EVERY=100 \
+        "$LOCK" "$J" run examples/story_chat/pretrain.jai -- --steps "$steps" | grep -E "held-out|ran steps"
+    rm -f "$dir"/*.ckpt
+    echo "== torch, $steps steps"
+    MODE=train STEPS="$steps" WARMUP=40 EVAL_EVERY=100 EVAL_WINDOWS=256 \
+        "$LOCK" "$PY" examples/story_chat/story_chat.py
+    exit 0
+fi
+
 if [ "${INSIDE_LOCK:-0}" != 1 ]; then
     INSIDE_LOCK=1 exec "$LOCK" "$0" "$@"
 fi

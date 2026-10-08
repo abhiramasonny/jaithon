@@ -146,6 +146,7 @@ validation (2,210 rows), from the same 15-minute checkpoint:
 | epoch 1 | 3.367 | 3.244 |
 | epoch 2 | 3.235 | 2.978 |
 | epoch 3 | | **2.918** (train 2.303) |
+| `finetune.jai -- --eval`: test split, 2,231 rows | | **2.991** (perplexity 19.9) |
 
 The pretrained model has never seen `<|user|>` or `<|bot|>` and answers the
 first probe by carrying on with a story. 24,832 training rows (3.25M tokens,

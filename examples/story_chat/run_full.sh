@@ -80,12 +80,14 @@ while true; do
 done
 say "fine-tuning finished"
 
-# 4. Final evaluation: held-out bits per byte over 2048 windows, three
+# 4. Final evaluation: held-out bits per byte over 2048 windows, the chat
+#    model on the validation and test dialogues, three
 #    stories, and a scripted conversation.
 say "final evaluation (waiting for the GPU lock)"
 cat > "$RUN_DIR/final_eval.sh" <<EOF
 #!/bin/sh
 MODE=eval EVAL_WINDOWS=2048 "$J" run examples/story_chat/pretrain.jai -- --resume
+"$J" run examples/story_chat/finetune.jai -- --eval
 SAMPLES=3 NEW=200 "$J" run examples/story_chat/generate.jai -- "Once upon a time"
 printf 'Hi! How are you today?\nWhat did you do this weekend?\nThat sounds fun. Do you like to read?\nWhat is your favourite book?\nThanks, bye!\n' \
     | CHAT_ECHO=1 "$J" run examples/story_chat/chat.jai

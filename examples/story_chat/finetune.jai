@@ -88,7 +88,27 @@ fn show_replies(model: GPT, tok: Tokenizer) -> void {
     model.set_training(true)
 }
 
+#: `--eval`: the masked loss of the saved chat model on the validation and
+#: test dialogues, which training never reads.
+fn evaluate() -> int {
+    let batch = env_int("FT_BATCH", 32)
+    let (model, meta) = load_model(chat_checkpoint(), batch: batch)
+    let tok = load_tokenizer(tokenizer_path(model.cfg.vocab))
+    let quantum = env_int("QUANTUM", 64)
+    let epoch: int = meta["finetune_epoch"]
+    for split in ["validation", "test"] {
+        let rows = split_rows(tok, read_dialogues(dialog_file(split)), model.cfg.seq)
+        let loss = masked_loss(model, rows, batch, quantum)
+        print(
+            f"chat model (fine-tuned {epoch} epochs) on dialogues_{split}: {rows.len()} rows, masked loss {loss:.4f}, perplexity {math.exp(loss):.2f}"
+        )
+    }
+    model.free()
+    return 0
+}
+
 fn main() -> int {
+    if has_flag("--eval") { return evaluate() }
     let state_path = chat_checkpoint() + ".state"
     let resuming = has_flag("--resume") and Path(state_path).exists()
     let source = if resuming { state_path } else { os.env_or("FROM_CKPT", pretrain_checkpoint()) }

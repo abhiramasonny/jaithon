@@ -172,7 +172,7 @@ def train():
         if s < warmup:
             lr = peak * (s + 1) / warmup
         else:
-            p = min(1.0, (s - warmup) / max(1, total - warmup))
+            p = min(1.0, s / total)  # as pretrain.jai: the cosine runs over the whole schedule
             lr = peak * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * p)))
         recent.append(step(model, opt, *batch(data, rng, dev), lr).item())
         if (s + 1) % env_int("EVAL_EVERY", 250) == 0 or s + 1 == total:
