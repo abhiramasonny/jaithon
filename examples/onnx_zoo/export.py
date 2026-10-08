@@ -181,6 +181,34 @@ def all_ops(graph, acc):
     return acc
 
 
+def calibrate(m, inputs):
+    """Give every BatchNorm statistics measured on random input, and a random affine.
+
+    A fresh BatchNorm has a running mean of 0 and variance of 1, and through a
+    deep net that shrinks every activation towards zero: mobilenet_v2's logits
+    came out near 3e-9 and googlenet's features near 2e-11, so HardSwish, SiLU
+    and sigmoid never left their linear part and agreeing with onnxruntime
+    proved little. Measured statistics keep the activations near unit scale.
+    A batch of two, because training-mode BatchNorm over a 1x1 map refuses one.
+    """
+    norms = [x for x in m.modules() if isinstance(x, nn.modules.batchnorm._BatchNorm)]
+    fed = [torch.from_numpy(a) for _, a in inputs]
+    if not norms or not all(t.is_floating_point() for t in fed):
+        return
+    g = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        for bn in norms:
+            bn.reset_running_stats()
+            bn.momentum = None
+            if bn.affine:
+                bn.weight.uniform_(0.5, 1.5, generator=g)
+                bn.bias.normal_(0.0, 0.2, generator=g)
+        m.train()
+        for _ in range(2):
+            m(*[torch.randn((2,) + tuple(t.shape[1:]), generator=g) for t in fed])
+    m.eval()
+
+
 def export_one(name, build, inputs_fn, mode):
     tag = name + {"legacy": "", "dyn": "_dyn", "dyn1": "_dyn1"}[mode]
     path = os.path.join(OUT, tag + ".onnx")
@@ -192,6 +220,7 @@ def export_one(name, build, inputs_fn, mode):
         nn.init.normal_(m.heads.head.weight, std=0.02)
         nn.init.normal_(m.heads.head.bias, std=0.02)
     inputs = inputs_fn()
+    calibrate(m, inputs)
     targs = tuple(torch.from_numpy(a) for _, a in inputs)
     names = [k for k, _ in inputs]
     rec = {"name": tag, "arch": name, "mode": mode, "params": int(sum(p.numel() for p in m.parameters()))}

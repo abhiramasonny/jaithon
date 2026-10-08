@@ -20,12 +20,25 @@ from .zoo_model import Exported, TOLERANCE, measure, zoo_dir
 
 let ACCEPTANCE = ["squeezenet1_1", "mobilenet_v3_small", "resnet18_dyn", "vit_tiny_dyn1"]
 
+#: A reference that is all but zero agrees with any answer near zero. Before
+#: export.py measured BatchNorm statistics, mobilenet_v3_small's logits were
+#: 2e-9 and its HardSwish never left the straight part, so the check passed
+#: whatever the activations did.
+let LIVE_OUTPUT = 1.0e-3
+
 fn main() -> int {
     var failed = 0
     for tag in ACCEPTANCE {
         let found = Exported.find(tag)
         if found is null {
             print(f"MISSING {tag}: not exported in {zoo_dir()}; see this file's header")
+            failed += 1
+            continue
+        }
+        var scale = 0.0
+        for value in found.outputs[0].values() { scale = max(scale, abs(value)) }
+        if scale < LIVE_OUTPUT {
+            print(f"FAIL    {tag}: the reference peaks at {scale:.1e}; re-export with export.py")
             failed += 1
             continue
         }
