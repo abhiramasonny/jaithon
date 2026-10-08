@@ -27,6 +27,7 @@ from .ops import relu, reshape, rsqrt, scale, scaled_dot_product_attention, sigm
 from .optimizers import Adam, Optimizer, SGD, zero_grad
 from .plots import save_history_plot
 from .tensor import Tensor, constant, fill, ones, zeros
+from .tensor import no_grad, is_grad_enabled, set_grad_enabled
 from .optimizers import AdamW, clip_grad_norm, one_cycle_lr
 from .layers import ResBlock
 from .data import random_crop_flip, random_crop_flip_into
@@ -42,6 +43,7 @@ export { clamp, maximum, minimum, sum, mean, max_pool2d, avg_pool2d, dropout, ms
 export { batch_norm, layer_norm, group_norm, scaled_dot_product_attention, gather_rows }
 export { eye, flip, upsample_nearest2d, split_heads, merge_heads, multi_head_attention, tril }
 export { add_correct_into, add_scaled_into }
+export { no_grad, is_grad_enabled, set_grad_enabled }
 export { AdamW, clip_grad_norm, one_cycle_lr }
 export { ResBlock, random_crop_flip, random_crop_flip_into }
 
