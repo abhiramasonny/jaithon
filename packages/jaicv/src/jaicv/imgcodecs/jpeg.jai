@@ -7,8 +7,17 @@
 #: Encoding writes baseline 4:2:0 for colour and 4:4:4 for greyscale, with the
 #: standard Annex K tables scaled by a quality setting.
 import std.math
+from std.os import env_or
 from ..core.mat import Mat
 from ..core.types import CV_8U, CV_MAKETYPE
+
+#: Read once. On, a scan goes through `scan_fast`: a lookahead Huffman decode,
+#: a sparse IDCT and integer planes, with the same arithmetic in the same
+#: order as the reference loop in `scan`, so the picture is the same byte for
+#: byte. A stream the fast path cannot reproduce exactly -- one that reads past
+#: a restart marker, an odd sampling layout -- is handed back to the reference
+#: loop. Off, every scan goes through the reference loop.
+let _FAST_JPEG = env_or("JAICV_FAST_JPEG", "1") != "0"
 
 #: Zig-zag order: the sequence a JPEG stores an 8x8 block's coefficients in.
 pub let ZIGZAG = [
@@ -229,9 +238,14 @@ pub class HuffmanTable {
     pub let value_at: list[int]
     #: The symbols, in code order.
     pub let values: list[int]
+    #: `scan_fast`'s nine-bit lookahead, built the first time it is wanted:
+    #: `length << 8 | symbol` for every nine-bit prefix a code of nine bits or
+    #: fewer resolves, -1 where it takes a longer code.
+    pub var lookahead: list[int]
 
     pub fn init(self, counts: list[int], values: list[int]) {
         self.values = values
+        self.lookahead = []
         var min_code: list[int] = []
         var max_code: list[int] = []
         var value_at: list[int] = []
@@ -393,7 +407,12 @@ fn idct_8x8(block: list[float], out: list[float], scratch: list[float]) -> void 
 }
 
 #: Decode a baseline JPEG into a BGR (or single-channel) `Mat`.
-pub fn decode(data: bytes) -> Mat {
+pub fn decode(data: bytes) -> Mat { return decode_with(data, _FAST_JPEG) }
+
+#: `decode`, choosing the scan: `fast` takes `scan_fast` where it can
+#: reproduce the reference exactly, and false always takes the reference loop.
+#: The two give the same bytes; this is how a test holds them to it.
+pub fn decode_with(data: bytes, fast: bool) -> Mat {
     if not looks_like(data) { throw ValueError("this is not a JPEG") }
     var quant: dict[int, list[int]] = {}
     #: Seeded with the tables of the standard's Annex K. A conforming JPEG
@@ -504,7 +523,8 @@ pub fn decode(data: bytes) -> Mat {
                 ac_tables,
                 frame_width,
                 frame_height,
-                restart_interval
+                restart_interval,
+                fast
             )
         }
         at = body_end
@@ -521,7 +541,8 @@ fn scan(
     ac_tables: dict[int, HuffmanTable],
     frame_width: int,
     frame_height: int,
-    restart_interval: int
+    restart_interval: int,
+    fast: bool
 ) -> Mat {
     if components.len() == 0 or frame_width == 0 or frame_height == 0 {
         throw ValueError("this JPEG has no frame")
@@ -540,8 +561,6 @@ fn scan(
     for component in components {
         component.width = mcus_across * component.h * 8
         component.height = mcus_down * component.v * 8
-        component.samples = [0.0 for _index in 0..component.width * component.height]
-        component.predictor = 0
     }
 
     #: Resolved once, not once a block. The lookup and its null check ran for
@@ -566,6 +585,29 @@ fn scan(
         block_ac.push(ac)
     }
 
+    if fast {
+        let quick = scan_fast(
+            data,
+            start,
+            components,
+            quant_tables,
+            block_dc,
+            block_ac,
+            frame_width,
+            frame_height,
+            restart_interval,
+            max_h,
+            max_v,
+            mcus_across,
+            mcus_down
+        )
+        if quick is not null { return quick }
+    }
+
+    for component in components {
+        component.samples = [0.0 for _index in 0..component.width * component.height]
+        component.predictor = 0
+    }
     let reader = BitReader(data, start)
     var block = [0.0 for _index in 0..64]
     var pixels = [0.0 for _index in 0..64]
@@ -795,6 +837,1102 @@ fn clamp255(value: float) -> float {
     if value <= 0.0 { return 0.0 }
     if value >= 255.0 { return 255.0 }
     return float(int(value + 0.5))
+}
+
+# ---------------------------------------------------------------------------
+# The fast scan.
+#
+# Everything above this line is the reference decoder, and everything below
+# reproduces it exactly: the same float operations in the same order, so a
+# picture decoded either way is the same byte for byte. What changes is how the
+# work is laid out, which is where the reference spent its time:
+#
+# - Bits come out of a 56-bit accumulator over the scan with its stuffing
+#   already taken out, rather than one method call a bit, and a Huffman code of
+#   nine bits or fewer -- nearly all of them -- is one table lookup.
+# - The IDCT skips what is zero instead of testing it: a column with no
+#   coefficient costs nothing, a coefficient feeds its eight outputs side by
+#   side, and the zeroth basis row -- one number eight times -- is one product
+#   rather than eight. A block that is only its DC term is one value written
+#   sixty-four times. The reference skips the same zeros one test at a time
+#   and adds the same terms in the same order, so the sums are the same sums.
+# - Planes are int lists, not float ones. Every sample in them came out of a
+#   clamp-and-round, so it is a whole number, and the triangle filter's float
+#   arithmetic on whole numbers is exact -- `(3 * here + previous + 2) >> 2` is
+#   the same number the reference gets with `int(... * 0.25)`. 4:2:0 chroma is
+#   doubled down the columns inside the colour conversion, not stored twice.
+# - The colour conversion is three table lookups and one subtraction a pixel:
+#   each of its terms depends on one or two whole-number samples only.
+# - The picture is packed straight into bytes and handed to `Mat.from_bytes`,
+#   not pushed a float at a time into a list for `Mat.from_list`.
+#
+# Each loop sits in a function of its own, because the JIT records a fixed
+# number of loop forms per function and the reference `scan` ran out of them.
+# On a 640x426 COCO photograph this is about 16 ms against the reference's 60;
+# see packages/jaicv/README.md for the numbers and what the rest of it is.
+# ---------------------------------------------------------------------------
+
+#: Every DCT basis value of the zeroth frequency is the same number, which is
+#: what lets a DC-only block be computed once. Checked rather than assumed.
+fn dc_row_is_flat() -> bool {
+    for x in 1..8 {
+        if DCT_BASIS[x] != DCT_BASIS[0] { return false }
+    }
+    return true
+}
+
+let DC_FLAT = dc_row_is_flat()
+
+#: Where the parts of a decoding table start. The first 512 entries are the
+#: nine-bit lookahead: `length << 8 | symbol` for each prefix that a code of
+#: nine bits or fewer resolves, -1 where it takes a longer one. Then the table
+#: itself, flat, for the longer codes: sixteen `max_code`, sixteen `min_code`,
+#: sixteen `value_at`, the symbol count, and the symbols.
+const LOOK_MAX = 512
+const LOOK_MIN = 528
+const LOOK_AT = 544
+const LOOK_COUNT = 560
+const LOOK_VALUES = 561
+
+#: One Huffman table laid out for `FastScan.block`, built once a table.
+#:
+#: The lookahead is what `BitReader.decode`'s loop does to a prefix: it takes
+#: the first length whose code is at or below that length's `max_code`, so a
+#: prefix belongs to the shortest such length and lengths are filled shortest
+#: first, each over only the prefixes no shorter length took. An index that
+#: comes out negative is left at -1 too, and `block` hands that stream back to
+#: the reference loop, which reads it the way it always has.
+fn lookahead_for(table: HuffmanTable) -> list[int] {
+    if table.lookahead.len() > 0 { return table.lookahead }
+    let max_code = table.max_code
+    let min_code = table.min_code
+    let value_at = table.value_at
+    let values = table.values
+    let count = values.len()
+    var look: list[int] = __prim__.list_filled(LOOK_VALUES + count, -2)
+    var length = 0
+    var code = 0
+    var top = 0
+    var index = 0
+    var entry = 0
+    var first = 0
+    var last = 0
+    var at = 0
+    while length < 9 {
+        top = max_code[length]
+        if top >= 0 {
+            if top > (1 << length + 1) - 1 { top = (1 << length + 1) - 1 }
+            code = 0
+            while code <= top {
+                index = value_at[length] + code - min_code[length]
+                entry = if index < 0 {
+                    -1
+                } elif index < count {
+                    length + 1 << 8 | values[index]
+                } else {
+                    length + 1 << 8
+                }
+                first = code << 8 - length
+                last = first + (1 << 8 - length)
+                at = first
+                while at < last {
+                    if look[at] == -2 { look[at] = entry }
+                    at += 1
+                }
+                code += 1
+            }
+        }
+        length += 1
+    }
+    at = 0
+    while at < LOOK_MAX {
+        if look[at] == -2 { look[at] = -1 }
+        at += 1
+    }
+    at = 0
+    while at < 16 {
+        look[LOOK_MAX + at] = max_code[at]
+        look[LOOK_MIN + at] = min_code[at]
+        look[LOOK_AT + at] = value_at[at]
+        at += 1
+    }
+    look[LOOK_COUNT] = count
+    at = 0
+    while at < count {
+        look[LOOK_VALUES + at] = values[at]
+        at += 1
+    }
+    table.lookahead = look
+    return look
+}
+
+#: The entropy-coded data from `start` with its stuffed `FF 00` pairs undone and
+#: its restart markers taken out. `marks` gets the position in the result of
+#: each restart marker, then one more entry: where the scan's data ends, which is
+#: the first marker that is not a restart. The result is longer than the data by
+#: eight zeros, so the accumulator can look ahead past the end without a test.
+fn unstuff(data: bytes, start: int, marks: list[int]) -> list[int] {
+    let end = data.len()
+    var clean: list[int] = __prim__.list_filled(end - start + 8, 0)
+    var count = 0
+    var at = start
+    var byte = 0
+    var following = 0
+    var going = true
+    while going and at < end {
+        byte = data[at]
+        if byte != 0xFF {
+            clean[count] = byte
+            count += 1
+            at += 1
+        } elif at + 1 >= end {
+            going = false
+        } else {
+            following = data[at + 1]
+            if following == 0x00 {
+                clean[count] = 0xFF
+                count += 1
+                at += 2
+            } elif following >= 0xD0 and following <= 0xD7 {
+                marks.push(count)
+                at += 2
+            } else {
+                going = false
+            }
+        }
+    }
+    marks.push(count)
+    return clean
+}
+
+#: The state of one fast scan, and the two things done to every block.
+#:
+#: A class rather than free functions because the function tier compiles a
+#: function of at most eight arguments, and a block needs a dozen things: here
+#: they are fields, read into locals once a call. Nothing hot calls anything
+#: that might not have compiled, nothing returns from inside a loop, and no
+#: local holds an instance -- each of those has left a whole body of this
+#: decoder interpreted at one time or another.
+class FastScan {
+    #: The unstuffed data, and the accumulator over it: `nbits` bits of `acc`
+    #: are unread, and `pos` is the next index of `clean` to load.
+    var clean: list[int]
+    var acc: int
+    var nbits: int
+    var pos: int
+    #: Restart positions in `clean`, then where the scan's data ends.
+    var marks: list[int]
+    var marker: int
+    pub var restart_interval: int
+    var since_restart: int
+    pub var mcus_across: int
+    var planes: list[list[int]]
+    var widths: list[int]
+    var hs: list[int]
+    var vs: list[int]
+    var quant: list[list[int]]
+    #: `lookahead_for` of each component's tables.
+    var dc_tables: list[list[int]]
+    var ac_tables: list[list[int]]
+    var predictors: list[int]
+    #: One block's coefficients at natural positions, zero between blocks.
+    var coef: list[float]
+    var scratch: list[float]
+    #: A DC-only block's one value, from `rows` to `columns`.
+    var flat: int
+    var basis: list[float]
+    var zigzag: list[int]
+
+    pub fn init(
+        self,
+        clean: list[int],
+        marks: list[int],
+        planes: list[list[int]],
+        widths: list[int],
+        hs: list[int],
+        vs: list[int],
+        quant: list[list[int]],
+        tables: list[list[int]]
+    ) {
+        self.clean = clean
+        self.acc = 0
+        self.nbits = 0
+        self.pos = 0
+        self.marks = marks
+        self.marker = 0
+        self.restart_interval = 0
+        self.since_restart = 0
+        self.mcus_across = 0
+        self.planes = planes
+        self.widths = widths
+        self.hs = hs
+        self.vs = vs
+        self.quant = quant
+        #: `tables` is each component's DC table then its AC table.
+        var dc_tables: list[list[int]] = []
+        var ac_tables: list[list[int]] = []
+        for slot in 0..planes.len() {
+            dc_tables.push(tables[slot * 2])
+            ac_tables.push(tables[slot * 2 + 1])
+        }
+        self.dc_tables = dc_tables
+        self.ac_tables = ac_tables
+        self.predictors = __prim__.list_filled(planes.len(), 0)
+        self.coef = __prim__.list_filled(64, 0.0)
+        self.scratch = __prim__.list_filled(64, 0.0)
+        self.flat = 0
+        var basis: list[float] = __prim__.list_filled(64, 0.0)
+        for index in 0..64 { basis[index] = DCT_BASIS[index] }
+        self.basis = basis
+        var zigzag: list[int] = __prim__.list_filled(64, 0)
+        for index in 0..64 { zigzag[index] = ZIGZAG[index] }
+        self.zigzag = zigzag
+    }
+
+    #: One MCU row, in the reference's order. False when the stream reads past
+    #: the end of a restart interval, or uses a table the lookahead could not
+    #: express, either of which the reference reads differently.
+    pub fn row(self, mcu_y: int) -> bool {
+        let count = self.planes.len()
+        let interval = self.restart_interval
+        let across = self.mcus_across
+        let marks = self.marks
+        let predictors = self.predictors
+        let planes = self.planes
+        let widths = self.widths
+        let hs = self.hs
+        let vs = self.vs
+        var ok = true
+        var mcu_x = 0
+        var slot = 0
+        var by = 0
+        var bx = 0
+        var top = 0
+        var packed = 0
+        var live = 0
+        var edge = 0
+        while ok and mcu_x < across {
+            if interval > 0 and self.since_restart == interval {
+                #: The reference aligns and scans forward from where it is to
+                #: the next marker. That lands on this interval's own marker
+                #: exactly when nothing past the interval was read, and only
+                #: then does reading on from the marker here agree with it.
+                if self.marker >= marks.len() - 1 {
+                    ok = false
+                } else {
+                    edge = marks[self.marker]
+                    if self.pos * 8 - self.nbits > edge * 8 { ok = false }
+                    self.acc = 0
+                    self.nbits = 0
+                    self.pos = edge
+                    self.marker += 1
+                    slot = 0
+                    while slot < count {
+                        predictors[slot] = 0
+                        slot += 1
+                    }
+                    self.since_restart = 0
+                }
+            }
+            slot = 0
+            while slot < count {
+                let plane = planes[slot]
+                let width = widths[slot]
+                let h = hs[slot]
+                let v = vs[slot]
+                by = 0
+                while by < v {
+                    top = (mcu_y * v + by) * 8 * width + mcu_x * h * 8
+                    bx = 0
+                    while bx < h {
+                        packed = self.block(slot)
+                        if packed < 0 {
+                            ok = false
+                        } else {
+                            live = self.rows(packed)
+                            self.columns(live, plane, width, top + bx * 8)
+                        }
+                        bx += 1
+                    }
+                    by += 1
+                }
+                slot += 1
+            }
+            self.since_restart += 1
+            mcu_x += 1
+        }
+        return ok
+    }
+
+    #: Whether the scan, now finished, stayed inside the data it had.
+    pub fn finished(self) -> bool {
+        let last = self.marks.len() - 1
+        let at = if self.marker < last { self.marker } else { last }
+        return self.pos * 8 - self.nbits <= self.marks[at] * 8
+    }
+
+    #: One block's coefficients into `coef`. Returns how many it set, the DC
+    #: always among them, in the low byte and which columns they fell in
+    #: above it -- or -1 for a stream the reference must read:
+    #: a DC length no conforming stream has, or a code whose table index comes
+    #: out negative.
+    fn block(self, slot: int) -> int {
+        let clean = self.clean
+        let limit = clean.len()
+        let coef = self.coef
+        let zigzag = self.zigzag
+        let table = self.quant[slot]
+        let dc_table = self.dc_tables[slot]
+        let ac_table = self.ac_tables[slot]
+        var acc = self.acc
+        var nbits = self.nbits
+        var pos = self.pos
+        var entry = 0
+        var code = 0
+        var length = 0
+        var top = 0
+        var index = 0
+        var raw = 0
+        var run = 0
+        var size = 0
+        var symbol = 0
+        var count = 1
+        var at = 0
+        var going = true
+
+        if nbits < 32 {
+            acc = acc & (1 << nbits) - 1
+            while nbits <= 48 {
+                acc = acc << 8 | (if pos < limit { clean[pos] } else { 0 })
+                pos += 1
+                nbits += 8
+            }
+        }
+        entry = dc_table[acc >> nbits - 9 & 511]
+        if entry == -1 {
+            #: `BitReader.decode`, written out for a code longer than nine
+            #: bits. A call would do, except that a call to a function that
+            #: has not compiled stops the compile of everything after it, and
+            #: a stream whose codes are all short never calls it.
+            entry = 16 << 8
+            code = 0
+            length = 0
+            while length < 16 {
+                code = code << 1 | acc >> nbits - 1 - length & 1
+                top = dc_table[LOOK_MAX + length]
+                if top >= 0 and code <= top {
+                    index = dc_table[LOOK_AT + length] + code - dc_table[LOOK_MIN + length]
+                    entry = if index < 0 {
+                        -1
+                    } elif index < dc_table[LOOK_COUNT] {
+                        length + 1 << 8 | dc_table[LOOK_VALUES + index]
+                    } else {
+                        length + 1 << 8
+                    }
+                    length = 16
+                }
+                length += 1
+            }
+            if entry < 0 { return -1 }
+        }
+        nbits -= entry >> 8
+        length = entry & 255
+        if length > 16 { return -1 }
+        var difference = 0
+        if length > 0 {
+            raw = acc >> nbits - length & (1 << length) - 1
+            nbits -= length
+            difference = if raw < 1 << length - 1 { raw - (1 << length) + 1 } else { raw }
+        }
+        let predictor = self.predictors[slot] + difference
+        self.predictors[slot] = predictor
+        coef[0] = float(predictor * table[0])
+        var columns = 1
+
+        index = 1
+        while going and index < 64 {
+            if nbits < 32 {
+                acc = acc & (1 << nbits) - 1
+                while nbits <= 48 {
+                    acc = acc << 8 | (if pos < limit { clean[pos] } else { 0 })
+                    pos += 1
+                    nbits += 8
+                }
+            }
+            entry = ac_table[acc >> nbits - 9 & 511]
+            if entry == -1 {
+                entry = 16 << 8
+                code = 0
+                length = 0
+                while length < 16 {
+                    code = code << 1 | acc >> nbits - 1 - length & 1
+                    top = ac_table[LOOK_MAX + length]
+                    if top >= 0 and code <= top {
+                        at = ac_table[LOOK_AT + length] + code - ac_table[LOOK_MIN + length]
+                        entry = if at < 0 {
+                            -1
+                        } elif at < ac_table[LOOK_COUNT] {
+                            length + 1 << 8 | ac_table[LOOK_VALUES + at]
+                        } else {
+                            length + 1 << 8
+                        }
+                        length = 16
+                    }
+                    length += 1
+                }
+            }
+            symbol = entry & 255
+            run = symbol >> 4
+            size = symbol & 15
+            if entry < 0 {
+                count = -1
+                going = false
+            } elif symbol == 0 {
+                nbits -= entry >> 8
+                going = false
+            } elif size == 0 {
+                nbits -= entry >> 8
+                if run != 15 { going = false } else { index += 16 }
+            } else {
+                nbits -= entry >> 8
+                index += run
+                if index >= 64 {
+                    going = false
+                } else {
+                    raw = acc >> nbits - size & (1 << size) - 1
+                    nbits -= size
+                    if raw < 1 << size - 1 { raw = raw - (1 << size) + 1 }
+                    at = zigzag[index]
+                    coef[at] = float(raw * table[index])
+                    columns = columns | 1 << (at & 7)
+                    count += 1
+                    index += 1
+                }
+            }
+        }
+        if count < 0 { return -1 }
+        self.acc = acc
+        self.nbits = nbits
+        self.pos = pos
+        return columns << 8 | count
+    }
+
+    #: The first half of `idct_8x8`, for the block in `coef` that `block`
+    #: described in `packed`: column u of the coefficients becomes column u of
+    #: `scratch`. Returns which columns came out not all zero, and leaves
+    #: `coef` all zeros again for the next block.
+    #:
+    #: A block that is only its DC term is every output the same sum, so the
+    #: same number: it is worked out once here, left in `flat`, and -1 tells
+    #: `columns` to fill the block with it.
+    #:
+    #: The reference adds `coefficient * basis` over every coefficient that is
+    #: not zero, in order, then halves; this does the same over the same
+    #: coefficients in the same order, with the eight outputs a coefficient
+    #: feeds summed side by side instead of one after another.
+    #:
+    #: `rows` and `columns` are separate, and both called for every block,
+    #: because the function tier holds a body to 20,000 instructions and will
+    #: not plan a call to a method that has never run.
+    fn rows(self, packed: int) -> int {
+        let coef = self.coef
+        let basis = self.basis
+        let scratch = self.scratch
+        let count = packed & 255
+        var coefficient = 0.0
+        var total = 0.0
+        var k = 0
+        var u = 0
+        var v = 0
+        var at = 0
+
+        let b0 = basis[0]
+        if count == 1 {
+            coefficient = coef[0]
+            coef[0] = 0.0
+            total = 0.0
+            if coefficient != 0.0 { total += coefficient * b0 }
+            coefficient = total * 0.5
+            total = 0.0
+            if coefficient != 0.0 { total += coefficient * b0 }
+            let level = total * 0.5 + 128.0
+            self.flat = if level <= 0.0 { 0 } elif level >= 255.0 { 255 } else { int(level + 0.5) }
+            return -1
+        }
+
+        let columns = packed >> 8
+        var t0 = 0.0
+        var t1 = 0.0
+        var t2 = 0.0
+        var t3 = 0.0
+        var t4 = 0.0
+        var t5 = 0.0
+        var t6 = 0.0
+        var t7 = 0.0
+        var any = false
+        var live = 0
+        while u < 8 {
+            if columns >> u & 1 != 0 {
+                #: The v = 0 term comes first and is the same for all eight
+                #: outputs, because that basis row is flat: one product, and
+                #: `0.0 + p` is `p`.
+                coefficient = coef[u]
+                coef[u] = 0.0
+                any = coefficient != 0.0
+                total = if any { coefficient * b0 } else { 0.0 }
+                t0 = total
+                t1 = total
+                t2 = total
+                t3 = total
+                t4 = total
+                t5 = total
+                t6 = total
+                t7 = total
+                v = 1
+                while v < 8 {
+                    at = v * 8
+                    coefficient = coef[at + u]
+                    if coefficient != 0.0 {
+                        coef[at + u] = 0.0
+                        t0 += coefficient * basis[at]
+                        t1 += coefficient * basis[at + 1]
+                        t2 += coefficient * basis[at + 2]
+                        t3 += coefficient * basis[at + 3]
+                        t4 += coefficient * basis[at + 4]
+                        t5 += coefficient * basis[at + 5]
+                        t6 += coefficient * basis[at + 6]
+                        t7 += coefficient * basis[at + 7]
+                        any = true
+                    }
+                    v += 1
+                }
+                if any {
+                    live = live | 1 << u
+                    scratch[u] = t0 * 0.5
+                    scratch[8 + u] = t1 * 0.5
+                    scratch[16 + u] = t2 * 0.5
+                    scratch[24 + u] = t3 * 0.5
+                    scratch[32 + u] = t4 * 0.5
+                    scratch[40 + u] = t5 * 0.5
+                    scratch[48 + u] = t6 * 0.5
+                    scratch[56 + u] = t7 * 0.5
+                }
+            }
+            u += 1
+        }
+        return live
+    }
+
+    #: The second half: the columns of `scratch` named by `live`, through the
+    #: transform again and the clamp after it, into `plane` at `origin` with
+    #: rows `width` apart. A `live` of -1 is a DC-only block, every sample of
+    #: it `flat`.
+    fn columns(self, live: int, plane: list[int], width: int, origin: int) -> void {
+        var y = 0
+        var x = 0
+        var at = 0
+        if live < 0 {
+            let pixel = self.flat
+            while y < 8 {
+                at = origin + y * width
+                x = 0
+                while x < 8 {
+                    plane[at + x] = pixel
+                    x += 1
+                }
+                y += 1
+            }
+            return
+        }
+        let basis = self.basis
+        let scratch = self.scratch
+        var coefficient = 0.0
+        var level = 0.0
+        var u = 0
+        var t0 = 0.0
+        var t1 = 0.0
+        var t2 = 0.0
+        var t3 = 0.0
+        var t4 = 0.0
+        var t5 = 0.0
+        var t6 = 0.0
+        var t7 = 0.0
+        let b0 = basis[0]
+        let first = live & 1
+        while y < 8 {
+            coefficient = if first != 0 { scratch[y * 8] } else { 0.0 }
+            level = if coefficient != 0.0 { coefficient * b0 } else { 0.0 }
+            t0 = level
+            t1 = level
+            t2 = level
+            t3 = level
+            t4 = level
+            t5 = level
+            t6 = level
+            t7 = level
+            u = 1
+            while u < 8 {
+                if live >> u & 1 != 0 {
+                    coefficient = scratch[y * 8 + u]
+                    if coefficient != 0.0 {
+                        at = u * 8
+                        t0 += coefficient * basis[at]
+                        t1 += coefficient * basis[at + 1]
+                        t2 += coefficient * basis[at + 2]
+                        t3 += coefficient * basis[at + 3]
+                        t4 += coefficient * basis[at + 4]
+                        t5 += coefficient * basis[at + 5]
+                        t6 += coefficient * basis[at + 6]
+                        t7 += coefficient * basis[at + 7]
+                    }
+                }
+                u += 1
+            }
+            at = origin + y * width
+            level = t0 * 0.5 + 128.0
+            plane[at] = if level <= 0.0 { 0 } elif level >= 255.0 { 255 } else { int(level + 0.5) }
+            level = t1 * 0.5 + 128.0
+            plane[at + 1] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            level = t2 * 0.5 + 128.0
+            plane[at + 2] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            level = t3 * 0.5 + 128.0
+            plane[at + 3] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            level = t4 * 0.5 + 128.0
+            plane[at + 4] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            level = t5 * 0.5 + 128.0
+            plane[at + 5] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            level = t6 * 0.5 + 128.0
+            plane[at + 6] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            level = t7 * 0.5 + 128.0
+            plane[at + 7] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            y += 1
+        }
+    }
+}
+
+#: `upsample_axis` along rows, on whole-number samples, into `out`, which is
+#: `factor` times as wide.
+#:
+#: These run once a plane, so they compile on stack replacement, and they are
+#: written for it: every local declared before the loops (one declared in a
+#: loop body is null on the way in, which the form will not take), and the
+#: output passed in rather than made here (a list the body built itself has
+#: no element kind the tier can see).
+fn widen_rows(plane: list[int], width: int, height: int, factor: int, out: list[int]) -> void {
+    let out_width = width * factor
+    let last = width - 1
+    var y = 0
+    var index = 0
+    var row = 0
+    var target = 0
+    var here = 0
+    var previous = 0
+    var following = 0
+    var step = 0
+    while y < height {
+        row = y * width
+        target = y * out_width
+        if factor == 2 {
+            previous = plane[row]
+            index = 0
+            while index < width {
+                here = plane[row + index]
+                following = if index < last { plane[row + index + 1] } else { here }
+                out[target] = 3 * here + previous + 2 >> 2
+                out[target + 1] = 3 * here + following + 1 >> 2
+                previous = here
+                target += 2
+                index += 1
+            }
+        } else {
+            index = 0
+            while index < width {
+                here = plane[row + index]
+                step = 0
+                while step < factor {
+                    out[target] = here
+                    target += 1
+                    step += 1
+                }
+                index += 1
+            }
+        }
+        y += 1
+    }
+}
+
+#: `upsample_axis` down columns, a row at a time, into `out`, which is
+#: `factor` times as tall.
+fn widen_columns(plane: list[int], width: int, height: int, factor: int, out: list[int]) -> void {
+    let last = height - 1
+    var y = 0
+    var x = 0
+    var here_row = 0
+    var previous_row = 0
+    var following_row = 0
+    var first = 0
+    var second = 0
+    var here = 0
+    var step = 0
+    while y < height {
+        here_row = y * width
+        previous_row = if y > 0 { here_row - width } else { here_row }
+        following_row = if y < last { here_row + width } else { here_row }
+        if factor == 2 {
+            first = y * 2 * width
+            second = first + width
+            x = 0
+            while x < width {
+                here = plane[here_row + x]
+                out[first + x] = 3 * here + plane[previous_row + x] + 2 >> 2
+                out[second + x] = 3 * here + plane[following_row + x] + 1 >> 2
+                x += 1
+            }
+        } else {
+            step = 0
+            while step < factor {
+                first = (y * factor + step) * width
+                x = 0
+                while x < width {
+                    out[first + x] = plane[here_row + x]
+                    x += 1
+                }
+                step += 1
+            }
+        }
+        y += 1
+    }
+}
+
+#: `assemble`'s colour conversion as tables, built the first time a colour
+#: JPEG takes the fast path. Every term of it is a function of one or two
+#: whole-number samples, so it can be worked out for all of them once:
+#:
+#: - `_BLUE_RED[luma << 8 | cb]` is `clamp255(luma + 1.772 * cb)`, and
+#:   `_BLUE_RED[65536 + (luma << 8 | cr)]` is `clamp255(luma + 1.402 * cr)`;
+#: - `_GREEN[luma << 8 | cb]` is `luma - 0.344136 * cb`, and
+#:   `_GREEN[65536 + cr]` is `0.714136 * cr`, so green is one subtraction and
+#:   a clamp -- the same two operations, in the same order, as `assemble`.
+#:
+#: (`cb` and `cr` here are the samples less 128.0, exactly as there.)
+var _BLUE_RED: list[int] = []
+var _GREEN: list[float] = []
+
+fn colour_tables() -> void {
+    if _BLUE_RED.len() > 0 { return }
+    var blue_red: list[int] = __prim__.list_filled(131072, 0)
+    var green: list[float] = __prim__.list_filled(65536 + 256, 0.0)
+    var luma = 0
+    var chroma = 0
+    var y = 0.0
+    var c = 0.0
+    var level = 0.0
+    while luma < 256 {
+        y = float(luma)
+        chroma = 0
+        while chroma < 256 {
+            c = float(chroma) - 128.0
+            level = y + 1.772 * c
+            blue_red[luma << 8 | chroma] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            level = y + 1.402 * c
+            blue_red[65536 + (luma << 8 | chroma)] = if level <= 0.0 {
+                0
+            } elif level >= 255.0 {
+                255
+            } else {
+                int(level + 0.5)
+            }
+            green[luma << 8 | chroma] = y - 0.344136 * c
+            chroma += 1
+        }
+        luma += 1
+    }
+    chroma = 0
+    while chroma < 256 {
+        green[65536 + chroma] = 0.714136 * (float(chroma) - 128.0)
+        chroma += 1
+    }
+    _BLUE_RED = blue_red
+    _GREEN = green
+}
+
+#: YCbCr planes, all `stride` wide, to packed BGR, by `colour_tables`.
+fn ycc_to_bgr(
+    luma_plane: list[int],
+    cb_plane: list[int],
+    cr_plane: list[int],
+    stride: int,
+    width: int,
+    height: int,
+    out: list[int]
+) -> void {
+    let blue_red = _BLUE_RED
+    let green = _GREEN
+    var o = 0
+    var y = 0
+    var x = 0
+    var at = 0
+    var luma = 0
+    var cb = 0
+    var cr = 0
+    var level = 0.0
+    while y < height {
+        at = y * stride
+        x = 0
+        while x < width {
+            luma = luma_plane[at] << 8
+            cb = cb_plane[at]
+            cr = cr_plane[at]
+            out[o] = blue_red[luma | cb]
+            level = green[luma | cb] - green[65536 + cr]
+            out[o + 1] = if level <= 0.0 { 0 } elif level >= 255.0 { 255 } else { int(level + 0.5) }
+            out[o + 2] = blue_red[65536 + (luma | cr)]
+            o += 3
+            at += 1
+            x += 1
+        }
+        y += 1
+    }
+}
+
+#: `ycc_to_bgr` for chroma planes still at half height, upsampled down the
+#: columns as it goes: `widen_columns`' two rows from each chroma row, worked
+#: out where they are wanted instead of stored. Output row y reads chroma row
+#: y / 2 and the one above it (y even) or below it (y odd), as `widen_columns`
+#: does, with its rounding.
+fn ycc_to_bgr_tall(
+    luma_plane: list[int],
+    cb_plane: list[int],
+    cr_plane: list[int],
+    stride: int,
+    width: int,
+    height: int,
+    chroma_rows: int,
+    out: list[int]
+) -> void {
+    let blue_red = _BLUE_RED
+    let green = _GREEN
+    let last = chroma_rows - 1
+    var o = 0
+    var y = 0
+    var x = 0
+    var at = 0
+    var half = 0
+    var here = 0
+    var other = 0
+    var bias = 0
+    var luma = 0
+    var cb = 0
+    var cr = 0
+    var level = 0.0
+    while y < height {
+        half = y >> 1
+        here = half * stride
+        if y & 1 == 0 {
+            other = if half > 0 { here - stride } else { here }
+            bias = 2
+        } else {
+            other = if half < last { here + stride } else { here }
+            bias = 1
+        }
+        at = y * stride
+        x = 0
+        while x < width {
+            luma = luma_plane[at + x] << 8
+            cb = 3 * cb_plane[here + x] + cb_plane[other + x] + bias >> 2
+            cr = 3 * cr_plane[here + x] + cr_plane[other + x] + bias >> 2
+            out[o] = blue_red[luma | cb]
+            level = green[luma | cb] - green[65536 + cr]
+            out[o + 1] = if level <= 0.0 { 0 } elif level >= 255.0 { 255 } else { int(level + 0.5) }
+            out[o + 2] = blue_red[65536 + (luma | cr)]
+            o += 3
+            x += 1
+        }
+        y += 1
+    }
+}
+
+#: One plane's top-left `width` by `height`, packed.
+fn crop_plane(plane: list[int], stride: int, width: int, height: int, out: list[int]) -> void {
+    var o = 0
+    var y = 0
+    var x = 0
+    var row = 0
+    while y < height {
+        row = y * stride
+        x = 0
+        while x < width {
+            out[o] = plane[row + x]
+            o += 1
+            x += 1
+        }
+        y += 1
+    }
+}
+
+#: The scan, the fast way, or null to send it through the reference loop.
+fn scan_fast(
+    data: bytes,
+    start: int,
+    components: list[Component],
+    quant_tables: list[list[int]],
+    block_dc: list[HuffmanTable],
+    block_ac: list[HuffmanTable],
+    frame_width: int,
+    frame_height: int,
+    restart_interval: int,
+    max_h: int,
+    max_v: int,
+    mcus_across: int,
+    mcus_down: int
+) -> Mat? {
+    let count = components.len()
+    if count != 1 and count != 3 { return null }
+    #: `rows` and `columns` take the zeroth basis row as one number. It is,
+    #: on every machine this has run on; if it ever were not, the reference
+    #: decodes instead.
+    if not DC_FLAT { return null }
+    var planes: list[list[int]] = []
+    var widths: list[int] = []
+    var heights: list[int] = []
+    var hs: list[int] = []
+    var vs: list[int] = []
+    var tables: list[list[int]] = []
+    var usable = true
+    for component in components {
+        if component.h < 1 or component.h > 4 or component.v < 1 or component.v > 4 {
+            usable = false
+        } elif max_h % component.h != 0 or max_v % component.v != 0 {
+            usable = false
+        }
+    }
+    if not usable { return null }
+    for slot in 0..count {
+        let component = components[slot]
+        planes.push(__prim__.list_filled(component.width * component.height, 0))
+        widths.push(component.width)
+        heights.push(component.height)
+        hs.push(component.h)
+        vs.push(component.v)
+        tables.push(lookahead_for(block_dc[slot]))
+        tables.push(lookahead_for(block_ac[slot]))
+    }
+
+    var marks: list[int] = []
+    let clean = unstuff(data, start, marks)
+    let fast = FastScan(clean, marks, planes, widths, hs, vs, quant_tables, tables)
+    fast.restart_interval = restart_interval
+    fast.mcus_across = mcus_across
+    var decoded = true
+    var mcu_y = 0
+    while decoded and mcu_y < mcus_down {
+        decoded = fast.row(mcu_y)
+        mcu_y += 1
+    }
+    if not decoded or not fast.finished() { return null }
+
+    #: `assemble`'s upsampling: across first, then down, each by the whole
+    #: factor that brings the plane to the frame's sampling. Chroma at half
+    #: height under full-size luma -- 4:2:0, what cameras and video write --
+    #: is left at half height and doubled inside the colour conversion.
+    let tall = count == 3 and
+        hs[0] == max_h and
+        vs[0] == max_v and
+        vs[1] == vs[2] and
+        max_v // vs[1] == 2
+    for slot in 0..count {
+        if hs[slot] < max_h {
+            let factor = max_h // hs[slot]
+            var wider: list[int] = __prim__.list_filled(widths[slot] * factor * heights[slot], 0)
+            widen_rows(planes[slot], widths[slot], heights[slot], factor, wider)
+            planes[slot] = wider
+            widths[slot] = widths[slot] * factor
+        }
+        if vs[slot] < max_v and not tall {
+            let factor = max_v // vs[slot]
+            var taller: list[int] = __prim__.list_filled(widths[slot] * heights[slot] * factor, 0)
+            widen_columns(planes[slot], widths[slot], heights[slot], factor, taller)
+            planes[slot] = taller
+            heights[slot] = heights[slot] * factor
+        }
+    }
+
+    var out: list[int] = __prim__.list_filled(frame_width * frame_height * count, 0)
+    if count == 1 {
+        crop_plane(planes[0], widths[0], frame_width, frame_height, out)
+    } else {
+        colour_tables()
+        if tall {
+            ycc_to_bgr_tall(
+                planes[0],
+                planes[1],
+                planes[2],
+                widths[0],
+                frame_width,
+                frame_height,
+                heights[1],
+                out
+            )
+        } else {
+            ycc_to_bgr(planes[0], planes[1], planes[2], widths[0], frame_width, frame_height, out)
+        }
+    }
+    #: `bytes_new` rather than `bytes`: the conversion builtin walks the list
+    #: as a generic iterable, a third of the whole decode on its own.
+    return Mat.from_bytes(
+        frame_height,
+        frame_width,
+        CV_MAKETYPE(CV_8U, count),
+        __prim__.bytes_new(out)
+    )
 }
 
 fn scaled_table(base: list[int], quality: int) -> list[int] {
