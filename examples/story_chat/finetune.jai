@@ -11,8 +11,9 @@
 #: 2.979), after `WARMUP` (50) steps, cosine to a tenth over all `--epochs`
 #: (3).
 #: Reports the masked loss on `dialogues_validation` every epoch and saves the
-#: best to `CHAT_CKPT` (default `~/.cache/jaithon/story_chat/chat.ckpt`), and
-#: the latest, optimiser and all, beside it as `chat.ckpt.state`.
+#: best to `CHAT_CKPT` (default `~/.cache/jaithon/story_chat/chat.ckpt`,
+#: weights only), and the latest, optimiser and all, beside it as
+#: `chat.ckpt.state`.
 #: `--one-epoch` stops after an epoch (exit status 10 while epochs remain) and
 #: `--resume` carries on from the latest, so `run_full.sh` can give each epoch
 #: its own turn on the GPU.
@@ -213,7 +214,7 @@ fn main() -> int {
         )
         trainer.save(state_path, m)
         if improved {
-            trainer.save(path, m)
+            trainer.save_weights(path, m)
             print(f"saved {path} (best validation loss so far)")
         }
         if one_epoch and epoch < epochs {

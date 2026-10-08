@@ -111,6 +111,15 @@ pub class Trainer {
         Path(partial).rename(Path(path))
     }
 
+    #: The weights alone, for a model that is only going to be loaded: a
+    #: third of the size of `save`'s file.
+    pub fn save_weights(self, path: str, meta: dict[str, any]) -> void {
+        let partial = path + ".partial"
+        jt.save_checkpoint(partial, self.model.names(), self.params, meta: meta)
+        if Path(path).exists() { Path(path).remove() }
+        Path(partial).rename(Path(path))
+    }
+
     #: Carry on from a checkpoint `save` wrote; returns its metadata.
     pub fn restore(self, path: str) -> dict[str, any] {
         var names = self.model.names()
