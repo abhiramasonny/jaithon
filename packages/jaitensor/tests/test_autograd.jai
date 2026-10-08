@@ -1,6 +1,8 @@
 #: Backward passes against a central difference, and against arithmetic done here.
 import jaitensor as jt
+import std.gpu as gpu
 import std.math
+import std.os
 from jaitensor.tensor import GradNode, Tensor
 from std.test import assert_eq, assert_near, assert_true
 
@@ -593,4 +595,312 @@ fn test_group_norm_backward_matches_a_hand_computation() -> void {
         assert_values_near(grads[2].download(), want_beta, 1e-4)
         for grad in grads { grad.free() }
     }
+}
+
+fn free_graph(held: list[Tensor]) -> void {
+    for tensor in held { tensor.free() }
+}
+
+fn clear_grad(tensor: Tensor) -> void {
+    let gradient = tensor.grad
+    if gradient is not null {
+        gradient.free()
+        tensor.grad = null
+    }
+}
+
+#: `op` applied with the constant on the left (`swap` false) or the right.
+fn binary_by_name(name: str, constant: Tensor, x: Tensor, swap: bool) -> Tensor {
+    let a = if swap { x } else { constant }
+    let b = if swap { constant } else { x }
+    if name == "add" { return jt.add(a, b) }
+    if name == "subtract" { return jt.subtract(a, b) }
+    if name == "multiply" { return jt.multiply(a, b) }
+    return jt.divide(a, b)
+}
+
+#: d/dx of sum(op(c, x)) or sum(op(x, c)), elementwise, done here.
+fn binary_grad_by_hand(name: str, c: float, x: float, swap: bool) -> float {
+    if name == "add" { return 1.0 }
+    if name == "subtract" { return if swap { 1.0 } else { -1.0 } }
+    if name == "multiply" { return c }
+    return if swap { 1.0 / c } else { -c / (x * x) }
+}
+
+fn test_backward_gives_no_gradient_to_a_constant_on_either_side_of_a_binary_op() -> void {
+    if not jt.is_available() { return }
+    let x_values = [0.5, -1.25, 2.0, 1.5]
+    let c_values = [2.0, 0.75, -1.5, 3.0]
+    let x = jt.Tensor([4], x_values, requires_grad: true)
+    defer { x.free() }
+    let c = jt.Tensor([4], c_values)
+    defer { c.free() }
+    for name in ["add", "subtract", "multiply", "divide"] {
+        for swap in [false, true] {
+            gpu.synchronize()
+            let before = gpu.live_buffers()
+            for _step in 0..3 {
+                let out = binary_by_name(name, c, x, swap)
+                let loss = jt.sum(out)
+                free_graph(loss.backward())
+                loss.free()
+                if c.grad is not null {
+                    throw AssertionError(f"{name} (swap {swap}) gave the constant a gradient")
+                }
+                let gradient = x.grad
+                if gradient is null { throw AssertionError(f"{name} (swap {swap}) gave x no gradient") }
+                var want: list[float] = []
+                for index in 0..4 {
+                    want.push(binary_grad_by_hand(name, c_values[index], x_values[index], swap))
+                }
+                assert_values_near(gradient.download(), want, 1e-5)
+                clear_grad(x)
+            }
+            gpu.synchronize()
+            assert_eq(gpu.live_buffers(), before)
+        }
+    }
+}
+
+fn test_matmul_backward_gives_no_gradient_to_a_data_operand_on_either_side() -> void {
+    if not jt.is_available() { return }
+    let data = jt.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    defer { data.free() }
+    let right = jt.Tensor([3, 2], [0.5, -1.0, 2.0, 0.25, -0.5, 1.5], requires_grad: true)
+    defer { right.free() }
+    let left = jt.Tensor([3, 2], [1.0, -2.0, 0.5, 0.75, 3.0, -1.0], requires_grad: true)
+    defer { left.free() }
+    for _step in 0..3 {
+        #: data @ right: d/d(right) of the sum is data^T @ ones, data's column sums.
+        let product = jt.matmul(data, right)
+        let loss = jt.sum(product)
+        free_graph(loss.backward())
+        loss.free()
+        assert_true(data.grad is null)
+        let gradient = right.grad
+        if gradient is null { throw AssertionError("matmul gave the weight no gradient") }
+        assert_values_near(gradient.download(), [5.0, 5.0, 7.0, 7.0, 9.0, 9.0], 1e-5)
+        clear_grad(right)
+
+        #: left^T-shaped use: left [3,2] times data [2,3]; d/d(left) of the sum
+        #: is ones @ data^T, data's row sums in every row.
+        let reversed = jt.matmul(left, data)
+        let reversed_loss = jt.sum(reversed)
+        free_graph(reversed_loss.backward())
+        reversed_loss.free()
+        assert_true(data.grad is null)
+        let left_grad = left.grad
+        if left_grad is null { throw AssertionError("matmul gave the left weight no gradient") }
+        assert_values_near(left_grad.download(), [6.0, 15.0, 6.0, 15.0, 6.0, 15.0], 1e-5)
+        clear_grad(left)
+    }
+}
+
+#: The custom linear from probes5/eager/nograd_inputs.jai: neither the batch
+#: nor the target asked for a gradient, and over three steps neither grows one,
+#: while the weights' gradients come out as computed here.
+fn test_custom_linear_leaves_the_batch_and_target_without_gradients() -> void {
+    if not jt.is_available() { return }
+    let rows = 4
+    let inner = 3
+    let cols = 2
+    var x_values: list[float] = []
+    for index in 0..rows * inner { x_values.push(float(index % 5) * 0.5 - 1.0) }
+    var t_values: list[float] = []
+    for index in 0..rows * cols { t_values.push(float(index % 3) - 1.0) }
+    let x = jt.Tensor([rows, inner], x_values)
+    defer { x.free() }
+    let target = jt.Tensor([rows, cols], t_values)
+    defer { target.free() }
+    let w = jt.Tensor([inner, cols], [0.5, -0.25, 1.0, 0.75, -1.5, 0.125], requires_grad: true)
+    defer { w.free() }
+    let bias = jt.Tensor([cols], [0.1, -0.2], requires_grad: true)
+    defer { bias.free() }
+    gpu.synchronize()
+    let before = gpu.live_buffers()
+    for _step in 0..3 {
+        let y = jt.add(jt.matmul(x, w), bias)
+        let loss = jt.sum(jt.subtract(y, target))
+        free_graph(loss.backward())
+        loss.free()
+        assert_true(x.grad is null)
+        assert_true(target.grad is null)
+        let w_grad = w.grad
+        let b_grad = bias.grad
+        if w_grad is null or b_grad is null { throw AssertionError("weights got no gradient") }
+        #: d/dW sum(xW + b - t) = x^T @ ones; d/db = rows.
+        var want_w: list[float] = []
+        for k in 0..inner {
+            var column = 0.0
+            for r in 0..rows { column += x_values[r * inner + k] }
+            for _c in 0..cols { want_w.push(column) }
+        }
+        assert_values_near(w_grad.download(), want_w, 1e-5)
+        assert_values_near(b_grad.download(), [float(rows), float(rows)], 1e-5)
+        clear_grad(w)
+        clear_grad(bias)
+    }
+    gpu.synchronize()
+    assert_eq(gpu.live_buffers(), before)
+}
+
+fn test_backward_releases_an_intermediate_gradient_unless_it_is_retained() -> void {
+    if not jt.is_available() { return }
+    if os.env_or("JAITENSOR_BACKWARD_FREE", "1") == "0" { return }
+    let x = jt.Tensor([3], [1.0, -2.0, 0.5], requires_grad: true)
+    defer { x.free() }
+    let squared = jt.multiply(x, x)
+    let loss = jt.sum(squared)
+    let held = loss.backward()
+    assert_true(squared.grad is null)
+    let gradient = x.grad
+    if gradient is null { throw AssertionError("expected x.grad") }
+    assert_values_near(gradient.download(), [2.0, -4.0, 1.0], 1e-5)
+    free_graph(held)
+    loss.free()
+    clear_grad(x)
+
+    let kept = jt.multiply(x, x).retain_grad()
+    let kept_loss = jt.sum(jt.scale(kept, 3.0))
+    let kept_held = kept_loss.backward()
+    let kept_grad = kept.grad
+    if kept_grad is null { throw AssertionError("a retained gradient was released") }
+    assert_values_near(kept_grad.download(), [3.0, 3.0, 3.0], 1e-5)
+    let x_grad = x.grad
+    if x_grad is null { throw AssertionError("expected x.grad") }
+    assert_values_near(x_grad.download(), [6.0, -12.0, 3.0], 1e-5)
+    free_graph(kept_held)
+    kept_loss.free()
+}
+
+#: A retained gradient that the op below passes straight through (either side
+#: of a sum) must not change when that input's gradient is added to later.
+fn test_a_retained_gradient_is_not_shared_with_the_input_below_it() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([2], [1.0, 2.0], requires_grad: true)
+    defer { x.free() }
+    let summed = jt.add(x, x).retain_grad()
+    let loss = jt.sum(jt.add(summed, x))
+    let held = loss.backward()
+    let kept = summed.grad
+    if kept is null { throw AssertionError("a retained gradient was released") }
+    assert_values_near(kept.download(), [1.0, 1.0], 1e-6)
+    let x_grad = x.grad
+    if x_grad is null { throw AssertionError("expected x.grad") }
+    assert_values_near(x_grad.download(), [3.0, 3.0], 1e-6)
+    free_graph(held)
+    loss.free()
+}
+
+#: `reshape`'s backward hands its input a view of the upstream gradient. For
+#: a parameter that view pointed into the reshaped tensor's gradient, which
+#: freeing the graph released, so the parameter's `.grad` read whatever the
+#: pool handed out next.
+fn test_a_reshaped_parameter_keeps_its_gradient_after_the_graph_is_freed() -> void {
+    if not jt.is_available() { return }
+    let w = jt.Tensor([2, 3], [1.0, 2.0, 3.0, -1.0, -2.0, 0.5], requires_grad: true)
+    defer { w.free() }
+    for step in 0..3 {
+        let flat = jt.reshape(w, [6])
+        let loss = jt.sum(jt.multiply(flat, flat))
+        free_graph(loss.backward())
+        loss.free()
+        #: Take the freed memory back out of the pool and scribble on it.
+        var scribbles: list[Tensor] = []
+        for _i in 0..4 { scribbles.push(jt.fill([6], 7.0)) }
+        gpu.synchronize()
+        let gradient = w.grad
+        if gradient is null { throw AssertionError("expected w.grad") }
+        assert_true(not gradient.is_freed())
+        let times = float(step + 1)
+        assert_values_near(
+            gradient.download(),
+            [2.0 * times, 4.0 * times, 6.0 * times, -2.0 * times, -4.0 * times, 1.0 * times],
+            1e-5
+        )
+        for scribble in scribbles { scribble.free() }
+    }
+}
+
+fn test_backward_releases_what_only_one_op_saved_for_its_backward() -> void {
+    if not jt.is_available() { return }
+    if os.env_or("JAITENSOR_BACKWARD_FREE", "1") == "0" { return }
+    let logits = jt.Tensor([2, 3], [1.0, 2.0, 0.5, 0.5, -1.0, 2.0], requires_grad: true)
+    defer { logits.free() }
+    let labels = jt.Tensor([2], [1.0, 2.0])
+    defer { labels.free() }
+    let loss = jt.SparseCategoricalCrossentropy(from_logits: true).forward(logits, labels)
+    let node = loss.creator
+    if node is null { throw AssertionError("expected a recorded loss") }
+    let saved = node.extras
+    assert_true(saved.len() > 0)
+    let held = loss.backward()
+    for tensor in saved { assert_true(tensor.is_freed()) }
+    assert_true(logits.grad is not null)
+    free_graph(held)
+    loss.free()
+}
+
+fn test_no_grad_records_nothing_and_restores_the_previous_state() -> void {
+    if not jt.is_available() { return }
+    let x = jt.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
+    defer { x.free() }
+    let w = jt.Tensor([2, 2], [0.5, -1.0, 1.5, 2.0], requires_grad: true)
+    defer { w.free() }
+    let gamma = jt.Tensor([2], [1.0, 1.0], requires_grad: true)
+    defer { gamma.free() }
+    let beta = jt.Tensor([2], [0.0, 0.0], requires_grad: true)
+    defer { beta.free() }
+    let labels = jt.Tensor([2], [0.0, 1.0])
+    defer { labels.free() }
+    assert_true(jt.is_grad_enabled())
+    gpu.synchronize()
+    let before = gpu.live_buffers()
+    var seen: list[bool] = []
+    jt.no_grad(fn() -> void {
+        seen.push(jt.is_grad_enabled())
+        let y = jt.matmul(x, w)
+        assert_true(y.creator is null)
+        assert_true(not y.requires_grad)
+        let z = jt.add(y, w)
+        assert_true(z.creator is null)
+        let n = jt.layer_norm(z, gamma, beta)
+        assert_true(n.creator is null)
+        let loss = jt.SparseCategoricalCrossentropy(from_logits: true).forward(n, labels)
+        assert_true(loss.creator is null)
+        #: Fused while nothing records; the two-step form would leave its
+        #: middle tensor to a graph that is never built.
+        let gelu_out = jt.linear_gelu(x, w, beta)
+        assert_true(gelu_out.creator is null)
+        let residual_out = jt.linear_residual(x, w, x)
+        assert_true(residual_out.creator is null)
+        jt.no_grad(fn() -> void { seen.push(jt.is_grad_enabled()) })
+        seen.push(jt.is_grad_enabled())
+        for tensor in [y, z, n, loss, gelu_out, residual_out] { tensor.free() }
+    })
+    assert_eq(seen, [false, false, false])
+    assert_true(jt.is_grad_enabled())
+    gpu.synchronize()
+    assert_eq(gpu.live_buffers(), before)
+    assert_true(w.grad is null)
+
+    var raised = false
+    try {
+        jt.no_grad(fn() -> void { throw ValueError("inside") })
+    } catch _failure: ValueError {
+        raised = true
+    }
+    assert_true(raised)
+    assert_true(jt.is_grad_enabled())
+
+    let previous = jt.set_grad_enabled(false)
+    assert_true(previous)
+    let off = jt.matmul(x, w)
+    assert_true(off.creator is null)
+    off.free()
+    assert_true(not jt.set_grad_enabled(true))
+    let on = jt.matmul(x, w)
+    assert_true(on.creator is not null)
+    free_graph(on.discard_graph())
+    on.free()
 }

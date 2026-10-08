@@ -1,7 +1,7 @@
 #: Matrix products, and the dense and fused linear layers built on them.
 import std.gpu as gpu
 import ..gemm as gemm
-from ..tensor import GradNode, Tensor
+from ..tensor import GradNode, Tensor, is_grad_enabled
 from ..trace import record_dense_forward, record_dense_backward
 from .elementwise import add, gelu
 from .kernels import cached_kernel, reduce_leading, unary_backward
@@ -122,20 +122,34 @@ pub fn matmul(
     }
     let output = raw_matmul(a, b, trans_a: trans_a, trans_b: trans_b, out: out)
     if out is null and (a.requires_grad or b.requires_grad) {
+        #: As `dense_affine` does: a side that never asked for a gradient
+        #: (a data batch, a frozen weight) gets its placeholder back instead
+        #: of a whole GEMM nobody reads.
+        let need_a = a.requires_grad
+        let need_b = b.requires_grad
         output.attach_creator(GradNode([a, b], fn(upstream: Tensor) -> list[Tensor] {
-            if trans_a and trans_b {
-                return [raw_matmul(b, upstream, trans_a: true, trans_b: true), raw_matmul(upstream, a, trans_a: true, trans_b: true)]
-            }
-            if trans_a {
-                return [raw_matmul(b, upstream, trans_b: true), raw_matmul(a, upstream)]
-            }
-            if trans_b {
-                return [raw_matmul(upstream, b), raw_matmul(upstream, a, trans_a: true)]
-            }
-            return [raw_matmul(upstream, b, trans_b: true), raw_matmul(a, upstream, trans_a: true)]
+            let grad_a = if need_a { matmul_grad_a(a, b, upstream, trans_a, trans_b) } else { a }
+            let grad_b = if need_b { matmul_grad_b(a, b, upstream, trans_a, trans_b) } else { b }
+            return [grad_a, grad_b]
         }))
     }
     return output
+}
+
+#: Gradient of `op(a) @ op(b)` with respect to `a`, in `a`'s own layout.
+fn matmul_grad_a(a: Tensor, b: Tensor, upstream: Tensor, trans_a: bool, trans_b: bool) -> Tensor {
+    if trans_a and trans_b { return raw_matmul(b, upstream, trans_a: true, trans_b: true) }
+    if trans_a { return raw_matmul(b, upstream, trans_b: true) }
+    if trans_b { return raw_matmul(upstream, b) }
+    return raw_matmul(upstream, b, trans_b: true)
+}
+
+#: Gradient of `op(a) @ op(b)` with respect to `b`, in `b`'s own layout.
+fn matmul_grad_b(a: Tensor, b: Tensor, upstream: Tensor, trans_a: bool, trans_b: bool) -> Tensor {
+    if trans_a and trans_b { return raw_matmul(upstream, a, trans_a: true, trans_b: true) }
+    if trans_a { return raw_matmul(a, upstream) }
+    if trans_b { return raw_matmul(upstream, a, trans_a: true) }
+    return raw_matmul(a, upstream, trans_a: true)
 }
 
 #: Affine transform `x @ weights + bias` with an optional fused activation.
@@ -193,7 +207,10 @@ pub fn dense_affine(x: Tensor, weights: Tensor, bias: Tensor, activation: int) -
 #: function of what went *into* it, and a fused epilogue keeps only what came
 #: out, so training takes the two-step path and keeps the intermediate it needs.
 pub fn linear_gelu(x: Tensor, weights: Tensor, bias: Tensor) -> Tensor {
-    if x.requires_grad or weights.requires_grad or bias.requires_grad {
+    #: Inside `no_grad` nothing records the intermediate, so the two-step
+    #: path would leave it to nobody; the fused one is right there.
+    let training = is_grad_enabled() and (x.requires_grad or weights.requires_grad or bias.requires_grad)
+    if training {
         return gelu(dense_affine(x, weights, bias, 0))
     }
     return raw_matmul(x, weights, bias: bias, epilogue: 5)
@@ -217,7 +234,8 @@ pub fn linear_residual(x: Tensor, weights: Tensor, residual: Tensor) -> Tensor {
             f"linear_residual needs a residual of [{rows}, {columns}], got {residual.shape}"
         )
     }
-    if x.requires_grad or weights.requires_grad or residual.requires_grad {
+    let training = is_grad_enabled() and (x.requires_grad or weights.requires_grad or residual.requires_grad)
+    if training {
         return add(residual, matmul(x, weights))
     }
     return raw_matmul(x, weights, bias: residual, epilogue: 6)

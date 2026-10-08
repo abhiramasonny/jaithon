@@ -43,7 +43,7 @@ fn broadcast_add(a: Tensor, b: Tensor) -> Tensor {
     return output
 }
 
-fn binary_backward(a: Tensor, b: Tensor, upstream: Tensor, operation: int) -> list[Tensor] {
+fn binary_backward_both(a: Tensor, b: Tensor, upstream: Tensor, operation: int) -> list[Tensor] {
     let grad_a = Tensor(a.shape)
     let grad_b = Tensor(b.shape)
     let kernel = cached_kernel("binary_backward_op")
@@ -53,6 +53,39 @@ fn binary_backward(a: Tensor, b: Tensor, upstream: Tensor, operation: int) -> li
         [a.size, operation]
     )
     return [grad_a, grad_b]
+}
+
+#: Gradients of `a (op) b` for the sides that want one.
+#:
+#: A side that never asked for a gradient gets its placeholder (the input
+#: itself) and no kernel. Where a side's gradient is the upstream as it
+#: stands -- either side of a sum, the left of a difference -- the upstream
+#: is handed over rather than copied; `backward()` gives it to that input.
+#: Every value is the same expression the two-sided kernel evaluates, so the
+#: answer is unchanged bit for bit.
+fn binary_backward(
+    a: Tensor,
+    b: Tensor,
+    upstream: Tensor,
+    operation: int,
+    need_a: bool,
+    need_b: bool
+) -> list[Tensor] {
+    if need_a and need_b {
+        if operation == 0 { return [upstream, unary(upstream, 0)] }
+        if operation == 1 { return [upstream, unary(upstream, 7)] }
+        return binary_backward_both(a, b, upstream, operation)
+    }
+    if need_a {
+        if operation == 0 or operation == 1 { return [upstream, b] }
+        return [binary(upstream, b, operation), b]
+    }
+    if operation == 0 { return [a, upstream] }
+    if operation == 1 { return [a, unary(upstream, 7)] }
+    if operation == 2 { return [a, binary(upstream, a, 2)] }
+    let both = binary_backward_both(a, b, upstream, operation)
+    both[0].free()
+    return [a, both[1]]
 }
 
 #: Elementwise sum of equal-shaped tensors, or of `a` with a `b` whose shape
@@ -65,10 +98,15 @@ pub fn add(a: Tensor, b: Tensor) -> Tensor {
     }
     let output = if broadcasting { broadcast_add(a, b) } else { binary(a, b, 0) }
     if a.requires_grad or b.requires_grad {
+        let need_a = a.requires_grad
+        let need_b = b.requires_grad
         output.attach_creator(GradNode([a, b], |upstream| if broadcasting {
-            [unary(upstream, 0), reduce_leading(upstream, b.shape)]
+            [
+                if need_a { upstream } else { a },
+                if need_b { reduce_leading(upstream, b.shape) } else { b },
+            ]
         } else {
-            binary_backward(a, b, upstream, 0)
+            binary_backward(a, b, upstream, 0, need_a, need_b)
         }))
     }
     return output
@@ -78,7 +116,9 @@ pub fn add(a: Tensor, b: Tensor) -> Tensor {
 pub fn subtract(a: Tensor, b: Tensor) -> Tensor {
     let output = binary(a, b, 1)
     if a.requires_grad or b.requires_grad {
-        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 1)))
+        let need_a = a.requires_grad
+        let need_b = b.requires_grad
+        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 1, need_a, need_b)))
     }
     return output
 }
@@ -87,7 +127,9 @@ pub fn subtract(a: Tensor, b: Tensor) -> Tensor {
 pub fn multiply(a: Tensor, b: Tensor) -> Tensor {
     let output = binary(a, b, 2)
     if a.requires_grad or b.requires_grad {
-        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 2)))
+        let need_a = a.requires_grad
+        let need_b = b.requires_grad
+        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 2, need_a, need_b)))
     }
     return output
 }
@@ -96,7 +138,9 @@ pub fn multiply(a: Tensor, b: Tensor) -> Tensor {
 pub fn divide(a: Tensor, b: Tensor) -> Tensor {
     let output = binary(a, b, 3)
     if a.requires_grad or b.requires_grad {
-        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 3)))
+        let need_a = a.requires_grad
+        let need_b = b.requires_grad
+        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 3, need_a, need_b)))
     }
     return output
 }
@@ -273,10 +317,26 @@ pub fn clamp(input: Tensor, lo: float, hi: float) -> Tensor {
 }
 
 #: Route an upstream gradient to whichever side of a min/max comparison won.
-fn select_grads(a: Tensor, b: Tensor, upstream: Tensor, want_max: int) -> list[Tensor] {
+#: A side that wants no gradient gets its placeholder and no kernel.
+fn select_grads(
+    a: Tensor,
+    b: Tensor,
+    upstream: Tensor,
+    want_max: int,
+    need_a: bool,
+    need_b: bool
+) -> list[Tensor] {
     let kernel = cached_kernel("select_backward")
     var grads: list[Tensor] = []
     for side in 0..2 {
+        if side == 0 and not need_a {
+            grads.push(a)
+            continue
+        }
+        if side == 1 and not need_b {
+            grads.push(b)
+            continue
+        }
         let grad = Tensor(a.shape)
         kernel.dispatch_async(
             [a.buffer(), b.buffer(), upstream.buffer(), grad.buffer()],
@@ -295,7 +355,9 @@ pub fn maximum(a: Tensor, b: Tensor) -> Tensor {
     let kernel = cached_kernel("maximum_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
     if a.requires_grad or b.requires_grad {
-        output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 1)))
+        let need_a = a.requires_grad
+        let need_b = b.requires_grad
+        output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 1, need_a, need_b)))
     }
     return output
 }
@@ -307,7 +369,9 @@ pub fn minimum(a: Tensor, b: Tensor) -> Tensor {
     let kernel = cached_kernel("minimum_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
     if a.requires_grad or b.requires_grad {
-        output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 0)))
+        let need_a = a.requires_grad
+        let need_b = b.requires_grad
+        output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 0, need_a, need_b)))
     }
     return output
 }
