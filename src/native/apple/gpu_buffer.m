@@ -25,7 +25,10 @@
  *
  * `JAITHON_GPU_POOL=0` turns it off, and `JAITHON_GPU_POISON=1` fills every
  * recycled buffer with a signalling NaN, so anything that quietly relied on a
- * fresh allocation arriving zeroed fails loudly instead of occasionally. */
+ * fresh allocation arriving zeroed fails loudly instead of occasionally. The
+ * fill of a buffer still busy with its previous owner's work is queued behind
+ * that work rather than waited for, so POISON runs the same pool paths -- the
+ * busy hand-out and the trade at a first host write -- as a normal run. */
 /* MPS rejects a user buffer below its own alignment quantum. */
 #define JAI_GPU_MIN_BYTES 256
 
@@ -252,6 +255,33 @@ void *jaiGpuBufferHandle(JaiGpuBuffer *b) {
     return b->buffer;
 }
 
+static void poisonFromHost(id<MTLBuffer> buffer, size_t bytes) {
+    float *slots = (float *)[buffer contents];
+    const size_t count = bytes / sizeof(float);
+    for (size_t i = 0; i < count; i++) slots[i] = NAN;
+}
+
+/* JAITHON_GPU_POISON for a recycled buffer. One whose previous owner's work
+ * has finished is filled from the host. A busy one is filled on the queue,
+ * behind that work, and its batch becomes the one the new owner waits on --
+ * nothing is marked, so it stays untouched and a first host write may still
+ * trade it. Waiting for it instead, as this once did, meant no recycled buffer
+ * was ever busy under POISON and the trade never ran there. */
+static uint64_t poisonRecycled(id<MTLBuffer> buffer, size_t bytes, uint64_t carried) {
+    if (carried <= doneBatch()) {
+        poisonFromHost(buffer, bytes);
+        return carried;
+    }
+    uint64_t batch = 0;
+    @synchronized(gQueue) {
+        batch = encodeNanFillLocked(buffer, bytes);
+    }
+    if (batch != 0) return batch;
+    jaiGpuSynchronize();
+    poisonFromHost(buffer, bytes);
+    return carried;
+}
+
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
     if (bytes == 0 || !ensureDevice()) return NULL;
     if (bytes > gMaxBufferLength) return NULL;
@@ -265,12 +295,7 @@ JaiGpuBuffer *jaiGpuAlloc(size_t bytes) {
                 buffer = poolTake(bytes, &carried);
             }
             reused = buffer != nil;
-            if (reused && poolPoisons()) {
-                jaiGpuSynchronize();
-                float *slots = (float *)[buffer contents];
-                const size_t count = bytes / sizeof(float);
-                for (size_t i = 0; i < count; i++) slots[i] = NAN;
-            }
+            if (reused && poolPoisons()) carried = poisonRecycled(buffer, bytes, carried);
         }
         if (buffer == nil) {
             /* Never smaller than MPS's own minimum. Several of its primitives
@@ -321,6 +346,9 @@ static bool swapForFresh(JaiGpuBuffer *b) {
     id<MTLBuffer> fresh = [gDevice newBufferWithLength:least
                                                options:MTLResourceStorageModeShared];
     if (fresh == nil) return false;
+    /* The buffer it stands in for held NaN under POISON, and a partial write
+     * must leave the rest of it that way. */
+    if (poolPoisons()) poisonFromHost(fresh, b->bytes);
     void *busy = b->buffer;
     const uint64_t busyBatch = b->lastBatch;
     b->buffer = (__bridge_retained void *)fresh;

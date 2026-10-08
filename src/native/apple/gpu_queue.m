@@ -1030,6 +1030,20 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
     return !failurePending();
 }
 
+uint64_t encodeNanFillLocked(id<MTLBuffer> buffer, size_t bytes) {
+    /* fillBuffer wants a whole number of words; every float buffer is. */
+    const size_t span = bytes & ~(size_t)3;
+    if (buffer == nil || span == 0) return 0;
+    if (!ensureAsyncCommandBuffer()) return 0;
+    if (gOpenBatch == 0) beginBatchLocked();
+    id<MTLBlitCommandEncoder> blit = [gAsyncCommands blitCommandEncoder];
+    if (blit == nil) return 0;
+    /* All ones in every byte is a NaN in every float. */
+    [blit fillBuffer:buffer range:NSMakeRange(0, span) value:0xFF];
+    [blit endEncoding];
+    return gOpenBatch;
+}
+
 bool ensureAsyncCommandBuffer(void) {
     if (gAsyncEncoder != nil) {
         [gAsyncEncoder endEncoding];

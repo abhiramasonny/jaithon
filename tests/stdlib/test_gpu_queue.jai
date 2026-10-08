@@ -307,6 +307,67 @@ fn test_a_dispatch_whose_backpressure_wait_times_out_says_why() -> void {
     )
 }
 
+#: JAITHON_GPU_POISON reaches the pool paths a normal run takes. A recycled
+#: buffer still busy with its previous owner's kernel is poisoned on the
+#: queue, behind that kernel, instead of waited for, so a first host write can
+#: still trade it for a fresh buffer -- and that fresh buffer is poisoned too,
+#: so a partial write leaves NaN around it. Read before any write, a busy
+#: recycled buffer reads NaN through the queue.
+fn test_poison_covers_a_busy_recycled_buffer_and_its_trade() -> void {
+    if not gpu.is_available() { return }
+    let src = child_program(
+        [
+            "let old = gpu.Buffer.of([1.0, 2.0, 3.0])",
+            "kernel.dispatch_async([old], 3)",
+            "old.free()",
+            "let traded = gpu.Buffer(3)",
+            "traded.upload([0.0], 1)",
+            "let t = traded.download()",
+            "print(f\"traded {t[0] != t[0]} {t[1]} {t[2] != t[2]}\")",
+            "let other = gpu.Buffer.of([1.0, 2.0, 3.0, 4.0])",
+            "kernel.dispatch_async([other], 4)",
+            "other.free()",
+            "let unread = gpu.Buffer(4)",
+            "let u = unread.download()",
+            "print(f\"unread {u[0] != u[0]} {u[3] != u[3]}\")",
+        ]
+    )
+    let ran = run_child(src, "JAITHON_GPU_POISON=1", "poison")
+    assert_eq(ran.exit_code, 0, ran.stderr)
+    assert_true(ran.stdout.contains("traded true 0.0 true"), ran.stdout)
+    assert_true(ran.stdout.contains("unread true true"), ran.stdout)
+}
+
+#: POISON queues the fill of a busy recycled buffer instead of draining the
+#: queue for it. Each step below takes back the buffer the step before freed,
+#: still busy, so a fill that waited would commit and drain once a step -- 40
+#: command buffers, and a recycled buffer that is never busy, which is the
+#: pool path POISON exists to check. Queued, the loop stays one batch.
+fn test_poison_fills_a_busy_recycled_buffer_on_the_queue() -> void {
+    if not gpu.is_available() { return }
+    let src = child_program(
+        [
+            "let a = gpu.Buffer.of([1.0, 2.0, 3.0])",
+            "for _i in 0..40 {",
+            "    let t = gpu.Buffer(3)",
+            "    kernel.dispatch_async([t], 3)",
+            "    kernel.dispatch_async([a], 3)",
+            "    t.free()",
+            "}",
+            "gpu.synchronize()",
+            "print(a.download())",
+        ]
+    )
+    let ran = run_child(
+        src,
+        "JAITHON_GPU_POISON=1 JAITHON_GPU_METER=1 JAITHON_GPU_KERNEL_COMMIT=0",
+        "poison_queue"
+    )
+    assert_eq(ran.exit_code, 0, ran.stderr)
+    assert_true(ran.stdout.contains("[41.0, 42.0, 43.0]"), ran.stdout)
+    assert_true(ran.stderr.contains("buffers 1 "), ran.stderr)
+}
+
 #: A loop that never reads still has its work committed in bounded pieces.
 #: With the kernel-only split off, only the size cap can commit, so the meter
 #: counts one buffer per hundred dispatches -- and the answer is still exact

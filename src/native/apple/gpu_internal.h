@@ -102,6 +102,10 @@ id<MTLCommandBuffer> newAsyncCommandBuffer(void);
  * overlap), and after it, where a batch past its size cap is committed. */
 void     noteGraphEncodeLocked(void);
 void     afterGraphEncodeLocked(void);
+/* Fill the first `bytes` of `buffer` with NaN on the queue, behind whatever is
+ * already queued against it, and return the batch that does it (0 when
+ * nothing could be encoded). Marks no JaiGpuBuffer. For JAITHON_GPU_POISON. */
+uint64_t encodeNanFillLocked(id<MTLBuffer> buffer, size_t bytes);
 void     encodeDispatch(id<MTLComputeCommandEncoder> encoder,
                         id<MTLComputePipelineState> pipeline,
                         NSUInteger threads, NSUInteger groupSize);
