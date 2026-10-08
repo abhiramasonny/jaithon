@@ -66,11 +66,15 @@ FRESH=1 PRETRAIN_MINUTES=15 CHUNK_MINUTES=5 FT_EPOCHS=2 ./examples/story_chat/ru
 
 It took 21 minutes of wall clock (the lock came round quickly that time):
 15 minutes of pretraining in four locked chunks, 2,728 steps, **22,347,776
-tokens at 24,830 tokens a second**; two fine-tuning epochs; the final
-evaluation. The fine-tuning was then redone at a better learning rate (below)
-from the same pretrained checkpoint, with
-`FROM_CKPT=.../run-15m/pretrain.ckpt LR=3e-4` and three `--one-epoch --resume`
-runs under the lock; 3e-4 and three epochs are now the defaults.
+tokens at 24,830 tokens a second**; two fine-tuning epochs at what was then
+the default rate, 1e-4; the final evaluation. The fine-tuning was then redone
+from the same pretrained checkpoint at 3e-4 for three epochs, which did
+better (below) and is now the default:
+
+```bash
+FROM_CKPT=~/.cache/jaithon/story_chat/run-15m/pretrain.ckpt RUN_DIR=~/.cache/jaithon/story_chat/ft-lr3e-4-e3 \
+    ./scripts/bench/gpu_lock.sh ./jaithon run examples/story_chat/finetune.jai -- --epochs 3 --one-epoch --resume   # three times
+```
 
 ### Pretraining
 
@@ -229,8 +233,8 @@ The bigger vocabulary starts ahead -- each of its tokens carries more of the
 text -- and falls behind by five minutes: TinyStories is written in a small
 vocabulary, so doubling the ids buys only 3.3% more bytes a token (4.183
 against 4.049), while the output head and its gradients and the embedding
-double and the step costs 17% more. The trend runs the way the two-hour run
-goes, so 4096 it is. Each figure is one run; the two 5-minute runs saw the
+double and the step costs 17% more. Two hours is far further along that
+trend, so 4096 it is. Each figure is one run; the two 5-minute runs saw the
 same contention (their rates are within 4%), the 2-minute ones a quiet GPU.
 
 ## The model
