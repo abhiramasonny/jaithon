@@ -67,11 +67,6 @@ pub fn config_from_env() -> Config {
 #: the rest; 0 commits only at the loss download. Read once.
 pub let FLUSH = env_int("GPT_FLUSH", 2)
 
-#: `GPT_MIXED=1` runs the large products in float16 (jaitensor's
-#: `set_mixed_precision`), storage and optimiser staying float32. Off by
-#: default; read once, when a model is built.
-pub let MIXED = env_int("GPT_MIXED", 0) == 1
-
 #: Uniform values in `[-limit, limit]` drawn on the host. jaitensor's
 #: `fill_uniform` gives correlated tensors for different seeds (one xorshift
 #: round over a Weyl sequence; the decode track is fixing it), so a deep
@@ -175,7 +170,6 @@ pub class GPT {
     pub let lnf: LayerNorm
 
     pub fn init(self, cfg: Config, seed: int = 1) {
-        if MIXED { jt.set_mixed_precision(true) }
         let rng = Random.with_seed(seed)
         self.cfg = cfg
         self.wte = Embedding(cfg.vocab, cfg.dim)
