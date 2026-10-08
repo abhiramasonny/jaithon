@@ -43,8 +43,10 @@
 #: the whole of them, and is what every importer and the plan compiler use.
 from .graph.execute import implemented_operators, is_implemented, run_graph
 from .graph.nodes import Attr, Graph, GraphNode, attr_float, attr_int, attr_ints, attr_str
+from .graph.ops_shape import mark_rank_zero, RANK_ZERO_INDICES
 from .graph.tensors import normalize_axis
 
 export { Attr, Graph, GraphNode }
 export { attr_float, attr_int, attr_ints, attr_str, normalize_axis }
 export { implemented_operators, is_implemented, run_graph }
+export { mark_rank_zero, RANK_ZERO_INDICES }

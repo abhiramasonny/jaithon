@@ -385,23 +385,88 @@ def custom_domain_fixture() -> None:
     onnx.save(model, MODELS / "onnx_custom_domain.onnx")
 
 
-def external_fixture() -> None:
-    """An initializer whose bytes are in a file nobody shipped."""
-    weight = helper.make_tensor("weight", TensorProto.FLOAT, [4], [0.0, 0.0, 0.0, 0.0])
-    weight.ClearField("float_data")
-    weight.data_location = TensorProto.EXTERNAL
-    entry = weight.external_data.add()
-    entry.key = "location"
-    entry.value = "weight.bin"
+#: The two weights `onnx_external.onnx` keeps in its sidecar, back to back.
+EXTERNAL_WEIGHT = [0.5, -1.0, 2.0, 3.5]
+EXTERNAL_SHIFT = [2.0, 2.0, 0.5, -1.0]
+
+
+def external_tensor(name: str, location: str, offset: int | None, length: int | None) -> onnx.TensorProto:
+    tensor = helper.make_tensor(name, TensorProto.FLOAT, [4], [0.0, 0.0, 0.0, 0.0])
+    tensor.ClearField("float_data")
+    tensor.data_location = TensorProto.EXTERNAL
+    for key, value in (("location", location), ("offset", offset), ("length", length)):
+        if value is None:
+            continue
+        entry = tensor.external_data.add()
+        entry.key = key
+        entry.value = str(value)
+    return tensor
+
+
+def external_model(path: str, weight: onnx.TensorProto, shift: onnx.TensorProto) -> None:
     graph = helper.make_graph(
-        [helper.make_node("Add", ["input", "weight"], ["output"], name="biased")],
+        [
+            helper.make_node("Add", ["input", "weight"], ["biased"], name="biased"),
+            helper.make_node("Mul", ["biased", "shift"], ["output"], name="scaled"),
+        ],
         "external",
         [helper.make_tensor_value_info("input", TensorProto.FLOAT, [4])],
         [helper.make_tensor_value_info("output", TensorProto.FLOAT, [4])],
-        initializer=[weight],
+        initializer=[weight, shift],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)])
-    onnx.save(model, MODELS / "onnx_external.onnx")
+    model.ir_version = 9
+    onnx.save(model, MODELS / path)
+
+
+def external_fixture() -> None:
+    """Initializers whose bytes are in a sidecar, the way torch >= 2.9 writes every export.
+
+    `onnx_external.onnx` reads both weights out of one `.onnx.data` file by
+    offset and length. The others are each refused for a different reason:
+    a sidecar nobody shipped, one that reads past the end of the file, and
+    two locations that leave the model's directory.
+    """
+    sidecar = "onnx_external.onnx.data"
+    (MODELS / sidecar).write_bytes(np.array(EXTERNAL_WEIGHT + EXTERNAL_SHIFT, dtype="<f4").tobytes())
+    external_model("onnx_external.onnx", external_tensor("weight", sidecar, 0, 16),
+                   external_tensor("shift", sidecar, 16, None))
+    external_model("onnx_external_missing.onnx", external_tensor("weight", "weight.bin", None, None),
+                   external_tensor("shift", sidecar, 16, 16))
+    external_model("onnx_external_short.onnx", external_tensor("weight", sidecar, 0, 16),
+                   external_tensor("shift", sidecar, 24, 16))
+    external_model("onnx_external_escape.onnx", external_tensor("weight", "../models/" + sidecar, 0, 16),
+                   external_tensor("shift", sidecar, 16, 16))
+    external_model("onnx_external_absolute.onnx", external_tensor("weight", "/etc/hosts", 0, 16),
+                   external_tensor("shift", sidecar, 16, 16))
+
+
+def scalar_gather_fixture() -> None:
+    """`x[:, 1][:, -1]` as an exporter writes it: two Gathers by rank-zero indices.
+
+    The first index is a `Constant` with no dimensions and the second an
+    initializer with none; each drops the axis it picks from, so `[2, 3, 4]`
+    comes out `[2]`. The test checks the values against the input directly.
+    """
+    first = helper.make_tensor("first", TensorProto.INT64, [], [1])
+    last = helper.make_tensor("last", TensorProto.INT64, [], [-1])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Constant", [], ["first"], name="c_first", value=first),
+            helper.make_node("Gather", ["input", "first"], ["row"], name="pick_row", axis=1),
+            helper.make_node("Gather", ["row", "last"], ["output"], name="pick_last", axis=1),
+        ],
+        "scalar_gather",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [2, 3, 4])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [2])],
+        initializer=[last],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)])
+    model.ir_version = 9
+    path = MODELS / "onnx_scalar_gather.onnx"
+    onnx.save(model, path)
+    sample = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    assert onnxruntime_run(path, sample).tolist() == [7.0, 19.0]
 
 
 def constant_fixture() -> None:
@@ -543,4 +608,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    # `onnx_fixtures.py external scalar_gather` rewrites only those fixtures,
+    # leaving every other file and onnx_cases.txt alone -- a full run re-exports
+    # the torch models, whose bytes change with the installed torch.
+    if len(sys.argv) > 1:
+        for name in sys.argv[1:]:
+            globals()[f"{name}_fixture"]()
+    else:
+        main()

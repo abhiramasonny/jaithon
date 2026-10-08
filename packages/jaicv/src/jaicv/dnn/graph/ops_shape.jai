@@ -4,8 +4,10 @@
 from jaitensor import Tensor
 
 from .kernels import kernel_for
-from .nodes import GraphNode, attr_float, attr_int, attr_ints, attr_str, ints_from, maybe, need
-from .tensors import concat_along, contiguous_strides, copy_of, gather_strided, host_ints
+from .nodes import Attr, GraphNode, attr_float, attr_int, attr_ints, attr_str, ints_from, maybe
+from .nodes import need
+from .tensors import broadcast_shape, concat_along, contiguous_strides, copy_of, expand_to
+from .tensors import gather_strided, host_ints
 from .tensors import normalize_axis, pad_nd_of, shaped, slice_axis, transpose_to, unary_ex_of
 
 pub fn op_reshape(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
@@ -212,6 +214,24 @@ pub fn op_slice(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [gather_strided(data, shape, base, strides)]
 }
 
+#: The attribute an importer puts on a `Gather` whose indices the file wrote
+#: as a rank-zero scalar. jaitensor has no rank-zero tensor, so the index
+#: arrives as `[1]` either way, and this is what says the axis should go.
+pub let RANK_ZERO_INDICES = "jaicv_rank_zero_indices"
+
+#: Mark every `Gather` indexed by one of `scalars` -- the names a file wrote
+#: with no dimensions -- so that it drops the axis it picks from, as ONNX
+#: says. Without it `x[:, 0]` keeps a width of one and the `Gemm` after a
+#: ViT's class token refuses a rank-three operand.
+pub fn mark_rank_zero(nodes: list[GraphNode], scalars: dict[str, bool]) -> void {
+    for node in nodes {
+        if node.op != "Gather" or node.inputs.len() < 2 { continue }
+        if scalars.get(node.inputs[1], false) {
+            node.attrs[RANK_ZERO_INDICES] = Attr.of_int(1)
+        }
+    }
+}
+
 pub fn op_gather(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let data = need(ins, 0, node)
     let indices = need(ins, 1, node)
@@ -220,18 +240,42 @@ pub fn op_gather(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     for other in axis + 1..data.rank() { inner *= data.shape[other] }
     var dims: list[int] = []
     for other in 0..axis { dims.push(data.shape[other]) }
-    #: A rank-zero index would drop this axis in ONNX, but jaitensor has no
-    #: rank-zero tensor, so such an index arrives as `[1]` and the axis stays
-    #: as a width of one. A graph that needs it gone follows with a Squeeze.
-    for dimension in indices.shape { dims.push(dimension) }
+    #: A rank-zero index drops the axis; a vector of them replaces it. The
+    #: importer says which, since both arrive as a tensor of shape `[1]`. A
+    #: scalar picked out of a vector is `[1]` again, which is what a scalar is
+    #: here.
+    let dropped = indices.size == 1 and attr_int(node, RANK_ZERO_INDICES, 0) == 1
+    if not dropped {
+        for dimension in indices.shape { dims.push(dimension) }
+    }
     for other in axis + 1..data.rank() { dims.push(data.shape[other]) }
-    let output = Tensor(dims)
+    let output = Tensor(shaped(dims))
     kernel_for("gather_axis").dispatch_async(
         [data.buffer(), indices.buffer(), output.buffer()],
         output.size,
         [output.size, data.shape[axis], inner, indices.size]
     )
     return [output]
+}
+
+#: `data` stretched to the shape its second input names -- by numpy's rules,
+#: and in both directions: a `1` in the target keeps the axis the data has,
+#: and the data's own width-one axes are the ones repeated, so the result is
+#: the broadcast of the two shapes rather than the target alone.
+pub fn op_expand(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let data = need(ins, 0, node)
+    let target = host_ints(need(ins, 1, node))
+    for dimension in target {
+        if dimension < 0 {
+            throw ValueError(f"{node.label()} expands to {target}, which has a negative width")
+        }
+        if dimension == 0 {
+            throw ValueError(f"{node.label()} expands to {target}, and an empty tensor has no place here")
+        }
+    }
+    let shape = broadcast_shape(data.shape, target, node.label())
+    if shape == data.shape { return [copy_of(data, shape)] }
+    return [expand_to(data, shape)]
 }
 
 pub fn op_pad(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
