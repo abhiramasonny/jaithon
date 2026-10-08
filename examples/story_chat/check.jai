@@ -21,6 +21,8 @@
 #: - a save cut off at any step leaves a checkpoint that loads;
 #: - the repetition penalty counts a token once however often it recurs, and
 #:   leaves the role and end tokens alone;
+#: - bytes that are not UTF-8 decode to U+FFFD one byte each, and the
+#:   characters around them are kept;
 #: - a chat session of one line ends after that line even when it is a
 #:   command (`--prompt "/help"` once printed the commands for ever), a bad
 #:   command argument is answered rather than thrown, and a reply as long as
@@ -205,6 +207,17 @@ fn check_interrupted_saves(path: str, prompt: list[int], want: list[float]) -> v
     expect(
         a and b and c,
         f"a save cut off while copying ({a}), after removing the old file ({b}) or while writing ({c}) settles to a checkpoint that loads"
+    )
+}
+
+fn check_text_of() -> void {
+    #: "café", the lead byte of a three-byte character cut off, "ok".
+    let cut = text_of(bytes([99, 97, 102, 195, 169, 226, 111, 107]))
+    #: An overlong form, a surrogate and a stray continuation byte.
+    let bad = text_of(bytes([224, 128, 128, 237, 160, 128, 128, 65]))
+    expect(
+        cut == "caf\u{e9}\u{fffd}ok" and bad == "\u{fffd}".repeat(7) + "A",
+        f"bytes that are not UTF-8 become U+FFFD and the rest is kept ({repr(cut)}, {repr(bad)})"
     )
 }
 
@@ -439,6 +452,7 @@ fn main() -> int {
     )
     free_all([batch.x, batch.rows, batch.y])
     check_penalty()
+    check_text_of()
     check_chat(model, tok)
     model.free()
     gpu.synchronize()
