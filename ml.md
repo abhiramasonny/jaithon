@@ -138,6 +138,26 @@ one-thread-per-column LayerNorm parameter gradient.
 `JAITENSOR_ATTN_SOFTMAX_HOLD=1` makes the attention softmax hold rows in
 registers instead of re-reading them. It is off by default.
 
+Products the tile kernels cannot divide can run on the thin GEMM kernels,
+`thin_n` and `thin_m`, where each lane owns one output and a slice of K. The
+static plan uses them for an output row or column under 32 while the output
+makes few 32x32 tiles (any number at 1 to 4 wide, 128 up to 16 wide, 16 up to
+31 wide or where the lanes read along K), and for small products (2M
+multiply-adds and fewer than 64 tiles). A batched product is judged by the
+whole batch, so jaicv's blocks and attention's heads keep the tile kernels. A
+chain of batch-1 1x64x64 products runs at 5.5 us a call this way, host
+included, against 42 us on the staged kernel. The thin kernels accumulate in
+float32 even under mixed precision, where the staged ones stage in half.
+`JAITENSOR_GEMM_THIN=0` keeps those shapes on the staged kernel and out of
+tuning.
+
+`batch_norm(x, gamma, beta, residual: s, relu: true)` computes
+`relu(batch_norm(x) + s)` in one elementwise pass, and its backward in two.
+`BatchNorm2d(relu: true)` and `BatchNorm2d.forward_residual(x, s)` expose it.
+Where the channel count is a multiple of four, the plain normalisation's
+passes also handle four channels per thread. `JAITENSOR_BN_FUSED=0` composes
+`add` and `relu` instead and keeps the one-float kernels.
+
 `gather_rows` records a scatter-add into the source so `Embedding` can train.
 `group_norm` is NHWC, one mean/variance per sample per group. `tril` zeros the
 strict upper triangle of a rank-two tensor. `binary_cross_entropy_with_logits`

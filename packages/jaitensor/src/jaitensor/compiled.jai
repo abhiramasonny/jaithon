@@ -356,7 +356,7 @@ fn emit_batch_norm(state: Build, layer: any, input: Built) -> Built? {
             state.refuse("a batch normalisation the platform would not build")
             return null
         }
-        return Built(made, input.shape)
+        return batch_norm_relu(state, layer, Built(made, input.shape))
     }
     #: The three leading axes folded into one. A reduction down the rows of a
     #: matrix is the shape the framework is tuned for; the same reduction
@@ -379,7 +379,13 @@ fn emit_batch_norm(state: Build, layer: any, input: Built) -> Built? {
         state.refuse("a batch normalisation the platform would not reshape back")
         return null
     }
-    return Built(back, input.shape)
+    return batch_norm_relu(state, layer, Built(back, input.shape))
+}
+
+#: The ReLU a `BatchNorm2d(relu: true)` applies after itself.
+fn batch_norm_relu(state: Build, layer: any, normed: Built) -> Built {
+    if not layer.relu { return normed }
+    return Built(emit_activation(state, normed.value, Activation.Relu), normed.shape)
 }
 
 #: Batch normalisation is expressible and is left out anyway. Four ways have

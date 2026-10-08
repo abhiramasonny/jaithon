@@ -25,6 +25,9 @@
 #: - `JAITENSOR_GEMM_STATIC_DIRECT=0` keeps the old static plan, which only
 #:   ever chose a staged kernel.
 #: - `JAITENSOR_GEMM_DEEP_SPLITS=0` stops splitting K past sixteen.
+#: - `JAITENSOR_GEMM_THIN=0` keeps thin and short-K products (a row or a
+#:   column under 32, or fewer than 8 steps of K) on the staged kernel
+#:   instead of the thin ones, and keeps the thin ones out of tuning.
 import std.gpu as gpu
 from std.gpu import Buffer, Kernel
 from std.io import Path
@@ -35,6 +38,7 @@ let _LAZY_TUNE = env_or("JAITENSOR_GEMM_LAZY_TUNE", "1") != "0"
 let _PAD = env_or("JAITENSOR_GEMM_PAD", "1") != "0"
 let _STATIC_DIRECT = env_or("JAITENSOR_GEMM_STATIC_DIRECT", "1") != "0"
 let _DEEP_SPLITS = env_or("JAITENSOR_GEMM_DEEP_SPLITS", "1") != "0"
+let _THIN = env_or("JAITENSOR_GEMM_THIN", "1") != "0"
 
 let TEMPLATE = """
 kernel void NAME(device const float* a [[buffer(0)]],
@@ -201,8 +205,8 @@ kernel void NAME(device const float* a [[buffer(0)]],
                     else if (epilogue != 0u) total += bias[c];
                     if (epilogue == 2u) total = max(total, 0.0f);
                     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
-                    else if (epilogue == 4u) total = tanh(total);
-                    else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+                    else if (epilogue == 4u) total = gemm_tanh(total);
+                    else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
                 }
                 dest[r * columns + c] = total;
             }
@@ -332,12 +336,128 @@ _KLOOPS_
                 else if (epilogue != 0u) total += bias[c];
                 if (epilogue == 2u) total = max(total, 0.0f);
                 else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
-                else if (epilogue == 4u) total = tanh(total);
-                else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+                else if (epilogue == 4u) total = gemm_tanh(total);
+                else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
             }
             dest[r * columns + c] = total;
         }
     }
+}
+"""
+
+#: A product whose output is thin -- a row or a column, a batch of one, a
+#: one-wide head -- or whose inner axis is a handful of steps.
+#:
+#: The tile kernels cannot take these: a direct tile has to divide the shape,
+#: and the staged one that took them instead computes a 32x32 tile in a single
+#: simdgroup. With one threadgroup or two on the whole device there is nothing
+#: to hide a load behind, and every step of K cost a full trip to memory: 42 us
+#: for a 1x64x64 product and 140 us for 1x256x64, against 6 us for a direct
+#: 32x64x64 that does 32 times the arithmetic.
+#:
+#: Here every lane owns one output and a slice of K. Lanes run along the fast
+#: axis -- the columns (`_AXIS_` 0) or the rows (1) -- `fw` of them to a
+#: simdgroup, and the simdgroup's other `32 / fw` lanes take interleaved steps
+#: of K for the same outputs. The eight simdgroups are `sg_slow` rows of the
+#: slow axis by `8 / sg_slow` more slices of K. Each lane keeps four
+#: independent sums so four loads are in flight at once; the K slices meet by
+#: shuffles inside the simdgroup and through threadgroup memory across them,
+#: always in the same order. The host chooses `fw` and `sg_slow` per shape
+#: (see `thin_layout`) and passes them after the usual arguments.
+let THIN_TEMPLATE = """
+kernel void NAME(device const float* a [[buffer(0)]],
+                 device const float* b [[buffer(1)]],
+                 device float* output [[buffer(2)]],
+                 device const float* bias [[buffer(3)]],
+                 constant uint& rows [[buffer(4)]],
+                 constant uint& inner [[buffer(5)]],
+                 constant uint& columns [[buffer(6)]],
+                 constant uint& trans_a [[buffer(7)]],
+                 constant uint& trans_b [[buffer(8)]],
+                 constant uint& epilogue [[buffer(9)]],
+                 constant uint& splits [[buffer(10)]],
+                 constant uint& stride_a [[buffer(11)]],
+                 constant uint& stride_b [[buffer(12)]],
+                 constant uint& stride_out [[buffer(13)]],
+                 constant uint& fw [[buffer(14)]],
+                 constant uint& sg_slow [[buffer(15)]],
+                 uint wid [[threadgroup_position_in_grid]],
+                 uint sgitg [[simdgroup_index_in_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint AXIS = _AXIS_;
+    constexpr uint WARPS = 8u;
+    threadgroup float partial[WARPS * 32u];
+
+    const uint fast_extent = AXIS == 0u ? columns : rows;
+    const uint slow_extent = AXIS == 0u ? rows : columns;
+    const uint fast_groups = (fast_extent + fw - 1u) / fw;
+    const uint slow_groups = (slow_extent + sg_slow - 1u) / sg_slow;
+    const uint tiles = fast_groups * slow_groups;
+    const uint per_item = tiles * splits;
+    const uint item = wid / per_item;
+    const uint local = wid - item * per_item;
+    const uint slice = local / tiles;
+    const uint tile = local - slice * tiles;
+    a += item * stride_a;
+    b += item * stride_b;
+    output += item * stride_out;
+
+    const uint sg_k = WARPS / sg_slow;
+    const uint kl = 32u / fw;
+    const uint slow_in = sgitg / sg_k;
+    const uint kg = sgitg - slow_in * sg_k;
+    const uint f = lane % fw;
+    const uint kq = lane / fw;
+    const uint fast = (tile % fast_groups) * fw + f;
+    const uint slow = (tile / fast_groups) * sg_slow + slow_in;
+    const uint m = AXIS == 0u ? slow : fast;
+    const uint n = AXIS == 0u ? fast : slow;
+    const bool live = m < rows && n < columns;
+
+    const uint chunk = (inner + splits - 1u) / splits;
+    const uint k_begin = slice * chunk;
+    const uint k_stop = min(inner, k_begin + chunk);
+    const uint step = sg_k * kl;
+
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    float s3 = 0.0f;
+    if (live) {
+        const uint a_base = trans_a ? m : m * inner;
+        const uint a_step = trans_a ? rows : 1u;
+        const uint b_base = trans_b ? n * inner : n;
+        const uint b_step = trans_b ? 1u : columns;
+        uint k = k_begin + kg * kl + kq;
+        for (; k + 3u * step < k_stop; k += 4u * step) {
+            s0 = fma(a[a_base + k * a_step], b[b_base + k * b_step], s0);
+            s1 = fma(a[a_base + (k + step) * a_step], b[b_base + (k + step) * b_step], s1);
+            s2 = fma(a[a_base + (k + 2u * step) * a_step], b[b_base + (k + 2u * step) * b_step], s2);
+            s3 = fma(a[a_base + (k + 3u * step) * a_step], b[b_base + (k + 3u * step) * b_step], s3);
+        }
+        for (; k < k_stop; k += step) s0 = fma(a[a_base + k * a_step], b[b_base + k * b_step], s0);
+    }
+    float total = (s0 + s1) + (s2 + s3);
+    for (uint off = 16u; off >= fw; off >>= 1u) total += simd_shuffle_xor(total, off);
+    if (sg_k > 1u) {
+        if (kq == 0u) partial[sgitg * 32u + f] = total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (kg != 0u || kq != 0u || !live) return;
+        total = 0.0f;
+        for (uint g = 0u; g < sg_k; ++g) total += partial[(slow_in * sg_k + g) * 32u + f];
+    } else if (kq != 0u || !live) {
+        return;
+    }
+    device float* dest = output + slice * rows * columns;
+    if (splits == 1u) {
+        if (epilogue == 6u) total += bias[m * columns + n];
+        else if (epilogue != 0u) total += bias[n];
+        if (epilogue == 2u) total = max(total, 0.0f);
+        else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
+        else if (epilogue == 4u) total = gemm_tanh(total);
+        else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+    }
+    dest[m * columns + n] = total;
 }
 """
 
@@ -360,8 +480,8 @@ kernel void split_reduce(device const float* partials [[buffer(0)]],
     else if (epilogue != 0u) total += bias[local % columns];
     if (epilogue == 2u) total = max(total, 0.0f);
     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
-    else if (epilogue == 4u) total = tanh(total);
-    else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+    else if (epilogue == 4u) total = gemm_tanh(total);
+    else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
     output[id] = total;
 }
 
@@ -402,8 +522,8 @@ kernel void gemm_unpad(device const float* src [[buffer(0)]],
     else if (epilogue != 0u) total += bias[c];
     if (epilogue == 2u) total = max(total, 0.0f);
     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
-    else if (epilogue == 4u) total = tanh(total);
-    else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+    else if (epilogue == 4u) total = gemm_tanh(total);
+    else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
     output[id] = total;
 }
 """
@@ -434,6 +554,9 @@ pub class Config {
     pub let warps_rows: int
     #: Simdgroups across the tile.
     pub let warps_columns: int
+    #: -1 for a tile kernel; for a thin kernel, the axis its lanes run along:
+    #: 0 for the columns, 1 for the rows. See `THIN_TEMPLATE`.
+    pub let axis: int
 
     pub fn init(
         self,
@@ -443,7 +566,8 @@ pub class Config {
         tile_columns: int,
         step: int,
         warps_rows: int,
-        warps_columns: int
+        warps_columns: int,
+        axis: int = -1
     ) {
         self.entry = entry
         self.staged = staged
@@ -452,7 +576,11 @@ pub class Config {
         self.step = step
         self.warps_rows = warps_rows
         self.warps_columns = warps_columns
+        self.axis = axis
     }
+
+    #: Whether this is one of the thin kernels rather than a tile kernel.
+    pub fn thin(self) -> bool { return self.axis >= 0 }
 
     #: Threads in a threadgroup.
     pub fn group_size(self) -> int { return self.warps_rows * self.warps_columns * 32 }
@@ -474,6 +602,11 @@ let CONFIGS = [
     Config("direct64x64", false, 64, 64, 8, 4, 2),
     Config("direct32x64", false, 32, 64, 8, 2, 2),
     Config("direct32x32", false, 32, 32, 8, 2, 1),
+    #: The thin kernels, last so the indices above them stay what plan
+    #: caches and tests already name. Their tile is chosen per shape; the
+    #: extents here are only the most a threadgroup covers.
+    Config("thin_n", false, 8, 32, 1, 8, 1, axis: 0),
+    Config("thin_m", false, 32, 8, 1, 8, 1, axis: 1),
 ]
 
 let SPLIT_CANDIDATES = [1, 2, 4, 8, 16]
@@ -619,6 +752,10 @@ let TUNE_WARM_SECONDS = 0.05
 let TUNE_WARM_STRIDE = 8
 
 fn instantiate(config: Config, element: str) -> str {
+    if config.thin() {
+        let thin = THIN_TEMPLATE.replace("NAME", config.entry)
+        return thin.replace("_AXIS_", f"{config.axis}u")
+    }
     let template = if config.staged { TEMPLATE } else { DIRECT_TEMPLATE }
     var text = template.replace("NAME", config.entry)
     if not config.staged { text = text.replace("_KLOOPS_", direct_loops()) }
@@ -631,8 +768,25 @@ fn instantiate(config: Config, element: str) -> str {
     return text
 }
 
+#: The epilogues' tanh: the precise one.
+#:
+#: Kernels compile in fast-math mode, and there `tanh` is worked out through
+#: an exponential that overflows: it returned 0 at 44 and NaN from 45 up, so
+#: a tanh layer whose pre-activation reached 45 gave NaN, and GELU -- whose
+#: argument carries a cube -- gave NaN from an input of 20. Clamping the
+#: argument to 15 fixed that but laundered a NaN into -1, since `clamp` is a
+#: max and a min and each drops a NaN: a diverged tanh layer read as finite
+#: outputs with a zero gradient instead of a NaN loss. `precise::tanh` is 1 at
+#: 45 and at infinity and NaN at NaN, and it runs once per output, after the
+#: product.
+let GEMM_PRELUDE = """#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+static inline float gemm_tanh(float x) { return precise::tanh(x); }
+"""
+
 fn build_source(element: str) -> str {
-    var text = "#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n"
+    var text = GEMM_PRELUDE
     for config in CONFIGS { text = text + instantiate(config, element) }
     return text + REDUCE_SOURCE
 }
@@ -789,22 +943,199 @@ fn tile_count(config: Config, rows: int, columns: int) -> int {
     return across * down
 }
 
+#: Steps of K one lane of a thin kernel is meant to take, and the most a
+#: split of one may leave it before the static plan splits K.
+let THIN_LANE_STEPS = 16
+let THIN_SPLIT_DEPTH = 256
+
+fn pow2_ceiling(extent: int) -> int {
+    var power = 1
+    while power < extent { power = power * 2 }
+    return power
+}
+
+#: Multiply-adds below which any product no direct tile divides is a thin
+#: kernel's, thin or not, and above which a thin product goes back to the
+#: tile kernels statically.
+#:
+#: Small ragged products are latency, and the staged kernel has none to
+#: spare: 33x64x64 ran 44 us staged against 6.5 on `thin_n`, 100 cubed 75
+#: against 17. By 300 cubed the tile kernel's reuse wins (83 us split four
+#: ways against 128). At the other end a thin output over a large operand
+#: wants that reuse too: 500000x130x10 ran 4.2 ms on `gemm64x32` and 12.6 on
+#: `thin_n`. The tuner still times the thin kernels on both.
+let THIN_SMALL_WORK = 2097152
+let THIN_MAX_WORK = 67108864
+
+#: How many 32x32 output tiles a product may make and still be the thin
+#: kernels' statically, by its narrower output side.
+#:
+#: What the thin kernels win is the parallelism the tile kernels cannot find
+#: in a handful of tiles, and the padding a 32-wide tile computes past a
+#: narrow side. What they give up is all reuse: each lane reads both operands
+#: for each of its outputs. So the wider the narrow side, the fewer tiles it
+#: takes before the tile kernels win back. One to four wide, padding is most
+#: of a tile and the thin kernels win at any size: 100000x50x4 ran 235 us
+#: against 522 staged. Up to 16 wide they win to about 128 tiles (4096x512x16,
+#: 164 against 209) and lose past it (5000x200x16, 156 against 100;
+#: 20000x128x16, 332 against 258). From 17 to 31 they win at 16 tiles
+#: (24x2048x512, 89 against 205; 31x1000x256, 69 against 96) and lose at 32
+#: (1024x1000x31, 278 against 136). Where the lanes read along K (see
+#: `thin_layout`) they keep the tighter budget even up to 16 wide:
+#: 1024x1000x16 with `b` transposed (32 tiles) ran 134 us against 106, and
+#: 10 wide at 32 to 128 tiles was a tie. A product that is not thin at all
+#: is theirs only small and under 64 tiles: 512x10x256 (128 tiles) ran 17 us
+#: staged against 20 thin, 4096x4x100 45 against 55.
+let THIN_ANY_WIDTH = 4
+let THIN_NARROW_WIDTH = 16
+let THIN_NARROW_TILES = 128
+let THIN_EDGE_TILES = 16
+let THIN_SMALL_TILES = 64
+
+#: Lanes along the output a thin kernel keeps when the operand those lanes
+#: read lies along K, and the depth from which it does. See `thin_layout`.
+let THIN_K_LANES = 4
+let THIN_K_INNER = 128
+
+#: Whether a product has an output row or column under 32.
+fn thin_output(rows: int, columns: int) -> bool { return rows < 32 or columns < 32 }
+
+#: Whether the thin kernels may run a product at all, and be timed on it: one
+#: with an output row or column under 32, or one small enough that latency
+#: may be all it costs. Which of these they run statically is `thin_suits`.
+fn thin_shape(rows: int, inner: int, columns: int) -> bool {
+    return thin_output(rows, columns) or rows * inner * columns <= THIN_SMALL_WORK
+}
+
+#: Whether the static plan for `batch` products of this shape, in one
+#: dispatch, is a thin kernel.
+#:
+#: A batch is judged as the product it adds up to -- its work and its tiles
+#: are the batch's. One small ragged product is latency; a batch of them
+#: gives the tile kernels the threadgroups one could not. jaicv cuts a long
+#: product into blocks of 2M multiply-adds and sends them as one batch, and
+#: attention multiplies every head at once: judged block by block,
+#: 10000x33x100 ran on `thin_n` at 520 us against 218 staged, and a
+#: 32-sequence, 8-head attention step at length 77 took 16.5 ms against 6.5.
+fn thin_suits(
+    rows: int,
+    inner: int,
+    columns: int,
+    batch: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> bool {
+    if not thin_shape(rows, inner, columns) { return false }
+    let work = rows * inner * columns * batch
+    if work >= THIN_MAX_WORK { return false }
+    let tiles = tile_count(CONFIGS[DIRECT_NARROW], rows, columns) * batch
+    let narrow = min(rows, columns)
+    if narrow >= 32 { return work <= THIN_SMALL_WORK and tiles < THIN_SMALL_TILES }
+    if narrow <= THIN_ANY_WIDTH or work <= THIN_SMALL_WORK { return true }
+    let config = CONFIGS[static_thin(rows, inner, columns, trans_a)]
+    let along_k = inner >= THIN_K_INNER and thin_k_major(config, trans_a, trans_b)
+    if narrow <= THIN_NARROW_WIDTH and not along_k { return tiles <= THIN_NARROW_TILES }
+    return tiles <= THIN_EDGE_TILES
+}
+
+#: Whether the operand a thin kernel's lanes read side by side lies along K:
+#: `b` transposed under `thin_n`, `a` untransposed under `thin_m`.
+fn thin_k_major(config: Config, trans_a: bool, trans_b: bool) -> bool {
+    return if config.axis == 0 { trans_b } else { not trans_a }
+}
+
+#: The thin kernel's lanes along the fast axis per simdgroup, its simdgroups
+#: along the slow axis, and its threadgroup count, for one shape.
+#:
+#: As many lanes go along the fast axis as it has outputs, up to a whole
+#: simdgroup; the rest of the simdgroup, and as many of the eight simdgroups
+#: as it takes to give each lane about `THIN_LANE_STEPS` steps, split K; the
+#: simdgroups left over take more of the slow axis. A one-row product of
+#: 64 columns and 64 steps is two threadgroups of eight simdgroups, each lane
+#: eight steps; a one-wide column of 256 rows over 64 is eight threadgroups.
+#:
+#: Except where the operand the fast lanes read lies along K (see
+#: `thin_k_major`) and K is long: there a simdgroup of lanes side by side
+#: reads 32 rows of it a stride of K apart, a cache line each per load, and
+#: 2048x1000x10 with `b` transposed ran 335 us that way against 193 on the
+#: staged kernel. Only `THIN_K_LANES` lanes go along the output there, so the
+#: rest read along K together.
+fn thin_layout(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> list[int] {
+    let fast = if config.axis == 0 { columns } else { rows }
+    let slow = if config.axis == 0 { rows } else { columns }
+    var fw = min(32, pow2_ceiling(max(1, fast)))
+    if inner >= THIN_K_INNER and thin_k_major(config, trans_a, trans_b) {
+        fw = min(fw, THIN_K_LANES)
+    }
+    let kl = 32 // fw
+    let wanted = (inner + THIN_LANE_STEPS - 1) // THIN_LANE_STEPS
+    var sg_k = 1
+    while sg_k < 8 and sg_k * kl < wanted { sg_k = sg_k * 2 }
+    let sg_slow = min(8 // sg_k, pow2_ceiling(max(1, slow)))
+    let tiles = (fast + fw - 1) // fw * ((slow + sg_slow - 1) // sg_slow)
+    return [fw, sg_slow, tiles]
+}
+
+#: The lanes along the output a simdgroup of the thin kernel `entry` takes
+#: for this product (see `thin_layout`); 0 for any other kernel.
+pub fn thin_lanes(
+    entry: str,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> int {
+    let index = config_index(entry)
+    if index < 0 or not CONFIGS[index].thin() { return 0 }
+    return thin_layout(CONFIGS[index], rows, inner, columns, trans_a, trans_b)[0]
+}
+
+#: Threadgroups one split of one matrix takes on `config`.
+fn tiles_of(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> int {
+    if config.thin() { return thin_layout(config, rows, inner, columns, trans_a, trans_b)[2] }
+    return tile_count(config, rows, columns)
+}
+
 #: Every split count the planner may consider, in increasing order.
 fn split_counts() -> list[int] {
     if not _DEEP_SPLITS { return SPLIT_CANDIDATES }
     return SPLIT_CANDIDATES + DEEP_SPLITS
 }
 
-fn split_allowed(config: Config, rows: int, inner: int, columns: int, splits: int) -> bool {
+fn split_allowed(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    splits: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> bool {
     if splits == 1 { return true }
     if inner // splits < 64 { return false }
-    let tiles = tile_count(config, rows, columns)
+    let tiles = tiles_of(config, rows, inner, columns, trans_a, trans_b)
     if splits > 16 and tiles * 16 >= TARGET_GROUPS { return false }
     return tiles * splits <= 8192
 }
 
 fn config_allowed(config: Config, rows: int, inner: int, columns: int) -> bool {
     if config.staged { return true }
+    if config.thin() { return _THIN and thin_shape(rows, inner, columns) }
     return rows % config.tile_rows == 0 and columns % config.tile_columns == 0 and inner % 8 == 0
 }
 
@@ -817,6 +1148,46 @@ fn config_index(entry: str) -> int {
 
 let DIRECT_NARROW = config_index("direct32x32")
 let DIRECT_WIDE = config_index("direct32x64")
+let THIN_COLUMNS = config_index("thin_n")
+let THIN_ROWS = config_index("thin_m")
+
+#: The thin kernel a static plan uses.
+#:
+#: Lanes along the columns wherever there are a simdgroup's worth of them, so
+#: the result and an untransposed `b` are written and read in order. A
+#: narrower output puts its spare lanes on K, which also reads an
+#: untransposed `a` in order: 64x784x10 ran 10 us that way and 16.5 with
+#: lanes down the rows, 128x4096x10 40 against 147. Down the rows instead
+#: when `a` is transposed, so its rows are what lie side by side (64x256x1,
+#: 6.2 against 6.8), or when the rows are so many and K so short that a
+#: shuffle per output is the cost: 100000x50x1 ran 90 us down the rows and
+#: 323 across.
+fn static_thin(rows: int, inner: int, columns: int, trans_a: bool) -> int {
+    if columns >= 32 or columns >= rows { return THIN_COLUMNS }
+    if trans_a or rows >= 16 * inner { return THIN_ROWS }
+    return THIN_COLUMNS
+}
+
+#: K splits a thin static plan takes: none until a lane would walk more than
+#: `THIN_SPLIT_DEPTH` steps, and then as few as bring it under.
+fn thin_splits(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> int {
+    let layout = thin_layout(config, rows, inner, columns, trans_a, trans_b)
+    let lanes = 32 // layout[0] * (8 // layout[1])
+    let depth = (inner + lanes - 1) // lanes
+    var splits = 1
+    while depth > splits * THIN_SPLIT_DEPTH and
+        split_allowed(config, rows, inner, columns, splits * 2, trans_a, trans_b) {
+        splits = splits * 2
+    }
+    return splits
+}
 
 #: The most splits of `config` that keep the dispatch within `TARGET_GROUPS`
 #: and leave each split at least `STATIC_SPLIT_DEPTH` steps of K.
@@ -834,7 +1205,9 @@ fn filling_splits(config: Config, rows: int, inner: int, columns: int) -> int {
     for candidate in split_counts() {
         if not split_allowed(config, rows, inner, columns, candidate) { continue }
         if candidate > 1 and inner // candidate < depth { continue }
-        if tile_count(config, rows, columns) * candidate <= TARGET_GROUPS { splits = candidate }
+        if tiles_of(config, rows, inner, columns) * candidate <= TARGET_GROUPS {
+            splits = candidate
+        }
     }
     return splits
 }
@@ -910,7 +1283,8 @@ pub fn default_plan(
     inner: int,
     columns: int,
     trans_a: bool = false,
-    trans_b: bool = false
+    trans_b: bool = false,
+    batch: int = 1
 ) -> Plan {
     if _STATIC_DIRECT {
         let work = rows * inner * columns
@@ -922,6 +1296,15 @@ pub fn default_plan(
             if work >= MPS_STATIC_WORK and padding_pays(rows, inner, columns, trans_a, trans_b) {
                 return MPS_PLAN
             }
+        }
+        if direct < 0 and _THIN and thin_suits(rows, inner, columns, batch, trans_a, trans_b) {
+            let thin = static_thin(rows, inner, columns, trans_a)
+            let config = CONFIGS[thin]
+            return Plan(
+                config.entry,
+                thin,
+                thin_splits(config, rows, inner, columns, trans_a, trans_b)
+            )
         }
         let chosen = if direct >= 0 { direct } else { static_staged(rows, columns) }
         let config = CONFIGS[chosen]
@@ -950,7 +1333,7 @@ fn plan_legal(
     if plan.config < 0 { return mps_possible(rows, inner, columns, trans_a, trans_b) }
     let config = CONFIGS[plan.config]
     if not config_allowed(config, rows, inner, columns) { return false }
-    return split_allowed(config, rows, inner, columns, plan.splits)
+    return split_allowed(config, rows, inner, columns, plan.splits, trans_a, trans_b)
 }
 
 var _cache: dict[str, Plan] = {}
@@ -1000,9 +1383,16 @@ fn tune_epoch(element: str) -> str {
     #: shapes, and when a starved pass stopped being written down. The
     #: switches are in it because each changes what a tuning pass can choose
     #: between.
-    var extra = f"|{MIN_TILES}|{TARGET_GROUPS}|policy=lazy-buckets-4|{MPS_STATIC_WORK}|{TUNE_MPS_MARGIN}"
-    extra = extra + f"|{PAD_MPS_RATIO}|{STAGED_SPLIT_DEPTH}"
-    extra = extra + f"|{_LAZY_TUNE}|{_PAD}|{_STATIC_DIRECT}|{_DEEP_SPLITS}"
+    #: And again (5) when thin and short-K products moved off the staged
+    #: kernel onto the thin ones, and (6) when a thin plan's lanes started
+    #: reading along K for a K-major operand and big-output small products
+    #: went back to the tile kernels.
+    var extra = f"|{MIN_TILES}|{TARGET_GROUPS}|policy=lazy-buckets-6|{MPS_STATIC_WORK}|{TUNE_MPS_MARGIN}"
+    extra = extra + f"|{PAD_MPS_RATIO}|{STAGED_SPLIT_DEPTH}|{THIN_LANE_STEPS}|{THIN_SPLIT_DEPTH}"
+    extra = extra +
+        f"|{THIN_SMALL_WORK}|{THIN_MAX_WORK}|{THIN_SMALL_TILES}|{THIN_K_LANES}|{THIN_K_INNER}"
+    extra = extra + f"|{THIN_ANY_WIDTH}|{THIN_NARROW_WIDTH}|{THIN_NARROW_TILES}|{THIN_EDGE_TILES}"
+    extra = extra + f"|{_LAZY_TUNE}|{_PAD}|{_STATIC_DIRECT}|{_DEEP_SPLITS}|{_THIN}"
     for candidate in split_counts() { extra = extra + f",{candidate}" }
     #: FNV-1a over the bytes (jaiHashBytes), so it is the same number in every
     #: process on every machine -- which it has to be, for a file on disk.
@@ -1356,24 +1746,57 @@ fn encode(
     let a_flag = if trans_a { 1 } else { 0 }
     let b_flag = if trans_b { 1 } else { 0 }
     let width = config.group_size()
-    let groups = tile_count(config, rows, columns) * plan.splits * batch
+    var tiles = 0
+    var fw = 0
+    var sg_slow = 0
+    if config.thin() {
+        let layout = thin_layout(config, rows, inner, columns, trans_a, trans_b)
+        fw = layout[0]
+        sg_slow = layout[1]
+        tiles = layout[2]
+    } else {
+        tiles = tile_count(config, rows, columns)
+    }
+    let groups = tiles * plan.splits * batch
     if plan.splits == 1 {
-        kernel.dispatch_async(
-            [a, b, output, bias],
-            groups * width,
-            [rows, inner, columns, a_flag, b_flag, epilogue, 1, stride_a, stride_b, stride_out],
-            group_size: width
-        )
+        var uniforms = [
+            rows,
+            inner,
+            columns,
+            a_flag,
+            b_flag,
+            epilogue,
+            1,
+            stride_a,
+            stride_b,
+            stride_out,
+        ]
+        if config.thin() {
+            uniforms.push(fw)
+            uniforms.push(sg_slow)
+        }
+        kernel.dispatch_async([a, b, output, bias], groups * width, uniforms, group_size: width)
         return
     }
     let per_item = rows * columns * plan.splits
     let partials = scratch_for(per_item * batch)
-    kernel.dispatch_async(
-        [a, b, partials, bias],
-        groups * width,
-        [rows, inner, columns, a_flag, b_flag, epilogue, plan.splits, stride_a, stride_b, per_item],
-        group_size: width
-    )
+    var uniforms = [
+        rows,
+        inner,
+        columns,
+        a_flag,
+        b_flag,
+        epilogue,
+        plan.splits,
+        stride_a,
+        stride_b,
+        per_item,
+    ]
+    if config.thin() {
+        uniforms.push(fw)
+        uniforms.push(sg_slow)
+    }
+    kernel.dispatch_async([a, b, partials, bias], groups * width, uniforms, group_size: width)
     let reduce = kernel_for(element, "split_reduce")
     reduce.dispatch_async(
         [partials, output, bias],
@@ -1428,8 +1851,23 @@ pub fn candidates(
         found.push(fallback)
     }
     var direct_legal = false
+    #: Each thin kernel at most twice: whole, and split the way its static
+    #: plan would split it. One more plan is one more sample for every shape
+    #: a model touches, and the thin kernels choose their own layout.
     for (index, config) in CONFIGS.enumerate() {
-        if config.staged or not config_allowed(config, rows, inner, columns) { continue }
+        if not config.thin() or not config_allowed(config, rows, inner, columns) { continue }
+        let deep = thin_splits(config, rows, inner, columns, trans_a, trans_b)
+        if not (index == fallback.config and fallback.splits == 1) {
+            found.push(Plan(config.entry, index, 1))
+        }
+        if deep > 1 and not (index == fallback.config and fallback.splits == deep) {
+            found.push(Plan(config.entry, index, deep))
+        }
+    }
+    for (index, config) in CONFIGS.enumerate() {
+        if config.staged or config.thin() or not config_allowed(config, rows, inner, columns) {
+            continue
+        }
         direct_legal = true
         for splits in split_counts() {
             if not split_allowed(config, rows, inner, columns, splits) { continue }
@@ -2038,14 +2476,52 @@ fn batched_splits(
     inner: int,
     columns: int,
     tuned: int,
-    batch: int
+    batch: int,
+    trans_a: bool = false,
+    trans_b: bool = false
 ) -> int {
     var chosen = 1
     while chosen < tuned and chosen * batch < tuned {
-        if not split_allowed(config, rows, inner, columns, chosen * 2) { break }
+        if not split_allowed(config, rows, inner, columns, chosen * 2, trans_a, trans_b) { break }
         chosen = chosen * 2
     }
     return chosen
+}
+
+#: The plan `batch` products of this shape run on in one dispatch, given the
+#: plan one of them would: a thin plan only where the whole batch suits it
+#: (see `thin_suits`), and no more splits than the batch needs (see
+#: `batched_splits`).
+pub fn batched_plan(
+    one: Plan,
+    rows: int,
+    inner: int,
+    columns: int,
+    batch: int,
+    trans_a: bool = false,
+    trans_b: bool = false,
+    keep_thin: bool = false
+) -> Plan {
+    var tuned = one
+    if not keep_thin and
+        tuned.config >= 0 and
+        CONFIGS[tuned.config].thin() and
+        not thin_suits(rows, inner, columns, batch, trans_a, trans_b) {
+        tuned = default_plan(rows, inner, columns, trans_a, trans_b, batch: batch)
+    }
+    if tuned.config < 0 or tuned.splits == 1 { return tuned }
+    let splits = batched_splits(
+        CONFIGS[tuned.config],
+        rows,
+        inner,
+        columns,
+        tuned.splits,
+        batch,
+        trans_a,
+        trans_b
+    )
+    if splits == tuned.splits { return tuned }
+    return Plan(tuned.backend, tuned.config, splits)
 }
 
 #: Multiply `batch` pairs of equally shaped matrices in one dispatch.
@@ -2081,19 +2557,10 @@ pub fn dispatch_batched(
         dispatch(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
         return
     }
-    let tuned = plan_for(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
-    var plan = tuned
-    if tuned.config >= 0 and tuned.splits > 1 {
-        let splits = batched_splits(
-            CONFIGS[tuned.config],
-            rows,
-            inner,
-            columns,
-            tuned.splits,
-            batch
-        )
-        if splits != tuned.splits { plan = Plan(tuned.backend, tuned.config, splits) }
-    }
+    let one = plan_for(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+    #: A forced thin plan stays thin, so a probe can still time it batched.
+    let keep = forced_plan() is not null
+    let plan = batched_plan(one, rows, inner, columns, batch, trans_a, trans_b, keep_thin: keep)
     encode(
         plan,
         a,

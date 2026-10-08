@@ -523,6 +523,306 @@ kernel void channel_params_backward(device const float* input [[buffer(0)]],
     grad_beta[c] = b;
 }
 
+/* Batch normalisation's affine step with the residual add and the ReLU that
+ * follow it in a residual block, in one pass.
+ *
+ * Unfused that is three kernels and three trips through memory: the affine
+ * writes y, the add reads y and the skip and writes their sum, the ReLU reads
+ * the sum and writes it again. Here the input and the skip are read once and
+ * the result written once. `flags` bit 0 adds `residual`, bit 1 applies the
+ * ReLU; the arithmetic is the unfused kernels' own, in their order, so this
+ * one-float kernel agrees with them to the bit.
+ *
+ * Four channels to a thread wherever the channel count allows it, so a
+ * thread's loads are one 16-byte access each. That one does not agree to the
+ * bit: the compiler contracts the vector arithmetic differently, and the two
+ * differ by about 1e-7 relative. */
+kernel void batch_norm_apply(device const float* input [[buffer(0)]],
+                             device const float* mean [[buffer(1)]],
+                             device const float* variance [[buffer(2)]],
+                             device const float* gamma [[buffer(3)]],
+                             device const float* beta [[buffer(4)]],
+                             device const float* residual [[buffer(5)]],
+                             device float* output [[buffer(6)]],
+                             constant uint& count [[buffer(7)]],
+                             constant uint& channels [[buffer(8)]],
+                             constant uint& flags [[buffer(9)]],
+                             uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint c = id % channels;
+    float inv = rsqrt(variance[c] + 1e-5f);
+    float y = gamma[c] * (input[id] - mean[c]) * inv + beta[c];
+    if ((flags & 1u) != 0u) y = y + residual[id];
+    if ((flags & 2u) != 0u) y = max(y, 0.0f);
+    output[id] = y;
+}
+
+kernel void batch_norm_apply4(device const float4* input [[buffer(0)]],
+                              device const float* mean [[buffer(1)]],
+                              device const float* variance [[buffer(2)]],
+                              device const float* gamma [[buffer(3)]],
+                              device const float* beta [[buffer(4)]],
+                              device const float4* residual [[buffer(5)]],
+                              device float4* output [[buffer(6)]],
+                              constant uint& count [[buffer(7)]],
+                              constant uint& channels [[buffer(8)]],
+                              constant uint& flags [[buffer(9)]],
+                              uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint c = (id * 4u) % channels;
+    float4 m = float4(mean[c], mean[c + 1u], mean[c + 2u], mean[c + 3u]);
+    float4 v = float4(variance[c], variance[c + 1u], variance[c + 2u], variance[c + 3u]);
+    float4 g = float4(gamma[c], gamma[c + 1u], gamma[c + 2u], gamma[c + 3u]);
+    float4 b = float4(beta[c], beta[c + 1u], beta[c + 2u], beta[c + 3u]);
+    float4 inv = rsqrt(v + 1e-5f);
+    float4 y = g * (input[id] - m) * inv + b;
+    if ((flags & 1u) != 0u) y = y + residual[id];
+    if ((flags & 2u) != 0u) y = max(y, 0.0f);
+    output[id] = y;
+}
+
+/* The backward's two channel sums with the ReLU mask applied on the way in,
+ * read the same coalesced way as `channel_grad_partials` and summed in the
+ * same order, so the totals are the unfused ones exactly.
+ *
+ * The mask is the ReLU backward's own: the upstream gradient where the
+ * block's output is positive, zero elsewhere. With a residual, that masked
+ * gradient is also the skip's whole gradient, and it is written out here
+ * rather than by a pass of its own. */
+kernel void batch_norm_fused_partials(device const float* input [[buffer(0)]],
+                                      device const float* mean [[buffer(1)]],
+                                      device const float* variance [[buffer(2)]],
+                                      device const float* output [[buffer(3)]],
+                                      device const float* upstream [[buffer(4)]],
+                                      device float* part_dy [[buffer(5)]],
+                                      device float* part_dy_xhat [[buffer(6)]],
+                                      device float* grad_residual [[buffer(7)]],
+                                      constant uint& nspatial [[buffer(8)]],
+                                      constant uint& channels [[buffer(9)]],
+                                      constant uint& rows_each [[buffer(10)]],
+                                      constant uint& flags [[buffer(11)]],
+                                      uint chunk [[threadgroup_position_in_grid]],
+                                      uint lid [[thread_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    threadgroup float shared_dy[256];
+    threadgroup float shared_xhat[256];
+    uint c = lid % channels;
+    float inv = rsqrt(variance[c] + 1e-5f);
+    float centre = mean[c];
+    uint first = chunk * rows_each;
+    uint last = min(first + rows_each, nspatial);
+    const bool masked = (flags & 2u) != 0u;
+    const bool skip = (flags & 1u) != 0u;
+    float dy_total = 0.0f;
+    float dy_xhat = 0.0f;
+    for (uint f = first * channels + lid; f < last * channels; f += GROUP) {
+        float up = upstream[f];
+        if (masked) up = output[f] > 0.0f ? up : 0.0f;
+        if (skip) grad_residual[f] = up;
+        dy_total += up;
+        dy_xhat += up * (input[f] - centre) * inv;
+    }
+    shared_dy[lid] = dy_total;
+    shared_xhat[lid] = dy_xhat;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid >= channels) return;
+    float a = 0.0f;
+    float b = 0.0f;
+    for (uint j = lid; j < GROUP; j += channels) {
+        a += shared_dy[j];
+        b += shared_xhat[j];
+    }
+    part_dy[chunk * channels + lid] = a;
+    part_dy_xhat[chunk * channels + lid] = b;
+}
+
+/* The input gradient, `norm_channel_backward` with the same mask applied to
+ * the upstream gradient it reads. */
+kernel void batch_norm_fused_backward(device const float* input [[buffer(0)]],
+                                      device const float* mean [[buffer(1)]],
+                                      device const float* variance [[buffer(2)]],
+                                      device const float* gamma [[buffer(3)]],
+                                      device const float* output [[buffer(4)]],
+                                      device const float* upstream [[buffer(5)]],
+                                      device const float* sum_dy [[buffer(6)]],
+                                      device const float* sum_dy_xhat [[buffer(7)]],
+                                      device float* grad [[buffer(8)]],
+                                      constant uint& count [[buffer(9)]],
+                                      constant uint& channels [[buffer(10)]],
+                                      constant uint& nspatial [[buffer(11)]],
+                                      constant uint& flags [[buffer(12)]],
+                                      uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint c = id % channels;
+    float inv = rsqrt(variance[c] + 1e-5f);
+    float xhat = (input[id] - mean[c]) * inv;
+    float up = upstream[id];
+    if ((flags & 2u) != 0u) up = output[id] > 0.0f ? up : 0.0f;
+    float dy = up * gamma[c];
+    float scale = 1.0f / float(nspatial);
+    grad[id] = inv * (dy - scale * sum_dy[c] - scale * xhat * sum_dy_xhat[c]);
+}
+
+/* The same input gradient four channels to a thread, for every batch
+ * normalisation whose channel count comes in fours -- masked or not, which
+ * `flags` bit 1 says -- so each of its three reads and its write is one
+ * 16-byte access. */
+kernel void batch_norm_backward4(device const float4* input [[buffer(0)]],
+                                 device const float* mean [[buffer(1)]],
+                                 device const float* variance [[buffer(2)]],
+                                 device const float* gamma [[buffer(3)]],
+                                 device const float4* output [[buffer(4)]],
+                                 device const float4* upstream [[buffer(5)]],
+                                 device const float* sum_dy [[buffer(6)]],
+                                 device const float* sum_dy_xhat [[buffer(7)]],
+                                 device float4* grad [[buffer(8)]],
+                                 constant uint& count [[buffer(9)]],
+                                 constant uint& channels [[buffer(10)]],
+                                 constant uint& nspatial [[buffer(11)]],
+                                 constant uint& flags [[buffer(12)]],
+                                 uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint c = (id * 4u) % channels;
+    float4 m = float4(mean[c], mean[c + 1u], mean[c + 2u], mean[c + 3u]);
+    float4 v = float4(variance[c], variance[c + 1u], variance[c + 2u], variance[c + 3u]);
+    float4 g = float4(gamma[c], gamma[c + 1u], gamma[c + 2u], gamma[c + 3u]);
+    float4 sd = float4(sum_dy[c], sum_dy[c + 1u], sum_dy[c + 2u], sum_dy[c + 3u]);
+    float4 sx = float4(sum_dy_xhat[c], sum_dy_xhat[c + 1u], sum_dy_xhat[c + 2u], sum_dy_xhat[c + 3u]);
+    float4 inv = rsqrt(v + 1e-5f);
+    float4 xhat = (input[id] - m) * inv;
+    float4 up = upstream[id];
+    if ((flags & 2u) != 0u) up = select(float4(0.0f), up, output[id] > 0.0f);
+    float4 dy = up * g;
+    float scale = 1.0f / float(nspatial);
+    grad[id] = inv * (dy - scale * sd - scale * xhat * sx);
+}
+
+/* The channel statistics and the backward's channel sums four channels to a
+ * thread, for channel counts that come in fours and divide 256.
+ *
+ * The same blocks as `channel_partials` and `channel_grad_partials`, each a
+ * contiguous run of rows, but a thread reads a float4 a step instead of a
+ * float, so a block's 256 threads cover 1024 floats per step and keep four
+ * independent sums apiece. Thread `lid` always sees channels
+ * `4 * (lid % (channels / 4))` onwards, because 1024 is a multiple of the
+ * channel count. Each block writes its own partial and the existing joins
+ * add them. `batch_norm_fused_partials4` applies the ReLU mask on the way in
+ * and writes the skip's gradient; `flags` is as for `batch_norm_apply`. */
+kernel void channel_partials4(device const float4* input [[buffer(0)]],
+                              device float* part_total [[buffer(1)]],
+                              device float* part_square [[buffer(2)]],
+                              constant uint& nspatial [[buffer(3)]],
+                              constant uint& channels [[buffer(4)]],
+                              constant uint& rows_each [[buffer(5)]],
+                              uint chunk [[threadgroup_position_in_grid]],
+                              uint lid [[thread_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    threadgroup float4 shared_total[256];
+    threadgroup float4 shared_square[256];
+    const uint quads = channels / 4u;
+    uint first = chunk * rows_each;
+    uint last = min(first + rows_each, nspatial);
+    uint mine = lid % quads;
+    float4 shift = input[mine];
+    float4 total = 0.0f;
+    float4 square = 0.0f;
+    for (uint f = first * quads + lid; f < last * quads; f += GROUP) {
+        float4 v = input[f];
+        float4 d = v - shift;
+        total += v;
+        square += d * d;
+    }
+    shared_total[lid] = total;
+    shared_square[lid] = square;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid >= quads) return;
+    float4 a = 0.0f;
+    float4 b = 0.0f;
+    for (uint j = lid; j < GROUP; j += quads) {
+        a += shared_total[j];
+        b += shared_square[j];
+    }
+    const uint at = chunk * channels + 4u * lid;
+    part_total[at] = a.x;
+    part_total[at + 1u] = a.y;
+    part_total[at + 2u] = a.z;
+    part_total[at + 3u] = a.w;
+    part_square[at] = b.x;
+    part_square[at + 1u] = b.y;
+    part_square[at + 2u] = b.z;
+    part_square[at + 3u] = b.w;
+}
+
+kernel void batch_norm_fused_partials4(device const float4* input [[buffer(0)]],
+                                       device const float* mean [[buffer(1)]],
+                                       device const float* variance [[buffer(2)]],
+                                       device const float4* output [[buffer(3)]],
+                                       device const float4* upstream [[buffer(4)]],
+                                       device float* part_dy [[buffer(5)]],
+                                       device float* part_dy_xhat [[buffer(6)]],
+                                       device float4* grad_residual [[buffer(7)]],
+                                       constant uint& nspatial [[buffer(8)]],
+                                       constant uint& channels [[buffer(9)]],
+                                       constant uint& rows_each [[buffer(10)]],
+                                       constant uint& flags [[buffer(11)]],
+                                       uint chunk [[threadgroup_position_in_grid]],
+                                       uint lid [[thread_index_in_threadgroup]]) {
+    const uint GROUP = 256u;
+    threadgroup float4 shared_dy[256];
+    threadgroup float4 shared_xhat[256];
+    const uint quads = channels / 4u;
+    uint c = 4u * (lid % quads);
+    float4 centre = float4(mean[c], mean[c + 1u], mean[c + 2u], mean[c + 3u]);
+    float4 v = float4(variance[c], variance[c + 1u], variance[c + 2u], variance[c + 3u]);
+    float4 inv = rsqrt(v + 1e-5f);
+    uint first = chunk * rows_each;
+    uint last = min(first + rows_each, nspatial);
+    const bool masked = (flags & 2u) != 0u;
+    const bool skip = (flags & 1u) != 0u;
+    float4 dy_total = 0.0f;
+    float4 dy_xhat = 0.0f;
+    for (uint f = first * quads + lid; f < last * quads; f += GROUP) {
+        float4 up = upstream[f];
+        if (masked) up = select(float4(0.0f), up, output[f] > 0.0f);
+        if (skip) grad_residual[f] = up;
+        dy_total += up;
+        dy_xhat += up * (input[f] - centre) * inv;
+    }
+    shared_dy[lid] = dy_total;
+    shared_xhat[lid] = dy_xhat;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid >= quads) return;
+    float4 a = 0.0f;
+    float4 b = 0.0f;
+    for (uint j = lid; j < GROUP; j += quads) {
+        a += shared_dy[j];
+        b += shared_xhat[j];
+    }
+    const uint at = chunk * channels + 4u * lid;
+    part_dy[at] = a.x;
+    part_dy[at + 1u] = a.y;
+    part_dy[at + 2u] = a.z;
+    part_dy[at + 3u] = a.w;
+    part_dy_xhat[at] = b.x;
+    part_dy_xhat[at + 1u] = b.y;
+    part_dy_xhat[at + 2u] = b.z;
+    part_dy_xhat[at + 3u] = b.w;
+}
+
+/* The masked upstream gradient on its own, for channel counts the coalesced
+ * partials cannot take: the generic sum kernels then run on it unchanged. */
+kernel void batch_norm_relu_mask(device const float* output [[buffer(0)]],
+                                 device const float* upstream [[buffer(1)]],
+                                 device float* masked [[buffer(2)]],
+                                 constant uint& count [[buffer(3)]],
+                                 constant uint& flags [[buffer(4)]],
+                                 uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    float up = upstream[id];
+    if ((flags & 2u) != 0u) up = output[id] > 0.0f ? up : 0.0f;
+    masked[id] = up;
+}
+
 kernel void add_scaled_into(device const float* value [[buffer(0)]],
                             device float* total [[buffer(1)]],
                             constant uint& weight [[buffer(2)]],
