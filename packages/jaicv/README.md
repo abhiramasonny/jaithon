@@ -197,6 +197,67 @@ Device paths are switched the same way:
 | `JAICV_LOGISTIC_DEVICE` | `LogisticRegression.train` forms the gradient on the device once the samples hold 65,536 values or more; off, on the host |
 | `JAICV_LOGISTIC_RESIDENT` | `LogisticRegression.train`'s device descent keeps the weights on the device, in float32, and reads nothing back until the last step, for training sets of up to 2^25 values (it holds four copies of them); off, or above that, each step's gradient comes back and the weights are updated on the host in double |
 
+## Image decoding
+
+The JPEG and PNG decoders are Jaithon, and each has a fast path in front of a
+reference decoder. The fast path gives the same bytes as the reference, not a
+picture within a unit of it: same float operations, same order. Anything it
+cannot reproduce exactly goes to the reference -- a JPEG that reads past a
+restart marker or the end of its scan, an odd sampling layout, a damaged
+Huffman table; a palette, sub-byte, sixteen-bit or interlaced PNG.
+
+| Switch | What it does when on |
+|---|---|
+| `JAICV_FAST_JPEG` | `jpeg.scan_fast`: unstuffed data under a 56-bit accumulator with a nine-bit Huffman lookahead, an IDCT that skips zero columns and sums a coefficient's eight outputs side by side, integer planes, 4:2:0 chroma doubled inside a table-driven colour conversion, and the picture packed straight into bytes for `Mat.from_bytes`; off, the reference loop in `jpeg.scan` |
+| `JAICV_FAST_PNG` | `png.decode_fast` for eight-bit grey, grey-alpha, RGB and RGBA: rows unfiltered in place into one int list, red and blue swapped in it, packed into bytes for `Mat.from_bytes`; off, the reference, which builds a float list a pixel at a time for `Mat.from_list` |
+
+`jpeg.decode_with(data, fast)` and `png.decode_with(data, fast)` take either
+path in one process; `tests/test_imgcodecs.jai` holds them to each other on
+made-up images, damaged ones included. Real files were checked by hash, every
+image byte for byte against the reference decoder: the first 300 COCO val2017
+JPEGs (all 4:4:4, two of them grey), all 120 frames of a 720p 4:2:0 MJPEG AVI,
+the first 1000 HASYv2 PNGs, and 192 files written by OpenCV at 4:4:4, 4:2:2,
+4:2:0, 4:1:1 and 4:4:0, with and without restart intervals, grey, odd sizes,
+and PNGs of every colour type and depth.
+
+Measured on an M2 Max under `scripts/bench/gpu_lock.sh`, bytes already in
+memory, median of five rounds after a second of warm-up, against OpenCV 4 with
+`cv2.setNumThreads(1)` on the same files:
+
+| | fast | reference | cv2 |
+|---|---|---|---|
+| COCO JPEG, 640x426 average, 20 images | 17.0 ms | 57.9 ms | 1.61 ms |
+| HASY 32x32 RGB PNG, 500 images | 23.3 us | 265.6 us | 10.1 us |
+| HASY `imread(path, IMREAD_GRAYSCALE)` | 53.0 us | 300.6 us | 36.2 us |
+
+The PNG is at the per-image floor: the rest of `imread` is the file read and
+the device buffer the `Mat` lives in, and `IMREAD_GRAYSCALE` adds a
+`cvt_color` dispatch. The whole HASY set (168,233 files) loads in about 9 s,
+from 50 s.
+
+The JPEG is not. A decode is now about 40,000 interpreted instructions and a
+hundred allocations (the reference: 1.1 million and 4,000), so the JIT runs
+nearly all of it, and the time is what the compiled code costs. On a COCO
+image about 4 ms of the 17 is the Huffman decode, 7.5 the IDCT, 2 the colour
+conversion, 1.2 packing the list into bytes, and the rest unstuffing and
+allocation. Each step is held to the reference's arithmetic, so there is no
+cheaper transform to switch to -- the IDCT has to add the same terms in the
+same order -- and what is left is the compiled code's cost per list access
+and per float operation: about 0.8 ns a multiply-add in the best case. The
+limits it was written around, all in the JIT:
+
+- a function of more than eight arguments never reaches the function tier, so
+  the per-block work is methods on `FastScan` reading fields;
+- a body is held to 20,000 instructions: the Huffman decode compiles to about
+  18,400, which is why it is one method and the IDCT two;
+- a call to a function or method that has not run yet stops the compile of
+  what follows it, so rare paths -- long Huffman codes, restarts -- are
+  written out in line rather than called;
+- a return inside a loop keeps that loop off stack replacement, and a local
+  declared inside a loop body is null on the way in, which a loop form will
+  not take: every loop here declares its locals first and ends on a flag;
+- `bytes` is immutable, so the picture is built as an int list and packed.
+
 ## Device memory
 
 Device memory is not garbage collected, so every operation releases the
