@@ -615,3 +615,38 @@ fn test_transpose_handles_every_edge_of_its_tile() -> void {
         flipped.free()
     }
 }
+
+#: GELU and tanh stay finite however large the input. The kernels build with
+#: fast math, whose tanh overflows an exponential: GELU gave NaN from an input
+#: of 12 forward and backward, and tanh from 45, so a GPT's loss turned NaN a
+#: few hundred steps in. Both specialised kernels and the switch kernel.
+fn test_gelu_and_tanh_stay_finite_on_large_inputs() -> void {
+    if not jt.is_available() { return }
+    let xs = [-1.0e4, -100.0, -20.0, -12.0, -1.0, 0.0, 1.0, 12.0, 20.0, 45.0, 100.0, 1.0e4]
+    let x = jt.Tensor([12], xs, requires_grad: true)
+    let y = jt.gelu(x)
+    let values = y.download()
+    let total = jt.sum(y)
+    for held in total.backward() { held.free() }
+    for (i, v) in xs.enumerate() {
+        if v >= 12.0 { assert_near(values[i], v, 1e-6 * v) }
+        if v <= -12.0 { assert_near(values[i], 0.0, 1e-6) }
+    }
+    let g = x.grad
+    assert_true(g is not null)
+    if g is not null {
+        let grads = g.download()
+        for (i, v) in xs.enumerate() {
+            if v >= 12.0 { assert_near(grads[i], 1.0, 1e-6) }
+            if v <= -12.0 { assert_near(grads[i], 0.0, 1e-6) }
+        }
+    }
+    let plain = jt.Tensor([12], xs)
+    let t = jt.tanh(plain)
+    let tv = t.download()
+    for (i, v) in xs.enumerate() {
+        assert_true(math.is_finite(tv[i]))
+        if math.fabs(v) >= 20.0 { assert_near(tv[i], if v > 0.0 { 1.0 } else { -1.0 }, 1e-7) }
+    }
+    for tensor in [total, x, plain, t] { tensor.free() }
+}

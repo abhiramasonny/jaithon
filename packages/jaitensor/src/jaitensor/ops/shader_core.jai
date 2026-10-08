@@ -92,7 +92,7 @@ kernel void unary_op(device const float* input [[buffer(0)]],
     if (operation == 0) output[id] = value;
     else if (operation == 1) output[id] = max(value, 0.0f);
     else if (operation == 2) output[id] = 1.0f / (1.0f + exp(-value));
-    else if (operation == 3) output[id] = tanh(value);
+    else if (operation == 3) output[id] = tanh(clamp(value, -15.0f, 15.0f));
     else if (operation == 4) output[id] = exp(value);
     else if (operation == 5) output[id] = log(value);
     else if (operation == 6) output[id] = fabs(value);
@@ -102,7 +102,7 @@ kernel void unary_op(device const float* input [[buffer(0)]],
     else if (operation == 10) output[id] = value * value;
     else if (operation == 11) {
         float inner = 0.7978845608f * (value + 0.044715f * value * value * value);
-        output[id] = 0.5f * value * (1.0f + tanh(inner));
+        output[id] = 0.5f * value * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
     } else if (operation == 12) {
         output[id] = value / (1.0f + exp(-value));
     } else {
@@ -414,7 +414,7 @@ kernel void unary_backward_op(device const float* saved [[buffer(0)]],
         float x = s;
         float x3 = x * x * x;
         float inner = 0.7978845608f * (x + 0.044715f * x3);
-        float t = tanh(inner);
+        float t = tanh(clamp(inner, -15.0f, 15.0f));
         float dt = 1.0f - t * t;
         float dinner = 0.7978845608f * (1.0f + 3.0f * 0.044715f * x * x);
         grad_input[id] = u * (0.5f * (1.0f + t) + 0.5f * x * dt * dinner);
