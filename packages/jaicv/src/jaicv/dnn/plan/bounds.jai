@@ -86,22 +86,26 @@ pub fn resolved_pads(
     strides: list[int],
     dilations: list[int]
 ) -> list[int]? {
+    #: As ONNX writes them, every axis's start and then every axis's end;
+    #: two axes for an image and one for a sequence.
+    let axes = spatial.len()
+    let none = [0 for _slot in 0..2 * axes]
     let mode = attr_str(node, "auto_pad", "NOTSET")
     if mode == "NOTSET" {
-        let pads = attr_ints(node, "pads", [0, 0, 0, 0])
-        if pads.len() != 4 { return null }
+        let pads = attr_ints(node, "pads", none)
+        if pads.len() != 2 * axes { return null }
         return pads
     }
-    if mode == "VALID" { return [0, 0, 0, 0] }
+    if mode == "VALID" { return none }
     if mode != "SAME_UPPER" and mode != "SAME_LOWER" { return null }
-    var pads = [0, 0, 0, 0]
-    for axis in 0..2 {
+    var pads = [0 for _slot in 0..2 * axes]
+    for axis in 0..axes {
         let reach = (window[axis] - 1) * dilations[axis] + 1
         let out = (spatial[axis] + strides[axis] - 1) // strides[axis]
         let total = max((out - 1) * strides[axis] + reach - spatial[axis], 0)
         let head = if mode == "SAME_UPPER" { total // 2 } else { total - total // 2 }
         pads[axis] = head
-        pads[axis + 2] = total - head
+        pads[axis + axes] = total - head
     }
     return pads
 }

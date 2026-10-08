@@ -236,6 +236,7 @@ kernel void unary_ex(device const float* input [[buffer(0)]],
     else if (op == 5) y = x >= 0.0f ? x : a * x;
     else if (op == 6) y = trunc(x);
     else if (op == 7) y = x != 0.0f ? 1.0f : 0.0f;
+    else if (op == 8) y = x * clamp(a * x + b, 0.0f, 1.0f);
     output[id] = y;
 }
 
@@ -270,7 +271,9 @@ kernel void binary_ex(device const float* a [[buffer(0)]],
     } else if (op == 8) {
         /* Sign follows the dividend: C's fmod, which is Mod with `fmod` on. */
         r = y == 0.0f ? NAN : fmod(x, y);
-    } else r = x < 0.0f ? x * y : x;
+    } else if (op == 9) r = x >= y ? 1.0f : 0.0f;
+    else if (op == 10) r = x <= y ? 1.0f : 0.0f;
+    else r = x < 0.0f ? x * y : x;
     output[id] = r;
 }
 
@@ -626,14 +629,22 @@ kernel void conv_transpose_nchw(device const float* input [[buffer(0)]],
                                 constant uint& dilationH [[buffer(17)]],
                                 constant uint& dilationW [[buffer(18)]],
                                 constant uint& hasBias [[buffer(19)]],
+                                constant uint& groups [[buffer(20)]],
                                 uint id [[thread_position_in_grid]]) {
+    /* `inChannels` and `outChannels` are per group. ONNX lays the weights out
+       `[C_in, C_out / groups, kH, kW]`, so a global input channel indexes the
+       first axis directly and the output channel within its group the second. */
     if (id >= count) return;
+    uint allOut = outChannels * groups;
     uint ow = id % outW;
     uint oh = (id / outW) % outH;
-    uint co = (id / (outW * outH)) % outChannels;
-    uint n = id / (outW * outH * outChannels);
-    float total = hasBias != 0 ? bias[co] : 0.0f;
-    for (uint ci = 0; ci < inChannels; ++ci) {
+    uint channel = (id / (outW * outH)) % allOut;
+    uint n = id / (outW * outH * allOut);
+    uint group = channel / outChannels;
+    uint co = channel % outChannels;
+    float total = hasBias != 0 ? bias[channel] : 0.0f;
+    for (uint local = 0; local < inChannels; ++local) {
+        uint ci = group * inChannels + local;
         for (uint r = 0; r < kh; ++r) {
             int reach = int(oh) + int(padH) - int(r * dilationH);
             if (reach < 0 || reach % int(strideH) != 0) continue;
@@ -644,7 +655,7 @@ kernel void conv_transpose_nchw(device const float* input [[buffer(0)]],
                 if (span < 0 || span % int(strideW) != 0) continue;
                 int iw = span / int(strideW);
                 if (iw >= int(inW)) continue;
-                float x = input[((n * inChannels + ci) * inH + uint(ih)) * inW + uint(iw)];
+                float x = input[((n * inChannels * groups + ci) * inH + uint(ih)) * inW + uint(iw)];
                 float w = weights[((ci * outChannels + co) * kh + r) * kw + s];
                 total += x * w;
             }

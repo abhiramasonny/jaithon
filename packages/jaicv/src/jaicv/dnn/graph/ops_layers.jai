@@ -3,6 +3,7 @@
 #: image through a window or along its channels.
 import jaitensor as jt
 from jaitensor import Tensor
+from std.os import env, set_env, unset_env
 
 from .kernels import LOWEST_FLOAT, f32_bits, kernel_for
 from .nodes import GraphNode, attr_float, attr_floats, attr_int, attr_ints, attr_str, maybe, need
@@ -75,36 +76,134 @@ fn pad_spatial(input: Tensor, pads: list[int], value: float) -> Tensor {
     return pad_nd_of(input, [0, 0, pads[0], pads[1]], [0, 0, pads[2], pads[3]], 0, value)
 }
 
+#: Whether a grouped, dilated or one-dimensional convolution runs as one
+#: graph convolution. Read once. `JAICV_GRAPH_CONV=0` brings back the loop
+#: this replaced -- one jaitensor convolution per group, and a refusal for any
+#: dilation -- which is what the one-dispatch route is measured against.
+#:
+#: The loop was the whole cost of a depthwise network on the interpreter: a
+#: MobileNetV2 frame is about 7000 one-channel convolutions that way, and took
+#: seconds, where the graph route is seventeen dispatches.
+let GRAPH_CONV = env("JAICV_GRAPH_CONV") != "0"
+
+#: The one-operator graphs those convolutions run as, by everything that
+#: decides their shape. The weights and the bias are inputs of the graph
+#: rather than constants baked into it, so every node with the same shapes
+#: shares one -- MobileNetV2's seventeen depthwise convolutions need ten --
+#: and feeding different weights under the same name needs no rebuild.
+var _conv_graphs: dict[str, int] = {}
+var _conv_shapes: dict[str, list[int]] = {}
+
+#: Compile a graph to encode onto the shared queue.
+#:
+#: A plan picks between encoding and blocking the first time it runs, by
+#: timing a dozen runs of each, which is worth it for a whole model and is
+#: most of the first call for a one-operator graph. An interpreter step only
+#: ever wants encoding -- it queues like every other operator here and lets
+#: the next one overlap -- so that route is named while the graph compiles,
+#: unless the caller has already chosen one with `JAITHON_GRAPH_ROUTE`.
+fn compile_encoded(builder: int, inputs: list[int], outputs: list[int]) -> int? {
+    let chosen = env("JAITHON_GRAPH_ROUTE")
+    if chosen is null { set_env("JAITHON_GRAPH_ROUTE", "encode") }
+    let plan = __prim__.graph_compile(builder, inputs, outputs, "latency")
+    if chosen is null { unset_env("JAITHON_GRAPH_ROUTE") }
+    return plan
+}
+
+#: `x` convolved with `w` as one dispatch of a compiled one-operator graph.
+#:
+#: `params` is the builder's eleven -- strides, the four pads, dilations,
+#: groups and two layout flags -- for the two-dimensional form. A rank-three
+#: `x` is a one-dimensional convolution, run as a two-dimensional one over a
+#: height of one, with the reshapes inside the graph so nothing is copied.
+fn graph_conv_of(
+    x: Tensor,
+    w: Tensor,
+    bias: Tensor?,
+    params: list[int],
+    out_shape: list[int],
+    what: str
+) -> Tensor {
+    let key = f"{x.shape} {w.shape} {bias is not null} {params}"
+    var plan = _conv_graphs.get(key, null)
+    if plan is null {
+        let builder = __prim__.graph_new()
+        let fed_x = __prim__.graph_input(builder, x.shape)
+        let fed_w = __prim__.graph_input(builder, w.shape)
+        var inputs = [fed_x, fed_w]
+        var fed_bias = -1
+        if bias is not null {
+            fed_bias = __prim__.graph_input(builder, [bias.size])
+            inputs.push(fed_bias)
+        }
+        let flat = x.rank() == 3
+        let source = if flat {
+            __prim__.graph_reshape(builder, fed_x, [x.shape[0], x.shape[1], 1, x.shape[2]])
+        } else {
+            fed_x
+        }
+        let filters = if flat {
+            __prim__.graph_reshape(builder, fed_w, [w.shape[0], w.shape[1], 1, w.shape[2]])
+        } else {
+            fed_w
+        }
+        var result = __prim__.graph_conv(builder, source, filters, fed_bias, params)
+        if flat and result >= 0 { result = __prim__.graph_reshape(builder, result, out_shape) }
+        let built = if result < 0 { null } else { compile_encoded(builder, inputs, [result]) }
+        __prim__.graph_free(builder)
+        if built is null {
+            throw ValueError(f"{what} is a convolution the graph compiler would not take")
+        }
+        let shape = __prim__.graph_plan_output_shape(built, 0)
+        if shape != out_shape {
+            __prim__.graph_plan_free(built)
+            throw ValueError(f"{what} compiled to {shape} where its attributes give {out_shape}")
+        }
+        _conv_graphs[key] = built
+        _conv_shapes[key] = shape
+        plan = built
+    }
+    let output = Tensor(_conv_shapes[key])
+    var handles = [x.buffer().handle_of(), w.buffer().handle_of()]
+    if bias is not null { handles.push(bias.buffer().handle_of()) }
+    __prim__.graph_run(plan, handles, [output.buffer().handle_of()])
+    return output
+}
+
+#: The axes after the first two, which are what a window slides over.
+fn spatial_of(shape: list[int]) -> list[int] {
+    var dims: list[int] = []
+    for axis in 2..shape.len() { dims.push(shape[axis]) }
+    return dims
+}
+
 pub fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let x = need(ins, 0, node)
     let w = need(ins, 1, node)
     let bias = maybe(ins, 2)
-    if x.rank() != 4 {
-        throw ValueError(f"{node.label()} needs a 4-D NCHW input, got {x.shape}")
+    if x.rank() != 4 and x.rank() != 3 {
+        throw ValueError(f"{node.label()} needs a 3-D NCL or 4-D NCHW input, got {x.shape}")
     }
-    if w.rank() != 4 {
-        throw ValueError(f"{node.label()} needs 4-D weights, got {w.shape}")
+    if w.rank() != x.rank() {
+        throw ValueError(f"{node.label()} needs {x.rank()}-D weights for {x.shape}, got {w.shape}")
     }
-    let dilations = two_of(attr_ints(node, "dilations", [1, 1]), node, "dilations")
-    for spread in dilations {
-        if spread != 1 {
-            throw ValueError(
-                f"{node.label()} has dilations {dilations}, which jaitensor's convolution " +
-                    "does not take"
-            )
-        }
-    }
-    let window = two_of(
-        attr_ints(node, "kernel_shape", [w.shape[2], w.shape[3]]),
-        node,
-        "kernel_shape"
-    )
-    if window != [w.shape[2], w.shape[3]] {
+    let axes = x.rank() - 2
+    let kernel = spatial_of(w.shape)
+    let window = attr_ints(node, "kernel_shape", kernel)
+    if window != kernel {
         throw ValueError(f"{node.label()} declares kernel_shape {window} for weights {w.shape}")
     }
-    let strides = two_of(attr_ints(node, "strides", [1, 1]), node, "strides")
-    let step = only_square(strides, node, "strides")
-    let pads = resolve_pads(node, [x.shape[2], x.shape[3]], window, strides, [1, 1])
+    let ones = [1 for _axis in 0..axes]
+    let strides = attr_ints(node, "strides", ones)
+    let dilations = attr_ints(node, "dilations", ones)
+    if strides.len() != axes or dilations.len() != axes {
+        throw ValueError(
+            f"{node.label()} has strides {strides} and dilations {dilations} for " +
+                f"{axes} spatial axes"
+        )
+    }
+    let spatial = spatial_of(x.shape)
+    let pads = resolve_pads(node, spatial, window, strides, dilations)
     let groups = attr_int(node, "group", 1)
     let out_channels = w.shape[0]
     let in_per_group = w.shape[1]
@@ -120,6 +219,52 @@ pub fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     if bias is not null and bias.size != out_channels {
         throw ValueError(f"{node.label()} has {bias.size} biases for {out_channels} filters")
     }
+    var out_shape = [x.shape[0], out_channels]
+    for axis in 0..axes {
+        let reach = dilations[axis] * (window[axis] - 1) + 1
+        let extent = spatial[axis] + pads[axis] + pads[axes + axis]
+        if extent < reach {
+            throw ValueError(f"{node.label()} has a window wider than its padded input {x.shape}")
+        }
+        out_shape.push((extent - reach) // strides[axis] + 1)
+    }
+
+    #: Everything jaitensor's own convolution does not take goes to the graph
+    #: convolution in one dispatch: groups, dilations, a stride that differs
+    #: between the axes, and one-dimensional input.
+    let plain = axes == 2 and
+        groups == 1 and
+        dilations == [1, 1] and
+        strides[0] == strides[1]
+    if not plain and (GRAPH_CONV or axes == 1) {
+        let params = if axes == 1 {
+            [1, strides[0], 0, 0, pads[0], pads[1], 1, dilations[0], groups, 0, 0]
+        } else {
+            [
+                strides[0],
+                strides[1],
+                pads[0],
+                pads[2],
+                pads[1],
+                pads[3],
+                dilations[0],
+                dilations[1],
+                groups,
+                0,
+                0,
+            ]
+        }
+        return [graph_conv_of(x, w, bias, params, out_shape, node.label())]
+    }
+    for spread in dilations {
+        if spread != 1 {
+            throw ValueError(
+                f"{node.label()} has dilations {dilations}, which jaitensor's convolution " +
+                    "does not take"
+            )
+        }
+    }
+    let step = only_square(strides, node, "strides")
 
     #: One padding value goes to jaitensor when the four agree, because its
     #: convolution already skips the holes; anything else is materialised
@@ -132,6 +277,10 @@ pub fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     #: NCHW activations and OIHW weights, which is exactly what `conv2d_nchw`
     #: takes, so nothing is transposed on the way in or out -- the round trip
     #: this used to make was two thirds of what convolution appeared to cost.
+    #:
+    #: More than one group only reaches here with `JAICV_GRAPH_CONV=0`, and
+    #: then slices afresh each call: memoising the slices on the node kept
+    #: thousands of handles alive and made every later allocation slower.
     var pieces: list[Tensor] = []
     let out_per_group = out_channels // groups
     for group in 0..groups {
@@ -140,11 +289,11 @@ pub fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
         } else {
             slice_axis(padded, 1, group * in_per_group, in_per_group)
         }
-        #: A group's filters are a contiguous run of OIHW's first axis, and
-        #: they are the same run on every frame, so the slice is kept on the
-        #: node. Ungrouped convolutions -- nearly all of them -- slice nothing
-        #: and hand the initializer straight through.
-        let slice_w = if groups == 1 { w } else { group_weights(node, w, group, out_per_group) }
+        let slice_w = if groups == 1 {
+            w
+        } else {
+            slice_axis(w, 0, group * out_per_group, out_per_group)
+        }
         var slice_bias: Tensor? = null
         if bias is not null {
             slice_bias = if groups == 1 {
@@ -157,6 +306,7 @@ pub fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
             jt.conv2d_nchw(slice_in, slice_w, bias: slice_bias, stride: step, padding: inner_pad)
         )
         if slice_in is not padded { slice_in.free() }
+        if slice_w is not w { slice_w.free() }
         if slice_bias is not null and slice_bias is not bias { slice_bias.free() }
     }
     if padded is not x { padded.free() }
@@ -165,22 +315,6 @@ pub fn op_conv(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
         for piece in pieces { piece.free() }
     }
     return [output]
-}
-
-#: One group's filters out of an OIHW weight tensor, memoised on the node.
-#:
-#: The slice depends only on the weights, which are an initializer, so it is
-#: the same tensor every run -- but it is recomputed if the caller ever feeds
-#: different weights under the same name.
-fn group_weights(node: GraphNode, w: Tensor, group: int, out_per_group: int) -> Tensor {
-    let key = f"w{group}"
-    let kept = node.cached.get(key, null)
-    if kept is not null and node.cached_of.get(key, null) is w { return kept }
-    if kept is not null { kept.free() }
-    let cut = slice_axis(w, 0, group * out_per_group, out_per_group)
-    node.cached[key] = cut
-    node.cached_of[key] = w
-    return cut
 }
 
 pub fn op_conv_transpose(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
@@ -229,43 +363,35 @@ pub fn op_conv_transpose(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
                 f"give {spatial}"
         )
     }
+    #: One dispatch for every group: the kernel works out which group an
+    #: output channel is in and reads only that group's input channels.
     let in_per_group = in_channels // groups
-    var pieces: list[Tensor] = []
-    for group in 0..groups {
-        let part_x = if groups == 1 {
-            x
-        } else {
-            slice_axis(x, 1, group * in_per_group, in_per_group)
-        }
-        let part_w = if groups == 1 {
-            w
-        } else {
-            slice_axis(w, 0, group * in_per_group, in_per_group)
-        }
-        var part_bias: Tensor? = null
-        if bias is not null {
-            part_bias = if groups == 1 {
-                bias
-            } else {
-                slice_axis(bias, 0, group * out_per_group, out_per_group)
-            }
-        }
-        let output = Tensor([x.shape[0], out_per_group, spatial[0], spatial[1]])
-        let bias_buffer = if part_bias is null { output.buffer() } else { part_bias.buffer() }
-        kernel_for("conv_transpose_nchw").dispatch_async([part_x.buffer(), part_w.buffer(), bias_buffer, output.buffer()], output.size, [output.size, in_per_group, x.shape[2], x.shape[3], out_per_group, spatial[0], spatial[1], window[0], window[1], strides[0], strides[1], pads[0], pads[1], dilations[0], dilations[1], if part_bias is null {
-            0
-        } else {
-            1
-        }])
-        pieces.push(output)
-        if part_x is not x { part_x.free() }
-        if part_w is not w { part_w.free() }
-        if part_bias is not null and part_bias is not bias { part_bias.free() }
-    }
-    if pieces.len() == 1 { return [pieces[0]] }
-    let joined = concat_along(pieces, 1, node.label())
-    for piece in pieces { piece.free() }
-    return [joined]
+    let output = Tensor([x.shape[0], out_channels, spatial[0], spatial[1]])
+    let bias_buffer = if bias is null { output.buffer() } else { bias.buffer() }
+    kernel_for("conv_transpose_nchw").dispatch_async(
+        [x.buffer(), w.buffer(), bias_buffer, output.buffer()],
+        output.size,
+        [
+            output.size,
+            in_per_group,
+            x.shape[2],
+            x.shape[3],
+            out_per_group,
+            spatial[0],
+            spatial[1],
+            window[0],
+            window[1],
+            strides[0],
+            strides[1],
+            pads[0],
+            pads[1],
+            dilations[0],
+            dilations[1],
+            if bias is null { 0 } else { 1 },
+            groups,
+        ]
+    )
+    return [output]
 }
 
 fn op_pool(node: GraphNode, ins: list[Tensor?], is_max: bool) -> list[Tensor] {
