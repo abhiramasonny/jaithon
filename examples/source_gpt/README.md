@@ -97,7 +97,8 @@ Read it this way:
   other all the way: 2.60 / 2.62 at step 250, 1.98 / 1.99 at 500, 1.70 / 1.69
   at 1,000, 1.46 / 1.49 at 2,000 (jai first; 8 batches until the last, which
   is all 1,920 windows). Torch's own two runs ended 0.025 apart, 1.488 and
-  1.463, so the gap between the sides is inside the gap between seeds.
+  1.463, with the same seed, so the gap between the sides is inside torch's own
+  run-to-run spread.
 - **Decoding reaches the target on the merged tree, not on this branch.** A
   decoded byte is about 40 dispatches of one row each, and the device -- not
   the host, whose encode is 0.3 ms of it -- spends its time in the one-row
