@@ -251,7 +251,13 @@ fn main() -> int {
     var pending: Tensor? = null
     var finished = progress(step, total, train_seconds, budget) >= 1.0
     while not finished {
-        if minutes > 0.0 and t0.elapsed().to_seconds() >= minutes * 60.0 { break }
+        if minutes > 0.0 and t0.elapsed().to_seconds() >= minutes * 60.0 {
+            #: A sliver of the budget left over -- the chunk's evaluations
+            #: are not training time -- is finished here rather than given
+            #: a turn on the GPU of its own.
+            let left = budget * 60.0 - train_seconds
+            if budget <= 0.0 or left > 0.2 * minutes * 60.0 { break }
+        }
         let done = progress(step, total, start_seconds + t0.elapsed().to_seconds() - aside, budget)
         let lr = scheduled_rate(step, done, peak, warmup, floor)
         let (x, y) = sampler.next(cfg.batch, cfg.seq)

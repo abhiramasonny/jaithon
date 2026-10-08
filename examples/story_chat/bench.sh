@@ -9,7 +9,7 @@
 # warms for WARM (3) seconds of wall clock, then times REPS (5) x BENCH_STEPS
 # (5) steps, reading the loss every step. GPT_* and VOCAB set the shape on
 # both sides. PEER_FUSED=1 gives torch its fused AdamW. "jai fp16" is
-# GPT_MIXED=1, the large products in float16.
+# GPT_MIXED=1, the large products in float16; MIXED_TOO=0 leaves it out.
 set -e
 J="${JAITHON:-./jaithon}"
 PY="${PYTHON:-$HOME/.venvs/scratch/bin/python}"
@@ -29,6 +29,10 @@ if [ "${INSIDE_LOCK:-0}" != 1 ]; then
 fi
 r=0
 while [ "$r" -lt "$ROUNDS" ]; do
-    if [ $((r % 2)) -eq 0 ]; then jai; torch; mixed; else mixed; torch; jai; fi
+    if [ "${MIXED_TOO:-1}" = 1 ]; then
+        if [ $((r % 2)) -eq 0 ]; then jai; torch; mixed; else mixed; torch; jai; fi
+    else
+        if [ $((r % 2)) -eq 0 ]; then jai; torch; else torch; jai; fi
+    fi
     r=$((r + 1))
 done
