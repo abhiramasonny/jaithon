@@ -165,6 +165,8 @@ def train():
     rng = np.random.default_rng(7)
     span = len(valid) - T - 1
     count = env_int("EVAL_WINDOWS", 256)
+    if count < B or count % B:
+        raise SystemExit(f"EVAL_WINDOWS={count}: it has to be a multiple of the batch, {B}")
     held = [i * (span // count) for i in range(count)]
     t0 = time.perf_counter()
     recent = []
