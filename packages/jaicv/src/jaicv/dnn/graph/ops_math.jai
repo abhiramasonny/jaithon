@@ -308,7 +308,10 @@ let GRAPH_MATMUL = env("JAICV_GRAPH_MATMUL") != "0"
 #: The one-operator matmul graphs, by the two operand shapes.
 var _matmul_graphs: dict[str, int] = {}
 
-#: `left @ right` over matching batch axes, as one dispatch.
+#: `left @ right` over matching batch axes, as one dispatch. A matrix on the
+#: right of a batch -- a linear layer over every token or pixel -- is one
+#: product of the flattened rows instead, reshaped inside the graph, so the
+#: weights are never copied out once per row of the batch.
 fn graph_matmul_of(left: Tensor, right: Tensor, dims: list[int]) -> Tensor {
     let key = f"{left.shape} {right.shape}"
     var plan = _matmul_graphs.get(key, null)
@@ -316,7 +319,15 @@ fn graph_matmul_of(left: Tensor, right: Tensor, dims: list[int]) -> Tensor {
         let builder = __prim__.graph_new()
         let fed_left = __prim__.graph_input(builder, left.shape)
         let fed_right = __prim__.graph_input(builder, right.shape)
-        let product = __prim__.graph_matmul(builder, fed_left, fed_right)
+        let flat = right.rank() == 2 and left.rank() > 2
+        let rows = left.size // left.shape[left.rank() - 1]
+        let source = if flat {
+            __prim__.graph_reshape(builder, fed_left, [rows, left.shape[left.rank() - 1]])
+        } else {
+            fed_left
+        }
+        var product = __prim__.graph_matmul(builder, source, fed_right)
+        if flat and product >= 0 { product = __prim__.graph_reshape(builder, product, dims) }
         let built = if product < 0 {
             null
         } else {
@@ -417,8 +428,13 @@ pub fn op_matmul(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
             node.label()
         )
     }
+    var dims = [dimension for dimension in batch]
+    dims.push(rows)
+    dims.push(columns)
     let product = if batch.len() == 0 {
         jt.matmul(left, right)
+    } elif GRAPH_MATMUL and right.rank() == 2 {
+        graph_matmul_of(left, right, dims)
     } else {
         batched_matmul(left, right, batch, rows, inner, columns)
     }
