@@ -8,7 +8,7 @@ from .kernels import base_kernel
 from .params import check_matrix
 from std.os import env_or
 
-from .reduce import DIRECT_WIDTH, row_topk, row_topk_into, topk_one_pass
+from .reduce import DIRECT_WIDTH, direct_search_takes, row_topk, row_topk_into, topk_one_pass
 
 #: `JAILEARN_NEAREST_EXACT=0` returns `nearest_rows` to the expanded form
 #: alone: no term-by-term search for narrow rows, and no exact distances for
@@ -113,7 +113,7 @@ pub fn nearest_rows(
     let index = Tensor([queries, k])
     let one_pass = topk_one_pass(k)
     let refine = exact and _NEAREST_EXACT
-    if refine and one_pass and a.shape[1] <= DIRECT_WIDTH {
+    if refine and direct_search_takes(k) and a.shape[1] <= DIRECT_WIDTH {
         row_topk_into(
             b.buffer(),
             queries,

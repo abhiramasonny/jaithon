@@ -399,6 +399,17 @@ fn test_neighbours_survive_an_offset_and_a_narrow_row() -> void {
     assert_true(line >= 0.99, f"one zero-mean feature: {line} of nearest rows right")
 }
 
+#: The term-by-term search for narrow rows takes `k` only up to
+#: `TOPK_ONE_PASS_MAX`; a larger `k` goes through the GEMM, which on narrow
+#: rows a hundred from the origin needs the centring as much as wide ones do.
+fn test_a_narrow_row_past_the_one_pass_k_is_centred() -> void {
+    if not jl.is_available() { return }
+    if not jl.exact_search() { return }
+    let k = jl.TOPK_ONE_PASS_MAX + 8
+    let narrow = neighbour_agreement(3000, 2, 20, k, 100.0, 1.0)
+    assert_true(narrow >= 0.99, f"two features, offset 100, k {k}: {narrow} of neighbours right")
+}
+
 #: An exact duplicate is at distance zero, so distance weighting takes only
 #: it -- which the expanded form missed by up to five on integer features in
 #: the hundreds, so the rule never fired.

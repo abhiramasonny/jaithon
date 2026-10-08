@@ -14,8 +14,9 @@
 #:
 #: The distances are float32, where scikit-learn's brute force upcasts to
 #: float64, so the search is arranged to lose as little as float32 must.
-#: Rows of at most `DIRECT_WIDTH` features are compared term by term. Wider
-#: ones go through the GEMM, whose expanded form `|a|^2 + |b|^2 - 2 a.b`
+#: Rows of at most `DIRECT_WIDTH` features are compared term by term, for a
+#: `k` up to `TOPK_ONE_PASS_MAX`. Wider ones, and a larger `k`, go through the
+#: GEMM, whose expanded form `|a|^2 + |b|^2 - 2 a.b`
 #: rounds at the scale of the squared norms: on data a thousand from the
 #: origin it picked the wrong nearest row five times in six. So the index
 #: centres the training rows on their column means once, at `fit`, and each
@@ -37,7 +38,7 @@ from jaitensor import Tensor
 from .base import DIRECT_WIDTH, Estimator, EstimatorKind, LabelIndex, Params, cached_kernel
 from .base import check_fitted, check_matrix, check_pair, check_width, column_moments, exact_search
 from .base import nearest_rows, param_int, param_str, params_of, refine_nearest, require_target
-from .base.reduce import copy_into
+from .base.reduce import copy_into, direct_search_takes
 
 let SOURCE = """#include <metal_stdlib>
 using namespace metal;
@@ -194,8 +195,10 @@ fn centred(x: Tensor, mean: Tensor) -> Tensor {
 
 #: The training rows both estimators search, and the search itself.
 #:
-#: Wider than `DIRECT_WIDTH`, it also keeps the rows centred on their column
-#: means, which is what the GEMM search ranks (see the module comment).
+#: It also keeps the rows centred on their column means, which is what the
+#: GEMM search ranks (see the module comment). A narrow index needs them too:
+#: the term-by-term search takes `k` only up to `TOPK_ONE_PASS_MAX`, and a
+#: larger `k` goes through the GEMM.
 class NeighborIndex {
     pub var rows: Tensor?
     var centre: Tensor?
@@ -218,7 +221,7 @@ class NeighborIndex {
         self.free()
         self.rows = copy_of(x)
         self.width = x.shape[1]
-        if x.shape[1] > DIRECT_WIDTH and exact_search() {
+        if exact_search() {
             let (mean, variance) = column_moments(x)
             variance.free()
             self.centre = mean
@@ -239,7 +242,8 @@ class NeighborIndex {
         }
         let mean = self.centre
         let shifted = self.shifted
-        if mean is null or shifted is null { return nearest_rows(x, rows, k) }
+        let direct = self.width <= DIRECT_WIDTH and direct_search_takes(k)
+        if direct or mean is null or shifted is null { return nearest_rows(x, rows, k) }
         let queries = centred(x, mean)
         defer { queries.free() }
         let (squared, index) = nearest_rows(queries, shifted, k, exact: false)

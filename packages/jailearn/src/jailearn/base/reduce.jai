@@ -237,6 +237,14 @@ pub const DIRECT_WIDTH: int = 8
 #: Whether `row_topk_into` takes a `k` this large in one pass.
 pub fn topk_one_pass(k: int) -> bool { return _ROW_TOPK and k <= TOPK_ONE_PASS_MAX }
 
+#: Whether the term-by-term search for rows of at most `DIRECT_WIDTH`
+#: features takes a `k` this large. It runs on the one-pass kernel whatever
+#: `JAILEARN_ROW_TOPK` says: that switch restores the old top-k for a
+#: finished matrix, and there is no old kernel for a search that never
+#: finishes one -- without it, narrow rows would fall back to the expanded
+#: form this search exists to avoid.
+pub fn direct_search_takes(k: int) -> bool { return k <= TOPK_ONE_PASS_MAX }
+
 #: Write the best `k` of each of `rows` rows of `m` into rows `first..` of
 #: `values` and `index`, in one pass (`topk_one_pass(k)` must hold).
 #:
@@ -262,7 +270,10 @@ pub fn row_topk_into(
     right: Buffer? = null,
     direct_width: int = 0
 ) -> void {
-    if not topk_one_pass(k) { throw ValueError(f"k {k} is past the one-pass top-k") }
+    let direct = direct_width > 0
+    if not (if direct { direct_search_takes(k) } else { topk_one_pass(k) }) {
+        throw ValueError(f"k {k} is past the one-pass top-k")
+    }
     if direct_width > DIRECT_WIDTH {
         throw ValueError(
             f"a direct search takes at most {DIRECT_WIDTH} features, got {direct_width}"
