@@ -967,12 +967,81 @@ fn pow2_ceiling(extent: int) -> int {
 let THIN_SMALL_WORK = 2097152
 let THIN_MAX_WORK = 67108864
 
-#: Whether the thin kernels may run a product: one with an output row or
-#: column under 32, or fewer than 8 steps of K, or one small enough that only
-#: latency matters.
+#: How many 32x32 output tiles a product may make and still be the thin
+#: kernels' statically, by its narrower output side.
+#:
+#: What the thin kernels win is the parallelism the tile kernels cannot find
+#: in a handful of tiles, and the padding a 32-wide tile computes past a
+#: narrow side. What they give up is all reuse: each lane reads both operands
+#: for each of its outputs. So the wider the narrow side, the fewer tiles it
+#: takes before the tile kernels win back. One to four wide, padding is most
+#: of a tile and the thin kernels win at any size: 100000x50x4 ran 235 us
+#: against 522 staged. Up to 16 wide they win to about 128 tiles (4096x512x16,
+#: 164 against 209) and lose past it (5000x200x16, 156 against 100;
+#: 20000x128x16, 332 against 258). From 17 to 31 they win at 16 tiles
+#: (24x2048x512, 89 against 205; 31x1000x256, 69 against 96) and lose at 32
+#: (1024x1000x31, 278 against 136). Where the lanes read along K (see
+#: `thin_layout`) they keep the tighter budget even up to 16 wide:
+#: 1024x1000x16 with `b` transposed (32 tiles) ran 134 us against 106, and
+#: 10 wide at 32 to 128 tiles was a tie. A product that is not thin at all
+#: is theirs only small and under 64 tiles: 512x10x256 (128 tiles) ran 17 us
+#: staged against 20 thin, 4096x4x100 45 against 55.
+let THIN_ANY_WIDTH = 4
+let THIN_NARROW_WIDTH = 16
+let THIN_NARROW_TILES = 128
+let THIN_EDGE_TILES = 16
+let THIN_SMALL_TILES = 64
+
+#: Lanes along the output a thin kernel keeps when the operand those lanes
+#: read lies along K, and the depth from which it does. See `thin_layout`.
+let THIN_K_LANES = 4
+let THIN_K_INNER = 128
+
+#: Whether a product has an output row or column under 32.
+fn thin_output(rows: int, columns: int) -> bool { return rows < 32 or columns < 32 }
+
+#: Whether the thin kernels may run a product at all, and be timed on it: one
+#: with an output row or column under 32, or one small enough that latency
+#: may be all it costs. Which of these they run statically is `thin_suits`.
 fn thin_shape(rows: int, inner: int, columns: int) -> bool {
-    if rows < 32 or columns < 32 or inner < 8 { return true }
-    return rows * inner * columns <= THIN_SMALL_WORK
+    return thin_output(rows, columns) or rows * inner * columns <= THIN_SMALL_WORK
+}
+
+#: Whether the static plan for `batch` products of this shape, in one
+#: dispatch, is a thin kernel.
+#:
+#: A batch is judged as the product it adds up to -- its work and its tiles
+#: are the batch's. One small ragged product is latency; a batch of them
+#: gives the tile kernels the threadgroups one could not. jaicv cuts a long
+#: product into blocks of 2M multiply-adds and sends them as one batch, and
+#: attention multiplies every head at once: judged block by block,
+#: 10000x33x100 ran on `thin_n` at 520 us against 218 staged, and a
+#: 32-sequence, 8-head attention step at length 77 took 16.5 ms against 6.5.
+fn thin_suits(
+    rows: int,
+    inner: int,
+    columns: int,
+    batch: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> bool {
+    if not thin_shape(rows, inner, columns) { return false }
+    let work = rows * inner * columns * batch
+    if work >= THIN_MAX_WORK { return false }
+    let tiles = tile_count(CONFIGS[DIRECT_NARROW], rows, columns) * batch
+    let narrow = min(rows, columns)
+    if narrow >= 32 { return work <= THIN_SMALL_WORK and tiles < THIN_SMALL_TILES }
+    if narrow <= THIN_ANY_WIDTH or work <= THIN_SMALL_WORK { return true }
+    let config = CONFIGS[static_thin(rows, inner, columns, trans_a)]
+    let along_k = inner >= THIN_K_INNER and thin_k_major(config, trans_a, trans_b)
+    if narrow <= THIN_NARROW_WIDTH and not along_k { return tiles <= THIN_NARROW_TILES }
+    return tiles <= THIN_EDGE_TILES
+}
+
+#: Whether the operand a thin kernel's lanes read side by side lies along K:
+#: `b` transposed under `thin_n`, `a` untransposed under `thin_m`.
+fn thin_k_major(config: Config, trans_a: bool, trans_b: bool) -> bool {
+    return if config.axis == 0 { trans_b } else { not trans_a }
 }
 
 #: The thin kernel's lanes along the fast axis per simdgroup, its simdgroups
@@ -984,10 +1053,27 @@ fn thin_shape(rows: int, inner: int, columns: int) -> bool {
 #: simdgroups left over take more of the slow axis. A one-row product of
 #: 64 columns and 64 steps is two threadgroups of eight simdgroups, each lane
 #: eight steps; a one-wide column of 256 rows over 64 is eight threadgroups.
-fn thin_layout(config: Config, rows: int, inner: int, columns: int) -> list[int] {
+#:
+#: Except where the operand the fast lanes read lies along K (see
+#: `thin_k_major`) and K is long: there a simdgroup of lanes side by side
+#: reads 32 rows of it a stride of K apart, a cache line each per load, and
+#: 2048x1000x10 with `b` transposed ran 335 us that way against 193 on the
+#: staged kernel. Only `THIN_K_LANES` lanes go along the output there, so the
+#: rest read along K together.
+fn thin_layout(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> list[int] {
     let fast = if config.axis == 0 { columns } else { rows }
     let slow = if config.axis == 0 { rows } else { columns }
-    let fw = min(32, pow2_ceiling(max(1, fast)))
+    var fw = min(32, pow2_ceiling(max(1, fast)))
+    if inner >= THIN_K_INNER and thin_k_major(config, trans_a, trans_b) {
+        fw = min(fw, THIN_K_LANES)
+    }
     let kl = 32 // fw
     let wanted = (inner + THIN_LANE_STEPS - 1) // THIN_LANE_STEPS
     var sg_k = 1
@@ -997,9 +1083,31 @@ fn thin_layout(config: Config, rows: int, inner: int, columns: int) -> list[int]
     return [fw, sg_slow, tiles]
 }
 
+#: The lanes along the output a simdgroup of the thin kernel `entry` takes
+#: for this product (see `thin_layout`); 0 for any other kernel.
+pub fn thin_lanes(
+    entry: str,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> int {
+    let index = config_index(entry)
+    if index < 0 or not CONFIGS[index].thin() { return 0 }
+    return thin_layout(CONFIGS[index], rows, inner, columns, trans_a, trans_b)[0]
+}
+
 #: Threadgroups one split of one matrix takes on `config`.
-fn tiles_of(config: Config, rows: int, inner: int, columns: int) -> int {
-    if config.thin() { return thin_layout(config, rows, inner, columns)[2] }
+fn tiles_of(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> int {
+    if config.thin() { return thin_layout(config, rows, inner, columns, trans_a, trans_b)[2] }
     return tile_count(config, rows, columns)
 }
 
@@ -1009,10 +1117,18 @@ fn split_counts() -> list[int] {
     return SPLIT_CANDIDATES + DEEP_SPLITS
 }
 
-fn split_allowed(config: Config, rows: int, inner: int, columns: int, splits: int) -> bool {
+fn split_allowed(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    splits: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> bool {
     if splits == 1 { return true }
     if inner // splits < 64 { return false }
-    let tiles = tiles_of(config, rows, inner, columns)
+    let tiles = tiles_of(config, rows, inner, columns, trans_a, trans_b)
     if splits > 16 and tiles * 16 >= TARGET_GROUPS { return false }
     return tiles * splits <= 8192
 }
@@ -1054,13 +1170,20 @@ fn static_thin(rows: int, inner: int, columns: int, trans_a: bool) -> int {
 
 #: K splits a thin static plan takes: none until a lane would walk more than
 #: `THIN_SPLIT_DEPTH` steps, and then as few as bring it under.
-fn thin_splits(config: Config, rows: int, inner: int, columns: int) -> int {
-    let layout = thin_layout(config, rows, inner, columns)
+fn thin_splits(
+    config: Config,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool = false,
+    trans_b: bool = false
+) -> int {
+    let layout = thin_layout(config, rows, inner, columns, trans_a, trans_b)
     let lanes = 32 // layout[0] * (8 // layout[1])
     let depth = (inner + lanes - 1) // lanes
     var splits = 1
     while depth > splits * THIN_SPLIT_DEPTH and
-        split_allowed(config, rows, inner, columns, splits * 2) {
+        split_allowed(config, rows, inner, columns, splits * 2, trans_a, trans_b) {
         splits = splits * 2
     }
     return splits
@@ -1160,7 +1283,8 @@ pub fn default_plan(
     inner: int,
     columns: int,
     trans_a: bool = false,
-    trans_b: bool = false
+    trans_b: bool = false,
+    batch: int = 1
 ) -> Plan {
     if _STATIC_DIRECT {
         let work = rows * inner * columns
@@ -1173,10 +1297,14 @@ pub fn default_plan(
                 return MPS_PLAN
             }
         }
-        if direct < 0 and _THIN and thin_shape(rows, inner, columns) and work < THIN_MAX_WORK {
+        if direct < 0 and _THIN and thin_suits(rows, inner, columns, batch, trans_a, trans_b) {
             let thin = static_thin(rows, inner, columns, trans_a)
             let config = CONFIGS[thin]
-            return Plan(config.entry, thin, thin_splits(config, rows, inner, columns))
+            return Plan(
+                config.entry,
+                thin,
+                thin_splits(config, rows, inner, columns, trans_a, trans_b)
+            )
         }
         let chosen = if direct >= 0 { direct } else { static_staged(rows, columns) }
         let config = CONFIGS[chosen]
@@ -1205,7 +1333,7 @@ fn plan_legal(
     if plan.config < 0 { return mps_possible(rows, inner, columns, trans_a, trans_b) }
     let config = CONFIGS[plan.config]
     if not config_allowed(config, rows, inner, columns) { return false }
-    return split_allowed(config, rows, inner, columns, plan.splits)
+    return split_allowed(config, rows, inner, columns, plan.splits, trans_a, trans_b)
 }
 
 var _cache: dict[str, Plan] = {}
@@ -1256,10 +1384,14 @@ fn tune_epoch(element: str) -> str {
     #: switches are in it because each changes what a tuning pass can choose
     #: between.
     #: And again (5) when thin and short-K products moved off the staged
-    #: kernel onto the thin ones.
-    var extra = f"|{MIN_TILES}|{TARGET_GROUPS}|policy=lazy-buckets-5|{MPS_STATIC_WORK}|{TUNE_MPS_MARGIN}"
+    #: kernel onto the thin ones, and (6) when a thin plan's lanes started
+    #: reading along K for a K-major operand and big-output small products
+    #: went back to the tile kernels.
+    var extra = f"|{MIN_TILES}|{TARGET_GROUPS}|policy=lazy-buckets-6|{MPS_STATIC_WORK}|{TUNE_MPS_MARGIN}"
     extra = extra + f"|{PAD_MPS_RATIO}|{STAGED_SPLIT_DEPTH}|{THIN_LANE_STEPS}|{THIN_SPLIT_DEPTH}"
-    extra = extra + f"|{THIN_SMALL_WORK}|{THIN_MAX_WORK}"
+    extra = extra +
+        f"|{THIN_SMALL_WORK}|{THIN_MAX_WORK}|{THIN_SMALL_TILES}|{THIN_K_LANES}|{THIN_K_INNER}"
+    extra = extra + f"|{THIN_ANY_WIDTH}|{THIN_NARROW_WIDTH}|{THIN_NARROW_TILES}|{THIN_EDGE_TILES}"
     extra = extra + f"|{_LAZY_TUNE}|{_PAD}|{_STATIC_DIRECT}|{_DEEP_SPLITS}|{_THIN}"
     for candidate in split_counts() { extra = extra + f",{candidate}" }
     #: FNV-1a over the bytes (jaiHashBytes), so it is the same number in every
@@ -1618,7 +1750,7 @@ fn encode(
     var fw = 0
     var sg_slow = 0
     if config.thin() {
-        let layout = thin_layout(config, rows, inner, columns)
+        let layout = thin_layout(config, rows, inner, columns, trans_a, trans_b)
         fw = layout[0]
         sg_slow = layout[1]
         tiles = layout[2]
@@ -1724,7 +1856,7 @@ pub fn candidates(
     #: a model touches, and the thin kernels choose their own layout.
     for (index, config) in CONFIGS.enumerate() {
         if not config.thin() or not config_allowed(config, rows, inner, columns) { continue }
-        let deep = thin_splits(config, rows, inner, columns)
+        let deep = thin_splits(config, rows, inner, columns, trans_a, trans_b)
         if not (index == fallback.config and fallback.splits == 1) {
             found.push(Plan(config.entry, index, 1))
         }
@@ -2344,14 +2476,52 @@ fn batched_splits(
     inner: int,
     columns: int,
     tuned: int,
-    batch: int
+    batch: int,
+    trans_a: bool = false,
+    trans_b: bool = false
 ) -> int {
     var chosen = 1
     while chosen < tuned and chosen * batch < tuned {
-        if not split_allowed(config, rows, inner, columns, chosen * 2) { break }
+        if not split_allowed(config, rows, inner, columns, chosen * 2, trans_a, trans_b) { break }
         chosen = chosen * 2
     }
     return chosen
+}
+
+#: The plan `batch` products of this shape run on in one dispatch, given the
+#: plan one of them would: a thin plan only where the whole batch suits it
+#: (see `thin_suits`), and no more splits than the batch needs (see
+#: `batched_splits`).
+pub fn batched_plan(
+    one: Plan,
+    rows: int,
+    inner: int,
+    columns: int,
+    batch: int,
+    trans_a: bool = false,
+    trans_b: bool = false,
+    keep_thin: bool = false
+) -> Plan {
+    var tuned = one
+    if not keep_thin and
+        tuned.config >= 0 and
+        CONFIGS[tuned.config].thin() and
+        not thin_suits(rows, inner, columns, batch, trans_a, trans_b) {
+        tuned = default_plan(rows, inner, columns, trans_a, trans_b, batch: batch)
+    }
+    if tuned.config < 0 or tuned.splits == 1 { return tuned }
+    let splits = batched_splits(
+        CONFIGS[tuned.config],
+        rows,
+        inner,
+        columns,
+        tuned.splits,
+        batch,
+        trans_a,
+        trans_b
+    )
+    if splits == tuned.splits { return tuned }
+    return Plan(tuned.backend, tuned.config, splits)
 }
 
 #: Multiply `batch` pairs of equally shaped matrices in one dispatch.
@@ -2387,19 +2557,10 @@ pub fn dispatch_batched(
         dispatch(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
         return
     }
-    let tuned = plan_for(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
-    var plan = tuned
-    if tuned.config >= 0 and tuned.splits > 1 {
-        let splits = batched_splits(
-            CONFIGS[tuned.config],
-            rows,
-            inner,
-            columns,
-            tuned.splits,
-            batch
-        )
-        if splits != tuned.splits { plan = Plan(tuned.backend, tuned.config, splits) }
-    }
+    let one = plan_for(a, b, output, bias, rows, inner, columns, trans_a, trans_b)
+    #: A forced thin plan stays thin, so a probe can still time it batched.
+    let keep = forced_plan() is not null
+    let plan = batched_plan(one, rows, inner, columns, batch, trans_a, trans_b, keep_thin: keep)
     encode(
         plan,
         a,

@@ -2,7 +2,7 @@
 import jaitensor as jt
 import std.gpu as gpu
 from jaitensor.gemm import Plan, bucket_extent, cache_key, candidates, default_plan, dispatch_plan
-from jaitensor.gemm import dispatch_batched
+from jaitensor.gemm import batched_plan, dispatch_batched, thin_lanes
 import std.math as math
 from jaitensor.gemm import last_tune_counts, plan_from_text, reload_plans
 from jaitensor.ops import matmul_backend
@@ -566,6 +566,9 @@ let THIN_SHAPES = [
     [33, 3, 40],
     [64, 10, 128],
     [5, 3000, 3],
+    [40, 300, 37],
+    [37, 200, 64],
+    [70, 1000, 10],
 ]
 
 fn test_thin_kernels_take_thin_shapes_statically() -> void {
@@ -818,6 +821,119 @@ fn test_a_nan_pre_activation_stays_nan_through_the_tanh_epilogue() -> void {
     }
     #: Through the padded graph route's unpad kernel too.
     for epilogue in [4, 5] { assert_nan_row_survives(plan_named("mpsgraph"), 9, 50, 7, epilogue) }
+}
+
+#: A small product whose output already makes a few hundred tiles has the
+#: parallelism the thin kernels would bring, and the tile kernels' reuse
+#: wins: 512x10x256 ran 17 us staged against 20 thin, 4096x4x100 45 against
+#: 55, 2048x7x512 with `b` transposed 58 against 113.
+fn test_a_small_product_with_a_big_output_keeps_the_tile_kernels() -> void {
+    assert_eq(default_plan(512, 10, 256).to_str(), "gemm64x32:1")
+    assert_eq(default_plan(512, 10, 256, true).to_str(), "gemm64x32:1")
+    assert_eq(default_plan(512, 10, 256, false, true).to_str(), "gemm64x32:1")
+    assert_eq(default_plan(4096, 4, 100).to_str(), "gemm64x32:1")
+    assert_eq(default_plan(2048, 7, 512, false, true).to_str(), "gemm64x32:1")
+    #: A few tiles are still the thin kernels'.
+    assert_eq(default_plan(64, 10, 128, false, true).to_str(), "thin_n:1")
+    assert_eq(default_plan(33, 64, 64).to_str(), "thin_n:1")
+}
+
+#: A thin output takes fewer tiles before the tile kernels win back, the
+#: wider its narrow side (see `THIN_ANY_WIDTH`): 1024x1000x31 with `b`
+#: transposed ran 278 us thin against 136 staged, 20000x128x16 332 against
+#: 258; 31 rows over 256 columns, eight tiles, 69 thin against 96.
+fn test_a_thin_output_keeps_the_thin_kernels_only_while_its_tiles_are_few() -> void {
+    assert_eq(default_plan(1024, 1000, 31, false, true).to_str(), "gemm64x32:8")
+    assert_eq(default_plan(1024, 1000, 16, false, true).to_str(), "gemm64x32:8")
+    assert_eq(default_plan(20000, 128, 16).to_str(), "gemm64x32:1")
+    assert_eq(default_plan(100000, 50, 10).to_str(), "gemm64x32:1")
+    assert_eq(default_plan(31, 1000, 256, false, true).to_str(), "thin_n:1")
+    assert_eq(default_plan(4096, 512, 16).to_str(), "thin_n:1")
+    assert_eq(default_plan(100000, 50, 4).to_str(), "thin_m:1")
+}
+
+#: Where the operand a thin kernel's lanes read side by side lies along K and
+#: K is long, the lanes read along K instead: 2048x1000x10 with `b`
+#: transposed ran 332 us with sixteen lanes along the output and 196 with
+#: four; 1x768x768 28 against 12.
+fn test_thin_lanes_read_along_k_for_a_k_major_operand() -> void {
+    assert_eq(thin_lanes("thin_n", 2048, 1000, 10, false, true), 4)
+    assert_eq(thin_lanes("thin_n", 2048, 1000, 10), 16)
+    assert_eq(thin_lanes("thin_n", 1, 768, 768, false, true), 4)
+    assert_eq(thin_lanes("thin_m", 64, 256, 1), 4)
+    assert_eq(thin_lanes("thin_m", 64, 256, 1, true), 32)
+    #: Short K keeps them along the output.
+    assert_eq(thin_lanes("thin_n", 1, 64, 64, false, true), 32)
+    assert_eq(thin_lanes("gemm32x32", 1, 64, 64), 0)
+}
+
+#: A batch is judged as the product it adds up to (see `thin_suits`): jaicv
+#: sends a long product as one batch of 2M-multiply-add blocks, and
+#: 10000x33x100 ran on `thin_n` at 520 us against 218 staged; attention
+#: multiplies every head at once, and a 32-sequence, 8-head step at length 77
+#: took 16.5 ms against 6.5.
+fn test_a_batch_of_small_products_is_judged_by_the_batch() -> void {
+    let block = default_plan(1024, 128, 16)
+    assert_eq(block.to_str(), "thin_n:1")
+    assert_eq(batched_plan(block, 1024, 128, 16, 19).to_str(), "gemm64x32:1")
+    let head = default_plan(77, 64, 77, false, true)
+    assert_eq(head.to_str(), "thin_n:1")
+    assert_eq(batched_plan(head, 77, 64, 77, 256, false, true).to_str(), "gemm32x32:1")
+    #: A tuned thin plan is held to the same rule.
+    assert_eq(batched_plan(plan_named("thin_m:2"), 77, 77, 64, 256).to_str(), "gemm32x32:1")
+    #: A few small products still add up to a small one.
+    assert_eq(batched_plan(default_plan(33, 64, 64), 33, 64, 64, 2).to_str(), "thin_n:1")
+    #: And a batch of thin ones -- one query row per head -- stays thin, where
+    #: a tile kernel would compute 31 rows of padding for every row.
+    let decode = default_plan(1, 64, 128, false, true)
+    assert_eq(batched_plan(decode, 1, 64, 128, 96, false, true).to_str(), decode.to_str())
+    #: A forced plan is what a probe asked to time.
+    assert_eq(
+        batched_plan(plan_named("thin_n"), 1024, 128, 16, 19, keep_thin: true).to_str(),
+        "thin_n:1"
+    )
+}
+
+fn test_a_batch_that_leaves_the_thin_kernels_still_matches_host() -> void {
+    if not jt.is_available() { return }
+    let batch = 6
+    let rows = 77
+    let inner = 64
+    let columns = 77
+    let a = device_tensor([batch * rows, inner], 71)
+    let b = device_tensor([batch * columns, inner], 72)
+    let out = jt.Tensor([batch * rows, columns])
+    defer { a.free() }
+    defer { b.free() }
+    defer { out.free() }
+    dispatch_batched(
+        a.buffer(),
+        b.buffer(),
+        out.buffer(),
+        out.buffer(),
+        rows,
+        inner,
+        columns,
+        batch,
+        rows * inner,
+        columns * inner,
+        trans_b: true
+    )
+    let got = out.download()
+    let av = a.download()
+    let bv = b.download()
+    for item in 0..batch {
+        for row in 0..rows {
+            for column in 0..columns {
+                var want = 0.0
+                for k in 0..inner {
+                    want += av[(item * rows + row) * inner + k] *
+                        bv[(item * columns + column) * inner + k]
+                }
+                assert_near(got[(item * rows + row) * columns + column], want, 1e-3)
+            }
+        }
+    }
 }
 
 fn test_a_batched_thin_product_matches_host() -> void {
