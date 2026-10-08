@@ -12,13 +12,14 @@ from .ops_layers import op_global_average_pool, op_global_max_pool, op_instance_
 from .ops_layers import op_layer_norm, op_lrn, op_max_pool, op_resize, op_upsample
 from .ops_math import op_abs, op_add, op_and, op_argmax, op_argmin, op_clip, op_div, op_dropout
 from .ops_math import op_elu, op_equal, op_erf, op_exp, op_gemm, op_greater, op_hard_sigmoid
+from .ops_math import op_greater_or_equal, op_hard_swish, op_less_or_equal
 from .ops_math import op_identity, op_leaky_relu, op_less, op_log, op_log_softmax, op_matmul
 from .ops_math import op_max, op_mean, op_min, op_mod, op_mul, op_neg, op_not, op_or, op_pow
 from .ops_math import op_prelu, op_reduce_max, op_reduce_mean, op_reduce_min, op_reduce_sum
 from .ops_math import op_relu, op_sigmoid, op_silu, op_softmax, op_softplus, op_sqrt, op_sub
 from .ops_math import op_sum, op_tanh, op_where
 from .ops_rnn import op_gru, op_lstm
-from .ops_shape import op_cast, op_concat, op_constant, op_constant_of_shape, op_flatten
+from .ops_shape import op_cast, op_concat, op_constant, op_constant_of_shape, op_expand, op_flatten
 from .ops_shape import op_gather, op_pad, op_reshape, op_shape, op_slice, op_split, op_squeeze
 from .ops_shape import op_transpose, op_unsqueeze
 from .tensors import copy_of
@@ -42,6 +43,7 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Sigmoid"] = op_sigmoid
     _handlers["Silu"] = op_silu
     _handlers["HardSigmoid"] = op_hard_sigmoid
+    _handlers["HardSwish"] = op_hard_swish
     _handlers["Tanh"] = op_tanh
     _handlers["Softplus"] = op_softplus
     _handlers["Erf"] = op_erf
@@ -72,6 +74,7 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Transpose"] = op_transpose
     _handlers["Slice"] = op_slice
     _handlers["Gather"] = op_gather
+    _handlers["Expand"] = op_expand
     _handlers["Pad"] = op_pad
     _handlers["MaxPool"] = op_max_pool
     _handlers["AveragePool"] = op_average_pool
@@ -101,6 +104,8 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Equal"] = op_equal
     _handlers["Greater"] = op_greater
     _handlers["Less"] = op_less
+    _handlers["GreaterOrEqual"] = op_greater_or_equal
+    _handlers["LessOrEqual"] = op_less_or_equal
     _handlers["Not"] = op_not
     _handlers["And"] = op_and
     _handlers["Or"] = op_or

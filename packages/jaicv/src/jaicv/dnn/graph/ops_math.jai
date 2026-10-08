@@ -65,6 +65,12 @@ pub fn op_hard_sigmoid(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [unary_ex_of(need(ins, 0, node), 1, first: alpha, second: beta)]
 }
 
+#: `x * HardSigmoid(x)` with the operator's fixed `alpha = 1/6`, `beta = 0.5`,
+#: in one pass rather than three.
+pub fn op_hard_swish(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    return [unary_ex_of(need(ins, 0, node), 8, first: 1.0 / 6.0, second: 0.5)]
+}
+
 pub fn op_softplus(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [unary_ex_of(need(ins, 0, node), 2)]
 }
@@ -166,6 +172,18 @@ pub fn op_greater(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
 
 pub fn op_less(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let combine = |a, b| binary_ex_of(a, b, 2)
+    return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
+}
+
+#: Their own comparisons rather than `Not` of the opposite one, which would
+#: call a NaN greater-or-equal to everything.
+pub fn op_greater_or_equal(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let combine = |a, b| binary_ex_of(a, b, 9)
+    return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
+}
+
+pub fn op_less_or_equal(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let combine = |a, b| binary_ex_of(a, b, 10)
     return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
 }
 

@@ -8,6 +8,11 @@ from .recurrent import emit_gru, emit_lstm
 from ..graph import GraphNode, attr_float, attr_int, attr_ints, attr_str
 from ..graph import normalize_axis
 
+#: The most zeros an `Expand` may bake into the graph to do its broadcast.
+#: Past this the growth is a tensor in its own right, and the interpreter's
+#: stride-zero copy is the better way to make it.
+let EXPAND_LIMIT = 1 << 20
+
 #: One node, translated into the graph under construction. Returns false when
 #: the operator is one this compiler cannot express, which abandons the whole
 #: compilation.
@@ -34,7 +39,33 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
     if node.op == "Conv" {
         let x = state.shape_of(node.inputs[0])
         let w = state.shape_of(node.inputs[1])
-        if x is null or w is null or x.len() != 4 or w.len() != 4 { return false }
+        let want = state.shape_of(out)
+        if x is null or w is null or want is null { return false }
+        if x.len() == 3 and w.len() == 3 and want.len() == 3 {
+            #: One-dimensional, as a two-dimensional convolution over a height
+            #: of one -- the same route the interpreter takes.
+            let strides = attr_ints(node, "strides", [1])
+            let dilations = attr_ints(node, "dilations", [1])
+            let pads = resolved_pads(node, [x[2]], [w[2]], strides, dilations)
+            if pads is null or strides.len() != 1 or dilations.len() != 1 { return false }
+            let bias = if node.inputs.len() > 2 and node.inputs[2].len() > 0 {
+                state.id_of(node.inputs[2])
+            } else {
+                -1
+            }
+            let source = __prim__.graph_reshape(b, state.id_of(node.inputs[0]), [x[0], x[1], 1, x[2]])
+            let filters = __prim__.graph_reshape(b, state.id_of(node.inputs[1]), [w[0], w[1], 1, w[2]])
+            let convolved = __prim__.graph_conv(
+                b,
+                source,
+                filters,
+                bias,
+                [1, strides[0], 0, 0, pads[0], pads[1], 1, dilations[0], attr_int(node, "group", 1), 0, 0]
+            )
+            state.ids[out] = __prim__.graph_reshape(b, convolved, dims_of(want))
+            return true
+        }
+        if x.len() != 4 or w.len() != 4 { return false }
         let window = [w[2], w[3]]
         let strides = attr_ints(node, "strides", [1, 1])
         let dilations = attr_ints(node, "dilations", [1, 1])
@@ -205,14 +236,57 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
         return true
     }
 
+    if node.op == "HardSwish" {
+        let x = state.id_of(node.inputs[0])
+        let scaled = __prim__.graph_binary(b, x, scalar(state, 1.0 / 6.0), 2)
+        let shifted = __prim__.graph_binary(b, scaled, scalar(state, 0.5), 0)
+        let gate = __prim__.graph_clamp(b, shifted, 0.0, 1.0)
+        state.ids[out] = __prim__.graph_binary(b, x, gate, 2)
+        return true
+    }
+
+    if node.op == "GreaterOrEqual" or node.op == "LessOrEqual" {
+        #: The builder has no such comparison, and `Not` of the opposite one
+        #: would call a NaN greater-or-equal to everything, so it is the
+        #: strict comparison or equality.
+        let a = state.id_of(node.inputs[0])
+        let c = state.id_of(node.inputs[1])
+        let strict = __prim__.graph_binary(b, a, c, if node.op == "GreaterOrEqual" { 8 } else { 9 })
+        let same = __prim__.graph_binary(b, a, c, 7)
+        state.ids[out] = __prim__.graph_binary(b, strict, same, 11)
+        return true
+    }
+
     if node.op == "Expand" {
-        #: Only where the shape does not actually change, which is what most
-        #: exported graphs use it for. A real expansion is left alone rather
-        #: than assumed to broadcast the way the operator means.
+        #: The survey has already worked out the broadcast of the two shapes,
+        #: which is what the operator produces. Adding zeros shaped like the
+        #: axes that grow is that broadcast in one operator, and the zeros are
+        #: only as large as the growth -- a class token repeated over a batch
+        #: is a `[batch, 1, 1]` constant, not a copy of the result.
         let want = state.shape_of(out)
         let have = state.shape_of(node.inputs[0])
-        if want is null or have is null or have != want { return false }
-        state.ids[out] = state.id_of(node.inputs[0])
+        if want is null or have is null or have.len() > want.len() { return false }
+        if have == want {
+            state.ids[out] = state.id_of(node.inputs[0])
+            return true
+        }
+        let offset = want.len() - have.len()
+        var growth: list[int] = []
+        var grown = 1
+        for axis in 0..want.len() {
+            let source = if axis < offset { 1 } else { have[axis - offset] }
+            if source == want[axis] {
+                growth.push(1)
+            } elif source == 1 {
+                growth.push(want[axis])
+                grown *= want[axis]
+            } else {
+                return false
+            }
+        }
+        if grown > EXPAND_LIMIT { return false }
+        let zeros = __prim__.graph_constant(b, __prim__.list_filled(grown, 0.0), growth)
+        state.ids[out] = __prim__.graph_binary(b, state.id_of(node.inputs[0]), zeros, 0)
         return true
     }
 
@@ -637,12 +711,30 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
         let x = state.shape_of(node.inputs[0])
         let want = state.shape_of(out)
         if x is null or want is null { return false }
-        let picked = __prim__.graph_gather(
-            b,
-            state.id_of(node.inputs[0]),
-            state.id_of(node.inputs[1]),
-            normalize_axis(attr_int(node, "axis", 0), x.len(), node.label())
-        )
+        let axis = normalize_axis(attr_int(node, "axis", 0), x.len(), node.label())
+        #: ONNX counts a negative index from the end -- `x[:, -1]` is how an
+        #: exporter writes a last-token read -- and the builder's gather does
+        #: not, so negatives are moved up by the axis's width first: on the
+        #: host when the indices are folded, and in the graph when they are not.
+        let width = x[axis]
+        let folded = state.constants.get(node.inputs[1], null)
+        var indices = state.id_of(node.inputs[1])
+        if folded is not null {
+            var negative = false
+            for value in folded {
+                if value < 0.0 { negative = true }
+            }
+            let shape = state.shape_of(node.inputs[1])
+            if negative and shape is not null {
+                let moved = [if value < 0.0 { value + float(width) } else { value } for value in folded]
+                indices = __prim__.graph_constant(b, moved, dims_of(shape))
+            }
+        } else {
+            let below = __prim__.graph_binary(b, indices, scalar(state, 0.0), 9)
+            let shift = __prim__.graph_binary(b, below, scalar(state, float(width)), 2)
+            indices = __prim__.graph_binary(b, indices, shift, 0)
+        }
+        let picked = __prim__.graph_gather(b, state.id_of(node.inputs[0]), indices, axis)
         #: ONNX drops the axis for a scalar index and keeps it for a vector
         #: one; the survey already knows which happened, so the result is
         #: reshaped to whatever it should have been.

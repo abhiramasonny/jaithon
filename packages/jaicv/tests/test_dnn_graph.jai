@@ -16,7 +16,7 @@
 import std.gpu as gpu
 from std.io import Path
 from std.test import assert_contains, assert_eq, assert_near, assert_throws, assert_true
-from jaicv.dnn.graph import Attr, Graph, GraphNode, is_implemented, run_graph
+from jaicv.dnn.graph import Attr, Graph, GraphNode, is_implemented, mark_rank_zero, run_graph
 from jaicv.dnn.plan import Plan, compile_plan, run_best
 from jaitensor import Tensor
 
@@ -42,6 +42,10 @@ class Case {
     pub var feeds: list[Recorded?]
     pub var attrs: dict[str, Attr]
     pub var wants: list[Recorded]
+    #: The input positions the reference fed a rank-zero scalar. They are
+    #: uploaded as `[1]` like any scalar here; this is what the importer would
+    #: have known from the file, and is handed to `mark_rank_zero` the same way.
+    pub var scalars: list[int]
 
     pub fn init(self, op: str, name: str) {
         self.op = op
@@ -49,6 +53,16 @@ class Case {
         self.feeds = []
         self.attrs = {}
         self.wants = []
+        self.scalars = []
+    }
+
+    #: This case's one node, under the names a test graph gives its inputs.
+    pub fn node(self, names: list[str], outs: list[str]) -> GraphNode {
+        let built = GraphNode(self.op, name: self.name, inputs: names, outputs: outs, attrs: self.attrs)
+        var scalar_names: dict[str, bool] = {}
+        for slot in self.scalars { scalar_names[names[slot]] = true }
+        mark_rank_zero([built], scalar_names)
+        return built
     }
 }
 
@@ -125,6 +139,8 @@ fn load_cases(path: Path) -> dict[str, list[Case]] {
             item.feeds.push(if fields[1] == "null" { null } else { read_tensor(fields, 1) })
         } elif fields[0] == "out" {
             item.wants.push(read_tensor(fields, 1))
+        } elif fields[0] == "scalar" {
+            item.scalars.push(int(fields[1]))
         } else {
             throw ValueError(f"the oracle file has a line starting {fields[0]}")
         }
@@ -164,15 +180,7 @@ fn worst_difference(item: Case) -> float {
     var outs: list[str] = []
     for slot in 0..item.wants.len() { outs.push(f"out{slot}") }
     let graph = Graph(
-        nodes: [
-            GraphNode(
-                item.op,
-                name: item.name,
-                inputs: names,
-                outputs: outs,
-                attrs: item.attrs
-            ),
-        ],
+        nodes: [item.node(names, outs)],
         inputs: declared,
         outputs: outs
     )
@@ -224,15 +232,7 @@ fn compiled_difference(item: Case, weights_are_constant: bool) -> float {
     var outs: list[str] = []
     for slot in 0..item.wants.len() { outs.push(f"out{slot}") }
     let graph = Graph(
-        nodes: [
-            GraphNode(
-                item.op,
-                name: item.name,
-                inputs: names,
-                outputs: outs,
-                attrs: item.attrs
-            ),
-        ],
+        nodes: [item.node(names, outs)],
         inputs: declared,
         outputs: outs,
         initializers: fixed
@@ -494,27 +494,30 @@ fn test_an_unimplemented_operator_names_itself() -> void {
     feed.free()
 }
 
+#: A convolution takes dilations now, through the graph route; a pool still
+#: does not, and is what says so.
 fn test_an_unsupported_attribute_names_the_node() -> void {
     let graph = Graph(
         nodes: [
             GraphNode(
-                "Conv",
+                "MaxPool",
                 name: "dilated",
-                inputs: ["x", "w"],
+                inputs: ["x"],
                 outputs: ["y"],
-                attrs: {"dilations": Attr.of_ints([2, 2])}
+                attrs: {
+                    "kernel_shape": Attr.of_ints([2, 2]),
+                    "dilations": Attr.of_ints([2, 2]),
+                }
             ),
         ],
-        inputs: ["x", "w"],
+        inputs: ["x"],
         outputs: ["y"]
     )
     let x = Tensor([1, 1, 5, 5], [float(value) for value in 0..25])
-    let w = Tensor([1, 1, 3, 3], [1.0 for _value in 0..9])
-    let error = assert_throws(ValueError, || run_graph(graph, {"x": x, "w": w}))
-    assert_contains(error.message, "operator Conv at node dilated")
+    let error = assert_throws(ValueError, || run_graph(graph, {"x": x}))
+    assert_contains(error.message, "operator MaxPool at node dilated")
     assert_contains(error.message, "dilations")
     x.free()
-    w.free()
 }
 
 fn test_feeds_and_initializers_are_never_freed() -> void {
@@ -846,4 +849,79 @@ fn test_the_cached_plan_answers_what_the_interpreter_answers() -> void {
             assert_near(got[index], want[index], 1e-6, f"{shape} differs at {index}")
         }
     }
+}
+
+#: torch writes one copy of identical weights and reads the rest through
+#: `Identity` -- every BatchNorm whose statistics are still zeros and ones
+#: shares them -- so densenet121's statistics all arrive that way. The plan
+#: has to fold through the `Identity` to see them, or the whole model stays on
+#: the interpreter.
+fn test_batch_norm_statistics_through_identity_compile() -> void {
+    if not gpu.is_available() { return }
+    let graph = Graph(
+        nodes: [
+            GraphNode("Identity", name: "mean_copy", inputs: ["mean"], outputs: ["mean_seen"]),
+            GraphNode("Identity", name: "var_copy", inputs: ["var"], outputs: ["var_seen"]),
+            GraphNode(
+                "BatchNormalization",
+                name: "bn",
+                inputs: ["x", "scale", "shift", "mean_seen", "var_seen"],
+                outputs: ["y"],
+                attrs: {"epsilon": Attr.of_float(1e-5)}
+            ),
+        ],
+        inputs: ["x"],
+        outputs: ["y"],
+        initializers: {
+            "scale": Tensor([2], [1.5, 0.5]),
+            "shift": Tensor([2], [0.25, -1.0]),
+            "mean": Tensor([2], [0.5, -0.5]),
+            "var": Tensor([2], [4.0, 0.25]),
+        }
+    )
+    let x = Tensor([1, 2, 2, 2], [1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0])
+    let plan = compile_plan(graph, {"x": x})
+    assert_true(plan is not null, "statistics read through Identity still compile")
+    if plan is not null {
+        let planned = plan.run({"x": x})
+        let plain = run_graph(graph, {"x": x})
+        let got = planned["y"].download()
+        let want = plain["y"].download()
+        for index in 0..want.len() {
+            assert_near(got[index], want[index], 1e-5, f"the plan differs at {index}")
+        }
+        planned["y"].free()
+        plain["y"].free()
+        plan.free()
+    }
+    x.free()
+    for (_name, tensor) in graph.initializers.items() { tensor.free() }
+}
+
+#: A depthwise convolution runs as one dispatch and keeps nothing on its node.
+#: The per-group loop it replaced memoised one weight slice per channel --
+#: about 7000 live tensors on MobileNetV2 -- and every later allocation got
+#: slower for it.
+fn test_a_depthwise_conv_keeps_no_slices_on_its_node() -> void {
+    if not gpu.is_available() { return }
+    var values: list[float] = []
+    for index in 0..2 * 16 * 5 * 5 { values.push(float(index % 11) * 0.25 - 1.0) }
+    let x = Tensor([2, 16, 5, 5], values)
+    let w = Tensor([16, 1, 3, 3], [float(index % 7) * 0.125 for index in 0..144])
+    let node = GraphNode(
+        "Conv",
+        name: "depthwise",
+        inputs: ["x", "w"],
+        outputs: ["y"],
+        attrs: {"group": Attr.of_int(16), "pads": Attr.of_ints([1, 1, 1, 1])}
+    )
+    let graph = Graph(nodes: [node], inputs: ["x"], outputs: ["y"], initializers: {"w": w})
+    for _call in 0..2 {
+        let produced = run_graph(graph, {"x": x})
+        assert_eq(produced["y"].shape, [2, 16, 5, 5], "a depthwise conv keeps its shape")
+        produced["y"].free()
+    }
+    assert_eq(node.cached.len(), 0, "the convolution memoised nothing on its node")
+    x.free()
+    w.free()
 }
