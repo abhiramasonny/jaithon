@@ -54,7 +54,7 @@ download still in progress).
 | `generate.jai` | story continuation |
 | `check.jai` | the fast acceptance check |
 | `story_chat.py` | the torch MPS peer, and a Python re-implementation of the BPE that checks the token files |
-| `run_full.sh`, `bench.sh`, `compare_vocab.sh` | the pipeline and the two measurements |
+| `run_full.sh`, `bench.sh`, `compare_vocab.sh` | the pipeline; speed (and with `quality`, learning) against torch; 4096 against 8192 ids |
 
 ## What 15 minutes of pretraining gives
 
@@ -282,12 +282,34 @@ torch's default and its fused AdamW alike, and both sides start from the same
 loss (8.41 and 8.45; ln 4096 is 8.32). The quiet pair is the cleanest: 33,060
 and 29,898 tokens a second against 22,534 and 22,632.
 
+**And they learn the same thing.** `bench.sh quality` trains both from scratch
+for 400 steps on the same schedule (warm-up 40, 6e-4, cosine over the 400)
+and evaluates the same 256 held-out windows every 100 steps; each side takes
+the lock on its own, on a busy machine:
+
+| step | jai held-out loss | torch held-out loss |
+|---|---|---|
+| 100 | 3.9204 | 3.9285 |
+| 200 | 3.4759 | 3.4676 |
+| 300 | 3.1849 | 3.1825 |
+| 400 | 3.0649 | 3.0590 |
+| training rate | 20,822 tokens/s (157 s) | 15,607 tokens/s (210 s) |
+
+Different random draws on the two sides (initial weights, windows), and
+the curves stay within 0.01 of each other.
+
 Float16 products (`GPT_MIXED=1`) measured slower, 365-394 ms against 347 in
 the same acquisition, so they stay off; why was not chased (the decode track
 owns the mixed-precision policy this wave). Over the real run the rate is a
 little lower than the bench, because every 250 steps the run evaluates 256
 held-out windows and samples a story; `pretrain.jai` reports training-only
 tokens a second, which over the 15-minute run was 24,830 on a busy machine.
+
+Other shapes, one acquisition at load average 30-75 (so read the ratios, not
+the rates): batch 64 ran 19,177 tokens a second and batch 16 17,379, against
+20,906 and 16,431 for batch 32 at the start and end of the same acquisition,
+so a bigger batch buys nothing; 6 layers ran 25,996. The 8-layer, batch-32
+default stays.
 
 ## The full two-hour run
 
