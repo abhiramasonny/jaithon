@@ -201,8 +201,8 @@ kernel void NAME(device const float* a [[buffer(0)]],
                     else if (epilogue != 0u) total += bias[c];
                     if (epilogue == 2u) total = max(total, 0.0f);
                     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
-                    else if (epilogue == 4u) total = tanh(total);
-                    else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+                    else if (epilogue == 4u) total = gemm_tanh(total);
+                    else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
                 }
                 dest[r * columns + c] = total;
             }
@@ -332,8 +332,8 @@ _KLOOPS_
                 else if (epilogue != 0u) total += bias[c];
                 if (epilogue == 2u) total = max(total, 0.0f);
                 else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
-                else if (epilogue == 4u) total = tanh(total);
-                else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+                else if (epilogue == 4u) total = gemm_tanh(total);
+                else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
             }
             dest[r * columns + c] = total;
         }
@@ -360,8 +360,8 @@ kernel void split_reduce(device const float* partials [[buffer(0)]],
     else if (epilogue != 0u) total += bias[local % columns];
     if (epilogue == 2u) total = max(total, 0.0f);
     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
-    else if (epilogue == 4u) total = tanh(total);
-    else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+    else if (epilogue == 4u) total = gemm_tanh(total);
+    else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
     output[id] = total;
 }
 
@@ -402,8 +402,8 @@ kernel void gemm_unpad(device const float* src [[buffer(0)]],
     else if (epilogue != 0u) total += bias[c];
     if (epilogue == 2u) total = max(total, 0.0f);
     else if (epilogue == 3u) total = 1.0f / (1.0f + exp(-total));
-    else if (epilogue == 4u) total = tanh(total);
-    else if (epilogue == 5u) total = 0.5f * total * (1.0f + tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
+    else if (epilogue == 4u) total = gemm_tanh(total);
+    else if (epilogue == 5u) total = 0.5f * total * (1.0f + gemm_tanh(0.7978845608f * (total + 0.044715f * total * total * total)));
     output[id] = total;
 }
 """
@@ -631,8 +631,21 @@ fn instantiate(config: Config, element: str) -> str {
     return text
 }
 
+#: The epilogues' tanh, with its argument held where it has an answer.
+#:
+#: Kernels compile in fast-math mode, and there `tanh` is worked out through
+#: an exponential that overflows: it returned 0 at 44 and NaN from 45 up, so
+#: a tanh layer whose pre-activation reached 45 gave NaN, and GELU -- whose
+#: argument carries a cube -- gave NaN from an input of 20. Past 15 the true
+#: value is 1 to the last bit of a float, so clamping there costs nothing.
+let GEMM_PRELUDE = """#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+static inline float gemm_tanh(float x) { return tanh(clamp(x, -15.0f, 15.0f)); }
+"""
+
 fn build_source(element: str) -> str {
-    var text = "#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n"
+    var text = GEMM_PRELUDE
     for config in CONFIGS { text = text + instantiate(config, element) }
     return text + REDUCE_SOURCE
 }

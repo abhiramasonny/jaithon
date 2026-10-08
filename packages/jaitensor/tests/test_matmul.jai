@@ -3,6 +3,7 @@ import jaitensor as jt
 import std.gpu as gpu
 from jaitensor.gemm import Plan, bucket_extent, cache_key, candidates, default_plan, dispatch_plan
 from jaitensor.gemm import last_tune_counts, plan_from_text, reload_plans
+import std.math as math
 from jaitensor.ops import matmul_backend
 from jaitensor.tensor import Tensor
 from std.io import Path
@@ -540,6 +541,88 @@ fn test_padded_graph_route_applies_the_epilogue() -> void {
             assert_near(got[row * columns + column], want, 1e-3)
         }
     }
+}
+
+fn host_activation(value: float, epilogue: int) -> float {
+    if epilogue == 2 { return max(value, 0.0) }
+    if epilogue == 3 { return 1.0 / (1.0 + math.exp(-value)) }
+    if epilogue == 4 {
+        if value > 15.0 { return 1.0 }
+        if value < -15.0 { return -1.0 }
+        return math.tanh(value)
+    }
+    if epilogue == 5 {
+        let inner = 0.7978845608 * (value + 0.044715 * value * value * value)
+        let t = if inner > 15.0 { 1.0 } elif inner < -15.0 { -1.0 } else { math.tanh(inner) }
+        return 0.5 * value * (1.0 + t)
+    }
+    return value
+}
+
+#: `out = act(op(a) x op(b) + bias)` on `plan`, against the host.
+fn assert_epilogue_matches_host(
+    plan: Plan,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool,
+    trans_b: bool,
+    epilogue: int,
+    scale: float = 1.0
+) -> void {
+    let a = jt.Tensor(if trans_a { [inner, rows] } else { [rows, inner] })
+    a.buffer().fill_uniform(-scale, scale, 41)
+    let b = if trans_b { device_tensor([columns, inner], 42) } else { device_tensor([inner, columns], 42) }
+    let bias = device_tensor([rows * columns], 43)
+    let out = jt.Tensor([rows, columns])
+    defer { a.free() }
+    defer { b.free() }
+    defer { bias.free() }
+    defer { out.free() }
+    out.buffer().fill(1.0e9)
+    dispatch_plan(
+        plan,
+        a.buffer(),
+        b.buffer(),
+        out.buffer(),
+        bias.buffer(),
+        rows,
+        inner,
+        columns,
+        trans_a: trans_a,
+        trans_b: trans_b,
+        epilogue: epilogue
+    )
+    let got = out.download()
+    let plain = host_reference(a.download(), b.download(), rows, inner, columns, trans_a, trans_b)
+    let shift = bias.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var value = plain[row * columns + column]
+            if epilogue == 6 {
+                value += shift[row * columns + column]
+            } elif epilogue != 0 {
+                value += shift[column]
+            }
+            let want = host_activation(value, epilogue)
+            let have = got[row * columns + column]
+            assert_true(math.is_finite(have), f"{plan.to_str()} epilogue {epilogue} gave {have}")
+            assert_near(have, want, 1e-3 * (1.0 + math.fabs(want)))
+        }
+    }
+}
+
+#: Kernels compile in fast-math mode, where `tanh` overflows an exponential:
+#: it gave 0 at 44 and NaN from 45, and GELU NaN from an input of 20. A 1x2000
+#: row of values around one sums to a pre-activation in the tens.
+fn test_tanh_and_gelu_epilogues_stay_finite_on_large_pre_activations() -> void {
+    if not jt.is_available() { return }
+    for text in ["gemm32x32", "gemm64x32"] {
+        for epilogue in [4, 5] {
+            assert_epilogue_matches_host(plan_named(text), 3, 2000, 5, false, false, epilogue, scale: 40.0)
+        }
+    }
+    assert_epilogue_matches_host(plan_named("direct32x32"), 32, 2000, 32, false, false, 5, scale: 40.0)
 }
 
 fn test_deep_split_matches_host() -> void {
