@@ -408,7 +408,7 @@ fn ce_grad(prediction: Tensor, stats: Tensor, upstream: Tensor) -> Tensor {
 fn sparse_ce_stats(
     prediction: Tensor,
     target: Tensor,
-    loss_acc: Tensor,
+    loss_acc: Tensor?,
     acc_weight: int
 ) -> tuple[Tensor, Tensor] {
     let batch = prediction.shape[0]
@@ -423,8 +423,9 @@ fn sparse_ce_stats(
 }
 
 #: The mean of `batch` per-sample losses, also added to `loss_acc` with
-#: `acc_weight` when that is positive.
-fn mean_of_samples(sample_loss: Tensor, batch: int, loss_acc: Tensor, acc_weight: int) -> Tensor {
+#: `acc_weight` when that is positive. Without an accumulator nothing is
+#: added, and the kernel's unused slot is bound to the partials.
+fn mean_of_samples(sample_loss: Tensor, batch: int, loss_acc: Tensor?, acc_weight: int) -> Tensor {
     let groups = (batch + _GROUP - 1) // _GROUP
     let partials = Tensor([groups])
     let reduce_kernel = cached("reduce_mean_partial")
@@ -436,9 +437,10 @@ fn mean_of_samples(sample_loss: Tensor, batch: int, loss_acc: Tensor, acc_weight
     )
     let mean = Tensor([1])
     let finalize_kernel = cached("finalize_mean")
-    let weight = if acc_weight > 0 { acc_weight } else { 0 }
+    let weight = if acc_weight > 0 and loss_acc is not null { acc_weight } else { 0 }
+    let total_buffer = if loss_acc is not null { loss_acc.buffer() } else { partials.buffer() }
     finalize_kernel.dispatch_async(
-        [partials.buffer(), mean.buffer(), loss_acc.buffer()],
+        [partials.buffer(), mean.buffer(), total_buffer],
         1,
         [groups, batch, weight]
     )
@@ -500,9 +502,7 @@ pub class SparseCategoricalCrossentropy: Loss {
             #: from the logits and three numbers a row: one pass over the
             #: logits here, one read and one write there, and nothing the size
             #: of the logits held between the two.
-            let accumulate = if loss_acc is not null { loss_acc } else { Tensor.zeros([1]) }
-            let (mean, stats) = sparse_ce_stats(prediction, target, accumulate, acc_weight)
-            if loss_acc is null { accumulate.free() }
+            let (mean, stats) = sparse_ce_stats(prediction, target, loss_acc, acc_weight)
             if prediction.requires_grad {
                 mean.attach_creator(
                     GradNode([prediction], |upstream| [ce_grad(prediction, stats, upstream)], extras: [stats])
