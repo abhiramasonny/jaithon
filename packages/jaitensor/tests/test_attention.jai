@@ -6,7 +6,7 @@ from jaitensor.layers import MultiHeadAttention
 from jaitensor.tensor import Tensor
 from std.io import Path
 from std.random import Random
-from std.test import assert_eq, assert_near, assert_true
+from std.test import assert_eq, assert_near, assert_throws, assert_true
 
 fn assert_values_near(actual: list[float], expected: list[float], tolerance: float = 1e-5) -> void {
     assert_eq(actual.len(), expected.len())
@@ -947,4 +947,48 @@ fn test_attention_layer_trains_with_frozen_projections() -> void {
             }
         }
     }
+}
+
+#: A leaf that went through `reshape` keeps a readable gradient once the
+#: graph is freed. `reshape`'s backward handed the leaf a view of the reshaped
+#: tensor's own gradient, which `backward()` returns for the caller to free,
+#: so the leaf's `.grad` pointed at freed memory and reading it killed the
+#: process. Batched attention reshapes every input it folds, so any leaf fed
+#: to it as `[batch, seq, dim]` -- a layer's input, or Q itself -- hit this.
+fn test_a_reshaped_leaf_keeps_its_gradient_after_the_graph_is_freed() -> void {
+    if not jt.is_available() { return }
+    let ws = wave(12, 0.5)
+    let x = Tensor([3, 4], wave(12, 0.1), requires_grad: true)
+    let w = Tensor([2, 6], ws)
+    let total = jt.sum(jt.multiply(jt.reshape(jt.reshape(x, [12]), [2, 6]), w))
+    free_all(total.backward())
+    total.free()
+    gpu.synchronize()
+    let g = x.grad
+    assert_true(g is not null)
+    if g is not null {
+        assert_eq(g.shape, [3, 4])
+        assert_values_near(g.download(), ws, 1e-6)
+    }
+    free_all([x, w])
+    #: The same through rank-three attention, whose batch fold reshapes Q.
+    let batch = 2
+    let seq = 8
+    let dim = 64
+    let q = Tensor([batch, seq, dim], wave(batch * seq * dim, 0.3), requires_grad: true)
+    let k = Tensor([batch, seq, dim], wave(batch * seq * dim, 1.3))
+    let v = Tensor([batch, seq, dim], wave(batch * seq * dim, 2.3))
+    let y = jt.multi_head_attention(q, k, v, 2, causal: true)
+    let loss = jt.sum(y)
+    free_all(loss.backward())
+    free_all([loss, y])
+    gpu.synchronize()
+    let gq = q.grad
+    assert_true(gq is not null)
+    if gq is not null {
+        var finite = true
+        for value in gq.download() { if not math.is_finite(value) { finite = false } }
+        assert_true(finite)
+    }
+    free_all([q, k, v])
 }
