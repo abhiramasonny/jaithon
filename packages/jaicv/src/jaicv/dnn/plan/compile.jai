@@ -54,7 +54,7 @@ pub fn compile_plan(graph: Graph, feeds: dict[str, Tensor]) -> Plan? {
     var shapes: dict[str, list[int]] = {}
     var produced: dict[str, Tensor] = {}
     try {
-        produced = run_graph(graph, feeds, shapes, wanted)
+        produced = run_graph(graph, feeds, shapes, wanted, FOLD_LIMIT)
     } catch _failure: Error {
         return null
     }

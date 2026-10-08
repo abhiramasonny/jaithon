@@ -147,13 +147,19 @@ pub fn run_graph(
     graph: Graph,
     feeds: dict[str, Tensor],
     shapes: dict[str, list[int]]? = null,
-    capture: dict[str, list[float]]? = null
+    capture: dict[str, list[float]]? = null,
+    capture_limit: int = -1
 ) -> dict[str, Tensor] {
     #: `shapes` and `capture`, when given, are filled with every value's shape
     #: and with the values of the names already present in `capture`. That is
     #: what the plan compiler needs to know before it can build a graph: what
     #: shape everything is, and what the shape arithmetic worked out to. It
     #: costs two dictionary writes a node and is null on every other path.
+    #:
+    #: A name whose value holds more than `capture_limit` elements, when that
+    #: is not negative, is taken out of `capture` instead of read back: the
+    #: compiler cannot fold anything that size, and a transposed tied
+    #: embedding is twelve million boxed floats for nothing.
     if graph.outputs.len() == 0 {
         throw ValueError("this graph names no outputs, so there is nothing to run it for")
     }
@@ -249,7 +255,11 @@ pub fn run_graph(
                 mine[name] = true
                 if shapes is not null { shapes[name] = tensor.shape }
                 if capture is not null and capture.get(name, null) is not null {
-                    capture[name] = tensor.download()
+                    if capture_limit >= 0 and tensor.size > capture_limit {
+                        capture.remove(name)
+                    } else {
+                        capture[name] = tensor.download()
+                    }
                 }
             }
             for (slot, name) in node.inputs.enumerate() {

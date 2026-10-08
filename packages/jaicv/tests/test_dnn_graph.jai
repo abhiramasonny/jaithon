@@ -1128,3 +1128,41 @@ fn test_graph_routes_take_a_view_of_a_batch() -> void {
     left.free()
     right.free()
 }
+
+#: The plan's survey leaves out what the compiler could never fold. Transpose
+#: folds now, and a transposed tied embedding is millions of floats: reading
+#: it back cost compile time and memory for a value thrown away after.
+fn test_the_survey_skips_values_too_large_to_fold() -> void {
+    if not gpu.is_available() { return }
+    let w = Tensor([3, 4], [float(index) for index in 0..12])
+    let graph = Graph(
+        nodes: [
+            GraphNode(
+                "Transpose",
+                name: "tie",
+                inputs: ["w"],
+                outputs: ["wt"],
+                attrs: {"perm": Attr.of_ints([1, 0])}
+            ),
+            GraphNode("Shape", name: "size", inputs: ["w"], outputs: ["dims"]),
+            GraphNode("MatMul", name: "logits", inputs: ["x", "wt"], outputs: ["y"]),
+        ],
+        inputs: ["x"],
+        outputs: ["y", "dims"],
+        initializers: {"w": w}
+    )
+    let x = Tensor([2, 4], [float(index % 3) - 1.0 for index in 0..8])
+    for (limit, keeps_wt) in [(-1, true), (6, false)] {
+        var capture: dict[str, list[float]] = {"wt": [], "dims": []}
+        let produced = run_graph(graph, {"x": x}, null, capture, limit)
+        assert_eq(capture["dims"], [3.0, 4.0], f"limit {limit} still reads a small value back")
+        if keeps_wt {
+            assert_eq(capture["wt"].len(), 12, "with no limit the transpose is read back")
+        } else {
+            assert_true(capture.get("wt", null) is null, "a value over the limit is left out")
+        }
+        for (_name, tensor) in produced.items() { tensor.free() }
+    }
+    x.free()
+    w.free()
+}
