@@ -9,9 +9,14 @@ one MPSGraph). Every row is held against onnxruntime's CPU answer for the
 same input, and timed at batch 1 against onnxruntime CPU and eager torch on
 the MPS device.
 
-**25 of the 26 run correctly on both paths** -- within a relative 1e-5 of
-onnxruntime, and in practice within 3e-6 -- and so do 44 of the 45 exports,
-counting the two dynamo exports of each transformer. Before this example's
+**25 of the 26 run correctly on both paths**, and so do 44 of the 45
+exports, counting the two dynamo exports of each transformer. Correct means
+within a relative 1e-5 of onnxruntime, or within twice torch's own distance
+from onnxruntime where that is more. With measured BatchNorm statistics (see
+below) the two references are themselves 2.1e-5 apart on `resnet50` and
+1.5e-4 on `fcn_resnet50`, and jaicv lands 2.1e-5 and 1.1e-4 from onnxruntime
+there, the same on both paths. Every other export is within 1e-5 flat, and
+in practice within 9e-6. Before this example's
 fixes it was 13 of 25, and none of the default-settings dynamo exports
 imported at all. The one left is torchvision's `ssdlite`, whose graph carries
 its own post-processing (`NonZero`, `TopK`, `NonMaxSuppression`, `If`); the
@@ -68,26 +73,26 @@ rank-zero `Gather`). Export them with
 | model | status | import ms | interp ms | compile ms | plan ms | torch MPS ms | ORT CPU ms | plan vs MPS | plan vs ORT | rel (interp / plan) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | squeezenet1_1 | ok | 49.00 | 4.14 | 20.03 | 0.75 (0.74-0.75) | 4.11 | 2.47 | 5.50x | 3.31x | 3.8e-07 / 1.9e-07 |
-| resnet18 | ok | 91.30 | 2.97 | 21.58 | 1.62 (1.62-1.62) | 6.37 | 10.91 | 3.93x | 6.73x | 4.9e-07 / 4.5e-07 |
-| resnet50 | ok | 162.36 | 6.67 | 49.98 | 3.67 (3.66-3.71) | 12.83 | 29.06 | 3.50x | 7.92x | 3.5e-07 / 3.4e-07 |
-| googlenet | ok | 72.17 | 4.14 | 26.22 | 2.37 (2.33-2.44) | 10.24 | 8.96 | 4.33x | 3.79x | 0.0e+00 / 0.0e+00 |
-| densenet121 | ok | 87.00 | 9.57 | 72.37 | 6.41 (6.32-6.53) | 22.98 | 21.42 | 3.59x | 3.34x | 3.7e-07 / 4.5e-07 |
-| mobilenet_v2 | ok | 69.77 | 4.09 | 22.99 | 1.97 (1.29-2.10) | 7.46 | 4.64 | 3.79x | 2.35x | 4.7e-07 / 4.0e-07 |
-| mobilenet_v3_small | ok | 54.10 | 5.53 | 24.46 | 1.78 (1.69-1.93) | 6.43 | 1.57 | 3.62x | 0.88x | 6.2e-07 / 5.7e-07 |
-| mobilenet_v3_large | ok | 71.69 | 6.20 | 33.67 | 1.93 (1.86-1.98) | 11.49 | 4.22 | 5.94x | 2.18x | 6.5e-07 / 5.8e-07 |
-| efficientnet_b0 | ok | 67.10 | 11.88 | 38.61 | 2.84 (2.79-3.30) | 12.34 | 8.14 | 4.35x | 2.87x | 1.1e-06 / 1.2e-06 |
-| mnasnet1_0 | ok | 59.49 | 4.25 | 22.57 | 2.31 (1.79-2.54) | 9.87 | 5.06 | 4.26x | 2.19x | 3.9e-07 / 3.9e-07 |
-| shufflenet_v2_x1_0 | ok | 55.82 | 8.22 | 36.66 | 3.21 (3.01-3.95) | 8.03 | 1.89 | 2.51x | 0.59x | 1.2e-07 / 1.2e-07 |
-| regnet_y_400mf | ok | 62.57 | 11.40 | 35.35 | 2.49 (2.46-2.53) | 10.40 | 4.55 | 4.18x | 1.83x | 3.1e-07 / 3.5e-07 |
+| resnet18 | ok | 91.30 | 2.97 | 21.58 | 1.62 (1.62-1.62) | 6.37 | 10.91 | 3.93x | 6.73x | 1.8e-06 / 1.7e-06 |
+| resnet50 | ok | 162.36 | 6.67 | 49.98 | 3.67 (3.66-3.71) | 12.83 | 29.06 | 3.50x | 7.92x | 2.1e-05 / 2.1e-05 |
+| googlenet | ok | 72.17 | 4.14 | 26.22 | 2.37 (2.33-2.44) | 10.24 | 8.96 | 4.33x | 3.79x | 9.0e-06 / 9.0e-06 |
+| densenet121 | ok | 87.00 | 9.57 | 72.37 | 6.41 (6.32-6.53) | 22.98 | 21.42 | 3.59x | 3.34x | 3.6e-06 / 2.8e-06 |
+| mobilenet_v2 | ok | 69.77 | 4.09 | 22.99 | 1.97 (1.29-2.10) | 7.46 | 4.64 | 3.79x | 2.35x | 7.2e-06 / 7.2e-06 |
+| mobilenet_v3_small | ok | 54.10 | 5.53 | 24.46 | 1.78 (1.69-1.93) | 6.43 | 1.57 | 3.62x | 0.88x | 1.9e-06 / 1.5e-06 |
+| mobilenet_v3_large | ok | 71.69 | 6.20 | 33.67 | 1.93 (1.86-1.98) | 11.49 | 4.22 | 5.94x | 2.18x | 2.5e-06 / 2.6e-06 |
+| efficientnet_b0 | ok | 67.10 | 11.88 | 38.61 | 2.84 (2.79-3.30) | 12.34 | 8.14 | 4.35x | 2.87x | 3.1e-06 / 2.7e-06 |
+| mnasnet1_0 | ok | 59.49 | 4.25 | 22.57 | 2.31 (1.79-2.54) | 9.87 | 5.06 | 4.26x | 2.19x | 3.8e-06 / 3.8e-06 |
+| shufflenet_v2_x1_0 | ok | 55.82 | 8.22 | 36.66 | 3.21 (3.01-3.95) | 8.03 | 1.89 | 2.51x | 0.59x | 4.4e-06 / 4.4e-06 |
+| regnet_y_400mf | ok | 62.57 | 11.40 | 35.35 | 2.49 (2.46-2.53) | 10.40 | 4.55 | 4.18x | 1.83x | 4.7e-06 / 4.1e-06 |
 | convnext_tiny | ok | 183.23 | 11.21 | 97.44 | 4.22 (4.20-4.25) | 7.06 | 29.32 | 1.67x | 6.94x | 1.4e-06 / 1.3e-06 |
 | vit_tiny | ok | 79.99 | 19.68 | 81.76 | 4.92 (4.69-5.14) | 4.72 | 8.30 | 0.96x | 1.69x | 1.7e-06 / 1.9e-06 |
-| vit_b_16 | ok | 441.07 | 33.84 | 460.72 | 9.97 (9.93-9.99) | 10.99 | 83.49 | 1.10x | 8.37x | 2.9e-06 / 2.4e-06 |
+| vit_b_16 | ok | 441.07 | 33.84 | 460.72 | 9.97 (9.93-9.99) | 10.99 | 83.49 | 1.10x | 8.37x | 2.6e-06 / 2.4e-06 |
 | swin_t | ok | 258.57 | 94.64 | 552.76 | 5.30 (5.28-5.32) | 10.91 | 28.99 | 2.06x | 5.47x | 8.1e-07 / 7.4e-07 |
-| lraspp_mbv3 | ok | 55.38 | 8.55 | 31.73 | 2.31 (2.30-2.36) | 12.21 | 11.77 | 5.27x | 5.08x | 2.2e-07 / 2.2e-07 |
-| deeplabv3_mbv3 | ok | 109.61 | 10.78 | 45.16 | 3.80 (3.74-3.82) | 13.51 | 27.49 | 3.56x | 7.24x | 6.0e-08 / 6.0e-08 |
-| fcn_resnet50 | ok | 205.68 | 21.61 | 79.06 | 16.68 (16.65-16.84) | 29.40 | 293.42 | 1.76x | 17.59x | 2.5e-06 / 2.5e-06 |
-| unet | ok | 70.80 | 29.74 | 45.33 | 4.26 (4.24-4.27) | 8.82 | 68.50 | 2.07x | 16.08x | 2.0e-07 / 1.8e-07 |
-| unet_bilinear | ok | 70.85 | 6.66 | 36.67 | 3.73 (3.71-3.75) | 10.13 | 70.08 | 2.72x | 18.81x | 1.5e-07 / 1.5e-07 |
+| lraspp_mbv3 | ok | 55.38 | 8.55 | 31.73 | 2.31 (2.30-2.36) | 12.21 | 11.77 | 5.27x | 5.08x | 1.8e-06 / 1.7e-06 |
+| deeplabv3_mbv3 | ok | 109.61 | 10.78 | 45.16 | 3.80 (3.74-3.82) | 13.51 | 27.49 | 3.56x | 7.24x | 7.1e-06 / 6.6e-06 |
+| fcn_resnet50 | ok | 205.68 | 21.61 | 79.06 | 16.68 (16.65-16.84) | 29.40 | 293.42 | 1.76x | 17.59x | 1.1e-04 / 1.1e-04 |
+| unet | ok | 70.80 | 29.74 | 45.33 | 4.26 (4.24-4.27) | 8.82 | 68.50 | 2.07x | 16.08x | 1.3e-06 / 1.3e-06 |
+| unet_bilinear | ok | 70.85 | 6.66 | 36.67 | 3.73 (3.71-3.75) | 10.13 | 70.08 | 2.72x | 18.81x | 9.0e-06 / 2.2e-06 |
 | bert_tiny | ok | 63.13 | 2.44 | 21.15 | 0.69 (0.68-0.85) | 2.04 | 0.62 | 2.95x | 0.89x | 2.8e-07 / 2.2e-07 |
 | distilbert | ok | 380.94 | 11.09 | 142.56 | 3.65 (3.43-4.20) | 5.73 | 23.59 | 1.57x | 6.47x | 1.2e-06 / 1.3e-06 |
 | gpt2_tiny_dyn1 | ok | 129.01 | 2.76 | 30.51 | 1.82 (1.77-1.84) | 2.80 | 1.49 | 1.54x | 0.82x | 6.3e-07 / 1.1e-06 |
@@ -100,11 +105,11 @@ before -- all ten import and run on both paths now:
 
 | model | status | import ms | interp ms | compile ms | plan ms | torch MPS ms | ORT CPU ms | plan vs MPS | plan vs ORT | rel (interp / plan) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| resnet18_dyn | ok | 86.51 | 2.69 | 18.96 | 1.63 (1.62-1.63) | 8.34 | 12.20 | 5.12x | 7.49x | 5.3e-07 / 5.3e-07 |
-| efficientnet_b0_dyn | ok | 65.71 | 10.82 | 25.72 | 2.55 (2.50-2.75) | 11.43 | 5.27 | 4.48x | 2.07x | 1.2e-06 / 1.1e-06 |
-| mobilenet_v3_large_dyn | ok | 66.23 | 4.93 | 20.78 | 2.02 (1.91-2.10) | 8.49 | 3.80 | 4.19x | 1.88x | 5.5e-07 / 4.8e-07 |
+| resnet18_dyn | ok | 86.51 | 2.69 | 18.96 | 1.63 (1.62-1.63) | 8.34 | 12.20 | 5.12x | 7.49x | 1.8e-06 / 1.7e-06 |
+| efficientnet_b0_dyn | ok | 65.71 | 10.82 | 25.72 | 2.55 (2.50-2.75) | 11.43 | 5.27 | 4.48x | 2.07x | 3.5e-06 / 2.2e-06 |
+| mobilenet_v3_large_dyn | ok | 66.23 | 4.93 | 20.78 | 2.02 (1.91-2.10) | 8.49 | 3.80 | 4.19x | 1.88x | 2.6e-06 / 2.1e-06 |
 | convnext_tiny_dyn | ok | 171.02 | 8.15 | 70.81 | 4.20 (4.18-4.22) | 6.76 | 30.78 | 1.61x | 7.33x | 1.4e-06 / 1.2e-06 |
-| unet_bilinear_dyn | ok | 68.28 | 5.23 | 17.78 | 3.73 (3.71-3.75) | 8.54 | 60.95 | 2.29x | 16.36x | 1.5e-07 / 1.5e-07 |
+| unet_bilinear_dyn | ok | 68.28 | 5.23 | 17.78 | 3.73 (3.71-3.75) | 8.54 | 60.95 | 2.29x | 16.36x | 9.0e-06 / 2.2e-06 |
 | vit_tiny_dyn | ok | 71.01 | 14.00 | 46.90 | 4.19 (3.75-5.17) | 4.67 | 8.15 | 1.11x | 1.95x | 1.8e-06 / 1.9e-06 |
 | swin_t_dyn | ok | 172.69 | 21.88 | 187.33 | 5.32 (5.29-5.35) | 10.68 | 27.99 | 2.01x | 5.26x | 7.9e-07 / 7.7e-07 |
 | bert_tiny_dyn | ok | 59.65 | 1.65 | 13.12 | 0.68 (0.67-0.69) | 2.34 | 0.60 | 3.45x | 0.88x | 2.2e-07 / 2.2e-07 |
@@ -118,7 +123,11 @@ read `mobilenet_v3_large` at 16.2 ms (13.0-18.4) where the table has 11.49,
 so its 5.94x over MPS is anywhere from about 4x to 8x. The batch is sized
 after the warm-up now; the column has not been re-measured since.
 
-`status` ok means both paths land within 1e-5 of onnxruntime; `rel` is the
+The `rel` column is from the BatchNorm-calibrated exports. Every timing
+column predates the calibration, which changed the numbers in the BatchNorm
+weights and nothing about the work done.
+
+`status` ok means both paths land within that tolerance; `rel` is the
 largest absolute difference over the largest absolute reference value, over
 the first output. `plan` is the compiled plan's median with its min-max
 across seven samples. `interp` is the interpreter's median. Ratios are the
