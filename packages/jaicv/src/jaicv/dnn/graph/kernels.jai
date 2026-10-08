@@ -216,6 +216,15 @@ static float erf_approx(float x) {
     return sign * (1.0f - poly * exp(-a * a));
 }
 
+/* Metal's tanh goes through exp(2x) under fast math and comes back NaN, inf
+   over inf, once its argument passes about 44 -- which Gelu's cubic reaches
+   from an input of 10.4 and an LSTM's cell state reaches by just running
+   long. Past ten the answer is one to the last float bit, so the argument
+   stops there. */
+static float stable_tanh(float x) {
+    return tanh(clamp(x, -10.0f, 10.0f));
+}
+
 kernel void unary_ex(device const float* input [[buffer(0)]],
                      device float* output [[buffer(1)]],
                      constant uint& count [[buffer(2)]],
@@ -240,8 +249,9 @@ kernel void unary_ex(device const float* input [[buffer(0)]],
     else if (op == 9) y = 0.5f * x * (1.0f + erf_approx(x * 0.70710678118654752f));
     else if (op == 10) {
         float inner = 0.79788456080286536f * (x + 0.044715f * x * x * x);
-        y = 0.5f * x * (1.0f + tanh(inner));
+        y = 0.5f * x * (1.0f + stable_tanh(inner));
     }
+    else if (op == 11) y = stable_tanh(x);
     output[id] = y;
 }
 
@@ -321,10 +331,10 @@ kernel void lstm_gates(device const float* input_gates [[buffer(0)]],
     float i = 1.0f / (1.0f + exp(-gi));
     float o = 1.0f / (1.0f + exp(-go));
     float f = 1.0f / (1.0f + exp(-gf));
-    float g = tanh(gc);
+    float g = stable_tanh(gc);
     float c = f * cell_in[id] + i * g;
     cell_out[id] = c;
-    hidden_out[id] = o * tanh(c);
+    hidden_out[id] = o * stable_tanh(c);
 }
 
 /* One GRU timestep with `linear_before_reset` set: the reset gate scales the
@@ -360,7 +370,7 @@ kernel void gru_step_linear(device const float* input_gates [[buffer(0)]],
     float gh = input_gates[from + 2u * hidden + col] +
                r * (hidden_gates[base + 2u * hidden + col] + recurrent_bias[2u * hidden + col]);
     if (clip > 0.0f) gh = clamp(gh, -clip, clip);
-    float h = tanh(gh);
+    float h = stable_tanh(gh);
     hidden_out[id] = (1.0f - z) * h + z * hidden_in[id];
 }
 
@@ -415,7 +425,7 @@ kernel void gru_finish(device const float* input_gates [[buffer(0)]],
     float gh = input_gates[input_base + row * 3u * hidden + 2u * hidden + col] +
                reset_product[id];
     if (clip > 0.0f) gh = clamp(gh, -clip, clip);
-    float h = tanh(gh);
+    float h = stable_tanh(gh);
     float z = gate_z[id];
     hidden_out[id] = (1.0f - z) * h + z * hidden_in[id];
 }

@@ -740,6 +740,25 @@ def build_cases():
     case("window", "convtranspose_grouped3", "ConvTranspose",
          [spread(1, 6, 3, 3, seed=94), spread(6, 2, 3, 3, seed=95), spread(6, seed=96)],
          {"group": 3, "strides": [2, 2], "pads": [1, 1, 1, 1], "output_padding": [1, 1]})
+    # Far past where a fast-math tanh overflows: exp(2x) is inf from about 44,
+    # which Gelu's cubic reaches from an input of 10.4. The interpreter gave NaN
+    # there and the compiled plan did not.
+    far = np.linspace(-120.0, 120.0, 49, dtype=np.float32).reshape(7, 7)
+    case("elementwise", "gelu_tanh_wide", "Gelu", [far], {"approximate": "tanh"}, opset=20)
+    case("elementwise", "gelu_exact_wide", "Gelu", [far], opset=20)
+    case("elementwise", "tanh_wide", "Tanh", [far])
+    # Recurrent gates driven far into saturation, so the cell candidate and the
+    # GRU's new state take tanh of something well past 44.
+    case("recurrent", "lstm_saturated", "LSTM",
+         [spread(3, 2, 3, low=-80.0, high=80.0, seed=104),
+          spread(1, 16, 3, low=-0.6, high=0.6, seed=105),
+          spread(1, 16, 4, low=-0.6, high=0.6, seed=106)],
+         {"hidden_size": 4}, outputs=3, opset=14)
+    case("recurrent", "gru_saturated", "GRU",
+         [spread(3, 2, 3, low=-80.0, high=80.0, seed=107),
+          spread(1, 12, 3, low=-0.6, high=0.6, seed=108),
+          spread(1, 12, 4, low=-0.6, high=0.6, seed=109)],
+         {"hidden_size": 4}, outputs=2, opset=14)
 
 
 # ------------------------------------------------------------- running them

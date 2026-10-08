@@ -165,6 +165,14 @@ fn cases_in(group: str) -> list[Case] {
     return found
 }
 
+#: The larger of two differences, with NaN the largest of all. A plain `>`
+#: is false against NaN, so an operator that came back NaN used to leave the
+#: worst at zero and pass.
+fn widen(worst: float, gap: float) -> float {
+    if gap != gap { return 1.0e30 }
+    return if gap > worst { gap } else { worst }
+}
+
 #: Run one case as a one-node graph and return the worst difference from the
 #: reference, scaled so a value of ten gets ten times the slack of a value of
 #: one and anything under one is judged absolutely.
@@ -195,7 +203,7 @@ fn worst_difference(item: Case) -> float {
         for index in 0..values.len() {
             let expected = want.values[index]
             let gap = abs(values[index] - expected) / max(1.0, abs(expected))
-            if gap > worst { worst = gap }
+            worst = widen(worst, gap)
         }
     }
     for (_name, tensor) in produced.items() { tensor.free() }
@@ -260,7 +268,7 @@ fn compiled_difference(item: Case, weights_are_constant: bool) -> float {
         for index in 0..values.len() {
             let expected = want.values[index]
             let gap = abs(values[index] - expected) / max(1.0, abs(expected))
-            if gap > worst { worst = gap }
+            worst = widen(worst, gap)
         }
     }
     for (_name, tensor) in produced.items() { tensor.free() }
@@ -660,7 +668,7 @@ fn test_end_to_end_network_matches_torch() -> void {
     var worst = 0.0
     for index in 0..values.len() {
         let gap = abs(values[index] - want.values[index])
-        if gap > worst { worst = gap }
+        worst = widen(worst, gap)
     }
     #: Measured at 1.8e-7 on an M2 Max against torch's float64 forward pass.
     assert_true(worst <= 2e-6, f"the network is off torch by {worst}")

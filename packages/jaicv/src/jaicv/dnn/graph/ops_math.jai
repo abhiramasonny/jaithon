@@ -28,8 +28,11 @@ pub fn op_silu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [jt.silu(need(ins, 0, node))]
 }
 
+#: Through `unary_ex` rather than `jt.tanh`, whose kernel comes back NaN from
+#: an argument of about 45 -- and a legacy GPT-2 export spells its Gelu with
+#: exactly this Tanh over a cubic.
 pub fn op_tanh(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
-    return [jt.tanh(need(ins, 0, node))]
+    return [unary_ex_of(need(ins, 0, node), 11)]
 }
 
 pub fn op_sqrt(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
