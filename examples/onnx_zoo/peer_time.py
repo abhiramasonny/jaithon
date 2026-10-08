@@ -31,7 +31,15 @@ def timeit(fn):
     while time.perf_counter() - t0 < WARM or calls < 3:
         fn()
         calls += 1
-    per = (time.perf_counter() - t0) * 1000 / calls
+    # The batch size comes from calls made after the warm-up. Averaged over the
+    # warm-up itself, a first MPS call of a second or more made a 10 ms model
+    # look like 500 ms, and every sample was then a single call.
+    t1 = time.perf_counter()
+    calls = 0
+    while time.perf_counter() - t1 < 0.1 or calls < 3:
+        fn()
+        calls += 1
+    per = (time.perf_counter() - t1) * 1000 / calls
     reps = max(1, int(150 / per)) if per < 150 else 1
     xs = []
     for _ in range(N):
