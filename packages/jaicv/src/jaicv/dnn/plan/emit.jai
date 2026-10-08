@@ -767,6 +767,43 @@ pub fn emit(state: Build, node: GraphNode) -> bool {
         return true
     }
 
+    if node.op == "GatherND" {
+        #: With the coordinates folded -- they are an initializer in every
+        #: export the zoo has, picking an attention mask apart -- each one is
+        #: a row of the data viewed as `[leading, slab]`, so the whole operator
+        #: is one ordinary gather of rows worked out here.
+        let x = state.shape_of(node.inputs[0])
+        let want = state.shape_of(out)
+        let at = state.shape_of(node.inputs[1])
+        let picks = state.constants.get(node.inputs[1], null)
+        if x is null or want is null or at is null or picks is null { return false }
+        if attr_int(node, "batch_dims", 0) != 0 { return false }
+        let depth = at[at.len() - 1]
+        if depth <= 0 or depth > x.len() { return false }
+        var lead = 1
+        for axis in 0..depth { lead *= x[axis] }
+        var slab = 1
+        for axis in depth..x.len() { slab *= x[axis] }
+        var rows: list[float] = []
+        for row in 0..picks.len() // depth {
+            var offset = 0
+            var stride = lead
+            for step in 0..depth {
+                stride = stride // x[step]
+                var coordinate = int(picks[row * depth + step])
+                if coordinate < 0 { coordinate += x[step] }
+                if coordinate < 0 or coordinate >= x[step] { return false }
+                offset += coordinate * stride
+            }
+            rows.push(float(offset))
+        }
+        let table = __prim__.graph_reshape(b, state.id_of(node.inputs[0]), [lead, slab])
+        let chosen = __prim__.graph_constant(b, rows, [rows.len()])
+        let picked = __prim__.graph_gather(b, table, chosen, 0)
+        state.ids[out] = __prim__.graph_reshape(b, picked, dims_of(want))
+        return true
+    }
+
     if node.op == "LSTM" { return emit_lstm(state, node) }
 
     if node.op == "GRU" { return emit_gru(state, node) }
