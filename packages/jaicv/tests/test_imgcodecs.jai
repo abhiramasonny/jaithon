@@ -110,6 +110,35 @@ fn test_a_damaged_jpeg_goes_the_way_the_reference_goes() -> void {
     }
 }
 
+#: A scan header whose length field runs past the end of the file. The
+#: reference reads the missing data as zeros and still gives a picture; the
+#: fast path has nothing to read and must hand the stream back, not fail.
+fn test_a_scan_header_running_past_the_end_goes_the_way_the_reference_goes() -> void {
+    if not have_gpu() { return }
+    for type_code in [CV_8UC1, CV_8UC3] {
+        let image = texture(15, 17, type_code, 7)
+        let whole = jpeg.encode(image, 90).to_list()
+        image.release()
+        var sos = -1
+        for at in 0..whole.len() - 1 {
+            if whole[at] == 0xFF and whole[at + 1] == 0xDA { sos = at }
+        }
+        assert_true(sos > 0)
+        let length_at = sos + 2
+        #: Where the header says the scan starts, against the end of the data:
+        #: inside it, on it, within the eight bytes the fast path pads with,
+        #: just beyond those, and as far as the field can reach.
+        var lengths: list[int] = [0xFFFF]
+        for past in [-1, 0, 1, 8, 9, 71] { lengths.push(whole.len() - length_at + past) }
+        for length in lengths {
+            var patched = whole.slice(0, whole.len())
+            patched[length_at] = length >> 8 & 255
+            patched[length_at + 1] = length & 255
+            same_outcome(bytes(patched))
+        }
+    }
+}
+
 fn be(value: int) -> list[int] {
     return [value >> 24 & 255, value >> 16 & 255, value >> 8 & 255, value & 255]
 }

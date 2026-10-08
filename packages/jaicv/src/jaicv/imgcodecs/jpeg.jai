@@ -1864,6 +1864,10 @@ fn scan_fast(
     mcus_across: int,
     mcus_down: int
 ) -> Mat? {
+    #: A scan header whose length runs past the end of the file leaves
+    #: nothing to read. The reference reads that as zeros; `unstuff` cannot
+    #: size a buffer for it.
+    if start >= data.len() { return null }
     let count = components.len()
     if count != 1 and count != 3 { return null }
     #: `rows` and `columns` take the zeroth basis row as one number. It is,
