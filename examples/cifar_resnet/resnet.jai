@@ -9,6 +9,7 @@ import std.gpu as gpu
 from jaitensor import Activate, Activation, AvgPool2d, BatchNorm2d, Conv2d, DataLoader, Dataset, Dense
 from jaitensor import Flatten, Layer, ResBlock, SGD, Sequential, SparseCategoricalCrossentropy, Tensor
 from jaitensor import add_correct_into, nhwc, one_cycle_lr, random_crop_flip_into, zero_grad
+from std.gpu import Kernel
 from std.io import Path, read_bytes
 from std.random import Random
 from std.time import Instant
@@ -18,10 +19,43 @@ pub const CHANNELS = 3
 pub const CLASSES = 10
 const PIXELS = SIDE * SIDE * CHANNELS
 
+#: Per-channel mean and standard deviation of the 50,000 training images
+#: (after scaling to [0, 1]); the peer uses the same six numbers.
+pub let CHANNEL_MEAN = [0.49139968, 0.48215841, 0.44653091]
+pub let CHANNEL_STD = [0.24703223, 0.24348513, 0.26158784]
+
+let NORMALIZE_SOURCE = """
+#include <metal_stdlib>
+using namespace metal;
+kernel void normalize_channels(device float* x [[buffer(0)]],
+                               device const float* shift_scale [[buffer(1)]],
+                               constant uint& count [[buffer(2)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    uint c = id % 3u;
+    x[id] = (x[id] - shift_scale[c]) * shift_scale[3u + c];
+}
+"""
+
+#: Standardise NHWC images in place, channel by channel, with the training
+#: set's statistics -- so the zeros a padded crop brings in are the average
+#: colour, not black.
+pub fn normalize_images(images: Tensor) -> void {
+    var numbers = [m for m in CHANNEL_MEAN]
+    for s in CHANNEL_STD { numbers.push(1.0 / s) }
+    let constants = Tensor([6], numbers)
+    Kernel.compile(NORMALIZE_SOURCE, "normalize_channels").dispatch_async(
+        [images.buffer(), constants.buffer()],
+        images.size,
+        [images.size]
+    )
+    constants.free()
+}
+
 #: One split of CIFAR-10 from `data/cifar-10/{split}-images.bin` and
-#: `-labels.bin`: planar uint8 images, scaled to [0, 1] on upload and turned
-#: NHWC once on the device.
-pub fn load_cifar(split: str, samples: int = 0) -> Dataset {
+#: `-labels.bin`: planar uint8 images, scaled to [0, 1] on upload, turned
+#: NHWC once on the device and, unless `normalize` is off, standardised.
+pub fn load_cifar(split: str, samples: int = 0, normalize: bool = true) -> Dataset {
     let root = Path("data/cifar-10")
     let images = read_bytes(root.join(f"{split}-images.bin").to_str())
     let labels = read_bytes(root.join(f"{split}-labels.bin").to_str())
@@ -33,6 +67,7 @@ pub fn load_cifar(split: str, samples: int = 0) -> Dataset {
     planar.buffer().upload_u8(images, 0, count * PIXELS, 0, 1.0 / 255.0)
     let features = nhwc(planar)
     planar.free()
+    if normalize { normalize_images(features) }
     return Dataset(features, Tensor.from_u8(labels, [count]))
 }
 
@@ -86,6 +121,7 @@ pub class Recipe {
     pub var weight_decay: float
     pub var padding: int
     pub var seed: int
+    pub var normalize: bool
     pub var verbose: bool
 
     pub fn init(self) {
@@ -99,13 +135,18 @@ pub class Recipe {
         self.weight_decay = 5e-4
         self.padding = 4
         self.seed = 0
+        self.normalize = true
         self.verbose = true
+    }
+
+    pub fn inputs(self) -> str {
+        return if self.normalize { "mean/std inputs" } else { "raw [0, 1] inputs" }
     }
 
     pub fn describe(self) -> str {
         return f"ResNet-{self.depth} width {self.width}, {self.epochs} epochs, batch {self.batch}, " +
             f"SGD nesterov momentum {self.momentum} wd {self.weight_decay}, one-cycle max lr {self.max_lr} " +
-            f"pct_start {self.pct_start}, crop pad {self.padding} + flip, seed {self.seed}"
+            f"pct_start {self.pct_start}, crop pad {self.padding} + flip, {self.inputs()}, seed {self.seed}"
     }
 }
 

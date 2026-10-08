@@ -5,7 +5,8 @@ on MPS in float32 NCHW.
         [--depth 20] [--width 16] [--batch 128] [--lr 0.2] [--pct 0.25] [--wd 5e-4]
 
 Kept identical to the Jaithon side on purpose:
-- data: uint8 planar CIFAR-10 / 255, nothing else (no mean/std normalisation);
+- data: uint8 planar CIFAR-10 / 255, then standardised per channel with the
+  training set's mean and std (the same six constants), --normalize 0 to skip;
 - model: 3x3 stem conv (with bias) + BN + ReLU, (depth-2)/6 basic blocks per
   stage, bias-free block convs, a 1x1 stride-2 projection + BN where the shape
   changes, global average pool, linear head; every weight drawn uniform with
@@ -34,12 +35,20 @@ import torch.nn.functional as F
 dev = torch.device("mps")
 
 
-def load(split):
+CHANNEL_MEAN = [0.49139968, 0.48215841, 0.44653091]
+CHANNEL_STD = [0.24703223, 0.24348513, 0.26158784]
+
+
+def load(split, normalize):
     x = np.fromfile(f"data/cifar-10/{split}-images.bin", dtype=np.uint8)
     y = np.fromfile(f"data/cifar-10/{split}-labels.bin", dtype=np.uint8)
     n = y.shape[0]
-    x = torch.from_numpy(x[: n * 3072].reshape(n, 3, 32, 32).astype(np.float32) / 255.0)
-    return x.to(dev), torch.from_numpy(y.astype(np.int64)).to(dev)
+    x = torch.from_numpy(x[: n * 3072].reshape(n, 3, 32, 32).astype(np.float32) / 255.0).to(dev)
+    if normalize:
+        mean = torch.tensor(CHANNEL_MEAN, device=dev)[None, :, None, None]
+        std = torch.tensor(CHANNEL_STD, device=dev)[None, :, None, None]
+        x = ((x - mean) * (1.0 / std)).contiguous()
+    return x, torch.from_numpy(y.astype(np.int64)).to(dev)
 
 
 def init_like_jaitensor(module):
@@ -148,12 +157,14 @@ def main():
     ap.add_argument("--pct", type=float, default=0.25)
     ap.add_argument("--wd", type=float, default=5e-4)
     ap.add_argument("--pad", type=int, default=4)
+    ap.add_argument("--normalize", type=int, default=1)
     a = ap.parse_args()
     print(f"torch {torch.__version__} MPS fp32 NCHW: ResNet-{a.depth} width {a.width}, {a.epochs} epochs, "
-          f"batch {a.batch}, SGD nesterov 0.9 wd {a.wd}, one-cycle max lr {a.lr} pct_start {a.pct}, seed {a.seed}")
+          f"batch {a.batch}, SGD nesterov 0.9 wd {a.wd}, one-cycle max lr {a.lr} pct_start {a.pct}, "
+          f"{'mean/std' if a.normalize else 'raw [0, 1]'} inputs, seed {a.seed}")
     torch.manual_seed(a.seed)
-    xtr, ytr = load("train")
-    xte, yte = load("test")
+    xtr, ytr = load("train", a.normalize)
+    xte, yte = load("test", a.normalize)
     net = ResNet(a.depth, a.width).to(dev)
     init_like_jaitensor(net)
     params = sum(p.numel() for p in net.parameters())

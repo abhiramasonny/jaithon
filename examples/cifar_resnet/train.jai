@@ -2,7 +2,7 @@
 #:
 #:     jaithon run examples/cifar_resnet/train.jai [--epochs 30] [--seed 0]
 #:         [--depth 20] [--width 16] [--batch 128] [--lr 0.2] [--pct 0.25]
-#:         [--wd 5e-4] [--train N]
+#:         [--wd 5e-4] [--normalize 1] [--train N]
 #:
 #: Every epoch draws a fresh random crop (pad 4) and flip for all 50,000
 #: images on the GPU, then makes one shuffled pass in batches of 128 with SGD
@@ -37,6 +37,8 @@ fn parse(args: list[str]) -> tuple[Recipe, int] {
             recipe.pct_start = float(value)
         } elif flag == "--wd" {
             recipe.weight_decay = float(value)
+        } elif flag == "--normalize" {
+            recipe.normalize = value != "0"
         } elif flag == "--train" {
             samples = int(value)
         } else {
@@ -57,13 +59,13 @@ fn main() -> int {
         parsed = parse(argv())
     } catch failure {
         print(failure.message)
-        print("usage: jaithon run examples/cifar_resnet/train.jai [--epochs N] [--seed N] [--depth 6n+2] [--width N] [--batch N] [--lr F] [--pct F] [--wd F] [--train N]")
+        print("usage: jaithon run examples/cifar_resnet/train.jai [--epochs N] [--seed N] [--depth 6n+2] [--width N] [--batch N] [--lr F] [--pct F] [--wd F] [--normalize 0|1] [--train N]")
         return 2
     }
     let (recipe, samples) = parsed
     print(recipe.describe())
-    let train = load_cifar("train", samples)
-    let test = load_cifar("test")
+    let train = load_cifar("train", samples, normalize: recipe.normalize)
+    let test = load_cifar("test", normalize: recipe.normalize)
     let outcome = train_resnet(recipe, train, test)
     print(f"parameters {outcome.parameters}")
     print(f"train {outcome.train_seconds:.2f}s  steady epoch {outcome.steady_epoch():.3f}s  first epoch {outcome.epoch_seconds[0]:.3f}s")
