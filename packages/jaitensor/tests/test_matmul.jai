@@ -553,8 +553,19 @@ fn test_padded_graph_route_applies_the_epilogue() -> void {
 #: The thin and short-K products the tile kernels cannot divide: batch-one
 #: rows, one-wide heads, X^T g for a one-wide input, outer products.
 let THIN_SHAPES = [
-    [1, 64, 64], [1, 4, 64], [1, 64, 2], [8, 64, 64], [1, 256, 1], [256, 64, 1], [64, 256, 1],
-    [256, 1, 64], [3, 5, 7], [31, 100, 33], [33, 3, 40], [64, 10, 128], [5, 3000, 3],
+    [1, 64, 64],
+    [1, 4, 64],
+    [1, 64, 2],
+    [8, 64, 64],
+    [1, 256, 1],
+    [256, 64, 1],
+    [64, 256, 1],
+    [256, 1, 64],
+    [3, 5, 7],
+    [31, 100, 33],
+    [33, 3, 40],
+    [64, 10, 128],
+    [5, 3000, 3],
 ]
 
 fn test_thin_kernels_take_thin_shapes_statically() -> void {
@@ -581,7 +592,10 @@ fn test_thin_kernels_are_tuned_only_where_they_can_run() -> void {
     }
     assert_true(thin, "a 16-row product times the thin kernels")
     for plan in candidates(512, 784, 256) {
-        assert_true(plan.backend != "thin_n" and plan.backend != "thin_m", f"{plan.to_str()} offered for 512x784x256")
+        assert_true(
+            plan.backend != "thin_n" and plan.backend != "thin_m",
+            f"{plan.to_str()} offered for 512x784x256"
+        )
     }
     assert_throws(ValueError, fn() {
         let a = jt.Tensor([256, 256])
@@ -635,7 +649,11 @@ fn assert_epilogue_matches_host(
 ) -> void {
     let a = jt.Tensor(if trans_a { [inner, rows] } else { [rows, inner] })
     a.buffer().fill_uniform(-scale, scale, 41)
-    let b = if trans_b { device_tensor([columns, inner], 42) } else { device_tensor([inner, columns], 42) }
+    let b = if trans_b {
+        device_tensor([columns, inner], 42)
+    } else {
+        device_tensor([inner, columns], 42)
+    }
     let bias = device_tensor([rows * columns], 43)
     let out = jt.Tensor([rows, columns])
     defer { a.free() }
@@ -680,8 +698,24 @@ fn test_thin_plans_apply_bias_relu_and_gelu_on_ragged_shapes() -> void {
     for shape in [[1, 64, 64], [1, 64, 2], [33, 3, 40], [256, 64, 1], [64, 10, 128], [3, 5, 7]] {
         for text in ["thin_n", "thin_m"] {
             for epilogue in [1, 2, 3, 4, 5, 6] {
-                assert_epilogue_matches_host(plan_named(text), shape[0], shape[1], shape[2], false, false, epilogue)
-                assert_epilogue_matches_host(plan_named(text), shape[0], shape[1], shape[2], true, true, epilogue)
+                assert_epilogue_matches_host(
+                    plan_named(text),
+                    shape[0],
+                    shape[1],
+                    shape[2],
+                    false,
+                    false,
+                    epilogue
+                )
+                assert_epilogue_matches_host(
+                    plan_named(text),
+                    shape[0],
+                    shape[1],
+                    shape[2],
+                    true,
+                    true,
+                    epilogue
+                )
             }
         }
     }
@@ -694,10 +728,28 @@ fn test_tanh_and_gelu_epilogues_stay_finite_on_large_pre_activations() -> void {
     if not jt.is_available() { return }
     for text in ["thin_n", "gemm32x32", "gemm64x32"] {
         for epilogue in [4, 5] {
-            assert_epilogue_matches_host(plan_named(text), 3, 2000, 5, false, false, epilogue, scale: 40.0)
+            assert_epilogue_matches_host(
+                plan_named(text),
+                3,
+                2000,
+                5,
+                false,
+                false,
+                epilogue,
+                scale: 40.0
+            )
         }
     }
-    assert_epilogue_matches_host(plan_named("direct32x32"), 32, 2000, 32, false, false, 5, scale: 40.0)
+    assert_epilogue_matches_host(
+        plan_named("direct32x32"),
+        32,
+        2000,
+        32,
+        false,
+        false,
+        5,
+        scale: 40.0
+    )
 }
 
 fn test_a_batched_thin_product_matches_host() -> void {
@@ -712,7 +764,18 @@ fn test_a_batched_thin_product_matches_host() -> void {
     defer { a.free() }
     defer { b.free() }
     defer { out.free() }
-    dispatch_batched(a.buffer(), b.buffer(), out.buffer(), out.buffer(), rows, inner, columns, batch, rows * inner, inner * columns)
+    dispatch_batched(
+        a.buffer(),
+        b.buffer(),
+        out.buffer(),
+        out.buffer(),
+        rows,
+        inner,
+        columns,
+        batch,
+        rows * inner,
+        inner * columns
+    )
     let got = out.download()
     let av = a.download()
     let bv = b.download()
@@ -721,7 +784,8 @@ fn test_a_batched_thin_product_matches_host() -> void {
             for column in 0..columns {
                 var want = 0.0
                 for k in 0..inner {
-                    want += av[(item * rows + row) * inner + k] * bv[(item * inner + k) * columns + column]
+                    want += av[(item * rows + row) * inner + k] *
+                        bv[(item * inner + k) * columns + column]
                 }
                 assert_near(got[(item * rows + row) * columns + column], want, 1e-3)
             }

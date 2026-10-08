@@ -989,7 +989,7 @@ fn thin_layout(config: Config, rows: int, inner: int, columns: int) -> list[int]
     var sg_k = 1
     while sg_k < 8 and sg_k * kl < wanted { sg_k = sg_k * 2 }
     let sg_slow = min(8 // sg_k, pow2_ceiling(max(1, slow)))
-    let tiles = ((fast + fw - 1) // fw) * ((slow + sg_slow - 1) // sg_slow)
+    let tiles = (fast + fw - 1) // fw * ((slow + sg_slow - 1) // sg_slow)
     return [fw, sg_slow, tiles]
 }
 
@@ -1052,10 +1052,11 @@ fn static_thin(rows: int, inner: int, columns: int, trans_a: bool) -> int {
 #: `THIN_SPLIT_DEPTH` steps, and then as few as bring it under.
 fn thin_splits(config: Config, rows: int, inner: int, columns: int) -> int {
     let layout = thin_layout(config, rows, inner, columns)
-    let lanes = (32 // layout[0]) * (8 // layout[1])
+    let lanes = 32 // layout[0] * (8 // layout[1])
     let depth = (inner + lanes - 1) // lanes
     var splits = 1
-    while depth > splits * THIN_SPLIT_DEPTH and split_allowed(config, rows, inner, columns, splits * 2) {
+    while depth > splits * THIN_SPLIT_DEPTH and
+        split_allowed(config, rows, inner, columns, splits * 2) {
         splits = splits * 2
     }
     return splits
@@ -1077,7 +1078,9 @@ fn filling_splits(config: Config, rows: int, inner: int, columns: int) -> int {
     for candidate in split_counts() {
         if not split_allowed(config, rows, inner, columns, candidate) { continue }
         if candidate > 1 and inner // candidate < depth { continue }
-        if tiles_of(config, rows, inner, columns) * candidate <= TARGET_GROUPS { splits = candidate }
+        if tiles_of(config, rows, inner, columns) * candidate <= TARGET_GROUPS {
+            splits = candidate
+        }
     }
     return splits
 }
@@ -1620,7 +1623,18 @@ fn encode(
     }
     let groups = tiles * plan.splits * batch
     if plan.splits == 1 {
-        var uniforms = [rows, inner, columns, a_flag, b_flag, epilogue, 1, stride_a, stride_b, stride_out]
+        var uniforms = [
+            rows,
+            inner,
+            columns,
+            a_flag,
+            b_flag,
+            epilogue,
+            1,
+            stride_a,
+            stride_b,
+            stride_out,
+        ]
         if config.thin() {
             uniforms.push(fw)
             uniforms.push(sg_slow)
@@ -1630,7 +1644,18 @@ fn encode(
     }
     let per_item = rows * columns * plan.splits
     let partials = scratch_for(per_item * batch)
-    var uniforms = [rows, inner, columns, a_flag, b_flag, epilogue, plan.splits, stride_a, stride_b, per_item]
+    var uniforms = [
+        rows,
+        inner,
+        columns,
+        a_flag,
+        b_flag,
+        epilogue,
+        plan.splits,
+        stride_a,
+        stride_b,
+        per_item,
+    ]
     if config.thin() {
         uniforms.push(fw)
         uniforms.push(sg_slow)
@@ -1704,7 +1729,9 @@ pub fn candidates(
         }
     }
     for (index, config) in CONFIGS.enumerate() {
-        if config.staged or config.thin() or not config_allowed(config, rows, inner, columns) { continue }
+        if config.staged or config.thin() or not config_allowed(config, rows, inner, columns) {
+            continue
+        }
         direct_legal = true
         for splits in split_counts() {
             if not split_allowed(config, rows, inner, columns, splits) { continue }

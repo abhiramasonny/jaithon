@@ -120,7 +120,11 @@ fn check_fused_against_composed(shape: list[int], with_skip: bool, with_relu: bo
     let watched = [x, gamma, beta, skip]
     let label = f"{shape} skip={with_skip} relu={with_relu}"
 
-    let fused = jt.batch_norm(x, gamma, beta, residual: if with_skip { skip } else { null }, relu: with_relu)
+    let fused = jt.batch_norm(x, gamma, beta, residual: if with_skip {
+        skip
+    } else {
+        null
+    }, relu: with_relu)
     let fused_values = fused.download()
     let fused_total = jt.sum(jt.multiply(fused, w))
     for held in fused_total.backward() { held.free() }
@@ -148,7 +152,15 @@ fn check_fused_against_composed(shape: list[int], with_skip: bool, with_relu: bo
 
 fn test_fused_batch_norm_matches_the_composed_operations() -> void {
     if not jt.is_available() { return }
-    for shape in [[8, 8, 8, 32], [4, 8, 8, 64], [2, 2, 2, 4], [3, 4, 5, 6], [2, 8, 8, 3], [16, 4, 4, 128], [8, 8, 8, 2]] {
+    for shape in [
+        [8, 8, 8, 32],
+        [4, 8, 8, 64],
+        [2, 2, 2, 4],
+        [3, 4, 5, 6],
+        [2, 8, 8, 3],
+        [16, 4, 4, 128],
+        [8, 8, 8, 2],
+    ] {
         check_fused_against_composed(shape, true, true)
         check_fused_against_composed(shape, false, true)
         check_fused_against_composed(shape, true, false)
@@ -207,7 +219,11 @@ fn test_a_relu_batch_norm_trains_alike_eagerly_and_compiled() -> void {
     let previous = env("JAITENSOR_BN_GRAPH")
     set_env("JAITENSOR_BN_GRAPH", "2")
     defer {
-        if previous is not null { set_env("JAITENSOR_BN_GRAPH", previous) } else { unset_env("JAITENSOR_BN_GRAPH") }
+        if previous is not null {
+            set_env("JAITENSOR_BN_GRAPH", previous)
+        } else {
+            unset_env("JAITENSOR_BN_GRAPH")
+        }
     }
     let step = compile_step(bn_relu_layers(5), [16, 8, 8, 3], 5, 0.05)
     assert_true(step is not null, f"would not compile: {refusal()}")

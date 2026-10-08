@@ -99,12 +99,11 @@ fn channel_moments(input: Tensor, nspatial: int, channels: int) -> list[Tensor] 
         let part_total = Tensor([chunks * channels])
         let part_square = Tensor([chunks * channels])
         let quads = channels % 4 == 0 and bn_fused_on()
-        cached_kernel(if quads { "channel_partials4" } else { "channel_partials" }).dispatch_async(
-            [input.buffer(), part_total.buffer(), part_square.buffer()],
-            chunks * 256,
-            [nspatial, channels, rows_each],
-            group_size: 256
-        )
+        cached_kernel(if quads {
+            "channel_partials4"
+        } else {
+            "channel_partials"
+        }).dispatch_async([input.buffer(), part_total.buffer(), part_square.buffer()], chunks * 256, [nspatial, channels, rows_each], group_size: 256)
         cached_kernel("channel_moments_join").dispatch_async(
             [
                 part_total.buffer(),
