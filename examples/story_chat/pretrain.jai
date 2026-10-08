@@ -209,7 +209,9 @@ fn main() -> int {
     var step = 0
     var tokens_seen = 0
     var train_seconds = 0.0
-    if has_flag("--resume") { settle_checkpoint(path) }
+    #: Only training writes the checkpoint, so only training settles it; an
+    #: evaluation reading it beside a running chunk must not.
+    if has_flag("--resume") and os.env_or("MODE", "train") == "train" { settle_checkpoint(path) }
     if has_flag("--resume") and Path(path).exists() {
         let meta = trainer.restore(path)
         let at: int = meta["step"]
