@@ -469,6 +469,36 @@ def scalar_gather_fixture() -> None:
     assert onnxruntime_run(path, sample).tolist() == [7.0, 19.0]
 
 
+def scalar_shape_fixture() -> None:
+    """A shape built from a scalar: `Shape -> Gather(1) -> Unsqueeze -> Concat -> Reshape`.
+
+    The Gather of a scalar out of a shape is a scalar, and an Unsqueeze of it is
+    `[1]`, ready to concatenate with the other `[1]`s -- which is how every
+    TorchScript export that reshapes by a computed size spells it.
+    """
+    second = helper.make_tensor("second", TensorProto.INT64, [], [1])
+    rest = helper.make_tensor("rest", TensorProto.INT64, [1], [-1])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Shape", ["input"], ["dims"], name="dims"),
+            helper.make_node("Gather", ["dims", "second"], ["width"], name="width", axis=0),
+            helper.make_node("Unsqueeze", ["width", "front"], ["width_1d"], name="lift"),
+            helper.make_node("Concat", ["width_1d", "rest"], ["target"], name="target", axis=0),
+            helper.make_node("Reshape", ["input", "target"], ["output"], name="fold"),
+        ],
+        "scalar_shape",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [2, 3])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [3, 2])],
+        initializer=[second, rest, helper.make_tensor("front", TensorProto.INT64, [1], [0])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)])
+    model.ir_version = 9
+    path = MODELS / "onnx_scalar_shape.onnx"
+    onnx.save(model, path)
+    sample = np.arange(6, dtype=np.float32).reshape(2, 3)
+    assert onnxruntime_run(path, sample).shape == (3, 2)
+
+
 def empty_shape_fixture() -> None:
     """The TorchScript exporter's scalar: `ConstantOfShape` of an empty shape.
 

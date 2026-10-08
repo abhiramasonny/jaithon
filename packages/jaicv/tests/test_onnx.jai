@@ -434,6 +434,20 @@ fn test_a_gather_by_a_scalar_drops_its_axis() -> void {
     free_onnx_weights(graph)
 }
 
+#: A scalar picked out of a `Shape` is still a scalar, and unsqueezing it
+#: gives `[1]`, which concatenates with the other `[1]`s into a target shape.
+#: Treated as `[1]` throughout, it came out `[1, 1]` and the `Concat` refused
+#: -- which is what stopped Swin's window partition.
+fn test_a_shape_built_from_a_scalar_reshapes() -> void {
+    let graph = read_net_from_onnx(MODELS + "onnx_scalar_shape.onnx")
+    let x = Tensor([2, 3], [float(value) for value in 0..6])
+    let produced = run_graph(graph, {"input": x})
+    assert_eq(produced["output"].shape, [3, 2], "reshaped by the width it read off the shape")
+    produced["output"].free()
+    x.free()
+    free_onnx_weights(graph)
+}
+
 #: BERT and DistilBERT, exported by TorchScript, make a scalar as
 #: `ConstantOfShape` of an empty `Constant`. The empty tensor has no place
 #: here, so the pair is folded into the scalar it stands for.

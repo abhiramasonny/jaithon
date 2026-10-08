@@ -84,6 +84,10 @@ pub fn op_unsqueeze(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let data = need(ins, 0, node)
     let asked = ints_from(node, ins, 1, "axes")
     if asked is null { throw ValueError(f"{node.label()} needs the axes to insert") }
+    #: A scalar has no axes of its own to keep, only the ones inserted.
+    if data.size == 1 and attr_int(node, RANK_ZERO_INPUT, 0) == 1 {
+        return [copy_of(data, [1 for _axis in asked])]
+    }
     let rank = data.rank() + asked.len()
     var inserted: list[int] = []
     for axis in asked { inserted.push(normalize_axis(axis, rank, node.label())) }
@@ -219,16 +223,75 @@ pub fn op_slice(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
 #: arrives as `[1]` either way, and this is what says the axis should go.
 pub let RANK_ZERO_INDICES = "jaicv_rank_zero_indices"
 
-#: Mark every `Gather` indexed by one of `scalars` -- the names a file wrote
-#: with no dimensions -- so that it drops the axis it picks from, as ONNX
-#: says. Without it `x[:, 0]` keeps a width of one and the `Gemm` after a
-#: ViT's class token refuses a rank-three operand.
+#: The attribute on an `Unsqueeze` whose input is a rank-zero scalar, which
+#: comes out with only the axes it inserts.
+pub let RANK_ZERO_INPUT = "jaicv_rank_zero_input"
+
+#: The operators whose result is a scalar whenever every input is one.
+let SCALAR_PRESERVING = {
+    "Add": true,
+    "Sub": true,
+    "Mul": true,
+    "Div": true,
+    "Mod": true,
+    "Pow": true,
+    "Neg": true,
+    "Abs": true,
+    "Floor": true,
+    "Ceil": true,
+    "Sqrt": true,
+    "Cast": true,
+    "Identity": true,
+    "Min": true,
+    "Max": true,
+    "Equal": true,
+    "Greater": true,
+    "Less": true,
+    "GreaterOrEqual": true,
+    "LessOrEqual": true,
+    "Not": true,
+    "And": true,
+    "Or": true,
+    "Where": true,
+}
+
+#: Follow the scalars a file writes through the shape arithmetic it does with
+#: them, and mark the two operators whose answer depends on the rank.
+#:
+#: `scalars` starts as the names the file wrote with no dimensions and grows
+#: as they flow: an element of a `Shape` picked by a scalar is one, and so is
+#: arithmetic on nothing but scalars. Then a `Gather` indexed by a scalar
+#: drops the axis it picks from -- without that `x[:, 0]` keeps a width of one
+#: and the `Gemm` after a ViT's class token refuses a rank-three operand --
+#: and an `Unsqueeze` of a scalar comes out with only the axes it adds, which
+#: is what lets `Shape -> Gather -> Unsqueeze -> Concat` build a shape.
+#:
+#: Nodes are taken in the file's order, which ONNX requires to be a
+#: topological one.
 pub fn mark_rank_zero(nodes: list[GraphNode], scalars: dict[str, bool]) -> void {
+    var vectors: dict[str, bool] = {}
     for node in nodes {
-        if node.op != "Gather" or node.inputs.len() < 2 { continue }
-        if scalars.get(node.inputs[1], false) {
-            node.attrs[RANK_ZERO_INDICES] = Attr.of_int(1)
+        if node.op == "Shape" {
+            for name in node.outputs { vectors[name] = true }
+            continue
         }
+        if node.op == "Gather" and node.inputs.len() >= 2 {
+            if scalars.get(node.inputs[1], false) {
+                node.attrs[RANK_ZERO_INDICES] = Attr.of_int(1)
+                if vectors.get(node.inputs[0], false) { scalars[node.outputs[0]] = true }
+            }
+            continue
+        }
+        if node.op == "Unsqueeze" and node.inputs.len() >= 1 {
+            if scalars.get(node.inputs[0], false) { node.attrs[RANK_ZERO_INPUT] = Attr.of_int(1) }
+            continue
+        }
+        if not SCALAR_PRESERVING.get(node.op, false) or node.outputs.len() != 1 { continue }
+        var every = node.inputs.len() > 0
+        for name in node.inputs {
+            if name.len() > 0 and not scalars.get(name, false) { every = false }
+        }
+        if every { scalars[node.outputs[0]] = true }
     }
 }
 
