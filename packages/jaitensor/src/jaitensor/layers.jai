@@ -1,6 +1,7 @@
 #: Neural-network layers.
 import std.math
 from std.gpu import Buffer
+from std.os import env
 from std.random import Random
 from .ops import conv2d, conv2d_out_dim, dense_affine, dense_static_backward, dense_static_forward
 from .ops import dropout, gather_rows, gelu, layer_norm, leaky_relu, max_pool2d, avg_pool2d
@@ -1342,6 +1343,16 @@ pub class Embedding: Layer {
     fn __str__(self) -> str { return f"Embedding({self.vocab}, {self.dim})" }
 }
 
+var _position_view: int = -1
+
+fn position_view_on() -> bool {
+    if _position_view < 0 {
+        let text = env("JAITENSOR_POSITION_VIEW")
+        _position_view = if text is not null and text == "0" { 0 } else { 1 }
+    }
+    return _position_view == 1
+}
+
 #: Learned positional embeddings: row `p` of a `[max_seq, dim]` table is added
 #: to every sequence's position `p`.
 #:
@@ -1392,7 +1403,8 @@ pub class PositionalEmbedding: Layer {
     #: gradient when the table trains. When it does not -- generation -- the
     #: rows are contiguous, so this is a view of them: no index upload and no
     #: gather for every decoded token. Free it either way; a view's free
-    #: leaves the table alone.
+    #: leaves the table alone. `JAITENSOR_POSITION_VIEW=0` gathers anyway, for
+    #: an A/B in one binary; read once.
     pub fn positions(self, seq: int, start: int = 0) -> Tensor {
         let table = self.table
         if table is null { throw RuntimeError("PositionalEmbedding has not been built") }
@@ -1401,7 +1413,9 @@ pub class PositionalEmbedding: Layer {
                 f"positions {start}..{start + seq} run past the {self.max_seq} this table holds"
             )
         }
-        if not table.requires_grad { return table.view(start * self.dim, [seq, self.dim]) }
+        if not table.requires_grad and position_view_on() {
+            return table.view(start * self.dim, [seq, self.dim])
+        }
         return gather_rows(table, self.indices(seq, start, 1))
     }
 
