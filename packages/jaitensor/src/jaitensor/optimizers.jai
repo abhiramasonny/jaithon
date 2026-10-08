@@ -719,7 +719,9 @@ pub fn clip_grad_norm(parameters: list[Tensor], max_norm: float) -> Tensor {
 #: The rate rises from `max_lr / div_factor` to `max_lr` over the first
 #: `pct_start` of `total_steps`, then falls to
 #: `max_lr / div_factor / final_div_factor` at the last step. Assign it to an
-#: optimizer's `learning_rate` before each step.
+#: optimizer's `learning_rate` before each step. When `pct_start` puts the
+#: peak at step 0 (`pct_start * total_steps == 1`), step 0 is `max_lr`, where
+#: PyTorch raises `ZeroDivisionError`.
 pub fn one_cycle_lr(
     step: int,
     total_steps: int,
@@ -741,6 +743,9 @@ pub fn one_cycle_lr(
     let last_step = float(total_steps - 1)
     let at = float(step)
     if at <= peak_step {
+        #: A warm-up that ends at step 0 is at its peak there. PyTorch divides
+        #: 0 by 0 for it and raises.
+        if peak_step <= 0.0 { return max_lr }
         return cosine_between(initial, max_lr, at / peak_step)
     }
     return cosine_between(max_lr, lowest, (at - peak_step) / (last_step - peak_step))

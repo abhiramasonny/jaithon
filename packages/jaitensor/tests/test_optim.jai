@@ -567,6 +567,18 @@ fn test_one_cycle_lr_matches_torch() -> void {
     let _past = assert_throws(ValueError, || jt.one_cycle_lr(21, 20, 0.1))
 }
 
+#: Four steps with `pct_start` 0.25 put the peak at step 0, which divided 0 by
+#: 0 (`train.jai --train 512` hit it). Step 0 is the peak, and the rest is the
+#: annealing phase, which PyTorch computes the same way.
+fn test_one_cycle_lr_with_the_peak_at_step_zero() -> void {
+    assert math.fabs(jt.one_cycle_lr(0, 4, 0.1, pct_start: 0.25) - 0.1) < 1e-15
+    let wanted = [0.0750001, 0.0250003, 4e-07]
+    for step in 1..4 {
+        let got = jt.one_cycle_lr(step, 4, 0.1, pct_start: 0.25)
+        assert math.fabs(got - wanted[step - 1]) < 1e-12, f"step {step}: {got} against {wanted[step - 1]}"
+    }
+}
+
 #: The float arguments go to the device as bits, and a number just under a
 #: power of two must round up to it rather than come out as half of it.
 fn test_float32_bits_rounds_like_a_float_buffer() -> void {
