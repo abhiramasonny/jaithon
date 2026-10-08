@@ -410,6 +410,17 @@ pub trait Optimizer {
 
     #: Apply one update to every given parameter, using its accumulated `.grad`.
     fn step(self, parameters: list[Tensor]) -> void
+
+    #: Set the learning rate for the steps that follow, so a schedule can be
+    #: written against any optimizer (a `Sequential` holds an `Optimizer`).
+    #: Assigning the concrete class's `learning_rate` does the same.
+    fn set_learning_rate(self, learning_rate: float) -> void
+}
+
+fn check_learning_rate(learning_rate: float) -> void {
+    if learning_rate != learning_rate or learning_rate <= 0.0 {
+        throw ValueError(f"learning_rate must be positive, got {learning_rate}")
+    }
 }
 
 #: NaN first: an ordered comparison with NaN throws a TypeError.
@@ -428,7 +439,12 @@ fn check_decay(weight_decay: float) -> void {
 #: training without the decay that was asked for.
 #:
 #: `learning_rate` may be assigned between steps; a schedule does not need a
-#: new optimizer, and the state kept against each parameter carries on.
+#: new optimizer, and the state kept against each parameter carries on. That
+#: holds for a loop that calls `step`. `Sequential.fit`'s compiled whole-step
+#: route builds the rate into its graph, so changing it between `fit` calls
+#: rebuilds that graph each time: correct, but slow for a per-epoch schedule.
+#: Decay costs the fused and compiled routes too: a 784-512-512-10 MLP with
+#: plain SGD took 101 ms an epoch compiled and 127 ms with weight decay.
 pub class SGD: Optimizer {
     #: Step size applied to each minibatch gradient. Assignable.
     pub var learning_rate: float
@@ -448,9 +464,7 @@ pub class SGD: Optimizer {
         nesterov: bool = false,
         weight_decay: float = 0.0
     ) {
-        if learning_rate <= 0.0 {
-            throw ValueError(f"learning_rate must be positive, got {learning_rate}")
-        }
+        check_learning_rate(learning_rate)
         if momentum < 0.0 or momentum >= 1.0 {
             throw ValueError(f"momentum must be in [0, 1), got {momentum}")
         }
@@ -477,6 +491,12 @@ pub class SGD: Optimizer {
 
     #: Optimizer name used in model output.
     pub fn name(self) -> str { return "SGD" }
+
+    #: Assign `learning_rate`, refusing one that is not positive.
+    pub fn set_learning_rate(self, learning_rate: float) -> void {
+        check_learning_rate(learning_rate)
+        self.learning_rate = learning_rate
+    }
 
     #: Apply one SGD update to every given parameter, using its `.grad`.
     pub fn step(self, parameters: list[Tensor]) -> void {
@@ -534,6 +554,12 @@ pub class Adam: Optimizer {
     #: Optimizer name used in model output.
     pub fn name(self) -> str { return "Adam" }
 
+    #: Assign `learning_rate`, refusing one that is not positive.
+    pub fn set_learning_rate(self, learning_rate: float) -> void {
+        check_learning_rate(learning_rate)
+        self.learning_rate = learning_rate
+    }
+
     #: Apply one Adam update to every given parameter, using its `.grad`.
     pub fn step(self, parameters: list[Tensor]) -> void {
         step_all(parameters, self.settings(), self.kind())
@@ -541,9 +567,7 @@ pub class Adam: Optimizer {
 }
 
 fn check_adam(learning_rate: float, beta1: float, beta2: float, epsilon: float) -> void {
-    if learning_rate <= 0.0 {
-        throw ValueError(f"learning_rate must be positive, got {learning_rate}")
-    }
+    check_learning_rate(learning_rate)
     if beta1 < 0.0 or beta1 >= 1.0 { throw ValueError(f"beta1 must be in [0, 1), got {beta1}") }
     if beta2 < 0.0 or beta2 >= 1.0 { throw ValueError(f"beta2 must be in [0, 1), got {beta2}") }
     if epsilon <= 0.0 { throw ValueError(f"epsilon must be positive, got {epsilon}") }
@@ -552,9 +576,10 @@ fn check_adam(learning_rate: float, beta1: float, beta2: float, epsilon: float) 
 #: Adam with decoupled weight decay (Loshchilov and Hutter).
 #:
 #: Each step first shrinks every weight by `learning_rate * weight_decay` of
-#: itself, then takes the Adam step on the undecayed gradient -- PyTorch's
-#: `AdamW` exactly. With `weight_decay` zero it is plain Adam and trains on
-#: every path Adam does.
+#: itself, then takes the Adam step on the undecayed gradient, as PyTorch's
+#: `AdamW` does. The defaults are PyTorch's except `epsilon`, which is Adam's
+#: 1e-7 here against PyTorch's 1e-8: pass `epsilon: 1e-8` to match it. With
+#: `weight_decay` zero it is plain Adam and trains on every path Adam does.
 pub class AdamW: Optimizer {
     #: Base step size. Assignable.
     pub var learning_rate: float
@@ -599,6 +624,12 @@ pub class AdamW: Optimizer {
 
     #: Optimizer name used in model output.
     pub fn name(self) -> str { return "AdamW" }
+
+    #: Assign `learning_rate`, refusing one that is not positive.
+    pub fn set_learning_rate(self, learning_rate: float) -> void {
+        check_learning_rate(learning_rate)
+        self.learning_rate = learning_rate
+    }
 
     #: Apply one AdamW update to every given parameter, using its `.grad`.
     pub fn step(self, parameters: list[Tensor]) -> void {

@@ -196,6 +196,8 @@ fn test_optimizer_configuration_rejects_invalid_values() -> void {
     let _epsilon = assert_throws(ValueError, || jt.Adam(epsilon: 0.0))
     #: An ordered comparison with NaN throws a TypeError, so these are
     #: tested for NaN first.
+    let _nan_rate = assert_throws(ValueError, || jt.SGD(learning_rate: math.NAN))
+    let _nan_adam_rate = assert_throws(ValueError, || jt.AdamW(learning_rate: math.NAN))
     let _nan_decay = assert_throws(ValueError, || jt.SGD(weight_decay: math.NAN))
     let _nan_adam_decay = assert_throws(ValueError, || jt.Adam(weight_decay: math.NAN))
 }
@@ -428,6 +430,31 @@ fn test_clip_grad_norm_matches_torch() -> void {
     a.free()
     b.free()
     unused.free()
+}
+
+fn schedule_through_the_trait(optimizer: Optimizer, learning_rate: float) -> void {
+    optimizer.set_learning_rate(learning_rate)
+}
+
+#: A schedule written against the `Optimizer` trait reaches each optimizer's
+#: rate, and a rate that is not positive is refused.
+fn test_the_learning_rate_can_be_set_through_the_trait() -> void {
+    let optimizers: list[Optimizer] = [
+        jt.SGD(
+            learning_rate: 0.1,
+            momentum: 0.9,
+            weight_decay: 5e-4
+        ),
+        jt.Adam(learning_rate: 0.01),
+        jt.AdamW(learning_rate: 0.01),
+    ]
+    for optimizer in optimizers {
+        schedule_through_the_trait(optimizer, 0.0025)
+        assert optimizer.settings()[0] == 0.0025, optimizer.name()
+        let _zero = assert_throws(ValueError, || optimizer.set_learning_rate(0.0))
+        let _nan = assert_throws(ValueError, || optimizer.set_learning_rate(math.NAN))
+        assert optimizer.settings()[0] == 0.0025, optimizer.name()
+    }
 }
 
 #: An infinite `max_norm` is PyTorch's way of asking for the norm without
