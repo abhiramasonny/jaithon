@@ -17,7 +17,6 @@
 #: `--one-epoch` stops after an epoch (exit status 10 while epochs remain) and
 #: `--resume` carries on from the latest, so `run_full.sh` can give each epoch
 #: its own turn on the GPU.
-import jaitensor as jt
 import std.gpu as gpu
 import std.math
 import std.os
@@ -30,7 +29,7 @@ from .model import GPT, checkpoint_meta, chat_checkpoint, env_float, env_int, fr
 from .model import pretrain_checkpoint, run_dir, tokenizer_path
 from .pretrain import Trainer, flag, has_flag, learning_rate
 from .sample import Decoder, Sampling, generate
-from .tokenizer import BOT, EOT, USER, Tokenizer, cache_dir, dialog_file, load_tokenizer, read_dialogues
+from .tokenizer import BOT, EOT, USER, Tokenizer, dialog_file, load_tokenizer, read_dialogues
 
 #: Mean loss over every target of `rows`, in nats a token.
 pub fn masked_loss(model: GPT, rows: list[Row], batch: int, quantum: int) -> float {

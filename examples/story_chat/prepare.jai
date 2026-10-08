@@ -16,7 +16,7 @@
 #: `ONLY=tokenizer` or `ONLY=valid` stops early; `check.jai` and the vocabulary
 #: comparison use that.
 import std.os
-from std.io import Path, open, write_file
+from std.io import Path, open
 from std.time import Instant
 from .tokenizer import EOT, TRAIN_BYTES, Tokenizer, cache_dir, count_pieces, dialog_file, file_size
 from .tokenizer import load_tokenizer, read_dialogues, read_range, story_file, train_bpe

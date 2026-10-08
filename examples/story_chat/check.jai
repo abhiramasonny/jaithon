@@ -20,7 +20,6 @@
 #:   a dialogue batch scores exactly the bot's tokens.
 #:
 #: It exits non-zero if any of them fails.
-import jaitensor as jt
 import std.gpu as gpu
 import std.math
 import std.os
@@ -28,7 +27,7 @@ from jaitensor import SparseCategoricalCrossentropy, Tensor
 from std.io import Path
 from std.random import Random
 from std.time import Instant
-from .dialog import Batch, Row, dialogue_rows, format_turns
+from .dialog import Batch, dialogue_rows, format_turns
 from .model import Config, GPT, Sampler, TokenFile, checkpoint_meta, free_all, load_model
 from .prepare import u16_bytes
 from .pretrain import Trainer, learning_rate

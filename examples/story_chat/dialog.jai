@@ -9,7 +9,6 @@
 #: the token after each -- the next `<|user|>` or the `<|endoftext|>` -- so it
 #: learns where its turn stops. The user's words and the `<|bot|>` that hands
 #: over are context, never targets.
-import jaitensor as jt
 from jaitensor import Tensor
 from std.random import Random
 from .tokenizer import BOT, EOT, USER, Tokenizer

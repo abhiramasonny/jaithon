@@ -33,11 +33,11 @@ from jaitensor import SparseCategoricalCrossentropy, Tensor
 from std.io import Path, append_file
 from std.random import Random
 from std.time import Instant
-from .model import FLUSH, Config, GPT, Optimisers, Sampler, TokenFile, checkpoint_meta, config_from_env
-from .model import config_of, drop_grads, env_float, env_int, free_all, held_out_loss, held_out_starts
+from .model import FLUSH, Config, GPT, Optimisers, Sampler, checkpoint_meta, config_from_env
+from .model import drop_grads, env_float, env_int, free_all, held_out_loss, held_out_starts
 from .model import pretrain_checkpoint, read_token_file, run_dir, target_bytes, token_path, tokenizer_path
 from .sample import Decoder, Sampling, generate
-from .tokenizer import EOT, Tokenizer, cache_dir, load_tokenizer, text_of
+from .tokenizer import EOT, Tokenizer, load_tokenizer
 
 #: The flag values after `--`.
 pub fn flag(name: str, fallback: str) -> str {
