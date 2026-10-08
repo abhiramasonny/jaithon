@@ -733,6 +733,15 @@ pub class LayerNorm: Layer {
 #: as one sequence; nothing attends across sequences. Rank two is one
 #: sequence, exactly as before, which is what `Sequential` hands the layer.
 #:
+#: `batch_first: false` reads rank three as `[seq, batch, dim]` instead, the
+#: order torch's `nn.MultiheadAttention` defaults to. That order folds for
+#: free: `[seq, batch * dim]` already is the packed layout of `batch * heads`
+#: heads, so attention reads the projections where they lie. Batch-first has
+#: to copy each of Q, K and V into it and the context back out, which at a
+#: GPT's `[64, 128, 256]` is 0.57 ms of a 1.78 ms forward and backward. A model
+#: whose every other op works row by row -- layer norm, the MLP, the residual
+#: adds -- can keep its activations sequence-first and never pay it.
+#:
 #: For generation, `start_cache(max_seq)` keeps every key and value the layer
 #: has projected in device buffers of `max_seq` rows. Each `forward` then
 #: takes only the new rows -- a prompt, then one token at a time -- projects
@@ -747,6 +756,9 @@ pub class MultiHeadAttention: Layer {
     pub let heads: int
     pub let dim: int
     pub let causal: bool
+    #: Whether a rank-three input is `[batch, seq, dim]` (true) or
+    #: `[seq, batch, dim]` (false).
+    pub let batch_first: bool
     var wq_value: Tensor?
     var wk_value: Tensor?
     var wv_value: Tensor?
@@ -756,7 +768,7 @@ pub class MultiHeadAttention: Layer {
     var cached: int
     var cache_batch: int
 
-    pub fn init(self, dim: int, heads: int = 1, causal: bool = false) {
+    pub fn init(self, dim: int, heads: int = 1, causal: bool = false, batch_first: bool = true) {
         if dim <= 0 or heads <= 0 {
             throw ValueError("MultiHeadAttention dim/heads must be positive")
         }
@@ -764,6 +776,7 @@ pub class MultiHeadAttention: Layer {
         self.dim = dim
         self.heads = heads
         self.causal = causal
+        self.batch_first = batch_first
         self.wq_value = null
         self.wk_value = null
         self.wv_value = null
@@ -949,6 +962,91 @@ pub class MultiHeadAttention: Layer {
         return Tensor([batch, rows, self.dim], storage: output.buffer())
     }
 
+    #: The cached forward for sequence-first `[rows, batch, dim]`. The new rows
+    #: of every sequence are already the next `rows` rows of the
+    #: position-major cache, whatever `rows` is, so the projections write them
+    #: in place and nothing is folded.
+    fn forward_cached_seq_first(
+        self,
+        x: Tensor,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor,
+        keys: Tensor,
+        values: Tensor
+    ) -> Tensor {
+        let rows = x.shape[0]
+        let batch = x.shape[1]
+        if batch != self.cache_batch {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {self.cache_batch} sequences, got a batch of {batch}"
+            )
+        }
+        let capacity = keys.shape[0]
+        if self.cached + rows > capacity {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {capacity} rows; {self.cached} are used and {rows} more were given"
+            )
+        }
+        let width = batch * self.dim
+        let start = self.cached * width
+        let seen = self.cached + rows
+        let flat = x.view(0, [rows * batch, self.dim])
+        let k_rows = keys.view(start, [rows * batch, self.dim])
+        let v_rows = values.view(start, [rows * batch, self.dim])
+        raw_matmul(flat, wk, out: k_rows)
+        raw_matmul(flat, wv, out: v_rows)
+        k_rows.free()
+        v_rows.free()
+        let q = raw_matmul(flat, wq)
+        flat.free()
+        let query = Tensor([rows, width], storage: q.buffer())
+        let k_seen = keys.view(0, [seen, width])
+        let v_seen = values.view(0, [seen, width])
+        let context = multi_head_attention(
+            query,
+            k_seen,
+            v_seen,
+            self.heads * batch,
+            causal: self.causal
+        )
+        k_seen.free()
+        v_seen.free()
+        query.free()
+        let per_row = Tensor([rows * batch, self.dim], storage: context.buffer())
+        let output = raw_matmul(per_row, wo)
+        per_row.free()
+        self.cached = seen
+        return Tensor([rows, batch, self.dim], storage: output.buffer())
+    }
+
+    #: The whole-sequence forward for sequence-first `[seq, batch, dim]`:
+    #: the rank-two path with `batch * heads` heads, and no copies.
+    fn forward_seq_first(self, x: Tensor, wq: Tensor, wk: Tensor, wv: Tensor, wo: Tensor) -> Tensor {
+        let seq = x.shape[0]
+        let batch = x.shape[1]
+        let width = batch * self.dim
+        let flat = reshape(x, [seq * batch, self.dim])
+        let q = matmul(flat, wq)
+        let k = matmul(flat, wk)
+        let v = matmul(flat, wv)
+        let q2 = reshape(q, [seq, width])
+        let k2 = reshape(k, [seq, width])
+        let v2 = reshape(v, [seq, width])
+        let context = multi_head_attention(q2, k2, v2, self.heads * batch, causal: self.causal)
+        hand_to_graph(context, [q2, k2, v2, q, k, v])
+        let per_row = reshape(context, [seq * batch, self.dim])
+        let product = matmul(per_row, wo)
+        if product.creator is null {
+            for held in [flat, per_row, context] { held.free() }
+            return Tensor([seq, batch, self.dim], storage: product.buffer())
+        }
+        let output = reshape(product, [seq, batch, self.dim])
+        hand_to_graph(output, [flat, per_row, context])
+        return output
+    }
+
     #: The whole-sequence forward for `[batch, seq, dim]`.
     #:
     #: Ownership follows the rank-two path: whatever a recorded graph reads
@@ -1006,6 +1104,12 @@ pub class MultiHeadAttention: Layer {
         let keys = self.cache_k
         let values = self.cache_v
         if x.rank() == 3 and x.shape[2] == self.dim {
+            if not self.batch_first {
+                if keys is not null and values is not null {
+                    return self.forward_cached_seq_first(x, wq, wk, wv, wo, keys, values)
+                }
+                return self.forward_seq_first(x, wq, wk, wv, wo)
+            }
             if keys is not null and values is not null {
                 return self.forward_cached_batched(x, wq, wk, wv, wo, keys, values)
             }
@@ -1013,13 +1117,13 @@ pub class MultiHeadAttention: Layer {
         }
         if x.rank() != 2 or x.shape[1] != self.dim {
             throw ValueError(
-                f"MultiHeadAttention needs [seq, {self.dim}] or [batch, seq, {self.dim}], got {x.shape}"
+                f"MultiHeadAttention needs [seq, {self.dim}] or a rank-three batch of them, got {x.shape}"
             )
         }
         if keys is not null and values is not null {
             if self.cache_batch != 1 {
                 throw ValueError(
-                    f"MultiHeadAttention cache holds {self.cache_batch} sequences; feed it [{self.cache_batch}, rows, {self.dim}]"
+                    f"MultiHeadAttention cache holds {self.cache_batch} sequences; feed it a batch of them"
                 )
             }
             return self.forward_cached(x, wq, wk, wv, wo, keys, values)
@@ -1073,7 +1177,8 @@ pub class MultiHeadAttention: Layer {
 
     fn __str__(self) -> str {
         let mask = if self.causal { ", causal" } else { "" }
-        return f"MultiHeadAttention(dim={self.dim}, heads={self.heads}{mask})"
+        let order = if self.batch_first { "" } else { ", seq first" }
+        return f"MultiHeadAttention(dim={self.dim}, heads={self.heads}{mask}{order})"
     }
 }
 
@@ -1188,26 +1293,34 @@ pub class Embedding: Layer {
 #: is what a cached decoder feeding one token at a time needs. Only the `seq`
 #: rows in use are gathered and they broadcast over the batch, so the
 #: gradient reaches the table as one sum over the batch rather than `batch`
-#: colliding atomic adds per row.
+#: colliding atomic adds per row. `batch_first: false` takes `[seq, batch,
+#: dim]`, to sit beside a sequence-first `MultiHeadAttention`; there the rows
+#: are gathered once per sequence, since the batch is not a leading axis.
 pub class PositionalEmbedding: Layer {
     pub let max_seq: int
     pub let dim: int
     #: Half-width of the uniform initialisation `build` draws from.
     pub let init_limit: float
+    #: Whether a rank-three input is `[batch, seq, dim]` (true) or
+    #: `[seq, batch, dim]` (false).
+    pub let batch_first: bool
     var table: Tensor?
     var index: Tensor?
     var index_start: int
+    var index_repeat: int
 
-    pub fn init(self, max_seq: int, dim: int, init_limit: float = 0.05) {
+    pub fn init(self, max_seq: int, dim: int, init_limit: float = 0.05, batch_first: bool = true) {
         if max_seq <= 0 or dim <= 0 {
             throw ValueError("PositionalEmbedding max_seq and dim must be positive")
         }
         self.max_seq = max_seq
         self.dim = dim
         self.init_limit = init_limit
+        self.batch_first = batch_first
         self.table = null
         self.index = null
         self.index_start = -1
+        self.index_repeat = 0
     }
 
     pub fn build(self, input_units: int, rng: Random) -> void {
@@ -1228,19 +1341,33 @@ pub class PositionalEmbedding: Layer {
                 f"positions {start}..{start + seq} run past the {self.max_seq} this table holds"
             )
         }
-        return gather_rows(table, self.indices(seq, start))
+        return gather_rows(table, self.indices(seq, start, 1))
     }
 
     #: `x` plus positions `0..seq`.
     pub fn forward(self, x: Tensor) -> Tensor { return self.forward_at(x, 0) }
 
-    #: `x` plus positions `start..start + seq`, for `[seq, dim]` or
-    #: `[batch, seq, dim]`.
+    #: `x` plus positions `start..start + seq`, for `[seq, dim]` or a
+    #: rank-three batch of them.
     pub fn forward_at(self, x: Tensor, start: int) -> Tensor {
         if x.rank() < 2 or x.rank() > 3 or x.shape[x.rank() - 1] != self.dim {
             throw ValueError(
-                f"PositionalEmbedding needs [seq, {self.dim}] or [batch, seq, {self.dim}], got {x.shape}"
+                f"PositionalEmbedding needs [seq, {self.dim}] or a rank-three batch of them, got {x.shape}"
             )
+        }
+        if x.rank() == 3 and not self.batch_first {
+            let table = self.table
+            if table is null { throw RuntimeError("PositionalEmbedding has not been built") }
+            let seq = x.shape[0]
+            if start < 0 or start + seq > self.max_seq {
+                throw ValueError(
+                    f"positions {start}..{start + seq} run past the {self.max_seq} this table holds"
+                )
+            }
+            let rows = gather_rows(table, self.indices(seq, start, x.shape[1]), x.shape)
+            let output = add(x, rows)
+            hand_to_graph(output, [rows])
+            return output
         }
         let rows = self.positions(x.shape[x.rank() - 2], start)
         let output = add(x, rows)
@@ -1248,17 +1375,24 @@ pub class PositionalEmbedding: Layer {
         return output
     }
 
-    #: The `[seq]` index tensor for `start..start + seq`, kept between calls:
-    #: training asks for the same one every step. The gather that read the
-    #: last one may still be queued, so a different one is a new tensor, not
-    #: an upload over the old.
-    fn indices(self, seq: int, start: int) -> Tensor {
+    #: The index tensor for positions `start..start + seq`, each `repeat`
+    #: times over, kept between calls: training asks for the same one every
+    #: step. The gather that read the last one may still be queued, so a
+    #: different one is a new tensor, not an upload over the old.
+    fn indices(self, seq: int, start: int, repeat: int) -> Tensor {
         let held = self.index
-        if held is not null and held.size == seq and self.index_start == start { return held }
+        if held is not null and held.size == seq * repeat and self.index_start == start {
+            if self.index_repeat == repeat { return held }
+        }
         if held is not null { held.free() }
-        let made = Tensor([seq], [float(start + offset) for offset in 0..seq])
+        var values: list[float] = []
+        for offset in 0..seq {
+            for _copy in 0..repeat { values.push(float(start + offset)) }
+        }
+        let made = Tensor([seq * repeat], values)
         self.index = made
         self.index_start = start
+        self.index_repeat = repeat
         return made
     }
 
@@ -1278,6 +1412,7 @@ pub class PositionalEmbedding: Layer {
         self.table = null
         self.index = null
         self.index_start = -1
+        self.index_repeat = 0
     }
 
     fn __str__(self) -> str { return f"PositionalEmbedding({self.max_seq}, {self.dim})" }

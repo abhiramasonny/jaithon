@@ -1148,3 +1148,101 @@ fn test_a_reshaped_leaf_keeps_its_gradient_after_the_graph_is_freed() -> void {
     }
     free_all([q, k, v])
 }
+
+#: `[batch, seq, dim]` host values reordered as `[seq, batch, dim]`, or back
+#: again with the first two counts swapped.
+fn swap_leading(values: list[float], first: int, second: int, dim: int) -> list[float] {
+    var out: list[float] = []
+    for j in 0..second {
+        for i in 0..first {
+            let base = (i * second + j) * dim
+            for value in values[base:base + dim] { out.push(value) }
+        }
+    }
+    return out
+}
+
+#: Output, dx and every parameter gradient of `sum(layer(x) * w)` for one
+#: rank-three block, as host lists in that order.
+fn layer_block_pass(layer: MultiHeadAttention, shape: list[int], xs: list[float], ws: list[float]) -> list[list[float]] {
+    let params = layer.parameters()
+    jt.zero_grad(params)
+    let x = Tensor(shape, xs, requires_grad: true)
+    let w = Tensor(shape, ws)
+    let y = layer.forward(x)
+    assert_eq(y.shape, shape)
+    var out = [y.download()]
+    let total = jt.sum(jt.multiply(y, w))
+    free_all(total.backward())
+    total.free()
+    for t in [x] + params {
+        let g = t.grad
+        assert_true(g is not null)
+        if g is not null { out.push(g.download()) }
+    }
+    free_all([x, w, y])
+    jt.zero_grad(params)
+    return out
+}
+
+#: A sequence-first layer on `[seq, batch, dim]` gives what a batch-first one
+#: with the same weights gives on `[batch, seq, dim]`, gradients included, and
+#: its unrecorded forward and cache hand back everything they allocate.
+fn check_seq_first(batch: int, seq: int, dim: int, heads: int, causal: bool) -> void {
+    let first = jt.MultiHeadAttention(dim, heads: heads, causal: causal)
+    let second = jt.MultiHeadAttention(dim, heads: heads, causal: causal, batch_first: false)
+    defer { first.free() }
+    defer { second.free() }
+    first.build(dim, Random.with_seed(9))
+    second.build(dim, Random.with_seed(9))
+    let xs = wave(batch * seq * dim, 0.45)
+    let ws = wave(batch * seq * dim, 2.05)
+    let want = layer_block_pass(first, [batch, seq, dim], xs, ws)
+    let got = layer_block_pass(
+        second,
+        [seq, batch, dim],
+        swap_leading(xs, batch, seq, dim),
+        swap_leading(ws, batch, seq, dim)
+    )
+    assert_eq(got.len(), 6)
+    assert_values_near(swap_leading(got[0], seq, batch, dim), want[0], 1e-4)
+    assert_values_near(swap_leading(got[1], seq, batch, dim), want[1], 1e-4)
+    for index in 2..6 { assert_values_near(got[index], want[index], 1e-4) }
+    for param in second.parameters() { param.requires_grad = false }
+    let x = Tensor([seq, batch, dim], swap_leading(xs, batch, seq, dim))
+    defer { x.free() }
+    var live = -1
+    for step in 0..3 {
+        let y = second.forward(x)
+        if step == 0 { assert_values_near(swap_leading(y.download(), seq, batch, dim), want[0], 4e-3) }
+        y.free()
+        gpu.synchronize()
+        if step == 1 { live = gpu.live_buffers() }
+        if step > 1 { assert_eq(gpu.live_buffers(), live) }
+    }
+    #: Through the cache: a prompt of three rows, then one at a time.
+    if causal {
+        second.start_cache(seq, batch: batch)
+        var decoded: list[float] = []
+        var at = 0
+        while at < seq {
+            let count = if at == 0 { min(3, seq) } else { 1 }
+            let rows = x.view(at * batch * dim, [count, batch, dim])
+            let y = second.forward(rows)
+            for value in y.download() { decoded.push(value) }
+            free_all([y, rows])
+            at += count
+        }
+        assert_values_near(swap_leading(decoded, seq, batch, dim), want[0], 4e-3)
+        second.free_cache()
+    }
+}
+
+#: `batch_first: false` is the order that folds for free; it must be the same
+#: attention as the batch-first order, on both training routes.
+fn test_attention_layer_takes_a_sequence_first_batch() -> void {
+    if not jt.is_available() { return }
+    check_seq_first(3, 64, 128, 2, true)
+    check_seq_first(2, 20, 64, 2, true)
+    check_seq_first(2, 64, 128, 2, false)
+}

@@ -195,6 +195,46 @@ fn test_positional_embedding_adds_each_position_to_every_sequence() -> void {
     assert_throws(ValueError, || positions.forward_at(x, 5))
 }
 
+#: Sequence-first `[seq, batch, dim]` gets position `t` on every row of step
+#: `t`, the same sum a batch-first input gets, and the same table gradient.
+fn test_positional_embedding_takes_a_sequence_first_batch() -> void {
+    if not jt.is_available() { return }
+    let width = 4
+    let seq = 5
+    let batch = 3
+    let positions = jt.PositionalEmbedding(8, width, batch_first: false)
+    defer { positions.free() }
+    positions.build(width, Random.with_seed(5))
+    let table = positions.parameters()[0].download()
+    let xs = [float(i) * 0.5 for i in 0..seq * batch * width]
+    let x = jt.Tensor([seq, batch, width], xs)
+    defer { x.free() }
+    let y = positions.forward_at(x, 2)
+    assert_eq(y.shape, [seq, batch, width])
+    let got = y.download()
+    for t in 0..seq {
+        for b in 0..batch {
+            for c in 0..width {
+                let at = (t * batch + b) * width + c
+                assert_near(got[at], xs[at] + table[(2 + t) * width + c], 1e-6)
+            }
+        }
+    }
+    let total = jt.sum(y)
+    for held in total.backward() { held.free() }
+    total.free()
+    y.free()
+    let grad = positions.parameters()[0].grad
+    assert_true(grad is not null)
+    if grad is not null {
+        let g = grad.download()
+        assert_near(g[0], 0.0, 1e-6)
+        assert_near(g[2 * width], float(batch), 1e-6)
+        assert_near(g[6 * width], float(batch), 1e-6)
+        assert_near(g[7 * width], 0.0, 1e-6)
+    }
+}
+
 fn test_conv2d_layer_builds_from_image_shape() -> void {
     if not jt.is_available() { return }
     var pixels: list[float] = []
