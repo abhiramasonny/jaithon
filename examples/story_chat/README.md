@@ -139,7 +139,8 @@ through the cache ran at 442-554 tokens a second, batch 1, under the lock.
 ### Fine-tuning
 
 The masked loss -- over the bot's tokens and turn ends only -- on DailyDialog
-validation (2,210 rows), from the same 15-minute checkpoint:
+validation (2,210 rows; 2,209 once `I ’ Ve` was lower-cased, which the 3e-4
+run had), from the same 15-minute checkpoint:
 
 | | LR 1e-4, 2 epochs (`run_full.sh` as first run) | LR 3e-4, 3 epochs (now the default) |
 |---|---|---|
