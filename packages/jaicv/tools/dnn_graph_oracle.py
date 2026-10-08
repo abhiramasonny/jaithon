@@ -750,7 +750,7 @@ def build_cases():
     # Recurrent gates driven far into saturation, so the cell candidate and the
     # GRU's new state take tanh of something well past 44.
     case("recurrent", "lstm_saturated", "LSTM",
-         [spread(3, 2, 3, low=-80.0, high=80.0, seed=104),
+         [spread(3, 2, 3, low=-300.0, high=300.0, seed=104),
           spread(1, 16, 3, low=-0.6, high=0.6, seed=105),
           spread(1, 16, 4, low=-0.6, high=0.6, seed=106)],
          {"hidden_size": 4}, outputs=3, opset=14)
