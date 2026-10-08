@@ -23,7 +23,7 @@
 from std.io import open as open_file, File, SEEK_SET
 from ..core.mat import Mat, merge
 from ..core.types import CV_8U, CV_MAKETYPE, Size
-from ..imgcodecs.jpeg import decode as decode_jpeg, looks_like as looks_like_jpeg
+from ..imgcodecs.jpeg import decode as decode_jpeg, looks_like as looks_like_jpeg, release_buffers
 
 fn le16_at(data: bytes, at: int) -> int { return data[at] | data[at + 1] << 8 }
 
@@ -216,5 +216,8 @@ pub class AviReader {
         if file is null { return }
         file.close()
         self.handle = null
+        #: The JPEG decoder keeps its frame-sized working lists for the next
+        #: frame; with the video closed there is none.
+        release_buffers()
     }
 }

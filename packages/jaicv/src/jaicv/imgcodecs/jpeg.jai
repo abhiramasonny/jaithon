@@ -1848,6 +1848,13 @@ fn spare(role: int, count: int) -> list[int] {
     return fresh
 }
 
+#: Let go of the working lists `spare` keeps between decodes: about forty
+#: megabytes after a 720p frame. Nothing decoded refers to them, so the next
+#: decode only allocates afresh. `AviReader.release` calls this.
+pub fn release_buffers() -> void {
+    for role in 0.._SPARE.len() { _SPARE[role] = [] }
+}
+
 #: The scan, the fast way, or null to send it through the reference loop.
 fn scan_fast(
     data: bytes,

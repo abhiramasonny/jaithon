@@ -80,6 +80,27 @@ fn test_the_fast_jpeg_scan_matches_the_reference_byte_for_byte() -> void {
     }
 }
 
+#: The working lists kept between decodes are only scratch: dropping them
+#: between two decodes of different sizes changes nothing.
+fn test_releasing_the_jpeg_buffers_changes_no_decode() -> void {
+    if not have_gpu() { return }
+    let large = texture(40, 56, CV_8UC3, 21)
+    let small = texture(9, 13, CV_8UC3, 22)
+    let first = jpeg.encode(large, 85)
+    let second = jpeg.encode(small, 85)
+    large.release()
+    small.release()
+    let before = jpeg.decode_with(first, true)
+    jpeg.release_buffers()
+    same_jpeg(second)
+    jpeg.release_buffers()
+    jpeg.release_buffers()
+    let after = jpeg.decode_with(first, true)
+    assert_true(before.to_bytes() == after.to_bytes())
+    before.release()
+    after.release()
+}
+
 fn test_a_damaged_jpeg_goes_the_way_the_reference_goes() -> void {
     if not have_gpu() { return }
     let image = texture(24, 40, CV_8UC3, 3)
