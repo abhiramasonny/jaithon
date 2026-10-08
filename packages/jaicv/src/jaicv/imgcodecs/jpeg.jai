@@ -238,9 +238,8 @@ pub class HuffmanTable {
     pub let value_at: list[int]
     #: The symbols, in code order.
     pub let values: list[int]
-    #: `scan_fast`'s nine-bit lookahead, built the first time it is wanted:
-    #: `length << 8 | symbol` for every nine-bit prefix a code of nine bits or
-    #: fewer resolves, -1 where it takes a longer code.
+    #: This table as `scan_fast` reads it (see `lookahead_for`), built the
+    #: first time it is wanted.
     pub var lookahead: list[int]
 
     pub fn init(self, counts: list[int], values: list[int]) {

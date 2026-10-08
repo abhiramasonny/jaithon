@@ -169,6 +169,7 @@ pub fn decode(data: bytes) -> Mat { return decode_with(data, _FAST_PNG) }
 fn decode_fast(data: bytes) -> Mat? {
     let header = read_header(data)
     if header.interlaced or header.bit_depth != 8 { return null }
+    if header.width <= 0 or header.height <= 0 { return null }
     let colour = header.colour_type
     if colour != COLOR_GRAY and
         colour != COLOR_RGB and
