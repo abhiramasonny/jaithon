@@ -181,7 +181,6 @@ fn decode_fast(data: bytes) -> Mat? {
     let width = header.width
     let height = header.height
     let row_bytes = width * channels
-    let expected = (row_bytes + 1) * height
 
     #: `gather_chunks`' walk, keeping the IDAT bodies as slices.
     var compressed = bytes([])
@@ -217,7 +216,11 @@ fn decode_fast(data: bytes) -> Mat? {
         at += 12 + length
     }
     if short or not any { return null }
-    let raw = __prim__.inflate(compressed, expected)
+    #: A size that does not fit in an int is the reference's to refuse,
+    #: and it does so only after it has looked for image data.
+    if row_bytes + 1 > (1 << 62) // height { return null }
+    let expected = (row_bytes + 1) * height
+    let raw = __prim__.inflate(compressed, min(expected, compressed.len() * 1032 + 1024))
     if raw.len() < expected { return null }
 
     var out: list[int] = __prim__.list_filled(row_bytes * height, 0)
@@ -329,8 +332,13 @@ pub fn decode_with(data: bytes, fast: bool) -> Mat {
     let bits_per_pixel = source_channels * depth
     let row_bytes = (header.width * bits_per_pixel + 7) // 8
     let stride = max(1, bits_per_pixel // 8)
-    let raw = __prim__.inflate(bytes(compressed), (row_bytes + 1) * header.height)
-    if raw.len() < (row_bytes + 1) * header.height {
+    let expected = (row_bytes + 1) * header.height
+    #: The size is only where inflate's buffer starts, and deflate cannot
+    #: expand data more than 1032 times. A header promising more is short
+    #: whatever the data says; asking for all of it up front aborted the
+    #: process on a hostile header instead of refusing the file.
+    let raw = __prim__.inflate(bytes(compressed), min(expected, compressed.len() * 1032 + 1024))
+    if raw.len() < expected {
         throw ValueError("this PNG's image data is shorter than its header promises")
     }
 

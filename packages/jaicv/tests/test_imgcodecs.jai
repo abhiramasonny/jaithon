@@ -246,3 +246,25 @@ fn test_png_files_the_fast_path_does_not_cover_still_decode() -> void {
     taller[23] = 40
     same_png(bytes(taller))
 }
+
+#: A header whose size cannot be multiplied out, with and without image data
+#: behind it: the fast path must not be the one to find that out, or it fails
+#: with a different error from the reference's.
+fn test_a_png_too_large_to_size_fails_the_way_the_reference_fails() -> void {
+    if not have_gpu() { return }
+    let data = __prim__.deflate(bytes([0, 1, 2, 3]), 6).to_list()
+    for size in [0xFFFFFFFF, 0x80000000] {
+        for colour in [0, 2, 6] {
+            for with_data in [false, true] {
+                var out: list[int] = [137, 80, 78, 71, 13, 10, 26, 10]
+                var header = be(size)
+                for byte in be(size) { header.push(byte) }
+                for byte in [8, colour, 0, 0, 0] { header.push(byte) }
+                png_chunk(out, "IHDR", header)
+                if with_data { png_chunk(out, "IDAT", data) }
+                png_chunk(out, "IEND", [])
+                same_png(bytes(out))
+            }
+        }
+    }
+}
