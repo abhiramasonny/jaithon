@@ -3,6 +3,7 @@
 #: change goes through, and the pads, joins and row reductions that have a
 #: kernel of their own.
 from jaitensor import Tensor
+from std.os import env, set_env, unset_env
 
 from .kernels import MAX_RANK, f32_bits, kernel_for, u32
 
@@ -300,4 +301,20 @@ pub fn normalize_axis(axis: int, rank: int, what: str) -> int {
         throw ValueError(f"{what} names axis {axis}, which is outside rank {rank}")
     }
     return resolved
+}
+
+#: Compile a graph to encode onto the shared queue.
+#:
+#: A plan picks between encoding and blocking the first time it runs, by
+#: timing a dozen runs of each, which is worth it for a whole model and is
+#: most of the first call for a one-operator graph. An interpreter step only
+#: ever wants encoding -- it queues like every other operator here and lets
+#: the next one overlap -- so that route is named while the graph compiles,
+#: unless the caller has already chosen one with `JAITHON_GRAPH_ROUTE`.
+pub fn compile_encoded(builder: int, inputs: list[int], outputs: list[int]) -> int? {
+    let chosen = env("JAITHON_GRAPH_ROUTE")
+    if chosen is null { set_env("JAITHON_GRAPH_ROUTE", "encode") }
+    let plan = __prim__.graph_compile(builder, inputs, outputs, "latency")
+    if chosen is null { unset_env("JAITHON_GRAPH_ROUTE") }
+    return plan
 }

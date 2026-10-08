@@ -3,12 +3,13 @@
 #: softmaxes that run along a row.
 import jaitensor as jt
 from jaitensor import Tensor
+from std.os import env
 
 from .kernels import HIGHEST_FLOAT, LOWEST_FLOAT
 from .nodes import GraphNode, attr_float, attr_int, attr_str, ints_from, maybe, need
 from .tensors import binary_ex_of, broadcast_shape, copy_of, elementwise, expand_to
 from .tensors import normalize_axis, row_reduce_of, shaped, softmax_rows, transpose_to
-from .tensors import unary_ex_of, volume
+from .tensors import compile_encoded, unary_ex_of, volume
 
 pub fn op_relu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [jt.relu(need(ins, 0, node))]
@@ -297,6 +298,50 @@ pub fn op_gemm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
 
 #: One `[rows, inner] x [inner, columns]` product per page of the broadcast
 #: batch, written straight into a window of the output.
+#: Whether a batched `MatMul` runs as one graph matmul rather than one
+#: jaitensor product per page of the batch. Read once; `JAICV_GRAPH_MATMUL=0`
+#: brings back the loop, which is the comparison. An attention layer is two
+#: batched products a head, and the loop made them seventy percent of a ViT's
+#: interpreted time.
+let GRAPH_MATMUL = env("JAICV_GRAPH_MATMUL") != "0"
+
+#: The one-operator matmul graphs, by the two operand shapes.
+var _matmul_graphs: dict[str, int] = {}
+
+#: `left @ right` over matching batch axes, as one dispatch.
+fn graph_matmul_of(left: Tensor, right: Tensor, dims: list[int]) -> Tensor {
+    let key = f"{left.shape} {right.shape}"
+    var plan = _matmul_graphs.get(key, null)
+    if plan is null {
+        let builder = __prim__.graph_new()
+        let fed_left = __prim__.graph_input(builder, left.shape)
+        let fed_right = __prim__.graph_input(builder, right.shape)
+        let product = __prim__.graph_matmul(builder, fed_left, fed_right)
+        let built = if product < 0 {
+            null
+        } else {
+            compile_encoded(builder, [fed_left, fed_right], [product])
+        }
+        __prim__.graph_free(builder)
+        if built is null {
+            throw ValueError(f"the graph compiler would not multiply {left.shape} by {right.shape}")
+        }
+        if __prim__.graph_plan_output_shape(built, 0) != dims {
+            __prim__.graph_plan_free(built)
+            throw ValueError(f"a graph product of {left.shape} and {right.shape} was not {dims}")
+        }
+        _matmul_graphs[key] = built
+        plan = built
+    }
+    let output = Tensor(dims)
+    __prim__.graph_run(
+        plan,
+        [left.buffer().handle_of(), right.buffer().handle_of()],
+        [output.buffer().handle_of()]
+    )
+    return output
+}
+
 fn batched_matmul(
     left: Tensor,
     right: Tensor,
@@ -319,6 +364,12 @@ fn batched_matmul(
         right
     } else {
         expand_to(right, right_shape)
+    }
+    if GRAPH_MATMUL {
+        let product = graph_matmul_of(spread_left, spread_right, dims)
+        if spread_left is not left { spread_left.free() }
+        if spread_right is not right { spread_right.free() }
+        return product
     }
     let output = Tensor(dims)
     for index in 0..volume(batch) {
