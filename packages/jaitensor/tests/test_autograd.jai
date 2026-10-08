@@ -3,6 +3,7 @@ import jaitensor as jt
 import std.gpu as gpu
 import std.math
 import std.os
+from jaitensor.losses import sparse_ce_with_delta
 from jaitensor.tensor import GradNode, Tensor
 from std.test import assert_eq, assert_near, assert_true
 
@@ -903,4 +904,84 @@ fn test_no_grad_records_nothing_and_restores_the_previous_state() -> void {
     assert_true(on.creator is not null)
     free_graph(on.discard_graph())
     on.free()
+}
+
+#: Softmax cross-entropy of one row and its gradient, in double precision here.
+fn ce_row_by_hand(row: list[float], label: int, scale: float) -> (float, list[float]) {
+    var peak = row[0]
+    for value in row { if value > peak { peak = value } }
+    var total = 0.0
+    for value in row { total += math.exp(value - peak) }
+    let loss = peak + math.log(total) - row[label]
+    var grad: list[float] = []
+    for (index, value) in row.enumerate() {
+        let hit = if index == label { 1.0 } else { 0.0 }
+        grad.push((math.exp(value - peak) / total - hit) * scale)
+    }
+    return (loss, grad)
+}
+
+#: Both kernels (a simdgroup a row up to 1024 classes, a threadgroup above),
+#: one class, and the labels at both ends, against arithmetic done here; and
+#: the autograd gradient against the static path's delta, which must agree
+#: bit for bit since the two share the arithmetic.
+fn test_sparse_cross_entropy_matches_a_hand_computation_at_every_width() -> void {
+    if not jt.is_available() { return }
+    let ce = jt.SparseCategoricalCrossentropy(from_logits: true)
+    for classes in [1, 7, 256, 1500, 4096] {
+        for rows in [1, 3] {
+            var values: list[float] = []
+            for index in 0..rows * classes {
+                values.push(float((index * 37) % 1009) / 256.0 - 2.0)
+            }
+            var labels: list[float] = []
+            for row in 0..rows { labels.push(float(if row % 2 == 0 { classes - 1 } else { 0 })) }
+            let logits = jt.Tensor([rows, classes], values, requires_grad: true)
+            let target = jt.Tensor([rows], labels)
+            let loss = ce.forward(logits, target)
+            let held = loss.backward()
+            var want_loss = 0.0
+            var want_grad: list[float] = []
+            for row in 0..rows {
+                let slice = [values[row * classes + column] for column in 0..classes]
+                let (row_loss, row_grad) = ce_row_by_hand(slice, int(labels[row]), 1.0 / float(rows))
+                want_loss += row_loss / float(rows)
+                for value in row_grad { want_grad.push(value) }
+            }
+            let got_loss = loss.download()[0]
+            assert_near(got_loss, want_loss, 1e-5 * max(1.0, math.fabs(want_loss)))
+            let gradient = logits.grad
+            if gradient is null { throw AssertionError("expected logits.grad") }
+            let got_grad = gradient.download()
+            assert_values_near(got_grad, want_grad, 1e-6)
+            let (static_loss, delta) = sparse_ce_with_delta(logits, target)
+            assert_eq(static_loss.download()[0], got_loss)
+            assert_eq(delta.download(), got_grad)
+            for tensor in held { tensor.free() }
+            for tensor in [static_loss, delta, loss, target, logits] { tensor.free() }
+        }
+    }
+}
+
+#: A weighted loss carries the weight into the gradient on the new path too.
+fn test_sparse_cross_entropy_gradient_carries_the_upstream() -> void {
+    if not jt.is_available() { return }
+    let logits = jt.Tensor([2, 3], [1.0, 2.0, 0.5, 0.5, -1.0, 2.0], requires_grad: true)
+    defer { logits.free() }
+    let labels = jt.Tensor([2], [1.0, 2.0])
+    defer { labels.free() }
+    let ce = jt.SparseCategoricalCrossentropy(from_logits: true)
+    let plain = ce.forward(logits, labels)
+    free_graph(plain.backward())
+    let once = logits.grad
+    if once is null { throw AssertionError("expected logits.grad") }
+    let single = once.download()
+    clear_grad(logits)
+    plain.free()
+    let weighted = jt.scale(ce.forward(logits, labels), 3.0)
+    free_graph(weighted.backward())
+    weighted.free()
+    let thrice = logits.grad
+    if thrice is null { throw AssertionError("expected logits.grad") }
+    assert_values_near(thrice.download(), [value * 3.0 for value in single], 1e-6)
 }

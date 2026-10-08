@@ -1,6 +1,7 @@
 #: Loss functions.
 import std.gpu as gpu
 from std.gpu import Buffer, Kernel
+from std.os import env_or
 from .tensor import Tensor, GradNode
 from .trace import record_sparse_ce
 from .ops import mse as mse_op, binary_cross_entropy as bce_op
@@ -60,6 +61,168 @@ kernel void sample_loss_and_delta(device const float* logits [[buffer(0)]],
     sample_loss[sample] = peak + log(total) - logits[base + answer];
 }
 
+// Sparse cross-entropy a row at a time across many threads.
+//
+// One simdgroup takes a row when it is narrow and a whole threadgroup of 256
+// when it is wide. Neighbouring threads read neighbouring classes, so every
+// read is coalesced, and each thread keeps an online maximum and the sum of
+// exponentials below it in one pass; the partial pairs are then joined
+// across the simdgroup and, for a wide row, across the threadgroup. The
+// delta, when wanted, is a second pass over the same row. The gradient
+// kernels repeat exactly the delta's arithmetic from the saved (max, sum),
+// so the autograd gradient is the static path's delta bit for bit when the
+// upstream is one.
+
+constant constexpr float CE_LOW = -3.0e38f;
+constant constexpr uint CE_WIDE = 256;
+
+inline float2 ce_scan(device const float* row, uint classes, uint first, uint step) {
+    float peak = CE_LOW;
+    float total = 0.0f;
+    for (uint digit = first; digit < classes; digit += step) {
+        float v = row[digit];
+        if (v > peak) {
+            total = total * exp(peak - v) + 1.0f;
+            peak = v;
+        } else {
+            total += exp(v - peak);
+        }
+    }
+    return float2(peak, total);
+}
+
+inline float2 ce_join(float2 part) {
+    float peak = simd_max(part.x);
+    float total = simd_sum(part.y * exp(part.x - peak));
+    return float2(peak, total);
+}
+
+inline float ce_delta(float v, float peak, float total, bool hit, float scale) {
+    float probability = exp(v - peak) / total;
+    float d = probability - (hit ? 1.0f : 0.0f);
+    return d * scale;
+}
+
+inline void ce_finish(device const float* x,
+                      device const float* labels,
+                      device float* sample_loss,
+                      device float* stats,
+                      uint row,
+                      float2 joined) {
+    uint answer = uint(labels[row]);
+    sample_loss[row] = joined.x + log(joined.y) - x[answer];
+    stats[row * 3] = joined.x;
+    stats[row * 3 + 1] = joined.y;
+    stats[row * 3 + 2] = labels[row];
+}
+
+kernel void ce_rows_narrow(device const float* logits [[buffer(0)]],
+                           device const float* labels [[buffer(1)]],
+                           device float* delta [[buffer(2)]],
+                           device float* sample_loss [[buffer(3)]],
+                           device const float* inv_batch [[buffer(4)]],
+                           device float* stats [[buffer(5)]],
+                           constant uint& batch [[buffer(6)]],
+                           constant uint& classes [[buffer(7)]],
+                           constant uint& write_delta [[buffer(8)]],
+                           uint gid [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint row = gid / 32;
+    if (row >= batch) return;
+    device const float* x = logits + ulong(row) * classes;
+    float2 joined = ce_join(ce_scan(x, classes, lane, 32));
+    if (lane == 0) ce_finish(x, labels, sample_loss, stats, row, joined);
+    if (write_delta == 0) return;
+    uint answer = uint(labels[row]);
+    float scale = inv_batch[0];
+    device float* d = delta + ulong(row) * classes;
+    for (uint digit = lane; digit < classes; digit += 32) {
+        d[digit] = ce_delta(x[digit], joined.x, joined.y, digit == answer, scale);
+    }
+}
+
+kernel void ce_rows_wide(device const float* logits [[buffer(0)]],
+                         device const float* labels [[buffer(1)]],
+                         device float* delta [[buffer(2)]],
+                         device float* sample_loss [[buffer(3)]],
+                         device const float* inv_batch [[buffer(4)]],
+                         device float* stats [[buffer(5)]],
+                         constant uint& batch [[buffer(6)]],
+                         constant uint& classes [[buffer(7)]],
+                         constant uint& write_delta [[buffer(8)]],
+                         uint row [[threadgroup_position_in_grid]],
+                         uint lid [[thread_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float peaks[CE_WIDE / 32];
+    threadgroup float totals[CE_WIDE / 32];
+    if (row >= batch) return;
+    device const float* x = logits + ulong(row) * classes;
+    float2 part = ce_join(ce_scan(x, classes, lid, CE_WIDE));
+    if (lane == 0) {
+        peaks[group] = part.x;
+        totals[group] = part.y;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Every simdgroup joins the same eight pairs in the same order, so they
+    // all hold the same answer and no second barrier is needed.
+    float2 gathered = lane < CE_WIDE / 32 ? float2(peaks[lane], totals[lane]) : float2(CE_LOW, 0.0f);
+    float2 joined = ce_join(gathered);
+    if (lid == 0) ce_finish(x, labels, sample_loss, stats, row, joined);
+    if (write_delta == 0) return;
+    uint answer = uint(labels[row]);
+    float scale = inv_batch[0];
+    device float* d = delta + ulong(row) * classes;
+    for (uint digit = lid; digit < classes; digit += CE_WIDE) {
+        d[digit] = ce_delta(x[digit], joined.x, joined.y, digit == answer, scale);
+    }
+}
+
+kernel void ce_grad_narrow(device const float* logits [[buffer(0)]],
+                           device const float* stats [[buffer(1)]],
+                           device const float* inv_batch [[buffer(2)]],
+                           device const float* upstream [[buffer(3)]],
+                           device float* grad [[buffer(4)]],
+                           constant uint& batch [[buffer(5)]],
+                           constant uint& classes [[buffer(6)]],
+                           uint gid [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint row = gid / 32;
+    if (row >= batch) return;
+    float peak = stats[row * 3];
+    float total = stats[row * 3 + 1];
+    uint answer = uint(stats[row * 3 + 2]);
+    float scale = inv_batch[0];
+    float up = upstream[0];
+    device const float* x = logits + ulong(row) * classes;
+    device float* g = grad + ulong(row) * classes;
+    for (uint digit = lane; digit < classes; digit += 32) {
+        g[digit] = ce_delta(x[digit], peak, total, digit == answer, scale) * up;
+    }
+}
+
+kernel void ce_grad_wide(device const float* logits [[buffer(0)]],
+                         device const float* stats [[buffer(1)]],
+                         device const float* inv_batch [[buffer(2)]],
+                         device const float* upstream [[buffer(3)]],
+                         device float* grad [[buffer(4)]],
+                         constant uint& batch [[buffer(5)]],
+                         constant uint& classes [[buffer(6)]],
+                         uint row [[threadgroup_position_in_grid]],
+                         uint lid [[thread_index_in_threadgroup]]) {
+    if (row >= batch) return;
+    float peak = stats[row * 3];
+    float total = stats[row * 3 + 1];
+    uint answer = uint(stats[row * 3 + 2]);
+    float scale = inv_batch[0];
+    float up = upstream[0];
+    device const float* x = logits + ulong(row) * classes;
+    device float* g = grad + ulong(row) * classes;
+    for (uint digit = lid; digit < classes; digit += CE_WIDE) {
+        g[digit] = ce_delta(x[digit], peak, total, digit == answer, scale) * up;
+    }
+}
+
 constexpr constant uint LOSS_GROUP = 256;
 
 kernel void reduce_mean_partial(device const float* values [[buffer(0)]],
@@ -97,6 +260,19 @@ kernel void finalize_mean(device const float* partials [[buffer(0)]],
 
 const _GROUP = 256
 
+#: Whether sparse cross-entropy runs a row across a simdgroup or threadgroup
+#: (`ce_rows_*`, coalesced, one pass for the statistics) or a row per thread
+#: (`sample_loss_and_delta`, three serial passes, strided reads). On by
+#: default; `JAITENSOR_CE_ROWS=0` takes the old kernel, for an A/B in one
+#: binary. At 2048 rows the old one took 214 ms against torch's 14.6 at a
+#: 50257-class vocabulary. Read once.
+let _CE_ROWS = env_or("JAITENSOR_CE_ROWS", "1") != "0"
+
+#: Rows up to this many classes go to one simdgroup each, wider ones to a
+#: threadgroup of `_CE_WIDE`.
+const _CE_NARROW_MAX = 1024
+const _CE_WIDE = 256
+
 var _kernel_cache: dict[str, Kernel] = {}
 var _scale_batch = 0
 var _scale_buffer: Buffer? = null
@@ -123,7 +299,14 @@ fn scale_buffer_for(batch: int) -> Buffer {
 
 #: Compile loss kernels before the first timed training step.
 pub fn warmup_kernels() -> void {
-    cached("sample_loss_and_delta")
+    if _CE_ROWS {
+        cached("ce_rows_narrow")
+        cached("ce_rows_wide")
+        cached("ce_grad_narrow")
+        cached("ce_grad_wide")
+    } else {
+        cached("sample_loss_and_delta")
+    }
     cached("reduce_mean_partial")
     cached("finalize_mean")
 }
@@ -146,18 +329,102 @@ pub fn sparse_ce_core(
     record_sparse_ce(batch, classes)
     let delta = Tensor([batch, classes])
     let sample_loss = Tensor([batch])
-    let sample_kernel = cached("sample_loss_and_delta")
-    sample_kernel.dispatch_async(
-        [
-            prediction.buffer(),
-            target.buffer(),
-            delta.buffer(),
-            sample_loss.buffer(),
-            scale_buffer_for(batch),
-        ],
-        batch,
-        [batch, classes]
-    )
+    if _CE_ROWS {
+        let stats = Tensor([batch, 3])
+        dispatch_ce_rows(prediction, target, delta, sample_loss, stats, true)
+        stats.free()
+    } else {
+        let sample_kernel = cached("sample_loss_and_delta")
+        sample_kernel.dispatch_async(
+            [
+                prediction.buffer(),
+                target.buffer(),
+                delta.buffer(),
+                sample_loss.buffer(),
+                scale_buffer_for(batch),
+            ],
+            batch,
+            [batch, classes]
+        )
+    }
+    let mean = mean_of_samples(sample_loss, batch, loss_acc, acc_weight)
+    sample_loss.free()
+    return (mean, delta)
+}
+
+#: Launch `ce_rows_*`: per-sample loss, the row statistics a later gradient
+#: needs (max, sum of exponentials, label), and the delta when `with_delta`.
+fn dispatch_ce_rows(
+    prediction: Tensor,
+    target: Tensor,
+    delta: Tensor?,
+    sample_loss: Tensor,
+    stats: Tensor,
+    with_delta: bool
+) -> void {
+    let batch = prediction.shape[0]
+    let classes = prediction.shape[1]
+    #: Bound to something real when there is no delta; it is never written.
+    let delta_buffer = if delta is not null { delta.buffer() } else { stats.buffer() }
+    let write = if with_delta and delta is not null { 1 } else { 0 }
+    let buffers = [
+        prediction.buffer(),
+        target.buffer(),
+        delta_buffer,
+        sample_loss.buffer(),
+        scale_buffer_for(batch),
+        stats.buffer(),
+    ]
+    if classes <= _CE_NARROW_MAX {
+        cached("ce_rows_narrow").dispatch_async(buffers, batch * 32, [batch, classes, write], group_size: 256)
+    } else {
+        cached("ce_rows_wide").dispatch_async(buffers, batch * _CE_WIDE, [batch, classes, write], group_size: _CE_WIDE)
+    }
+}
+
+#: The gradient of the mean loss with respect to the logits, times the
+#: device scalar `upstream`, from the statistics `dispatch_ce_rows` saved.
+fn ce_grad(prediction: Tensor, stats: Tensor, upstream: Tensor) -> Tensor {
+    let batch = prediction.shape[0]
+    let classes = prediction.shape[1]
+    let grad = Tensor([batch, classes])
+    let buffers = [
+        prediction.buffer(),
+        stats.buffer(),
+        scale_buffer_for(batch),
+        upstream.buffer(),
+        grad.buffer(),
+    ]
+    if classes <= _CE_NARROW_MAX {
+        cached("ce_grad_narrow").dispatch_async(buffers, batch * 32, [batch, classes], group_size: 256)
+    } else {
+        cached("ce_grad_wide").dispatch_async(buffers, batch * _CE_WIDE, [batch, classes], group_size: _CE_WIDE)
+    }
+    return grad
+}
+
+#: Mean sparse cross-entropy and the row statistics its gradient needs,
+#: without the delta: one read of the logits instead of two reads and a write.
+fn sparse_ce_stats(
+    prediction: Tensor,
+    target: Tensor,
+    loss_acc: Tensor,
+    acc_weight: int
+) -> tuple[Tensor, Tensor] {
+    let batch = prediction.shape[0]
+    let classes = prediction.shape[1]
+    record_sparse_ce(batch, classes)
+    let sample_loss = Tensor([batch])
+    let stats = Tensor([batch, 3])
+    dispatch_ce_rows(prediction, target, null, sample_loss, stats, false)
+    let mean = mean_of_samples(sample_loss, batch, loss_acc, acc_weight)
+    sample_loss.free()
+    return (mean, stats)
+}
+
+#: The mean of `batch` per-sample losses, also added to `loss_acc` with
+#: `acc_weight` when that is positive.
+fn mean_of_samples(sample_loss: Tensor, batch: int, loss_acc: Tensor, acc_weight: int) -> Tensor {
     let groups = (batch + _GROUP - 1) // _GROUP
     let partials = Tensor([groups])
     let reduce_kernel = cached("reduce_mean_partial")
@@ -175,9 +442,8 @@ pub fn sparse_ce_core(
         1,
         [groups, batch, weight]
     )
-    sample_loss.free()
     partials.free()
-    return (mean, delta)
+    return mean
 }
 
 #: Mean sparse softmax cross-entropy and per-sample delta for static backward.
@@ -228,6 +494,23 @@ pub class SparseCategoricalCrossentropy: Loss {
         let classes = prediction.shape[1]
         if target.size != batch {
             throw ValueError(f"loss needs {batch} labels, got {target.size}")
+        }
+        if _CE_ROWS {
+            #: The delta waits for the backward, which computes it straight
+            #: from the logits and three numbers a row: one pass over the
+            #: logits here, one read and one write there, and nothing the size
+            #: of the logits held between the two.
+            let accumulate = if loss_acc is not null { loss_acc } else { Tensor.zeros([1]) }
+            let (mean, stats) = sparse_ce_stats(prediction, target, accumulate, acc_weight)
+            if loss_acc is null { accumulate.free() }
+            if prediction.requires_grad {
+                mean.attach_creator(
+                    GradNode([prediction], |upstream| [ce_grad(prediction, stats, upstream)], extras: [stats])
+                )
+            } else {
+                stats.free()
+            }
+            return mean
         }
         let (mean, delta) = sparse_ce_with_delta(prediction, target, loss_acc, acc_weight)
         if prediction.requires_grad {
