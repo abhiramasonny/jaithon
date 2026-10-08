@@ -49,6 +49,14 @@ re-randomises it -- otherwise every output is zero and a comparison proves
 nothing -- and the legacy `vit_b_16` export needs
 `torch.backends.mha.set_fastpath_enabled(False)`.
 
+For the same reason every BatchNorm gets statistics measured on random input
+and a random scale and shift before the export. A fresh BatchNorm's mean of 0
+and variance of 1 shrink a deep random network's activations towards zero:
+mobilenet_v2's logits came out near 3e-9 and googlenet's features near 2e-11,
+so HardSwish, SiLU and sigmoid never left their straight part, and agreeing
+with onnxruntime to 1e-5 said little. `check.jai` now refuses a reference
+that peaks below 1e-3.
+
 `check.jai` is the acceptance set: `squeezenet1_1` (the control),
 `mobilenet_v3_small` (HardSwish and depthwise convolutions), `resnet18_dyn`
 (weights in a sidecar) and `vit_tiny_dyn1` (a class token picked by a
@@ -103,6 +111,13 @@ before -- all ten import and run on both paths now:
 | distilbert_dyn | ok | 318.81 | 9.78 | 133.62 | 3.50 (3.45-3.75) | 5.74 | 23.63 | 1.64x | 6.76x | 1.3e-06 / 1.3e-06 |
 | gpt2_tiny_dyn | ok | 117.52 | 2.78 | 30.65 | 1.91 (1.87-2.03) | 2.92 | 1.38 | 1.53x | 0.72x | 6.3e-07 / 1.1e-06 |
 
+The torch MPS column needs a caveat. `peer_time.py` sized its batch of calls
+from an average over the warm-up, which included the first call, so where
+that call took a second or more each sample was a single call. A reviewer
+read `mobilenet_v3_large` at 16.2 ms (13.0-18.4) where the table has 11.49,
+so its 5.94x over MPS is anywhere from about 4x to 8x. The batch is sized
+after the warm-up now; the column has not been re-measured since.
+
 `status` ok means both paths land within 1e-5 of onnxruntime; `rel` is the
 largest absolute difference over the largest absolute reference value, over
 the first output. `plan` is the compiled plan's median with its min-max
@@ -130,7 +145,32 @@ too noisy to replace these.
 
 ## What changed in jaicv.dnn to get here
 
-Bugs, each with a test that failed before and passes after:
+Found in review, each with a test that failed before and passes after:
+
+- **`Gelu` with `approximate="tanh"` came back NaN on the interpreter from an
+  input of about 10.4**, and `Tanh` from about 45. Metal's tanh goes through
+  exp(2x) under fast math, which is inf over inf once its argument passes 44,
+  and Gelu's cubic gets there early. The argument is clamped at 10, where the
+  answer is already 1 to the last bit; the LSTM and GRU kernels had the same
+  call. The compiled plan was right throughout, so the two paths disagreed,
+  and `run_best` answers its first call on the interpreter. The oracle
+  comparison also let NaN pass, because `NaN > worst` is false.
+  (`gelu_tanh_wide`, `tanh_wide`, `lstm_saturated`, `gru_saturated`.)
+- **Optional outputs listed under empty names** (`["y", "", ""]`, valid ONNX)
+  made `LayerNormalization` throw on both paths once it stopped producing the
+  statistics nobody named. Only a named output that never came back is a
+  fault now.
+- **A `Tensor.view` of a batch** whose last axis is not a multiple of four
+  floats is refused by MPSGraph, which the new one-operator convolution and
+  matrix product routes go through; jaitensor took it before. Such a feed is
+  now run again as a contiguous copy. (The compiled plan refused one before
+  this change too, and still does.)
+- **`compile_plan` read back folded values too large to fold**, such as a
+  transposed tied embedding, now that `Transpose` folds; it leaves anything
+  over `FOLD_LIMIT` on the device.
+
+Found while building the example, again each with a test that failed before
+and passes after:
 
 - **A `Gather` by a rank-zero index kept a width-one axis.** jaitensor has no
   rank-zero tensor, so a scalar arrives as `[1]` either way; the importer now
