@@ -78,7 +78,9 @@ def time_peers(tags):
             try:
                 torch.manual_seed(0)
                 np.random.seed(0)
-                m = specs[arch][0]().eval().to("mps")
+                m = specs[arch][0]().eval()
+                E.calibrate(m, list(feeds.items()))  # the BatchNorm statistics export.py gave the file
+                m = m.to("mps")
                 targs = tuple(torch.from_numpy(typed[k]).to("mps") for k in feeds)
 
                 def step():
