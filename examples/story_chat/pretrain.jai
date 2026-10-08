@@ -34,8 +34,9 @@ from std.io import Path, append_file
 from std.random import Random
 from std.time import Instant
 from .model import FLUSH, Config, GPT, Optimisers, Sampler, checkpoint_meta, config_from_env
-from .model import drop_grads, env_float, env_int, free_all, held_out_loss, held_out_starts
-from .model import pretrain_checkpoint, read_token_file, run_dir, target_bytes, token_path, tokenizer_path
+from .model import drop_grads, env_float, env_int, eval_windows, free_all, held_out_loss, held_out_starts
+from .model import commit_checkpoint, pretrain_checkpoint, read_token_file, run_dir, settle_checkpoint
+from .model import target_bytes, token_path, tokenizer_path
 from .sample import Decoder, Sampling, generate
 from .tokenizer import EOT, Tokenizer, load_tokenizer
 
@@ -98,26 +99,23 @@ pub class Trainer {
     }
 
     #: Save weights, optimiser moments and `meta` to `path`, through a
-    #: temporary file so an interrupted save never leaves half a checkpoint.
+    #: temporary file (`commit_checkpoint`), so that a save cut off at any
+    #: point leaves a whole checkpoint that `settle_checkpoint` puts back.
     pub fn save(self, path: str, meta: dict[str, any]) -> void {
         var names = self.model.names()
         var tensors = self.params.copy()
         let (onames, otensors) = self.opt.state()
         for n in onames { names.push(n) }
         for t in otensors { tensors.push(t) }
-        let partial = path + ".partial"
-        jt.save_checkpoint(partial, names, tensors, meta: meta)
-        if Path(path).exists() { Path(path).remove() }
-        Path(partial).rename(Path(path))
+        jt.save_checkpoint(path + ".partial", names, tensors, meta: meta)
+        commit_checkpoint(path)
     }
 
     #: The weights alone, for a model that is only going to be loaded: a
     #: third of the size of `save`'s file.
     pub fn save_weights(self, path: str, meta: dict[str, any]) -> void {
-        let partial = path + ".partial"
-        jt.save_checkpoint(partial, self.model.names(), self.params, meta: meta)
-        if Path(path).exists() { Path(path).remove() }
-        Path(partial).rename(Path(path))
+        jt.save_checkpoint(path + ".partial", self.model.names(), self.params, meta: meta)
+        commit_checkpoint(path)
     }
 
     #: Carry on from a checkpoint `save` wrote; returns its metadata.
@@ -174,6 +172,18 @@ pub fn scheduled_rate(step: int, done: float, peak: float, warmup: int, floor: f
     return peak * (floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.PI * p)))
 }
 
+#: The loss read back, refusing to carry on past a NaN or an infinity: the
+#: next save would replace the last good checkpoint with it.
+fn finite_loss(loss: Tensor, step: int) -> float {
+    let v = loss.download()[0]
+    if v - v != 0.0 {
+        throw RuntimeError(
+            f"training loss {v} at step {step}; stopping before a checkpoint keeps it"
+        )
+    }
+    return v
+}
+
 fn main() -> int {
     let cfg = config_from_env()
     let tok = load_tokenizer(tokenizer_path(cfg.vocab))
@@ -199,6 +209,7 @@ fn main() -> int {
     var step = 0
     var tokens_seen = 0
     var train_seconds = 0.0
+    if has_flag("--resume") { settle_checkpoint(path) }
     if has_flag("--resume") and Path(path).exists() {
         let meta = trainer.restore(path)
         let at: int = meta["step"]
@@ -225,7 +236,7 @@ fn main() -> int {
         return 0
     }
     if os.env_or("MODE", "train") == "eval" {
-        let windows = held_out_starts(valid_file, cfg.seq, env_int("EVAL_WINDOWS", 2048))
+        let windows = held_out_starts(valid_file, cfg.seq, eval_windows(2048, cfg.batch))
         let te = Instant.now()
         let val = held_out_loss(model, valid_file, windows)
         let nbytes = target_bytes(valid_file, tok, windows, cfg.seq)
@@ -239,7 +250,7 @@ fn main() -> int {
     let every = env_int("EVAL_EVERY", 250)
     let ckpt_every = env_int("CKPT_EVERY", 1000)
     let log_every = env_int("LOG_EVERY", 50)
-    let held = held_out_starts(valid_file, cfg.seq, env_int("EVAL_WINDOWS", 256))
+    let held = held_out_starts(valid_file, cfg.seq, eval_windows(256, cfg.batch))
     let held_bytes = target_bytes(valid_file, tok, held, cfg.seq)
     let bytes_per_token = float(held_bytes) / float(held.len() * cfg.seq)
     let log_path = run_dir() + "/pretrain_log.tsv"
@@ -275,7 +286,7 @@ fn main() -> int {
         #: still working on this step while the host reads the last.
         let before = pending
         if before is not null {
-            recent += before.download()[0]
+            recent += finite_loss(before, step)
             recent_n += 1
             before.free()
         }
@@ -324,7 +335,10 @@ fn main() -> int {
         }
     }
     let p = pending
-    if p is not null { p.free() }
+    if p is not null {
+        let _last = finite_loss(p, step)
+        p.free()
+    }
     gpu.synchronize()
     let wall = t0.elapsed().to_seconds()
     #: Both counts leave out the one loss still waiting to be read.

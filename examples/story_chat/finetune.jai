@@ -26,7 +26,7 @@ from std.random import Random
 from std.time import Instant
 from .dialog import Batch, Row, chat_prompt, epoch_batches, split_rows
 from .model import GPT, checkpoint_meta, chat_checkpoint, env_float, env_int, free_all, load_model
-from .model import pretrain_checkpoint, run_dir, tokenizer_path
+from .model import pretrain_checkpoint, run_dir, settle_checkpoint, tokenizer_path
 from .pretrain import Trainer, flag, has_flag, learning_rate
 from .sample import Decoder, Sampling, generate
 from .tokenizer import BOT, EOT, USER, Tokenizer, dialog_file, load_tokenizer, read_dialogues
@@ -109,6 +109,10 @@ fn evaluate() -> int {
 fn main() -> int {
     if has_flag("--eval") { return evaluate() }
     let state_path = chat_checkpoint() + ".state"
+    if has_flag("--resume") {
+        settle_checkpoint(chat_checkpoint())
+        settle_checkpoint(state_path)
+    }
     let resuming = has_flag("--resume") and Path(state_path).exists()
     let source = if resuming { state_path } else { os.env_or("FROM_CKPT", pretrain_checkpoint()) }
     let tl = Instant.now()
@@ -231,11 +235,13 @@ fn main() -> int {
                 "best_validation_loss": best,
             }
         )
-        trainer.save(state_path, m)
+        #: The best weights before the state that records their loss, so a
+        #: stop between the two never leaves a best loss with no weights.
         if improved {
             trainer.save_weights(path, m)
             print(f"saved {path} (best validation loss so far)")
         }
+        trainer.save(state_path, m)
         if one_epoch and epoch < epochs {
             print(f"epoch {epoch} of {epochs} done; run again with --resume to go on")
             model.free()

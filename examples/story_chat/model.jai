@@ -16,7 +16,7 @@ import std.os
 from jaitensor import AdamW, Embedding, LayerNorm, MultiHeadAttention, PositionalEmbedding, Tensor
 from jaitensor.ops import copy_into
 from jaitensor.optimizers import moment_buffers, set_steps_taken
-from std.io import Path, read_bytes
+from std.io import Path, read_bytes, write_file
 from std.random import Random
 from .tokenizer import Tokenizer, cache_dir
 
@@ -481,10 +481,26 @@ pub fn target_bytes(file: TokenFile, tok: Tokenizer, starts: list[int], seq: int
     return n
 }
 
+#: `EVAL_WINDOWS`, or `fallback`: a whole number of batches, since the loss
+#: is taken a batch at a time and bits per byte divides by every window's
+#: bytes.
+pub fn eval_windows(fallback: int, batch: int) -> int {
+    let count = env_int("EVAL_WINDOWS", fallback)
+    if count < batch or count % batch != 0 {
+        throw RuntimeError(f"EVAL_WINDOWS={count}: it has to be a multiple of the batch, {batch}")
+    }
+    return count
+}
+
 #: Mean held-out loss in nats a token over the windows at `starts`, a batch
 #: at a time. The graph is recorded and discarded, as training frees it.
 pub fn held_out_loss(model: GPT, file: TokenFile, starts: list[int]) -> float {
     let cfg = model.cfg
+    if starts.len() < cfg.batch or starts.len() % cfg.batch != 0 {
+        throw RuntimeError(
+            f"{starts.len()} held-out windows is not a whole number of batches of {cfg.batch}"
+        )
+    }
     let ce = jt.SparseCategoricalCrossentropy(from_logits: true)
     var total = 0.0
     var batches = 0
@@ -539,6 +555,46 @@ pub fn load_model(path: str, batch: int = 1) -> (GPT, dict[str, any]) {
     for (name, param) in model.names().zip(model.params()) { copy_into(loaded.get(name), param) }
     loaded.free()
     return (model, meta)
+}
+
+#: Put the checkpoint written to `<path>.partial` in place at `path`.
+#:
+#: std has no atomic rename (`Path.rename` copies, then deletes), so the move
+#: is done in steps that each leave a whole checkpoint on disk: the partial
+#: file is marked whole by an empty `<path>.whole`, the old file is replaced
+#: by a copy, and only then do the mark and the partial file go, in that
+#: order. A save cut off anywhere is put right by `settle_checkpoint`.
+pub fn commit_checkpoint(path: str) -> void {
+    write_file(path + ".whole", "")
+    finish_commit(path)
+}
+
+fn finish_commit(path: str) -> void {
+    let target = Path(path)
+    let partial = Path(path + ".partial")
+    if target.exists() { target.remove() }
+    partial.copy(target)
+    Path(path + ".whole").remove()
+    partial.remove()
+}
+
+#: Finish or undo a save of `path` that was cut off: with the mark, the
+#: partial file is whole and the move is done again; without it, the partial
+#: file never finished and is dropped, and `path` is the last whole save.
+#: Only the process that writes `path` calls this, before it reads it back:
+#: a reader running beside a save would take the save's file away.
+pub fn settle_checkpoint(path: str) -> void {
+    let partial = Path(path + ".partial")
+    let mark = Path(path + ".whole")
+    if mark.exists() and partial.exists() {
+        print(f"finishing the interrupted save of {path}")
+        finish_commit(path)
+    } elif partial.exists() {
+        print(f"dropping {path}.partial, a save that never finished")
+        partial.remove()
+    } elif mark.exists() {
+        mark.remove()
+    }
 }
 
 #: Where a run keeps its checkpoints and logs: `RUN_DIR`, by default the
