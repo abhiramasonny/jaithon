@@ -73,6 +73,10 @@ fn bn_fused_on() -> bool {
 #: whole number of channels, and the split has to be worth making: a couple of
 #: rows a block spends more on joining the partials than the first pass saves.
 #:
+#: Where the channels come in fours the blocks read a float4 a step
+#: (`channel_partials4`, `batch_norm_fused_partials4`): a [128,32,32,32]
+#: forward went from 104-112 us to 93-95, [128,8,8,128] from 52-60 to 47-49.
+#:
 #: 128 blocks spread the reduction over the long NHW axis well enough: over
 #: ResNet-8's blocks, 256 and 512 measured the same or up to 60% slower (a
 #: [128,32,32,32] forward 133 us at 128, 138 at 256, 176 at 512), the joins
@@ -94,7 +98,8 @@ fn channel_moments(input: Tensor, nspatial: int, channels: int) -> list[Tensor] 
         let rows_each = (nspatial + chunks - 1) // chunks
         let part_total = Tensor([chunks * channels])
         let part_square = Tensor([chunks * channels])
-        cached_kernel("channel_partials").dispatch_async(
+        let quads = channels % 4 == 0 and bn_fused_on()
+        cached_kernel(if quads { "channel_partials4" } else { "channel_partials" }).dispatch_async(
             [input.buffer(), part_total.buffer(), part_square.buffer()],
             chunks * 256,
             [nspatial, channels, rows_each],
@@ -233,8 +238,13 @@ pub fn batch_norm(
                 let rows_each = (nspatial + split - 1) // split
                 let part_dy = Tensor([split * channels])
                 let part_dy_xhat = Tensor([split * channels])
-                if fused {
-                    let skip_out = if grad_skip is not null { grad_skip.buffer() } else { part_dy.buffer() }
+                let skip_out = if grad_skip is not null { grad_skip.buffer() } else { part_dy.buffer() }
+                if quads {
+                    #: The fused pass with nothing to fuse is the plain sums, in
+                    #: the order the fused one takes them.
+                    let wanted = if fused { flags } else { 0 }
+                    cached_kernel("batch_norm_fused_partials4").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), output.buffer(), upstream.buffer(), part_dy.buffer(), part_dy_xhat.buffer(), skip_out], split * 256, [nspatial, channels, rows_each, wanted], group_size: 256)
+                } elif fused {
                     cached_kernel("batch_norm_fused_partials").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), output.buffer(), upstream.buffer(), part_dy.buffer(), part_dy_xhat.buffer(), skip_out], split * 256, [nspatial, channels, rows_each, flags], group_size: 256)
                 } else {
                     cached_kernel("channel_grad_partials").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), part_dy.buffer(), part_dy_xhat.buffer()], split * 256, [nspatial, channels, rows_each], group_size: 256)
