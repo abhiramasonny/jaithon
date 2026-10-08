@@ -17,22 +17,31 @@
 #: - a checkpoint saved and loaded gives back the same logits, bit for bit,
 #:   and a trainer restored from it takes the same next step as the original;
 #: - the fine-tuning loss, gathered at every row, equals the plain loss, and
-#:   a dialogue batch scores exactly the bot's tokens.
+#:   a dialogue batch scores exactly the bot's tokens;
+#: - a save cut off at any step leaves a checkpoint that loads;
+#: - the repetition penalty counts a token once however often it recurs, and
+#:   leaves the role and end tokens alone;
+#: - a chat session of one line ends after that line even when it is a
+#:   command (`--prompt "/help"` once printed the commands for ever), a bad
+#:   command argument is answered rather than thrown, and a reply as long as
+#:   the context still leaves the prompt room.
 #:
 #: It exits non-zero if any of them fails.
 import std.gpu as gpu
 import std.math
 import std.os
 from jaitensor import SparseCategoricalCrossentropy, Tensor
-from std.io import Path
+from std.io import Path, write_file
 from std.random import Random
 from std.time import Instant
+from .chat import COMMANDS, Chat, Lines
 from .dialog import Batch, dialogue_rows, format_turns
-from .model import Config, GPT, Sampler, TokenFile, checkpoint_meta, free_all, load_model
+from .model import Config, GPT, Sampler, TokenFile, checkpoint_meta, free_all, load_model, settle_checkpoint
 from .prepare import u16_bytes
 from .pretrain import Trainer, learning_rate
+from .sample import Sampling, pick
 from .tokenizer import BOT, EOT, USER, Tokenizer, count_pieces, dialog_file, load_tokenizer, read_dialogues
-from .tokenizer import read_range, story_file, train_bpe
+from .tokenizer import read_range, story_file, text_of, train_bpe
 
 var failures: list[str] = []
 
@@ -154,6 +163,131 @@ fn check_tokenizer(sample: bytes, dialogues: list[list[str]]) -> Tokenizer {
     return tok
 }
 
+#: The logits `path` gives for `prompt`, through the cache.
+fn logits_of(path: str, prompt: list[int]) -> list[float] {
+    let (m, _meta) = load_model(path)
+    m.set_training(false)
+    m.start_cache(m.cfg.seq)
+    let out = m.forward_cached(prompt, 0)
+    let row = out.download()
+    out.free()
+    m.free_cache()
+    m.free()
+    return row
+}
+
+fn leftovers(path: str) -> bool {
+    return Path(path + ".partial").exists() or Path(path + ".whole").exists()
+}
+
+#: Each way a save can be cut off, made by hand from a whole checkpoint at
+#: `path`, then settled and loaded.
+fn check_interrupted_saves(path: str, prompt: list[int], want: list[float]) -> void {
+    let whole = path + ".copy"
+    Path(path).copy(Path(whole))
+    #: Cut off while copying the new file over the old.
+    Path(whole).copy(Path(path + ".partial"))
+    write_file(path + ".whole", "")
+    write_file(path, "not a checkpoint")
+    settle_checkpoint(path)
+    let a = logits_of(path, prompt) == want and not leftovers(path)
+    #: Cut off between removing the old file and copying the new.
+    Path(whole).copy(Path(path + ".partial"))
+    write_file(path + ".whole", "")
+    Path(path).remove()
+    settle_checkpoint(path)
+    let b = logits_of(path, prompt) == want and not leftovers(path)
+    #: Cut off while writing the new file: the old one stands.
+    write_file(path + ".partial", "half a checkpoint")
+    settle_checkpoint(path)
+    let c = logits_of(path, prompt) == want and not leftovers(path)
+    Path(whole).remove()
+    expect(
+        a and b and c,
+        f"a save cut off while copying ({a}), after removing the old file ({b}) or while writing ({c}) settles to a checkpoint that loads"
+    )
+}
+
+#: Greedy picks that the penalty decides.
+fn check_penalty() -> void {
+    let s = Sampling(temperature: 0.0, repetition_penalty: 2.0)
+    let rng = Random.with_seed(1)
+    var row: list[float] = []
+    for _i in 0..300 { row.push(0.0) }
+    #: 5 seen three times: divided by 2 once (2.0) it still beats 1.5;
+    #: divided three times (0.5) it would not.
+    row[5] = 4.0
+    row[8] = 1.5
+    let once = pick(row, s, [5, 5, 5], rng)
+    #: <|user|> is in every chat prompt; penalised (1.5) it would lose to 2.0.
+    row[5] = 0.0
+    row[USER] = 3.0
+    row[9] = 2.0
+    let role = pick(row, s, [EOT, USER, 9, BOT, USER], rng)
+    expect(
+        once == 5 and role == USER,
+        f"the repetition penalty counts a token once ({once}, want 5) and spares <|user|> ({role}, want {USER})"
+    )
+}
+
+#: A chat session against the small model, everything it prints captured.
+fn check_chat(model: GPT, tok: Tokenizer) -> void {
+    model.set_training(false)
+    var printed: list[bytes] = []
+    let capture = fn(b: bytes) -> void {
+        printed.push(b)
+        if printed.len() > 2000 {
+            throw RuntimeError("the chat session did not end")
+        }
+    }
+    let chat = Chat(model, tok, Sampling(temperature: 0.0), 8, Random.with_seed(1), capture)
+    var ended = true
+    try {
+        chat.run(Lines(["/help"], false))
+    } catch _e: RuntimeError {
+        ended = false
+    }
+    var text = ""
+    for b in printed { text += text_of(b) }
+    expect(
+        ended and text == COMMANDS,
+        f"a one-line session of /help prints the commands once and ends ({printed.len()} writes)"
+    )
+    printed.clear()
+    chat.run(Lines(["/temp hot", "/temp 0.5", "/rep 0", "Hello there", "/quit", "not read"], false))
+    text = ""
+    for b in printed { text += text_of(b) }
+    expect(
+        chat.s.temperature == 0.5 and
+            chat.s.repetition_penalty == 1.1 and
+            chat.turns.len() == 2 and
+            text.contains("(not a number: hot)"),
+        f"bad command arguments are answered, one reply is made, /quit ends the session ({chat.turns.len()} turns)"
+    )
+    chat.free()
+    let long = Chat(
+        model,
+        tok,
+        Sampling(temperature: 0.0),
+        model.cfg.seq,
+        Random.with_seed(1),
+        capture
+    )
+    printed.clear()
+    var answered = true
+    try {
+        let _reply = long.answer("Tell me a long story, please.")
+    } catch _e: Error {
+        answered = false
+    }
+    long.free()
+    expect(
+        answered,
+        f"a reply allowed the whole context ({model.cfg.seq} tokens) still leaves the prompt room"
+    )
+    model.set_training(true)
+}
+
 fn main() -> int {
     let t_all = Instant.now()
     let sample = read_range(story_file("valid"), 0, 4 * 1048576)
@@ -240,12 +374,15 @@ fn main() -> int {
     restored.start_cache(cfg.seq)
     let a = model.forward_cached(prompt, 0)
     let b = restored.forward_cached(prompt, 0)
-    expect(a.download() == b.download(), "a saved and loaded checkpoint gives the same logits")
+    let want = a.download()
+    expect(want == b.download(), "a saved and loaded checkpoint gives the same logits")
+    expect(not leftovers(path), "a finished save leaves no partial file or mark")
     free_all([a, b])
     model.free_cache()
     restored.free_cache()
     restored.free()
     model.set_training(true)
+    check_interrupted_saves(path, prompt, want)
     let twin = GPT(cfg, seed: 99)
     let twin_trainer = Trainer(twin, 2.0e-3, 0.1, 1.0)
     let _m = twin_trainer.restore(path)
@@ -301,6 +438,8 @@ fn main() -> int {
         f"a dialogue batch scores the bot's {bot_tokens} tokens and their turn ends ({batch.targets})"
     )
     free_all([batch.x, batch.rows, batch.y])
+    check_penalty()
+    check_chat(model, tok)
     model.free()
     gpu.synchronize()
     print(f"check took {t_all.elapsed().to_seconds():.1f} s")
