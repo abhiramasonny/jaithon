@@ -1,11 +1,13 @@
 #: Neural-network layers.
 import std.math
 from std.gpu import Buffer
+from std.os import env
 from std.random import Random
 from .ops import conv2d, conv2d_out_dim, dense_affine, dense_static_backward, dense_static_forward
 from .ops import dropout, gather_rows, gelu, layer_norm, leaky_relu, max_pool2d, avg_pool2d
 from .ops import relu, reshape, sigmoid, softmax, tanh
 from .ops import batch_norm, group_norm, multi_head_attention, silu, matmul
+from .ops import add, copy_into, merge_heads, split_heads
 from .ops.attention import hand_to_graph
 from .ops.matmul import raw_matmul
 from .tensor import Tensor
@@ -698,7 +700,8 @@ pub class GroupNorm2d: Layer {
     }
 }
 
-#: Layer normalization over the last axis of a rank-two tensor.
+#: Layer normalization over the last axis of a tensor of rank two or more;
+#: leading axes fold into rows, so `[batch, seq, dim]` works as it is.
 pub class LayerNorm: Layer {
     var width: int
     var gamma_value: Tensor?
@@ -749,10 +752,30 @@ pub class LayerNorm: Layer {
     fn __str__(self) -> str { return f"LayerNorm({self.width})" }
 }
 
-#: Multi-head self-attention over rank-two `[seq, dim]` inputs.
+#: The product epilogue that adds `residual`, or none without one: 6 is
+#: `linear_residual`'s.
+fn epilogue_for(residual: Tensor?) -> int { return if residual is null { 0 } else { 6 } }
+
+#: Multi-head self-attention over `[seq, dim]` or batched `[batch, seq, dim]`
+#: inputs.
 #:
 #: `causal` lets each position attend only to itself and the positions before
 #: it, which is what an autoregressive model trains with.
+#:
+#: A rank-three input is a batch of independent sequences. The projections
+#: run as one product over all `batch * seq` rows and attention folds the
+#: batch into the head axis, so a batch costs the same number of dispatches
+#: as one sequence; nothing attends across sequences. Rank two is one
+#: sequence, exactly as before, which is what `Sequential` hands the layer.
+#:
+#: `batch_first: false` reads rank three as `[seq, batch, dim]` instead, the
+#: order torch's `nn.MultiheadAttention` defaults to. That order folds for
+#: free: `[seq, batch * dim]` already is the packed layout of `batch * heads`
+#: heads, so attention reads the projections where they lie. Batch-first has
+#: to copy each of Q, K and V into it and the context back out, which at a
+#: GPT's `[64, 128, 256]` is 0.57 ms of a 1.78 ms forward and backward. A model
+#: whose every other op works row by row -- layer norm, the MLP, the residual
+#: adds -- can keep its activations sequence-first and never pay it.
 #:
 #: For generation, `start_cache(max_seq)` keeps every key and value the layer
 #: has projected in device buffers of `max_seq` rows. Each `forward` then
@@ -761,11 +784,16 @@ pub class LayerNorm: Layer {
 #: everything cached so far, so a token costs the same at position 500 as at
 #: position 5 instead of recomputing the whole prefix. The cached forward
 #: records no gradient. `reset_cache` starts a new sequence in the same
-#: buffers; `free_cache` (or `free`) releases them.
+#: buffers; `free_cache` (or `free`) releases them. `start_cache(max_seq,
+#: batch: n)` keeps `n` sequences that advance together, fed as
+#: `[n, rows, dim]`.
 pub class MultiHeadAttention: Layer {
     pub let heads: int
     pub let dim: int
     pub let causal: bool
+    #: Whether a rank-three input is `[batch, seq, dim]` (true) or
+    #: `[seq, batch, dim]` (false).
+    pub let batch_first: bool
     var wq_value: Tensor?
     var wk_value: Tensor?
     var wv_value: Tensor?
@@ -773,8 +801,9 @@ pub class MultiHeadAttention: Layer {
     var cache_k: Tensor?
     var cache_v: Tensor?
     var cached: int
+    var cache_batch: int
 
-    pub fn init(self, dim: int, heads: int = 1, causal: bool = false) {
+    pub fn init(self, dim: int, heads: int = 1, causal: bool = false, batch_first: bool = true) {
         if dim <= 0 or heads <= 0 {
             throw ValueError("MultiHeadAttention dim/heads must be positive")
         }
@@ -782,6 +811,7 @@ pub class MultiHeadAttention: Layer {
         self.dim = dim
         self.heads = heads
         self.causal = causal
+        self.batch_first = batch_first
         self.wq_value = null
         self.wk_value = null
         self.wv_value = null
@@ -789,17 +819,31 @@ pub class MultiHeadAttention: Layer {
         self.cache_k = null
         self.cache_v = null
         self.cached = 0
+        self.cache_batch = 1
     }
 
-    #: Keep keys and values across `forward` calls, for up to `max_seq` rows.
-    #: Replaces any cache already held, and starts empty.
-    pub fn start_cache(self, max_seq: int) -> void {
+    #: Keep keys and values across `forward` calls, for up to `max_seq` rows
+    #: of each of `batch` sequences. Replaces any cache already held, and
+    #: starts empty.
+    #:
+    #: The cache is position-major, `[max_seq, batch * dim]`: row `s` holds
+    #: every sequence's key at position `s`, side by side. That is the layout
+    #: batched attention folds a batch into anyway, so a decode step attends
+    #: the cache where it lies, and one new row a sequence -- `[batch, dim]`
+    #: -- is already exactly one row of it. For one sequence it is the plain
+    #: `[max_seq, dim]`.
+    pub fn start_cache(self, max_seq: int, batch: int = 1) -> void {
         if max_seq <= 0 { throw ValueError(f"start_cache needs a positive length, got {max_seq}") }
+        if batch <= 0 { throw ValueError(f"start_cache needs a positive batch, got {batch}") }
         self.free_cache()
-        self.cache_k = Tensor([max_seq, self.dim])
-        self.cache_v = Tensor([max_seq, self.dim])
+        self.cache_k = Tensor([max_seq, batch * self.dim])
+        self.cache_v = Tensor([max_seq, batch * self.dim])
+        self.cache_batch = batch
         self.cached = 0
     }
+
+    #: How many sequences the cache holds side by side.
+    pub fn cache_batch_size(self) -> int { return self.cache_batch }
 
     #: Forget the cached rows but keep the buffers, for the next sequence.
     #: Nothing is written: the rows are simply overwritten as they refill.
@@ -817,9 +861,11 @@ pub class MultiHeadAttention: Layer {
         self.cache_k = null
         self.cache_v = null
         self.cached = 0
+        self.cache_batch = 1
     }
 
     #: `forward` with the cache on: `x` holds only the rows not seen yet.
+    #: A `residual` is added in the output product's epilogue.
     fn forward_cached(
         self,
         x: Tensor,
@@ -828,7 +874,8 @@ pub class MultiHeadAttention: Layer {
         wv: Tensor,
         wo: Tensor,
         keys: Tensor,
-        values: Tensor
+        values: Tensor,
+        residual: Tensor? = null
     ) -> Tensor {
         let rows = x.shape[0]
         let capacity = keys.shape[0]
@@ -855,9 +902,223 @@ pub class MultiHeadAttention: Layer {
         k_seen.free()
         v_seen.free()
         q.free()
-        let output = raw_matmul(context, wo)
+        let output = raw_matmul(context, wo, bias: residual, epilogue: epilogue_for(residual))
         context.free()
         self.cached = seen
+        return output
+    }
+
+    #: The cached forward for `[batch, rows, dim]`, one batch of sequences
+    #: advancing together. Records no gradient, like the rank-two one.
+    fn forward_cached_batched(
+        self,
+        x: Tensor,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor,
+        keys: Tensor,
+        values: Tensor
+    ) -> Tensor {
+        let batch = x.shape[0]
+        let rows = x.shape[1]
+        if batch != self.cache_batch {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {self.cache_batch} sequences, got a batch of {batch}"
+            )
+        }
+        if batch == 1 {
+            #: One sequence is the rank-two cache exactly; the folds below
+            #: would only copy it.
+            let single = x.view(0, [rows, self.dim])
+            let out = self.forward_cached(single, wq, wk, wv, wo, keys, values)
+            single.free()
+            return Tensor([1, rows, self.dim], storage: out.buffer())
+        }
+        let capacity = keys.shape[0]
+        if self.cached + rows > capacity {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {capacity} rows; {self.cached} are used and {rows} more were given"
+            )
+        }
+        let width = batch * self.dim
+        let start = self.cached * width
+        let seen = self.cached + rows
+        let flat = x.view(0, [batch * rows, self.dim])
+        var query = flat
+        if rows == 1 {
+            #: `[batch, dim]` is already the next cache row, `[1, batch * dim]`,
+            #: so the projections write it in place, as the rank-two path does.
+            let k_rows = keys.view(start, [batch, self.dim])
+            let v_rows = values.view(start, [batch, self.dim])
+            raw_matmul(flat, wk, out: k_rows)
+            raw_matmul(flat, wv, out: v_rows)
+            k_rows.free()
+            v_rows.free()
+            let q = raw_matmul(flat, wq)
+            query = Tensor([1, width], storage: q.buffer())
+        } else {
+            #: A prompt: `[batch * rows, dim]` is sequence-major, the cache is
+            #: position-major, and `merge_heads` with one "head" a sequence is
+            #: precisely that transpose.
+            for (weight, cache) in [(wk, keys), (wv, values)] {
+                let projected = raw_matmul(flat, weight)
+                let folded = merge_heads(projected, batch, rows)
+                projected.free()
+                let target = cache.view(start, [rows, width])
+                copy_into(folded, target)
+                target.free()
+                folded.free()
+            }
+            let q = raw_matmul(flat, wq)
+            query = merge_heads(q, batch, rows)
+            q.free()
+        }
+        flat.free()
+        let k_seen = keys.view(0, [seen, width])
+        let v_seen = values.view(0, [seen, width])
+        let context = multi_head_attention(
+            query,
+            k_seen,
+            v_seen,
+            self.heads * batch,
+            causal: self.causal
+        )
+        k_seen.free()
+        v_seen.free()
+        query.free()
+        let per_row = if rows == 1 {
+            Tensor([batch, self.dim], storage: context.buffer())
+        } else {
+            split_heads(context, batch)
+        }
+        if rows != 1 { context.free() }
+        let output = raw_matmul(per_row, wo)
+        per_row.free()
+        self.cached = seen
+        return Tensor([batch, rows, self.dim], storage: output.buffer())
+    }
+
+    #: The cached forward for sequence-first `[rows, batch, dim]`. The new rows
+    #: of every sequence are already the next `rows` rows of the
+    #: position-major cache, whatever `rows` is, so the projections write them
+    #: in place and nothing is folded.
+    fn forward_cached_seq_first(
+        self,
+        x: Tensor,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        residual: Tensor? = null
+    ) -> Tensor {
+        let rows = x.shape[0]
+        let batch = x.shape[1]
+        if batch != self.cache_batch {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {self.cache_batch} sequences, got a batch of {batch}"
+            )
+        }
+        let capacity = keys.shape[0]
+        if self.cached + rows > capacity {
+            throw ValueError(
+                f"MultiHeadAttention cache holds {capacity} rows; {self.cached} are used and {rows} more were given"
+            )
+        }
+        let width = batch * self.dim
+        let start = self.cached * width
+        let seen = self.cached + rows
+        let flat = x.view(0, [rows * batch, self.dim])
+        let k_rows = keys.view(start, [rows * batch, self.dim])
+        let v_rows = values.view(start, [rows * batch, self.dim])
+        raw_matmul(flat, wk, out: k_rows)
+        raw_matmul(flat, wv, out: v_rows)
+        k_rows.free()
+        v_rows.free()
+        let q = raw_matmul(flat, wq)
+        flat.free()
+        let query = Tensor([rows, width], storage: q.buffer())
+        let k_seen = keys.view(0, [seen, width])
+        let v_seen = values.view(0, [seen, width])
+        let context = multi_head_attention(
+            query,
+            k_seen,
+            v_seen,
+            self.heads * batch,
+            causal: self.causal
+        )
+        k_seen.free()
+        v_seen.free()
+        query.free()
+        let per_row = Tensor([rows * batch, self.dim], storage: context.buffer())
+        let output = raw_matmul(per_row, wo, bias: residual, epilogue: epilogue_for(residual))
+        per_row.free()
+        self.cached = seen
+        return Tensor([rows, batch, self.dim], storage: output.buffer())
+    }
+
+    #: The whole-sequence forward for sequence-first `[seq, batch, dim]`:
+    #: the rank-two path with `batch * heads` heads, and no copies.
+    fn forward_seq_first(
+        self,
+        x: Tensor,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor
+    ) -> Tensor {
+        let seq = x.shape[0]
+        let batch = x.shape[1]
+        let width = batch * self.dim
+        let flat = reshape(x, [seq * batch, self.dim])
+        let q = matmul(flat, wq)
+        let k = matmul(flat, wk)
+        let v = matmul(flat, wv)
+        let q2 = reshape(q, [seq, width])
+        let k2 = reshape(k, [seq, width])
+        let v2 = reshape(v, [seq, width])
+        let context = multi_head_attention(q2, k2, v2, self.heads * batch, causal: self.causal)
+        hand_to_graph(context, [q2, k2, v2, q, k, v])
+        let per_row = reshape(context, [seq * batch, self.dim])
+        let product = matmul(per_row, wo)
+        if product.creator is null {
+            for held in [flat, per_row, context] { held.free() }
+            return Tensor([seq, batch, self.dim], storage: product.buffer())
+        }
+        let output = reshape(product, [seq, batch, self.dim])
+        hand_to_graph(output, [flat, per_row, context])
+        return output
+    }
+
+    #: The whole-sequence forward for `[batch, seq, dim]`.
+    #:
+    #: Ownership follows the rank-two path: whatever a recorded graph reads
+    #: rides on it, through `hand_to_graph`, and what nothing recorded is
+    #: freed here. `flat` is read by the projections' backward and `per_row`
+    #: by the output product's, so they go to the graph with `context`; the
+    #: unrecorded result adopts the product's buffer rather than viewing it.
+    fn forward_batched(self, x: Tensor, wq: Tensor, wk: Tensor, wv: Tensor, wo: Tensor) -> Tensor {
+        let batch = x.shape[0]
+        let seq = x.shape[1]
+        let flat = reshape(x, [batch * seq, self.dim])
+        let q = matmul(flat, wq)
+        let k = matmul(flat, wk)
+        let v = matmul(flat, wv)
+        let q3 = reshape(q, [batch, seq, self.dim])
+        let k3 = reshape(k, [batch, seq, self.dim])
+        let v3 = reshape(v, [batch, seq, self.dim])
+        let context = multi_head_attention(q3, k3, v3, self.heads, causal: self.causal)
+        hand_to_graph(context, [q3, k3, v3, q, k, v])
+        let per_row = reshape(context, [batch * seq, self.dim])
+        let product = matmul(per_row, wo)
+        if product.creator is null {
+            for held in [flat, per_row, context] { held.free() }
+            return Tensor([batch, seq, self.dim], storage: product.buffer())
+        }
+        let output = reshape(product, [batch, seq, self.dim])
+        hand_to_graph(output, [flat, per_row, context])
         return output
     }
 
@@ -885,12 +1146,31 @@ pub class MultiHeadAttention: Layer {
         if wq is null or wk is null or wv is null or wo is null {
             throw RuntimeError("MultiHeadAttention has not been built")
         }
-        if x.rank() != 2 or x.shape[1] != self.dim {
-            throw ValueError(f"MultiHeadAttention needs [seq, {self.dim}], got {x.shape}")
-        }
         let keys = self.cache_k
         let values = self.cache_v
+        if x.rank() == 3 and x.shape[2] == self.dim {
+            if not self.batch_first {
+                if keys is not null and values is not null {
+                    return self.forward_cached_seq_first(x, wq, wk, wv, wo, keys, values)
+                }
+                return self.forward_seq_first(x, wq, wk, wv, wo)
+            }
+            if keys is not null and values is not null {
+                return self.forward_cached_batched(x, wq, wk, wv, wo, keys, values)
+            }
+            return self.forward_batched(x, wq, wk, wv, wo)
+        }
+        if x.rank() != 2 or x.shape[1] != self.dim {
+            throw ValueError(
+                f"MultiHeadAttention needs [seq, {self.dim}] or a rank-three batch of them, got {x.shape}"
+            )
+        }
         if keys is not null and values is not null {
+            if self.cache_batch != 1 {
+                throw ValueError(
+                    f"MultiHeadAttention cache holds {self.cache_batch} sequences; feed it a batch of them"
+                )
+            }
             return self.forward_cached(x, wq, wk, wv, wo, keys, values)
         }
         let q = matmul(x, wq)
@@ -908,6 +1188,49 @@ pub class MultiHeadAttention: Layer {
         hand_to_graph(context, [q, k, v])
         let output = matmul(context, wo)
         hand_to_graph(output, [context])
+        return output
+    }
+
+    #: `residual + forward(x)`, the first half of a transformer block.
+    #:
+    #: With the cache on, the add rides on the output product's epilogue, the
+    #: way `linear_residual` does it, so a decoded token pays one dispatch a
+    #: layer less. Anywhere else it is `forward` and then `add`, recorded as
+    #: usual. `residual` is the output's shape.
+    pub fn forward_add(self, x: Tensor, residual: Tensor) -> Tensor {
+        if residual.size != x.size {
+            throw ValueError(
+                f"forward_add residual {residual.shape} does not match input {x.shape}"
+            )
+        }
+        let wq = self.wq_value
+        let wk = self.wk_value
+        let wv = self.wv_value
+        let wo = self.wo_value
+        let keys = self.cache_k
+        let values = self.cache_v
+        if wq is not null and wk is not null and wv is not null and wo is not null {
+            if keys is not null and values is not null {
+                if x.rank() == 2 and x.shape[1] == self.dim and self.cache_batch == 1 {
+                    return self.forward_cached(x, wq, wk, wv, wo, keys, values, residual: residual)
+                }
+                if x.rank() == 3 and x.shape[2] == self.dim and not self.batch_first {
+                    return self.forward_cached_seq_first(
+                        x,
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                        keys,
+                        values,
+                        residual: residual
+                    )
+                }
+            }
+        }
+        let y = self.forward(x)
+        let output = add(residual, y)
+        hand_to_graph(output, [y])
         return output
     }
 
@@ -942,7 +1265,8 @@ pub class MultiHeadAttention: Layer {
 
     fn __str__(self) -> str {
         let mask = if self.causal { ", causal" } else { "" }
-        return f"MultiHeadAttention(dim={self.dim}, heads={self.heads}{mask})"
+        let order = if self.batch_first { "" } else { ", seq first" }
+        return f"MultiHeadAttention(dim={self.dim}, heads={self.heads}{mask}{order})"
     }
 }
 
@@ -1017,6 +1341,21 @@ pub class Embedding: Layer {
         return gather_rows(table, x, [x.shape[0], x.shape[1] * self.dim])
     }
 
+    #: One row of the table per index, keeping the indices' shape:
+    #: `[batch, seq]` gives `[batch, seq, dim]`, `[n]` gives `[n, dim]`.
+    #:
+    #: `forward` is what a `Sequential` wants, a `[batch, seq * dim]` block
+    #: the next layer was sized for; a transformer wants the rows kept apart,
+    #: which is this. Both are the same gather, read under a different shape,
+    #: and the gradient reaches the table either way.
+    pub fn lookup(self, indices: Tensor) -> Tensor {
+        let table = self.table
+        if table is null { throw RuntimeError("Embedding has not been built") }
+        var shape = [dimension for dimension in indices.shape]
+        shape.push(self.dim)
+        return gather_rows(table, indices, shape)
+    }
+
     pub fn parameters(self) -> list[Tensor] {
         let table = self.table
         if table is null { throw RuntimeError("Embedding has not been built") }
@@ -1032,6 +1371,186 @@ pub class Embedding: Layer {
     }
 
     fn __str__(self) -> str { return f"Embedding({self.vocab}, {self.dim})" }
+}
+
+var _position_view: int = -1
+
+fn position_view_on() -> bool {
+    if _position_view < 0 {
+        let text = env("JAITENSOR_POSITION_VIEW")
+        _position_view = if text is not null and text == "0" { 0 } else { 1 }
+    }
+    return _position_view == 1
+}
+
+#: Learned positional embeddings: row `p` of a `[max_seq, dim]` table is added
+#: to every sequence's position `p`.
+#:
+#: `forward` takes `[seq, dim]` or `[batch, seq, dim]` activations and adds
+#: positions `0..seq`; `forward_at(x, start)` adds `start..start + seq`, which
+#: is what a cached decoder feeding one token at a time needs. Only the `seq`
+#: rows in use are gathered and they broadcast over the batch, so the
+#: gradient reaches the table as one sum over the batch rather than `batch`
+#: colliding atomic adds per row. `batch_first: false` takes `[seq, batch,
+#: dim]`, to sit beside a sequence-first `MultiHeadAttention`; there the rows
+#: are gathered once per sequence, since the batch is not a leading axis.
+pub class PositionalEmbedding: Layer {
+    pub let max_seq: int
+    pub let dim: int
+    #: Half-width of the uniform initialisation `build` draws from.
+    pub let init_limit: float
+    #: Whether a rank-three input is `[batch, seq, dim]` (true) or
+    #: `[seq, batch, dim]` (false).
+    pub let batch_first: bool
+    var table: Tensor?
+    var index: Tensor?
+    var index_start: int
+    var index_repeat: int
+
+    pub fn init(self, max_seq: int, dim: int, init_limit: float = 0.05, batch_first: bool = true) {
+        if max_seq <= 0 or dim <= 0 {
+            throw ValueError("PositionalEmbedding max_seq and dim must be positive")
+        }
+        self.max_seq = max_seq
+        self.dim = dim
+        self.init_limit = init_limit
+        self.batch_first = batch_first
+        self.table = null
+        self.index = null
+        self.index_start = -1
+        self.index_repeat = 0
+    }
+
+    pub fn build(self, input_units: int, rng: Random) -> void {
+        let _ = input_units
+        if self.table is not null { return }
+        let table = Tensor([self.max_seq, self.dim], requires_grad: true)
+        table.buffer().fill_uniform(-self.init_limit, self.init_limit, rng.next_int())
+        self.table = table
+    }
+
+    #: The table's rows `start..start + seq` as `[seq, dim]`, recorded for the
+    #: gradient when the table trains. When it does not -- generation -- the
+    #: rows are contiguous, so this is a view of them: no index upload and no
+    #: gather for every decoded token. Free it either way; a view's free
+    #: leaves the table alone. `JAITENSOR_POSITION_VIEW=0` gathers anyway, for
+    #: an A/B in one binary; read once.
+    pub fn positions(self, seq: int, start: int = 0) -> Tensor {
+        let table = self.table
+        if table is null { throw RuntimeError("PositionalEmbedding has not been built") }
+        if seq <= 0 or start < 0 or start + seq > self.max_seq {
+            throw ValueError(
+                f"positions {start}..{start + seq} run past the {self.max_seq} this table holds"
+            )
+        }
+        if not table.requires_grad and position_view_on() {
+            return table.view(start * self.dim, [seq, self.dim])
+        }
+        return self.gather_positions(table, seq, start, 1, null)
+    }
+
+    #: `x` plus positions `0..seq`.
+    pub fn forward(self, x: Tensor) -> Tensor { return self.forward_at(x, 0) }
+
+    #: `x` plus positions `start..start + seq`, for `[seq, dim]` or a
+    #: rank-three batch of them.
+    pub fn forward_at(self, x: Tensor, start: int) -> Tensor {
+        if x.rank() < 2 or x.rank() > 3 or x.shape[x.rank() - 1] != self.dim {
+            throw ValueError(
+                f"PositionalEmbedding needs [seq, {self.dim}] or a rank-three batch of them, got {x.shape}"
+            )
+        }
+        if x.rank() == 3 and not self.batch_first {
+            let table = self.table
+            if table is null { throw RuntimeError("PositionalEmbedding has not been built") }
+            let seq = x.shape[0]
+            if start < 0 or start + seq > self.max_seq {
+                throw ValueError(
+                    f"positions {start}..{start + seq} run past the {self.max_seq} this table holds"
+                )
+            }
+            let rows = self.gather_positions(table, seq, start, x.shape[1], x.shape)
+            let output = add(x, rows)
+            hand_to_graph(output, [rows])
+            return output
+        }
+        let rows = self.positions(x.shape[x.rank() - 2], start)
+        let output = add(x, rows)
+        hand_to_graph(output, [rows])
+        return output
+    }
+
+    #: The table's rows at positions `start..start + seq`, each `repeat`
+    #: times over, shaped `shape`.
+    #:
+    #: A gather that records reads its index again in the backward, which may
+    #: come after several more forwards. Those can ask for another length or
+    #: offset and replace the cached index, so a recorded gather reads a
+    #: device copy of it instead, which the graph owns and frees with its other
+    #: intermediates. Freeing the cached index for another then leaves every
+    #: graph its own: two forwards of different lengths before one backward
+    #: used to throw that the index had already been freed. A gather that does
+    #: not record -- generation -- reads the cached index directly.
+    fn gather_positions(
+        self,
+        table: Tensor,
+        seq: int,
+        start: int,
+        repeat: int,
+        shape: list[int]?
+    ) -> Tensor {
+        let cached = self.indices(seq, start, repeat)
+        if not table.requires_grad { return gather_rows(table, cached, shape) }
+        let owned = Tensor([cached.size])
+        copy_into(cached, owned)
+        let rows = gather_rows(table, owned, shape)
+        let node = rows.creator
+        if node is not null { node.extras.push(owned) } else { owned.free() }
+        return rows
+    }
+
+    #: The index tensor for positions `start..start + seq`, each `repeat`
+    #: times over, kept between calls: training asks for the same one every
+    #: step. Only work already queued reads it -- a gather that did not record,
+    #: or the copy a recorded one took -- so a different one is a new tensor,
+    #: not an upload over the old, and the old one can go.
+    fn indices(self, seq: int, start: int, repeat: int) -> Tensor {
+        let held = self.index
+        if held is not null and held.size == seq * repeat and self.index_start == start {
+            if self.index_repeat == repeat { return held }
+        }
+        if held is not null { held.free() }
+        var values: list[float] = []
+        for offset in 0..seq {
+            for _copy in 0..repeat { values.push(float(start + offset)) }
+        }
+        let made = Tensor([seq * repeat], values)
+        self.index = made
+        self.index_start = start
+        self.index_repeat = repeat
+        return made
+    }
+
+    pub fn parameters(self) -> list[Tensor] {
+        let table = self.table
+        if table is null { throw RuntimeError("PositionalEmbedding has not been built") }
+        return [table]
+    }
+
+    pub fn output_width(self) -> int { return self.dim }
+
+    pub fn free(self) -> void {
+        let table = self.table
+        if table is not null { table.free() }
+        let held = self.index
+        if held is not null { held.free() }
+        self.table = null
+        self.index = null
+        self.index_start = -1
+        self.index_repeat = 0
+    }
+
+    fn __str__(self) -> str { return f"PositionalEmbedding({self.max_seq}, {self.dim})" }
 }
 
 #: NHWC max pooling window.

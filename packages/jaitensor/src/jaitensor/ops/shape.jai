@@ -11,9 +11,37 @@ pub fn reshape(input: Tensor, shape: list[int]) -> Tensor {
     let output = Tensor(shape, storage: input.buffer().view(0, input.size))
     if input.requires_grad {
         let original_shape = input.shape
-        output.attach_creator(GradNode([input], |upstream| [reshape(upstream, original_shape)]))
+        output.attach_creator(GradNode([input], fn(upstream: Tensor) -> list[Tensor] {
+            return [reshaped_gradient(output, upstream, original_shape)]
+        }))
     }
     return output
+}
+
+#: The gradient `reshape` hands back to its input: `upstream` under the
+#: input's shape, owning its memory.
+#:
+#: It was a view of `upstream`, which is the reshaped tensor's own `.grad`.
+#: That is freed with the reshaped tensor -- one of the intermediates
+#: `backward()` returns -- so a leaf that had been reshaped was left holding a
+#: gradient over freed memory, and reading it once the graph was released
+#: crashed the process. The buffer now moves to the input instead: nothing
+#: reads the reshaped tensor's gradient after its own backward has run, so it
+#: gives the buffer up rather than paying for a copy, and its `.grad` is null
+#: afterwards. An upstream that is not its `.grad` -- the shared unit seed or
+#: the ones `backward()` makes for a root it was not handed a seed for -- is
+#: copied. A root whose `.grad` the caller set by hand gives that tensor's
+#: buffer up the same way, so the input's gradient then shares the caller's
+#: seed: free one and the other goes with it, as with the view it was before.
+fn reshaped_gradient(output: Tensor, upstream: Tensor, shape: list[int]) -> Tensor {
+    let held = output.grad
+    if held is not null and held is upstream {
+        output.grad = null
+        return Tensor(shape, storage: upstream.buffer())
+    }
+    let copied = Tensor(shape)
+    copy_into(upstream, copied)
+    return copied
 }
 
 fn raw_transpose(input: Tensor) -> Tensor {

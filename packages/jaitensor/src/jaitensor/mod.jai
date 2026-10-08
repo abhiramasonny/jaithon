@@ -46,6 +46,10 @@ export { add_correct_into, add_scaled_into }
 export { no_grad, is_grad_enabled, set_grad_enabled }
 export { AdamW, clip_grad_norm, one_cycle_lr }
 export { ResBlock, random_crop_flip, random_crop_flip_into }
+from .layers import PositionalEmbedding
+from .checkpoint import Checkpoint, load_checkpoint, restore_checkpoint, save_checkpoint
+export { PositionalEmbedding }
+export { Checkpoint, load_checkpoint, restore_checkpoint, save_checkpoint }
 
 #: Whether the machine has a GPU backend that jaitensor can use.
 pub fn is_available() -> bool { return gpu.is_available() }

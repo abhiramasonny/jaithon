@@ -615,3 +615,78 @@ fn test_transpose_handles_every_edge_of_its_tile() -> void {
         flipped.free()
     }
 }
+
+#: GELU and tanh stay finite however large the input. The kernels build with
+#: fast math, whose tanh overflows an exponential: GELU gave NaN from an input
+#: of 12 forward and backward, and tanh from 45, so a GPT's loss turned NaN a
+#: few hundred steps in. Both specialised kernels and the switch kernel.
+fn test_gelu_and_tanh_stay_finite_on_large_inputs() -> void {
+    if not jt.is_available() { return }
+    let xs = [-1.0e4, -100.0, -20.0, -12.0, -1.0, 0.0, 1.0, 12.0, 20.0, 45.0, 100.0, 1.0e4]
+    let x = jt.Tensor([12], xs, requires_grad: true)
+    let y = jt.gelu(x)
+    let values = y.download()
+    let total = jt.sum(y)
+    for held in total.backward() { held.free() }
+    for (i, v) in xs.enumerate() {
+        if v >= 12.0 { assert_near(values[i], v, 1e-6 * v) }
+        if v <= -12.0 { assert_near(values[i], 0.0, 1e-6) }
+    }
+    let g = x.grad
+    assert_true(g is not null)
+    if g is not null {
+        let grads = g.download()
+        for (i, v) in xs.enumerate() {
+            if v >= 12.0 { assert_near(grads[i], 1.0, 1e-6) }
+            if v <= -12.0 { assert_near(grads[i], 0.0, 1e-6) }
+        }
+    }
+    let plain = jt.Tensor([12], xs)
+    let t = jt.tanh(plain)
+    let tv = t.download()
+    for (i, v) in xs.enumerate() {
+        assert_true(math.is_finite(tv[i]))
+        if math.fabs(v) >= 20.0 { assert_near(tv[i], if v > 0.0 { 1.0 } else { -1.0 }, 1e-7) }
+    }
+    for tensor in [total, x, plain, t] { tensor.free() }
+}
+
+#: tanh and GELU pass a NaN through, forward and backward, as torch does.
+#: Saturating tanh by clamping its argument turned NaN into -1 with a zero
+#: gradient, so a diverging tanh layer reported finite outputs and zero
+#: gradients instead of NaN. Infinities saturate.
+fn test_tanh_and_gelu_pass_nan_through() -> void {
+    if not jt.is_available() { return }
+    let xs = [math.NAN, -math.NAN, math.INF, -math.INF, 1.0]
+    let x = jt.Tensor([5], xs, requires_grad: true)
+    let y = jt.tanh(x)
+    let values = y.download()
+    let total = jt.sum(y)
+    for held in total.backward() { held.free() }
+    assert_true(math.is_nan(values[0]))
+    assert_true(math.is_nan(values[1]))
+    assert_eq(values[2], 1.0)
+    assert_eq(values[3], -1.0)
+    assert_near(values[4], 0.7615941559557649, 1e-6)
+    let g = x.grad
+    assert_true(g is not null)
+    if g is not null {
+        let grads = g.download()
+        assert_true(math.is_nan(grads[0]))
+        assert_true(math.is_nan(grads[1]))
+        assert_eq(grads[2], 0.0)
+        assert_eq(grads[3], 0.0)
+        assert_near(grads[4], 0.41997434161402614, 1e-6)
+    }
+    let u = jt.Tensor([2], [math.NAN, 1.0], requires_grad: true)
+    let v = jt.gelu(u)
+    let gelu_values = v.download()
+    let gelu_total = jt.sum(v)
+    for held in gelu_total.backward() { held.free() }
+    assert_true(math.is_nan(gelu_values[0]))
+    assert_near(gelu_values[1], 0.8411919906082768, 1e-5)
+    let ug = u.grad
+    assert_true(ug is not null)
+    if ug is not null { assert_true(math.is_nan(ug.download()[0])) }
+    for tensor in [total, x, gelu_total, u] { tensor.free() }
+}

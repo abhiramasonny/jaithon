@@ -6,7 +6,7 @@ from jaitensor.layers import MultiHeadAttention
 from jaitensor.tensor import Tensor
 from std.io import Path
 from std.random import Random
-from std.test import assert_eq, assert_near, assert_true
+from std.test import assert_eq, assert_near, assert_throws, assert_true
 
 fn assert_values_near(actual: list[float], expected: list[float], tolerance: float = 1e-5) -> void {
     assert_eq(actual.len(), expected.len())
@@ -947,4 +947,360 @@ fn test_attention_layer_trains_with_frozen_projections() -> void {
             }
         }
     }
+}
+
+#: Rows `lo..hi` of every sequence in a `[batch, total, dim]` host block, as
+#: a `[batch, hi - lo, dim]` block.
+fn sequence_rows(
+    values: list[float],
+    batch: int,
+    total: int,
+    dim: int,
+    lo: int,
+    hi: int
+) -> list[float] {
+    var out: list[float] = []
+    for b in 0..batch {
+        let base = b * total * dim
+        for value in values[base + lo * dim:base + hi * dim] { out.push(value) }
+    }
+    return out
+}
+
+#: The layer's output and gradients for `sum(layer(x) * w)`, in the order
+#: output, dx, then each parameter's gradient. `x` is fed as one
+#: `[batch, seq, dim]` block when `batched`, and otherwise one `[seq, dim]`
+#: sequence at a time with the parameter gradients summed across them.
+fn layer_batch_pass(
+    layer: MultiHeadAttention,
+    batch: int,
+    seq: int,
+    xs: list[float],
+    ws: list[float],
+    batched: bool,
+    trains: bool
+) -> list[list[float]] {
+    let dim = layer.dim
+    let params = layer.parameters()
+    jt.zero_grad(params)
+    var out: list[list[float]] = [[], []]
+    let pieces = if batched { [[batch, seq, dim]] } else { [[seq, dim] for _ in 0..batch] }
+    for (index, shape) in pieces.enumerate() {
+        let lo = index * seq * dim
+        let hi = if batched { batch * seq * dim } else { lo + seq * dim }
+        let x = Tensor(shape, xs[lo:hi], requires_grad: trains)
+        let w = Tensor(shape, ws[lo:hi])
+        let y = layer.forward(x)
+        assert_eq(y.shape, shape)
+        for value in y.download() { out[0].push(value) }
+        if trains {
+            let total = jt.sum(jt.multiply(y, w))
+            free_all(total.backward())
+            total.free()
+            let g = x.grad
+            assert_true(g is not null)
+            if g is not null { for value in g.download() { out[1].push(value) } }
+        }
+        free_all([x, w, y])
+    }
+    if trains {
+        for param in params {
+            let g = param.grad
+            assert_true(g is not null)
+            if g is not null { out.push(g.download()) }
+        }
+    }
+    jt.zero_grad(params)
+    return out
+}
+
+#: A batch through the layer must equal each sequence through it alone, with
+#: gradients recorded and without, and leak nothing a step.
+fn check_layer_takes_a_batch(batch: int, seq: int, dim: int, heads: int, causal: bool) -> void {
+    let layer = jt.MultiHeadAttention(dim, heads: heads, causal: causal)
+    defer { layer.free() }
+    layer.build(dim, Random.with_seed(4))
+    let xs = wave(batch * seq * dim, 0.7)
+    let ws = wave(batch * seq * dim, 1.9)
+    let together = layer_batch_pass(layer, batch, seq, xs, ws, true, true)
+    let alone = layer_batch_pass(layer, batch, seq, xs, ws, false, true)
+    assert_eq(together.len(), 6)
+    for (index, values) in together.enumerate() {
+        assert_values_near(values, alone[index], 1e-4)
+    }
+    #: Without a graph the batch takes the inference kernels, which hold Q, K
+    #: and V in half precision, and must hand back everything it allocates.
+    for param in layer.parameters() { param.requires_grad = false }
+    let quick = layer_batch_pass(layer, batch, seq, xs, ws, true, false)
+    assert_values_near(quick[0], alone[0], 4e-3)
+    var live = -1
+    for step in 0..3 {
+        let x = Tensor([batch, seq, dim], xs)
+        let y = layer.forward(x)
+        free_all([x, y])
+        gpu.synchronize()
+        if step == 1 { live = gpu.live_buffers() }
+        if step > 1 { assert_eq(gpu.live_buffers(), live) }
+    }
+    for param in layer.parameters() { param.requires_grad = true }
+}
+
+#: The layer used to refuse anything but `[seq, dim]`, so a model training on
+#: batches had to pull the projections out of `parameters()` and write the
+#: attention block itself. The cases take the MMA route (sequences of 64 at a
+#: head width of 64), the op route, and a plain mask.
+fn test_attention_layer_takes_a_batch_of_sequences() -> void {
+    if not jt.is_available() { return }
+    check_layer_takes_a_batch(3, 64, 128, 2, true)
+    check_layer_takes_a_batch(2, 20, 64, 2, true)
+    check_layer_takes_a_batch(2, 64, 128, 2, false)
+    check_layer_takes_a_batch(1, 64, 64, 1, true)
+}
+
+#: A batch of sequences decoded through the cache, a prompt and then one row
+#: at a time, equals the uncached batch for every sequence and position.
+fn check_batched_cache(batch: int, dim: int, heads: int, prompt: int, total: int) -> void {
+    let layer = jt.MultiHeadAttention(dim, heads: heads, causal: true)
+    defer { layer.free() }
+    layer.build(dim, Random.with_seed(11))
+    for parameter in layer.parameters() { parameter.requires_grad = false }
+    let xs = wave(batch * total * dim, 0.6)
+    let whole = Tensor([batch, total, dim], xs)
+    defer { whole.free() }
+    let reference = layer.forward(whole)
+    let expected = reference.download()
+    reference.free()
+    layer.start_cache(total, batch: batch)
+    assert_eq(layer.cache_batch_size(), batch)
+    var got: list[list[float]] = [[] for _ in 0..batch]
+    var live = -1
+    var start = 0
+    while start < total {
+        let count = if start == 0 { prompt } else { 1 }
+        let rows = Tensor(
+            [batch, count, dim],
+            sequence_rows(xs, batch, total, dim, start, start + count)
+        )
+        let y = layer.forward(rows)
+        assert_eq(y.shape, [batch, count, dim])
+        let values = y.download()
+        for b in 0..batch {
+            for value in values[b * count * dim:(b + 1) * count * dim] { got[b].push(value) }
+        }
+        free_all([y, rows])
+        start += count
+        gpu.synchronize()
+        if start > prompt + 1 {
+            if live < 0 { live = gpu.live_buffers() }
+            assert_eq(gpu.live_buffers(), live)
+        }
+    }
+    assert_eq(layer.cache_length(), total)
+    for b in 0..batch {
+        assert_values_near(got[b], expected[b * total * dim:(b + 1) * total * dim], 4e-3)
+    }
+    #: A rank-two input is one sequence, which a cache of several is not.
+    let single = Tensor([1, dim], xs[0:dim])
+    defer { single.free() }
+    layer.reset_cache()
+    if batch > 1 { assert_throws(ValueError, || layer.forward(single)) }
+    layer.free_cache()
+    assert_eq(layer.cache_batch_size(), 1)
+}
+
+fn test_attention_layer_cache_takes_a_batch() -> void {
+    if not jt.is_available() { return }
+    check_batched_cache(3, 128, 2, 5, 24)
+    check_batched_cache(2, 256, 4, 16, 40)
+    check_batched_cache(1, 64, 1, 4, 12)
+}
+
+#: A leaf that went through `reshape` keeps a readable gradient once the
+#: graph is freed. `reshape`'s backward handed the leaf a view of the reshaped
+#: tensor's own gradient, which `backward()` returns for the caller to free,
+#: so the leaf's `.grad` pointed at freed memory and reading it killed the
+#: process. Batched attention reshapes every input it folds, so any leaf fed
+#: to it as `[batch, seq, dim]` -- a layer's input, or Q itself -- hit this.
+fn test_a_reshaped_leaf_keeps_its_gradient_after_the_graph_is_freed() -> void {
+    if not jt.is_available() { return }
+    let ws = wave(12, 0.5)
+    let x = Tensor([3, 4], wave(12, 0.1), requires_grad: true)
+    let w = Tensor([2, 6], ws)
+    let total = jt.sum(jt.multiply(jt.reshape(jt.reshape(x, [12]), [2, 6]), w))
+    free_all(total.backward())
+    total.free()
+    gpu.synchronize()
+    let g = x.grad
+    assert_true(g is not null)
+    if g is not null {
+        assert_eq(g.shape, [3, 4])
+        assert_values_near(g.download(), ws, 1e-6)
+    }
+    free_all([x, w])
+    #: The same through rank-three attention, whose batch fold reshapes Q.
+    let batch = 2
+    let seq = 8
+    let dim = 64
+    let q = Tensor([batch, seq, dim], wave(batch * seq * dim, 0.3), requires_grad: true)
+    let k = Tensor([batch, seq, dim], wave(batch * seq * dim, 1.3))
+    let v = Tensor([batch, seq, dim], wave(batch * seq * dim, 2.3))
+    let y = jt.multi_head_attention(q, k, v, 2, causal: true)
+    let loss = jt.sum(y)
+    free_all(loss.backward())
+    free_all([loss, y])
+    gpu.synchronize()
+    let gq = q.grad
+    assert_true(gq is not null)
+    if gq is not null {
+        var finite = true
+        for value in gq.download() { if not math.is_finite(value) { finite = false } }
+        assert_true(finite)
+    }
+    free_all([q, k, v])
+}
+
+#: `[batch, seq, dim]` host values reordered as `[seq, batch, dim]`, or back
+#: again with the first two counts swapped.
+fn swap_leading(values: list[float], first: int, second: int, dim: int) -> list[float] {
+    var out: list[float] = []
+    for j in 0..second {
+        for i in 0..first {
+            let base = (i * second + j) * dim
+            for value in values[base:base + dim] { out.push(value) }
+        }
+    }
+    return out
+}
+
+#: Output, dx and every parameter gradient of `sum(layer(x) * w)` for one
+#: rank-three block, as host lists in that order.
+fn layer_block_pass(
+    layer: MultiHeadAttention,
+    shape: list[int],
+    xs: list[float],
+    ws: list[float]
+) -> list[list[float]] {
+    let params = layer.parameters()
+    jt.zero_grad(params)
+    let x = Tensor(shape, xs, requires_grad: true)
+    let w = Tensor(shape, ws)
+    let y = layer.forward(x)
+    assert_eq(y.shape, shape)
+    var out = [y.download()]
+    let total = jt.sum(jt.multiply(y, w))
+    free_all(total.backward())
+    total.free()
+    for t in [x] + params {
+        let g = t.grad
+        assert_true(g is not null)
+        if g is not null { out.push(g.download()) }
+    }
+    free_all([x, w, y])
+    jt.zero_grad(params)
+    return out
+}
+
+#: A sequence-first layer on `[seq, batch, dim]` gives what a batch-first one
+#: with the same weights gives on `[batch, seq, dim]`, gradients included, and
+#: its unrecorded forward and cache hand back everything they allocate.
+fn check_seq_first(batch: int, seq: int, dim: int, heads: int, causal: bool) -> void {
+    let first = jt.MultiHeadAttention(dim, heads: heads, causal: causal)
+    let second = jt.MultiHeadAttention(dim, heads: heads, causal: causal, batch_first: false)
+    defer { first.free() }
+    defer { second.free() }
+    first.build(dim, Random.with_seed(9))
+    second.build(dim, Random.with_seed(9))
+    let xs = wave(batch * seq * dim, 0.45)
+    let ws = wave(batch * seq * dim, 2.05)
+    let want = layer_block_pass(first, [batch, seq, dim], xs, ws)
+    let got = layer_block_pass(
+        second,
+        [seq, batch, dim],
+        swap_leading(xs, batch, seq, dim),
+        swap_leading(ws, batch, seq, dim)
+    )
+    assert_eq(got.len(), 6)
+    assert_values_near(swap_leading(got[0], seq, batch, dim), want[0], 1e-4)
+    assert_values_near(swap_leading(got[1], seq, batch, dim), want[1], 1e-4)
+    for index in 2..6 { assert_values_near(got[index], want[index], 1e-4) }
+    for param in second.parameters() { param.requires_grad = false }
+    let x = Tensor([seq, batch, dim], swap_leading(xs, batch, seq, dim))
+    defer { x.free() }
+    var live = -1
+    for step in 0..3 {
+        let y = second.forward(x)
+        if step == 0 {
+            assert_values_near(swap_leading(y.download(), seq, batch, dim), want[0], 4e-3)
+        }
+        y.free()
+        gpu.synchronize()
+        if step == 1 { live = gpu.live_buffers() }
+        if step > 1 { assert_eq(gpu.live_buffers(), live) }
+    }
+    #: Through the cache: a prompt of three rows, then one at a time.
+    if causal {
+        second.start_cache(seq, batch: batch)
+        var decoded: list[float] = []
+        var at = 0
+        while at < seq {
+            let count = if at == 0 { min(3, seq) } else { 1 }
+            let rows = x.view(at * batch * dim, [count, batch, dim])
+            let y = second.forward(rows)
+            for value in y.download() { decoded.push(value) }
+            free_all([y, rows])
+            at += count
+        }
+        assert_values_near(swap_leading(decoded, seq, batch, dim), want[0], 4e-3)
+        second.free_cache()
+    }
+}
+
+#: `batch_first: false` is the order that folds for free; it must be the same
+#: attention as the batch-first order, on both training routes.
+fn test_attention_layer_takes_a_sequence_first_batch() -> void {
+    if not jt.is_available() { return }
+    check_seq_first(3, 64, 128, 2, true)
+    check_seq_first(2, 20, 64, 2, true)
+    check_seq_first(2, 64, 128, 2, false)
+}
+
+#: `forward_add` is `residual + forward(x)`: through the cache, where the add
+#: rides on the output product, for one sequence and for a sequence-first
+#: batch, and recorded, where it is a plain add the gradient goes through.
+fn test_attention_layer_adds_its_residual() -> void {
+    if not jt.is_available() { return }
+    let dim = 128
+    for batch in [1, 3] {
+        let layer = jt.MultiHeadAttention(dim, heads: 2, causal: true, batch_first: false)
+        defer { layer.free() }
+        layer.build(dim, Random.with_seed(21))
+        for p in layer.parameters() { p.requires_grad = false }
+        let seq = 9
+        let shape = if batch == 1 { [seq, dim] } else { [seq, batch, dim] }
+        let x = Tensor(shape, wave(seq * batch * dim, 0.15))
+        let r = Tensor(shape, wave(seq * batch * dim, 1.15))
+        defer { x.free() }
+        defer { r.free() }
+        layer.start_cache(seq, batch: batch)
+        let plain = layer.forward(x)
+        layer.reset_cache()
+        let fused = layer.forward_add(x, r)
+        assert_eq(fused.shape, plain.shape)
+        let want = jt.add(r, plain)
+        assert_values_near(fused.download(), want.download(), 1e-5)
+        free_all([plain, fused, want])
+        layer.free_cache()
+    }
+    let layer = jt.MultiHeadAttention(64, heads: 1, causal: true)
+    defer { layer.free() }
+    layer.build(64, Random.with_seed(22))
+    let x = Tensor([64, 64], wave(64 * 64, 0.5))
+    let r = Tensor([64, 64], wave(64 * 64, 1.5), requires_grad: true)
+    let y = layer.forward_add(x, r)
+    let total = jt.sum(y)
+    free_all(total.backward())
+    let g = r.grad
+    assert_true(g is not null)
+    if g is not null { assert_values_near(g.download(), [1.0 for _ in 0..64 * 64], 1e-6) }
+    free_all([total, y, x, r])
 }

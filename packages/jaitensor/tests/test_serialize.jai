@@ -4,7 +4,7 @@ import std.math
 import std.os
 from jaitensor import Dataset
 from std.io import Path
-from std.test import assert_eq
+from std.test import assert_eq, assert_throws, assert_true
 
 fn separable_data(repeats: int = 32) -> Dataset {
     var features: list[float] = []
@@ -96,4 +96,86 @@ fn test_a_convolutional_model_survives_a_save_and_a_load() -> void {
     for (index, value) in before.enumerate() {
         assert math.fabs(value - after[index]) < 1e-6
     }
+}
+
+#: Whether two downloads hold the same float32 values bit for bit, as far as a
+#: host float can tell: NaN matches NaN, and a zero keeps its sign.
+fn same_bits(a: list[float], b: list[float]) -> bool {
+    if a.len() != b.len() { return false }
+    for (index, x) in a.enumerate() {
+        let y = b[index]
+        if math.is_nan(x) or math.is_nan(y) {
+            if not (math.is_nan(x) and math.is_nan(y)) { return false }
+        } elif x == 0.0 and y == 0.0 {
+            if (math.copysign(1.0, x) > 0.0) != (math.copysign(1.0, y) > 0.0) { return false }
+        } elif x != y {
+            return false
+        }
+    }
+    return true
+}
+
+#: A binary checkpoint gives back exactly the bits it was given: every rank,
+#: the awkward values JSON text cannot carry, the metadata beside them, and
+#: an in-place restore into tensors a model already holds.
+fn test_a_binary_checkpoint_round_trips_bit_for_bit() -> void {
+    if not jt.is_available() { return }
+    let path = Path(os.temp_dir()).join("jaithon-jaitensor-checkpoint-test.bin")
+    defer { if path.exists() { path.remove() } }
+    let odd = [
+        0.0,
+        -0.0,
+        1.0e-40,
+        -1.0e-45,
+        3.4028234663852886e38,
+        math.INF,
+        -math.INF,
+        math.NAN,
+        1.0 / 3.0,
+    ]
+    let special = jt.Tensor([9], odd)
+    let wide = jt.Tensor([3, 70, 33])
+    wide.buffer().fill_uniform(-2.0, 2.0, 17)
+    let scalar = jt.Tensor([1], [42.5])
+    let deep = jt.Tensor([2, 1, 3, 2], [float(i) - 5.5 for i in 0..12])
+    let names = ["special", "blocks/wide", "scalar", "deep é"]
+    let tensors = [special, wide, scalar, deep]
+    defer { for t in tensors { t.free() } }
+    jt.save_checkpoint(
+        path.to_str(),
+        names,
+        tensors,
+        meta: {"step": 2000, "dim": 256, "note": "gpt"}
+    )
+    let loaded = jt.load_checkpoint(path.to_str())
+    defer { loaded.free() }
+    assert_eq(loaded.names, names)
+    assert_eq(loaded.meta["step"], 2000)
+    assert_eq(loaded.meta["note"], "gpt")
+    for (index, tensor) in tensors.enumerate() {
+        let back = loaded.tensors[index]
+        assert_eq(back.shape, tensor.shape)
+        assert_true(same_bits(back.download(), tensor.download()), names[index])
+    }
+    let specials = loaded.get("special").download()
+    assert_true(math.is_nan(specials[7]) and specials[5] == math.INF and specials[6] == -math.INF)
+    assert_true(math.copysign(1.0, specials[1]) < 0.0 and specials[2] > 0.0)
+    #: Into existing tensors, in any order and leaving the rest of the file.
+    let into_wide = jt.Tensor([3, 70, 33])
+    let into_deep = jt.Tensor([2, 1, 3, 2])
+    defer { into_wide.free() }
+    defer { into_deep.free() }
+    let meta = jt.restore_checkpoint(
+        path.to_str(),
+        ["deep é", "blocks/wide"],
+        [into_deep, into_wide]
+    )
+    assert_eq(meta["dim"], 256)
+    assert_true(same_bits(into_wide.download(), wide.download()))
+    assert_true(same_bits(into_deep.download(), deep.download()))
+    let wrong = jt.Tensor([3, 70, 32])
+    defer { wrong.free() }
+    assert_throws(ValueError, || jt.restore_checkpoint(path.to_str(), ["blocks/wide"], [wrong]))
+    assert_throws(KeyError, || jt.restore_checkpoint(path.to_str(), ["absent"], [wrong]))
+    assert_throws(ValueError, || jt.save_checkpoint(path.to_str(), ["a", "a"], [wrong, wrong]))
 }

@@ -292,27 +292,32 @@ pub fn batch_norm(
     return output
 }
 
-#: Normalize the last axis of a rank-two tensor.
+#: Normalize the last axis of a tensor of rank two or more.
+#:
+#: Every leading axis folds into rows: `[batch, seq, dim]` is normalized as
+#: the `[batch * seq, dim]` it is laid out as, so a transformer's activations
+#: go straight in, and the result (and the input's gradient) keep the input's
+#: shape.
 pub fn layer_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
-    if input.rank() != 2 {
-        throw ValueError(f"layer_norm needs rank-two input, got {input.shape}")
+    if input.rank() < 2 {
+        throw ValueError(f"layer_norm needs rank two or more, got {input.shape}")
     }
-    let width = input.shape[1]
+    let width = input.shape[input.rank() - 1]
     if gamma.size != width or beta.size != width {
         throw ValueError("layer_norm gamma/beta must match the last dimension")
     }
+    let rows = if width == 0 { 0 } else { input.size // width }
     let output = Tensor(input.shape)
     let kernel = cached_kernel("layer_norm_forward")
     #: A threadgroup of 256 to each row, so the dispatch is that many threads
     #: per row rather than one.
     kernel.dispatch_async(
         [input.buffer(), gamma.buffer(), beta.buffer(), output.buffer()],
-        input.shape[0] * 256,
-        [input.shape[0], width],
+        rows * 256,
+        [rows, width],
         group_size: 256
     )
     if input.requires_grad or gamma.requires_grad or beta.requires_grad {
-        let rows = input.shape[0]
         output.attach_creator(GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
             let grad_input = Tensor(input.shape)
             #: Written by the input pass and read by the parameter pass, which
