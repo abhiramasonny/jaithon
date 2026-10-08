@@ -521,14 +521,21 @@ pub class Conv2d: Layer {
 #: tensors of state, a momentum to choose, and a different answer from every
 #: model already trained against this one -- so it is written down here
 #: rather than done quietly.
+#:
+#: `relu: true` applies a ReLU to the result, and `forward_residual(x, s)`
+#: adds a skip connection `s` before it: `relu(bn(x) + s)`, the tail of a
+#: residual block, in one pass instead of three (see `batch_norm`).
 pub class BatchNorm2d: Layer {
     pub let channels: int
+    #: Whether a ReLU follows the normalisation (and the residual, if any).
+    pub let relu: bool
     var last_shape: list[int]
     var gamma_value: Tensor?
     var beta_value: Tensor?
 
-    pub fn init(self, channels: int = 0) {
+    pub fn init(self, channels: int = 0, relu: bool = false) {
         self.channels = channels
+        self.relu = relu
         self.last_shape = []
         self.gamma_value = null
         self.beta_value = null
@@ -562,7 +569,16 @@ pub class BatchNorm2d: Layer {
         let gamma = self.gamma_value
         let beta = self.beta_value
         if gamma is null or beta is null { throw RuntimeError("BatchNorm2d has not been built") }
-        return batch_norm(x, gamma, beta)
+        return batch_norm(x, gamma, beta, relu: self.relu)
+    }
+
+    #: `bn(x) + residual`, then the ReLU if the layer has one, in one pass.
+    #: `residual` must have the shape of `x`.
+    pub fn forward_residual(self, x: Tensor, residual: Tensor) -> Tensor {
+        let gamma = self.gamma_value
+        let beta = self.beta_value
+        if gamma is null or beta is null { throw RuntimeError("BatchNorm2d has not been built") }
+        return batch_norm(x, gamma, beta, residual: residual, relu: self.relu)
     }
 
     pub fn parameters(self) -> list[Tensor] {
@@ -587,7 +603,10 @@ pub class BatchNorm2d: Layer {
         self.beta_value = null
     }
 
-    fn __str__(self) -> str { return f"BatchNorm2d({self.output_width()})" }
+    fn __str__(self) -> str {
+        if self.relu { return f"BatchNorm2d({self.output_width()}, relu)" }
+        return f"BatchNorm2d({self.output_width()})"
+    }
 }
 
 #: NHWC group normalization. `groups` must divide the channel count.

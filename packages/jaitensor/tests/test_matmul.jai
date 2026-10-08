@@ -2,6 +2,8 @@
 import jaitensor as jt
 import std.gpu as gpu
 from jaitensor.gemm import Plan, bucket_extent, cache_key, candidates, default_plan, dispatch_plan
+from jaitensor.gemm import dispatch_batched
+import std.math as math
 from jaitensor.gemm import last_tune_counts, plan_from_text, reload_plans
 from jaitensor.ops import matmul_backend
 from jaitensor.tensor import Tensor
@@ -117,17 +119,20 @@ fn test_default_plan_prefers_direct_kernels_then_splits() -> void {
     assert_eq(default_plan(128, 128, 128).to_str(), "direct32x32:1")
     assert_eq(default_plan(512, 784, 256).to_str(), "direct32x32:2")
     assert_eq(default_plan(1024, 384, 384).to_str(), "direct32x32:1")
-    #: Ragged shapes keep a staged kernel: `gemm64x32` where it still makes a
-    #: few threadgroups, split to fill the device, else `gemm32x32`.
-    assert_eq(default_plan(8, 7, 5).to_str(), "gemm32x32:1")
-    assert_eq(default_plan(100, 100, 100).to_str(), "gemm32x32:1")
+    #: Small ragged shapes are latency, and take a thin kernel: 8x7x5 ran
+    #: 4.7 us there against 19 staged, 100 cubed 17 against 75.
+    assert_eq(default_plan(8, 7, 5).to_str(), "thin_n:1")
+    assert_eq(default_plan(100, 100, 100).to_str(), "thin_n:1")
+    #: Larger ragged shapes keep a staged kernel: `gemm64x32` where it still
+    #: makes a few threadgroups, split to fill the device, else `gemm32x32`.
     #: 270 GFLOPS unsplit, 625 split four ways; and never the graph below the
     #: large threshold, whose first call per shape costs 3 ms.
     assert_eq(default_plan(300, 300, 300).to_str(), "gemm64x32:4")
     assert_eq(default_plan(1000, 1000, 96).to_str(), "gemm64x32:4")
     #: A one-wide output was given `gemm128x128` and computed mostly padding:
-    #: 6 GFLOPS against 20 for `gemm64x32`.
-    assert_eq(default_plan(100000, 50, 1, false, true).to_str(), "gemm64x32:1")
+    #: 6 GFLOPS against 20 for `gemm64x32`, and that against `thin_m`'s lanes
+    #: down the rows, 87 us to 490.
+    assert_eq(default_plan(100000, 50, 1, false, true).to_str(), "thin_m:1")
     #: Large products go to the graph wherever a device can run it.
     if gpu.is_available() {
         assert_eq(default_plan(512, 784, 8192).to_str(), "mpsgraph:1")
@@ -140,9 +145,12 @@ fn test_default_plan_splits_a_tall_skinny_product_past_sixteen() -> void {
     #: sixteen splits left the device mostly idle. 151 us at 64 splits
     #: against 224 at 32 and 383 at 16, and X^T y 103 us at 128.
     assert_eq(default_plan(50, 10000, 50).to_str(), "gemm32x32:64")
-    assert_eq(default_plan(50, 10000, 1).to_str(), "gemm32x32:128")
-    #: A product with tiles enough of its own is never split that far.
-    assert_eq(default_plan(8, 7, 5).to_str(), "gemm32x32:1")
+    #: A one-wide X^T y is a thin kernel's now, whose lanes take K between
+    #: them: 12.5 us against 94 for `gemm32x32:128`.
+    assert_eq(default_plan(50, 10000, 1).to_str(), "thin_n:1")
+    #: Transposed, its rows lie side by side, so the lanes go down them and K
+    #: is split instead: 14.9 us.
+    assert_eq(default_plan(50, 10000, 1, true).to_str(), "thin_m:8")
     #: Deeper still, the graph: it splits K itself, and beat every kernel
     #: plan at 100k samples.
     if gpu.is_available() {
@@ -538,6 +546,185 @@ fn test_padded_graph_route_applies_the_epilogue() -> void {
         for column in 0..columns {
             let want = max(plain[row * columns + column] + shift[column], 0.0)
             assert_near(got[row * columns + column], want, 1e-3)
+        }
+    }
+}
+
+#: The thin and short-K products the tile kernels cannot divide: batch-one
+#: rows, one-wide heads, X^T g for a one-wide input, outer products.
+let THIN_SHAPES = [
+    [1, 64, 64], [1, 4, 64], [1, 64, 2], [8, 64, 64], [1, 256, 1], [256, 64, 1], [64, 256, 1],
+    [256, 1, 64], [3, 5, 7], [31, 100, 33], [33, 3, 40], [64, 10, 128], [5, 3000, 3],
+]
+
+fn test_thin_kernels_take_thin_shapes_statically() -> void {
+    #: 43 us for 1x64x64 on the staged kernel, 5.5 on `thin_n`; 52 us for
+    #: 256x64x1, 5.7.
+    assert_eq(default_plan(1, 64, 64).to_str(), "thin_n:1")
+    assert_eq(default_plan(1, 256, 64, true).to_str(), "thin_n:1")
+    assert_eq(default_plan(256, 64, 1).to_str(), "thin_n:1")
+    assert_eq(default_plan(64, 256, 1, true).to_str(), "thin_m:1")
+    assert_eq(default_plan(256, 1, 64, false, true).to_str(), "thin_n:1")
+    #: Shapes a direct tile divides keep it.
+    assert_eq(default_plan(32, 64, 64).to_str(), "direct32x32:1")
+    assert_eq(default_plan(256, 64, 64).to_str(), "direct32x32:1")
+    #: A thin output over a large operand wants the tile kernels' reuse:
+    #: 4.2 ms on `gemm64x32` against 12.6 on `thin_n`.
+    assert_eq(default_plan(500000, 130, 10).to_str(), "gemm64x32:1")
+}
+
+fn test_thin_kernels_are_tuned_only_where_they_can_run() -> void {
+    if not gpu.is_available() { return }
+    var thin = false
+    for plan in candidates(16, 4096, 1024) {
+        if plan.backend == "thin_n" or plan.backend == "thin_m" { thin = true }
+    }
+    assert_true(thin, "a 16-row product times the thin kernels")
+    for plan in candidates(512, 784, 256) {
+        assert_true(plan.backend != "thin_n" and plan.backend != "thin_m", f"{plan.to_str()} offered for 512x784x256")
+    }
+    assert_throws(ValueError, fn() {
+        let a = jt.Tensor([256, 256])
+        let b = jt.Tensor([256, 256])
+        let out = jt.Tensor([256, 256])
+        dispatch_plan(plan_named("thin_n"), a.buffer(), b.buffer(), out.buffer(), out.buffer(), 256, 256, 256)
+    })
+}
+
+fn test_thin_plans_match_host_on_ragged_shapes() -> void {
+    if not jt.is_available() { return }
+    for shape in THIN_SHAPES {
+        for trans_a in [false, true] {
+            for trans_b in [false, true] {
+                for text in ["thin_n", "thin_m", "thin_n:2", "thin_m:4"] {
+                    let plan = plan_named(text)
+                    if plan.splits > 1 and shape[1] // plan.splits < 64 { continue }
+                    assert_plan_matches_host(plan, shape[0], shape[1], shape[2], trans_a, trans_b)
+                }
+            }
+        }
+    }
+}
+
+fn host_activation(value: float, epilogue: int) -> float {
+    if epilogue == 2 { return max(value, 0.0) }
+    if epilogue == 3 { return 1.0 / (1.0 + math.exp(-value)) }
+    if epilogue == 4 {
+        if value > 15.0 { return 1.0 }
+        if value < -15.0 { return -1.0 }
+        return math.tanh(value)
+    }
+    if epilogue == 5 {
+        let inner = 0.7978845608 * (value + 0.044715 * value * value * value)
+        let t = if inner > 15.0 { 1.0 } elif inner < -15.0 { -1.0 } else { math.tanh(inner) }
+        return 0.5 * value * (1.0 + t)
+    }
+    return value
+}
+
+#: `out = act(op(a) x op(b) + bias)` on `plan`, against the host.
+fn assert_epilogue_matches_host(
+    plan: Plan,
+    rows: int,
+    inner: int,
+    columns: int,
+    trans_a: bool,
+    trans_b: bool,
+    epilogue: int,
+    scale: float = 1.0
+) -> void {
+    let a = jt.Tensor(if trans_a { [inner, rows] } else { [rows, inner] })
+    a.buffer().fill_uniform(-scale, scale, 41)
+    let b = if trans_b { device_tensor([columns, inner], 42) } else { device_tensor([inner, columns], 42) }
+    let bias = device_tensor([rows * columns], 43)
+    let out = jt.Tensor([rows, columns])
+    defer { a.free() }
+    defer { b.free() }
+    defer { bias.free() }
+    defer { out.free() }
+    out.buffer().fill(1.0e9)
+    dispatch_plan(
+        plan,
+        a.buffer(),
+        b.buffer(),
+        out.buffer(),
+        bias.buffer(),
+        rows,
+        inner,
+        columns,
+        trans_a: trans_a,
+        trans_b: trans_b,
+        epilogue: epilogue
+    )
+    let got = out.download()
+    let plain = host_reference(a.download(), b.download(), rows, inner, columns, trans_a, trans_b)
+    let shift = bias.download()
+    for row in 0..rows {
+        for column in 0..columns {
+            var value = plain[row * columns + column]
+            if epilogue == 6 {
+                value += shift[row * columns + column]
+            } elif epilogue != 0 {
+                value += shift[column]
+            }
+            let want = host_activation(value, epilogue)
+            let have = got[row * columns + column]
+            assert_true(math.is_finite(have), f"{plan.to_str()} epilogue {epilogue} gave {have}")
+            assert_near(have, want, 1e-3 * (1.0 + math.fabs(want)))
+        }
+    }
+}
+
+fn test_thin_plans_apply_bias_relu_and_gelu_on_ragged_shapes() -> void {
+    if not jt.is_available() { return }
+    for shape in [[1, 64, 64], [1, 64, 2], [33, 3, 40], [256, 64, 1], [64, 10, 128], [3, 5, 7]] {
+        for text in ["thin_n", "thin_m"] {
+            for epilogue in [1, 2, 3, 4, 5, 6] {
+                assert_epilogue_matches_host(plan_named(text), shape[0], shape[1], shape[2], false, false, epilogue)
+                assert_epilogue_matches_host(plan_named(text), shape[0], shape[1], shape[2], true, true, epilogue)
+            }
+        }
+    }
+}
+
+#: Kernels compile in fast-math mode, where `tanh` overflows an exponential:
+#: it gave 0 at 44 and NaN from 45, and GELU NaN from an input of 20. A 1x2000
+#: row of values around one sums to a pre-activation in the tens.
+fn test_tanh_and_gelu_epilogues_stay_finite_on_large_pre_activations() -> void {
+    if not jt.is_available() { return }
+    for text in ["thin_n", "gemm32x32", "gemm64x32"] {
+        for epilogue in [4, 5] {
+            assert_epilogue_matches_host(plan_named(text), 3, 2000, 5, false, false, epilogue, scale: 40.0)
+        }
+    }
+    assert_epilogue_matches_host(plan_named("direct32x32"), 32, 2000, 32, false, false, 5, scale: 40.0)
+}
+
+fn test_a_batched_thin_product_matches_host() -> void {
+    if not jt.is_available() { return }
+    let batch = 3
+    let rows = 1
+    let inner = 70
+    let columns = 9
+    let a = device_tensor([batch * rows, inner], 51)
+    let b = device_tensor([batch * inner, columns], 52)
+    let out = jt.Tensor([batch * rows, columns])
+    defer { a.free() }
+    defer { b.free() }
+    defer { out.free() }
+    dispatch_batched(a.buffer(), b.buffer(), out.buffer(), out.buffer(), rows, inner, columns, batch, rows * inner, inner * columns)
+    let got = out.download()
+    let av = a.download()
+    let bv = b.download()
+    for item in 0..batch {
+        for row in 0..rows {
+            for column in 0..columns {
+                var want = 0.0
+                for k in 0..inner {
+                    want += av[(item * rows + row) * inner + k] * bv[(item * inner + k) * columns + column]
+                }
+                assert_near(got[(item * rows + row) * columns + column], want, 1e-3)
+            }
         }
     }
 }

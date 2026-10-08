@@ -138,6 +138,20 @@ one-thread-per-column LayerNorm parameter gradient.
 `JAITENSOR_ATTN_SOFTMAX_HOLD=1` makes the attention softmax hold rows in
 registers instead of re-reading them. It is off by default.
 
+Products the tile kernels cannot divide and that are thin (a row or a column
+under 32, or fewer than 8 steps of K) or small (2M multiply-adds or less) run
+on the thin GEMM kernels, `thin_n` and `thin_m`. Each lane owns one output and
+a slice of K. A batch-1 1x64x64 product takes 5.5 us of GPU time this way,
+against 42 us on the staged kernel. `JAITENSOR_GEMM_THIN=0` keeps those shapes
+on the staged kernel and out of tuning.
+
+`batch_norm(x, gamma, beta, residual: s, relu: true)` computes
+`relu(batch_norm(x) + s)` in one elementwise pass, and its backward in two.
+`BatchNorm2d(relu: true)` and `BatchNorm2d.forward_residual(x, s)` expose it.
+Where the channel count is a multiple of four, the plain normalisation's
+passes also handle four channels per thread. `JAITENSOR_BN_FUSED=0` composes
+`add` and `relu` instead and keeps the one-float kernels.
+
 `gather_rows` records a scatter-add into the source so `Embedding` can train.
 `group_norm` is NHWC, one mean/variance per sample per group. `tril` zeros the
 strict upper triangle of a rank-two tensor. `binary_cross_entropy_with_logits`
