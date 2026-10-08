@@ -150,6 +150,27 @@ round-trip. `reshape` and `slice_flat` are views (no device copy).
 `scale` passes the multiplier as float32 bits, not a 1-element buffer.
 `Buffer.fill_uniform` is a device kernel, so dropout noise stays on the GPU.
 
+`backward()` gives a gradient only to tensors that asked for one. Each
+`GradNode` records a `needs` mask when the op runs, so a data batch, a target,
+a mask or a constant never grows a `.grad`, and `matmul`, `add`, `subtract`,
+`multiply`, `divide`, `maximum` and `minimum` skip the kernel for that side
+(a custom `add(matmul(x, W), b)` no longer computes `dX`). An intermediate's
+gradient is released as soon as its op's backward has read it, and a tensor
+only one op saved for its backward (attention probabilities, norm statistics,
+the cross-entropy row statistics) is released after that op, as in torch with
+`retain_grad=False`. `t.retain_grad()` keeps one. Leaves keep theirs. The
+caller still frees what `backward()` returns; the early-freed ones are already
+gone and freeing them again is harmless. `jt.no_grad(fn() { ... })` runs a
+block that records no graph: its results have no `.creator` and are freed like
+any tensor. `set_grad_enabled` and `is_grad_enabled` are the unscoped forms.
+Sparse cross-entropy runs a row across a simdgroup (up to 1024 classes) or a
+threadgroup of 256, with an online max and sum in one coalesced pass; the
+autograd backward recomputes the gradient from three numbers a row instead of
+holding a logits-sized delta between forward and backward. A/B switches, each
+read once: `JAITENSOR_BACKWARD_FREE=0` keeps every intermediate gradient and
+saved tensor until the caller frees the graph. `JAITENSOR_CE_ROWS=0` takes
+the old one-thread-per-row cross-entropy kernel.
+
 ## What this is aimed at
 
 The language should stay the place models are written, compiled, and run.
