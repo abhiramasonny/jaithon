@@ -8,14 +8,6 @@
 file-local jaiCliDispatch              src/cli/main.c
 file-local jaiDiagCodeIsWarning        src/common/diag.c
 file-local jaiSourceLineText           src/common/diag.c
-file-local jaiArenaAlloc               src/common/memory.c
-dead       jaiArenaAllocZeroed         src/common/memory.c
-dead       jaiArenaFree                src/common/memory.c
-dead       jaiArenaInit                src/common/memory.c
-dead       jaiArenaMemdup              src/common/memory.c
-dead       jaiArenaReset               src/common/memory.c
-dead       jaiBufWriteI16              src/common/memory.c
-dead       jaiBufWriteU24              src/common/memory.c
 dead       jaiGpuDownload              src/native/apple/gpu_buffer.m
 dead       jaiProcessRun               src/native/posix/process.c
 dead       jaiStatPath                 src/native/posix/process.c

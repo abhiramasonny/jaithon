@@ -222,133 +222,6 @@ char *jaiMemdup(const char *s, size_t n) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Arena                                                               */
-/* ------------------------------------------------------------------ */
-
-#define JAI_ARENA_ALIGN         16u
-#define JAI_ARENA_DEFAULT_BLOCK (64u * 1024u)
-
-struct JaiArenaBlock {
-    JaiArenaBlock *next;
-    uint8_t       *base;      /* first aligned payload byte */
-    size_t         capacity;  /* payload bytes at `base` */
-    size_t         used;
-    size_t         allocSize; /* what jaiRealloc handed out, for the free */
-};
-
-static inline size_t alignUpSize(size_t n) {
-    const size_t mask = (size_t)JAI_ARENA_ALIGN - 1u;
-    if (JAI_UNLIKELY(n > SIZE_MAX - mask))
-        JAI_PANIC("arena allocation size overflow: %zu", n);
-    return (n + mask) & ~mask;
-}
-
-static JaiArenaBlock *arenaNewBlock(JaiArena *arena, size_t payload) {
-    size_t total = sizeof(JaiArenaBlock) + JAI_ARENA_ALIGN;
-    if (payload > SIZE_MAX - total) JAI_PANIC("arena block size overflow: %zu", payload);
-    total += payload;
-
-    JaiArenaBlock *b = (JaiArenaBlock *)jaiRealloc(NULL, 0, total);
-    uintptr_t raw     = (uintptr_t)b + sizeof(JaiArenaBlock);
-    uintptr_t aligned = (raw + (JAI_ARENA_ALIGN - 1)) & ~(uintptr_t)(JAI_ARENA_ALIGN - 1);
-
-    b->next      = NULL;
-    b->base      = (uint8_t *)aligned;
-    b->capacity  = total - (size_t)(aligned - (uintptr_t)b);
-    b->used      = 0;
-    b->allocSize = total;
-
-    arena->totalBytes += total;
-    return b;
-}
-
-void jaiArenaInit(JaiArena *arena, size_t blockSize) {
-    if (arena == NULL) return;
-    arena->head       = NULL;
-    arena->blockSize  = blockSize > 0 ? blockSize : JAI_ARENA_DEFAULT_BLOCK;
-    arena->totalBytes = 0;
-}
-
-void *jaiArenaAlloc(JaiArena *arena, size_t size) {
-    if (arena == NULL) return NULL;
-    if (arena->blockSize == 0)
-        arena->blockSize = JAI_ARENA_DEFAULT_BLOCK;
-
-    if (size == 0) size = 1;
-    size = alignUpSize(size);
-
-    JaiArenaBlock *b = arena->head;
-
-    if (JAI_UNLIKELY(b == NULL || b->capacity - b->used < size)) {
-        JaiArenaBlock *prev = b;
-        JaiArenaBlock *scan = b != NULL ? b->next : NULL;
-
-        while (scan != NULL && scan->capacity - scan->used < size) {
-            prev = scan;
-            scan = scan->next;
-        }
-
-        if (scan != NULL) {
-            prev->next = scan->next;
-            scan->next = arena->head;
-            arena->head = scan;
-            b = scan;
-        } else if (size > arena->blockSize) {
-            b = arenaNewBlock(arena, size);
-
-            if (arena->head == NULL) {
-                arena->head = b;
-            } else {
-                b->next = arena->head->next;
-                arena->head->next = b;
-            }
-        } else {
-            b = arenaNewBlock(arena, arena->blockSize);
-            b->next = arena->head;
-            arena->head = b;
-        }
-    }
-
-    void *p = b->base + b->used;
-    b->used += size;
-    return p;
-}
-
-void *jaiArenaAllocZeroed(JaiArena *arena, size_t size) {
-    void *p = jaiArenaAlloc(arena, size);
-    if (p != NULL && size > 0) memset(p, 0, size);
-    return p;
-}
-
-char *jaiArenaMemdup(JaiArena *arena, const char *s, size_t n) {
-    if (s == NULL) return NULL;
-
-    char *copy = (char *)jaiArenaAlloc(arena, n + 1);
-    if (copy == NULL) return NULL;
-    if (n > 0) memcpy(copy, s, n);
-    copy[n] = '\0';
-    return copy;
-}
-
-void jaiArenaReset(JaiArena *arena) {
-    if (arena == NULL) return;
-    for (JaiArenaBlock *b = arena->head; b != NULL; b = b->next) b->used = 0;
-}
-
-void jaiArenaFree(JaiArena *arena) {
-    if (arena == NULL) return;
-
-    JaiArenaBlock *b = arena->head;
-    while (b != NULL) {
-        JaiArenaBlock *next = b->next;
-        jaiRealloc(b, b->allocSize, 0);
-        b = next;
-    }
-    arena->head       = NULL;
-    arena->totalBytes = 0;
-}
-
-/* ------------------------------------------------------------------ */
 /* Byte buffer                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -462,22 +335,6 @@ void jaiBufWriteU16(JaiBuf *b, uint16_t v) {
     b->count = count + 2;
 }
 
-void jaiBufWriteU24(JaiBuf *b, uint32_t v) {
-    if (b == NULL) return;
-    if (JAI_UNLIKELY(v > 0xFFFFFFu))
-        JAI_PANIC("u24 operand out of range: %u", v);
-
-    const size_t count = b->count;
-    if (JAI_UNLIKELY(b->capacity - count < 3))
-        jaiBufReserve(b, 3);
-
-    uint8_t *p = b->data + count;
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16);
-    b->count = count + 3;
-}
-
 void jaiBufWriteU32(JaiBuf *b, uint32_t v) {
     if (b == NULL) return;
 
@@ -511,8 +368,6 @@ void jaiBufWriteU64(JaiBuf *b, uint64_t v) {
     p[7] = (uint8_t)(v >> 56);
     b->count = count + 8;
 }
-
-void jaiBufWriteI16(JaiBuf *b, int16_t v) { jaiBufWriteU16(b, (uint16_t)v); }
 
 void jaiBufWriteF64(JaiBuf *b, double v) {
     uint64_t bits;

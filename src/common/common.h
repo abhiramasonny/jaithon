@@ -161,31 +161,6 @@ JAI_INLINE void jaiHeapAccountFreed(size_t total) {
     jaiHeapBytes = total > jaiHeapBytes ? 0 : jaiHeapBytes - total;
 }
 
-
-/* ------------------------------------------------------------------ */
-/* Arena — bump allocator for AST nodes and other phase-scoped data    */
-/* ------------------------------------------------------------------ */
-
-typedef struct JaiArenaBlock JaiArenaBlock;
-
-typedef struct {
-    JaiArenaBlock *head;
-    size_t blockSize;
-    size_t totalBytes;
-} JaiArena;
-
-void  jaiArenaInit(JaiArena *arena, size_t blockSize);
-void *jaiArenaAlloc(JaiArena *arena, size_t size);
-void *jaiArenaAllocZeroed(JaiArena *arena, size_t size);
-char *jaiArenaMemdup(JaiArena *arena, const char *s, size_t n);
-void  jaiArenaReset(JaiArena *arena);
-void  jaiArenaFree(JaiArena *arena);
-
-#define JAI_ARENA_NEW(arena, type)                                             \
-    ((type *)jaiArenaAllocZeroed((arena), sizeof(type)))
-#define JAI_ARENA_NEW_ARRAY(arena, type, n)                                    \
-    ((type *)jaiArenaAllocZeroed((arena), sizeof(type) * (size_t)(n)))
-
 /* ------------------------------------------------------------------ */
 /* Byte buffer — growable byte/char sequence                           */
 /* ------------------------------------------------------------------ */
@@ -204,10 +179,8 @@ void   jaiBufAppend(JaiBuf *b, const void *bytes, size_t n);
 void   jaiBufAppendStr(JaiBuf *b, const char *s);
 void   jaiBufPrintf(JaiBuf *b, const char *fmt, ...) JAI_PRINTF(2, 3);
 void   jaiBufWriteU16(JaiBuf *b, uint16_t v);   /* little-endian */
-void   jaiBufWriteU24(JaiBuf *b, uint32_t v);
 void   jaiBufWriteU32(JaiBuf *b, uint32_t v);
 void   jaiBufWriteU64(JaiBuf *b, uint64_t v);
-void   jaiBufWriteI16(JaiBuf *b, int16_t v);
 void   jaiBufWriteF64(JaiBuf *b, double v);
 char  *jaiBufTakeCString(JaiBuf *b, size_t *outLen);
 
