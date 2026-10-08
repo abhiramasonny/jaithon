@@ -87,6 +87,28 @@ linear helpers (`add_bias`, `linear_scores`, `soft_threshold`,
 `column_norms`), and `Descent`, which is why every iterative fit in the
 package reports `n_iter` and `converged` the same way.
 
+`linear.jai` holds `StandardScaler`, `Ridge`, `linear_regression` and
+`LogisticRegression` (scikit-learn's L2 objective: Newton for two classes up
+to `JAILEARN_NEWTON_MAX_ORDER` (64) coefficients, each iteration one product
+that yields the weighted Hessian, the gradient and the loss together; L-BFGS
+with a device gradient past that and for the multinomial case; `solver`
+takes scikit-learn's `"lbfgs"` or `"newton-cholesky"` to choose by hand);
+`neighbors.jai` holds `KNeighborsClassifier` and `KNeighborsRegressor`, a
+brute-force search built on `nearest_rows`. Rows of at most `DIRECT_WIDTH`
+(8) features are compared term by term in one pass, for `k` up to
+`TOPK_ONE_PASS_MAX` (32); wider ones, and a larger `k`, take one GEMM
+per band of queries and a one-pass top-k that ranks the raw product, so the
+distance matrix is never finished or held whole, and the rows it picks get
+their distances recomputed term by term (`refine_nearest`). The expanded form
+`|a|^2 + |b|^2 - 2 a.b` rounds at the scale of the squared norms, so the
+neighbour index centres the training rows on their means at `fit` and every
+query batch on the same means: on fifty features a thousand from the origin
+that took the right-neighbour rate from 17% to all of them. A query holding a
+NaN or an infinity has no neighbours and predicts NaN.
+
+Every public estimator implements `Estimator`, so each goes into a `Pipeline`
+or `make_pipeline` as written above, `import jailearn as jl` and all.
+
 `pipeline.jai` composes estimators: `Pipeline`, `ColumnTransformer` and
 `FeatureUnion`, with `__` routing a parameter down to a named step.
 
@@ -98,6 +120,24 @@ Metal entry points are prefixed with their module's short name —
 `base_column_reduce`, `sh_histogram`, `svm_smo_gradient` — because
 `base.cached_kernel(source, entry)` caches on the entry name alone and two
 modules that both picked `assign` would silently share one kernel.
+
+## Switches
+
+Fast paths with an older path beside them, kept one environment variable away
+so a change can be measured as an A/B in one binary. Each is read once, when
+its module loads, and is on unless set to `0`.
+
+| Switch | Off restores |
+| --- | --- |
+| `JAILEARN_HOST_SOLVE` | the device Cholesky factor and substitutions (two dispatches a column, one a row) for every order, instead of reading a system of order up to `HOST_SOLVE_ORDER` (256) back and solving it on the host in double precision; 50x50 goes from about 200 dependent dispatches to one read back |
+| `JAILEARN_COLUMN_TILES` | one threadgroup per column striding the samples, two passes, for `column_moments`, `column_min_max` and `masked_column_mean`, instead of a grid of row tiles by column spans read as whole consecutive rows, folded per tile with Welford's update relative to each column's first sample, and merged by Chan's rule in a second small dispatch |
+| `JAILEARN_ROW_TOPK` | one thread per row making `k` passes (`base_row_topk`) for every `k`, instead of a threadgroup per row folding its columns in one coalesced pass into per-thread registers and merging the heads, for `k` up to `TOPK_ONE_PASS_MAX` (32); the same tie order, so the same answer. It also turns `nearest_rows` back into a finished distance matrix and a separate top-k, except the term-by-term search for narrow rows, which has no finished matrix to go back to |
+| `JAILEARN_RIDGE_PACKED` | `Ridge.fit` as a centred copy of `X`, then `XT X` and `XT y` as two products at the feature width (off the GEMM's fast route at widths not divisible by four), with the means read back before centring and the target summed on the host, instead of one product over a packed `[Xc \| yc \| 0..]` four-aligned operand and one wait |
+| `JAILEARN_LOGIT_FUSED` | a separate product for `LogisticRegression`'s margins each Newton iteration, instead of taking each row's margin inside the row kernel |
+| `JAILEARN_HASH_LABELS` | `distinct_values` as a device bitonic sort of the labels (a dispatch per network stage) and an atomic compaction, and `LabelIndex.fit_codes` as `encode` with its reduction and wait, instead of one pass into a 8192-slot open-addressed table that also refuses a NaN label |
+| `JAILEARN_NEAREST_EXACT` | `nearest_rows` and the neighbour estimators as the expanded-form GEMM search alone, `row_topk(pairwise_sqdist(a, b))` exactly, instead of a term-by-term search for rows of at most `DIRECT_WIDTH` features (and `k` up to `TOPK_ONE_PASS_MAX`) and, otherwise, a search over training rows and queries centred on the training means with the picked rows' distances recomputed term by term |
+| `JAILEARN_NEWTON_MAX_ORDER` | not on/off: the largest coefficient count a two-class `LogisticRegression(solver="auto")` fits by Newton's method (default 64); past it, L-BFGS. The host factor of Newton's Hessian is cubic in it |
+| `JAILEARN_SCALER_ON_DEVICE` | reading the moments back and building `StandardScaler`'s state on the host, two waits on the device per `fit_transform`, instead of one in-place kernel and no wait |
 
 ## Tests
 

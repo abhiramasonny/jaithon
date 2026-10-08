@@ -8,9 +8,14 @@
 #: `clone_unfitted` really is unfitted, that `get_params` round-trips through
 #: `set_params`, and that an unfitted estimator refuses rather than guessing.
 import std.gpu as gpu
+import std.math
+from std.os import env_or
 from std.test import assert_eq, assert_near, assert_throws, assert_true
 from jaitensor import Tensor
-from jailearn import EstimatorKind, Ridge, StandardScaler, linear_regression
+from jailearn import Estimator, EstimatorKind, LogisticRegression, Params, Pipeline, Ridge
+from jailearn import StandardScaler
+from jailearn import linear_regression, make_pipeline
+import jailearn as jl
 from jailearn.base import matrix
 
 fn have_gpu() -> bool { return gpu.is_available() }
@@ -185,4 +190,521 @@ fn test_the_estimator_contract_holds() -> void {
     defer { narrow.free() }
     assert_throws(ValueError, || ridge.predict(narrow))
     assert_throws(ValueError, || Ridge(-1.0))
+}
+
+#: Ridge against the normal equations solved on the host in double
+#: precision, at a width the host solve takes and one past it, with features
+#: whose means sit far from their spread -- which is what centring on the
+#: device, before the product, has to survive.
+fn check_ridge_against_host(rows: int, width: int, offset: float) -> void {
+    var values: list[float] = []
+    var target: list[float] = []
+    for i in 0..rows {
+        var total = 0.25
+        for j in 0..width {
+            let wave = math.sin(0.917 * float(i * width + j) + 0.3)
+            values.push(offset + wave)
+            total += wave * math.cos(float(j))
+        }
+        target.push(total + 0.1 * math.sin(3.3 * float(i)))
+    }
+    let x = Tensor([rows, width], values)
+    defer { x.free() }
+    let y = Tensor([rows], target)
+    defer { y.free() }
+    let model = Ridge(2.0)
+    defer { model.free() }
+    model.fit(x, y)
+
+    var centres = [0.0 for _j in 0..width]
+    var middle = 0.0
+    for i in 0..rows {
+        for j in 0..width { centres[j] += values[i * width + j] / float(rows) }
+        middle += target[i] / float(rows)
+    }
+    var system = [0.0 for _s in 0..width * width]
+    var rhs = [0.0 for _s in 0..width]
+    for i in 0..rows {
+        for a in 0..width {
+            let left = values[i * width + a] - centres[a]
+            rhs[a] += left * (target[i] - middle)
+            for b in 0..width {
+                system[a * width + b] += left * (values[i * width + b] - centres[b])
+            }
+        }
+    }
+    for a in 0..width { system[a * width + a] += 2.0 }
+    let want = jl.host_cholesky_solve(system, rhs, width)
+    let coef = model.coef_
+    if coef is not null {
+        let got = coef.download()
+        for j in 0..width { assert_near(got[j], want[j], 2e-3, f"{rows}x{width} coef {j}") }
+    }
+    var intercept = middle
+    for j in 0..width { intercept -= centres[j] * want[j] }
+    assert_near(
+        model.intercept_,
+        intercept,
+        2e-3 * max(1.0, math.fabs(intercept)),
+        f"{width} intercept"
+    )
+}
+
+fn test_ridge_matches_the_host_normal_equations() -> void {
+    if not have_gpu() { return }
+    check_ridge_against_host(500, 7, 0.0)
+    check_ridge_against_host(500, 7, 300.0)
+    #: Few rows, so the product stays under the GEMM tuner's threshold.
+    check_ridge_against_host(60, 259, 0.0)
+}
+
+#: Two hundred rows of five features and labels -1 and 2, built by a formula
+#: so scikit-learn could be run on exactly the same numbers.
+fn logistic_data() -> tuple[Tensor, Tensor] {
+    let rows = 200
+    let width = 5
+    let truth = [1.5, -2.0, 0.7, 0.0, 1.1]
+    var values: list[float] = []
+    var labels: list[float] = []
+    for i in 0..rows {
+        var score = 0.8 * math.sin(5.1 * float(i)) + 0.3
+        for j in 0..width {
+            let wave = math.sin(1.3 * float(i) + 0.7 * float(j))
+            let value = wave + 0.5 * math.cos(0.37 * float(i) * float(j))
+            values.push(value)
+            score += value * truth[j]
+        }
+        labels.push(if score > 0.0 { 2.0 } else { -1.0 })
+    }
+    return (Tensor([rows, width], values), Tensor([rows], labels))
+}
+
+#: Against scikit-learn's `LogisticRegression(C, fit_intercept, tol=1e-12)`,
+#: which converged to the optimum these coefficients are, at three settings.
+fn test_logistic_regression_matches_sklearn() -> void {
+    if not have_gpu() { return }
+    let (x, y) = logistic_data()
+    defer { x.free() }
+    defer { y.free() }
+    let cases: list[tuple[float, bool, list[float], float]] = [
+        (
+            1.0,
+            true,
+            [
+                0.5267232,
+                -2.6057907,
+                0.5334995,
+                0.3912605,
+                1.3343498,
+            ],
+            2.3092815
+        ),
+        (
+            0.1,
+            true,
+            [
+                -0.3577779,
+                -0.9729115,
+                -0.0144722,
+                0.2627082,
+                0.6384113,
+            ],
+            2.0821466
+        ),
+        (
+            1.0,
+            false,
+            [
+                2.8996225,
+                -2.842107,
+                0.2829699,
+                0.6658263,
+                2.0753875,
+            ],
+            0.0
+        ),
+    ]
+    for (c, intercept, coef, bias) in cases {
+        let model = LogisticRegression(C: c, fit_intercept: intercept)
+        model.fit(x, y)
+        let fitted = model.coef_
+        assert_true(fitted is not null, "fit records coefficients")
+        if fitted is not null {
+            assert_eq(fitted.shape, [1, 5])
+            let got = fitted.download()
+            for (index, want) in coef.enumerate() {
+                assert_near(
+                    got[index],
+                    want,
+                    1e-3 * max(1.0, math.fabs(want)),
+                    f"C {c} coef {index}"
+                )
+            }
+        }
+        assert_near(model.intercept_, bias, 1e-3 * max(1.0, math.fabs(bias)), f"C {c} intercept")
+        assert_true(model.converged_, f"C {c} converged")
+        assert_true(model.n_iter_ < 30, f"C {c} took {model.n_iter_} Newton steps")
+        model.free()
+    }
+
+    let model = LogisticRegression()
+    defer { model.free() }
+    model.fit(x, y)
+    assert_eq(model.kind(), EstimatorKind.Classifier)
+    assert_close(model.classes_, [-1.0, 2.0], "classes_")
+    let head = x.view(0, [6, 5])
+    defer { head.free() }
+    let predicted = model.predict(head)
+    defer { predicted.free() }
+    assert_close(predicted.download(), [2.0, -1.0, -1.0, 2.0, 2.0, 2.0], "predict")
+    let proba = model.predict_proba(head)
+    defer { proba.free() }
+    assert_eq(proba.shape, [6, 2])
+    let shares = proba.download()
+    let want = [0.1159787, 0.8840213, 0.7546127, 0.2453873, 0.5703635, 0.4296365]
+    for index in 0..6 { assert_near(shares[index], want[index], 1e-4, f"predict_proba {index}") }
+    let scores = model.decision_function(head)
+    defer { scores.free() }
+    assert_near(scores.download()[0], math.log(0.8840213 / 0.1159787), 1e-3, "decision_function")
+}
+
+#: Three classes from the same rows: scikit-learn's multinomial fit
+#: (`tol=1e-12`), at two settings, coefficients and intercepts.
+fn test_multinomial_logistic_regression_matches_sklearn() -> void {
+    if not have_gpu() { return }
+    let (x, _two) = logistic_data()
+    defer { x.free() }
+    defer { _two.free() }
+    let weights = [
+        [1.0, -0.5, 0.3, 0.0, 0.8],
+        [-0.7, 1.2, 0.0, 0.4, -0.3],
+        [0.2, 0.1, -1.1, 0.9, 0.0],
+    ]
+    let values = x.download()
+    var labels: list[float] = []
+    for i in 0..200 {
+        var best = 0
+        var top = -1.0e30
+        for k in 0..3 {
+            var score = 0.6 * math.sin(2.7 * float(i) + 1.9 * float(k))
+            for j in 0..5 { score += values[i * 5 + j] * weights[k][j] }
+            if score > top {
+                top = score
+                best = k
+            }
+        }
+        labels.push([5.0, 7.0, 9.0][best])
+    }
+    let y = Tensor([200], labels)
+    defer { y.free() }
+    let cases: list[tuple[float, bool, list[float], list[float]]] = [
+        (
+            1.0,
+            true,
+            [
+                0.921495,
+                -1.1577,
+                0.745035,
+                -0.690657,
+                0.773432,
+                -0.912808,
+                1.500597,
+                0.829982,
+                -0.074597,
+                -0.483631,
+                -0.008687,
+                -0.342898,
+                -1.575017,
+                0.765254,
+                -0.289802,
+            ],
+            [
+                0.46118,
+                -0.646521,
+                0.185341,
+            ]
+        ),
+        (
+            0.3,
+            false,
+            [
+                1.050079,
+                -0.897648,
+                0.564756,
+                -0.404177,
+                0.72196,
+                -1.047837,
+                1.129401,
+                0.582024,
+                -0.140759,
+                -0.505767,
+                -0.002242,
+                -0.231753,
+                -1.14678,
+                0.544936,
+                -0.216193,
+            ],
+            [0.0, 0.0, 0.0]
+        ),
+    ]
+    for (c, intercept, coef, bias) in cases {
+        let model = LogisticRegression(C: c, fit_intercept: intercept, tol: 1.0e-7, max_iter: 500)
+        model.fit(x, y)
+        assert_true(model.converged_, f"C {c} converged in {model.n_iter_}")
+        let fitted = model.coef_
+        if fitted is not null {
+            assert_eq(fitted.shape, [3, 5])
+            let got = fitted.download()
+            for (index, want) in coef.enumerate() {
+                assert_near(
+                    got[index],
+                    want,
+                    1e-3 * max(1.0, math.fabs(want)),
+                    f"C {c} coef {index}"
+                )
+            }
+        }
+        for (index, want) in bias.enumerate() {
+            assert_near(model.intercepts_[index], want, 1e-3, f"C {c} intercept {index}")
+        }
+        model.free()
+    }
+
+    let model = LogisticRegression(tol: 1.0e-7, max_iter: 500)
+    defer { model.free() }
+    model.fit(x, y)
+    assert_close(model.classes_, [5.0, 7.0, 9.0], "classes_")
+    let head = x.view(0, [6, 5])
+    defer { head.free() }
+    let predicted = model.predict(head)
+    defer { predicted.free() }
+    assert_close(predicted.download(), [7.0, 7.0, 9.0, 9.0, 5.0, 5.0], "multinomial predict")
+    let proba = model.predict_proba(head)
+    defer { proba.free() }
+    assert_eq(proba.shape, [6, 3])
+    let shares = proba.download()
+    let want = [0.273362, 0.69505, 0.031588, 0.276119, 0.667641, 0.05624]
+    for index in 0..6 {
+        assert_near(shares[index], want[index], 1e-4, f"multinomial proba {index}")
+    }
+    let scores = model.decision_function(head)
+    defer { scores.free() }
+    assert_eq(scores.shape, [6, 3])
+}
+
+fn test_logistic_regression_keeps_the_contract() -> void {
+    if not have_gpu() { return }
+    let (x, y) = logistic_data()
+    defer { x.free() }
+    defer { y.free() }
+    let model = LogisticRegression(C: 0.5, max_iter: 50)
+    defer { model.free() }
+    assert_throws(RuntimeError, || model.predict(x))
+    model.fit(x, y)
+    assert_eq(model.feature_count(), 5)
+    let other = LogisticRegression()
+    defer { other.free() }
+    other.set_params(model.get_params())
+    assert_near(other.C, 0.5, 1e-12, "set_params reads C")
+    assert_eq(other.max_iter, 50)
+    let fresh = model.clone_unfitted()
+    defer { fresh.free() }
+    assert_true(not fresh.is_fitted(), "a clone is unfitted")
+    assert_throws(ValueError, || LogisticRegression(C: 0.0))
+
+    let one = Tensor([200], [4.0 for _i in 0..200])
+    defer { one.free() }
+    assert_throws(ValueError, || model.fit(x, one))
+
+    #: One step cannot converge, and says so.
+    let short = LogisticRegression(max_iter: 1)
+    defer { short.free() }
+    short.fit(x, y)
+    assert_true(not short.converged_, "one Newton step is not convergence")
+
+    let piped = make_pipeline([StandardScaler(), LogisticRegression()])
+    defer { piped.free() }
+    piped.fit(x, y)
+    assert_true(piped.score(x, y) > 0.8, "a scaled logistic regression fits its own data")
+}
+
+#: The package's own estimators have to go into its own pipeline. Both of these
+#: once lacked the `Estimator` conformance, so `make_pipeline` refused them
+#: with a TypeError, while the suite stayed green because only test-local
+#: estimators had ever been piped.
+fn test_a_pipeline_takes_the_real_estimators() -> void {
+    if not have_gpu() { return }
+    let x = sample()
+    defer { x.free() }
+    let y = target()
+    defer { y.free() }
+
+    let scaler = StandardScaler()
+    defer { scaler.free() }
+    let ridge = Ridge(1.0)
+    defer { ridge.free() }
+    let scaled = scaler.fit_transform(x)
+    defer { scaled.free() }
+    ridge.fit(scaled, y)
+    let alone = ridge.predict(scaled)
+    defer { alone.free() }
+
+    let piped = make_pipeline([StandardScaler(), Ridge(1.0)])
+    defer { piped.free() }
+    piped.fit(x, y)
+    assert_eq(piped.kind(), EstimatorKind.Regressor)
+    let together = piped.predict(x)
+    defer { together.free() }
+    assert_close(together.download(), alone.download(), "piped predictions")
+    assert_near(piped.score(x, y), ridge.score(scaled, y), 1e-5, "piped score")
+
+    #: Named steps, and a parameter routed down to one of them.
+    let named = Pipeline([("scale", StandardScaler()), ("ridge", Ridge(5.0))])
+    defer { named.free() }
+    let routed_alpha: Params = {"ridge__alpha": 1.0}
+    named.set_params(routed_alpha)
+    named.fit(x, y)
+    let routed = named.predict(x)
+    defer { routed.free() }
+    assert_close(routed.download(), alone.download(), "routed alpha")
+
+    #: And as plain trait values, which is what a search holds.
+    let generic: Estimator = StandardScaler(false, true)
+    defer { generic.free() }
+    let copy = generic.clone_unfitted()
+    defer { copy.free() }
+    assert_true(not copy.is_fitted(), "a cloned scaler is unfitted")
+}
+
+#: Prediction hands back a tensor that owns its storage. A one-target score
+#: was a `jt.reshape` of the product, which is a view: freeing it never freed
+#: the product, so every `predict`, `predict_proba` and `decision_function`
+#: of a two-class logistic regression -- and every `Ridge.predict` -- left one
+#: buffer behind.
+fn test_predictions_release_everything_they_allocate() -> void {
+    if not have_gpu() { return }
+    let (x, y) = logistic_data()
+    defer { x.free() }
+    defer { y.free() }
+    let model = LogisticRegression()
+    defer { model.free() }
+    model.fit(x, y)
+    let ridge = Ridge(1.0)
+    defer { ridge.free() }
+    ridge.fit(x, y)
+    gpu.synchronize()
+    let before = gpu.live_buffers()
+    for _call in 0..10 {
+        model.decision_function(x).free()
+        model.predict(x).free()
+        model.predict_proba(x).free()
+        ridge.predict(x).free()
+    }
+    gpu.synchronize()
+    assert_eq(gpu.live_buffers(), before, "live buffers after forty predictions")
+    let scores = model.decision_function(x)
+    defer { scores.free() }
+    assert_eq(scores.shape, [200], "two-class scores are one per sample")
+    let fitted = ridge.predict(x)
+    defer { fitted.free() }
+    assert_eq(fitted.shape, [200], "ridge predicts one value per sample")
+}
+
+fn wide_logistic_data(rows: int, width: int) -> tuple[Tensor, Tensor] {
+    var values: list[float] = []
+    var labels: list[float] = []
+    for i in 0..rows {
+        var score = 0.6 * math.sin(3.7 * float(i))
+        for j in 0..width {
+            let value = math.sin(0.917 * float(i * width + j) + 0.3) + 0.3 * math.cos(float(j))
+            values.push(value)
+            score += value * math.sin(1.7 * float(j)) / math.sqrt(float(width))
+        }
+        labels.push(if score > 0.0 { 1.0 } else { 0.0 })
+    }
+    return (Tensor([rows, width], values), Tensor([rows], labels))
+}
+
+#: Two classes past `JAILEARN_NEWTON_MAX_ORDER` coefficients take L-BFGS:
+#: Newton's Hessian is factored on the host, a cubic cost that at three
+#: hundred features made a fit six times slower than scikit-learn's. Both
+#: solvers reach the same optimum, and the wide fit no longer pays the factor.
+fn test_a_wide_two_class_fit_takes_lbfgs() -> void {
+    if not have_gpu() { return }
+    let (x, y) = wide_logistic_data(1500, 80)
+    defer { x.free() }
+    defer { y.free() }
+    let newton = LogisticRegression(tol: 1.0e-6, solver: "newton-cholesky")
+    defer { newton.free() }
+    newton.fit(x, y)
+    let quasi = LogisticRegression(tol: 1.0e-6, solver: "lbfgs")
+    defer { quasi.free() }
+    quasi.fit(x, y)
+    let chosen = LogisticRegression()
+    defer { chosen.free() }
+    chosen.fit(x, y)
+    assert_eq(newton.solver_, "newton-cholesky", "asked for Newton")
+    assert_eq(quasi.solver_, "lbfgs", "asked for L-BFGS")
+    #: The crossover can be moved, and the suite is run with it moved.
+    let limit = int(env_or("JAILEARN_NEWTON_MAX_ORDER", "64"))
+    let by_size = fn(order: int) -> str {
+        return if order <= limit {
+            "newton-cholesky"
+        } else {
+            "lbfgs"
+        }
+    }
+    assert_eq(chosen.solver_, by_size(81), "81 coefficients by default")
+    assert_true(quasi.converged_, "L-BFGS converged")
+    #: The features' column means make the intercept and the coefficients
+    #: nearly collinear, so the optimum sits in a valley flat enough that two
+    #: points with a gradient under `tol` differ in the intercept by 6e-3.
+    #: The log-odds they give every sample are what is determined.
+    let first = newton.decision_function(x)
+    defer { first.free() }
+    let second = quasi.decision_function(x)
+    defer { second.free() }
+    let newton_odds = first.download()
+    let quasi_odds = second.download()
+    for index in 0..1500 {
+        assert_near(quasi_odds[index], newton_odds[index], 2.0e-3, f"log-odds of sample {index}")
+    }
+
+    let small = LogisticRegression()
+    defer { small.free() }
+    let (narrow, labels) = logistic_data()
+    defer { narrow.free() }
+    defer { labels.free() }
+    small.fit(narrow, labels)
+    assert_eq(small.solver_, by_size(6), "six coefficients by default")
+    assert_throws(ValueError, || LogisticRegression(solver: "sag"))
+    let tuned = LogisticRegression()
+    defer { tuned.free() }
+    let bad_c: Params = {"C": 0.0}
+    assert_throws(ValueError, || tuned.set_params(bad_c))
+    let bad_iter: Params = {"max_iter": 0}
+    assert_throws(ValueError, || tuned.set_params(bad_iter))
+    let picked: Params = {"solver": "lbfgs"}
+    tuned.set_params(picked)
+    assert_eq(tuned.clone_unfitted().solver, "lbfgs", "the solver survives a clone")
+}
+
+#: A NaN in X is refused as bad input by every solver, where the multinomial
+#: fit used to die inside its line search on a comparison with a NaN.
+fn test_logistic_regression_refuses_a_nan() -> void {
+    if not have_gpu() { return }
+    let x = jl.matrix([[0.0, 1.0], [1.0, math.NAN], [2.0, 0.5], [3.0, 2.0]])
+    defer { x.free() }
+    let two = jl.vector([0.0, 1.0, 0.0, 1.0])
+    defer { two.free() }
+    let three = jl.vector([0.0, 1.0, 2.0, 1.0])
+    defer { three.free() }
+    for solver in ["newton-cholesky", "lbfgs"] {
+        let model = LogisticRegression(solver: solver)
+        defer { model.free() }
+        assert_throws(ValueError, || model.fit(x, two))
+    }
+    let multinomial = LogisticRegression()
+    defer { multinomial.free() }
+    assert_throws(ValueError, || multinomial.fit(x, three))
 }

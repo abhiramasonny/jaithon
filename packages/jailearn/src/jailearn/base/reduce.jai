@@ -1,14 +1,55 @@
 #: Reductions down a matrix's columns and along its rows, and the sorts underneath.
+from std.gpu import Buffer
+from std.os import env_or
+
 from jaitensor import Tensor
 
 from .kernels import base_kernel
 from .params import check_matrix
+
+#: `JAILEARN_COLUMN_TILES=0` restores one threadgroup per column, striding
+#: the samples, instead of row tiles folded into per-group partials.
+let _COLUMN_TILES = env_or("JAILEARN_COLUMN_TILES", "1") != "0"
+
+#: Elements each thread of a tile should fold before its partial is worth
+#: writing; it sets how many rows a tile holds, and so how many partials are
+#: written for every column -- at most one per `TILE_WORK` values read.
+const TILE_WORK: int = 32
+const MAX_TILES: int = 1024
+const TILE_GROUP: int = 256
 
 fn column_reduce(x: Tensor, mask: Tensor, mode: int, ddof: int) -> tuple[Tensor, Tensor] {
     check_matrix(x)
     let width = x.shape[1]
     let first = Tensor([width])
     let second = Tensor([width])
+    if _COLUMN_TILES {
+        let rows = x.shape[0]
+        #: A group lays `span` columns across its threads and `lanes` rows
+        #: deep; a tile of `lanes * TILE_WORK` rows gives every thread
+        #: `TILE_WORK` values. Cutting by rows alone made a wide, short matrix
+        #: a tile per row, and a partials buffer three times its size.
+        let span = min(width, TILE_GROUP)
+        let lanes = TILE_GROUP // span
+        let chunks = (width + span - 1) // span
+        let tile = max(lanes * TILE_WORK, (rows + MAX_TILES - 1) // MAX_TILES)
+        let tiles = max(1, (rows + tile - 1) // tile)
+        let partials = Tensor([width * tiles * 3])
+        base_kernel("base_column_partials").dispatch_async(
+            [x.buffer(), mask.buffer(), partials.buffer()],
+            tiles * chunks * TILE_GROUP,
+            [rows, width, mode, tile, tiles],
+            group_size: TILE_GROUP
+        )
+        base_kernel("base_column_finish").dispatch_async(
+            [partials.buffer(), first.buffer(), second.buffer(), x.buffer()],
+            width * TILE_GROUP,
+            [width, mode, tiles, max(ddof, 0)],
+            group_size: TILE_GROUP
+        )
+        partials.free()
+        return (first, second)
+    }
     base_kernel("base_column_reduce").dispatch_async(
         [x.buffer(), mask.buffer(), first.buffer(), second.buffer()],
         width * 256,
@@ -167,14 +208,106 @@ pub fn row_argmin(m: Tensor) -> Tensor {
     return index
 }
 
+#: `JAILEARN_ROW_TOPK=0` restores one thread per row making `k` passes, for
+#: every `k`, instead of the one-pass threadgroup kernel.
+let _ROW_TOPK = env_or("JAILEARN_ROW_TOPK", "1") != "0"
+
+#: The largest `k` the one-pass kernel holds in registers; beyond it
+#: `row_topk` makes `k` passes, which at that size is a partial sort anyway.
+pub const TOPK_ONE_PASS_MAX: int = 32
+
+fn topk_capacity(k: int) -> int {
+    var capacity = 4
+    while capacity < k { capacity *= 2 }
+    return capacity
+}
+
+#: Threads per row: enough that each folds about sixteen columns, a whole
+#: number of simdgroups, at most a full group.
+fn topk_threads(columns: int) -> int {
+    var threads = 32
+    while threads < 256 and threads * 16 < columns { threads *= 2 }
+    return threads
+}
+
+#: The widest rows `row_topk_into` searches term by term; must match the
+#: kernel's `DIRECT_WIDTH`.
+pub const DIRECT_WIDTH: int = 8
+
+#: Whether `row_topk_into` takes a `k` this large in one pass.
+pub fn topk_one_pass(k: int) -> bool { return _ROW_TOPK and k <= TOPK_ONE_PASS_MAX }
+
+#: Whether the term-by-term search for rows of at most `DIRECT_WIDTH`
+#: features takes a `k` this large. It runs on the one-pass kernel whatever
+#: `JAILEARN_ROW_TOPK` says: that switch restores the old top-k for a
+#: finished matrix, and there is no old kernel for a search that never
+#: finishes one -- without it, narrow rows would fall back to the expanded
+#: form this search exists to avoid.
+pub fn direct_search_takes(k: int) -> bool { return k <= TOPK_ONE_PASS_MAX }
+
+#: Write the best `k` of each of `rows` rows of `m` into rows `first..` of
+#: `values` and `index`, in one pass (`topk_one_pass(k)` must hold).
+#:
+#: With `left` and `right`, `m` is read as the product `a.bT` and ranked as
+#: the squared distance `left[first + row] + right[column] - 2 m`, clamped at
+#: zero; that is how `distance.nearest_rows` searches without a finishing
+#: pass over the matrix.
+#:
+#: With `direct_width` instead, `m` is the `[columns, direct_width]` training
+#: matrix and `left` the `[rows, direct_width]` queries, and the ranked value
+#: is the squared distance taken term by term (`direct_width` at most
+#: `DIRECT_WIDTH`).
+pub fn row_topk_into(
+    m: Buffer,
+    rows: int,
+    columns: int,
+    k: int,
+    largest: bool,
+    values: Tensor,
+    index: Tensor,
+    first: int = 0,
+    left: Buffer? = null,
+    right: Buffer? = null,
+    direct_width: int = 0
+) -> void {
+    let direct = direct_width > 0
+    if not (if direct { direct_search_takes(k) } else { topk_one_pass(k) }) {
+        throw ValueError(f"k {k} is past the one-pass top-k")
+    }
+    if direct_width > DIRECT_WIDTH {
+        throw ValueError(
+            f"a direct search takes at most {DIRECT_WIDTH} features, got {direct_width}"
+        )
+    }
+    let mode = if direct_width > 0 and left is not null {
+        2
+    } elif left is not null and right is not null {
+        1
+    } else {
+        0
+    }
+    let wanted = if largest { 1 } else { 0 }
+    let threads = topk_threads(columns)
+    base_kernel(f"base_row_topk{topk_capacity(k)}").dispatch_async(
+        [m, values.buffer(), index.buffer(), left ?? m, right ?? m],
+        rows * threads,
+        [rows, columns, k, wanted, mode, first, direct_width],
+        group_size: threads
+    )
+}
+
 #: The `k` best entries of every row: `(values, indices)`, both `[n_rows, k]`.
 #: `largest` false picks the smallest, which is what a neighbour search wants
-#: out of a distance matrix.
+#: out of a distance matrix. Equal values come out smallest column first.
 pub fn row_topk(m: Tensor, k: int, largest: bool = true) -> tuple[Tensor, Tensor] {
     check_matrix(m, "m")
     if k <= 0 or k > m.shape[1] { throw ValueError(f"cannot take {k} of {m.shape[1]} columns") }
     let values = Tensor([m.shape[0], k])
     let index = Tensor([m.shape[0], k])
+    if topk_one_pass(k) {
+        row_topk_into(m.buffer(), m.shape[0], m.shape[1], k, largest, values, index)
+        return (values, index)
+    }
     let wanted = if largest { 1 } else { 0 }
     base_kernel("base_row_topk").dispatch_async(
         [m.buffer(), values.buffer(), index.buffer()],

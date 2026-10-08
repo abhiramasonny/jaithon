@@ -1190,7 +1190,17 @@ pub fn add_bias(x: Tensor) -> Tensor {
 #: `null`, which is scikit-learn's shape for both. A one-target model passes a
 #: one-row `coef` and squeezes the answer rather than getting a different shape
 #: back, so the linear models and the logistic regressions share this call.
-pub fn linear_scores(x: Tensor, coef: Tensor, intercept: Tensor? = null) -> Tensor {
+#:
+#: `flat` asks a one-target model for `[n_samples]` directly. The product is
+#: written through a `[n_samples, 1]` view of that tensor, so what comes back
+#: owns its storage: squeezing with `jt.reshape` afterwards hands out a view
+#: whose `free` never releases the product, which leaked one buffer a call.
+pub fn linear_scores(
+    x: Tensor,
+    coef: Tensor,
+    intercept: Tensor? = null,
+    flat: bool = false
+) -> Tensor {
     check_matrix(x)
     check_matrix(coef, "coef")
     if coef.shape[1] != x.shape[1] {
@@ -1200,7 +1210,13 @@ pub fn linear_scores(x: Tensor, coef: Tensor, intercept: Tensor? = null) -> Tens
     if bias is not null and bias.size != coef.shape[0] {
         throw ValueError(f"{bias.size} intercepts for {coef.shape[0]} targets")
     }
-    let out = jt.matmul(x, coef, trans_b: true)
+    if flat and coef.shape[0] != 1 {
+        throw ValueError(f"a flat score needs one target, coef has {coef.shape[0]}")
+    }
+    let out = if flat { Tensor([x.shape[0]]) } else { Tensor([x.shape[0], coef.shape[0]]) }
+    let shaped = out.view(0, [x.shape[0], coef.shape[0]])
+    jt.matmul(x, coef, trans_b: true, out: shaped)
+    shaped.free()
     if bias is not null {
         shared_kernel("sh_add_row_vector").dispatch_async(
             [out.buffer(), bias.buffer()],

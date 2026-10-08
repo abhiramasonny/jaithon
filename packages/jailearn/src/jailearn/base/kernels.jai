@@ -175,6 +175,169 @@ kernel void base_column_reduce(device const float* x [[buffer(0)]],
     second[column] = squares / float(max(rows - min(ddof, rows), 1u));
 }
 
+/* Fold one partial column statistic `(a, b, c)` into another.
+ *
+ * Mode 0 carries `(count, mean, M2)` and merges by Chan's rule, which is
+ * Welford's update between two groups: one pass, and no partial ever holds a
+ * raw sum of squares. That alone is NOT as stable as the two passes
+ * `base_column_reduce` makes -- a float32 running mean rounds at the ulp of
+ * the mean, so a column whose mean dwarfs its spread lost up to two hundred
+ * times the variance's accuracy -- which is why every value is folded
+ * relative to its column's first sample (see `base_column_partials`). Mode 1
+ * carries `(min, max)` and mode 2 `(count, sum)`. */
+static inline void column_fold(
+    thread float &a,
+    thread float &b,
+    thread float &c,
+    float a2,
+    float b2,
+    float c2,
+    uint mode
+) {
+    if (mode == 1u) { a = min(a, a2); b = max(b, b2); return; }
+    if (mode == 2u) { a += a2; b += b2; return; }
+    float total = a + a2;
+    if (total == 0.0f) return;
+    float delta = b2 - b;
+    b += delta * (a2 / total);
+    c += c2 + delta * delta * (a * (a2 / total));
+    a = total;
+}
+
+/* One tile of rows and one span of columns, as a partial statistic per
+ * column.
+ *
+ * `base_column_reduce` puts a threadgroup on each column, which is as many
+ * threadgroups as the data has features -- fifty, on a machine that wants
+ * thousands of threads -- and has each read with the row width as its stride.
+ * Here the threads of a group sit across the columns instead (`span` of them,
+ * then the next row in the next `span`), so a group's reads are whole
+ * consecutive rows. The groups form a grid of row tiles by column spans:
+ * group `g` takes tile `g / chunks` and span `g % chunks`, so a wide matrix
+ * with few rows still gets a group per span rather than a handful of groups
+ * walking every span in turn. Each thread folds its column's values with
+ * Welford's update, the group's lanes fold together in threadgroup memory,
+ * and lane 0 writes the tile's partial for the column at
+ * `partials[(column * tiles + tile) * 3]`.
+ *
+ * Mode 0 folds `value - x[column]`, the column's first sample: every tile
+ * shares that shift, so Chan's merge is unchanged, and `base_column_finish`
+ * adds it back to the mean. A shifted column's mean is of the order of its
+ * spread, so the running mean no longer rounds at the scale of an offset the
+ * variance does not depend on. */
+kernel void base_column_partials(device const float* x [[buffer(0)]],
+                                 device const float* mask [[buffer(1)]],
+                                 device float* partials [[buffer(2)]],
+                                 constant uint& rows [[buffer(3)]],
+                                 constant uint& width [[buffer(4)]],
+                                 constant uint& mode [[buffer(5)]],
+                                 constant uint& tile [[buffer(6)]],
+                                 constant uint& tiles [[buffer(7)]],
+                                 uint group [[threadgroup_position_in_grid]],
+                                 uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float first[GROUP];
+    threadgroup float second[GROUP];
+    threadgroup float third[GROUP];
+    uint span = min(width, GROUP);
+    uint lanes = GROUP / span;
+    uint lane = lid / span;
+    uint offset = lid - lane * span;
+    uint chunks = (width + span - 1u) / span;
+    uint which = group / chunks;
+    uint column = (group - which * chunks) * span + offset;
+    uint start = which * tile;
+    uint stop = min(start + tile, rows);
+    bool live = lane < lanes && column < width;
+    float a = mode == 1u ? INFINITY : 0.0f;
+    float b = mode == 1u ? -INFINITY : 0.0f;
+    float c = 0.0f;
+    if (live) {
+        float shift = mode == 0u && rows > 0u ? x[column] : 0.0f;
+        for (uint row = start + lane; row < stop; row += lanes) {
+            uint at = row * width + column;
+            float value = x[at];
+            if (mode == 1u) {
+                a = min(a, value);
+                b = max(b, value);
+            } else if (mode == 2u) {
+                if (mask[at] != 0.0f) continue;
+                a += 1.0f;
+                b += value;
+            } else {
+                value -= shift;
+                a += 1.0f;
+                float delta = value - b;
+                b += delta / a;
+                c += delta * (value - b);
+            }
+        }
+    }
+    first[lid] = a;
+    second[lid] = b;
+    third[lid] = c;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (live && lane == 0u) {
+        for (uint other = 1u; other < lanes; ++other) {
+            uint slot = other * span + offset;
+            column_fold(a, b, c, first[slot], second[slot], third[slot], mode);
+        }
+        uint at = (column * tiles + which) * 3u;
+        partials[at] = a;
+        partials[at + 1u] = b;
+        partials[at + 2u] = c;
+    }
+}
+
+/* Every column's partials folded into its answer, a threadgroup a column:
+ * each thread folds a stride of the partials and the group folds the threads
+ * as a tree. Writes what `base_column_reduce` writes for the same mode. */
+kernel void base_column_finish(device const float* partials [[buffer(0)]],
+                               device float* out_first [[buffer(1)]],
+                               device float* out_second [[buffer(2)]],
+                               device const float* x [[buffer(3)]],
+                               constant uint& width [[buffer(4)]],
+                               constant uint& mode [[buffer(5)]],
+                               constant uint& groups [[buffer(6)]],
+                               constant uint& ddof [[buffer(7)]],
+                               uint column [[threadgroup_position_in_grid]],
+                               uint lid [[thread_index_in_threadgroup]]) {
+    threadgroup float first[GROUP];
+    threadgroup float second[GROUP];
+    threadgroup float third[GROUP];
+    if (column >= width) return;
+    float a = mode == 1u ? INFINITY : 0.0f;
+    float b = mode == 1u ? -INFINITY : 0.0f;
+    float c = 0.0f;
+    for (uint group = lid; group < groups; group += GROUP) {
+        uint at = (column * groups + group) * 3u;
+        column_fold(a, b, c, partials[at], partials[at + 1u], partials[at + 2u], mode);
+    }
+    first[lid] = a;
+    second[lid] = b;
+    third[lid] = c;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint half_span = GROUP / 2u; half_span > 0u; half_span >>= 1) {
+        if (lid < half_span) {
+            column_fold(a, b, c, first[lid + half_span], second[lid + half_span],
+                        third[lid + half_span], mode);
+            first[lid] = a;
+            second[lid] = b;
+            third[lid] = c;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid != 0u) return;
+    if (mode == 1u) { out_first[column] = a; out_second[column] = b; return; }
+    if (mode == 2u) {
+        /* As in `base_column_reduce`: nothing left averages to zero. */
+        out_first[column] = a > 0.0f ? b / a : 0.0f;
+        return;
+    }
+    /* `base_column_partials` folded every value less the first sample. */
+    out_first[column] = a > 0.0f ? b + x[column] : 0.0f;
+    out_second[column] = c / max(a - float(min(ddof, uint(a))), 1.0f);
+}
+
 /* Every column copied into a power-of-two tall scratch, the pad set to
  * infinity so it sorts past the real values and never reaches an answer. */
 kernel void base_pad_columns(device const float* x [[buffer(0)]],
@@ -335,6 +498,218 @@ kernel void base_row_topk(device const float* m [[buffer(0)]],
     }
 }
 
+/* Whether `(s, i)` outranks `(t, j)`: the larger score, and on a tie the
+ * smaller column. Every top-k here ranks by this one rule, so the tie order
+ * is the same whichever kernel answered. */
+static inline bool topk_before(float s, uint i, float t, uint j) {
+    return s > t || (s == t && i < j);
+}
+
+/* The `k` best entries of each row in one pass, a threadgroup a row.
+ *
+ * `base_row_topk` gives a row one thread and `k` passes over it, so a
+ * thousand-row distance matrix ran on a thousand threads making five strided
+ * sweeps each. Here a row's threads take its columns a group-width apart --
+ * adjacent threads, adjacent columns, so the reads coalesce -- and each keeps
+ * its own best `K` in registers: `K` is a template constant so the insertion
+ * below unrolls onto fixed slots, and a runtime `k` at most `K` reads only the
+ * head of it. Then `k` rounds pick the best head across the group, a simd
+ * butterfly and one slot per simdgroup in threadgroup memory, and the thread
+ * that owned the winner pops it. Ranking is `topk_before` on `sign * value`,
+ * so equal values come out smallest column first, as `base_row_topk` does.
+ *
+ * `fused` reads `m` as the raw product `a.bT` and ranks the distance
+ * `max(left[first + row] + right[j] - 2 m, 0)` that `base_dist_finish` would
+ * have written, so a neighbour search never makes that pass over the whole
+ * matrix. Rows are written at `first + row`, which is how a search over bands
+ * of queries fills one answer. A row with fewer than `k` ranked entries pads
+ * with column `columns`, as `base_row_topk` does.
+ *
+ * `fused` 2 is the direct search for narrow rows: `m` is the training matrix
+ * `b`, `left` the queries `a`, both `width <= DIRECT_WIDTH` wide, and the
+ * ranked value is `sum((a_row - b_j)^2)` taken term by term. The expanded
+ * form cancels catastrophically when the squared norms dwarf the distance --
+ * one feature, or a few far from the origin -- and at this width the
+ * difference costs no more than the product would. A query holding a NaN or
+ * an infinity ranks nothing, so its row is all padding. */
+constexpr constant uint DIRECT_WIDTH = 8u;
+
+static inline bool not_finite(float v) {
+    return (as_type<uint>(v) & 0x7F800000u) == 0x7F800000u;
+}
+
+template <uint K>
+kernel void base_row_topk_group(device const float* m [[buffer(0)]],
+                                device float* values [[buffer(1)]],
+                                device float* index [[buffer(2)]],
+                                device const float* left [[buffer(3)]],
+                                device const float* right [[buffer(4)]],
+                                constant uint& rows [[buffer(5)]],
+                                constant uint& columns [[buffer(6)]],
+                                constant uint& k [[buffer(7)]],
+                                constant uint& largest [[buffer(8)]],
+                                constant uint& fused [[buffer(9)]],
+                                constant uint& first [[buffer(10)]],
+                                constant uint& width [[buffer(11)]],
+                                uint row [[threadgroup_position_in_grid]],
+                                uint lid [[thread_index_in_threadgroup]],
+                                uint threads [[threads_per_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint warp [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float heads[32];
+    threadgroup uint owners[32];
+    if (row >= rows) return;
+    const uint none = 0xFFFFFFFFu;
+    float sign = largest != 0u ? 1.0f : -1.0f;
+    float best[K];
+    uint at[K];
+    #pragma unroll
+    for (uint p = 0u; p < K; ++p) { best[p] = -INFINITY; at[p] = none; }
+    device const float* line = m + ulong(row) * ulong(columns);
+    float offset = fused == 1u ? left[first + row] : 0.0f;
+    float q[DIRECT_WIDTH];
+    uint reach = columns;
+    if (fused == 2u) {
+        bool bad = false;
+        #pragma unroll
+        for (uint c = 0u; c < DIRECT_WIDTH; ++c) {
+            q[c] = c < width ? left[ulong(first + row) * ulong(width) + c] : 0.0f;
+            bad = bad || not_finite(q[c]);
+        }
+        if (bad) reach = 0u;
+    }
+    for (uint j = lid; j < reach; j += threads) {
+        float value;
+        if (fused == 2u) {
+            device const float* p = m + ulong(j) * ulong(width);
+            value = 0.0f;
+            #pragma unroll
+            for (uint c = 0u; c < DIRECT_WIDTH; ++c) {
+                if (c < width) {
+                    float gap = q[c] - p[c];
+                    value += gap * gap;
+                }
+            }
+        } else {
+            value = line[j];
+            if (fused == 1u) value = max(offset + right[j] - 2.0f * value, 0.0f);
+        }
+        float s = sign * value;
+        if (!topk_before(s, j, best[K - 1u], at[K - 1u])) continue;
+        best[K - 1u] = s;
+        at[K - 1u] = j;
+        #pragma unroll
+        for (uint p = K - 1u; p > 0u; --p) {
+            if (topk_before(best[p], at[p], best[p - 1u], at[p - 1u])) {
+                float ts = best[p]; best[p] = best[p - 1u]; best[p - 1u] = ts;
+                uint ti = at[p]; at[p] = at[p - 1u]; at[p - 1u] = ti;
+            }
+        }
+    }
+    uint warps = (threads + 31u) / 32u;
+    for (uint slot = 0u; slot < k; ++slot) {
+        float s = best[0];
+        uint i = at[0];
+        for (ushort hop = 16; hop > 0; hop >>= 1) {
+            float s2 = simd_shuffle_xor(s, hop);
+            uint i2 = simd_shuffle_xor(i, hop);
+            if (topk_before(s2, i2, s, i)) { s = s2; i = i2; }
+        }
+        if (lane == 0u) { heads[warp] = s; owners[warp] = i; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float top = heads[0];
+        uint pick = owners[0];
+        for (uint w = 1u; w < warps; ++w) {
+            if (topk_before(heads[w], owners[w], top, pick)) { top = heads[w]; pick = owners[w]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0u) {
+            ulong out = ulong(first + row) * ulong(k) + slot;
+            values[out] = sign * top;
+            index[out] = float(pick == none ? columns : pick);
+        }
+        if (at[0] == pick) {
+            #pragma unroll
+            for (uint p = 0u; p + 1u < K; ++p) { best[p] = best[p + 1u]; at[p] = at[p + 1u]; }
+            best[K - 1u] = -INFINITY;
+            at[K - 1u] = none;
+        }
+    }
+}
+
+/* Each query's `k` neighbours, found by the expanded form, given their exact
+ * squared distances and put back in order, a simdgroup a query.
+ *
+ * `|a|^2 + |b|^2 - 2 a.b` in float32 is wrong by about an ulp of the squared
+ * norms, which is more than the distance between near neighbours once the
+ * norms are large: an exact duplicate came back at a distance of five. The
+ * search already holds the right rows; this recomputes `sum((a - b)^2)` for
+ * just those `k` and sorts them by `(distance, index)`, the order every top-k
+ * here uses. A query holding a NaN or an infinity has no neighbours: every
+ * slot is padded with index `points` and distance infinity.
+ *
+ * The lanes split the features, so each neighbour's row is read as whole
+ * consecutive words and summed with `simd_sum`. A thread a query read the
+ * rows one feature at a time and left most of the device idle: at a
+ * thousand queries of fifty features it took 0.77 ms, a third of the whole
+ * search. Lane 0 then sorts the `k`. */
+kernel void base_nearest_refine(device const float* a [[buffer(0)]],
+                                device const float* b [[buffer(1)]],
+                                device float* values [[buffer(2)]],
+                                device float* index [[buffer(3)]],
+                                constant uint& queries [[buffer(4)]],
+                                constant uint& width [[buffer(5)]],
+                                constant uint& k [[buffer(6)]],
+                                constant uint& points [[buffer(7)]],
+                                uint id [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    if (id >= queries) return;
+    device const float* query = a + ulong(id) * ulong(width);
+    device float* near = values + ulong(id) * ulong(k);
+    device float* at = index + ulong(id) * ulong(k);
+    bool bad = false;
+    for (uint c = lane; c < width; c += 32u) bad = bad || not_finite(query[c]);
+    bad = simd_any(bad);
+    for (uint j = 0u; j < k; ++j) {
+        uint i = uint(at[j]);
+        /* Uniform across the simdgroup: every lane holds the same `bad` and
+         * reads the same `i`, so all of them reach the `simd_sum`. */
+        if (bad || i >= points) {
+            if (lane == 0u) {
+                near[j] = INFINITY;
+                at[j] = float(points);
+            }
+            continue;
+        }
+        device const float* row = b + ulong(i) * ulong(width);
+        float part = 0.0f;
+        for (uint c = lane; c < width; c += 32u) {
+            float gap = query[c] - row[c];
+            part += gap * gap;
+        }
+        float total = simd_sum(part);
+        if (lane == 0u) near[j] = total;
+    }
+    if (lane != 0u) return;
+    for (uint j = 1u; j < k; ++j) {
+        float v = near[j];
+        float i = at[j];
+        uint p = j;
+        while (p > 0u && (near[p - 1u] > v || (near[p - 1u] == v && at[p - 1u] > i))) {
+            near[p] = near[p - 1u];
+            at[p] = at[p - 1u];
+            --p;
+        }
+        near[p] = v;
+        at[p] = i;
+    }
+}
+
+template [[host_name("base_row_topk4")]] [[kernel]] decltype(base_row_topk_group<4>) base_row_topk_group<4>;
+template [[host_name("base_row_topk8")]] [[kernel]] decltype(base_row_topk_group<8>) base_row_topk_group<8>;
+template [[host_name("base_row_topk16")]] [[kernel]] decltype(base_row_topk_group<16>) base_row_topk_group<16>;
+template [[host_name("base_row_topk32")]] [[kernel]] decltype(base_row_topk_group<32>) base_row_topk_group<32>;
+
 /* One total per class and column, a threadgroup striding the samples.
  *
  * `power` 0 counts each class and ignores `values`, 1 sums the column and 2
@@ -490,6 +865,64 @@ kernel void base_unique_from_sorted(device const float* sorted [[buffer(0)]],
     if (id > 0u && sorted[id] == sorted[id - 1u]) return;
     uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
     if (slot < capacity) out[slot] = sorted[id];
+}
+
+/* The distinct values of a vector, gathered into an open-addressed table of
+ * `slots` (a power of two) float bit patterns that starts out all `EMPTY`.
+ *
+ * Each sample hashes its bits and probes linearly: a slot that already holds
+ * them is a plain read, so once the handful of classes are in, the samples
+ * behind them cost one load each and no atomic; an empty slot is claimed by
+ * compare-and-swap, and the winner bumps `counter[0]`. A NaN, which is no
+ * class, or a sample that probes every slot without a home sets `counter[1]`.
+ * `-0.0` is folded onto `0.0`, which is how the sorted route's `==` saw
+ * them. */
+kernel void base_distinct_hash(device const float* values [[buffer(0)]],
+                               device atomic_uint* table [[buffer(1)]],
+                               device atomic_uint* counter [[buffer(2)]],
+                               constant uint& count [[buffer(3)]],
+                               constant uint& slots [[buffer(4)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id >= count) return;
+    const uint empty = 0xFFFFFFFFu;
+    float value = values[id];
+    if (not_a_number(value)) {
+        atomic_store_explicit(&counter[1], 0x3F800000u, memory_order_relaxed);
+        return;
+    }
+    uint bits = value == 0.0f ? 0u : as_type<uint>(value);
+    /* The HIGH bits of the product: a product's low bits depend only on the
+     * multiplicand's low bits, and an integer-valued float's low mantissa
+     * bits are all zero, so taking the low ones put every label from 0 to
+     * 1023 on one home slot and made each sample walk the whole chain. */
+    uint at = slots > 1u ? (bits * 2654435761u) >> (32u - ctz(slots)) : 0u;
+    for (uint probe = 0u; probe < slots; ++probe) {
+        uint held = atomic_load_explicit(&table[at], memory_order_relaxed);
+        if (held == bits) return;
+        if (held == empty) {
+            uint expected = empty;
+            if (atomic_compare_exchange_weak_explicit(&table[at], &expected, bits,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed)) {
+                atomic_fetch_add_explicit(&counter[0], 1u, memory_order_relaxed);
+                return;
+            }
+            if (expected == bits) return;
+            /* Lost the slot to another value: look at this one again. */
+            if (expected == empty) { probe--; continue; }
+        }
+        at = (at + 1u) & (slots - 1u);
+    }
+    atomic_store_explicit(&counter[1], 0x3F800000u, memory_order_relaxed);
+}
+
+/* `base_distinct_hash`'s table set to EMPTY and its two counters to zero. */
+kernel void base_distinct_reset(device uint* table [[buffer(0)]],
+                                device uint* counter [[buffer(1)]],
+                                constant uint& slots [[buffer(2)]],
+                                uint id [[thread_position_in_grid]]) {
+    if (id < slots) table[id] = 0xFFFFFFFFu;
+    if (id < 2u) counter[id] = 0u;
 }
 
 kernel void base_counter_value(device const atomic_uint* counter [[buffer(0)]],

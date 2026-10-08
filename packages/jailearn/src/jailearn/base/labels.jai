@@ -1,5 +1,7 @@
 #: Arbitrary class values mapped onto the codes every classifier fits against.
 import jaitensor as jt
+import std.math
+from std.os import env_or
 
 from jaitensor import Tensor
 from std.algo.sort import merge_sort
@@ -16,6 +18,7 @@ pub const MAX_CLASSES: int = 4096
 #: touches the answer -- at most `MAX_CLASSES` long -- and never the samples.
 pub fn distinct_values(y: Tensor) -> list[float] {
     if y.size == 0 { throw ValueError("cannot take the distinct values of an empty vector") }
+    if _HASH_LABELS { return hashed_distinct(y) }
     let column = y.view(0, [y.size, 1])
     let sorted = sort_columns(column)
     column.free()
@@ -38,7 +41,64 @@ pub fn distinct_values(y: Tensor) -> list[float] {
         throw ValueError(f"{count} distinct values exceeds the {MAX_CLASSES} this supports")
     }
     var kept: list[float] = []
-    for index in 0..count { kept.push(values[index]) }
+    for index in 0..count {
+        #: The host sort raises a TypeError on a NaN; name the real problem.
+        if math.is_nan(values[index]) { throw ValueError("a label is NaN, which is no class") }
+        kept.push(values[index])
+    }
+    return merge_sort(kept)
+}
+
+#: `JAILEARN_HASH_LABELS=0` finds a label vector's distinct values by a
+#: device bitonic sort and compaction (a dispatch per network stage, about a
+#: hundred at ten thousand samples) instead of one pass into a hash table.
+let _HASH_LABELS = env_or("JAILEARN_HASH_LABELS", "1") != "0"
+
+#: Twice `MAX_CLASSES`, so a full set of classes leaves the table half empty
+#: and a probe sequence stays short.
+const LABEL_SLOTS: int = 8192
+
+fn hashed_distinct(y: Tensor) -> list[float] {
+    #: The table and its two counters share one allocation, so the answer
+    #: comes back in a single read.
+    let whole = Tensor([LABEL_SLOTS + 2])
+    let table = whole.view(0, [LABEL_SLOTS])
+    let counter = whole.view(LABEL_SLOTS, [2])
+    base_kernel("base_distinct_reset").dispatch_async(
+        [table.buffer(), counter.buffer()],
+        LABEL_SLOTS,
+        [LABEL_SLOTS]
+    )
+    base_kernel("base_distinct_hash").dispatch_async(
+        [y.buffer(), table.buffer(), counter.buffer()],
+        y.size,
+        [y.size, LABEL_SLOTS]
+    )
+    table.free()
+    counter.free()
+    #: The table's bit patterns ARE the float values, and an empty slot's
+    #: all-ones pattern reads back as a NaN. More distinct values than slots
+    #: fills every slot, so the count alone catches overflow; the second
+    #: counter says a sample was NaN, which is no class at all.
+    let slots = whole.download()
+    whole.free()
+    var kept: list[float] = []
+    for index in 0..LABEL_SLOTS {
+        let value = slots[index]
+        #: `value == value` is false only for a NaN, and unlike a call to
+        #: `math.is_nan` it keeps this loop compiled.
+        if value == value { kept.push(value) }
+    }
+    if kept.len() > MAX_CLASSES {
+        #: A full table stopped counting: the labels hold at least this many.
+        let many = if kept.len() >= LABEL_SLOTS {
+            f"at least {kept.len()}"
+        } else {
+            f"{kept.len()}"
+        }
+        throw ValueError(f"{many} distinct values exceeds the {MAX_CLASSES} this supports")
+    }
+    if slots[LABEL_SLOTS + 1] != 0.0 { throw ValueError("a label is NaN, which is no class") }
     return merge_sort(kept)
 }
 
@@ -69,6 +129,18 @@ pub class LabelIndex {
 
     #: The class values as a `[k]` device tensor, for kernels that need them.
     pub fn class_tensor(self) -> Tensor { return self.table }
+
+    #: An index over `y` and `y`'s codes, for a fit. Every value of the
+    #: vector the index was built from has a class by construction, and the
+    #: hashed `distinct_values` has already refused a NaN, so the check
+    #: `encode` makes -- a reduction and a wait on the device -- is skipped.
+    pub static fn fit_codes(y: Tensor) -> tuple[LabelIndex, Tensor] {
+        let index = LabelIndex.from_labels(y)
+        if not _HASH_LABELS { return (index, index.encode(y)) }
+        let out = Tensor(y.shape)
+        index._map(y, out, 0)
+        return (index, out)
+    }
 
     #: Class values to codes `0..k-1`.
     pub fn encode(self, y: Tensor) -> Tensor {

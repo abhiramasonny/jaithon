@@ -6,6 +6,7 @@ import std.math
 from jailearn import Estimator, EstimatorKind, LabelIndex, Params
 from jaitensor import Tensor
 from std.test import assert_eq, assert_near, assert_throws, assert_true
+from std.time import Instant
 
 fn assert_values(
     actual: list[float],
@@ -199,6 +200,141 @@ fn test_column_statistics_use_two_passes() -> void {
     assert_near(jl.to_values(spread)[0], 1.0, 1e-3, "variance far from the origin")
 }
 
+fn host_column_check(rows: int, width: int, offset: float) -> void {
+    var values: list[float] = []
+    var masked: list[float] = []
+    for index in 0..rows * width {
+        values.push(offset + math.sin(float(index) * 0.7311) * float(1 + index % 7))
+        masked.push(if index % 5 == 0 { 1.0 } else { 0.0 })
+    }
+    let x = Tensor([rows, width], values)
+    defer { x.free() }
+    let mask = Tensor([rows, width], masked)
+    defer { mask.free() }
+    let (mean, variance) = jl.column_moments(x, ddof: 1)
+    defer { mean.free() }
+    defer { variance.free() }
+    let (low, high) = jl.column_min_max(x)
+    defer { low.free() }
+    defer { high.free() }
+    let kept = jl.masked_column_mean(x, mask)
+    defer { kept.free() }
+    let means = jl.to_values(mean)
+    let spreads = jl.to_values(variance)
+    let lows = jl.to_values(low)
+    let highs = jl.to_values(high)
+    let keeps = jl.to_values(kept)
+    for column in 0..width {
+        var total = 0.0
+        var smallest = values[column]
+        var largest = values[column]
+        var kept_total = 0.0
+        var kept_count = 0.0
+        for row in 0..rows {
+            let value = values[row * width + column]
+            total += value
+            smallest = min(smallest, value)
+            largest = max(largest, value)
+            if masked[row * width + column] == 0.0 {
+                kept_total += value
+                kept_count += 1.0
+            }
+        }
+        let centre = total / float(rows)
+        var squares = 0.0
+        for row in 0..rows {
+            let gap = values[row * width + column] - centre
+            squares += gap * gap
+        }
+        let what = f"{rows}x{width} column {column}"
+        assert_near(means[column], centre, 1e-3 + 1e-6 * math.fabs(offset), f"{what} mean")
+        assert_near(spreads[column], squares / float(rows - 1), 2e-3, f"{what} variance")
+        assert_near(lows[column], smallest, 1e-3, f"{what} min")
+        assert_near(highs[column], largest, 1e-3, f"{what} max")
+        let expected = if kept_count > 0.0 { kept_total / kept_count } else { 0.0 }
+        assert_near(keeps[column], expected, 1e-3 + 1e-6 * math.fabs(offset), f"{what} masked")
+    }
+}
+
+#: The column statistics cut the samples into tiles and fold per-tile
+#: partials, so they are checked here at shapes that make many tiles, columns
+#: wider than a threadgroup, a single column, and a mean far from the spread.
+fn test_column_statistics_fold_tiles_of_rows() -> void {
+    if not jl.is_available() { return }
+    host_column_check(20011, 3, 0.0)
+    host_column_check(700, 300, 0.0)
+    host_column_check(9001, 1, 0.0)
+    host_column_check(4099, 7, 10000.0)
+}
+
+#: The relative error of every column variance against a double-precision
+#: two-pass variance of the same float32 values, worst column.
+fn worst_variance_error(rows: int, width: int, offset: float) -> float {
+    var drawn: list[float] = []
+    for index in 0..rows * width {
+        drawn.push(offset + math.sin(float(index) * 0.7311 + 0.2) * 1.7)
+    }
+    let x = Tensor([rows, width], drawn)
+    defer { x.free() }
+    #: What the device holds: the draws rounded to float32.
+    let values = jl.to_values(x)
+    let (mean, variance) = jl.column_moments(x)
+    defer { mean.free() }
+    defer { variance.free() }
+    let means = jl.to_values(mean)
+    let spreads = jl.to_values(variance)
+    var worst = 0.0
+    for column in 0..width {
+        var total = 0.0
+        for row in 0..rows { total += values[row * width + column] }
+        let centre = total / float(rows)
+        var squares = 0.0
+        for row in 0..rows {
+            let gap = values[row * width + column] - centre
+            squares += gap * gap
+        }
+        let exact = squares / float(rows)
+        assert_near(means[column], centre, 1e-6 * math.fabs(offset) + 1e-5, f"mean {column}")
+        worst = max(worst, math.fabs(spreads[column] - exact) / exact)
+    }
+    return worst
+}
+
+#: A column whose mean dwarfs its spread. A float32 running mean rounds at the
+#: ulp of the mean, so Welford's update alone lost up to two hundred times the
+#: variance's accuracy at an offset of ten thousand (1.3e-4 against the
+#: two-pass kernel's 3.7e-7 at 300 x 5); every value is folded relative to
+#: the column's first sample instead, which keeps the running mean at the
+#: scale of the spread.
+fn test_column_variance_survives_a_large_offset() -> void {
+    if not jl.is_available() { return }
+    for (rows, width, offset) in [
+        (300, 5, 1.0e3),
+        (300, 5, 1.0e4),
+        (10000, 8, 1.0e4),
+        (7, 3, 1.0e4),
+        (513, 257, 1.0e4),
+        (300, 5, 1.0e5),
+    ] {
+        let worst = worst_variance_error(rows, width, offset)
+        #: Unshifted, 300 x 5 at 1e4 was off by 1.3e-4 and at 1e5 by 2.6e-3;
+        #: the two-pass kernel `JAILEARN_COLUMN_TILES=0` restores is 3.7e-7
+        #: and 1.1e-4.
+        let bound = if offset >= 1.0e5 { 5.0e-4 } else { 1.0e-5 }
+        assert_true(worst < bound, f"{rows}x{width} offset {offset}: variance off by {worst}")
+    }
+}
+
+#: A wide matrix with few rows is cut into spans of columns as well as tiles
+#: of rows; checked against the host at shapes that leave a short last span
+#: and a single tile.
+fn test_column_statistics_cut_wide_short_matrices_into_spans() -> void {
+    if not jl.is_available() { return }
+    host_column_check(40, 2000, 0.0)
+    host_column_check(3, 600, 5.0)
+    host_column_check(2, 300, 0.0)
+}
+
 fn test_masked_mean_and_nan_mask_make_an_imputer() -> void {
     if not jl.is_available() { return }
     let x = jl.matrix([[1.0, math.NAN], [3.0, 20.0]])
@@ -331,6 +467,49 @@ fn test_row_reductions_break_ties_at_the_lowest_column() -> void {
     assert_throws(ValueError, || jl.row_topk(m, 4))
 }
 
+#: The host's answer: every column ranked by value (descending when
+#: `largest`), equal values by column ascending, the first `k` kept. The
+#: values are small integers, so one numeric key carries both orders.
+fn host_topk(values: list[float], rows: int, columns: int, k: int, largest: bool) -> list[int] {
+    var picked: list[int] = []
+    let sign = if largest { -1.0 } else { 1.0 }
+    for row in 0..rows {
+        var order = [column for column in 0..columns]
+        let base = row * columns
+        order.sort(key: |c| sign * values[base + c] * 100000.0 + float(c))
+        for slot in 0..k { picked.push(order[slot]) }
+    }
+    return picked
+}
+
+#: Duplicates everywhere, so the tie order is what is being tested: equal
+#: values must come out smallest column first, at every capacity the one-pass
+#: kernel has and past it, with a row wide enough that many threads share it.
+fn test_row_topk_breaks_ties_at_the_lowest_column_in_one_pass() -> void {
+    if not jl.is_available() { return }
+    let rows = 7
+    let columns = 3001
+    var values: list[float] = []
+    for index in 0..rows * columns { values.push(float((index * 7919 + index // 13) % 23)) }
+    let m = Tensor([rows, columns], values)
+    defer { m.free() }
+    for k in [1, 4, 5, 8, 9, 16, 17, 32, 33] {
+        for largest in [true, false] {
+            let (top, at) = jl.row_topk(m, k, largest: largest)
+            let got = jl.to_values(at)
+            let got_values = jl.to_values(top)
+            top.free()
+            at.free()
+            let want = host_topk(values, rows, columns, k, largest)
+            for slot in 0..rows * k {
+                let row = slot // k
+                assert_eq(int(got[slot]), want[slot], f"k {k} largest {largest} slot {slot}")
+                assert_eq(got_values[slot], values[row * columns + want[slot]], f"k {k} value")
+            }
+        }
+    }
+}
+
 fn test_class_aggregation_gathers_the_sufficient_statistics() -> void {
     if not jl.is_available() { return }
     let labels = jl.vector([0.0, 1.0, 1.0, 2.0])
@@ -460,6 +639,90 @@ fn test_label_index_maps_arbitrary_codes_both_ways() -> void {
     index.free()
 }
 
+#: The distinct values come out ascending and exact at every scale the
+#: classifiers meet: many repeats of a few classes, thousands of classes up to
+#: the limit, zero of either sign as one value, and one class past the limit
+#: refused rather than truncated.
+fn test_distinct_values_holds_at_scale_and_at_the_limit() -> void {
+    if not jl.is_available() { return }
+    var many: list[float] = []
+    for index in 0..50000 { many.push([2.5, -1.0, 7.0][index * 7 % 3]) }
+    let repeated = Tensor([50000], many)
+    defer { repeated.free() }
+    assert_values(jl.distinct_values(repeated), [-1.0, 2.5, 7.0], "three classes, many times")
+
+    var spread: list[float] = []
+    for index in 0..9000 { spread.push(float(index * 37 % jl.MAX_CLASSES) * 0.5 - 7.0) }
+    let wide = Tensor([9000], spread)
+    defer { wide.free() }
+    let found = jl.distinct_values(wide)
+    assert_eq(found.len(), jl.MAX_CLASSES, "every class up to the limit")
+    for index in 0..found.len() {
+        assert_near(found[index], float(index) * 0.5 - 7.0, 1e-9, f"class {index}")
+    }
+
+    let signed = jl.vector([0.0, -0.0, 1.0, -0.0])
+    defer { signed.free() }
+    assert_values(jl.distinct_values(signed), [0.0, 1.0], "zero of either sign is one value")
+
+    let too_many = Tensor([jl.MAX_CLASSES + 1], [float(i) for i in 0..jl.MAX_CLASSES + 1])
+    defer { too_many.free() }
+    assert_throws(ValueError, || jl.distinct_values(too_many))
+
+    #: A fit indexes and encodes in one step, skipping `encode`'s check; a NaN
+    #: label must still be refused rather than coded as a class.
+    let y = jl.vector([5.0, 3.0, 5.0])
+    defer { y.free() }
+    let (index, codes) = LabelIndex.fit_codes(y)
+    defer { index.free() }
+    defer { codes.free() }
+    assert_values(jl.to_values(codes), [1.0, 0.0, 1.0], "fit_codes")
+    let broken = jl.vector([1.0, math.NAN, 2.0])
+    defer { broken.free() }
+    assert_throws(ValueError, || LabelIndex.fit_codes(broken))
+}
+
+fn best_label_time(y: Tensor) -> float {
+    var best = 1.0e9
+    for _run in 0..7 {
+        let start = Instant.now()
+        let found = jl.distinct_values(y)
+        best = min(best, start.elapsed().to_millis())
+        assert_true(found.len() > 0, "some class")
+    }
+    return best
+}
+
+#: Integer-valued labels used to share one home slot in the label table: a
+#: product's low bits depend only on the multiplicand's low bits, and those
+#: are zero for a float holding an integer, so 0..1023 hashed to one slot and
+#: every sample walked a chain as long as the classes. Four thousand classes
+#: took about five times as long as three; with the product's high bits the
+#: two are within the cost of sorting the larger answer.
+fn test_distinct_values_spreads_integer_labels() -> void {
+    if not jl.is_available() { return }
+    let samples = 10000
+    let many = Tensor([samples], [float(index % 4000) for index in 0..samples])
+    defer { many.free() }
+    let few = Tensor([samples], [float(index % 3) for index in 0..samples])
+    defer { few.free() }
+    let found = jl.distinct_values(many)
+    assert_eq(found.len(), 4000, "four thousand classes")
+    for index in 0..4000 { assert_near(found[index], float(index), 0.0, f"class {index}") }
+    best_label_time(many)
+    best_label_time(few)
+    #: The best of three rounds: another process on the device can only make
+    #: a round slower, and the chain walk made every round about five times
+    #: slower, so the best round still tells the two apart.
+    var ratio = 1.0e9
+    for _round in 0..3 {
+        let wide = best_label_time(many)
+        let narrow = best_label_time(few)
+        ratio = min(ratio, wide / max(narrow, 0.05))
+    }
+    assert_true(ratio < 3.0, f"4000 classes took {ratio}x as long as 3")
+}
+
 fn test_cholesky_solves_the_normal_equations() -> void {
     if not jl.is_available() { return }
     let a = jl.matrix([[4.0, 2.0], [2.0, 3.0]])
@@ -494,6 +757,90 @@ fn test_cholesky_solves_the_normal_equations() -> void {
     let indefinite = jl.matrix([[1.0, 2.0], [2.0, 1.0]])
     defer { indefinite.free() }
     assert_throws(ValueError, || jl.cholesky_factor(indefinite))
+    assert_throws(ValueError, || jl.cholesky_solve(indefinite, b))
+
+    #: A NaN anywhere in the lower triangle reaches a pivot and refuses.
+    let missing = jl.matrix([[4.0, 2.0], [math.NAN, 3.0]])
+    defer { missing.free() }
+    assert_throws(ValueError, || jl.cholesky_factor(missing))
+}
+
+#: `M MT + order I`, which is positive definite and well conditioned, with a
+#: right-hand side of two columns.
+fn spd_system(order: int) -> tuple[list[float], list[float]] {
+    var m: list[float] = []
+    for index in 0..order * order { m.push(math.sin(float(index) * 0.37 + 0.11)) }
+    var a = [0.0 for _slot in 0..order * order]
+    for row in 0..order {
+        for column in 0..order {
+            var total = 0.0
+            for k in 0..order { total += m[row * order + k] * m[column * order + k] }
+            a[row * order + column] = total + (if row == column { float(order) } else { 0.0 })
+        }
+    }
+    var b: list[float] = []
+    for index in 0..order * 2 { b.push(math.cos(float(index) * 0.23)) }
+    return (a, b)
+}
+
+fn assert_solves(a: list[float], x: list[float], b: list[float], order: int, what: str) -> void {
+    let rhs = b.len() // order
+    for row in 0..order {
+        for column in 0..rhs {
+            var total = 0.0
+            for k in 0..order { total += a[row * order + k] * x[k * rhs + column] }
+            assert_near(total, b[row * rhs + column], 1e-3, f"{what} row {row}")
+        }
+    }
+}
+
+#: Small systems are factored on the host, large ones on the device; both have
+#: to solve the system, and refuse the same matrices.
+fn check_solve_at(order: int) -> void {
+    let (values, rhs) = spd_system(order)
+    let a = Tensor([order, order], values)
+    defer { a.free() }
+    let b = Tensor([order, 2], rhs)
+    defer { b.free() }
+    let x = jl.cholesky_solve(a, b)
+    defer { x.free() }
+    assert_eq(x.shape, [order, 2])
+    assert_solves(values, jl.to_values(x), rhs, order, f"order {order}")
+
+    let l = jl.cholesky_factor(a)
+    defer { l.free() }
+    let forward = jl.triangular_solve(l, b)
+    defer { forward.free() }
+    let back = jl.triangular_solve(l, forward, transposed: true)
+    defer { back.free() }
+    let direct = jl.to_values(x)
+    let stepped = jl.to_values(back)
+    for index in 0..direct.len() {
+        assert_near(stepped[index], direct[index], 1e-4, f"order {order} substitution")
+    }
+
+    #: Negated, the same matrix has a negative first pivot.
+    let negated = jt.scale(a, -1.0)
+    defer { negated.free() }
+    assert_throws(ValueError, || jl.cholesky_factor(negated))
+    assert_throws(ValueError, || jl.cholesky_solve(negated, b))
+}
+
+fn test_cholesky_solves_on_both_sides_of_the_host_order() -> void {
+    if not jl.is_available() { return }
+    check_solve_at(37)
+    check_solve_at(jl.HOST_SOLVE_ORDER + 3)
+
+    #: The host entry point for a caller that already holds the system, with a
+    #: damping term on the diagonal.
+    let (values, rhs) = spd_system(5)
+    let solved = jl.host_cholesky_solve(values, rhs, 5)
+    assert_solves(values, solved, rhs, 5, "host_cholesky_solve")
+    let damped = jl.host_cholesky_solve(values, rhs, 5, damping: 2.0)
+    var shifted = [value for value in values]
+    for index in 0..5 { shifted[index * 5 + index] += 2.0 }
+    assert_solves(shifted, damped, rhs, 5, "damped host_cholesky_solve")
+    assert_throws(ValueError, || jl.host_cholesky_solve([1.0, 2.0, 2.0, 1.0], [1.0, 1.0], 2))
 }
 
 fn test_the_estimator_protocol_defaults() -> void {

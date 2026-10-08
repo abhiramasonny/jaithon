@@ -5,7 +5,7 @@ from ..array import INT32, NDArray, element_count, require_real
 from .common import FLOAT32_EPS, _emit, _extend, _slice_matrix, _stacked
 from .norm import _as_number, norm
 from .solve import inv
-from .svd import _svd_host
+from .svd import _svd_host, _tall_projection, _takes_qr_first
 
 #: The cutoff below which a singular value is taken as noise.
 #:
@@ -143,6 +143,20 @@ fn _lstsq_solve(
             projected[step * wide + column] = total
         }
     }
+    _lstsq_apply(x, projected, s, vt, n, k, wide, cutoff)
+}
+
+#: `x += V S^+ projected`, the half of a solve that never sees the height.
+fn _lstsq_apply(
+    x: list[float],
+    projected: list[float],
+    s: list[float],
+    vt: list[float],
+    n: int,
+    k: int,
+    wide: int,
+    cutoff: float
+) -> void {
     for step in 0..k {
         if s[step] <= cutoff { continue }
         let inverse = 1.0 / s[step]
@@ -191,17 +205,29 @@ pub fn lstsq(a: NDArray, b: NDArray, rcond: float = -1.0) -> (NDArray, NDArray, 
         throw ValueError(f"lstsq cannot fit {m} rows against {b.shape[0]}")
     }
 
-    let (u, s, vt) = _svd_host(a.to_list(), m, n, false, true)
     let rhs = b.to_list()
     let k = min(m, n)
-    let cutoff = _rank_cutoff(s, m, n, rcond)
+    var x = [0.0] * (n * wide)
+    var projected = [0.0] * (k * wide)
+    var s: list[float] = []
+    var cutoff = 0.0
+    if _takes_qr_first(m, n) {
+        #: `U` is never formed: the reflectors take `b` straight to `U^T b`.
+        let (top, values, vt) = _tall_projection(a.to_list(), m, n, rhs, wide)
+        s = values
+        projected = top
+        cutoff = _rank_cutoff(s, m, n, rcond)
+        _lstsq_apply(x, projected, s, vt, n, k, wide, cutoff)
+    } else {
+        let (u, values, vt) = _svd_host(a.to_list(), m, n, false, true)
+        s = values
+        cutoff = _rank_cutoff(s, m, n, rcond)
+        _lstsq_solve(x, projected, u, s, vt, rhs, m, n, k, wide, cutoff)
+    }
     var rank = 0
     for value in s {
         if value > cutoff { rank += 1 }
     }
-    var x = [0.0 for _slot in 0..n * wide]
-    var projected = [0.0 for _slot in 0..k * wide]
-    _lstsq_solve(x, projected, u, s, vt, rhs, m, n, k, wide, cutoff)
 
     var residuals: list[float] = []
     if rank == n and m > n {

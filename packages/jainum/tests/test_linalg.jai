@@ -17,6 +17,7 @@ from jainum.linalg import BLOCKED_FROM, BLOCKED_PANEL, blocked_panel
 from jainum.linalg import cholesky, cond, det, eig, eigh, eigvals, eigvalsh
 from jainum.linalg import inv, lstsq, lu_factor, lu_solve, matrix_rank, norm
 from jainum.linalg import pinv, qr, slogdet, solve, svd, svdvals, triangular_solve
+from jainum.linalg.eigen import _jacobi_eigh, _tridiagonal_eigh
 
 fn have_gpu() -> bool { return gpu.is_available() }
 
@@ -1000,6 +1001,74 @@ fn test_svd_survives_a_rank_deficient_matrix() -> void {
     assert_close(none.to_list(), [0.0, 0.0, 0.0], 1e-12, "no values to find")
 }
 
+#: A matrix at least twice as tall as it is wide is factored `A = QR` first
+#: and its `R` taken apart instead. Everything the full bidiagonalization
+#: promised has to survive that: the matrix rebuilt, orthonormal columns, the
+#: values descending, a rank deficiency found, and a least squares residual
+#: orthogonal to the design.
+fn test_a_tall_matrix_loses_nothing_to_the_qr_first() -> void {
+    if not have_gpu() { return }
+    let m = 57
+    let n = 6
+    var values = spread(m * n, 211)
+    let a = from_host(values, [m, n])
+    defer { a.free() }
+    let (u, s, vt) = svd(a, false)
+    defer { u.free() }
+    defer { s.free() }
+    defer { vt.free() }
+    assert_eq(u.shape, [m, n])
+    let uv = u.to_list()
+    let sv = s.to_list()
+    assert_identity(product(transposed(uv, m, n), n, m, uv, n), n, 1e-5, "tall u is orthonormal")
+    for index in 1..n { assert_true(sv[index] <= sv[index - 1] + 1e-12, "descending") }
+    let scaled = product(diagonal_matrix(sv), n, n, vt.to_list(), n)
+    assert_close(product(uv, m, n, scaled, n), values, 1e-5, "tall a = u s v^T")
+    let only = svdvals(a)
+    defer { only.free() }
+    assert_close(only.to_list(), sv, 1e-6, "the values alone are the same values")
+
+    #: The full basis still takes the bidiagonalization, and agrees.
+    let (fu, fs, fvt) = svd(a)
+    defer { fu.free() }
+    defer { fs.free() }
+    defer { fvt.free() }
+    assert_close(fs.to_list(), sv, 1e-5, "full and thin agree on the values")
+
+    var deficient = spread(m * n, 223)
+    for row in 0..m { deficient[row * n + 5] = deficient[row * n + 1] - deficient[row * n + 2] }
+    let short = from_host(deficient, [m, n])
+    defer { short.free() }
+    let rank = matrix_rank(short)
+    defer { rank.free() }
+    assert_eq(rank.item(), 5.0, "a dependent column, found through R")
+
+    let target = spread(m, 227)
+    let b = from_host(target, [m])
+    defer { b.free() }
+    let (x, residual, fitted_rank, _values) = lstsq(a, b)
+    defer { x.free() }
+    defer { residual.free() }
+    defer { fitted_rank.free() }
+    defer { _values.free() }
+    let fitted = product(values, m, n, x.to_list(), 1)
+    var gap = [0.0 for _index in 0..m]
+    var squared = 0.0
+    for row in 0..m {
+        gap[row] = fitted[row] - target[row]
+        squared += gap[row] * gap[row]
+    }
+    let projected = product(transposed(values, m, n), n, m, gap, 1)
+    for index in 0..n { assert_near(projected[index], 0.0, 1e-5, "tall residual is orthogonal") }
+    assert_near(residual.to_list()[0], squared, 1e-4, "tall residual")
+
+    let inverse = pinv(a)
+    defer { inverse.free() }
+    let iv = inverse.to_list()
+    let back = product(product(values, m, n, iv, m), m, m, values, n)
+    assert_close(back, values, 1e-4, "tall a pinv(a) a = a")
+}
+
 fn test_svd_handles_repeated_and_degenerate_shapes() -> void {
     if not have_gpu() { return }
     #: Every singular value the same: the shift has nothing to separate and
@@ -1212,4 +1281,64 @@ fn test_a_zero_row_and_a_zero_column_leave_every_loop_alone() -> void {
     let value = det(a)
     defer { value.free() }
     assert_near(value.item(), 0.0, 1e-6, "a matrix with an empty column has no determinant")
+}
+
+#: The tridiagonal QL `eigh` now takes, against Jacobi and against the
+#: spectrum a matrix was built from, in double precision on the host: a
+#: random symmetric 40x40, one with a triple and a double eigenvalue, the
+#: zero matrix, a 1x1, and matrices far outside float32's range, which are
+#: scaled first so nothing in the iteration overflows. A NaN refuses, so the
+#: caller falls back to Jacobi.
+fn test_the_tridiagonal_eigh_agrees_with_jacobi() -> void {
+    let n = 40
+    let noise = spread(n * n, 59)
+    var a = [0.0 for _slot in 0..n * n]
+    for row in 0..n {
+        for column in 0..=row {
+            a[row * n + column] = noise[row * n + column]
+            a[column * n + row] = noise[row * n + column]
+        }
+    }
+    let (answered, w, v) = _tridiagonal_eigh(a, n, true)
+    assert_true(answered, "a finite matrix gets an answer")
+    let (jacobi, _basis) = _jacobi_eigh(a, n, false)
+    assert_close(w, jacobi, 1e-12, "the same spectrum Jacobi finds")
+    let (_again, alone, _none) = _tridiagonal_eigh(a, n, false)
+    assert_close(alone, w, 0.0, "the values-only path is the same arithmetic")
+    assert_identity(product(transposed(v, n, n), n, n, v, n), n, 1e-12, "orthonormal vectors")
+    assert_close(
+        product(a, n, n, v, n),
+        product(v, n, n, diagonal_matrix(w), n),
+        1e-12,
+        "a v = v w"
+    )
+
+    let wanted = [-2.0, 1.0, 1.0, 1.0, 3.0, 3.0]
+    let built = conjugated(rotation(6, 61), diagonal_matrix(wanted), 6)
+    let (_ok, repeated, basis) = _tridiagonal_eigh(built, 6, true)
+    assert_close(repeated, wanted, 1e-12, "repeated eigenvalues")
+    assert_identity(product(transposed(basis, 6, 6), 6, 6, basis, 6), 6, 1e-12, "a basis for each")
+
+    let (_z, zeros, eye) = _tridiagonal_eigh([0.0 for _slot in 0..9], 3, true)
+    assert_close(zeros, [0.0, 0.0, 0.0], 0.0, "the zero matrix")
+    assert_identity(eye, 3, 0.0, "has the identity for its vectors")
+    let (_o, single, unit) = _tridiagonal_eigh([-4.5], 1, true)
+    assert_close(single, [-4.5], 0.0, "a 1x1")
+    assert_close(unit, [1.0], 0.0, "a 1x1's vector")
+
+    let huge = [value * 1.0e200 for value in built]
+    let (_h, large, _lv) = _tridiagonal_eigh(huge, 6, true)
+    for index in 0..6 {
+        assert_near(large[index] / 1.0e200, wanted[index], 1e-12, "scaled past float32")
+    }
+    let tiny = [value * 1.0e-200 for value in built]
+    let (_t, small, _sv) = _tridiagonal_eigh(tiny, 6, false)
+    for index in 0..6 {
+        assert_near(small[index] * 1.0e200, wanted[index], 1e-12, "scaled below float32")
+    }
+
+    var broken = [value for value in built]
+    broken[7] = math.NAN
+    let (refused, _bw, _bv) = _tridiagonal_eigh(broken, 6, true)
+    assert_true(not refused, "a NaN refuses rather than spinning")
 }
