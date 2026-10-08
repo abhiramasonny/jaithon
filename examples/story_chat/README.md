@@ -263,8 +263,8 @@ wall-clock warm-up then 5 x 5 steps, reading the loss every step. The peer is
 groups, clipping and token file, scaled-dot-product attention.
 
 Three acquisitions, each alternating the sides, at three levels of load from
-the dozen other agents on the machine (load average 3 to 110); the ratio held
-where the absolute numbers did not:
+the other agents on the machine (load average 3 to 110); the ratio held where
+the absolute numbers did not:
 
 | | ms a step (median of 5 x 5), two runs | tokens a second | jai faster by |
 |---|---|---|---|
@@ -281,8 +281,9 @@ torch's default and its fused AdamW alike, and both sides start from the same
 loss (8.41 and 8.45; ln 4096 is 8.32). The quiet pair is the cleanest: 33,060
 and 29,898 tokens a second against 22,534 and 22,632.
 
-Float16 products (`GPT_MIXED=1`) do not help at this size -- the conversions
-cost more than they save -- so they stay off. Over the real run the rate is a
+Float16 products (`GPT_MIXED=1`) measured slower, 365-394 ms against 347 in
+the same acquisition, so they stay off; why was not chased (the decode track
+owns the mixed-precision policy this wave). Over the real run the rate is a
 little lower than the bench, because every 250 steps the run evaluates 256
 held-out windows and samples a story; `pretrain.jai` reports training-only
 tokens a second, which over the 15-minute run was 24,830 on a busy machine.
@@ -300,7 +301,7 @@ hours is 180-215M tokens, a third of an epoch of TinyStories, about 24,000
 steps. The schedule is measured in training time, so the cosine reaches its
 floor when the two hours are up whatever the step costs. The wall time is two
 hours, plus evaluation and checkpoints (a few percent), plus however long the
-lock keeps it waiting between chunks: with a dozen agents queued, a turn took
+lock keeps it waiting between chunks: with two dozen waiters queued, a turn took
 anywhere from seconds to over an hour to come round during this work, so the
 scripts wait up to a day for it (`GPU_LOCK_WAIT`).
 
