@@ -213,19 +213,6 @@ const char *jaiSourceLineText(int fileId, uint32_t offset, size_t *outLen,
     return f->source + start;
 }
 
-JaiSpan jaiSpanJoin(JaiSpan a, JaiSpan b) {
-    if (a.file < 0) return b;
-    if (b.file < 0) return a;
-    if (a.file != b.file) return a;
-
-    JaiSpan out;
-    out.file = a.file;
-    out.start = a.start < b.start ? a.start : b.start;
-    out.end = a.end > b.end ? a.end : b.end;
-    if (out.end < out.start) out.end = out.start;
-    return out;
-}
-
 //error codes
 
 #define JAI_WARNING_BASE 10000
@@ -277,111 +264,6 @@ JaiDiagCode jaiDiagCodeFromString(const char *text) {
     }
     if (text[0] == 'W') return (JaiDiagCode)(JAI_WARNING_BASE + value - 100);
     return (JaiDiagCode)value;
-}
-
-static int nameDistanceSized(const char *a, size_t la,
-                             const char *b, size_t lb, int max) {
-    if (max < 0) return max + 1;
-    if (la > JAI_SUGGEST_MAX_LEN || lb > JAI_SUGGEST_MAX_LEN)
-        return max + 1;
-
-    const size_t gap = la > lb ? la - lb : lb - la;
-    if ((int)gap > max)
-        return max + 1;
-
-    const int inf = max + 1;
-    int row0[JAI_SUGGEST_MAX_LEN + 1];
-    int row1[JAI_SUGGEST_MAX_LEN + 1];
-    int row2[JAI_SUGGEST_MAX_LEN + 1];
-
-    int *prev2 = row0;
-    int *prev = row1;
-    int *cur = row2;
-
-    for (size_t j = 0; j <= lb; ++j) {
-        prev2[j] = inf;
-        prev[j] = j <= (size_t)max ? (int)j : inf;
-        cur[j] = inf;
-    }
-
-    for (size_t i = 1; i <= la; ++i) {
-        size_t lo = i > (size_t)max ? i - (size_t)max : 1u;
-        size_t hi = i + (size_t)max;
-        if (hi > lb) hi = lb;
-
-        cur[0] = i <= (size_t)max ? (int)i : inf;
-
-        if (lo > 1)
-            cur[lo - 1] = inf;
-
-        int best = lo == 1 ? cur[0] : inf;
-
-        for (size_t j = lo; j <= hi; ++j) {
-            const int cost = a[i - 1] == b[j - 1] ? 0 : 1;
-
-            int d = prev[j] + 1;
-
-            const int insertion = cur[j - 1] + 1;
-            if (insertion < d) d = insertion;
-
-            const int substitution = prev[j - 1] + cost;
-            if (substitution < d) d = substitution;
-
-            if (i > 1 && j > 1 &&
-                a[i - 1] == b[j - 2] &&
-                a[i - 2] == b[j - 1]) {
-                const int transpose = prev2[j - 2] + 1;
-                if (transpose < d) d = transpose;
-            }
-
-            cur[j] = d;
-            if (d < best) best = d;
-        }
-
-        if (hi < lb)
-            cur[hi + 1] = inf;
-
-        if (best > max)
-            return max + 1;
-
-        int *tmp = prev2;
-        prev2 = prev;
-        prev = cur;
-        cur = tmp;
-    }
-
-    return prev[lb] <= max ? prev[lb] : max + 1;
-}
-
-int jaiNameDistance(const char *a, const char *b, int max) {
-    if (a == NULL || b == NULL)
-        return max + 1;
-
-    return nameDistanceSized(a, strlen(a), b, strlen(b), max);
-}
-
-bool jaiNameIsCloser(const char *name, const char *candidate, int *best) {
-    if (name == NULL || candidate == NULL || best == NULL)
-        return false;
-
-    const size_t nameLen = strlen(name);
-    const size_t candidateLen = strlen(candidate);
-
-    if (nameLen == candidateLen &&
-        memcmp(name, candidate, nameLen) == 0)
-        return false;
-
-    int limit = (int)((nameLen > 3 ? nameLen : 3) / 3);
-    if (limit > 3) limit = 3;
-
-    const int d =
-        nameDistanceSized(name, nameLen, candidate, candidateLen, limit);
-
-    if (d > limit || d >= *best)
-        return false;
-
-    *best = d;
-    return true;
 }
 
 JaiDiagBag gDiags;

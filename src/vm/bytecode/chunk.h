@@ -543,15 +543,9 @@ void jaiChunkFree(Chunk *chunk);
  * array twice is a bug, not a resize. */
 bool jaiChunkReserveCaches(Chunk *chunk, int count);
 
-void jaiChunkWrite(Chunk *chunk, uint8_t byte, uint32_t spanStart, uint32_t spanEnd);
-void jaiChunkWriteU16(Chunk *chunk, uint16_t v, uint32_t s, uint32_t e);
-void jaiChunkWriteU24(Chunk *chunk, uint32_t v, uint32_t s, uint32_t e);
-void jaiChunkWriteI16(Chunk *chunk, int16_t v, uint32_t s, uint32_t e);
 void jaiChunkPatchU16(Chunk *chunk, int offset, uint16_t v);
 void jaiChunkPatchI16(Chunk *chunk, int offset, int16_t v);
 
-/* Appends `v` and returns its index, deduplicating equal constants. */
-uint32_t jaiChunkAddConstant(Chunk *chunk, Value v);
 /* Source span covering the instruction at `codeOffset`. */
 void     jaiChunkSpanAt(const Chunk *chunk, int codeOffset, uint32_t *start,
                         uint32_t *end);

@@ -24,8 +24,7 @@
  * a decodability check on the instruction stream.
  *
  * Chunk.constIndex is not stored either: it is derived from the constant pool,
- * and jaiFunctionNew leaves it NULL so jaiChunkAddConstant rebuilds it from the
- * loaded pool if a later pass appends to it.
+ * and jaiFunctionNew leaves it NULL.
  */
 
 #include "vm/bytecode/serialize_internal.h"
@@ -219,87 +218,4 @@ ObjFunction *jaiDeserializeCached(const uint8_t *data, size_t size,
         (void)jaiRealloc(sidecar, sidecarLen + 5, 0);
     }
     return fn;
-}
-
-ObjFunction *jaiCacheLoad(const char *sourcePath, ObjModule *module,
-                          uint64_t sourceHash) {
-    size_t length = 0;
-    uint8_t *data = jaiCacheRead(sourcePath, &length);
-    if (data == NULL) return NULL;
-
-    ObjFunction *fn = jaiDeserializeCached(data, length, module, sourceHash,
-                                           sourcePath);
-    jaiCacheReadFree(data, length);
-    return fn;
-}
-
-static bool hasSuffix(const char *s, const char *suffix) {
-    size_t sl = strlen(s), fl = strlen(suffix);
-    return sl >= fl && memcmp(s + sl - fl, suffix, fl) == 0;
-}
-
-/* Deletes the artefacts this module creates — cache files and any temporary
- * left behind by an interrupted store — then the directory if it is now
- * empty. Foreign files are left alone. */
-static void clearCacheDir(const char *dir) {
-    DIR *d = opendir(dir);
-    if (d == NULL) return;
-
-    for (struct dirent *e = readdir(d); e != NULL; e = readdir(d)) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        if (!hasSuffix(e->d_name, JAIC_SUFFIX) &&
-            strstr(e->d_name, JAIC_SUFFIX ".tmp") == NULL) {
-            continue;
-        }
-
-        char path[JAI_MAX_PATH];
-        jaiPathJoin(path, sizeof path, dir, e->d_name);
-        if (path[0] == '\0') continue;
-
-        struct stat st;
-        if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-        (void)unlink(path);
-    }
-    (void)closedir(d);
-    (void)rmdir(dir);   /* succeeds only if nothing else was in there */
-}
-
-static void clearCacheTree(const char *dir, int depth) {
-    if (depth > 32) return;   /* a symlink loop cannot be walked forever */
-
-    DIR *d = opendir(dir);
-    if (d == NULL) return;
-
-    for (struct dirent *e = readdir(d); e != NULL; e = readdir(d)) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-
-        char path[JAI_MAX_PATH];
-        jaiPathJoin(path, sizeof path, dir, e->d_name);
-        if (path[0] == '\0') continue;
-
-        /* lstat, not stat: a symlinked directory is not descended into, so a
-         * clear can never delete outside the tree it was given. */
-        struct stat st;
-        if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-
-        if (strcmp(e->d_name, JAIC_CACHE_DIR) == 0) {
-            clearCacheDir(path);
-        } else {
-            clearCacheTree(path, depth + 1);
-        }
-    }
-    (void)closedir(d);
-}
-
-void jaiCacheClear(const char *rootDir) {
-    if (rootDir == NULL || rootDir[0] == '\0') return;
-    if (!jaiPathIsDir(rootDir)) return;
-
-    char base[JAI_MAX_PATH];
-    jaiPathBasename(base, sizeof base, rootDir);
-    if (strcmp(base, JAIC_CACHE_DIR) == 0) {
-        clearCacheDir(rootDir);
-        return;
-    }
-    clearCacheTree(rootDir, 0);
 }

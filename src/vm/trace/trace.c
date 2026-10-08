@@ -122,10 +122,6 @@ bool jaiTraceRecordOp(const char *name, const int *shape, int shape_len) {
     return true;
 }
 
-int jaiTraceOpCount(void) {
-    return gSession.op_count;
-}
-
 bool jaiTraceReplay(void) {
     return gSession.shapes_match && gSession.op_count > 0;
 }

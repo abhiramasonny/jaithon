@@ -24,7 +24,6 @@ typedef struct {
 #define JAI_SPAN_NONE ((JaiSpan){0, 0, -1})
 
 JAI_INLINE bool jaiSpanValid(JaiSpan s) { return s.file >= 0 && s.end >= s.start; }
-JaiSpan jaiSpanJoin(JaiSpan a, JaiSpan b);
 
 int             jaiSourceAdd(const char *path, char *source, size_t length);
 /* Register `path` without reading it; jaiSourceGet reads it on first use.
@@ -158,13 +157,6 @@ typedef enum {
 const char *jaiDiagCodeString(JaiDiagCode code);
 JaiDiagCode jaiDiagCodeFromString(const char *text);
 bool        jaiDiagCodeIsWarning(JaiDiagCode code);
-
-#define JAI_SUGGEST_MAX_LEN 64
-
-int  jaiNameDistance(const char *a, const char *b, int max);
-
-#define JAI_SUGGEST_NO_MATCH 4
-bool jaiNameIsCloser(const char *name, const char *candidate, int *best);
 
 typedef enum { JAI_SEV_ERROR, JAI_SEV_WARNING, JAI_SEV_NOTE, JAI_SEV_HELP } JaiSeverity;
 
