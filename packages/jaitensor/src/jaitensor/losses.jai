@@ -376,9 +376,19 @@ fn dispatch_ce_rows(
         stats.buffer(),
     ]
     if classes <= _CE_NARROW_MAX {
-        cached("ce_rows_narrow").dispatch_async(buffers, batch * 32, [batch, classes, write], group_size: 256)
+        cached("ce_rows_narrow").dispatch_async(
+            buffers,
+            batch * 32,
+            [batch, classes, write],
+            group_size: 256
+        )
     } else {
-        cached("ce_rows_wide").dispatch_async(buffers, batch * _CE_WIDE, [batch, classes, write], group_size: _CE_WIDE)
+        cached("ce_rows_wide").dispatch_async(
+            buffers,
+            batch * _CE_WIDE,
+            [batch, classes, write],
+            group_size: _CE_WIDE
+        )
     }
 }
 
@@ -396,9 +406,19 @@ fn ce_grad(prediction: Tensor, stats: Tensor, upstream: Tensor) -> Tensor {
         grad.buffer(),
     ]
     if classes <= _CE_NARROW_MAX {
-        cached("ce_grad_narrow").dispatch_async(buffers, batch * 32, [batch, classes], group_size: 256)
+        cached("ce_grad_narrow").dispatch_async(
+            buffers,
+            batch * 32,
+            [batch, classes],
+            group_size: 256
+        )
     } else {
-        cached("ce_grad_wide").dispatch_async(buffers, batch * _CE_WIDE, [batch, classes], group_size: _CE_WIDE)
+        cached("ce_grad_wide").dispatch_async(
+            buffers,
+            batch * _CE_WIDE,
+            [batch, classes],
+            group_size: _CE_WIDE
+        )
     }
     return grad
 }
@@ -505,7 +525,11 @@ pub class SparseCategoricalCrossentropy: Loss {
             let (mean, stats) = sparse_ce_stats(prediction, target, loss_acc, acc_weight)
             if prediction.requires_grad {
                 mean.attach_creator(
-                    GradNode([prediction], |upstream| [ce_grad(prediction, stats, upstream)], extras: [stats])
+                    GradNode(
+                        [prediction],
+                        |upstream| [ce_grad(prediction, stats, upstream)],
+                        extras: [stats]
+                    )
                 )
             } else {
                 stats.free()

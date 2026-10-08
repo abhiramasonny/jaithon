@@ -101,15 +101,26 @@ pub fn add(a: Tensor, b: Tensor) -> Tensor {
         let need_a = wants_grad(a)
         let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], |upstream| if broadcasting {
-            [
-                if need_a { upstream } else { a },
-                if need_b { reduce_leading(upstream, b.shape) } else { b },
-            ]
+            broadcast_add_grads(a, b, upstream, need_a, need_b)
         } else {
             binary_backward(a, b, upstream, 0, need_a, need_b)
         }))
     }
     return output
+}
+
+#: The upstream for the full-shape side and its sum over the leading axes
+#: for the broadcast side, each only if wanted (the input itself otherwise).
+fn broadcast_add_grads(
+    a: Tensor,
+    b: Tensor,
+    upstream: Tensor,
+    need_a: bool,
+    need_b: bool
+) -> list[Tensor] {
+    let grad_a = if need_a { upstream } else { a }
+    let grad_b = if need_b { reduce_leading(upstream, b.shape) } else { b }
+    return [grad_a, grad_b]
 }
 
 #: Elementwise difference of equal-shaped tensors.
@@ -118,7 +129,9 @@ pub fn subtract(a: Tensor, b: Tensor) -> Tensor {
     if a.requires_grad or b.requires_grad {
         let need_a = wants_grad(a)
         let need_b = wants_grad(b)
-        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 1, need_a, need_b)))
+        output.attach_creator(
+            GradNode([a, b], |upstream| binary_backward(a, b, upstream, 1, need_a, need_b))
+        )
     }
     return output
 }
@@ -129,7 +142,9 @@ pub fn multiply(a: Tensor, b: Tensor) -> Tensor {
     if a.requires_grad or b.requires_grad {
         let need_a = wants_grad(a)
         let need_b = wants_grad(b)
-        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 2, need_a, need_b)))
+        output.attach_creator(
+            GradNode([a, b], |upstream| binary_backward(a, b, upstream, 2, need_a, need_b))
+        )
     }
     return output
 }
@@ -140,7 +155,9 @@ pub fn divide(a: Tensor, b: Tensor) -> Tensor {
     if a.requires_grad or b.requires_grad {
         let need_a = wants_grad(a)
         let need_b = wants_grad(b)
-        output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 3, need_a, need_b)))
+        output.attach_creator(
+            GradNode([a, b], |upstream| binary_backward(a, b, upstream, 3, need_a, need_b))
+        )
     }
     return output
 }
@@ -357,7 +374,9 @@ pub fn maximum(a: Tensor, b: Tensor) -> Tensor {
     if a.requires_grad or b.requires_grad {
         let need_a = wants_grad(a)
         let need_b = wants_grad(b)
-        output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 1, need_a, need_b)))
+        output.attach_creator(
+            GradNode([a, b], |upstream| select_grads(a, b, upstream, 1, need_a, need_b))
+        )
     }
     return output
 }
@@ -371,7 +390,9 @@ pub fn minimum(a: Tensor, b: Tensor) -> Tensor {
     if a.requires_grad or b.requires_grad {
         let need_a = wants_grad(a)
         let need_b = wants_grad(b)
-        output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 0, need_a, need_b)))
+        output.attach_creator(
+            GradNode([a, b], |upstream| select_grads(a, b, upstream, 0, need_a, need_b))
+        )
     }
     return output
 }

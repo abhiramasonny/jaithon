@@ -128,8 +128,16 @@ pub fn matmul(
         let need_a = wants_grad(a)
         let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], fn(upstream: Tensor) -> list[Tensor] {
-            let grad_a = if need_a { matmul_grad_a(a, b, upstream, trans_a, trans_b) } else { a }
-            let grad_b = if need_b { matmul_grad_b(a, b, upstream, trans_a, trans_b) } else { b }
+            let grad_a = if need_a {
+                matmul_grad_a(a, b, upstream, trans_a, trans_b)
+            } else {
+                a
+            }
+            let grad_b = if need_b {
+                matmul_grad_b(a, b, upstream, trans_a, trans_b)
+            } else {
+                b
+            }
             return [grad_a, grad_b]
         }))
     }
@@ -209,7 +217,8 @@ pub fn dense_affine(x: Tensor, weights: Tensor, bias: Tensor, activation: int) -
 pub fn linear_gelu(x: Tensor, weights: Tensor, bias: Tensor) -> Tensor {
     #: Inside `no_grad` nothing records the intermediate, so the two-step
     #: path would leave it to nobody; the fused one is right there.
-    let training = is_grad_enabled() and (x.requires_grad or weights.requires_grad or bias.requires_grad)
+    let training = is_grad_enabled() and
+        (x.requires_grad or weights.requires_grad or bias.requires_grad)
     if training {
         return gelu(dense_affine(x, weights, bias, 0))
     }
@@ -234,7 +243,8 @@ pub fn linear_residual(x: Tensor, weights: Tensor, residual: Tensor) -> Tensor {
             f"linear_residual needs a residual of [{rows}, {columns}], got {residual.shape}"
         )
     }
-    let training = is_grad_enabled() and (x.requires_grad or weights.requires_grad or residual.requires_grad)
+    let training = is_grad_enabled() and
+        (x.requires_grad or weights.requires_grad or residual.requires_grad)
     if training {
         return add(residual, matmul(x, weights))
     }
