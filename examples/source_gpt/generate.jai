@@ -67,11 +67,12 @@ fn byte_tensor(values: list[int]) -> Tensor {
     return Tensor([values.len()], [float(v) for v in values])
 }
 
-#: Decode `count` bytes after `prompt` through the cache. `on_byte` sees each
-#: one as it is chosen; the result is every byte, prompt first.
+#: Decode `count` bytes after `prompt` through the cache. The result is every
+#: byte, prompt first. An empty prompt starts from a newline, the byte a
+#: top-level `fn` follows.
 fn decode(
     model: GPT,
-    prompt: list[int],
+    given: list[int],
     count: int,
     temperature: float,
     top_k: int,
@@ -79,6 +80,7 @@ fn decode(
 ) -> list[int] {
     let window = model.cfg.seq
     let keep = window // 2
+    let prompt = if given.len() == 0 { [10] } else { given }
     var out = prompt.copy()
     model.reset_cache()
     var context = if prompt.len() > window { prompt[prompt.len() - window:] } else { prompt.copy() }

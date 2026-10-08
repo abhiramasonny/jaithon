@@ -10,7 +10,8 @@
 #: sequence `b`. Every op but attention works row by row and does not care,
 #: and attention folds that order into its heads without a copy (see
 #: `MultiHeadAttention`'s `batch_first`). `GPT_BATCH_FIRST=1` trains in the
-#: batch-first order instead, for an A/B in one binary; read once.
+#: batch-first order instead, for an A/B in one binary; read once. It is for
+#: training: batched cached decoding is written sequence-first and refuses it.
 import jaitensor as jt
 import std.gpu as gpu
 import std.math
@@ -299,6 +300,11 @@ pub class GPT {
 
     #: A cache for `batch` sequences of up to `max_seq` bytes in every layer.
     pub fn start_cache(self, max_seq: int, batch: int = 1) -> void {
+        if BATCH_FIRST and batch > 1 {
+            throw ValueError(
+                "GPT_BATCH_FIRST=1 is for training: batched cached decoding is sequence-first"
+            )
+        }
         for b in self.blocks { b.attn.start_cache(max_seq, batch: batch) }
     }
 
