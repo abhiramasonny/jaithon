@@ -8,6 +8,7 @@ generates it, so there is nothing to download except the one model that says so.
 | | what it shows |
 |---|---|
 | [`tiny_lm/`](tiny_lm) | a character language model, trained on a page of text in the source file. `Embedding`, and what memorising looks like from the inside |
+| [`source_gpt/`](source_gpt) | a byte-level GPT trained on this repository's own source, 1.35x torch MPS a step, sampled through a KV cache; batched attention, `layer_norm` at any rank, binary checkpoints |
 | [`digit_trainer/`](digit_trainer) | jaicv draws the training set, jaitensor learns it, jaicv draws the mistakes. 99.2% on held-out digits, nine seconds |
 | `fashion_mnist.jai` | a dense classifier on a real dataset |
 | `mnist_gpu.jai` | the shortest end-to-end training loop here |
