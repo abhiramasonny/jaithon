@@ -1,5 +1,6 @@
 #: `Dataset` and the loader: how a batch is built and what shuffling has to keep.
 import jaitensor as jt
+from std.gpu import Buffer
 from std.test import assert_eq, assert_near, assert_throws
 
 fn test_dataset_constructors_are_format_agnostic() -> void {
@@ -133,4 +134,144 @@ fn test_dataloader_shuffle_keeps_images_shaped() -> void {
         features.free()
         labels.free()
     }
+}
+
+#: The shift (dx, dy) and flip that turn `source` image `n` into `output`
+#: image `n`, as `[dx, dy, flip]`, or an empty list when none does. Pixels
+#: brought in from outside the image are zero; the source holds no zeros.
+fn crop_that_made(
+    source: list[float],
+    output: list[float],
+    n: int,
+    height: int,
+    width: int,
+    channels: int,
+    padding: int
+) -> list[int] {
+    let per = height * width * channels
+    for flip in [0, 1] {
+        for dy in -padding..=padding {
+            for dx in -padding..=padding {
+                var same = true
+                for y in 0..height {
+                    for x in 0..width {
+                        let sx = (if flip == 1 { width - 1 - x } else { x }) + dx
+                        let sy = y + dy
+                        for c in 0..channels {
+                            let want = if sx >= 0 and sx < width and sy >= 0 and sy < height {
+                                source[n * per + (sy * width + sx) * channels + c]
+                            } else {
+                                0.0
+                            }
+                            if output[n * per + (y * width + x) * channels + c] != want {
+                                same = false
+                            }
+                        }
+                    }
+                }
+                if same { return [dx, dy, flip] }
+            }
+        }
+    }
+    return []
+}
+
+#: Every image comes out as itself shifted by at most `padding` each way,
+#: zero-filled, and mirrored or not: a crop of the padded image. A seed gives
+#: the same batch every time and another seed another batch, and across a
+#: batch every kind of crop turns up.
+fn test_random_crop_flip_is_a_seeded_padded_crop() -> void {
+    if not jt.is_available() { return }
+    let images = 64
+    let height = 5
+    let width = 6
+    let channels = 2
+    let padding = 2
+    let size = images * height * width * channels
+    let source = jt.Tensor(
+        [images, height, width, channels],
+        [float(index + 1) for index in 0..size]
+    )
+    let values = source.download()
+    let first = jt.random_crop_flip(source, padding: padding, seed: 11)
+    let again = jt.random_crop_flip(source, padding: padding, seed: 11)
+    let other = jt.random_crop_flip(source, padding: padding, seed: 12)
+    let a = first.download()
+    assert_eq(a, again.download())
+    assert a != other.download()
+    var shifts: dict[str, bool] = {}
+    var flips = 0
+    for n in 0..images {
+        let crop = crop_that_made(values, a, n, height, width, channels, padding)
+        assert crop.len() == 3, f"image {n} is not a crop of its source"
+        shifts[f"{crop[0]},{crop[1]}"] = true
+        flips += crop[2]
+    }
+    assert shifts.len() >= 15, f"only {shifts.len()} of 25 shifts in 64 images"
+    assert flips > 16 and flips < 48, f"{flips} of 64 flipped"
+
+    #: Without flipping, every crop is an unflipped one; written in place.
+    let held = jt.Tensor(source.shape)
+    jt.random_crop_flip_into(source, held, padding: padding, seed: 11, flip: false)
+    let unflipped = held.download()
+    for n in 0..images {
+        let crop = crop_that_made(values, unflipped, n, height, width, channels, padding)
+        assert crop.len() == 3 and crop[2] == 0, f"image {n} flipped or not a crop"
+    }
+    #: No padding and no flip is a copy.
+    jt.random_crop_flip_into(source, held, padding: 0, seed: 5, flip: false)
+    assert_eq(held.download(), values)
+    let _self = assert_throws(ValueError, || jt.random_crop_flip_into(source, source))
+    let _flat = assert_throws(ValueError, || jt.random_crop_flip(jt.Tensor([4, 3])))
+    for tensor in [source, first, again, other, held] { tensor.free() }
+}
+
+#: The highest handle among the next 256 buffers. Handles are handed out
+#: lowest free slot first, so this stays put while everything made in between
+#: is freed, and climbs by one for every handle something kept below it. (One
+#: probe is not enough: a kept handle can sit above a slot a later free opens.)
+fn handle_frontier() -> int {
+    var probes: list[Buffer] = []
+    var top = 0
+    for _index in 0..256 {
+        let probe = Buffer(1)
+        top = max(top, probe.handle_of())
+        probes.push(probe)
+    }
+    for probe in probes { probe.free() }
+    return top
+}
+
+#: A shuffled epoch frees everything it made.
+#:
+#: `next_batch` took a view of the order for each batch's indices and never
+#: freed it. A view holds no device memory, so nothing counting buffers saw
+#: it, but it holds a handle, and handles are found by a scan from the bottom
+#: of the table: a training run kept one per batch, and every allocation
+#: after that walked past all of them. ResNet-20 on CIFAR-10 spent its last
+#: epochs three times as long as its first doing it.
+fn test_a_shuffled_epoch_keeps_no_handles() -> void {
+    if not jt.is_available() { return }
+    let data = jt.Dataset(jt.Tensor([40, 2, 2, 1]), jt.Tensor([40], [float(i % 4) for i in 0..40]))
+    for _warm in 0..2 {
+        let loader = jt.DataLoader(data, 8, shuffle: true, seed: 3)
+        while loader.has_next() {
+            let (features, labels) = loader.next_batch()
+            features.free()
+            labels.free()
+        }
+        loader.free()
+    }
+    let before = handle_frontier()
+    for epoch in 0..3 {
+        let loader = jt.DataLoader(data, 8, shuffle: true, seed: epoch)
+        while loader.has_next() {
+            let (features, labels) = loader.next_batch()
+            features.free()
+            labels.free()
+        }
+        loader.free()
+    }
+    assert_eq(handle_frontier(), before)
+    data.free()
 }

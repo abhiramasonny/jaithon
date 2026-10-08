@@ -155,6 +155,7 @@ pub fn conv2d(
         }
         raw_matmul(col, flat_w, bias: bias, epilogue: epilogue, out: flat_out)
         col.free()
+        flat_w.free()
     }
     try {
         gpu.conv2d_async(input.buffer(), weights.buffer(), output.buffer(), n, h, w, cin, cout, kh, kw, stride_h: stride, stride_w: stride, pad_h: padding, pad_w: padding, bias: if bias is null {
@@ -400,6 +401,7 @@ fn attach_conv_grad(
                 [n, h, w, cin, kh, kw, stride, stride, padding, padding]
             )
             grad_col.free()
+            flat_w.free()
         }
 
         #: Same order as `inputs`, which listed only what wanted a gradient.
@@ -407,6 +409,10 @@ fn attach_conv_grad(
         if wants_input { grads.push(grad_input) }
         if wants_weights { grads.push(grad_weights) }
         if wants_bias { grads.push(reduce_leading(flat_up, [cout])) }
+        #: The flat views hold no memory, only handles -- but every handle kept
+        #: is one more slot each later allocation scans past. One a convolution
+        #: a step made a long run slower with every epoch.
+        flat_up.free()
         if activation == 1 { upstream.free() }
         return grads
     }))
