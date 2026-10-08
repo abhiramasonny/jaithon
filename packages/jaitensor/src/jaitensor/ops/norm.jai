@@ -1,5 +1,6 @@
 #: Batch, layer and group normalisation, and dropout.
 from ..tensor import GradNode, Tensor
+from .elementwise import add, relu as relu_op
 from .kernels import cached_kernel, f32_bits
 from .shape import reshape
 from std.os import env
@@ -50,12 +51,32 @@ pub fn dropout(input: Tensor, p: float = 0.5, training: bool = true, seed: int? 
     return output
 }
 
+#: Whether `batch_norm`'s residual add and ReLU run inside its own pass, and
+#: its elementwise passes four channels to a thread. `JAITENSOR_BN_FUSED=0`
+#: composes the add and the ReLU from `add` and `relu` instead, the way a
+#: model wrote them before, and keeps the one-float kernels, for an A/B in
+#: one binary. Read once.
+var _bn_fused: int = -1
+
+fn bn_fused_on() -> bool {
+    if _bn_fused < 0 {
+        let text = env("JAITENSOR_BN_FUSED")
+        _bn_fused = if text is not null and text == "0" { 0 } else { 1 }
+    }
+    return _bn_fused == 1
+}
+
 #: Channel-last batch normalization using per-channel mean and variance of `x`.
 #: Blocks for the coalesced channel reduction, or zero when it does not apply.
 #:
 #: Each block's threads stay on one channel apiece only if the group holds a
 #: whole number of channels, and the split has to be worth making: a couple of
 #: rows a block spends more on joining the partials than the first pass saves.
+#:
+#: 128 blocks spread the reduction over the long NHW axis well enough: over
+#: ResNet-8's blocks, 256 and 512 measured the same or up to 60% slower (a
+#: [128,32,32,32] forward 133 us at 128, 138 at 256, 176 at 512), the joins
+#: growing with the count while the first pass was already at its ceiling.
 fn channel_chunks(nspatial: int, channels: int) -> int {
     if channels > 256 or 256 % channels != 0 { return 0 }
     let wanted = min(128, nspatial // 64)
@@ -63,15 +84,9 @@ fn channel_chunks(nspatial: int, channels: int) -> int {
     return wanted
 }
 
-pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
-    if input.rank() != 4 {
-        throw ValueError(f"batch_norm needs NHWC input, got {input.shape}")
-    }
-    let channels = input.shape[3]
-    if gamma.size != channels or beta.size != channels {
-        throw ValueError("batch_norm gamma/beta must match the channel count")
-    }
-    let nspatial = input.shape[0] * input.shape[1] * input.shape[2]
+#: The per-channel mean and biased variance of an NHWC block, as two
+#: `[channels]` tensors the caller frees.
+fn channel_moments(input: Tensor, nspatial: int, channels: int) -> list[Tensor] {
     let mean = Tensor([channels])
     let variance = Tensor([channels])
     let chunks = channel_chunks(nspatial, channels)
@@ -106,43 +121,159 @@ pub fn batch_norm(input: Tensor, gamma: Tensor, beta: Tensor) -> Tensor {
             group_size: 256
         )
     }
+    return [mean, variance]
+}
+
+#: `relu(batch_norm(x) + residual)` written out of the separate operations, as
+#: models wrote it before the fused pass existed. The reference the fused pass
+#: is held to, and what `JAITENSOR_BN_FUSED=0` runs.
+fn composed_batch_norm(
+    input: Tensor,
+    gamma: Tensor,
+    beta: Tensor,
+    residual: Tensor?,
+    then_relu: bool
+) -> Tensor {
+    let normed = batch_norm(input, gamma, beta)
+    let summed = if residual is not null { add(normed, residual) } else { normed }
+    let result = if then_relu { relu_op(summed) } else { summed }
+    #: Without a graph nothing will free the steps in between.
+    if not result.requires_grad {
+        if summed is not normed { normed.free() }
+        if result is not summed { summed.free() }
+    }
+    return result
+}
+
+#: Channel-last (NHWC) batch normalization over the batch's own statistics.
+#:
+#: `residual`, when given, is added after the affine step and `relu` then
+#: applied, so `batch_norm(x, g, b, residual: s, relu: true)` is
+#: `relu(batch_norm(x, g, b) + s)` -- a residual block's tail -- in one pass
+#: over the activations instead of three, and its backward in two instead of
+#: five: the ReLU mask is applied as the upstream gradient is read, and the
+#: skip's gradient, which is that masked gradient, is written by the pass that
+#: reads it. The result and every gradient match the composed operations.
+pub fn batch_norm(
+    input: Tensor,
+    gamma: Tensor,
+    beta: Tensor,
+    residual: Tensor? = null,
+    relu: bool = false
+) -> Tensor {
+    if input.rank() != 4 {
+        throw ValueError(f"batch_norm needs NHWC input, got {input.shape}")
+    }
+    let channels = input.shape[3]
+    if gamma.size != channels or beta.size != channels {
+        throw ValueError("batch_norm gamma/beta must match the channel count")
+    }
+    let skip = residual
+    if skip is not null and skip.shape != input.shape {
+        throw ValueError(f"batch_norm residual {skip.shape} must match the input {input.shape}")
+    }
+    let fused = skip is not null or relu
+    if fused and not bn_fused_on() { return composed_batch_norm(input, gamma, beta, skip, relu) }
+    let nspatial = input.shape[0] * input.shape[1] * input.shape[2]
+    let moments = channel_moments(input, nspatial, channels)
+    let mean = moments[0]
+    let variance = moments[1]
     let output = Tensor(input.shape)
-    let kernel = cached_kernel("batch_norm_forward")
-    kernel.dispatch_async(
-        [
-            input.buffer(),
-            mean.buffer(),
-            variance.buffer(),
-            gamma.buffer(),
-            beta.buffer(),
-            output.buffer(),
-        ],
-        input.size,
-        [input.size, channels]
-    )
-    if input.requires_grad or gamma.requires_grad or beta.requires_grad {
-        output.attach_creator(GradNode([input, gamma, beta], fn(upstream: Tensor) -> list[Tensor] {
+    let flags = (if skip is not null { 1 } else { 0 }) + (if relu { 2 } else { 0 })
+    #: Four channels to a thread wherever they come in fours, fused or not:
+    #: the plain affine step ran 133 us over a [128,32,32,32] block one float
+    #: to a thread and 112 four to one, with the ReLU folded in as well.
+    let quads = channels % 4 == 0 and bn_fused_on()
+    if fused or quads {
+        let skip_buffer = if skip is not null { skip.buffer() } else { input.buffer() }
+        let entry = if quads { "batch_norm_apply4" } else { "batch_norm_apply" }
+        let count = if quads { input.size // 4 } else { input.size }
+        cached_kernel(entry).dispatch_async(
+            [
+                input.buffer(),
+                mean.buffer(),
+                variance.buffer(),
+                gamma.buffer(),
+                beta.buffer(),
+                skip_buffer,
+                output.buffer(),
+            ],
+            count,
+            [count, channels, flags]
+        )
+    } else {
+        cached_kernel("batch_norm_forward").dispatch_async(
+            [
+                input.buffer(),
+                mean.buffer(),
+                variance.buffer(),
+                gamma.buffer(),
+                beta.buffer(),
+                output.buffer(),
+            ],
+            input.size,
+            [input.size, channels]
+        )
+    }
+    let skip_grad = skip is not null and skip.requires_grad
+    if input.requires_grad or gamma.requires_grad or beta.requires_grad or skip_grad {
+        var inputs = [input, gamma, beta]
+        if skip is not null { inputs.push(skip) }
+        output.attach_creator(GradNode(inputs, fn(upstream: Tensor) -> list[Tensor] {
             let sum_dy = Tensor([channels])
             let sum_dy_xhat = Tensor([channels])
             let grad_gamma = Tensor([channels])
             let grad_beta = Tensor([channels])
+            let grad_skip: Tensor? = if skip is not null { Tensor(input.shape) } else { null }
+            #: What the input pass reads as the upstream gradient: `upstream`
+            #: itself, or the masked copy the generic path makes.
+            var masked: Tensor? = null
             let split = channel_chunks(nspatial, channels)
             if split > 0 {
                 let rows_each = (nspatial + split - 1) // split
                 let part_dy = Tensor([split * channels])
                 let part_dy_xhat = Tensor([split * channels])
-                cached_kernel("channel_grad_partials").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), part_dy.buffer(), part_dy_xhat.buffer()], split * 256, [nspatial, channels, rows_each], group_size: 256)
+                if fused {
+                    let skip_out = if grad_skip is not null { grad_skip.buffer() } else { part_dy.buffer() }
+                    cached_kernel("batch_norm_fused_partials").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), output.buffer(), upstream.buffer(), part_dy.buffer(), part_dy_xhat.buffer(), skip_out], split * 256, [nspatial, channels, rows_each, flags], group_size: 256)
+                } else {
+                    cached_kernel("channel_grad_partials").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), part_dy.buffer(), part_dy_xhat.buffer()], split * 256, [nspatial, channels, rows_each], group_size: 256)
+                }
                 cached_kernel("channel_grad_join").dispatch_async([part_dy.buffer(), part_dy_xhat.buffer(), gamma.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels, [split, channels])
                 part_dy.free()
                 part_dy_xhat.free()
             } else {
-                cached_kernel("norm_channel_sums").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels * 256, [nspatial, channels], group_size: 256)
+                var source = upstream
+                if fused {
+                    let made = if grad_skip is not null { grad_skip } else { Tensor(input.shape) }
+                    cached_kernel("batch_norm_relu_mask").dispatch_async([output.buffer(), upstream.buffer(), made.buffer()], input.size, [input.size, flags])
+                    masked = made
+                    source = made
+                }
+                cached_kernel("norm_channel_sums").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), source.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_gamma.buffer(), grad_beta.buffer()], channels * 256, [nspatial, channels], group_size: 256)
             }
             let grad_input = Tensor(input.shape)
-            let back = cached_kernel("norm_channel_backward")
-            back.dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, channels, nspatial])
+            let held = masked
+            #: With a skip, its gradient already is the masked upstream one, so
+            #: the input pass reads that instead of the output and the upstream
+            #: gradient both: one read less of the block.
+            let ready = if held is not null { held } elif grad_skip is not null { grad_skip } else { null }
+            if quads {
+                let source = if ready is not null { ready } else { upstream }
+                let mask = if ready is null and relu { 2 } else { 0 }
+                cached_kernel("batch_norm_backward4").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), output.buffer(), source.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size // 4, [input.size // 4, channels, nspatial, mask])
+                if held is not null and grad_skip is null { held.free() }
+            } elif fused and ready is null {
+                cached_kernel("batch_norm_fused_backward").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), output.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, channels, nspatial, flags])
+            } elif ready is not null {
+                cached_kernel("norm_channel_backward").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), ready.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, channels, nspatial])
+                if held is not null and grad_skip is null { held.free() }
+            } else {
+                cached_kernel("norm_channel_backward").dispatch_async([input.buffer(), mean.buffer(), variance.buffer(), gamma.buffer(), upstream.buffer(), sum_dy.buffer(), sum_dy_xhat.buffer(), grad_input.buffer()], input.size, [input.size, channels, nspatial])
+            }
             sum_dy.free()
             sum_dy_xhat.free()
+            if grad_skip is not null { return [grad_input, grad_gamma, grad_beta, grad_skip] }
             return [grad_input, grad_gamma, grad_beta]
         }, extras: [mean, variance]))
         return output
