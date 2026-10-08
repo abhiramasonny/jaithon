@@ -227,11 +227,17 @@ pub fn run_graph(
                 produced_slot = handler(node, ins)
             }
             let produced = produced_slot
-            if produced.len() < node.outputs.len() {
-                throw ValueError(
-                    f"{node.label()} names {node.outputs.len()} outputs and produced " +
-                        f"{produced.len()}"
-                )
+            #: A node may list optional outputs it does not want under empty
+            #: names -- `["y", "", ""]` is valid ONNX -- and a handler that
+            #: makes only what is named leaves those slots out. Only a named
+            #: output that never came back is a fault.
+            for slot in produced.len()..node.outputs.len() {
+                if node.outputs[slot].len() > 0 {
+                    throw ValueError(
+                        f"{node.label()} names {node.outputs.len()} outputs and produced " +
+                            f"{produced.len()}"
+                    )
+                }
             }
             for (slot, tensor) in produced.enumerate() {
                 let name = if slot < node.outputs.len() { node.outputs[slot] } else { "" }

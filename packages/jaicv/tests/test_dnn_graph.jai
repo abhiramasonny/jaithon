@@ -989,3 +989,75 @@ fn test_layer_norm_leaves_no_buffers_behind() -> void {
     x.free()
     scale.free()
 }
+
+#: Optional outputs a node does not want may be listed under empty names, and
+#: `["y", "", ""]` is valid ONNX. Making only the named statistics must not
+#: turn that into a node that "names three outputs and produced one", on the
+#: interpreter or in the survey the plan compiles from.
+fn test_layer_norm_takes_unnamed_trailing_outputs() -> void {
+    if not gpu.is_available() { return }
+    let x = Tensor([2, 3, 8], [float(index % 5) * 0.75 - 1.5 for index in 0..48])
+    let scale = Tensor([8], [1.0, 0.5, 2.0, 1.5, -1.0, 0.25, 1.0, 3.0])
+    fn graph_of(outputs: list[str], gamma: Tensor) -> Graph {
+        return Graph(
+            nodes: [
+                GraphNode(
+                    "LayerNormalization",
+                    name: "ln",
+                    inputs: ["x", "scale"],
+                    outputs: outputs,
+                    attrs: {"axis": Attr.of_int(-1)}
+                ),
+            ],
+            inputs: ["x"],
+            outputs: [name for name in outputs if name.len() > 0],
+            initializers: {"scale": gamma}
+        )
+    }
+    let reference = run_graph(graph_of(["y", "mean", "deviation"], scale), {"x": x})
+    let want_y = reference["y"].download()
+    let want_mean = reference["mean"].download()
+    for (_name, tensor) in reference.items() { tensor.free() }
+    for outputs in [["y", "", ""], ["y", ""], ["y", "mean", ""]] {
+        let graph = graph_of(outputs, scale)
+        let before = gpu.live_buffers()
+        let produced = run_graph(graph, {"x": x})
+        assert_eq(
+            produced.len(),
+            graph.outputs.len(),
+            f"{outputs} came back with its named outputs"
+        )
+        let got_y = produced["y"].download()
+        for index in 0..want_y.len() {
+            assert_near(got_y[index], want_y[index], 1e-6, f"{outputs} y differs at {index}")
+        }
+        if outputs.len() == 3 and outputs[1] == "mean" {
+            assert_eq(produced["mean"].shape, [2, 3, 1], "the mean keeps the outer axes")
+            let got_mean = produced["mean"].download()
+            for index in 0..want_mean.len() {
+                assert_near(got_mean[index], want_mean[index], 1e-6, f"{outputs} mean at {index}")
+            }
+        }
+        for (_name, tensor) in produced.items() { tensor.free() }
+        assert_eq(
+            gpu.live_buffers() - before,
+            0,
+            f"LayerNormalization with outputs {outputs} leaked"
+        )
+    }
+    #: The plan's survey runs the interpreter, so it threw too, and a node the
+    #: plan took on the base tree was refused.
+    let plan = compile_plan(graph_of(["y", "", ""], scale), {"x": x})
+    assert_true(plan is not null, "a layer norm with unnamed statistics still compiles")
+    if plan is not null {
+        let planned = plan.run({"x": x})
+        let got = planned["y"].download()
+        for index in 0..want_y.len() {
+            assert_near(got[index], want_y[index], 1e-5, f"the plan differs at {index}")
+        }
+        planned["y"].free()
+        plan.free()
+    }
+    x.free()
+    scale.free()
+}

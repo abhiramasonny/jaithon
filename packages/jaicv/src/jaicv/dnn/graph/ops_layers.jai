@@ -531,15 +531,22 @@ pub fn op_layer_norm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     #: fifty a frame on a ViT, and every allocation after slower for them.
     var moment_shape: list[int] = []
     for other in 0..rank { moment_shape.push(if other < axis { x.shape[other] } else { 1 }) }
-    #: Positions identify outputs, so everything up to the last named one goes
-    #: back, and the caller frees whichever of those has no name.
+    #: Positions identify outputs, so the list runs up to the last named one
+    #: and stops: `run_graph` takes a short list when every slot after it is
+    #: unnamed. An unnamed slot before a named one only holds the place, so it
+    #: gets the bare statistic, which the caller frees.
     var last = 0
     for slot in 1..min(node.outputs.len(), 3) {
         if node.outputs[slot].len() > 0 { last = slot }
     }
     var produced = [output]
     for (slot, moment) in [mean, inv_std].enumerate() {
-        if slot + 1 <= last { produced.push(copy_of(moment, moment_shape)) }
+        let position = slot + 1
+        if position <= last and node.outputs[position].len() == 0 {
+            produced.push(moment)
+            continue
+        }
+        if position <= last { produced.push(copy_of(moment, moment_shape)) }
         moment.free()
     }
     return produced
