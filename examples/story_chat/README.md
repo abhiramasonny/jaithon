@@ -7,7 +7,7 @@ the loss on the bot's turns only, and a terminal chat that streams its replies
 through the attention cache.
 
 ```bash
-./jaithon run examples/story_chat/check.jai          # the acceptance check, about 5 s
+./jaithon run examples/story_chat/check.jai          # the acceptance check, 5-10 s
 ./examples/story_chat/run_full.sh                    # the whole pipeline: 2 h of pretraining, in locked 5-minute chunks
 ./jaithon run examples/story_chat/chat.jai           # talk to it
 ./jaithon run examples/story_chat/generate.jai -- "Once upon a time, a little fox"
@@ -19,7 +19,8 @@ repository: token files, tokenizers, checkpoints and logs go to
 
 **The numbers and samples below come from a 15-minute pretraining run, an
 eighth of the real budget.** The two-hour run is `run_full.sh` with its
-defaults; it has not been run yet.
+defaults; one was started from this branch at 13:38 on 2026-10-08, and none
+of its results are in this README.
 
 ## Data
 
