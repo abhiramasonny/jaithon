@@ -32,7 +32,9 @@ fn pick(row: list[float], temperature: float, top_k: int, rng: Random) -> int {
             #: Comparing NaN throws here. The fused GELU product epilogue gave
             #: NaN from a pre-activation of about 20 until gemm_tanh clamped
             #: its argument (thin-gemms-fused-batchnorm); say so plainly.
-            throw RuntimeError("the model produced NaN logits; this needs the GEMM epilogue tanh clamp")
+            throw RuntimeError(
+                "the model produced NaN logits; this needs the GEMM epilogue tanh clamp"
+            )
         }
     }
     var best = 0
