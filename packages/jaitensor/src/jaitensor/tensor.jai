@@ -317,14 +317,7 @@ pub class Tensor {
                 let keeps = tensor is self or tensor.retains_grad
                 if keeps { own_grads(node, grads, upstream) }
                 settle_grads(node, grads, upstream)
-                if not keeps {
-                    if _EARLY_FREE {
-                        release_upstream(tensor, upstream, node, grads)
-                    } elif handed_on(node, grads, upstream) {
-                        #: Passed straight through: the input owns it now.
-                        tensor.grad = null
-                    }
-                }
+                if not keeps { release_upstream(tensor, upstream, node, grads, _EARLY_FREE) }
                 if _EARLY_FREE { release_saved(node, index, last_reader) }
             }
             index -= 1
@@ -582,16 +575,25 @@ fn own_grads(node: GradNode, grads: list[Tensor], upstream: Tensor) -> void {
     }
 }
 
-#: Release an intermediate's gradient once its op's backward has read it.
+#: Settle who owns an intermediate's gradient once its op's backward has
+#: read it, and with `free_now` release it.
 #:
 #: Every consumer has already contributed by now -- they all come later in
 #: the forward order, so earlier in this walk -- and nothing but this op's
 #: backward reads it. Two things can still hold its memory: an op that
 #: passed it straight through as an input's gradient (which then owns it),
 #: or one that handed back a view of it (`reshape`), which then keeps it
-#: alive as its `backing`. With more than one such holder it is left for the
+#: alive as its `backing` -- so a parameter whose gradient is that view does
+#: not lose it when the graph is freed. Both happen whether or not anything
+#: is released early. With more than one such holder it is left for the
 #: caller to free with the tensor, as before.
-fn release_upstream(tensor: Tensor, upstream: Tensor, node: GradNode, grads: list[Tensor]) -> void {
+fn release_upstream(
+    tensor: Tensor,
+    upstream: Tensor,
+    node: GradNode,
+    grads: list[Tensor],
+    free_now: bool
+) -> void {
     var holders = 0
     var holder: Tensor? = null
     for (position, grad) in grads.enumerate() {
@@ -602,11 +604,16 @@ fn release_upstream(tensor: Tensor, upstream: Tensor, node: GradNode, grads: lis
         }
     }
     if holders > 1 { return }
-    tensor.grad = null
     let kept = holder
     if kept is null {
-        upstream.free()
-    } elif kept is not upstream {
+        if free_now {
+            tensor.grad = null
+            upstream.free()
+        }
+        return
+    }
+    tensor.grad = null
+    if kept is not upstream {
         let earlier = kept.backing
         if earlier is null {
             kept.backing = upstream
