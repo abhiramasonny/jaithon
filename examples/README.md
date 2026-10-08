@@ -1,7 +1,8 @@
 # examples
 
 Every one of these runs from a clean checkout. Where a program needs data it
-generates it, so there is nothing to download except the one model that says so.
+generates it, so there is nothing to download except the one model and the two
+text datasets (`story_chat`) that say so.
 
 ## Machine learning
 
@@ -9,6 +10,7 @@ generates it, so there is nothing to download except the one model that says so.
 |---|---|
 | [`tiny_lm/`](tiny_lm) | a character language model, trained on a page of text in the source file. `Embedding`, and what memorising looks like from the inside |
 | [`source_gpt/`](source_gpt) | a byte-level GPT trained on this repository's own source, 1.35x torch MPS a step, sampled through a KV cache; batched attention, `layer_norm` at any rank, binary checkpoints |
+| [`story_chat/`](story_chat) | a 27M-parameter GPT you can talk to: a BPE tokenizer trained in Jaithon, pretraining on TinyStories, fine-tuning on DailyDialog with the loss on the bot's turns only, a terminal chat. Needs the two datasets in `~/Developer/datasets` |
 | [`digit_trainer/`](digit_trainer) | jaicv draws the training set, jaitensor learns it, jaicv draws the mistakes. 99.2% on held-out digits, nine seconds |
 | [`cifar_resnet/`](cifar_resnet) | ResNet-20 on CIFAR-10: residual blocks, fused batch norm, GPU crop and flip, a one-cycle schedule. 90.2% in 130 s, 1.42x faster than PyTorch on MPS. Reads the CIFAR-10 files `tests/bench/jaitensor/prepare_data.py cifar10` writes |
 | `fashion_mnist.jai` | a dense classifier on a real dataset |
