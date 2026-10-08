@@ -1,13 +1,20 @@
 # story_chat
 
-A GPT you can talk to, built and trained end to end in Jaithon on human-written
-English: a byte-level BPE tokenizer learned here, a 27.4M-parameter model
-pretrained on TinyStories, then fine-tuned on DailyDialog conversations with
-the loss on the bot's turns only, and a terminal chat that streams its replies
-through the attention cache.
+A GPT you can talk to, built and trained end to end in Jaithon: a byte-level
+BPE tokenizer learned here, a 27.4M-parameter model pretrained on TinyStories,
+then fine-tuned on DailyDialog conversations with the loss on the bot's turns
+only, and a terminal chat that streams its replies through the attention
+cache.
+
+Of the two datasets only DailyDialog is human-written. TinyStories is
+synthetic: GPT-4 wrote its stories (the `GPT4` in the file names), in the
+vocabulary of a small child. It teaches the model English grammar and
+storytelling cheaply; the conversations it learns to hold come from the
+people who wrote DailyDialog.
 
 ```bash
 ./jaithon run examples/story_chat/check.jai          # the acceptance check, 5-10 s
+sh examples/story_chat/check_run_full.sh             # run_full.sh's control flow, no GPU, 6 s
 ./examples/story_chat/run_full.sh                    # the whole pipeline: 2 h of pretraining, in locked 5-minute chunks
 ./jaithon run examples/story_chat/chat.jai           # talk to it
 ./jaithon run examples/story_chat/generate.jai -- "Once upon a time, a little fox"
@@ -28,7 +35,8 @@ Read-only, never copied into the repository:
 
 - `~/Developer/datasets/tinystories/TinyStoriesV2-GPT4-{train,valid}.txt`
   (`STORY_DATA`): 2.23 GB and 22.5 MB, 2,717,495 and 27,630 short stories in
-  the vocabulary of a small child, separated by `<|endoftext|>`.
+  the vocabulary of a small child, separated by `<|endoftext|>`. Machine
+  text: GPT-4 generated every story.
 - `~/Developer/datasets/dailydialog/{train,validation,test}/dialogues_*.txt`
   (`DIALOG_DATA`): 11,118 / 1,000 / 1,000 human-written everyday
   conversations, one a line, turns separated by `__eou__`. The text has a space
@@ -45,15 +53,16 @@ download still in progress).
 | file | what it does |
 |---|---|
 | `tokenizer.jai` | byte-level BPE: GPT-2's piece cutter, merges learned with incremental pair counts, a piece cache for encoding, merges saved as text |
-| `prepare.jai` | learns the tokenizer from 64 MB of TinyStories train plus all of DailyDialog train, then encodes both TinyStories splits to uint16 token files, 64 MB at a time |
+| `prepare.jai` | learns the tokenizer from 64 MB of TinyStories train plus all of DailyDialog train, then encodes both TinyStories splits to uint16 token files, 16 MB at a time |
 | `model.jai` | the GPT, the token files and batches, held-out loss and bits per byte, AdamW with decay on the matrices only, optimiser state for checkpoints |
 | `pretrain.jai` | pretraining: random windows, warm-up and cosine over a time budget, clipping, held-out evaluation and a sample every 250 steps, `--minutes` chunks and `--resume`; `MODE=bench` times the step, `MODE=eval` evaluates a checkpoint |
 | `dialog.jai` | DailyDialog as `<|user|>`/`<|bot|>` turns, the loss mask, length buckets, the chat prompt |
 | `finetune.jai` | fine-tuning on the bot's tokens, an epoch per run with `--one-epoch --resume` |
-| `sample.jai` | temperature, top-k, top-p and repetition penalty on downloaded logits; cached decoding with a sliding context |
-| `chat.jai` | the terminal chat |
+| `sample.jai` | temperature, top-k, top-p and repetition penalty on downloaded logits; cached decoding with a sliding context. The penalty, as in CTRL, divides each distinct recent token's logit once, and leaves `<|endoftext|>`, `<|user|>` and `<|bot|>` alone |
+| `chat.jai` | the terminal chat: `/reset`, `/temp N`, `/topk N`, `/topp P`, `/rep R`, `/quit`; `--prompt "..."` or a pipe runs a session of those lines and exits |
 | `generate.jai` | story continuation |
 | `check.jai` | the fast acceptance check |
+| `check_run_full.sh` | `run_full.sh`'s control flow with stand-ins for every stage and for the lock, in 6 s and without a GPU: the pipeline reaches the end, and every request for the lock waits `LOCK_YIELD` after the last hold |
 | `story_chat.py` | the torch MPS peer, and a Python re-implementation of the BPE that checks the token files |
 | `run_full.sh`, `bench.sh`, `compare_vocab.sh` | the pipeline; speed (and with `quality`, learning) against torch; 4096 against 8192 ids |
 
@@ -157,22 +166,23 @@ depending on what else was using the GPU. The third epoch still helps, with
 the gap to the training loss opening.
 
 A scripted conversation (temperature 0.7, top-k 40, top-p 0.9, repetition
-penalty 1.1, the defaults), verbatim, from the 3e-4 model:
+penalty 1.1, the defaults, seed 1), verbatim, from the 3e-4 model after the
+15-minute pretraining run:
 
 ```
 you> Hi! How are you today?
 bot> Not bad. I have a bad cold.
 you> What did you do this weekend?
-bot> Well, my stomach was born in the United States. It was none of my life, but I heard that there were some fluents in my mind and Ir I had a bad headache for my pre-servisors.
+bot> Well, my stomach was born in the United States.
 you> That sounds fun. Do you like to read?
-bot> Yes, I do. It's very easy to get out of the noodles and I think I've heard of it before!
+bot> No. I never read books before.
 you> What is your favourite book?
-bot> My book is on sale today, but I'm a bit tired of it.
+bot> It is my favorite book.
 you> Thanks, bye!
-bot> I guess we can read that before we read a book.
+bot> I love the book!
 ```
 
-And at temperature 0.5:
+And at temperature 0.5, the same model:
 
 ```
 you> Hello, what is your name?
@@ -182,13 +192,23 @@ bot> I'm from Germany.
 you> Can you recommend a good restaurant?
 bot> Yes, I can.
 you> I would like to book a table for two tonight.
-bot> What kind of food do you like best?
+bot> What kind of food do you like?
 you> How much does it cost?
-bot> I want $ 750.
+bot> About 300 yuan.
 ```
 
+An earlier version of the sampler applied the repetition penalty once per
+occurrence, compounding, and to the role tokens as well -- so `<|user|>`,
+which is in every chat prompt and is the token the bot says to hand the turn
+back, was pushed down. Its replies ran on: the same seed gave "Well, my
+stomach was born in the United States. It was none of my life, but I heard
+that there were some fluents in my mind [...]" to the second line above. A
+review measured the mean reply over 100-119 DailyDialog test openers with
+three or five turns of context: 15.2 and 16.5 tokens with that penalty, 12.6
+and 12.8 with the standard one, 12.4 and 12.6 with none.
+
 It answers in English sentences, in DailyDialog's register -- names, jobs,
-shopping, travel, a waiter's "What kind of food do you like best?" -- and takes
+shopping, travel, a waiter's "What kind of food do you like?" -- and takes
 its turn and hands it back. Short exchanges land; long replies wander, and it
 does not hold a conversation's thread for long. Fifteen minutes is 4% of an
 epoch of TinyStories, and DailyDialog's adult vocabulary (hotels, banks,
@@ -239,6 +259,11 @@ against 4.049), while the output head and its gradients and the embedding
 double and the step costs 17% more. Two hours is far further along that
 trend, so 4096 it is. Each figure is one run; the two 5-minute runs saw the
 same contention (their rates are within 4%), the 2-minute ones a quiet GPU.
+The evidence is thin: a review measured the seed-to-seed spread of held-out
+bits per byte at 250 steps as 0.0036 (seeds 7, 8, 9), so the 5-minute gap of
+0.0070 is about twice the noise, and the sign flips between 2 and 5 minutes.
+The choice for two hours is an extrapolation of that trend, not a
+measurement.
 
 ## The model
 
@@ -273,7 +298,6 @@ the absolute numbers did not:
 |---|---|---|---|
 | **jai**, busy (load ~40) | **347.1 / 346.5** | **23,603 / 23,640** | |
 | torch MPS, default AdamW | 440.2 / 495.8 | 18,610 / 16,523 | 1.27x / 1.43x |
-| jai, `GPT_MIXED=1` (products in float16) | 394.2 / 364.9 | 20,780 / 22,449 | |
 | **jai**, quiet (load ~3) | **247.8 / 274.0** | **33,060 / 29,898** | |
 | torch MPS, fused AdamW (`PEER_FUSED=1`) | 363.5 / 362.0 | 22,534 / 22,632 | 1.47x / 1.32x |
 | **jai**, very busy (load 60-110) | **395.4 / 406.1** | **20,716 / 20,172** | |
@@ -295,17 +319,26 @@ the lock on its own, on a busy machine:
 | 200 | 3.4759 | 3.4676 |
 | 300 | 3.1849 | 3.1825 |
 | 400 | 3.0649 | 3.0590 |
-| training rate | 20,822 tokens/s (157 s) | 15,607 tokens/s (210 s) |
 
 Different random draws on the two sides (initial weights, windows), and
-the curves stay within 0.01 of each other.
+the curves stay within 0.01 of each other. (The two runs' rates are not
+compared here: each side ran at its own machine load, and torch's figure
+counts its evaluations while Jaithon's does not.)
 
-Float16 products (`GPT_MIXED=1`) measured slower, 365-394 ms against 347 in
-the same acquisition, so they stay off; why was not chased (the decode track
-owns the mixed-precision policy this wave). Over the real run the rate is a
-little lower than the bench, because every 250 steps the run evaluates 256
-held-out windows and samples a story; `pretrain.jai` reports training-only
-tokens a second, which over the 15-minute run was 24,830 on a busy machine.
+Over the real run the rate is a little lower than the bench, because every
+250 steps the run evaluates 256 held-out windows and samples a story;
+`pretrain.jai` reports training-only tokens a second, which over the
+15-minute run was 24,830 on a busy machine.
+
+Everything runs in float32. An earlier version had a `GPT_MIXED=1` switch
+that called `jt.set_mixed_precision(true)`, and this README reported it as
+float16 products that measured slower. Neither held: the switch does not put
+this model's products in float16. With it on from the start of the process,
+the full-size model's logits are bit-identical to float32, and three
+training losses agree to within 6e-8 of each other, a difference of
+accumulation order, where float16 products would differ by around 1e-3. The
+"slower" reading was run-to-run noise (a review timed the two in one binary
+within the 3% A-against-A floor). The switch is gone.
 
 Other shapes, one acquisition at load average 30-75 (so read the ratios, not
 the rates): batch 64 ran 19,177 tokens a second and batch 16 17,379, against
@@ -328,10 +361,17 @@ floor when the two hours are up whatever the step costs. The wall time is two
 hours, plus evaluation and checkpoints (a few percent), plus however long the
 lock keeps it waiting between chunks: with two dozen waiters queued, a turn took
 anywhere from seconds to over an hour to come round during this work, so the
-scripts wait up to a day for it (`GPU_LOCK_WAIT`).
+scripts wait up to a day for it (`GPU_LOCK_WAIT`). Between two turns the
+script waits `LOCK_YIELD` (5) seconds before it asks again, longer than
+`gpu_lock.sh`'s 2-second poll, so a waiting measurement gets the GPU between
+chunks; without it the next chunk took the lock back 25-50 ms after letting
+go, and a review watched the run hold it 62% of the time.
 
 It is restartable at any point: run it again and it carries on from the last
-checkpoint (`FRESH=1` starts over). The run writes to
+checkpoint (`FRESH=1` starts over). A checkpoint is written beside the old one
+and then copied over it (std has no atomic rename), marked so that a save cut
+off at any step -- a kill, a crash, a full disk -- is finished or undone by the
+next `--resume`, which always finds a whole checkpoint. The run writes to
 `~/.cache/jaithon/story_chat/run-120m/` -- `pretrain.ckpt` (329 MB: weights and
 AdamW moments), `chat.ckpt` (110 MB, weights), `chat.ckpt.state`,
 `pretrain_log.tsv`, `finetune_log.tsv`, `run_full.log`, `final_eval.txt` -- and
@@ -358,15 +398,14 @@ All read once, at start.
 | `RUN_DIR` | `STORY_CACHE` (`run_full.sh`: `STORY_CACHE/run-<N>m`) | checkpoints and logs of a run |
 | `PRETRAIN_CKPT`, `CHAT_CKPT`, `FROM_CKPT` | `RUN_DIR/pretrain.ckpt`, `RUN_DIR/chat.ckpt`, the pretrain checkpoint | `FROM_CKPT` is what fine-tuning starts from |
 | `VOCAB` | 4096 | which tokenizer and token files (`prepare.jai` makes them) |
-| `SAMPLE_MB`, `BLOCK_MB` | 64, 64 | `prepare.jai`: the tokenizer's sample, the encoding block |
+| `SAMPLE_MB`, `BLOCK_MB` | 64, 16 | `prepare.jai`: the tokenizer's sample, the encoding block (16 MB blocks peak under 4 GB resident, 64 MB ones about 14 GB, for the same token file in the same time) |
 | `GPT_LAYERS`, `GPT_DIM`, `GPT_HEADS`, `GPT_SEQ`, `GPT_BATCH` | 8, 512, 8, 256, 32 | the shape; `story_chat.py` reads the same |
 | `LR`, `WARMUP`, `MIN_LR_FRAC`, `WD`, `CLIP`, `SEED` | 6e-4, 200, 0.1, 0.1, 1.0, 7 | pretraining (fine-tuning: `LR` 3e-4, `WARMUP` 50, `SEED` 11) |
-| `EVAL_EVERY`, `EVAL_WINDOWS`, `CKPT_EVERY`, `LOG_EVERY`, `SAMPLE_PROMPT` | 250, 256, 1000, 50, "Once upon a time" | pretraining |
+| `EVAL_EVERY`, `EVAL_WINDOWS`, `CKPT_EVERY`, `LOG_EVERY`, `SAMPLE_PROMPT` | 250, 256, 1000, 50, "Once upon a time" | pretraining; `EVAL_WINDOWS` has to be a multiple of the batch (2048 for `MODE=eval`) |
 | `GPT_FLUSH` | 2 | as in source_gpt: commit the queued work after every block |
-| `GPT_MIXED` | 0 | 1 runs the products in float16; slower here (above), so off |
 | `FT_BATCH`, `QUANTUM`, `EPOCHS` | 32, 64, 3 | fine-tuning: rows are padded to a multiple of `QUANTUM` tokens |
 | `TEMP`, `TOPK`, `TOPP`, `REP`, `MAX_NEW`, `SEED`, `CHAT_ECHO` | 0.7, 40, 0.9, 1.1, 64, 1, 0 | `chat.jai` (`generate.jai`: 0.8, 40, 0.95, 1.0, `NEW` 300, `SAMPLES` 1, `CKPT`) |
-| `PRETRAIN_MINUTES`, `CHUNK_MINUTES`, `FT_EPOCHS`, `FRESH`, `GPU_LOCK_WAIT` | 120, 5, 3, 0, 86400 | `run_full.sh` |
+| `PRETRAIN_MINUTES`, `CHUNK_MINUTES`, `FT_EPOCHS`, `FRESH`, `GPU_LOCK_WAIT`, `LOCK_YIELD` | 120, 5, 3, 0, 86400, 5 | `run_full.sh` |
 | `PEER_FUSED` | 0 | `story_chat.py`: 1 uses torch's fused AdamW |
 
 ## What the example needed, and what it found
@@ -390,17 +429,28 @@ tracks own them this wave:
 
 `check.jai` also proves the resume path the chunked run depends on: a trainer
 restored from a checkpoint -- weights, both AdamW moments, the step count --
-takes the same next two steps as the original, to the bit.
+takes the same next two steps as the original, within 1e-4 in loss. In a
+default run the gap is 0; with `JAITHON_GPU_POISON=1` a review measured
+4.8e-7, from the order of accumulation, not from uninitialised memory (no
+NaN appeared).
 
-Three things it ran into in its own tooling. `gpu_lock.sh` gives up after an
+Things it ran into in its own tooling. `gpu_lock.sh` gives up after an
 hour by default, which with the machine this busy cancelled a queued
-benchmark; the scripts now wait up to a day. A chunk that stops at five
-minutes of wall clock leaves the evaluation time it spent as a few seconds of
-budget, which used to queue for a turn of its own; a leftover under a fifth
-of a chunk is now finished in the chunk. And the disk: a run directory holds
-about a gigabyte at its peak (the 329 MB pretraining checkpoint is written
-beside the old one before it replaces it), and the disk this ran on filled up
-during the vocabulary comparison (346 MB free of 787 GB, shared with every
-other agent). The best chat model is now saved as weights alone (110 MB),
-and the comparison's checkpoints were deleted; leave a few gigabytes free
-before the two-hour run.
+benchmark; the scripts now wait up to a day. `run_full.sh` asked for the lock
+again the moment it let it go, and so kept it from every other waiter; it
+now waits `LOCK_YIELD` first (`check_run_full.sh` holds it to that). A chunk
+that stops at five minutes of wall clock leaves the evaluation time it spent
+as a few seconds of budget, which used to queue for a turn of its own; a
+leftover under a fifth of a chunk is now finished in the chunk. A save is
+not atomic, since std has no rename (`Path.rename` copies and deletes): a
+save cut off mid-copy used to leave a truncated `pretrain.ckpt` that
+`--resume` refused, and one cut off between deleting the old file and copying
+the new left none, so `--resume` started the schedule again from step 0.
+Saves are now marked and settled (above), and training stops on a NaN or
+infinite loss before it can overwrite the last good checkpoint. And the disk:
+a run directory holds about a gigabyte at its peak (the 329 MB pretraining
+checkpoint is written beside the old one before it replaces it), and the disk
+this ran on filled up during the vocabulary comparison (346 MB free of 787 GB,
+shared with every other agent). The best chat model is now saved as weights
+alone (110 MB), and the comparison's checkpoints were deleted; leave a few
+gigabytes free before the two-hour run.
