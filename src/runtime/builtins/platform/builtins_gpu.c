@@ -33,6 +33,13 @@ bool requireBuffer(Value v, int index, const char *fnName,
     return true;
 }
 
+bool jaiThrowGpuFailure(const char *fnName) {
+    const char *why = jaiGpuTakeError();
+    if (why == NULL || why[0] == '\0') why = "no reason was recorded";
+    return jaiThrow(vm.cRuntimeError, "%s(): queued GPU work did not complete: %s",
+                    fnName, why);
+}
+
 /* A buffer handle as the native buffer and the element offset into it, for
  * the graph primitives next door -- they need the same two facts and have no
  * business knowing what a `GpuBuffer` looks like. */
@@ -184,9 +191,11 @@ static bool nGpuBufferUpload(int argc, Value *args, Value *out) {
         }
         narrowed[i] = (float)jaiAsDouble(jaiListGet(values, i));
     }
-    jaiGpuUpload(b->buffer, narrowed, (size_t)values->count * sizeof(float),
-                 (size_t)(b->origin + offset) * sizeof(float));
+    const bool written = jaiGpuUpload(b->buffer, narrowed,
+                                      (size_t)values->count * sizeof(float),
+                                      (size_t)(b->origin + offset) * sizeof(float));
     JAI_FREE_ARRAY(float, narrowed, values->count);
+    if (!written) return jaiThrowGpuFailure("gpu_buffer_upload");
 
     *out = NULL_VAL;
     return true;
@@ -221,9 +230,10 @@ static bool nGpuBufferUploadU8(int argc, Value *args, Value *out) {
         return jaiThrow(vm.cValueError,
                         "gpu_buffer_upload_u8(): %lld values at %lld exceed buffer capacity %lld",
                         (long long)count, (long long)destOffset, (long long)b->count);
-    if (count > 0)
-        jaiGpuUploadU8(b->buffer, bytes->data + sourceOffset, (size_t)count,
-                       (size_t)(b->origin + destOffset), (float)scale);
+    if (count > 0 &&
+        !jaiGpuUploadU8(b->buffer, bytes->data + sourceOffset, (size_t)count,
+                        (size_t)(b->origin + destOffset), (float)scale))
+        return jaiThrowGpuFailure("gpu_buffer_upload_u8");
     *out = NULL_VAL;
     return true;
 }
@@ -254,9 +264,10 @@ static bool nGpuBufferDownloadU8(int argc, Value *args, Value *out) {
 
     ObjBytes *bytes = jaiBytesNew(NULL, (size_t)count);
     if (bytes == NULL) return false;
-    if (count > 0)
-        jaiGpuDownloadU8(b->buffer, bytes->data, (size_t)count,
-                         (size_t)(b->origin + offset), (float)scale);
+    if (count > 0 &&
+        !jaiGpuDownloadU8(b->buffer, bytes->data, (size_t)count,
+                          (size_t)(b->origin + offset), (float)scale))
+        return jaiThrowGpuFailure("gpu_buffer_download_u8");
     *out = OBJ_VAL(bytes);
     return true;
 }
@@ -349,8 +360,7 @@ static bool nGpuBufferPackArgb(int argc, Value *args, Value *out) {
 
     const float *source = jaiGpuMapRead(b->buffer, (size_t)(b->origin + offset),
                                         (size_t)count);
-    if (source == NULL)
-        return jaiThrow(vm.cRuntimeError, "gpu_buffer_pack_argb(): the buffer would not map");
+    if (source == NULL) return jaiThrowGpuFailure("gpu_buffer_pack_argb");
 
     JaiArgbWork work = {source, list->items, scale != 0.0 ? (float)(1.0 / scale) : 1.0f,
                         (int)channels};
@@ -373,8 +383,9 @@ static bool nGpuBufferFillUniform(int argc, Value *args, Value *out) {
     if (!(low < high))
         return jaiThrow(vm.cValueError,
                         "gpu_buffer_fill_uniform(): low must be less than high");
-    jaiGpuFillUniform(b->buffer, (size_t)b->origin, (size_t)b->count,
-                      (float)low, (float)high, (uint64_t)seed);
+    if (!jaiGpuFillUniform(b->buffer, (size_t)b->origin, (size_t)b->count,
+                           (float)low, (float)high, (uint64_t)seed))
+        return jaiThrowGpuFailure("gpu_buffer_fill_uniform");
     *out = NULL_VAL;
     return true;
 }
@@ -383,7 +394,8 @@ static bool nGpuBufferFillZero(int argc, Value *args, Value *out) {
     (void)argc;
     GpuBuffer *b;
     if (!requireBuffer(args[0], 1, "gpu_buffer_fill_zero", &b)) return false;
-    jaiGpuFillZero(b->buffer, (size_t)b->origin, (size_t)b->count);
+    if (!jaiGpuFillZero(b->buffer, (size_t)b->origin, (size_t)b->count))
+        return jaiThrowGpuFailure("gpu_buffer_fill_zero");
     *out = NULL_VAL;
     return true;
 }
@@ -429,9 +441,7 @@ static bool nGpuBufferDownload(int argc, Value *args, Value *out) {
      * buffer before the loop below even started. */
     const float *raw = jaiGpuMapRead(b->buffer, (size_t)(b->origin + offset),
                                      (size_t)wanted);
-    if (raw == NULL)
-        return jaiThrow(vm.cRuntimeError,
-                        "gpu_buffer_download(): the buffer could not be read");
+    if (raw == NULL) return jaiThrowGpuFailure("gpu_buffer_download");
 
     /* Reserved once and written through, rather than pushed a value at a
      * time. The push path re-checks capacity on every element, and a 720p

@@ -94,21 +94,25 @@ bool          jaiGpuMixedPrecision(void);
 JaiGpuBuffer *jaiGpuAlloc(size_t bytes);
 void          jaiGpuFree(JaiGpuBuffer *b);
 /* `offset` is a byte offset into the device buffer, so std.gpu can move a slice
- * of a buffer without a read-modify-write of the whole thing. */
-void          jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes,
+ * of a buffer without a read-modify-write of the whole thing.
+ *
+ * The transfers below that write or read from the host first wait for queued
+ * work on the buffer. They return false, having copied nothing, when the range
+ * does not fit or when that wait failed (jaiGpuTakeError says why). */
+bool          jaiGpuUpload(JaiGpuBuffer *b, const void *src, size_t bytes,
                            size_t offset);
 /* Expand unsigned bytes directly into float slots, applying `scale`. */
-void          jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
+bool          jaiGpuUploadU8(JaiGpuBuffer *b, const uint8_t *src, size_t count,
                              size_t offset, float scale);
-void          jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
+bool          jaiGpuFillUniform(JaiGpuBuffer *b, size_t elementOffset, size_t count,
                                 float low, float high, uint64_t seed);
-void          jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count);
-void          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
+bool          jaiGpuFillZero(JaiGpuBuffer *b, size_t elementOffset, size_t count);
+bool          jaiGpuDownload(JaiGpuBuffer *b, void *dst, size_t bytes,
                              size_t offset);
 /* The buffer's own memory to read from, after everything queued has run, or
- * NULL when the range does not fit. Storage is shared, so a caller that is
- * going to walk the values anyway can skip the staging copy entirely. Good
- * until the next GPU work touches the buffer. */
+ * NULL when the range does not fit or the wait failed. Storage is shared, so a
+ * caller that is going to walk the values anyway can skip the staging copy
+ * entirely. Good until the next GPU work touches the buffer. */
 const float  *jaiGpuMapRead(JaiGpuBuffer *b, size_t elementOffset, size_t count);
 /* The same, to write through. Waits for whatever queued work could still write
  * these bytes, so what the host puts there is not landed on afterwards, and
@@ -122,7 +126,7 @@ float        *jaiGpuMapWrite(JaiGpuBuffer *b, size_t elementOffset, size_t count
  * back without turning every one of them into a boxed list element -- a 720p
  * frame is 2.8 million floats, and boxing them costs eight milliseconds
  * against a fraction of one for this. */
-void          jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
+bool          jaiGpuDownloadU8(JaiGpuBuffer *b, uint8_t *dst, size_t count,
                                size_t offset, float scale);
 /* Building a whole network as one MPSGraph rather than dispatching each of its
  * operators separately.
@@ -303,6 +307,12 @@ bool          jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int c
 /* Commit queued async work so the GPU can start; does not wait. */
 bool          jaiGpuFlush(void);
 bool          jaiGpuSynchronize(void);
+/* Why queued GPU work failed, for the RuntimeError that reports it: the Metal
+ * error (domain, code, description, and per-encoder status when it was
+ * recorded) or the timeout that ended a wait. A failure stays pending -- every
+ * later wait, read or waiting host write fails -- until this takes it, so it
+ * is raised once. Empty when nothing is pending. */
+const char   *jaiGpuTakeError(void);
 /* Wait only for the queued work that could have written this buffer, leaving
  * anything queued after it running. Reading a result this way does not stall
  * on work submitted afterwards, which is what lets a loop overlap the two. */

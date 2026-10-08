@@ -159,9 +159,17 @@ static bool dispatchKernel(Value *args, Value *out, bool async) {
     if (offsets != NULL) JAI_FREE_ARRAY(size_t, offsets, handles->count);
     if (scalars != NULL) JAI_FREE_ARRAY(uint32_t, scalars, scalarList->count);
 
-    if (!ok)
+    if (!ok) {
+        /* Queued work that failed or timed out under a wait the dispatch made
+         * -- backpressure, or the synchronize in front of a blocking one --
+         * is the reason, and says so. */
+        const char *why = jaiGpuTakeError();
+        if (why != NULL && why[0] != '\0')
+            return jaiThrow(vm.cRuntimeError, "%s(): queued GPU work did not complete: %s",
+                            name, why);
         return jaiThrow(vm.cRuntimeError,
                         "%s(): the device did not accept or complete the kernel", name);
+    }
 
     *out = NULL_VAL;
     return true;
@@ -177,13 +185,14 @@ bool nGpuDispatchAsync(int argc, Value *args, Value *out) {
     return dispatchKernel(args, out, true);
 }
 
+/* The native side keeps why a wait failed -- the Metal error, or the timeout
+ * that ended it -- and jaiThrowGpuFailure's message carries it, because "did
+ * not complete" on its own is all five failures of one session ever said. */
 bool nGpuFlush(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
     if (!requireGpu("gpu_flush")) return false;
-    if (!jaiGpuFlush())
-        return jaiThrow(vm.cRuntimeError,
-                        "gpu_flush(): queued GPU work did not complete");
+    if (!jaiGpuFlush()) return jaiThrowGpuFailure("gpu_flush");
     *out = NULL_VAL;
     return true;
 }
@@ -192,9 +201,7 @@ bool nGpuSynchronize(int argc, Value *args, Value *out) {
     (void)argc;
     (void)args;
     if (!requireGpu("gpu_synchronize")) return false;
-    if (!jaiGpuSynchronize())
-        return jaiThrow(vm.cRuntimeError,
-                        "gpu_synchronize(): queued GPU work did not complete");
+    if (!jaiGpuSynchronize()) return jaiThrowGpuFailure("gpu_synchronize");
     *out = NULL_VAL;
     return true;
 }

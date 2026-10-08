@@ -143,7 +143,7 @@ static MLMultiArray *wrap(JaiGpuBuffer *buffer, size_t elementOffset, NSArray<NS
     if (writing) {
         id<MTLBuffer> held = (__bridge id<MTLBuffer>)jaiGpuBufferHandle(buffer);
         if (held == nil) return nil;
-        jaiGpuWaitFor(buffer);
+        if (!jaiGpuWaitFor(buffer)) return nil;
         base = (float *)[held contents] + elementOffset;
     } else {
         base = (void *)jaiGpuMapRead(buffer, elementOffset, count);
@@ -236,7 +236,9 @@ static bool prepare(JaiCoreMLModel *model,
     }
     /* The results land in memory the GPU also reads, so work already queued
      * against those buffers has to have finished before they are written. */
-    for (int i = 0; i < call->count; i++) jaiGpuWaitFor(outs[i]);
+    for (int i = 0; i < call->count; i++) {
+        if (!jaiGpuWaitFor(outs[i])) return false;
+    }
     return true;
 }
 

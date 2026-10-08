@@ -45,6 +45,12 @@ struct JaiGpuBuffer {
      * when none has. Reading the buffer waits for that batch and no further --
      * see markLocked and jaiGpuWaitFor. */
     uint64_t lastBatch;
+    /* Recycled, and nothing has been queued against it or handed its
+     * MTLBuffer since. Only the previous owner's work can still be pending on
+     * these bytes, so a first host write may trade the MTLBuffer for a fresh
+     * one instead of waiting for that work -- see hostWriteBarrier. Cleared by
+     * markLocked and by every path that exposes the MTLBuffer itself. */
+    bool   untouched;
 };
 
 struct JaiGpuKernel {
@@ -88,6 +94,18 @@ void     markLocked(JaiGpuBuffer *b);
 void     mark(JaiGpuBuffer *b);
 bool     flushAsyncLocked(id<MTLCommandBuffer> *oldestOut, uint64_t *oldestBatch);
 bool     ensureAsyncCommandBuffer(void);
+/* A command buffer for the shared batch, with per-encoder error status when
+ * JAITHON_GPU_ENCODER_STATUS asks for it. */
+id<MTLCommandBuffer> newAsyncCommandBuffer(void);
+/* The two sides of an MPSGraph encode onto the shared batch: before it, so
+ * the batch knows it holds graph work (and is not split for kernel-only
+ * overlap), and after it, where a batch past its size cap is committed. */
+void     noteGraphEncodeLocked(void);
+void     afterGraphEncodeLocked(void);
+/* Fill the first `bytes` of `buffer` with NaN on the queue, behind whatever is
+ * already queued against it, and return the batch that does it (0 when
+ * nothing could be encoded). Marks no JaiGpuBuffer. For JAITHON_GPU_POISON. */
+uint64_t encodeNanFillLocked(id<MTLBuffer> buffer, size_t bytes);
 void     encodeDispatch(id<MTLComputeCommandEncoder> encoder,
                         id<MTLComputePipelineState> pipeline,
                         NSUInteger threads, NSUInteger groupSize);

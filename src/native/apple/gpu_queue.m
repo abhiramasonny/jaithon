@@ -5,6 +5,9 @@
 
 #include "native/apple/gpu_internal.h"
 
+#include <errno.h>
+#include <pthread.h>
+
 id<MTLCommandBuffer> gAsyncCommands;
 id<MTLComputeCommandEncoder> gAsyncEncoder;
 static NSMutableArray<id<MTLCommandBuffer>> *gInFlight;
@@ -13,6 +16,13 @@ static NSMutableDictionary<NSString *, id<MTLLibrary>> *gSourceLibraries;
 
 #define JAI_GPU_MAX_IN_FLIGHT 16
 #define JAI_GPU_AUTO_COMMIT 0
+/* See kernelCommitThreshold, batchCapUnits, batchCapSeconds and
+ * waitTimeoutSeconds for what these bound and why. */
+#define JAI_GPU_KERNEL_COMMIT 64
+#define JAI_GPU_BATCH_UNITS 4096
+#define JAI_GPU_FIRST_BATCH_UNITS 512
+#define JAI_GPU_BATCH_MS 250
+#define JAI_GPU_WAIT_SECONDS 120.0
 
 /* Which queued work a given buffer is waiting on.
  *
@@ -33,7 +43,38 @@ static NSMutableDictionary<NSString *, id<MTLLibrary>> *gSourceLibraries;
 static uint64_t gBatchCounter;  /* last batch number handed out */
 static uint64_t gOpenBatch;     /* number of gAsyncCommands, 0 when none open */
 static unsigned gOpenEncoded;   /* dispatches encoded into it since it opened */
+static unsigned gOpenGraphs;    /* MPSGraph encodes into it since it opened */
+static bool gOpenHasGraph;      /* it holds at least one MPSGraph encode */
 static int gAutoCommit = -1;
+static int gKernelCommit = -1;
+static int gBatchUnits = -1;
+static double gBatchSeconds = -1.0;
+static double gWaitSeconds = -1.0;
+static int gEncoderStatus = -1;
+/* GPU seconds per encoded unit (a dispatch or a graph encode), averaged over
+ * finished batches. Written by Metal's completion thread, read by the
+ * encoder, so it is an atomic; 0 until the first batch finishes. */
+static _Atomic double gUnitSeconds;
+/* When the GPU could first have started the open batch, and when the last
+ * finished batch ended, on the clock Metal's GPUEndTime uses
+ * (CLOCK_UPTIME_RAW). A batch's GPU time is taken as its end less the later of
+ * those two, not as GPUEndTime less GPUStartTime: MPSGraph commits a batch
+ * part way through (commitAndContinue) and the buffer that finally carries the
+ * handler starts only at the last part, which read a 1.5 ms dispatch as a
+ * fifth of that.
+ *
+ * The earliest start is the commit for a batch of kernels alone, and the
+ * first graph encode for one with a graph in it -- the only place a part can
+ * be committed early. Not the moment the batch opened: the host time spent
+ * encoding into it, with the GPU idle, would count as GPU time, and after a
+ * long host phase every batch would be cut at a fraction of the work the cap
+ * means to allow. */
+static double gFirstGraphAt;
+static _Atomic double gLastEnd;
+
+static double uptimeNow(void) {
+    return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9;
+}
 /* Every batch at or below this has finished. Written both by a thread that
  * waited for one and by Metal's own completion handler on a thread of its
  * own, so it is an atomic rather than something the queue lock covers -- the
@@ -68,6 +109,279 @@ static bool fineSyncEnabled(void) {
 
 static void commitOpenLocked(void);
 static uint64_t takeFrontLocked(void);
+static void ensureInFlight(void);
+
+/* A failure no RuntimeError has carried yet, and why it happened.
+ *
+ * A wait used to come back false on any status but Completed and drop
+ * `commands.error` on the floor, so five failures in one session said only
+ * "did not complete" and nothing could be learned from any of them.
+ *
+ * The flag, not any one return value, is what decides whether an operation
+ * raises: a batch that failed or timed out sets it, and every wait -- a
+ * synchronize, a read, a host write that had to wait -- reports false while
+ * it is set, so whichever of them comes first raises it. Raising takes it
+ * (jaiGpuTakeError), so the same failure is not raised twice. A failure in a
+ * batch nobody waits on individually, one retired by backpressure inside an
+ * encode say, therefore still reaches the next wait.
+ *
+ * The first failure since the last take keeps the text: a later one is
+ * usually its consequence. The text is written from Metal's completion thread
+ * as well as from waiters, so it has a lock of its own -- never the queue's,
+ * which a waiter may be holding. */
+static pthread_mutex_t gErrorLock = PTHREAD_MUTEX_INITIALIZER;
+static char gLastError[1024];
+static char gLastErrorCopy[1024];
+static atomic_bool gErrorPending;
+
+static void recordGpuError(const char *fmt, ...) JAI_PRINTF(1, 2);
+static void recordGpuError(const char *fmt, ...) {
+    pthread_mutex_lock(&gErrorLock);
+    if (!atomic_load(&gErrorPending)) {
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(gLastError, sizeof gLastError, fmt, args);
+        va_end(args);
+        atomic_store(&gErrorPending, true);
+    }
+    pthread_mutex_unlock(&gErrorLock);
+}
+
+static bool failurePending(void) {
+    return atomic_load(&gErrorPending);
+}
+
+const char *jaiGpuTakeError(void) {
+    pthread_mutex_lock(&gErrorLock);
+    if (atomic_load(&gErrorPending)) {
+        memcpy(gLastErrorCopy, gLastError, sizeof gLastErrorCopy);
+    } else {
+        gLastErrorCopy[0] = '\0';
+    }
+    gLastError[0] = '\0';
+    atomic_store(&gErrorPending, false);
+    pthread_mutex_unlock(&gErrorLock);
+    return gLastErrorCopy;
+}
+
+/* Per-encoder status in a failed buffer's error costs Metal some bookkeeping
+ * on every command buffer, so it is asked for only on request:
+ * JAITHON_GPU_ENCODER_STATUS=1. */
+static bool encoderStatusOn(void) {
+    if (gEncoderStatus < 0) {
+        const char *setting = getenv("JAITHON_GPU_ENCODER_STATUS");
+        gEncoderStatus = setting != NULL && strcmp(setting, "0") != 0 ? 1 : 0;
+    }
+    return gEncoderStatus == 1;
+}
+
+id<MTLCommandBuffer> newAsyncCommandBuffer(void) {
+    if (gQueue == nil) return nil;
+    if (!encoderStatusOn()) return [gQueue commandBuffer];
+    MTLCommandBufferDescriptor *desc = [MTLCommandBufferDescriptor new];
+    desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    return [gQueue commandBufferWithDescriptor:desc];
+}
+
+static const char *commandErrorName(NSInteger code) {
+    switch (code) {
+    case MTLCommandBufferErrorInternal:        return "internal error";
+    case MTLCommandBufferErrorTimeout:         return "timeout";
+    case MTLCommandBufferErrorPageFault:       return "page fault";
+    case MTLCommandBufferErrorAccessRevoked:   return "access revoked";
+    case MTLCommandBufferErrorNotPermitted:    return "not permitted";
+    case MTLCommandBufferErrorOutOfMemory:     return "out of memory";
+    case MTLCommandBufferErrorInvalidResource: return "invalid resource";
+    case MTLCommandBufferErrorMemoryless:      return "memoryless";
+    case MTLCommandBufferErrorDeviceRemoved:   return "device removed";
+    case MTLCommandBufferErrorStackOverflow:   return "stack overflow";
+    default:                                   return "unrecognised code";
+    }
+}
+
+static const char *encoderStateName(MTLCommandEncoderErrorState state) {
+    switch (state) {
+    case MTLCommandEncoderErrorStateCompleted: return "completed";
+    case MTLCommandEncoderErrorStateAffected:  return "affected";
+    case MTLCommandEncoderErrorStatePending:   return "pending";
+    case MTLCommandEncoderErrorStateFaulted:   return "faulted";
+    default:                                   return "unknown";
+    }
+}
+
+static const char *utf8Or(NSString *text, const char *fallback) {
+    const char *raw = text != nil ? [text UTF8String] : NULL;
+    return raw != NULL ? raw : fallback;
+}
+
+/* Domain, code, description and -- when JAITHON_GPU_ENCODER_STATUS was on as
+ * the buffer was made -- which encoder faulted. */
+static void recordCommandError(id<MTLCommandBuffer> done, uint64_t batch) {
+    @autoreleasepool {
+        NSError *error = done.error;
+        NSMutableString *encoders = nil;
+        id infos = error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+        if ([infos isKindOfClass:[NSArray class]] && [(NSArray *)infos count] > 0) {
+            encoders = [NSMutableString string];
+            for (id<MTLCommandBufferEncoderInfo> info in (NSArray *)infos) {
+                [encoders appendFormat:@"%@%@ %s", encoders.length > 0 ? @", " : @"",
+                                       info.label.length > 0 ? info.label : @"(unlabelled)",
+                                       encoderStateName(info.errorState)];
+            }
+        }
+        char which[48];
+        if (batch != 0) {
+            snprintf(which, sizeof which, "for batch %llu", (unsigned long long)batch);
+        } else {
+            snprintf(which, sizeof which, "of a synchronous dispatch");
+        }
+        recordGpuError("the Metal command buffer %s failed: %s code %ld (%s): %s%s%s",
+                       which,
+                       error != nil ? utf8Or(error.domain, "?") : "no NSError",
+                       error != nil ? (long)error.code : 0L,
+                       error != nil ? commandErrorName(error.code) : "status error",
+                       error != nil ? utf8Or(error.localizedDescription, "") : "",
+                       encoders != nil ? "; encoders: "
+                                       : (encoderStatusOn() ? ""
+                                          : "; JAITHON_GPU_ENCODER_STATUS=1 adds which encoder failed"),
+                       encoders != nil ? utf8Or(encoders, "") : "");
+    }
+}
+
+/* How long a wait may go without its batch finishing before it gives up.
+ *
+ * waitUntilCompleted has no bound, and one run sat in it at 0% CPU for over
+ * five minutes. A batch that takes this long is lost either way; an error
+ * says so where a hang says nothing. The clock restarts for each buffer, so a
+ * long queue that is making progress never trips it.
+ * JAITHON_GPU_WAIT_TIMEOUT is in seconds; 0 waits forever. */
+static double waitTimeoutSeconds(void) {
+    if (gWaitSeconds < 0.0) {
+        const char *setting = getenv("JAITHON_GPU_WAIT_TIMEOUT");
+        gWaitSeconds = setting != NULL ? atof(setting) : JAI_GPU_WAIT_SECONDS;
+        if (!(gWaitSeconds >= 0.0)) gWaitSeconds = JAI_GPU_WAIT_SECONDS;
+    }
+    return gWaitSeconds;
+}
+
+/* Every committed batch carries a completion handler that raises gDoneBatch
+ * and then broadcasts here, so a waiter sleeps on a condition it can bound. */
+static pthread_mutex_t gDoneLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  gDoneCond = PTHREAD_COND_INITIALIZER;
+
+static void signalDone(void) {
+    pthread_mutex_lock(&gDoneLock);
+    pthread_cond_broadcast(&gDoneCond);
+    pthread_mutex_unlock(&gDoneLock);
+}
+
+/* JAITHON_GPU_DEBUG_STALL=1 makes the first committed batch wait on an event
+ * nobody signals, so a test can watch a wait time out and report instead of
+ * hanging. The event is signalled once the wait has given up, so the queue
+ * drains and the process exits normally. Test-only; read once. */
+static int gDebugStall = -1;
+static id<MTLSharedEvent> gStallEvent;
+
+static void injectStallLocked(id<MTLCommandBuffer> commands) {
+    if (gDebugStall < 0) {
+        const char *setting = getenv("JAITHON_GPU_DEBUG_STALL");
+        gDebugStall = setting != NULL && strcmp(setting, "0") != 0 ? 1 : 0;
+    }
+    if (gDebugStall != 1 || gStallEvent != nil) return;
+    gStallEvent = [gDevice newSharedEvent];
+    if (gStallEvent == nil) return;
+    [commands encodeWaitForEvent:gStallEvent value:1];
+}
+
+static void releaseStall(void) {
+    if (gStallEvent != nil) gStallEvent.signaledValue = 1;
+}
+
+/* Wait for one committed batch, for at most waitTimeoutSeconds.
+ *
+ * True once the batch has finished, whether it worked or not -- a failed one
+ * has set the pending failure from its completion handler, and the caller
+ * reports that, not this. False when the wait gave up: the batch is still
+ * queued, so the caller must put it back on the books it took it from, or a
+ * later wait would not wait for it and a read would see the bytes from before
+ * it. A timeout sets the pending failure itself.
+ *
+ * The deadline is on the uptime clock, which a system sleep or a clock step
+ * does not move, so neither can end a wait on a GPU that is fine. */
+static bool waitBatch(id<MTLCommandBuffer> commands, uint64_t batch) {
+    if (commands == nil) return true;
+    if (doneBatch() < batch) {
+        const double limit = waitTimeoutSeconds();
+        bool timedOut = false;
+        pthread_mutex_lock(&gDoneLock);
+        if (limit <= 0.0) {
+            while (doneBatch() < batch) pthread_cond_wait(&gDoneCond, &gDoneLock);
+        } else {
+            const double deadline = uptimeNow() + limit;
+            while (doneBatch() < batch) {
+                const double left = deadline - uptimeNow();
+                if (left <= 0.0) {
+                    timedOut = true;
+                    break;
+                }
+                const double whole = floor(left);
+                struct timespec span = {
+                    .tv_sec = (time_t)whole,
+                    .tv_nsec = (long)((left - whole) * 1e9),
+                };
+                pthread_cond_timedwait_relative_np(&gDoneCond, &gDoneLock, &span);
+            }
+        }
+        pthread_mutex_unlock(&gDoneLock);
+        if (timedOut) {
+            const MTLCommandBufferStatus status = [commands status];
+            recordGpuError("GPU work queued in batch %llu did not finish within %g s "
+                           "(command buffer status %ld); the device is hung or heavily "
+                           "contended. JAITHON_GPU_WAIT_TIMEOUT sets the limit in seconds",
+                           (unsigned long long)batch, limit, (long)status);
+            releaseStall();
+            return false;
+        }
+    }
+    /* The batch is known finished, by its own handler or a later one's. A
+     * later one's runs first only in principle, and then this returns at once;
+     * it is here so the batch really is final when the caller moves on. */
+    [commands waitUntilCompleted];
+    return true;
+}
+
+/* Put batches a wait took off the books, and did not see finish, back where
+ * they were: at the front, since everything committed since is newer. */
+static void requeueLocked(NSArray<id<MTLCommandBuffer>> *commands,
+                          NSArray<NSNumber *> *batches, NSUInteger from) {
+    if (from >= commands.count) return;
+    ensureInFlight();
+    const NSRange rest = NSMakeRange(from, commands.count - from);
+    NSIndexSet *front = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, rest.length)];
+    [gInFlight insertObjects:[commands subarrayWithRange:rest] atIndexes:front];
+    [gInFlightBatch insertObjects:[batches subarrayWithRange:rest] atIndexes:front];
+}
+
+static void requeueOneLocked(id<MTLCommandBuffer> commands, uint64_t batch) {
+    ensureInFlight();
+    [gInFlight insertObject:commands atIndex:0];
+    [gInFlightBatch insertObject:@(batch) atIndex:0];
+}
+
+/* The backpressure wait for the oldest batch, which a caller took off the
+ * books under the lock and waits for outside it. False when a failure is now
+ * pending, whether this batch's or an earlier one's. */
+static bool waitOldest(id<MTLCommandBuffer> oldest, uint64_t batch) {
+    if (oldest == nil) return !failurePending();
+    if (!waitBatch(oldest, batch)) {
+        @synchronized(gQueue) {
+            requeueOneLocked(oldest, batch);
+        }
+        return false;
+    }
+    noteDone(batch);
+    return !failurePending();
+}
 
 /* How many dispatches may pile into one command buffer before it is sent.
  *
@@ -92,6 +406,83 @@ static int autoCommitThreshold(void) {
     return gAutoCommit;
 }
 
+/* The half of auto-commit that is a good idea: split a batch that holds only
+ * kernels.
+ *
+ * What cost jaitensor 26% was splitting MPSGraph work, which loses the
+ * overlap MPSGraph arranges inside one buffer. A batch of plain kernels has no
+ * such overlap to lose, and committing it every so many dispatches buys two
+ * things: the GPU starts on the front of a chain while the host writes the
+ * back, and the buffers the chain frees settle, so the pool hands them back
+ * instead of allocating (10.4 us an op at N=1024 against 3.1 with a commit
+ * every 64). So a batch is committed after this many kernel dispatches, but
+ * only while no graph has been encoded into it -- noteGraphEncodeLocked turns
+ * that off for the rest of the batch.
+ * JAITHON_GPU_KERNEL_COMMIT sets the count; 0 turns it off. */
+static int kernelCommitThreshold(void) {
+    if (gKernelCommit < 0) {
+        const char *setting = getenv("JAITHON_GPU_KERNEL_COMMIT");
+        gKernelCommit = setting != NULL ? atoi(setting) : JAI_GPU_KERNEL_COMMIT;
+        if (gKernelCommit < 0) gKernelCommit = 0;
+    }
+    return gKernelCommit;
+}
+
+/* The most one command buffer may hold, whatever it holds.
+ *
+ * A loop that never reads queues everything into one buffer: one warm-up loop
+ * put 36,947 dispatches and 10.8 s of GPU work into a single command buffer,
+ * and that is the shape every "queued GPU work did not complete" in one
+ * session had. So a batch is committed once it holds this many dispatches and
+ * graph encodes (a training step is about 450), or once its estimated GPU time
+ * passes batchCapSeconds, and backpressure then keeps at most
+ * JAI_GPU_MAX_IN_FLIGHT of them queued. Only loops that never wait reach
+ * either bound. JAITHON_GPU_BATCH_CAP sets the count; 0 turns the cap off. */
+static int batchCapUnits(void) {
+    if (gBatchUnits < 0) {
+        const char *setting = getenv("JAITHON_GPU_BATCH_CAP");
+        gBatchUnits = setting != NULL ? atoi(setting) : JAI_GPU_BATCH_UNITS;
+        if (gBatchUnits < 0) gBatchUnits = 0;
+    }
+    return gBatchUnits;
+}
+
+/* Estimated from gUnitSeconds, the GPU time per unit of the batches that have
+ * finished. JAITHON_GPU_BATCH_MS sets it in milliseconds; 0 turns it off. */
+static double batchCapSeconds(void) {
+    if (gBatchSeconds < 0.0) {
+        const char *setting = getenv("JAITHON_GPU_BATCH_MS");
+        gBatchSeconds = (setting != NULL ? atof(setting) : (double)JAI_GPU_BATCH_MS) / 1000.0;
+        if (!(gBatchSeconds >= 0.0)) gBatchSeconds = 0.0;
+    }
+    return gBatchSeconds;
+}
+
+/* Whether the open batch should go now. `afterGraph` keeps the two kernel
+ * thresholds to the dispatch site they apply at. */
+static bool shouldCommitLocked(bool afterGraph) {
+    if (gAsyncCommands == nil) return false;
+    if (!afterGraph) {
+        const int global = autoCommitThreshold();
+        if (global > 0 && gOpenEncoded >= (unsigned)global) return true;
+        const int kernels = kernelCommitThreshold();
+        if (kernels > 0 && !gOpenHasGraph && gOpenEncoded >= (unsigned)kernels) return true;
+    }
+    const unsigned units = gOpenEncoded + gOpenGraphs;
+    const int cap = batchCapUnits();
+    if (cap <= 0) return false;
+    const double perUnit = atomic_load_explicit(&gUnitSeconds, memory_order_relaxed);
+    /* Until one batch has finished there is no estimate, and a first batch
+     * of four thousand heavy units is seconds of work; the first one is cut
+     * short instead, which costs a loop that waits nothing. */
+    const unsigned most = perUnit > 0.0 || cap < JAI_GPU_FIRST_BATCH_UNITS
+        ? (unsigned)cap : JAI_GPU_FIRST_BATCH_UNITS;
+    if (units >= most) return true;
+    const double capSeconds = batchCapSeconds();
+    if (capSeconds > 0.0 && perUnit > 0.0 && perUnit * (double)units >= capSeconds) return true;
+    return false;
+}
+
 static void ensureInFlight(void) {
     if (gInFlight == nil) gInFlight = [[NSMutableArray alloc] init];
     if (gInFlightBatch == nil) gInFlightBatch = [[NSMutableArray alloc] init];
@@ -111,9 +502,10 @@ void beginBatchLocked(void) {
  * somewhere else instead. */
 void markLocked(JaiGpuBuffer *b) {
     if (b == NULL || gQueue == nil) return;
+    b->untouched = false;
     if (gOpenBatch == 0) {
         if (gAsyncCommands == nil) {
-            gAsyncCommands = [gQueue commandBuffer];
+            gAsyncCommands = newAsyncCommandBuffer();
             if (gAsyncCommands == nil) return;
         }
         beginBatchLocked();
@@ -293,7 +685,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
             uint64_t oldestBatch = 0;
             @synchronized(gQueue) {
                 if (gAsyncCommands == nil) {
-                    gAsyncCommands = [gQueue commandBuffer];
+                    gAsyncCommands = newAsyncCommandBuffer();
                     if (gAsyncCommands == nil) return false;
                     beginBatchLocked();
                 }
@@ -318,8 +710,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
                 encodeDispatch(gAsyncEncoder, pipeline, (NSUInteger)threads,
                                (NSUInteger)groupSize);
                 gOpenEncoded++;
-                const int limit = autoCommitThreshold();
-                if (limit > 0 && gOpenEncoded >= (unsigned)limit) {
+                if (shouldCommitLocked(false)) {
                     commitOpenLocked();
                     if (gInFlight != nil && gInFlight.count > JAI_GPU_MAX_IN_FLIGHT) {
                         oldest = gInFlight[0];
@@ -331,11 +722,7 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
              * backpressure that keeps the queue from growing without bound,
              * and holding the lock through it would stop every other thread
              * from encoding while this one sleeps. */
-            if (oldest != nil) {
-                [oldest waitUntilCompleted];
-                if ([oldest status] != MTLCommandBufferStatusCompleted) return false;
-                noteDone(oldestBatch);
-            }
+            if (oldest != nil) return waitOldest(oldest, oldestBatch);
             return true;
         }
 
@@ -364,10 +751,33 @@ static bool dispatchKernel(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
         encodeDispatch(encoder, pipeline, (NSUInteger)threads,
                        (NSUInteger)groupSize);
         [encoder endEncoding];
+        /* Off the batch books, so it is bounded by a semaphore of its own
+         * rather than by gDoneBatch. The command buffer does not retain what
+         * it reads, so the handler does: after a timeout the caller may free
+         * these buffers while the kernel is still running on them. */
+        NSMutableArray<id<MTLBuffer>> *held = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+        for (int i = 0; i < count; i++) [held addObject:(__bridge id<MTLBuffer>)buffers[i]->buffer];
+        dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+        [commands addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            (void)held;
+            dispatch_semaphore_signal(finished);
+        }];
         [commands commit];
+        const double limit = waitTimeoutSeconds();
+        const dispatch_time_t until = limit > 0.0
+            ? dispatch_time(DISPATCH_TIME_NOW, (int64_t)(limit * 1e9))
+            : DISPATCH_TIME_FOREVER;
+        if (dispatch_semaphore_wait(finished, until) != 0) {
+            recordGpuError("a synchronous dispatch did not finish within %g s; the "
+                           "device is hung or heavily contended", limit);
+            return false;
+        }
         [commands waitUntilCompleted];
         meterNote(commands, 1u);
-        return [commands status] == MTLCommandBufferStatusCompleted;
+        if ([commands status] == MTLCommandBufferStatusCompleted) return true;
+        recordCommandError(commands, 0);
+        return false;
     }
 }
 
@@ -393,11 +803,35 @@ bool jaiGpuDispatchAsync(JaiGpuKernel *k, JaiGpuBuffer **buffers, int count,
 static void commitOpenLocked(void) {
     if (gAsyncCommands == nil) return;
     [gAsyncEncoder endEncoding];
+    injectStallLocked(gAsyncCommands);
     const uint64_t mine = gOpenBatch;
     const uint32_t encoded = gOpenEncoded;
+    const uint32_t units = gOpenEncoded + gOpenGraphs;
+    const double startedBy = gOpenHasGraph ? gFirstGraphAt : uptimeNow();
     [gAsyncCommands addCompletedHandler:^(id<MTLCommandBuffer> done) {
         meterNote(done, encoded);
+        const double ended = done.GPUEndTime;
+        const double previous = atomic_load_explicit(&gLastEnd, memory_order_relaxed);
+        if (ended > previous) atomic_store_explicit(&gLastEnd, ended, memory_order_relaxed);
+        if ([done status] == MTLCommandBufferStatusError) {
+            recordCommandError(done, mine);   /* sets the pending failure */
+        } else if (units > 0 && ended > 0.0) {
+            /* From whichever came later, the earliest the batch could start
+             * or the one before it ending: anything else on the queue in
+             * between is counted too, which can only over-estimate and so
+             * only commit sooner. */
+            const double took = ended - (previous > startedBy ? previous : startedBy);
+            if (took > 0.0) {
+                const double perUnit = took / (double)units;
+                const double seen = atomic_load_explicit(&gUnitSeconds, memory_order_relaxed);
+                atomic_store_explicit(&gUnitSeconds,
+                                      seen > 0.0 ? 0.75 * seen + 0.25 * perUnit : perUnit,
+                                      memory_order_relaxed);
+            }
+        }
+        /* Raised before the broadcast, so a woken waiter sees it. */
         noteDone(mine);
+        signalDone();
     }];
     [gAsyncCommands commit];
     ensureInFlight();
@@ -407,6 +841,32 @@ static void commitOpenLocked(void) {
     gAsyncCommands = nil;
     gOpenBatch = 0;
     gOpenEncoded = 0;
+    gOpenGraphs = 0;
+    gOpenHasGraph = false;
+}
+
+void noteGraphEncodeLocked(void) {
+    if (!gOpenHasGraph) gFirstGraphAt = uptimeNow();
+    gOpenHasGraph = true;
+    gOpenGraphs++;
+}
+
+/* Inside the queue lock and after the graph is in the batch, so every buffer
+ * the caller marked for it names the batch that is committed here. The wait
+ * for the oldest is taken inside the lock: there is no caller to hand a
+ * failure to, so it stays pending for the next wait. */
+void afterGraphEncodeLocked(void) {
+    if (!shouldCommitLocked(true)) return;
+    commitOpenLocked();
+    if (gInFlight != nil && gInFlight.count > JAI_GPU_MAX_IN_FLIGHT) {
+        id<MTLCommandBuffer> oldest = gInFlight[0];
+        const uint64_t batch = takeFrontLocked();
+        if (waitBatch(oldest, batch)) {
+            noteDone(batch);
+        } else {
+            requeueOneLocked(oldest, batch);
+        }
+    }
 }
 
 /* Take the front of the queue off the books, returning the batch it holds.
@@ -434,12 +894,18 @@ bool flushAsyncLocked(id<MTLCommandBuffer> *oldestOut, uint64_t *oldestBatch) {
 }
 
 bool jaiGpuFlush(void) {
-    if (!ensureDevice()) return false;
+    if (!ensureDevice()) {
+        recordGpuError("no Metal device is available");
+        return false;
+    }
     @autoreleasepool {
         id<MTLCommandBuffer> oldest = nil;
         uint64_t oldestBatch = 0;
         @synchronized(gQueue) {
-            if (!commitMlpAccLocked()) return false;
+            if (!commitMlpAccLocked()) {
+                recordGpuError("the fused MLP's staged accumulators could not be committed");
+                return false;
+            }
             commitOpenLocked();
             if (gInFlight != nil && gInFlight.count > JAI_GPU_MAX_IN_FLIGHT) {
                 oldest = gInFlight[0];
@@ -447,40 +913,44 @@ bool jaiGpuFlush(void) {
             }
         }
         if (oldest == nil) return true;
-        [oldest waitUntilCompleted];
-        if ([oldest status] != MTLCommandBufferStatusCompleted) return false;
-        noteDone(oldestBatch);
-        return true;
+        return waitOldest(oldest, oldestBatch);
     }
 }
 
 bool jaiGpuSynchronize(void) {
     @autoreleasepool {
         @synchronized(gQueue) {
-            if (!commitMlpAccLocked()) return false;
-            if (!commitMlpWeightsLocked()) return false;
-            if (gMlp3Side != 0) {
-                if (!commitMlp3WeightsLocked()) return false;
+            bool staged = commitMlpAccLocked() && commitMlpWeightsLocked();
+            if (staged && gMlp3Side != 0) staged = commitMlp3WeightsLocked();
+            if (!staged) {
+                recordGpuError("the fused MLP's staged weights could not be committed");
+                return false;
             }
         }
     }
     if (!jaiGpuFlush()) return false;
     @autoreleasepool {
-        NSArray<id<MTLCommandBuffer>> *pending;
-        uint64_t newest = 0;
+        NSArray<id<MTLCommandBuffer>> *pending = nil;
+        NSArray<NSNumber *> *batches = nil;
         @synchronized(gQueue) {
-            if (gInFlight == nil || gInFlight.count == 0) return true;
-            pending = [gInFlight copy];
-            newest = gInFlightBatch.lastObject.unsignedLongLongValue;
-            [gInFlight removeAllObjects];
-            [gInFlightBatch removeAllObjects];
+            if (gInFlight != nil && gInFlight.count > 0) {
+                pending = [gInFlight copy];
+                batches = [gInFlightBatch copy];
+                [gInFlight removeAllObjects];
+                [gInFlightBatch removeAllObjects];
+            }
         }
-        for (id<MTLCommandBuffer> commands in pending) {
-            [commands waitUntilCompleted];
-            if ([commands status] != MTLCommandBufferStatusCompleted) return false;
+        for (NSUInteger i = 0; i < pending.count; i++) {
+            const uint64_t batch = batches[i].unsignedLongLongValue;
+            if (!waitBatch(pending[i], batch)) {
+                @synchronized(gQueue) {
+                    requeueLocked(pending, batches, i);
+                }
+                return false;
+            }
+            noteDone(batch);
         }
-        noteDone(newest);
-        return true;
+        return !failurePending();
     }
 }
 
@@ -517,10 +987,13 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
         if (waitFrom != 0.0) meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
         return ok;
     }
-    if (want == 0) return true;   /* nothing pending: not a wait */
+    /* Nothing pending on this buffer, so not a wait -- but a failure nobody
+     * has been told about still comes out here rather than be read past. */
+    if (want == 0) return !failurePending();
 
     @autoreleasepool {
         NSArray<id<MTLCommandBuffer>> *pending = nil;
+        NSArray<NSNumber *> *batches = nil;
         uint64_t reached = 0;
         @synchronized(gQueue) {
             if (gOpenBatch != 0 && gOpenBatch <= want) commitOpenLocked();
@@ -531,14 +1004,20 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
             }
             if (take > 0) {
                 pending = [gInFlight subarrayWithRange:NSMakeRange(0, take)];
+                batches = [gInFlightBatch subarrayWithRange:NSMakeRange(0, take)];
                 reached = gInFlightBatch[take - 1].unsignedLongLongValue;
                 [gInFlight removeObjectsInRange:NSMakeRange(0, take)];
                 [gInFlightBatch removeObjectsInRange:NSMakeRange(0, take)];
             }
         }
-        for (id<MTLCommandBuffer> commands in pending) {
-            [commands waitUntilCompleted];
-            if ([commands status] != MTLCommandBufferStatusCompleted) {
+        for (NSUInteger i = 0; i < pending.count; i++) {
+            if (!waitBatch(pending[i], batches[i].unsignedLongLongValue)) {
+                /* Still queued, and still writing the buffer: back on the
+                 * books, so the next read or synchronize waits for it again
+                 * rather than read past it. */
+                @synchronized(gQueue) {
+                    requeueLocked(pending, batches, i);
+                }
                 if (waitFrom != 0.0) {
                     meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
                 }
@@ -548,7 +1027,21 @@ bool jaiGpuWaitFor(JaiGpuBuffer *b) {
         if (reached != 0) noteDone(reached);
     }
     if (waitFrom != 0.0) meterHostWait((uint64_t)((meterNow() - waitFrom) * 1e9));
-    return true;
+    return !failurePending();
+}
+
+uint64_t encodeNanFillLocked(id<MTLBuffer> buffer, size_t bytes) {
+    /* fillBuffer wants a whole number of words; every float buffer is. */
+    const size_t span = bytes & ~(size_t)3;
+    if (buffer == nil || span == 0) return 0;
+    if (!ensureAsyncCommandBuffer()) return 0;
+    if (gOpenBatch == 0) beginBatchLocked();
+    id<MTLBlitCommandEncoder> blit = [gAsyncCommands blitCommandEncoder];
+    if (blit == nil) return 0;
+    /* All ones in every byte is a NaN in every float. */
+    [blit fillBuffer:buffer range:NSMakeRange(0, span) value:0xFF];
+    [blit endEncoding];
+    return gOpenBatch;
 }
 
 bool ensureAsyncCommandBuffer(void) {
@@ -557,7 +1050,7 @@ bool ensureAsyncCommandBuffer(void) {
         gAsyncEncoder = nil;
     }
     if (gAsyncCommands == nil) {
-        gAsyncCommands = [gQueue commandBuffer];
+        gAsyncCommands = newAsyncCommandBuffer();
         if (gAsyncCommands == nil) return false;
         beginBatchLocked();
     }

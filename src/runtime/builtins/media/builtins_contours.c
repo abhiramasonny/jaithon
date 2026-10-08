@@ -618,6 +618,11 @@ static bool primGridBorders(int argc, Value *args, Value *out) {
         if (reach > 0) {
             srcFloats = jaiGpuMapRead(device, (size_t)deviceBase, (size_t)reach);
             if (srcFloats == NULL) {
+                const char *why = jaiGpuTakeError();
+                if (why[0] != '\0') {
+                    return jaiThrow(vm.cRuntimeError,
+                                    "grid_borders(): queued GPU work did not complete: %s", why);
+                }
                 return jaiThrow(vm.cValueError,
                                 "grid_borders(): %lldx%lld at %lld with a step of %lld is outside the buffer",
                                 (long long)rows, (long long)cols, (long long)origin, (long long)step);
