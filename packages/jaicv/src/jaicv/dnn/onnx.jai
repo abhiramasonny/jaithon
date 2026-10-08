@@ -50,7 +50,7 @@ from jaitensor import Tensor
 from ..core.mat import Mat
 from ..core.types import CV_32F, CV_MAKETYPE
 from .blob import Net, Runnable
-from .graph import Attr, Graph, GraphNode, is_implemented, run_graph
+from .graph import Attr, Graph, GraphNode, is_implemented, mark_rank_zero, run_graph
 from .plan import run_best
 from .protobuf import Field, WIRE_I32, WIRE_I64, WIRE_LEN, WIRE_VARINT, as_bytes, as_double, as_float, as_string, field_by_number, fields_by_number, packed_doubles, packed_fixed32, packed_fixed64, packed_floats, packed_varints, parse_message, parse_nested
 
@@ -330,27 +330,151 @@ fn optional_int(fields: list[Field], number: int, fallback: int) -> int {
     return found.varint
 }
 
-#: Where an external tensor says its bytes live, for the error that refuses it.
-fn external_location(fields: list[Field]) -> str {
+#: An external tensor's `external_data` entries -- `location`, `offset`,
+#: `length` and `checksum` -- by key.
+fn external_entries(fields: list[Field]) -> dict[str, str] {
+    var entries: dict[str, str] = {}
     for entry in fields_by_number(fields, TENSOR_EXTERNAL) {
         let pair = parse_nested(entry)
-        if optional_string(pair, ENTRY_KEY) == "location" {
-            return optional_string(pair, ENTRY_VALUE)
-        }
+        entries[optional_string(pair, ENTRY_KEY)] = optional_string(pair, ENTRY_VALUE)
     }
-    return "a file it does not name"
+    return entries
+}
+
+#: Where an external tensor says its bytes live, for the error that refuses it.
+fn external_location(fields: list[Field]) -> str {
+    let location = external_entries(fields).get("location", "")
+    return if location.len() > 0 { location } else { "a file it does not name" }
+}
+
+#: Whether a file's `location` stays inside the model's own directory.
+#:
+#: The location is written by whoever wrote the model, so it is checked as
+#: text before anything is opened: no absolute path, no drive letter, and no
+#: `..` component in either separator. That is the same rule onnxruntime
+#: applies, and it is what stops a downloaded model from reading any file
+#: the user can.
+fn location_is_contained(location: str) -> bool {
+    if location.len() == 0 { return false }
+    if location[0] == "/" or location[0] == "\\" { return false }
+    if location.len() > 1 and location[1] == ":" { return false }
+    for part in location.replace("\\", "/").split("/") {
+        if part == ".." { return false }
+    }
+    return true
+}
+
+#: A non-negative integer out of an `external_data` entry, which protobuf
+#: carries as text.
+fn entry_count(text: str, key: str, where: str) -> int {
+    var value = 0
+    if text.len() == 0 {
+        throw ValueError(f"{where} gives an empty {key} for its external data")
+    }
+    for index in 0..text.len() {
+        let digit = text[index]
+        if digit < "0" or digit > "9" {
+            throw ValueError(
+                f"{where} gives the {key} {text} for its external data, which is not a count"
+            )
+        }
+        if value > MAX_EXTERNAL_BYTES {
+            throw ValueError(f"{where} gives the {key} {text}, which no file this reader opens is")
+        }
+        value = value * 10 + int(digit)
+    }
+    return value
+}
+
+#: The largest sidecar offset or length that is taken at its word. An
+#: offset is file-controlled, and the check keeps the arithmetic below from
+#: overflowing long before it could matter.
+const MAX_EXTERNAL_BYTES = 1 << 40
+
+#: The bytes of a tensor kept outside the model, as the `raw_data` field they
+#: would have been inside it -- external data is defined as exactly those
+#: bytes, so everything after this is the inline route.
+fn external_raw(fields: list[Field], where: str, files: ExternalFiles?) -> Field {
+    let entries = external_entries(fields)
+    let location = entries.get("location", "")
+    if files is null {
+        throw ValueError(
+            f"{where} keeps its weights in {external_location(fields)}, " +
+                "a file beside the model, and a model read from bytes has no beside; " +
+                "read it from its path instead"
+        )
+    }
+    if not location_is_contained(location) {
+        throw ValueError(
+            f"{where} keeps its weights at {location}, which is not inside the " +
+                "model's own directory, so it is not read"
+        )
+    }
+    let data = files.read(location, where)
+    let offset = if "offset" in entries {
+        entry_count(entries["offset"], "offset", where)
+    } else {
+        0
+    }
+    if offset > data.len() {
+        throw ValueError(f"{where} starts at byte {offset} of {location}, which has {data.len()}")
+    }
+    let length = if "length" in entries {
+        entry_count(entries["length"], "length", where)
+    } else {
+        data.len() - offset
+    }
+    if length > data.len() - offset {
+        throw ValueError(
+            f"{where} reads {length} bytes from byte {offset} of {location}, " +
+                f"which has {data.len()}"
+        )
+    }
+    return Field(TENSOR_RAW_DATA, WIRE_LEN, data: data.slice(offset, offset + length))
+}
+
+#: The files a model's external tensors live in, each read once however many
+#: tensors share it -- a torch export puts every weight in one.
+class ExternalFiles {
+    let base: str
+    var held: dict[str, bytes]
+
+    pub fn init(self, base: str) {
+        self.base = base
+        self.held = {}
+    }
+
+    pub fn read(self, location: str, where: str) -> bytes {
+        let kept = self.held.get(location, null)
+        if kept is not null { return kept }
+        let path = if self.base.len() == 0 { location } else { f"{self.base}/{location}" }
+        var data = bytes([])
+        try {
+            data = io.read_bytes(path)
+        } catch _failure: Error {
+            throw ValueError(f"{where} keeps its weights in {location}, and {path} cannot be read")
+        }
+        self.held[location] = data
+        return data
+    }
 }
 
 #: One `TensorProto`, decoded but not yet uploaded.
+#:
+#: `scalar` says the file wrote it with no dimensions at all. It is held as
+#: `[1]` like every other scalar, but the difference matters to a `Gather`
+#: indexed by it, which drops its axis for a scalar and keeps it for `[1]`.
 class Blob {
     pub let name: str
     pub let shape: list[int]
     pub let values: list[float]
+    pub let scalar: bool
 
-    pub fn init(self, name: str, shape: list[int], values: list[float]) {
+    pub fn init(self, name: str, shape: list[int], values: list[float], scalar: bool = false) {
         self.name = name
         self.shape = shape
         self.values = values
+        self.scalar = scalar
     }
 }
 
@@ -477,23 +601,23 @@ fn typed_values(fields: list[Field], kind: int, where: str) -> list[float] {
 }
 
 #: One `TensorProto`, whichever way it was written.
-fn read_blob(field: Field, whose: str) -> Blob {
+fn read_blob(field: Field, whose: str, files: ExternalFiles? = null) -> Blob {
     let fields = parse_nested(field)
     let name = optional_string(fields, TENSOR_NAME)
     let where = if name.len() > 0 { f"{whose} {name}" } else { whose }
     if field_by_number(fields, TENSOR_SEGMENT) is not null {
         throw ValueError(f"{where} arrives in segments, which only a model past 2 GB is written in")
     }
-    if optional_int(fields, TENSOR_LOCATION, 0) == LOCATION_EXTERNAL {
-        throw ValueError(
-            f"{where} keeps its weights in {external_location(fields)}, " +
-                "a file beside the model that this reader does not follow"
-        )
-    }
+    let external = optional_int(fields, TENSOR_LOCATION, 0) == LOCATION_EXTERNAL
     let kind = optional_int(fields, TENSOR_DATA_TYPE, 0)
-    let shape = blob_shape(repeated_varints(fields, TENSOR_DIMS, where), where)
+    let dims = repeated_varints(fields, TENSOR_DIMS, where)
+    let shape = blob_shape(dims, where)
     let count = element_count(shape, where)
-    let raw = field_by_number(fields, TENSOR_RAW_DATA)
+    let raw = if external {
+        external_raw(fields, where, files)
+    } else {
+        field_by_number(fields, TENSOR_RAW_DATA)
+    }
     let values = if raw is not null {
         raw_values(raw, kind, count, where)
     } else {
@@ -502,7 +626,7 @@ fn read_blob(field: Field, whose: str) -> Blob {
     if values.len() != count {
         throw ValueError(f"{where} is shaped {shape} and holds {values.len()} values")
     }
-    return Blob(name, shape, values)
+    return Blob(name, shape, values, scalar: dims.len() == 0)
 }
 
 #: The shape a `ValueInfoProto` declares, with `-1` where the file left a
@@ -545,13 +669,24 @@ class Reading {
     pub var weights: dict[str, Tensor]
     pub var nodes: list[GraphNode]
     pub var taken: dict[str, bool]
+    #: The weights the file wrote as rank-zero scalars; see `Blob.scalar`.
+    pub var scalars: dict[str, bool]
+    #: The constants the file wrote with a zero-width dimension, which hold
+    #: nothing and so are not weights; see `constant_is_empty`.
+    pub var empty: dict[str, bool]
+    #: Where external tensors are read from, or null for a model that came
+    #: as bytes and so has no directory to look in.
+    pub var files: ExternalFiles?
     var minted: int
 
-    pub fn init(self) {
+    pub fn init(self, files: ExternalFiles? = null) {
         self.opset = 0
         self.weights = {}
         self.nodes = []
         self.taken = {}
+        self.scalars = {}
+        self.empty = {}
+        self.files = files
         self.minted = 0
     }
 
@@ -631,11 +766,11 @@ fn attribute_kind(fields: list[Field], where: str) -> int {
 #:
 #: A failure partway through releases the tensors already built, because the
 #: node they would have hung off is never returned.
-fn read_attributes(fields: list[Field], label: str) -> dict[str, Attr] {
+fn read_attributes(fields: list[Field], label: str, files: ExternalFiles?) -> dict[str, Attr] {
     var attrs: dict[str, Attr] = {}
     try {
         for attribute in fields_by_number(fields, NODE_ATTRIBUTE) {
-            let (key, value) = read_attribute(parse_nested(attribute), label)
+            let (key, value) = read_attribute(parse_nested(attribute), label, files)
             if key.len() == 0 { throw ValueError(f"{label} carries an attribute with no name") }
             #: A repeated name would otherwise drop the first attribute on the
             #: floor, and with it the device buffer its tensor had already
@@ -655,7 +790,7 @@ fn read_attributes(fields: list[Field], label: str) -> dict[str, Attr] {
     return attrs
 }
 
-fn read_attribute(fields: list[Field], label: str) -> tuple[str, Attr] {
+fn read_attribute(fields: list[Field], label: str, files: ExternalFiles?) -> tuple[str, Attr] {
     let name = optional_string(fields, ATTR_NAME)
     var where = f"an unnamed attribute of {label}"
     if name.len() > 0 { where = f"the attribute {name} of {label}" }
@@ -685,7 +820,7 @@ fn read_attribute(fields: list[Field], label: str) -> tuple[str, Attr] {
     if kind == KIND_TENSOR {
         let held = field_by_number(fields, ATTR_TENSOR)
         if held is null { throw ValueError(f"{where} is a tensor attribute holding no tensor") }
-        let blob = read_blob(held, where)
+        let blob = read_blob(held, where, files)
         return (name, Attr.of_tensor(Tensor(blob.shape, blob.values)))
     }
     throw ValueError(
@@ -768,6 +903,39 @@ fn legacy_softmax(reading: Reading, node: GraphNode) -> list[GraphNode] {
     ]
 }
 
+#: Whether a `Constant` stands for a rank-zero scalar: a `value` tensor with
+#: no dimensions, or the `value_float` and `value_int` forms, which are
+#: scalars by definition. Read off the attribute fields themselves, because
+#: once a tensor is uploaded a scalar and a one-element vector look the same.
+fn constant_is_scalar(fields: list[Field]) -> bool {
+    for attribute in fields_by_number(fields, NODE_ATTRIBUTE) {
+        let parts = parse_nested(attribute)
+        let key = optional_string(parts, ATTR_NAME)
+        if key == "value_float" or key == "value_int" { return true }
+        if key != "value" { continue }
+        let held = field_by_number(parts, ATTR_TENSOR)
+        if held is null { return false }
+        return field_by_number(parse_nested(held), TENSOR_DIMS) is null
+    }
+    return false
+}
+
+#: Whether a `Constant` holds an empty tensor -- a dimension of zero. The one
+#: use exporters have for such a thing is the shape a `ConstantOfShape` is
+#: given to make a scalar, which `place_node` folds; anything else that reads
+#: it finds no value and says so.
+fn constant_is_empty(fields: list[Field]) -> bool {
+    for attribute in fields_by_number(fields, NODE_ATTRIBUTE) {
+        let parts = parse_nested(attribute)
+        if optional_string(parts, ATTR_NAME) != "value" { continue }
+        let held = field_by_number(parts, ATTR_TENSOR)
+        if held is null { return false }
+        let dims = repeated_varints(parse_nested(held), TENSOR_DIMS, "a constant")
+        return 0 in dims
+    }
+    return false
+}
+
 #: One `NodeProto`, as the nodes it becomes -- usually one, none for a
 #: `Constant` that has been folded into the weights, four for a `Softmax` old
 #: enough to have meant something else.
@@ -781,15 +949,22 @@ fn read_node(reading: Reading, fields: list[Field]) -> list[GraphNode] {
     }
     let inputs = repeated_strings(fields, NODE_INPUT)
     let outputs = repeated_strings(fields, NODE_OUTPUT)
+    if op == "Constant" and outputs.len() == 1 and constant_is_empty(fields) {
+        reading.empty[outputs[0]] = true
+        return []
+    }
     var node = GraphNode(op, name: name, inputs: inputs, outputs: outputs)
     let label = node.label()
     let domain = optional_string(fields, NODE_DOMAIN)
     if domain.len() > 0 and domain != "ai.onnx" {
         throw ValueError(f"{label} comes from the {domain} operator set, which is not implemented")
     }
-    for (key, value) in read_attributes(fields, label).items() { node.attrs[key] = value }
+    for (key, value) in read_attributes(fields, label, reading.files).items() {
+        node.attrs[key] = value
+    }
+    let scalar = op == "Constant" and constant_is_scalar(fields)
     try {
-        return place_node(reading, node, label)
+        return place_node(reading, node, label, scalar)
     } catch failure: Error {
         free_node_tensors(node)
         throw failure
@@ -803,7 +978,7 @@ fn read_node(reading: Reading, fields: list[Field]) -> list[GraphNode] {
 #: why the tensor a `Constant` hands over is taken out of them first rather
 #: than freed beside them. It is either in the weights or it is nowhere, and
 #: never in both.
-fn place_node(reading: Reading, node: GraphNode, label: str) -> list[GraphNode] {
+fn place_node(reading: Reading, node: GraphNode, label: str, scalar: bool) -> list[GraphNode] {
     let op = node.op
     if op == "Constant" {
         if node.outputs.len() != 1 {
@@ -814,6 +989,20 @@ fn place_node(reading: Reading, node: GraphNode, label: str) -> list[GraphNode] 
         let kept = constant_tensor(node, label)
         let _moved = node.attrs.pop("value", null)
         reading.adopt(node.outputs[0], kept, label)
+        free_node_tensors(node)
+        if scalar { reading.scalars[node.outputs[0]] = true }
+        return []
+    }
+    #: `ConstantOfShape` of an empty shape is a scalar, which is how the
+    #: TorchScript exporter writes one: the value attribute, held as `[1]`.
+    if op == "ConstantOfShape" and
+        node.inputs.len() == 1 and
+        reading.empty.get(node.inputs[0], false) {
+        let held = node.attrs.get("value", null)
+        var value = 0.0
+        if held is not null and held.tensor is not null { value = held.tensor.download()[0] }
+        reading.hold(node.outputs[0], [1], [value], label)
+        reading.scalars[node.outputs[0]] = true
         free_node_tensors(node)
         return []
     }
@@ -846,7 +1035,7 @@ fn place_node(reading: Reading, node: GraphNode, label: str) -> list[GraphNode] 
 }
 
 #: The whole file, as a graph and the shapes it declared.
-fn import_model(data: bytes) -> Model {
+fn import_model(data: bytes, files: ExternalFiles? = null) -> Model {
     var fields: list[Field] = []
     try {
         fields = parse_message(data)
@@ -858,7 +1047,7 @@ fn import_model(data: bytes) -> Model {
         throw ValueError("this file is not an ONNX model: it holds no graph")
     }
 
-    let reading = Reading()
+    let reading = Reading(files)
     for entry in fields_by_number(fields, MODEL_OPSET) {
         let declared = parse_nested(entry)
         let domain = optional_string(declared, OPSET_DOMAIN)
@@ -882,8 +1071,9 @@ fn assemble(reading: Reading, fields: list[Field]) -> Model {
         throw ValueError("this model has sparse initializers, which are not implemented")
     }
     for entry in fields_by_number(fields, GRAPH_INITIALIZER) {
-        let blob = read_blob(entry, "the initializer")
+        let blob = read_blob(entry, "the initializer", reading.files)
         reading.hold(blob.name, blob.shape, blob.values, f"the initializer {blob.name}")
+        if blob.scalar { reading.scalars[blob.name] = true }
     }
 
     #: Every name the file uses, gathered before a node is rewritten so that an
@@ -921,6 +1111,9 @@ fn assemble(reading: Reading, fields: list[Field]) -> Model {
     for message in node_messages {
         for node in read_node(reading, message) { reading.nodes.push(node) }
     }
+    #: The one place a scalar's rank changes an answer: a `Gather` indexed by
+    #: one drops its axis. Marked now, while the file's ranks are still known.
+    mark_rank_zero(reading.nodes, reading.scalars)
     let graph = Graph(
         nodes: reading.nodes,
         inputs: inputs,
@@ -953,8 +1146,21 @@ pub fn read_net_from_onnx_bytes(data: bytes) -> Graph { return import_model(data
 #: partway, for a weight this reader cannot decode, and for an operator the
 #: executor does not implement -- naming the node in the last case, so that a
 #: model can be turned away before a forward pass rather than during one.
-pub fn read_net_from_onnx(path: str) -> Graph {
-    return read_net_from_onnx_bytes(io.read_bytes(path))
+pub fn read_net_from_onnx(path: str) -> Graph { return import_from(path).graph }
+
+#: The directory a model's external data is looked for in: the model's own.
+fn directory_of(path: str) -> str {
+    let cut = path.rfind("/")
+    if cut < 0 { return "" }
+    if cut == 0 { return "/" }
+    return path[0:cut]
+}
+
+#: A model read from its path, which is what lets it follow its external
+#: data -- `.onnx.data` beside the model is how every torch export from 2.9 on
+#: is written by default, and the only way a model past 2 GB can be.
+fn import_from(path: str) -> Model {
+    return import_model(io.read_bytes(path), ExternalFiles(directory_of(path)))
 }
 
 #: The model in an ONNX file: the graph, and the shapes it declared for its
@@ -965,9 +1171,7 @@ pub fn read_net_from_onnx(path: str) -> Graph {
 #: letterbox to the network's input size without being told what that is, and
 #: hardcoding it is how a reader ends up only ever working with one model. A
 #: dimension the file left symbolic reads as `-1`.
-pub fn read_onnx_model(path: str) -> Model {
-    return import_model(io.read_bytes(path))
-}
+pub fn read_onnx_model(path: str) -> Model { return import_from(path) }
 
 #: A network behind `Runnable`, so an ONNX file can stand where OpenCV's
 #: detector code puts a `dnn::Net`.
@@ -1101,7 +1305,7 @@ pub class OnnxNet: Runnable {
 #: freed: a `Net` has nowhere to keep a destructor, and this is what knows
 #: which graph to hand `free_onnx_weights`.
 pub fn read_onnx_engine(path: str) -> OnnxNet {
-    return OnnxNet(import_model(io.read_bytes(path)))
+    return OnnxNet(import_from(path))
 }
 
 #: An ONNX model on disk, as the `Net` OpenCV's `readNetFromONNX` returns.

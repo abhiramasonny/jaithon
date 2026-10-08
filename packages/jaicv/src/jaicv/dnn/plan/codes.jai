@@ -72,4 +72,31 @@ pub let FOLDABLE = {
     "Equal": true,
     "Where": true,
     "Range": true,
+    #: An exporter that finds two identical weights keeps one and reads the
+    #: other through an `Identity` -- torch does it for every BatchNorm whose
+    #: statistics are still the zeros and ones it started with -- so these
+    #: have to fold, or a `BatchNormalization` downstream cannot see its own
+    #: statistics and the whole model falls back to the interpreter.
+    "Identity": true,
+    "Dropout": true,
+    "Expand": true,
+    "GreaterOrEqual": true,
+    "LessOrEqual": true,
+    #: Index arithmetic over position ids and masks, nearly always on
+    #: constants; the plan has no other way to express these.
+    "GatherElements": true,
+    "GatherND": true,
+    "ScatterND": true,
+    #: The rest of the arithmetic a TorchScript export does on shapes -- the
+    #: padding Swin works out for its windows goes through a `Transpose`.
+    "Transpose": true,
+    "Neg": true,
+    "Abs": true,
+    "Min": true,
+    "Max": true,
+    "Less": true,
+    "Greater": true,
+    "Not": true,
+    "And": true,
+    "Or": true,
 }

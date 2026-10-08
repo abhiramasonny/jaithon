@@ -3,6 +3,7 @@
 #: change goes through, and the pads, joins and row reductions that have a
 #: kernel of their own.
 from jaitensor import Tensor
+from std.os import env, set_env, unset_env
 
 from .kernels import MAX_RANK, f32_bits, kernel_for, u32
 
@@ -300,4 +301,48 @@ pub fn normalize_axis(axis: int, rank: int, what: str) -> int {
         throw ValueError(f"{what} names axis {axis}, which is outside rank {rank}")
     }
     return resolved
+}
+
+#: Compile a graph to encode onto the shared queue.
+#:
+#: A plan picks between encoding and blocking the first time it runs, by
+#: timing a dozen runs of each, which is worth it for a whole model and is
+#: most of the first call for a one-operator graph. An interpreter step only
+#: ever wants encoding -- it queues like every other operator here and lets
+#: the next one overlap -- so that route is named while the graph compiles,
+#: unless the caller has already chosen one with `JAITHON_GRAPH_ROUTE`.
+pub fn compile_encoded(builder: int, inputs: list[int], outputs: list[int]) -> int? {
+    let chosen = env("JAITHON_GRAPH_ROUTE")
+    if chosen is null { set_env("JAITHON_GRAPH_ROUTE", "encode") }
+    var plan: int? = null
+    try {
+        plan = __prim__.graph_compile(builder, inputs, outputs, "latency")
+    } finally {
+        if chosen is null { unset_env("JAITHON_GRAPH_ROUTE") }
+    }
+    return plan
+}
+
+#: Run a one-operator graph compiled by `compile_encoded`, `fed` in, `output`
+#: out.
+#:
+#: MPSGraph reads a window that starts part way into a buffer only when its
+#: rows are whole 16-byte lines, so a `Tensor.view` of a batch whose last axis
+#: is not a multiple of four floats is refused before anything is queued.
+#: jaitensor's kernels address such a view directly, and an operator that runs
+#: on them has to keep taking one, so the feeds go again as contiguous copies.
+pub fn run_one_op_graph(plan: int, fed: list[Tensor], output: Tensor) -> void {
+    let destination = [output.buffer().handle_of()]
+    try {
+        __prim__.graph_run(plan, [tensor.buffer().handle_of() for tensor in fed], destination)
+        return
+    } catch _refused: RuntimeError {
+        #: Retried below rather than here, so a second refusal is not caught.
+    }
+    let copies = [copy_of(tensor, tensor.shape) for tensor in fed]
+    try {
+        __prim__.graph_run(plan, [copy.buffer().handle_of() for copy in copies], destination)
+    } finally {
+        for copy in copies { copy.free() }
+    }
 }

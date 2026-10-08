@@ -16,7 +16,7 @@
 import std.gpu as gpu
 from std.io import Path
 from std.test import assert_contains, assert_eq, assert_near, assert_throws, assert_true
-from jaicv.dnn.graph import Attr, Graph, GraphNode, is_implemented, run_graph
+from jaicv.dnn.graph import Attr, Graph, GraphNode, is_implemented, mark_rank_zero, run_graph
 from jaicv.dnn.plan import Plan, compile_plan, run_best
 from jaitensor import Tensor
 
@@ -42,6 +42,10 @@ class Case {
     pub var feeds: list[Recorded?]
     pub var attrs: dict[str, Attr]
     pub var wants: list[Recorded]
+    #: The input positions the reference fed a rank-zero scalar. They are
+    #: uploaded as `[1]` like any scalar here; this is what the importer would
+    #: have known from the file, and is handed to `mark_rank_zero` the same way.
+    pub var scalars: list[int]
 
     pub fn init(self, op: str, name: str) {
         self.op = op
@@ -49,6 +53,22 @@ class Case {
         self.feeds = []
         self.attrs = {}
         self.wants = []
+        self.scalars = []
+    }
+
+    #: This case's one node, under the names a test graph gives its inputs.
+    pub fn node(self, names: list[str], outs: list[str]) -> GraphNode {
+        let built = GraphNode(
+            self.op,
+            name: self.name,
+            inputs: names,
+            outputs: outs,
+            attrs: self.attrs
+        )
+        var scalar_names: dict[str, bool] = {}
+        for slot in self.scalars { scalar_names[names[slot]] = true }
+        mark_rank_zero([built], scalar_names)
+        return built
     }
 }
 
@@ -125,6 +145,8 @@ fn load_cases(path: Path) -> dict[str, list[Case]] {
             item.feeds.push(if fields[1] == "null" { null } else { read_tensor(fields, 1) })
         } elif fields[0] == "out" {
             item.wants.push(read_tensor(fields, 1))
+        } elif fields[0] == "scalar" {
+            item.scalars.push(int(fields[1]))
         } else {
             throw ValueError(f"the oracle file has a line starting {fields[0]}")
         }
@@ -141,6 +163,14 @@ fn cases_in(group: str) -> list[Case] {
     let found = _cases.get(group, null)
     if found is null { throw ValueError(f"the oracle file has no {group} group") }
     return found
+}
+
+#: The larger of two differences, with NaN the largest of all. A plain `>`
+#: is false against NaN, so an operator that came back NaN used to leave the
+#: worst at zero and pass.
+fn widen(worst: float, gap: float) -> float {
+    if gap != gap { return 1.0e30 }
+    return if gap > worst { gap } else { worst }
 }
 
 #: Run one case as a one-node graph and return the worst difference from the
@@ -163,19 +193,7 @@ fn worst_difference(item: Case) -> float {
     }
     var outs: list[str] = []
     for slot in 0..item.wants.len() { outs.push(f"out{slot}") }
-    let graph = Graph(
-        nodes: [
-            GraphNode(
-                item.op,
-                name: item.name,
-                inputs: names,
-                outputs: outs,
-                attrs: item.attrs
-            ),
-        ],
-        inputs: declared,
-        outputs: outs
-    )
+    let graph = Graph(nodes: [item.node(names, outs)], inputs: declared, outputs: outs)
     let produced = run_graph(graph, feeds)
     var worst = 0.0
     for (slot, want) in item.wants.enumerate() {
@@ -185,7 +203,7 @@ fn worst_difference(item: Case) -> float {
         for index in 0..values.len() {
             let expected = want.values[index]
             let gap = abs(values[index] - expected) / max(1.0, abs(expected))
-            if gap > worst { worst = gap }
+            worst = widen(worst, gap)
         }
     }
     for (_name, tensor) in produced.items() { tensor.free() }
@@ -224,15 +242,7 @@ fn compiled_difference(item: Case, weights_are_constant: bool) -> float {
     var outs: list[str] = []
     for slot in 0..item.wants.len() { outs.push(f"out{slot}") }
     let graph = Graph(
-        nodes: [
-            GraphNode(
-                item.op,
-                name: item.name,
-                inputs: names,
-                outputs: outs,
-                attrs: item.attrs
-            ),
-        ],
+        nodes: [item.node(names, outs)],
         inputs: declared,
         outputs: outs,
         initializers: fixed
@@ -258,7 +268,7 @@ fn compiled_difference(item: Case, weights_are_constant: bool) -> float {
         for index in 0..values.len() {
             let expected = want.values[index]
             let gap = abs(values[index] - expected) / max(1.0, abs(expected))
-            if gap > worst { worst = gap }
+            worst = widen(worst, gap)
         }
     }
     for (_name, tensor) in produced.items() { tensor.free() }
@@ -494,27 +504,30 @@ fn test_an_unimplemented_operator_names_itself() -> void {
     feed.free()
 }
 
+#: A convolution takes dilations now, through the graph route; a pool still
+#: does not, and is what says so.
 fn test_an_unsupported_attribute_names_the_node() -> void {
     let graph = Graph(
         nodes: [
             GraphNode(
-                "Conv",
+                "MaxPool",
                 name: "dilated",
-                inputs: ["x", "w"],
+                inputs: ["x"],
                 outputs: ["y"],
-                attrs: {"dilations": Attr.of_ints([2, 2])}
+                attrs: {
+                    "kernel_shape": Attr.of_ints([2, 2]),
+                    "dilations": Attr.of_ints([2, 2]),
+                }
             ),
         ],
-        inputs: ["x", "w"],
+        inputs: ["x"],
         outputs: ["y"]
     )
     let x = Tensor([1, 1, 5, 5], [float(value) for value in 0..25])
-    let w = Tensor([1, 1, 3, 3], [1.0 for _value in 0..9])
-    let error = assert_throws(ValueError, || run_graph(graph, {"x": x, "w": w}))
-    assert_contains(error.message, "operator Conv at node dilated")
+    let error = assert_throws(ValueError, || run_graph(graph, {"x": x}))
+    assert_contains(error.message, "operator MaxPool at node dilated")
     assert_contains(error.message, "dilations")
     x.free()
-    w.free()
 }
 
 fn test_feeds_and_initializers_are_never_freed() -> void {
@@ -655,7 +668,7 @@ fn test_end_to_end_network_matches_torch() -> void {
     var worst = 0.0
     for index in 0..values.len() {
         let gap = abs(values[index] - want.values[index])
-        if gap > worst { worst = gap }
+        worst = widen(worst, gap)
     }
     #: Measured at 1.8e-7 on an M2 Max against torch's float64 forward pass.
     assert_true(worst <= 2e-6, f"the network is off torch by {worst}")
@@ -846,4 +859,310 @@ fn test_the_cached_plan_answers_what_the_interpreter_answers() -> void {
             assert_near(got[index], want[index], 1e-6, f"{shape} differs at {index}")
         }
     }
+}
+
+#: torch writes one copy of identical weights and reads the rest through
+#: `Identity` -- every BatchNorm whose statistics are still zeros and ones
+#: shares them -- so densenet121's statistics all arrive that way. The plan
+#: has to fold through the `Identity` to see them, or the whole model stays on
+#: the interpreter.
+fn test_batch_norm_statistics_through_identity_compile() -> void {
+    if not gpu.is_available() { return }
+    let graph = Graph(
+        nodes: [
+            GraphNode(
+                "Identity",
+                name: "mean_copy",
+                inputs: ["mean"],
+                outputs: ["mean_seen"]
+            ),
+            GraphNode(
+                "Identity",
+                name: "var_copy",
+                inputs: ["var"],
+                outputs: ["var_seen"]
+            ),
+            GraphNode(
+                "BatchNormalization",
+                name: "bn",
+                inputs: ["x", "scale", "shift", "mean_seen", "var_seen"],
+                outputs: ["y"],
+                attrs: {"epsilon": Attr.of_float(1e-5)}
+            ),
+        ],
+        inputs: ["x"],
+        outputs: ["y"],
+        initializers: {
+            "scale": Tensor([2], [1.5, 0.5]),
+            "shift": Tensor([2], [0.25, -1.0]),
+            "mean": Tensor([2], [0.5, -0.5]),
+            "var": Tensor([2], [4.0, 0.25]),
+        }
+    )
+    let x = Tensor([1, 2, 2, 2], [1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0])
+    let plan = compile_plan(graph, {"x": x})
+    assert_true(plan is not null, "statistics read through Identity still compile")
+    if plan is not null {
+        let planned = plan.run({"x": x})
+        let plain = run_graph(graph, {"x": x})
+        let got = planned["y"].download()
+        let want = plain["y"].download()
+        for index in 0..want.len() {
+            assert_near(got[index], want[index], 1e-5, f"the plan differs at {index}")
+        }
+        planned["y"].free()
+        plain["y"].free()
+        plan.free()
+    }
+    x.free()
+    for (_name, tensor) in graph.initializers.items() { tensor.free() }
+}
+
+#: A depthwise convolution runs as one dispatch and keeps nothing on its node.
+#: The per-group loop it replaced memoised one weight slice per channel --
+#: about 7000 live tensors on MobileNetV2 -- and every later allocation got
+#: slower for it.
+fn test_a_depthwise_conv_keeps_no_slices_on_its_node() -> void {
+    if not gpu.is_available() { return }
+    var values: list[float] = []
+    for index in 0..2 * 16 * 5 * 5 { values.push(float(index % 11) * 0.25 - 1.0) }
+    let x = Tensor([2, 16, 5, 5], values)
+    let w = Tensor([16, 1, 3, 3], [float(index % 7) * 0.125 for index in 0..144])
+    let node = GraphNode(
+        "Conv",
+        name: "depthwise",
+        inputs: ["x", "w"],
+        outputs: ["y"],
+        attrs: {"group": Attr.of_int(16), "pads": Attr.of_ints([1, 1, 1, 1])}
+    )
+    let graph = Graph(nodes: [node], inputs: ["x"], outputs: ["y"], initializers: {"w": w})
+    for _call in 0..2 {
+        let produced = run_graph(graph, {"x": x})
+        assert_eq(produced["y"].shape, [2, 16, 5, 5], "a depthwise conv keeps its shape")
+        produced["y"].free()
+    }
+    assert_eq(node.cached.len(), 0, "the convolution memoised nothing on its node")
+    x.free()
+    w.free()
+}
+
+#: A LayerNormalization run with and without its optional statistics leaves
+#: no buffer behind. Its row mean and deviation came back as reshapes, which
+#: share storage, so freeing them freed nothing: two buffers a node a call.
+fn test_layer_norm_leaves_no_buffers_behind() -> void {
+    if not gpu.is_available() { return }
+    let x = Tensor([2, 3, 4], [float(index % 5) - 2.0 for index in 0..24])
+    let scale = Tensor([4], [1.0, 0.5, 2.0, 1.5])
+    for outputs in [["y"], ["y", "", "deviation"], ["y", "mean", "deviation"]] {
+        let graph = Graph(
+            nodes: [
+                GraphNode(
+                    "LayerNormalization",
+                    name: "ln",
+                    inputs: ["x", "scale"],
+                    outputs: outputs,
+                    attrs: {"axis": Attr.of_int(-1)}
+                ),
+            ],
+            inputs: ["x"],
+            outputs: [name for name in outputs if name.len() > 0],
+            initializers: {"scale": scale}
+        )
+        let before = gpu.live_buffers()
+        for _call in 0..3 {
+            let produced = run_graph(graph, {"x": x})
+            if outputs.len() == 3 {
+                assert_eq(
+                    produced["deviation"].shape,
+                    [2, 3, 1],
+                    "the deviation keeps the outer axes"
+                )
+            }
+            for (_name, tensor) in produced.items() { tensor.free() }
+        }
+        assert_eq(
+            gpu.live_buffers() - before,
+            0,
+            f"LayerNormalization with outputs {outputs} leaked"
+        )
+    }
+    x.free()
+    scale.free()
+}
+
+#: Optional outputs a node does not want may be listed under empty names, and
+#: `["y", "", ""]` is valid ONNX. Making only the named statistics must not
+#: turn that into a node that "names three outputs and produced one", on the
+#: interpreter or in the survey the plan compiles from.
+fn test_layer_norm_takes_unnamed_trailing_outputs() -> void {
+    if not gpu.is_available() { return }
+    let x = Tensor([2, 3, 8], [float(index % 5) * 0.75 - 1.5 for index in 0..48])
+    let scale = Tensor([8], [1.0, 0.5, 2.0, 1.5, -1.0, 0.25, 1.0, 3.0])
+    fn graph_of(outputs: list[str], gamma: Tensor) -> Graph {
+        return Graph(
+            nodes: [
+                GraphNode(
+                    "LayerNormalization",
+                    name: "ln",
+                    inputs: ["x", "scale"],
+                    outputs: outputs,
+                    attrs: {"axis": Attr.of_int(-1)}
+                ),
+            ],
+            inputs: ["x"],
+            outputs: [name for name in outputs if name.len() > 0],
+            initializers: {"scale": gamma}
+        )
+    }
+    let reference = run_graph(graph_of(["y", "mean", "deviation"], scale), {"x": x})
+    let want_y = reference["y"].download()
+    let want_mean = reference["mean"].download()
+    for (_name, tensor) in reference.items() { tensor.free() }
+    for outputs in [["y", "", ""], ["y", ""], ["y", "mean", ""]] {
+        let graph = graph_of(outputs, scale)
+        let before = gpu.live_buffers()
+        let produced = run_graph(graph, {"x": x})
+        assert_eq(
+            produced.len(),
+            graph.outputs.len(),
+            f"{outputs} came back with its named outputs"
+        )
+        let got_y = produced["y"].download()
+        for index in 0..want_y.len() {
+            assert_near(got_y[index], want_y[index], 1e-6, f"{outputs} y differs at {index}")
+        }
+        if outputs.len() == 3 and outputs[1] == "mean" {
+            assert_eq(produced["mean"].shape, [2, 3, 1], "the mean keeps the outer axes")
+            let got_mean = produced["mean"].download()
+            for index in 0..want_mean.len() {
+                assert_near(got_mean[index], want_mean[index], 1e-6, f"{outputs} mean at {index}")
+            }
+        }
+        for (_name, tensor) in produced.items() { tensor.free() }
+        assert_eq(
+            gpu.live_buffers() - before,
+            0,
+            f"LayerNormalization with outputs {outputs} leaked"
+        )
+    }
+    #: The plan's survey runs the interpreter, so it threw too, and a node the
+    #: plan took on the base tree was refused.
+    let plan = compile_plan(graph_of(["y", "", ""], scale), {"x": x})
+    assert_true(plan is not null, "a layer norm with unnamed statistics still compiles")
+    if plan is not null {
+        let planned = plan.run({"x": x})
+        let got = planned["y"].download()
+        for index in 0..want_y.len() {
+            assert_near(got[index], want_y[index], 1e-5, f"the plan differs at {index}")
+        }
+        planned["y"].free()
+        plan.free()
+    }
+    x.free()
+    scale.free()
+}
+
+#: A batch sliced with `Tensor.view` starts part way into its buffer, and
+#: MPSGraph will not read a window like that whose rows are not whole 16-byte
+#: lines. The convolutions and products that run as one-operator graphs took
+#: such a view on the base tree, through jaitensor, and have to keep doing so.
+fn test_graph_routes_take_a_view_of_a_batch() -> void {
+    if not gpu.is_available() { return }
+    let whole = Tensor([2, 16, 5, 5], [float(index % 13) * 0.25 - 1.0 for index in 0..800])
+    let w = Tensor([16, 1, 3, 3], [float(index % 7) * 0.125 - 0.3 for index in 0..144])
+    let depthwise = Graph(
+        nodes: [
+            GraphNode(
+                "Conv",
+                name: "depthwise",
+                inputs: ["x", "w"],
+                outputs: ["y"],
+                attrs: {"group": Attr.of_int(16), "pads": Attr.of_ints([1, 1, 1, 1])}
+            ),
+        ],
+        inputs: ["x"],
+        outputs: ["y"],
+        initializers: {"w": w}
+    )
+    let product = Graph(
+        nodes: [GraphNode("MatMul", name: "product", inputs: ["a", "b"], outputs: ["y"])],
+        inputs: ["a", "b"],
+        outputs: ["y"]
+    )
+    let left = Tensor([2, 3, 5, 5], [float(index % 9) * 0.5 - 2.0 for index in 0..150])
+    let right = Tensor([3, 5, 3], [float(index % 4) - 1.5 for index in 0..45])
+    let image = whole.view(400, [1, 16, 5, 5])
+    let page = left.view(75, [3, 5, 5])
+    for (graph, viewed) in [(depthwise, {"x": image}), (product, {"a": page, "b": right})] {
+        var copied: dict[str, Tensor] = {}
+        for (name, tensor) in viewed.items() {
+            copied[name] = Tensor(tensor.shape, tensor.download())
+        }
+        let before = gpu.live_buffers()
+        let got = run_graph(graph, viewed)
+        let want = run_graph(graph, copied)
+        let got_y = got["y"].download()
+        let want_y = want["y"].download()
+        assert_eq(got_y.len(), want_y.len())
+        for index in 0..want_y.len() {
+            assert_near(
+                got_y[index],
+                want_y[index],
+                1e-6,
+                f"{graph.nodes[0].name} on a view at {index}"
+            )
+        }
+        got["y"].free()
+        want["y"].free()
+        assert_eq(
+            gpu.live_buffers() - before,
+            0,
+            f"{graph.nodes[0].name} on a view leaked its copies"
+        )
+        for (_name, tensor) in copied.items() { tensor.free() }
+    }
+    image.free()
+    page.free()
+    whole.free()
+    w.free()
+    left.free()
+    right.free()
+}
+
+#: The plan's survey leaves out what the compiler could never fold. Transpose
+#: folds now, and a transposed tied embedding is millions of floats: reading
+#: it back cost compile time and memory for a value thrown away after.
+fn test_the_survey_skips_values_too_large_to_fold() -> void {
+    if not gpu.is_available() { return }
+    let w = Tensor([3, 4], [float(index) for index in 0..12])
+    let graph = Graph(
+        nodes: [
+            GraphNode(
+                "Transpose",
+                name: "tie",
+                inputs: ["w"],
+                outputs: ["wt"],
+                attrs: {"perm": Attr.of_ints([1, 0])}
+            ),
+            GraphNode("Shape", name: "size", inputs: ["w"], outputs: ["dims"]),
+            GraphNode("MatMul", name: "logits", inputs: ["x", "wt"], outputs: ["y"]),
+        ],
+        inputs: ["x"],
+        outputs: ["y", "dims"],
+        initializers: {"w": w}
+    )
+    let x = Tensor([2, 4], [float(index % 3) - 1.0 for index in 0..8])
+    for (limit, keeps_wt) in [(-1, true), (6, false)] {
+        var capture: dict[str, list[float]] = {"wt": [], "dims": []}
+        let produced = run_graph(graph, {"x": x}, null, capture, limit)
+        assert_eq(capture["dims"], [3.0, 4.0], f"limit {limit} still reads a small value back")
+        if keeps_wt {
+            assert_eq(capture["wt"].len(), 12, "with no limit the transpose is read back")
+        } else {
+            assert_true(capture.get("wt", null) is null, "a value over the limit is left out")
+        }
+        for (_name, tensor) in produced.items() { tensor.free() }
+    }
+    x.free()
+    w.free()
 }

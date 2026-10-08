@@ -3,12 +3,13 @@
 #: softmaxes that run along a row.
 import jaitensor as jt
 from jaitensor import Tensor
+from std.os import env
 
 from .kernels import HIGHEST_FLOAT, LOWEST_FLOAT
-from .nodes import GraphNode, attr_float, attr_int, ints_from, maybe, need
+from .nodes import GraphNode, attr_float, attr_int, attr_str, ints_from, maybe, need
 from .tensors import binary_ex_of, broadcast_shape, copy_of, elementwise, expand_to
 from .tensors import normalize_axis, row_reduce_of, shaped, softmax_rows, transpose_to
-from .tensors import unary_ex_of, volume
+from .tensors import compile_encoded, run_one_op_graph, unary_ex_of, volume
 
 pub fn op_relu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [jt.relu(need(ins, 0, node))]
@@ -27,8 +28,11 @@ pub fn op_silu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [jt.silu(need(ins, 0, node))]
 }
 
+#: Through `unary_ex` rather than `jt.tanh`, whose kernel comes back NaN from
+#: an argument of about 45 -- and a legacy GPT-2 export spells its Gelu with
+#: exactly this Tanh over a cubic.
 pub fn op_tanh(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
-    return [jt.tanh(need(ins, 0, node))]
+    return [unary_ex_of(need(ins, 0, node), 11)]
 }
 
 pub fn op_sqrt(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
@@ -63,6 +67,25 @@ pub fn op_hard_sigmoid(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let alpha = attr_float(node, "alpha", 0.2)
     let beta = attr_float(node, "beta", 0.5)
     return [unary_ex_of(need(ins, 0, node), 1, first: alpha, second: beta)]
+}
+
+#: `x * HardSigmoid(x)` with the operator's fixed `alpha = 1/6`, `beta = 0.5`,
+#: in one pass rather than three.
+pub fn op_hard_swish(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    return [unary_ex_of(need(ins, 0, node), 8, first: 1.0 / 6.0, second: 0.5)]
+}
+
+#: Opset 20's `Gelu`, exact or with the tanh approximation, in one pass. It
+#: is what a dynamo export writes where the legacy exporter spelt out
+#: `Div`, `Erf`, `Add`, `Mul`, `Mul`.
+pub fn op_gelu(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let approximate = attr_str(node, "approximate", "none")
+    if approximate != "none" and approximate != "tanh" {
+        throw ValueError(
+            f"{node.label()} asks for the {approximate} approximation, which Gelu does not have"
+        )
+    }
+    return [unary_ex_of(need(ins, 0, node), if approximate == "tanh" { 10 } else { 9 })]
 }
 
 pub fn op_softplus(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
@@ -169,6 +192,18 @@ pub fn op_less(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
 }
 
+#: Their own comparisons rather than `Not` of the opposite one, which would
+#: call a NaN greater-or-equal to everything.
+pub fn op_greater_or_equal(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let combine = |a, b| binary_ex_of(a, b, 9)
+    return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
+}
+
+pub fn op_less_or_equal(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
+    let combine = |a, b| binary_ex_of(a, b, 10)
+    return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
+}
+
 pub fn op_and(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
     let combine = |a, b| binary_ex_of(a, b, 3)
     return [elementwise(need(ins, 0, node), need(ins, 1, node), node.label(), combine)]
@@ -268,6 +303,62 @@ pub fn op_gemm(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
 
 #: One `[rows, inner] x [inner, columns]` product per page of the broadcast
 #: batch, written straight into a window of the output.
+#: Whether a batched `MatMul` runs as one graph matmul rather than one
+#: jaitensor product per page of the batch. Read once; `JAICV_GRAPH_MATMUL=0`
+#: brings back the loop, which is the comparison. An attention layer is two
+#: batched products a head, and the loop made them seventy percent of a ViT's
+#: interpreted time.
+let GRAPH_MATMUL = env("JAICV_GRAPH_MATMUL") != "0"
+
+#: The one-operator matmul graphs, by the two operand shapes.
+var _matmul_graphs: dict[str, int] = {}
+
+#: `left @ right` over matching batch axes, as one dispatch. A matrix on the
+#: right of a batch -- a linear layer over every token or pixel -- is one
+#: product of the flattened rows instead, reshaped inside the graph, so the
+#: weights are never copied out once per row of the batch.
+fn graph_matmul_of(left: Tensor, right: Tensor, dims: list[int]) -> Tensor {
+    let key = f"{left.shape} {right.shape}"
+    var plan = _matmul_graphs.get(key, null)
+    if plan is null {
+        let builder = __prim__.graph_new()
+        let fed_left = __prim__.graph_input(builder, left.shape)
+        let fed_right = __prim__.graph_input(builder, right.shape)
+        let flat = right.rank() == 2 and left.rank() > 2
+        let rows = left.size // left.shape[left.rank() - 1]
+        let source = if flat {
+            __prim__.graph_reshape(builder, fed_left, [rows, left.shape[left.rank() - 1]])
+        } else {
+            fed_left
+        }
+        var product = __prim__.graph_matmul(builder, source, fed_right)
+        if flat and product >= 0 { product = __prim__.graph_reshape(builder, product, dims) }
+        let built = if product < 0 {
+            null
+        } else {
+            compile_encoded(builder, [fed_left, fed_right], [product])
+        }
+        __prim__.graph_free(builder)
+        if built is null {
+            throw ValueError(f"the graph compiler would not multiply {left.shape} by {right.shape}")
+        }
+        if __prim__.graph_plan_output_shape(built, 0) != dims {
+            __prim__.graph_plan_free(built)
+            throw ValueError(f"a graph product of {left.shape} and {right.shape} was not {dims}")
+        }
+        _matmul_graphs[key] = built
+        plan = built
+    }
+    let output = Tensor(dims)
+    try {
+        run_one_op_graph(plan, [left, right], output)
+    } catch failure: Error {
+        output.free()
+        throw failure
+    }
+    return output
+}
+
 fn batched_matmul(
     left: Tensor,
     right: Tensor,
@@ -290,6 +381,12 @@ fn batched_matmul(
         right
     } else {
         expand_to(right, right_shape)
+    }
+    if GRAPH_MATMUL {
+        let product = graph_matmul_of(spread_left, spread_right, dims)
+        if spread_left is not left { spread_left.free() }
+        if spread_right is not right { spread_right.free() }
+        return product
     }
     let output = Tensor(dims)
     for index in 0..volume(batch) {
@@ -337,8 +434,13 @@ pub fn op_matmul(node: GraphNode, ins: list[Tensor?]) -> list[Tensor] {
             node.label()
         )
     }
+    var dims = [dimension for dimension in batch]
+    dims.push(rows)
+    dims.push(columns)
     let product = if batch.len() == 0 {
         jt.matmul(left, right)
+    } elif GRAPH_MATMUL and right.rank() == 2 {
+        graph_matmul_of(left, right, dims)
     } else {
         batched_matmul(left, right, batch, rows, inner, columns)
     }

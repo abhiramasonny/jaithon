@@ -1,0 +1,11 @@
+# The exports live in ~/.cache/jaithon/onnx_zoo, never here; this is in case
+# ONNX_ZOO_DIR is pointed inside the tree.
+*.onnx
+*.onnx.data
+*.bin
+*.meta
+*.tsv
+census.json
+peer.json
+models.txt
+__pycache__/

@@ -216,6 +216,15 @@ static float erf_approx(float x) {
     return sign * (1.0f - poly * exp(-a * a));
 }
 
+/* Metal's tanh goes through exp(2x) under fast math and comes back NaN, inf
+   over inf, once its argument passes about 44 -- which Gelu's cubic reaches
+   from an input of 10.4 and an LSTM's cell state reaches by just running
+   long. Past ten the answer is one to the last float bit, so the argument
+   stops there. */
+static float stable_tanh(float x) {
+    return tanh(clamp(x, -10.0f, 10.0f));
+}
+
 kernel void unary_ex(device const float* input [[buffer(0)]],
                      device float* output [[buffer(1)]],
                      constant uint& count [[buffer(2)]],
@@ -236,6 +245,13 @@ kernel void unary_ex(device const float* input [[buffer(0)]],
     else if (op == 5) y = x >= 0.0f ? x : a * x;
     else if (op == 6) y = trunc(x);
     else if (op == 7) y = x != 0.0f ? 1.0f : 0.0f;
+    else if (op == 8) y = x * clamp(a * x + b, 0.0f, 1.0f);
+    else if (op == 9) y = 0.5f * x * (1.0f + erf_approx(x * 0.70710678118654752f));
+    else if (op == 10) {
+        float inner = 0.79788456080286536f * (x + 0.044715f * x * x * x);
+        y = 0.5f * x * (1.0f + stable_tanh(inner));
+    }
+    else if (op == 11) y = stable_tanh(x);
     output[id] = y;
 }
 
@@ -270,7 +286,9 @@ kernel void binary_ex(device const float* a [[buffer(0)]],
     } else if (op == 8) {
         /* Sign follows the dividend: C's fmod, which is Mod with `fmod` on. */
         r = y == 0.0f ? NAN : fmod(x, y);
-    } else r = x < 0.0f ? x * y : x;
+    } else if (op == 9) r = x >= y ? 1.0f : 0.0f;
+    else if (op == 10) r = x <= y ? 1.0f : 0.0f;
+    else r = x < 0.0f ? x * y : x;
     output[id] = r;
 }
 
@@ -313,10 +331,10 @@ kernel void lstm_gates(device const float* input_gates [[buffer(0)]],
     float i = 1.0f / (1.0f + exp(-gi));
     float o = 1.0f / (1.0f + exp(-go));
     float f = 1.0f / (1.0f + exp(-gf));
-    float g = tanh(gc);
+    float g = stable_tanh(gc);
     float c = f * cell_in[id] + i * g;
     cell_out[id] = c;
-    hidden_out[id] = o * tanh(c);
+    hidden_out[id] = o * stable_tanh(c);
 }
 
 /* One GRU timestep with `linear_before_reset` set: the reset gate scales the
@@ -352,7 +370,7 @@ kernel void gru_step_linear(device const float* input_gates [[buffer(0)]],
     float gh = input_gates[from + 2u * hidden + col] +
                r * (hidden_gates[base + 2u * hidden + col] + recurrent_bias[2u * hidden + col]);
     if (clip > 0.0f) gh = clamp(gh, -clip, clip);
-    float h = tanh(gh);
+    float h = stable_tanh(gh);
     hidden_out[id] = (1.0f - z) * h + z * hidden_in[id];
 }
 
@@ -407,7 +425,7 @@ kernel void gru_finish(device const float* input_gates [[buffer(0)]],
     float gh = input_gates[input_base + row * 3u * hidden + 2u * hidden + col] +
                reset_product[id];
     if (clip > 0.0f) gh = clamp(gh, -clip, clip);
-    float h = tanh(gh);
+    float h = stable_tanh(gh);
     float z = gate_z[id];
     hidden_out[id] = (1.0f - z) * h + z * hidden_in[id];
 }
@@ -626,14 +644,22 @@ kernel void conv_transpose_nchw(device const float* input [[buffer(0)]],
                                 constant uint& dilationH [[buffer(17)]],
                                 constant uint& dilationW [[buffer(18)]],
                                 constant uint& hasBias [[buffer(19)]],
+                                constant uint& groups [[buffer(20)]],
                                 uint id [[thread_position_in_grid]]) {
+    /* `inChannels` and `outChannels` are per group. ONNX lays the weights out
+       `[C_in, C_out / groups, kH, kW]`, so a global input channel indexes the
+       first axis directly and the output channel within its group the second. */
     if (id >= count) return;
+    uint allOut = outChannels * groups;
     uint ow = id % outW;
     uint oh = (id / outW) % outH;
-    uint co = (id / (outW * outH)) % outChannels;
-    uint n = id / (outW * outH * outChannels);
-    float total = hasBias != 0 ? bias[co] : 0.0f;
-    for (uint ci = 0; ci < inChannels; ++ci) {
+    uint channel = (id / (outW * outH)) % allOut;
+    uint n = id / (outW * outH * allOut);
+    uint group = channel / outChannels;
+    uint co = channel % outChannels;
+    float total = hasBias != 0 ? bias[channel] : 0.0f;
+    for (uint local = 0; local < inChannels; ++local) {
+        uint ci = group * inChannels + local;
         for (uint r = 0; r < kh; ++r) {
             int reach = int(oh) + int(padH) - int(r * dilationH);
             if (reach < 0 || reach % int(strideH) != 0) continue;
@@ -644,7 +670,7 @@ kernel void conv_transpose_nchw(device const float* input [[buffer(0)]],
                 if (span < 0 || span % int(strideW) != 0) continue;
                 int iw = span / int(strideW);
                 if (iw >= int(inW)) continue;
-                float x = input[((n * inChannels + ci) * inH + uint(ih)) * inW + uint(iw)];
+                float x = input[((n * inChannels * groups + ci) * inH + uint(ih)) * inW + uint(iw)];
                 float w = weights[((ci * outChannels + co) * kh + r) * kw + s];
                 total += x * w;
             }

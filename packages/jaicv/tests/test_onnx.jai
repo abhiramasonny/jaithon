@@ -368,9 +368,97 @@ fn test_somebody_elses_operator_set_is_refused() -> void {
     assert_contains(error.message, "fused")
 }
 
-fn test_weights_in_another_file_are_refused() -> void {
-    let error = assert_throws(ValueError, || read_net_from_onnx(MODELS + "onnx_external.onnx"))
+#: Both weights live in `onnx_external.onnx.data`, one after the other, the
+#: way torch's default export writes them.
+fn test_weights_in_a_sidecar_are_read() -> void {
+    let graph = read_net_from_onnx(MODELS + "onnx_external.onnx")
+    let weight = [0.5, -1.0, 2.0, 3.5]
+    let shift = [2.0, 2.0, 0.5, -1.0]
+    assert_eq(graph.initializers["weight"].download(), weight, "the first weight, at offset 0")
+    assert_eq(graph.initializers["shift"].download(), shift, "the second, to the end of the file")
+    let x = Tensor([4], [1.0, 2.0, 3.0, 4.0])
+    let produced = run_graph(graph, {"input": x})
+    let got = produced["output"].download()
+    for index in 0..4 {
+        assert_eq(got[index], (float(index + 1) + weight[index]) * shift[index], f"output {index}")
+    }
+    produced["output"].free()
+    x.free()
+    free_onnx_weights(graph)
+}
+
+fn test_a_sidecar_that_is_not_there_is_refused() -> void {
+    let error = assert_throws(
+        ValueError,
+        || read_net_from_onnx(MODELS + "onnx_external_missing.onnx")
+    )
     assert_contains(error.message, "weight.bin")
+}
+
+fn test_a_sidecar_too_short_for_its_tensor_is_refused() -> void {
+    let error = assert_throws(
+        ValueError,
+        || read_net_from_onnx(MODELS + "onnx_external_short.onnx")
+    )
+    assert_contains(error.message, "from byte 24")
+}
+
+#: The location is the model's word, and a model is somebody else's file: a
+#: path out of its own directory is refused before anything is opened.
+fn test_a_sidecar_outside_the_model_directory_is_refused() -> void {
+    for name in ["onnx_external_escape.onnx", "onnx_external_absolute.onnx"] {
+        let error = assert_throws(ValueError, || read_net_from_onnx(MODELS + name))
+        assert_contains(error.message, "not inside the model's own directory", name)
+    }
+}
+
+#: A model handed over as bytes has no directory to look beside.
+fn test_a_sidecar_from_bytes_is_refused() -> void {
+    let data = io.read_bytes(MODELS + "onnx_external.onnx")
+    let error = assert_throws(ValueError, || read_net_from_onnx_bytes(data))
+    assert_contains(error.message, "onnx_external.onnx.data")
+    assert_contains(error.message, "read it from its path")
+}
+
+#: `x[:, 1][:, -1]`: a rank-zero `Constant` and a rank-zero initializer, each
+#: dropping the axis it picks from. Kept as width-one axes, this came out
+#: `[2, 1, 1]`.
+fn test_a_gather_by_a_scalar_drops_its_axis() -> void {
+    let graph = read_net_from_onnx(MODELS + "onnx_scalar_gather.onnx")
+    let x = Tensor([2, 3, 4], [float(value) for value in 0..24])
+    let produced = run_graph(graph, {"input": x})
+    assert_eq(produced["output"].shape, [2], "both picked axes are gone")
+    assert_eq(produced["output"].download(), [7.0, 19.0], "x[:, 1, -1]")
+    produced["output"].free()
+    x.free()
+    free_onnx_weights(graph)
+}
+
+#: A scalar picked out of a `Shape` is still a scalar, and unsqueezing it
+#: gives `[1]`, which concatenates with the other `[1]`s into a target shape.
+#: Treated as `[1]` throughout, it came out `[1, 1]` and the `Concat` refused
+#: -- which is what stopped Swin's window partition.
+fn test_a_shape_built_from_a_scalar_reshapes() -> void {
+    let graph = read_net_from_onnx(MODELS + "onnx_scalar_shape.onnx")
+    let x = Tensor([2, 3], [float(value) for value in 0..6])
+    let produced = run_graph(graph, {"input": x})
+    assert_eq(produced["output"].shape, [3, 2], "reshaped by the width it read off the shape")
+    produced["output"].free()
+    x.free()
+    free_onnx_weights(graph)
+}
+
+#: BERT and DistilBERT, exported by TorchScript, make a scalar as
+#: `ConstantOfShape` of an empty `Constant`. The empty tensor has no place
+#: here, so the pair is folded into the scalar it stands for.
+fn test_a_constant_of_an_empty_shape_is_a_scalar() -> void {
+    let graph = read_net_from_onnx(MODELS + "onnx_empty_shape.onnx")
+    let x = Tensor([3], [1.0, -2.0, 4.0])
+    let produced = run_graph(graph, {"input": x})
+    assert_eq(produced["output"].download(), [2.5, -5.0, 10.0], "the input times the scalar")
+    produced["output"].free()
+    x.free()
+    free_onnx_weights(graph)
 }
 
 #: The `Net` an OpenCV detector would be holding, fed the blob layout

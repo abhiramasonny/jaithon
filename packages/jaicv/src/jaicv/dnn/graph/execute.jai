@@ -12,13 +12,15 @@ from .ops_layers import op_global_average_pool, op_global_max_pool, op_instance_
 from .ops_layers import op_layer_norm, op_lrn, op_max_pool, op_resize, op_upsample
 from .ops_math import op_abs, op_add, op_and, op_argmax, op_argmin, op_clip, op_div, op_dropout
 from .ops_math import op_elu, op_equal, op_erf, op_exp, op_gemm, op_greater, op_hard_sigmoid
+from .ops_math import op_gelu, op_greater_or_equal, op_hard_swish, op_less_or_equal
 from .ops_math import op_identity, op_leaky_relu, op_less, op_log, op_log_softmax, op_matmul
 from .ops_math import op_max, op_mean, op_min, op_mod, op_mul, op_neg, op_not, op_or, op_pow
 from .ops_math import op_prelu, op_reduce_max, op_reduce_mean, op_reduce_min, op_reduce_sum
 from .ops_math import op_relu, op_sigmoid, op_silu, op_softmax, op_softplus, op_sqrt, op_sub
 from .ops_math import op_sum, op_tanh, op_where
+from .ops_index import op_gather_elements, op_gather_nd, op_range, op_scatter_nd
 from .ops_rnn import op_gru, op_lstm
-from .ops_shape import op_cast, op_concat, op_constant, op_constant_of_shape, op_flatten
+from .ops_shape import op_cast, op_concat, op_constant, op_constant_of_shape, op_expand, op_flatten
 from .ops_shape import op_gather, op_pad, op_reshape, op_shape, op_slice, op_split, op_squeeze
 from .ops_shape import op_transpose, op_unsqueeze
 from .tensors import copy_of
@@ -42,6 +44,8 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Sigmoid"] = op_sigmoid
     _handlers["Silu"] = op_silu
     _handlers["HardSigmoid"] = op_hard_sigmoid
+    _handlers["HardSwish"] = op_hard_swish
+    _handlers["Gelu"] = op_gelu
     _handlers["Tanh"] = op_tanh
     _handlers["Softplus"] = op_softplus
     _handlers["Erf"] = op_erf
@@ -72,6 +76,11 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Transpose"] = op_transpose
     _handlers["Slice"] = op_slice
     _handlers["Gather"] = op_gather
+    _handlers["Expand"] = op_expand
+    _handlers["GatherElements"] = op_gather_elements
+    _handlers["GatherND"] = op_gather_nd
+    _handlers["ScatterND"] = op_scatter_nd
+    _handlers["Range"] = op_range
     _handlers["Pad"] = op_pad
     _handlers["MaxPool"] = op_max_pool
     _handlers["AveragePool"] = op_average_pool
@@ -101,6 +110,8 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Equal"] = op_equal
     _handlers["Greater"] = op_greater
     _handlers["Less"] = op_less
+    _handlers["GreaterOrEqual"] = op_greater_or_equal
+    _handlers["LessOrEqual"] = op_less_or_equal
     _handlers["Not"] = op_not
     _handlers["And"] = op_and
     _handlers["Or"] = op_or
@@ -136,13 +147,19 @@ pub fn run_graph(
     graph: Graph,
     feeds: dict[str, Tensor],
     shapes: dict[str, list[int]]? = null,
-    capture: dict[str, list[float]]? = null
+    capture: dict[str, list[float]]? = null,
+    capture_limit: int = -1
 ) -> dict[str, Tensor] {
     #: `shapes` and `capture`, when given, are filled with every value's shape
     #: and with the values of the names already present in `capture`. That is
     #: what the plan compiler needs to know before it can build a graph: what
     #: shape everything is, and what the shape arithmetic worked out to. It
     #: costs two dictionary writes a node and is null on every other path.
+    #:
+    #: A name whose value holds more than `capture_limit` elements, when that
+    #: is not negative, is taken out of `capture` instead of read back: the
+    #: compiler cannot fold anything that size, and a transposed tied
+    #: embedding is twelve million boxed floats for nothing.
     if graph.outputs.len() == 0 {
         throw ValueError("this graph names no outputs, so there is nothing to run it for")
     }
@@ -216,11 +233,17 @@ pub fn run_graph(
                 produced_slot = handler(node, ins)
             }
             let produced = produced_slot
-            if produced.len() < node.outputs.len() {
-                throw ValueError(
-                    f"{node.label()} names {node.outputs.len()} outputs and produced " +
-                        f"{produced.len()}"
-                )
+            #: A node may list optional outputs it does not want under empty
+            #: names -- `["y", "", ""]` is valid ONNX -- and a handler that
+            #: makes only what is named leaves those slots out. Only a named
+            #: output that never came back is a fault.
+            for slot in produced.len()..node.outputs.len() {
+                if node.outputs[slot].len() > 0 {
+                    throw ValueError(
+                        f"{node.label()} names {node.outputs.len()} outputs and produced " +
+                            f"{produced.len()}"
+                    )
+                }
             }
             for (slot, tensor) in produced.enumerate() {
                 let name = if slot < node.outputs.len() { node.outputs[slot] } else { "" }
@@ -232,7 +255,11 @@ pub fn run_graph(
                 mine[name] = true
                 if shapes is not null { shapes[name] = tensor.shape }
                 if capture is not null and capture.get(name, null) is not null {
-                    capture[name] = tensor.download()
+                    if capture_limit >= 0 and tensor.size > capture_limit {
+                        capture.remove(name)
+                    } else {
+                        capture[name] = tensor.download()
+                    }
                 }
             }
             for (slot, name) in node.inputs.enumerate() {

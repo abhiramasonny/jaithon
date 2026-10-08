@@ -3,6 +3,15 @@
 from .build import Build, as_ints
 from ..graph import GraphNode, attr_ints, attr_str, normalize_axis
 
+#: A slice bound out of the float it was folded into. An open end is
+#: written as the largest int64, which as a float is one past it and does not
+#: convert back; anything that far out means the end of the axis anyway.
+fn bound_of(value: float) -> int {
+    if value >= 4.0e18 { return 1 << 62 }
+    if value <= -4.0e18 { return -(1 << 62) }
+    return int(value)
+}
+
 #: A `Slice` node's per-axis bounds, resolved against the input's real shape.
 #:
 #: ONNX writes an open end as the largest integer there is and allows negative
@@ -54,8 +63,8 @@ pub fn slice_bounds(
         #: back rather than as one past the beginning, and a reversed slice
         #: came out empty -- so those go to the interpreter.
         if step <= 0 { return null }
-        var first = int(given_starts[slot])
-        var last = int(given_ends[slot])
+        var first = bound_of(given_starts[slot])
+        var last = bound_of(given_ends[slot])
         if first < 0 { first += width }
         if last < 0 { last += width }
         #: Forward and backward clamp to different ends: walking down, the
@@ -73,6 +82,9 @@ pub fn slice_bounds(
         let step = steps[index]
         let span = (ends[index] - starts[index] + step - 1) // step
         if max(span, 0) != want[index] { return null }
+        #: An empty slice has no tensor in the compiled graph to land in --
+        #: MPSGraph hands back a width of one -- so it is the interpreter's.
+        if want[index] == 0 { return null }
     }
     return [starts, ends, steps]
 }
@@ -86,22 +98,26 @@ pub fn resolved_pads(
     strides: list[int],
     dilations: list[int]
 ) -> list[int]? {
+    #: As ONNX writes them, every axis's start and then every axis's end;
+    #: two axes for an image and one for a sequence.
+    let axes = spatial.len()
+    let none = [0 for _slot in 0..2 * axes]
     let mode = attr_str(node, "auto_pad", "NOTSET")
     if mode == "NOTSET" {
-        let pads = attr_ints(node, "pads", [0, 0, 0, 0])
-        if pads.len() != 4 { return null }
+        let pads = attr_ints(node, "pads", none)
+        if pads.len() != 2 * axes { return null }
         return pads
     }
-    if mode == "VALID" { return [0, 0, 0, 0] }
+    if mode == "VALID" { return none }
     if mode != "SAME_UPPER" and mode != "SAME_LOWER" { return null }
-    var pads = [0, 0, 0, 0]
-    for axis in 0..2 {
+    var pads = [0 for _slot in 0..2 * axes]
+    for axis in 0..axes {
         let reach = (window[axis] - 1) * dilations[axis] + 1
         let out = (spatial[axis] + strides[axis] - 1) // strides[axis]
         let total = max((out - 1) * strides[axis] + reach - spatial[axis], 0)
         let head = if mode == "SAME_UPPER" { total // 2 } else { total - total // 2 }
         pads[axis] = head
-        pads[axis + 2] = total - head
+        pads[axis + axes] = total - head
     }
     return pads
 }

@@ -682,6 +682,84 @@ def build_cases():
         opset=9,
     )
 
+    # Added for the model zoo (examples/onnx_zoo). Appended rather than
+    # interleaved, so every case above keeps its exact lines.
+    wide = spread(2, 3, 4, low=-5.0, high=5.0, seed=70)
+    case("elementwise", "hardswish_basic", "HardSwish", [wide], opset=14)
+    case("elementwise", "gelu_exact", "Gelu", [wide], opset=20)
+    case("elementwise", "gelu_tanh", "Gelu", [wide], {"approximate": "tanh"}, opset=20)
+    ties = np.round(spread(2, 3, 4, seed=71))
+    ties_right = np.round(spread(1, 3, 1, seed=72))
+    case("broadcast", "greaterorequal_broadcast", "GreaterOrEqual", [ties, ties_right], opset=16)
+    case("broadcast", "lessorequal_broadcast", "LessOrEqual", [ties, ties_right], opset=16)
+    # A rank-zero index drops the axis it picks from; a one-element vector keeps it.
+    data = spread(2, 3, 4, seed=73)
+    case("shape", "gather_scalar_axis1", "Gather", [data, np.array(1, dtype=np.int64)], {"axis": 1})
+    case("shape", "gather_scalar_axis0", "Gather", [spread(3, 4, seed=74), np.array(2, dtype=np.int64)])
+    case("shape", "gather_scalar_negative", "Gather", [data, np.array(-1, dtype=np.int64)], {"axis": -1})
+    case("shape", "gather_vector_of_one", "Gather", [data, np.array([1], dtype=np.int64)], {"axis": 1})
+    case("shape", "expand_grow", "Expand", [spread(3, 1, seed=75), np.array([2, 3, 4], dtype=np.int64)])
+    # Both directions: the target's ones keep the data's widths.
+    case("shape", "expand_both_ways", "Expand", [spread(2, 1, 4, seed=76), np.array([3, 1], dtype=np.int64)])
+    case("shape", "expand_same", "Expand", [spread(2, 3, seed=77), np.array([2, 3], dtype=np.int64)])
+    # Convolutions the per-group loop could not run, or ran a group at a time.
+    image = spread(1, 3, 9, 9, seed=78)
+    case("window", "conv_dilated", "Conv", [image, spread(4, 3, 3, 3, seed=79), spread(4, seed=80)],
+         {"dilations": [2, 2], "pads": [2, 2, 2, 2]})
+    case("window", "conv_depthwise_dilated", "Conv", [image, spread(3, 1, 3, 3, seed=81), spread(3, seed=82)],
+         {"group": 3, "dilations": [2, 3], "pads": [2, 3, 1, 2]})
+    case("window", "conv_depthwise_stride2", "Conv", [spread(1, 6, 8, 8, seed=83), spread(6, 1, 3, 3, seed=84)],
+         {"group": 6, "strides": [2, 2], "pads": [1, 1, 1, 1]})
+    case("window", "conv_uneven_strides", "Conv", [image, spread(2, 3, 3, 3, seed=85)],
+         {"strides": [2, 1], "pads": [1, 0, 1, 0]})
+    case("window", "conv_multiplier", "Conv", [spread(1, 2, 6, 6, seed=86), spread(6, 1, 3, 3, seed=87), spread(6, seed=88)],
+         {"group": 2, "pads": [1, 1, 1, 1]})
+    case("window", "conv1d_grouped_dilated", "Conv",
+         [spread(1, 4, 11, seed=89), spread(6, 2, 3, seed=90), spread(6, seed=91)],
+         {"group": 2, "dilations": [2], "strides": [2], "pads": [1, 2]})
+    case("window", "conv1d_plain", "Conv", [spread(2, 3, 7, seed=92), spread(5, 3, 3, seed=93)], {"pads": [1, 1]})
+    # The index arithmetic transformer exports build masks and position ids from.
+    table = spread(3, 4, seed=97)
+    case("shape", "gatherelements_axis1", "GatherElements",
+         [table, np.array([[0, 3], [2, -1], [1, 1]], dtype=np.int64)], {"axis": 1})
+    case("shape", "gatherelements_axis0", "GatherElements",
+         [table, np.array([[2, 0, 1, 1]], dtype=np.int64)], {"axis": 0})
+    case("shape", "gathernd_rows", "GatherND",
+         [spread(2, 3, 4, seed=98), np.array([[1, 2], [0, -1]], dtype=np.int64)])
+    case("shape", "gathernd_batch", "GatherND",
+         [spread(2, 3, 4, seed=99), np.array([[2], [0]], dtype=np.int64)], {"batch_dims": 1})
+    case("shape", "scatternd_rows", "ScatterND",
+         [spread(4, 3, seed=100), np.array([[3], [0]], dtype=np.int64), spread(2, 3, seed=101)], opset=16)
+    case("shape", "scatternd_add", "ScatterND",
+         [spread(4, 3, seed=102), np.array([[1, 2], [1, 2]], dtype=np.int64), spread(2, seed=103)],
+         {"reduction": "add"}, opset=16)
+    case("shape", "range_float", "Range",
+         [np.array(0.5, dtype=np.float32), np.array(4.0, dtype=np.float32), np.array(0.75, dtype=np.float32)])
+    case("shape", "range_down", "Range",
+         [np.array(10, dtype=np.int64), np.array(2, dtype=np.int64), np.array(-3, dtype=np.int64)])
+    case("window", "convtranspose_grouped3", "ConvTranspose",
+         [spread(1, 6, 3, 3, seed=94), spread(6, 2, 3, 3, seed=95), spread(6, seed=96)],
+         {"group": 3, "strides": [2, 2], "pads": [1, 1, 1, 1], "output_padding": [1, 1]})
+    # Far past where a fast-math tanh overflows: exp(2x) is inf from about 44,
+    # which Gelu's cubic reaches from an input of 10.4. The interpreter gave NaN
+    # there and the compiled plan did not.
+    far = np.linspace(-120.0, 120.0, 49, dtype=np.float32).reshape(7, 7)
+    case("elementwise", "gelu_tanh_wide", "Gelu", [far], {"approximate": "tanh"}, opset=20)
+    case("elementwise", "gelu_exact_wide", "Gelu", [far], opset=20)
+    case("elementwise", "tanh_wide", "Tanh", [far])
+    # Recurrent gates driven far into saturation, so the cell candidate and the
+    # GRU's new state take tanh of something well past 44.
+    case("recurrent", "lstm_saturated", "LSTM",
+         [spread(3, 2, 3, low=-300.0, high=300.0, seed=104),
+          spread(1, 16, 3, low=-0.6, high=0.6, seed=105),
+          spread(1, 16, 4, low=-0.6, high=0.6, seed=106)],
+         {"hidden_size": 4}, outputs=3, opset=14)
+    case("recurrent", "gru_saturated", "GRU",
+         [spread(3, 2, 3, low=-80.0, high=80.0, seed=107),
+          spread(1, 12, 3, low=-0.6, high=0.6, seed=108),
+          spread(1, 12, 4, low=-0.6, high=0.6, seed=109)],
+         {"hidden_size": 4}, outputs=2, opset=14)
+
 
 # ------------------------------------------------------------- running them
 
@@ -742,6 +820,12 @@ def emit_ops(path):
             lines.append(attr_line(key, value))
         for array in spec["inputs"]:
             lines.append("in null" if array is None else tensor_line("in", array))
+        # `tensor_line` writes a rank-zero input as `[1]`, which is all the
+        # executor can hold; this says which ones were really scalars, the
+        # way the importer would know from the file.
+        for slot, array in enumerate(spec["inputs"]):
+            if array is not None and np.asarray(array).ndim == 0 and spec["op"] == "Gather":
+                lines.append(f"scalar {slot}")
         for array in produced:
             lines.append(tensor_line("out", array))
     with open(path, "w") as handle:
