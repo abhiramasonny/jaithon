@@ -3,7 +3,7 @@
 import std.gpu as gpu
 import std.math
 from std.os import env
-from ..tensor import GradNode, Tensor
+from ..tensor import GradNode, Tensor, is_grad_enabled
 from .elementwise import scale
 from .kernels import cached_attn_kernel, f32_bits
 from .matmul import matmul, raw_matmul, raw_matmul_batched
@@ -22,7 +22,10 @@ pub fn scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor) -
         throw ValueError("key/value sequence mismatch")
     }
     let factor = 1.0 / math.sqrt(float(query.shape[1]))
-    if query.requires_grad or key.requires_grad or value.requires_grad {
+    #: Under `no_grad` the composed form records nothing, so nothing would
+    #: free its three temporaries; the path below frees its own.
+    let records = query.requires_grad or key.requires_grad or value.requires_grad
+    if records and is_grad_enabled() {
         return matmul(softmax(scale(matmul(query, key, trans_b: true), factor)), value)
     }
     let scores = raw_matmul(query, key, trans_b: true)
@@ -88,7 +91,10 @@ pub fn multi_head_attention(
     }
     let hd = dim // heads
     let factor = 1.0 / math.sqrt(float(hd))
-    if query.requires_grad or key.requires_grad or value.requires_grad {
+    #: Under `no_grad` nothing will run a backward, so the fused inference
+    #: kernels serve even when a parameter requires a gradient.
+    let records = query.requires_grad or key.requires_grad or value.requires_grad
+    if records and is_grad_enabled() {
         if seq == kv_seq and mha_mma_ok(seq, hd) {
             return mha_by_mma(query, key, value, heads, seq, hd, factor, causal)
         }
