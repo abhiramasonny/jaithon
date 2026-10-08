@@ -272,10 +272,16 @@ pub class Tensor {
     #: Seeds `self.grad` to `ones(self.shape)` first if it isn't already
     #: set, so a plain `loss.backward()` works without the caller manually
     #: pre-seeding the root gradient. Then accumulates into each
-    #: dependency's `.grad`. Returns every non-leaf, non-root tensor the
-    #: graph built — still valid, not yet freed — so the caller can free
-    #: them after encoding the rest of the step. `Tensor.free` no longer
-    #: fences; `gpu.flush()` or `gpu.synchronize()` commits the work.
+    #: dependency's `.grad`, skipping any that never asked for one. Returns
+    #: every non-leaf, non-root tensor the graph built — still valid, not yet
+    #: freed — so the caller can free them after encoding the rest of the
+    #: step. `Tensor.free` no longer fences; `gpu.flush()` or
+    #: `gpu.synchronize()` commits the work.
+    #:
+    #: An intermediate's own `.grad` is released as soon as its op's backward
+    #: has read it (unless `retain_grad()` asked to keep it), and so is a
+    #: tensor only one op saved for its backward; freeing those again with
+    #: the rest of the returned list is harmless. Leaves keep their `.grad`.
     pub fn backward(self) -> list[Tensor] {
         if self.size != 1 {
             throw ValueError(f"backward needs a scalar tensor, got shape {self.shape}")
@@ -394,7 +400,7 @@ pub class GradNode {
         self.inputs = inputs
         self.backward_fn = backward_fn
         self.extras = extras
-        self.needs = [input.requires_grad or input.creator is not null for input in inputs]
+        self.needs = [wants_grad(input) for input in inputs]
     }
 
     pub fn apply(self, upstream: Tensor) -> list[Tensor] { return self.backward_fn(upstream) }
@@ -525,6 +531,11 @@ fn accumulate_grad(target: Tensor, contribution: Tensor) -> void {
         contribution.free()
     }
 }
+
+#: Whether a backward should compute `tensor`'s gradient: it asked for one,
+#: or an op produced it, so the walk runs through it. Ops building a
+#: `GradNode` use this to skip the side of a backward nobody reads.
+pub fn wants_grad(tensor: Tensor) -> bool { return tensor.requires_grad or tensor.creator is not null }
 
 #: Whether `grads` holds `candidate` at a position whose input wants it.
 fn handed_on(node: GradNode, grads: list[Tensor], candidate: Tensor) -> bool {
@@ -666,7 +677,7 @@ pub fn set_grad_enabled(enabled: bool) -> bool {
     return previous
 }
 
-export { element_count, GradNode, no_grad, is_grad_enabled, set_grad_enabled }
+export { element_count, GradNode, no_grad, is_grad_enabled, set_grad_enabled, wants_grad }
 
 #: Construct a constant GPU tensor from flat row-major values.
 pub fn constant(values: list[float], shape: list[int]) -> Tensor { return Tensor(shape, values) }

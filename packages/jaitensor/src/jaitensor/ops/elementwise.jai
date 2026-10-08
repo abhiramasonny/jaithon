@@ -1,6 +1,6 @@
 #: Elementwise unary and binary ops, their broadcasting, and the
 #: activations built from them.
-from ..tensor import GradNode, Tensor
+from ..tensor import GradNode, Tensor, wants_grad
 from .kernels import cached_kernel, f32_bits, reduce_leading, unary_backward
 from .shaders import BINARY_FORMS, UNARY_FORMS
 
@@ -98,8 +98,8 @@ pub fn add(a: Tensor, b: Tensor) -> Tensor {
     }
     let output = if broadcasting { broadcast_add(a, b) } else { binary(a, b, 0) }
     if a.requires_grad or b.requires_grad {
-        let need_a = a.requires_grad
-        let need_b = b.requires_grad
+        let need_a = wants_grad(a)
+        let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], |upstream| if broadcasting {
             [
                 if need_a { upstream } else { a },
@@ -116,8 +116,8 @@ pub fn add(a: Tensor, b: Tensor) -> Tensor {
 pub fn subtract(a: Tensor, b: Tensor) -> Tensor {
     let output = binary(a, b, 1)
     if a.requires_grad or b.requires_grad {
-        let need_a = a.requires_grad
-        let need_b = b.requires_grad
+        let need_a = wants_grad(a)
+        let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 1, need_a, need_b)))
     }
     return output
@@ -127,8 +127,8 @@ pub fn subtract(a: Tensor, b: Tensor) -> Tensor {
 pub fn multiply(a: Tensor, b: Tensor) -> Tensor {
     let output = binary(a, b, 2)
     if a.requires_grad or b.requires_grad {
-        let need_a = a.requires_grad
-        let need_b = b.requires_grad
+        let need_a = wants_grad(a)
+        let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 2, need_a, need_b)))
     }
     return output
@@ -138,8 +138,8 @@ pub fn multiply(a: Tensor, b: Tensor) -> Tensor {
 pub fn divide(a: Tensor, b: Tensor) -> Tensor {
     let output = binary(a, b, 3)
     if a.requires_grad or b.requires_grad {
-        let need_a = a.requires_grad
-        let need_b = b.requires_grad
+        let need_a = wants_grad(a)
+        let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], |upstream| binary_backward(a, b, upstream, 3, need_a, need_b)))
     }
     return output
@@ -355,8 +355,8 @@ pub fn maximum(a: Tensor, b: Tensor) -> Tensor {
     let kernel = cached_kernel("maximum_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
     if a.requires_grad or b.requires_grad {
-        let need_a = a.requires_grad
-        let need_b = b.requires_grad
+        let need_a = wants_grad(a)
+        let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 1, need_a, need_b)))
     }
     return output
@@ -369,8 +369,8 @@ pub fn minimum(a: Tensor, b: Tensor) -> Tensor {
     let kernel = cached_kernel("minimum_op")
     kernel.dispatch_async([a.buffer(), b.buffer(), output.buffer()], a.size, [a.size])
     if a.requires_grad or b.requires_grad {
-        let need_a = a.requires_grad
-        let need_b = b.requires_grad
+        let need_a = wants_grad(a)
+        let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], |upstream| select_grads(a, b, upstream, 0, need_a, need_b)))
     }
     return output

@@ -1,7 +1,7 @@
 #: Matrix products, and the dense and fused linear layers built on them.
 import std.gpu as gpu
 import ..gemm as gemm
-from ..tensor import GradNode, Tensor, is_grad_enabled
+from ..tensor import GradNode, Tensor, is_grad_enabled, wants_grad
 from ..trace import record_dense_forward, record_dense_backward
 from .elementwise import add, gelu
 from .kernels import cached_kernel, reduce_leading, unary_backward
@@ -125,8 +125,8 @@ pub fn matmul(
         #: As `dense_affine` does: a side that never asked for a gradient
         #: (a data batch, a frozen weight) gets its placeholder back instead
         #: of a whole GEMM nobody reads.
-        let need_a = a.requires_grad
-        let need_b = b.requires_grad
+        let need_a = wants_grad(a)
+        let need_b = wants_grad(b)
         output.attach_creator(GradNode([a, b], fn(upstream: Tensor) -> list[Tensor] {
             let grad_a = if need_a { matmul_grad_a(a, b, upstream, trans_a, trans_b) } else { a }
             let grad_b = if need_b { matmul_grad_b(a, b, upstream, trans_a, trans_b) } else { b }
