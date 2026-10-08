@@ -122,7 +122,17 @@ fn test_a_binary_checkpoint_round_trips_bit_for_bit() -> void {
     if not jt.is_available() { return }
     let path = Path(os.temp_dir()).join("jaithon-jaitensor-checkpoint-test.bin")
     defer { if path.exists() { path.remove() } }
-    let odd = [0.0, -0.0, 1.0e-40, -1.0e-45, 3.4028234663852886e38, math.INF, -math.INF, math.NAN, 1.0 / 3.0]
+    let odd = [
+        0.0,
+        -0.0,
+        1.0e-40,
+        -1.0e-45,
+        3.4028234663852886e38,
+        math.INF,
+        -math.INF,
+        math.NAN,
+        1.0 / 3.0,
+    ]
     let special = jt.Tensor([9], odd)
     let wide = jt.Tensor([3, 70, 33])
     wide.buffer().fill_uniform(-2.0, 2.0, 17)
@@ -131,7 +141,12 @@ fn test_a_binary_checkpoint_round_trips_bit_for_bit() -> void {
     let names = ["special", "blocks/wide", "scalar", "deep é"]
     let tensors = [special, wide, scalar, deep]
     defer { for t in tensors { t.free() } }
-    jt.save_checkpoint(path.to_str(), names, tensors, meta: {"step": 2000, "dim": 256, "note": "gpt"})
+    jt.save_checkpoint(
+        path.to_str(),
+        names,
+        tensors,
+        meta: {"step": 2000, "dim": 256, "note": "gpt"}
+    )
     let loaded = jt.load_checkpoint(path.to_str())
     defer { loaded.free() }
     assert_eq(loaded.names, names)
@@ -150,7 +165,11 @@ fn test_a_binary_checkpoint_round_trips_bit_for_bit() -> void {
     let into_deep = jt.Tensor([2, 1, 3, 2])
     defer { into_wide.free() }
     defer { into_deep.free() }
-    let meta = jt.restore_checkpoint(path.to_str(), ["deep é", "blocks/wide"], [into_deep, into_wide])
+    let meta = jt.restore_checkpoint(
+        path.to_str(),
+        ["deep é", "blocks/wide"],
+        [into_deep, into_wide]
+    )
     assert_eq(meta["dim"], 256)
     assert_true(same_bits(into_wide.download(), wide.download()))
     assert_true(same_bits(into_deep.download(), deep.download()))

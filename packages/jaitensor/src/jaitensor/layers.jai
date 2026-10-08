@@ -1030,7 +1030,14 @@ pub class MultiHeadAttention: Layer {
 
     #: The whole-sequence forward for sequence-first `[seq, batch, dim]`:
     #: the rank-two path with `batch * heads` heads, and no copies.
-    fn forward_seq_first(self, x: Tensor, wq: Tensor, wk: Tensor, wv: Tensor, wo: Tensor) -> Tensor {
+    fn forward_seq_first(
+        self,
+        x: Tensor,
+        wq: Tensor,
+        wk: Tensor,
+        wv: Tensor,
+        wo: Tensor
+    ) -> Tensor {
         let seq = x.shape[0]
         let batch = x.shape[1]
         let width = batch * self.dim
@@ -1161,7 +1168,9 @@ pub class MultiHeadAttention: Layer {
     #: usual. `residual` is the output's shape.
     pub fn forward_add(self, x: Tensor, residual: Tensor) -> Tensor {
         if residual.size != x.size {
-            throw ValueError(f"forward_add residual {residual.shape} does not match input {x.shape}")
+            throw ValueError(
+                f"forward_add residual {residual.shape} does not match input {x.shape}"
+            )
         }
         let wq = self.wq_value
         let wk = self.wk_value

@@ -951,7 +951,14 @@ fn test_attention_layer_trains_with_frozen_projections() -> void {
 
 #: Rows `lo..hi` of every sequence in a `[batch, total, dim]` host block, as
 #: a `[batch, hi - lo, dim]` block.
-fn sequence_rows(values: list[float], batch: int, total: int, dim: int, lo: int, hi: int) -> list[float] {
+fn sequence_rows(
+    values: list[float],
+    batch: int,
+    total: int,
+    dim: int,
+    lo: int,
+    hi: int
+) -> list[float] {
     var out: list[float] = []
     for b in 0..batch {
         let base = b * total * dim
@@ -1070,7 +1077,10 @@ fn check_batched_cache(batch: int, dim: int, heads: int, prompt: int, total: int
     var start = 0
     while start < total {
         let count = if start == 0 { prompt } else { 1 }
-        let rows = Tensor([batch, count, dim], sequence_rows(xs, batch, total, dim, start, start + count))
+        let rows = Tensor(
+            [batch, count, dim],
+            sequence_rows(xs, batch, total, dim, start, start + count)
+        )
         let y = layer.forward(rows)
         assert_eq(y.shape, [batch, count, dim])
         let values = y.download()
@@ -1164,7 +1174,12 @@ fn swap_leading(values: list[float], first: int, second: int, dim: int) -> list[
 
 #: Output, dx and every parameter gradient of `sum(layer(x) * w)` for one
 #: rank-three block, as host lists in that order.
-fn layer_block_pass(layer: MultiHeadAttention, shape: list[int], xs: list[float], ws: list[float]) -> list[list[float]] {
+fn layer_block_pass(
+    layer: MultiHeadAttention,
+    shape: list[int],
+    xs: list[float],
+    ws: list[float]
+) -> list[list[float]] {
     let params = layer.parameters()
     jt.zero_grad(params)
     let x = Tensor(shape, xs, requires_grad: true)
@@ -1214,7 +1229,9 @@ fn check_seq_first(batch: int, seq: int, dim: int, heads: int, causal: bool) -> 
     var live = -1
     for step in 0..3 {
         let y = second.forward(x)
-        if step == 0 { assert_values_near(swap_leading(y.download(), seq, batch, dim), want[0], 4e-3) }
+        if step == 0 {
+            assert_values_near(swap_leading(y.download(), seq, batch, dim), want[0], 4e-3)
+        }
         y.free()
         gpu.synchronize()
         if step == 1 { live = gpu.live_buffers() }
