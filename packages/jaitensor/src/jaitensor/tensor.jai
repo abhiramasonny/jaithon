@@ -614,18 +614,21 @@ fn release_upstream(tensor: Tensor, upstream: Tensor, node: GradNode, grads: lis
 #: never released early: that op reads it too, and it may be the caller's.
 fn last_readers(order: list[Tensor]) -> dict[int, int] {
     var last: dict[int, int] = {}
-    var inputs_seen: dict[int, bool] = {}
     for (index, tensor) in order.enumerate() {
         let node = tensor.creator
         if node is null { continue }
-        for input in node.inputs { inputs_seen[input.id] = true }
         for extra in node.extras {
             let known = last.get(extra.id, -1)
             if known < 0 or index < known { last[extra.id] = index }
         }
     }
-    for id in inputs_seen.keys() {
-        if last.contains(id) { last[id] = -1 }
+    if last.len() == 0 { return last }
+    for tensor in order {
+        let node = tensor.creator
+        if node is null { continue }
+        for input in node.inputs {
+            if last.contains(input.id) { last[input.id] = -1 }
+        }
     }
     return last
 }
