@@ -718,6 +718,25 @@ def build_cases():
          [spread(1, 4, 11, seed=89), spread(6, 2, 3, seed=90), spread(6, seed=91)],
          {"group": 2, "dilations": [2], "strides": [2], "pads": [1, 2]})
     case("window", "conv1d_plain", "Conv", [spread(2, 3, 7, seed=92), spread(5, 3, 3, seed=93)], {"pads": [1, 1]})
+    # The index arithmetic transformer exports build masks and position ids from.
+    table = spread(3, 4, seed=97)
+    case("shape", "gatherelements_axis1", "GatherElements",
+         [table, np.array([[0, 3], [2, -1], [1, 1]], dtype=np.int64)], {"axis": 1})
+    case("shape", "gatherelements_axis0", "GatherElements",
+         [table, np.array([[2, 0, 1, 1]], dtype=np.int64)], {"axis": 0})
+    case("shape", "gathernd_rows", "GatherND",
+         [spread(2, 3, 4, seed=98), np.array([[1, 2], [0, -1]], dtype=np.int64)])
+    case("shape", "gathernd_batch", "GatherND",
+         [spread(2, 3, 4, seed=99), np.array([[2], [0]], dtype=np.int64)], {"batch_dims": 1})
+    case("shape", "scatternd_rows", "ScatterND",
+         [spread(4, 3, seed=100), np.array([[3], [0]], dtype=np.int64), spread(2, 3, seed=101)], opset=16)
+    case("shape", "scatternd_add", "ScatterND",
+         [spread(4, 3, seed=102), np.array([[1, 2], [1, 2]], dtype=np.int64), spread(2, seed=103)],
+         {"reduction": "add"}, opset=16)
+    case("shape", "range_float", "Range",
+         [np.array(0.5, dtype=np.float32), np.array(4.0, dtype=np.float32), np.array(0.75, dtype=np.float32)])
+    case("shape", "range_down", "Range",
+         [np.array(10, dtype=np.int64), np.array(2, dtype=np.int64), np.array(-3, dtype=np.int64)])
     case("window", "convtranspose_grouped3", "ConvTranspose",
          [spread(1, 6, 3, 3, seed=94), spread(6, 2, 3, 3, seed=95), spread(6, seed=96)],
          {"group": 3, "strides": [2, 2], "pads": [1, 1, 1, 1], "output_padding": [1, 1]})

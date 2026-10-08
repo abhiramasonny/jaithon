@@ -665,6 +665,9 @@ class Reading {
     pub var taken: dict[str, bool]
     #: The weights the file wrote as rank-zero scalars; see `Blob.scalar`.
     pub var scalars: dict[str, bool]
+    #: The constants the file wrote with a zero-width dimension, which hold
+    #: nothing and so are not weights; see `constant_is_empty`.
+    pub var empty: dict[str, bool]
     #: Where external tensors are read from, or null for a model that came
     #: as bytes and so has no directory to look in.
     pub var files: ExternalFiles?
@@ -676,6 +679,7 @@ class Reading {
         self.nodes = []
         self.taken = {}
         self.scalars = {}
+        self.empty = {}
         self.files = files
         self.minted = 0
     }
@@ -910,6 +914,22 @@ fn constant_is_scalar(fields: list[Field]) -> bool {
     return false
 }
 
+#: Whether a `Constant` holds an empty tensor -- a dimension of zero. The one
+#: use exporters have for such a thing is the shape a `ConstantOfShape` is
+#: given to make a scalar, which `place_node` folds; anything else that reads
+#: it finds no value and says so.
+fn constant_is_empty(fields: list[Field]) -> bool {
+    for attribute in fields_by_number(fields, NODE_ATTRIBUTE) {
+        let parts = parse_nested(attribute)
+        if optional_string(parts, ATTR_NAME) != "value" { continue }
+        let held = field_by_number(parts, ATTR_TENSOR)
+        if held is null { return false }
+        let dims = repeated_varints(parse_nested(held), TENSOR_DIMS, "a constant")
+        return 0 in dims
+    }
+    return false
+}
+
 #: One `NodeProto`, as the nodes it becomes -- usually one, none for a
 #: `Constant` that has been folded into the weights, four for a `Softmax` old
 #: enough to have meant something else.
@@ -923,6 +943,10 @@ fn read_node(reading: Reading, fields: list[Field]) -> list[GraphNode] {
     }
     let inputs = repeated_strings(fields, NODE_INPUT)
     let outputs = repeated_strings(fields, NODE_OUTPUT)
+    if op == "Constant" and outputs.len() == 1 and constant_is_empty(fields) {
+        reading.empty[outputs[0]] = true
+        return []
+    }
     var node = GraphNode(op, name: name, inputs: inputs, outputs: outputs)
     let label = node.label()
     let domain = optional_string(fields, NODE_DOMAIN)
@@ -961,6 +985,17 @@ fn place_node(reading: Reading, node: GraphNode, label: str, scalar: bool) -> li
         reading.adopt(node.outputs[0], kept, label)
         free_node_tensors(node)
         if scalar { reading.scalars[node.outputs[0]] = true }
+        return []
+    }
+    #: `ConstantOfShape` of an empty shape is a scalar, which is how the
+    #: TorchScript exporter writes one: the value attribute, held as `[1]`.
+    if op == "ConstantOfShape" and node.inputs.len() == 1 and reading.empty.get(node.inputs[0], false) {
+        let held = node.attrs.get("value", null)
+        var value = 0.0
+        if held is not null and held.tensor is not null { value = held.tensor.download()[0] }
+        reading.hold(node.outputs[0], [1], [value], label)
+        reading.scalars[node.outputs[0]] = true
+        free_node_tensors(node)
         return []
     }
     if not is_implemented(op) {

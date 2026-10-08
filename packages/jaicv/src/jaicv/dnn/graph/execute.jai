@@ -18,6 +18,7 @@ from .ops_math import op_max, op_mean, op_min, op_mod, op_mul, op_neg, op_not, o
 from .ops_math import op_prelu, op_reduce_max, op_reduce_mean, op_reduce_min, op_reduce_sum
 from .ops_math import op_relu, op_sigmoid, op_silu, op_softmax, op_softplus, op_sqrt, op_sub
 from .ops_math import op_sum, op_tanh, op_where
+from .ops_index import op_gather_elements, op_gather_nd, op_range, op_scatter_nd
 from .ops_rnn import op_gru, op_lstm
 from .ops_shape import op_cast, op_concat, op_constant, op_constant_of_shape, op_expand, op_flatten
 from .ops_shape import op_gather, op_pad, op_reshape, op_shape, op_slice, op_split, op_squeeze
@@ -76,6 +77,10 @@ fn handlers() -> dict[str, fn(GraphNode, list[Tensor?]) -> list[Tensor]] {
     _handlers["Slice"] = op_slice
     _handlers["Gather"] = op_gather
     _handlers["Expand"] = op_expand
+    _handlers["GatherElements"] = op_gather_elements
+    _handlers["GatherND"] = op_gather_nd
+    _handlers["ScatterND"] = op_scatter_nd
+    _handlers["Range"] = op_range
     _handlers["Pad"] = op_pad
     _handlers["MaxPool"] = op_max_pool
     _handlers["AveragePool"] = op_average_pool

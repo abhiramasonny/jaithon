@@ -82,4 +82,9 @@ pub let FOLDABLE = {
     "Expand": true,
     "GreaterOrEqual": true,
     "LessOrEqual": true,
+    #: Index arithmetic over position ids and masks, nearly always on
+    #: constants; the plan has no other way to express these.
+    "GatherElements": true,
+    "GatherND": true,
+    "ScatterND": true,
 }

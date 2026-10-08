@@ -428,6 +428,19 @@ fn test_a_gather_by_a_scalar_drops_its_axis() -> void {
     free_onnx_weights(graph)
 }
 
+#: BERT and DistilBERT, exported by TorchScript, make a scalar as
+#: `ConstantOfShape` of an empty `Constant`. The empty tensor has no place
+#: here, so the pair is folded into the scalar it stands for.
+fn test_a_constant_of_an_empty_shape_is_a_scalar() -> void {
+    let graph = read_net_from_onnx(MODELS + "onnx_empty_shape.onnx")
+    let x = Tensor([3], [1.0, -2.0, 4.0])
+    let produced = run_graph(graph, {"input": x})
+    assert_eq(produced["output"].download(), [2.5, -5.0, 10.0], "the input times the scalar")
+    produced["output"].free()
+    x.free()
+    free_onnx_weights(graph)
+}
+
 #: The `Net` an OpenCV detector would be holding, fed the blob layout
 #: `blob_from_image` produces: `N * C` rows of `H * W`.
 fn test_the_net_wrapper_runs_the_cnn() -> void {

@@ -469,6 +469,33 @@ def scalar_gather_fixture() -> None:
     assert onnxruntime_run(path, sample).tolist() == [7.0, 19.0]
 
 
+def empty_shape_fixture() -> None:
+    """The TorchScript exporter's scalar: `ConstantOfShape` of an empty shape.
+
+    The shape is a `Constant` with a zero-width dimension, which holds nothing
+    and has no tensor here; the importer folds the pair into the scalar it
+    makes, 2.5, and the graph multiplies the input by it.
+    """
+    nothing = helper.make_tensor("nothing", TensorProto.INT64, [0], [])
+    fill = helper.make_tensor("fill", TensorProto.FLOAT, [1], [2.5])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Constant", [], ["shape"], name="c_shape", value=nothing),
+            helper.make_node("ConstantOfShape", ["shape"], ["scalar"], name="make_scalar", value=fill),
+            helper.make_node("Mul", ["input", "scalar"], ["output"], name="scale"),
+        ],
+        "empty_shape",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [3])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [3])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", OPSET)])
+    model.ir_version = 9
+    path = MODELS / "onnx_empty_shape.onnx"
+    onnx.save(model, path)
+    sample = np.array([1.0, -2.0, 4.0], dtype=np.float32)
+    assert onnxruntime_run(path, sample).tolist() == [2.5, -5.0, 10.0]
+
+
 def constant_fixture() -> None:
     """Constant nodes in each of the five shapes an exporter writes them in.
 
