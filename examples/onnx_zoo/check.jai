@@ -59,6 +59,9 @@ fn main() -> int {
         print(f"{failed} of {ACCEPTANCE.len()} missed (tolerance {TOLERANCE})")
         return 1
     }
-    print(f"all {ACCEPTANCE.len()} within {TOLERANCE} of onnxruntime on both paths")
+    print(
+        f"all {ACCEPTANCE.len()} within {TOLERANCE} of onnxruntime on both paths, or twice " +
+            "torch's own distance from it where that is more"
+    )
     return 0
 }

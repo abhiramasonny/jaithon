@@ -5,8 +5,9 @@
 #: The two paths are the interpreter (`run_graph`, one operator at a time) and
 #: the compiled plan (`compile_plan`, the whole model as one MPSGraph). A model
 #: counts as running on a path when it imports, runs, and lands within a
-#: relative 1e-5 of onnxruntime CPU: the largest absolute difference over the
-#: largest absolute reference value, over the first output.
+#: relative 1e-5 of onnxruntime CPU -- the largest absolute difference over the
+#: largest absolute reference value, over the first output -- or within twice
+#: what torch's own CPU answer is from onnxruntime's, when that is larger.
 import std.gpu as gpu
 import std.io as io
 from std.os import env, home_dir
@@ -18,6 +19,12 @@ from jaicv.dnn.plan import Plan, compile_plan
 
 #: How far a path may land from onnxruntime and still count as correct.
 pub let TOLERANCE = 1e-5
+
+#: A model whose two CPU references already disagree by more than `TOLERANCE`
+#: gets twice their disagreement instead. With measured BatchNorm statistics,
+#: torch and onnxruntime are 2e-5 apart on ResNet-50 and 1.5e-4 on
+#: FCN-ResNet-50, which no third float32 runtime can be held inside.
+pub let REFERENCE_SLACK = 2.0
 
 #: Where `export.py` writes: `$ONNX_ZOO_DIR`, or `~/.cache/jaithon/onnx_zoo`.
 #: Outside the repository on purpose -- the exports are 2.8 GB.
@@ -75,12 +82,16 @@ pub class Exported {
     pub var model: str
     pub var inputs: list[Spec]
     pub var outputs: list[Spec]
+    #: How far torch's CPU answer is from onnxruntime's, measured the way
+    #: `relative_difference` measures; negative when export.py did not say.
+    pub var agreement: float
 
     pub fn init(self, tag: str) {
         self.tag = tag
         self.model = ""
         self.inputs = []
         self.outputs = []
+        self.agreement = -1.0
     }
 
     #: The export for `tag`, or null when export.py has not written it.
@@ -92,6 +103,7 @@ pub class Exported {
             if line.starts_with("model ") { found.model = line.split(" ")[1] }
             if line.starts_with("input ") { found.inputs.push(parse_spec(line)) }
             if line.starts_with("output ") { found.outputs.push(parse_spec(line)) }
+            if line.starts_with("agreement ") { found.agreement = float(line.split(" ")[1]) }
         }
         return found
     }
@@ -198,6 +210,8 @@ pub class Row {
     pub var plan_rel: float
     pub var plan: Timing?
     pub var refusal: str
+    #: `TOLERANCE`, or twice the references' own disagreement when larger.
+    pub var tolerance: float
 
     pub fn init(self, tag: str) {
         self.tag = tag
@@ -210,13 +224,16 @@ pub class Row {
         self.plan_rel = -1.0
         self.plan = null
         self.refusal = ""
+        self.tolerance = TOLERANCE
     }
 
     pub fn interp_ok(self) -> bool {
-        return self.interp_rel >= 0.0 and self.interp_rel <= TOLERANCE
+        return self.interp_rel >= 0.0 and self.interp_rel <= self.tolerance
     }
 
-    pub fn plan_ok(self) -> bool { return self.plan_rel >= 0.0 and self.plan_rel <= TOLERANCE }
+    pub fn plan_ok(self) -> bool {
+        return self.plan_rel >= 0.0 and self.plan_rel <= self.tolerance
+    }
 
     pub fn both_ok(self) -> bool { return self.interp_ok() and self.plan_ok() }
 }
@@ -226,6 +243,7 @@ pub class Row {
 #: timed too, after a `warm_s`-second warm-up.
 pub fn measure(found: Exported, warm_s: float, samples: int) -> Row {
     let row = Row(found.tag)
+    row.tolerance = max(TOLERANCE, REFERENCE_SLACK * found.agreement)
     var clock = Instant.now()
     var graph: Graph? = null
     try {

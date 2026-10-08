@@ -22,7 +22,7 @@
 import std.io as io
 from std.os import argv, env, set_env
 
-from .zoo_model import Exported, Row, TOLERANCE, every_tag, measure, zoo_dir
+from .zoo_model import Exported, REFERENCE_SLACK, Row, TOLERANCE, every_tag, measure, zoo_dir
 
 fn number(value: float) -> str {
     if value < 0.0 { return "-" }
@@ -120,7 +120,10 @@ fn main() -> int {
         let plan = row.plan
         print(f"== {tag}  [{status(row)}]  nodes={row.nodes}")
         if row.refusal.len() > 0 { print(f"   first refusal: {row.refusal}") }
-        print(f"   rel vs onnxruntime: interp {rel(row.interp_rel)}  plan {rel(row.plan_rel)}")
+        print(
+            f"   rel vs onnxruntime: interp {rel(row.interp_rel)}  plan {rel(row.plan_rel)}  " +
+                f"(torch {rel(found.agreement)}, held to {row.tolerance:.1e})"
+        )
         print(
             f"   import {number(row.import_ms)} ms  interp cold {number(row.interp_cold_ms)} ms  " +
                 f"plan compile {number(row.compile_ms)} ms"
@@ -142,6 +145,19 @@ fn main() -> int {
     for row in rows {
         if row.both_ok() { both += 1 }
     }
-    print(f"{both} of {rows.len()} exports land within {TOLERANCE} of onnxruntime on both paths")
+    var strict = 0
+    for row in rows {
+        if row.interp_rel >= 0.0 and
+            row.interp_rel <= TOLERANCE and
+            row.plan_rel >= 0.0 and
+            row.plan_rel <= TOLERANCE {
+            strict += 1
+        }
+    }
+    print(
+        f"{both} of {rows.len()} exports land within {TOLERANCE} of onnxruntime on both paths, " +
+            f"or within {REFERENCE_SLACK}x of torch's own distance from it; {strict} within " +
+            f"{TOLERANCE} flat"
+    )
     return 0
 }

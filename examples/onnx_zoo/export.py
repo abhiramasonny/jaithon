@@ -271,6 +271,12 @@ def export_one(name, build, inputs_fn, mode):
     if tout is not None and tout.shape == ref.shape:
         rec["torch_vs_ort_maxabs"] = float(np.abs(tout - ref).max())
     meta = [f"model {path}"]
+    peak = float(np.abs(ref).max())
+    if "torch_vs_ort_maxabs" in rec and peak > 0:
+        # How far two CPU runtimes already are from each other on this model,
+        # as zoo.jai measures it: no third float32 runtime can be held closer.
+        rec["torch_vs_ort_rel"] = rec["torch_vs_ort_maxabs"] / peak
+        meta.append(f"agreement {rec['torch_vs_ort_rel']!r}")
     for k, a in inputs:
         f = os.path.join(OUT, f"{tag}.in.{k}.bin")
         a.astype(np.float32).tofile(f)
