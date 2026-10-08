@@ -8,6 +8,7 @@ from .ops import relu, reshape, sigmoid, softmax, tanh
 from .ops import batch_norm, group_norm, multi_head_attention, silu, matmul
 from .ops.attention import hand_to_graph
 from .ops.matmul import raw_matmul
+from .ops import add
 from .tensor import Tensor
 
 #: Something `Sequential` can stack: turns an input tensor into an output
@@ -1109,4 +1110,160 @@ pub class AvgPool2d: Layer {
     pub fn free(self) -> void { }
 
     fn __str__(self) -> str { return f"AvgPool2d(k={self.kernel_size})" }
+}
+
+#: A residual basic block (He et al. 2016) over NHWC activations:
+#:
+#:     relu(bn2(conv2(relu(bn1(conv1(x))))) + shortcut(x))
+#:
+#: Both convolutions are 3x3 with padding 1; the first takes the block's
+#: `stride`. The shortcut is `x` itself, or a 1x1 convolution with the same
+#: stride and its own batch norm -- the projection -- when the block changes
+#: the shape. `projection` left out means exactly then; `true` asks for one
+#: anyway. The convolutions carry no bias, since the batch norm after each
+#: would subtract it straight back out.
+#:
+#: Usable inside `Sequential` after anything that hands on an `[H, W, C]`
+#: shape. The batch norms normalise by the batch they are given, in
+#: prediction too; see `BatchNorm2d`.
+pub class ResBlock: Layer {
+    #: Output channels.
+    pub let channels: int
+    #: Stride of the first convolution and the shortcut.
+    pub let stride: int
+    #: Whether the shortcut is a projection rather than the identity. Settled
+    #: when the block is built.
+    pub var projects: bool
+    let projection_asked: bool
+    let norm1: BatchNorm2d
+    let norm2: BatchNorm2d
+    let norm_shortcut: BatchNorm2d
+    var conv1: Tensor?
+    var conv2: Tensor?
+    var shortcut: Tensor?
+    var in_shape: list[int]
+    var out_shape: list[int]
+
+    pub fn init(self, channels: int, stride: int = 1, projection: bool = false) {
+        if channels <= 0 { throw ValueError(f"ResBlock channels must be positive, got {channels}") }
+        if stride <= 0 { throw ValueError(f"ResBlock stride must be positive, got {stride}") }
+        self.channels = channels
+        self.stride = stride
+        self.projects = projection
+        self.projection_asked = projection
+        self.norm1 = BatchNorm2d()
+        self.norm2 = BatchNorm2d()
+        self.norm_shortcut = BatchNorm2d()
+        self.conv1 = null
+        self.conv2 = null
+        self.shortcut = null
+        self.in_shape = []
+        self.out_shape = []
+    }
+
+    pub fn build(self, input_units: int, rng: Random) -> void {
+        throw ValueError("ResBlock needs an [H, W, C] input shape, not a flat width")
+    }
+
+    #: Allocate the block's weights for an `[H, W, C]` input. Building again
+    #: for the same shape keeps the weights it has.
+    pub fn build_from_shape(self, shape: list[int], rng: Random) -> void {
+        if shape.len() != 3 { throw ValueError(f"ResBlock expected [H, W, C], got {shape}") }
+        if self.conv1 is not null {
+            if shape != self.in_shape {
+                throw ValueError(f"ResBlock was built for {self.in_shape}, got {shape}")
+            }
+            return
+        }
+        let in_channels = shape[2]
+        self.projects = self.projection_asked or self.stride != 1 or in_channels != self.channels
+        let height = (shape[0] + 2 - 3) // self.stride + 1
+        let width = (shape[1] + 2 - 3) // self.stride + 1
+        if height <= 0 or width <= 0 { throw ValueError(f"ResBlock input {shape} is too small") }
+        self.conv1 = residual_weights(3, in_channels, self.channels, rng)
+        self.conv2 = residual_weights(3, self.channels, self.channels, rng)
+        let inner = [height, width, self.channels]
+        self.norm1.build_from_shape(inner, rng)
+        self.norm2.build_from_shape(inner, rng)
+        if self.projects {
+            self.shortcut = residual_weights(1, in_channels, self.channels, rng)
+            self.norm_shortcut.build_from_shape(inner, rng)
+        }
+        self.in_shape = [d for d in shape]
+        self.out_shape = inner
+    }
+
+    pub fn forward(self, x: Tensor) -> Tensor {
+        let conv1 = self.conv1
+        let conv2 = self.conv2
+        if conv1 is null or conv2 is null { throw RuntimeError("ResBlock has not been built") }
+        if x.rank() != 4 { throw ValueError(f"ResBlock needs NHWC input, got {x.shape}") }
+        let inner = relu(self.norm1.forward(conv2d(x, conv1, stride: self.stride, padding: 1)))
+        let main = self.norm2.forward(conv2d(inner, conv2, padding: 1))
+        let skip = self.shortcut_of(x)
+        return relu(add(main, skip))
+    }
+
+    fn shortcut_of(self, x: Tensor) -> Tensor {
+        let shortcut = self.shortcut
+        if not self.projects or shortcut is null { return x }
+        return self.norm_shortcut.forward(conv2d(x, shortcut, stride: self.stride))
+    }
+
+    #: The first convolution and its norm, the second and its norm, then the
+    #: projection and its norm when there is one.
+    pub fn parameters(self) -> list[Tensor] {
+        let conv1 = self.conv1
+        let conv2 = self.conv2
+        if conv1 is null or conv2 is null { throw RuntimeError("ResBlock has not been built") }
+        var out: list[Tensor] = [conv1]
+        out.extend(self.norm1.parameters())
+        out.push(conv2)
+        out.extend(self.norm2.parameters())
+        let shortcut = self.shortcut
+        if shortcut is not null {
+            out.push(shortcut)
+            out.extend(self.norm_shortcut.parameters())
+        }
+        return out
+    }
+
+    pub fn output_width(self) -> int {
+        if self.out_shape.len() == 0 { return self.channels }
+        var n = 1
+        for d in self.out_shape { n *= d }
+        return n
+    }
+
+    pub fn output_shape(self) -> list[int] {
+        if self.out_shape.len() == 0 { return [self.channels] }
+        return [d for d in self.out_shape]
+    }
+
+    pub fn free(self) -> void {
+        for held in [self.conv1, self.conv2, self.shortcut] {
+            if held is not null { held.free() }
+        }
+        self.conv1 = null
+        self.conv2 = null
+        self.shortcut = null
+        self.norm1.free()
+        self.norm2.free()
+        self.norm_shortcut.free()
+    }
+
+    fn __str__(self) -> str {
+        let kind = if self.projects { "projection" } else { "identity" }
+        return f"ResBlock({self.channels}, stride {self.stride}, {kind})"
+    }
+}
+
+#: HWIO weights for a bias-free convolution, drawn as `Conv2d` draws a linear
+#: one: uniform with variance one over the fan-in.
+fn residual_weights(kernel: int, in_channels: int, out_channels: int, rng: Random) -> Tensor {
+    let fan = kernel * kernel * in_channels
+    let limit = math.sqrt(3.0 / float(fan))
+    let weights = Tensor([kernel, kernel, in_channels, out_channels], requires_grad: true)
+    weights.buffer().fill_uniform(-limit, limit, rng.next_int())
+    return weights
 }
